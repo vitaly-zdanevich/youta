@@ -14,12 +14,12 @@
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 
 Youta is a low-resource terminal YouTube audio player and subscription manager
-written in Rust. Subscriptions are currently stored and managed locally;
-YouTube-account synchronization is not implemented yet. Youta uses an
-invisible `mpv` process for playback, communicates with it over JSON IPC, and
-can use `yt-dlp` as an explicitly enabled media resolver and downloader. The
-terminal UI remains the only visible interface: its seek bar, queue, volume,
-pause state, and hotkeys control `mpv`.
+written in Rust. It saves and shows listening progress. Subscriptions are
+currently stored and managed locally; YouTube-account synchronization is not
+implemented yet. Youta uses an invisible `mpv` process for playback,
+communicates with it over JSON IPC, and can use `yt-dlp` as an explicitly
+enabled media resolver and downloader. The terminal UI remains the only visible
+interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
 
 > **Project status: pre-alpha foundation.** The repository contains the first
 > working TUI and core state model, local SQLite persistence, OPML
@@ -563,3 +563,29 @@ upload. `YOUTA_LIVE_YOUTUBE_URL` can select another public YouTube URL.
 ## License
 
 Youta is licensed under the [MIT License](LICENSE).
+
+## Similar terminal YouTube projects
+
+- [youtube-tui](https://github.com/Siriusmart/youtube-tui) is a Rust TUI for
+  browsing YouTube videos, channels, and playlists, with filters, history,
+  subscriptions, and external or embedded `mpv` playback.
+- [GopherTube](https://github.com/KrishnaSSH/gophertube) is a Go TUI for
+  searching, watching, and downloading YouTube videos through `mpv`, `yt-dlp`,
+  and `chafa`.
+- [invidtui](https://github.com/darkhz/invidtui) is a Go TUI backed by
+  Invidious instances, with audio and video playback, browsing, downloads, and
+  Invidious account feeds, playlists, and subscriptions.
+- [YTerMusic](https://github.com/ccgauche/ytermusic) is a Rust YouTube Music
+  TUI focused on playlists and Supermix, caching, offline playback, and
+  background downloads.
+- [Feather](https://github.com/13unk0wn/Feather) is an early-development Rust
+  and Ratatui YouTube Music player that uses `yt-dlp` and `mpv`.
+- [yewtube](https://github.com/mps-youtube/yewtube) is a Python terminal
+  YouTube player and downloader with search, local and YouTube playlists,
+  comments, and support for external players.
+- [terminal-yt](https://github.com/jooooscha/terminal-yt) is a
+  Newsboat-inspired Rust TUI that reads YouTube RSS/Atom subscriptions, marks
+  videos as played, and opens them in a configurable external player.
+- [ytfzf](https://github.com/pystardust/ytfzf) is a POSIX and `fzf`-based
+  search, watch, and download frontend with thumbnails, subscriptions, and
+  history; its upstream repository says it is no longer actively maintained.
