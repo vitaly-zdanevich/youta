@@ -1,0 +1,20 @@
+/target/
+/dist/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# Repository-local configuration can contain provider credentials.
+/config.toml
+/.env
+/.env.*
+!/.env.example
+
+# Local coverage and profiling output.
+/coverage/
+/lcov.info
+*.profraw
+*.profdata
+/tarpaulin-report.html
+/perf.data*

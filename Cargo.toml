@@ -1,0 +1,165 @@
+[package]
+name = "youta"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A low-resource terminal YouTube audio player and subscription manager using yt-dlp"
+license = "MIT"
+repository = "https://github.com/vitaly-zdanevich/youta"
+homepage = "https://github.com/vitaly-zdanevich/youta"
+readme = "README.md"
+keywords = ["audio", "podcasts", "terminal", "tui", "youtube"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[features]
+default = [
+    "tui",
+    "thumbnails",
+    "local",
+    "rss",
+    "invidious",
+    "youtube-official",
+    "peertube",
+    "vimeo",
+    "rutube",
+    "bilibili",
+    "radio",
+    "bbc-radio",
+    "funkwhale",
+    "jamendo",
+    "soundcloud",
+    "soundstream",
+    "apple-podcasts",
+    "litres",
+    "sponsorblock",
+    "dearrow",
+    "wikidata",
+    "generic-ytdlp",
+    "tracker-music",
+    "backend-mpv",
+    "yt-dlp",
+]
+
+# User interface and playback backends.
+tui = ["dep:crossterm", "dep:ratatui", "dep:toml_edit"]
+backend-mpv = []
+backend-native = []
+alsa = []
+jack = []
+pulseaudio = []
+pipewire = []
+waveform = []
+thumbnails = [
+    "tui",
+    "network",
+    "dep:image",
+    "dep:ratatui-image",
+    "dep:sha2",
+]
+keyring = []
+
+# Shared networking and first-class sources.
+network = ["dep:ureq"]
+local = ["dep:lofty"]
+rss = ["network", "dep:feed-rs"]
+invidious = ["network"]
+peertube = ["network"]
+vimeo = ["yt-dlp"]
+rutube = ["yt-dlp"]
+youtube-official = ["network"]
+yt-dlp = []
+sponsorblock = ["network"]
+dearrow = ["network"]
+wikidata = ["network"]
+wikimedia = ["network"]
+archive-org = ["network"]
+librivox = ["network"]
+apple-podcasts = ["rss"]
+litres = ["network", "dep:sha2"]
+podcast-index = ["rss"]
+gpodder = ["rss"]
+radio = ["network"]
+bbc-radio = ["radio", "yt-dlp"]
+funkwhale = ["network"]
+jamendo = ["network"]
+soundcloud = ["network", "yt-dlp"]
+soundstream = ["network"]
+generic-ytdlp = ["yt-dlp"]
+tracker-music = ["network", "dep:quick-xml"]
+lastfm = ["network"]
+discord = []
+
+# Optional remote storage and service adapters.
+google-drive = ["network"]
+yandex-disk = ["network"]
+webdav = ["network"]
+ssh = []
+evernote = []
+telegram = []
+bandcamp = ["network"]
+odysee = ["network"]
+rumble = ["network"]
+bilibili = ["network"]
+yandex-music = ["network"]
+vk = ["network"]
+
+# Optional archive and peer-to-peer support.
+archive-zip = []
+archive-rar = []
+torrent = []
+
+# Portable release builds can opt into a bundled SQLite library. Distribution
+# packages should prefer their system SQLite.
+bundled-sqlite = ["rusqlite/bundled"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+crossbeam-channel = "0.5.16"
+directories = "6.0.0"
+figment = { version = "0.10.19", features = ["env", "toml"] }
+opml = "1.1.6"
+rusqlite = { version = "0.40.1", default-features = false, features = ["cache"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+toml_edit = { version = "0.22.27", optional = true }
+url = { version = "2.5.8", features = ["serde"] }
+
+crossterm = { version = "0.29.0", optional = true }
+feed-rs = { version = "2.4.0", optional = true }
+lofty = { version = "0.24.0", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros"], optional = true }
+ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"], optional = true }
+quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
+sha2 = { version = "0.10.9", optional = true }
+ureq = { version = "3.3.0", features = ["json"], optional = true }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+debug = "line-tables-only"
+lto = "thin"
+opt-level = 3
+panic = "unwind"
+strip = "none"
+
+[profile.release-small]
+inherits = "release"
+debug = 0
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

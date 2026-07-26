@@ -1,0 +1,109 @@
+# Youta configuration example.
+#
+# Copy this file to ~/.config/youta/config.toml. Set YOUTA_CONFIG_DIR to use a
+# different application directory. Environment overrides use the YOUTA_ prefix
+# and two underscores for nesting; for example:
+#
+#   YOUTA_PLAYBACK__VOLUME_PERCENT=40
+#
+# Persistent state and downloads also remain beneath the application directory.
+
+[playback]
+# `mpv` is the implemented external backend. `native` is reserved for a build
+# that includes the experimental native backend.
+backend = 'mpv'
+
+# One of: `auto`, `alsa`, `jack`, `pulse-audio`, or `pipe-wire`.
+output = 'auto'
+
+# Uncomment to select a backend-specific device. For mpv/ALSA this can be a
+# value such as `alsa/hw:2,0`. List devices with `mpv --audio-device=help`.
+# device = 'alsa/hw:2,0'
+
+volume_percent = 80
+speed_percent = 100
+resume_rewind_seconds = 30
+
+[playback.audiophile]
+# These settings affect Youta/player arguments only. Youta never changes the
+# CPU governor, real-time scheduler, kernel parameters, or device permissions.
+enabled = false
+exclusive_device = false
+avoid_resampling = false
+
+# Leave unset to preserve the source/device negotiation. Forcing a rate can
+# require resampling and is not automatically a quality improvement.
+# output_sample_rate_hz = 96000
+
+[subscriptions]
+# Automatic work runs only while Youta is open.
+auto_download = true
+audio_format = 'opus'
+download_thumbnails = true
+
+[ui]
+show_button_hotkeys = true
+
+# One of: `auto`, `dark`, or `light`.
+theme = 'auto'
+
+# One of: `auto`, `off`, or `on`. Runtime capability checks still suppress
+# graphics on a real TTY or when no supported image protocol is detected.
+thumbnails = 'auto'
+
+# Maximum artwork height in terminal rows. Youta reduces it when the Details
+# panel is shorter so metadata, links, and description text retain space.
+thumbnail_height = 20
+seekbar_color = 'cyan'
+nyan_cat_seekbar = false
+dos_rpg_mode = false
+
+[persistence]
+position_save_interval_seconds = 30
+played_threshold_percent = 90
+
+# Experimental and off by default. Secrets, caches, database side files, and
+# media must never be included in automatic commits.
+git_commit_on_change = false
+
+[providers]
+# Metadata backend for YouTube search and public details. One of: `auto`,
+# `official`, or `invidious`. `auto` prefers `youtube_api_key` when the
+# official adapter is compiled in, then falls back to `invidious_base_url`.
+# Playback remains on the separate yt-dlp/mpv path.
+youtube_backend = 'auto'
+
+# Base URLs and credentials are unset until the user chooses a provider.
+# invidious_base_url = 'https://inv.example.org/'
+# peertube_instance_url = 'https://video.example.org/'
+# funkwhale_instance_url = 'https://audio.example.org/'
+
+# Mirsoft Game Music Base currently serves its catalog only over unencrypted
+# HTTP. The insecure catalog is enabled by default at the user's request and
+# triggers a one-time warning. Set this to false to reject Mirsoft and every
+# other plain-HTTP provider URL. Youta never sends credentials to Mirsoft.
+allow_insecure_http = true
+
+# Prefer environment overrides for secrets, for example:
+#
+#   YOUTA_PROVIDERS__YOUTUBE_API_KEY='...'
+#   YOUTA_PROVIDERS__MOD_ARCHIVE_API_KEY='...'
+#   YOUTA_PROVIDERS__JAMENDO_CLIENT_ID='...'
+#
+# If YouTube search has no provider, its TUI setup popup accepts either the API
+# key below or the Invidious URL above. It shows the exact config.toml path and,
+# on Unix, saves the directory with mode 0700 and the file with mode 0600.
+# The popup includes API-key creation/restriction steps plus selectable links
+# to Google's official credential guide, Google Cloud Credentials, and the
+# official Invidious public-instance list.
+# The YouTube API key is plaintext in this file; its environment override takes
+# precedence. The planned keyring adapter is not part of the current foundation.
+# youtube_api_key = '...'
+# mod_archive_api_key = '...'
+# Register your own application at https://devportal.jamendo.com/; Youta never
+# ships Jamendo's documentation/testing client ID.
+# jamendo_client_id = '...'
+
+# Helper names may instead be absolute paths.
+yt_dlp_executable = 'yt-dlp'
+mpv_executable = 'mpv'
