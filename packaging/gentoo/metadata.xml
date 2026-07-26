@@ -26,6 +26,7 @@
 		<flag name="funkwhale">Enable configurable Funkwhale instances</flag>
 		<flag name="generic-ytdlp">Accept direct URLs supported by installed yt-dlp extractors</flag>
 		<flag name="google-drive">Enable optional Google Drive source and backup support</flag>
+		<flag name="gpm">Enable safe, opportunistic GPM mouse input on Linux virtual consoles without linking libgpm</flag>
 		<flag name="gpodder">Enable the gpodder.net podcast adapter</flag>
 		<flag name="invidious">Enable configurable Invidious instances for YouTube discovery</flag>
 		<flag name="jamendo">Enable Jamendo catalog search and track metadata through the official API using a runtime client ID</flag>
@@ -60,6 +61,7 @@
 		<flag name="wikimedia">Enable Wikimedia Commons discovery and reviewed transfer support</flag>
 		<flag name="yandex-disk">Enable optional Yandex Disk source and backup support</flag>
 		<flag name="yandex-music">Enable the experimental Yandex Music adapter</flag>
+		<flag name="youtube-music">Enable independent YouTube Music catalog search through the installed yt-dlp</flag>
 		<flag name="youtube-official">Enable YouTube Data API v3 search and public metadata using a runtime API key</flag>
 		<flag name="yt-dlp">Use the external yt-dlp resolver/downloader</flag>
 	</use>

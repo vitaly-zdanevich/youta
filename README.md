@@ -36,8 +36,12 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
 - Persistent state is local-first and restartable. Youta stores navigation,
   queue, history, notes, bookmarks, and playback positions beneath
   `~/.config/youta/`.
-- Local media folders are read-only inputs. Youta does not reorganize or move
-  them.
+- The Local tab browses supported media and images in place. Youta never
+  reorganizes folders automatically; only explicit Rename and Move to Trash
+  actions change a selected entry. Recursive folder sizes are enabled by
+  default, calculated asynchronously one folder at a time, and never follow
+  symbolic links. `[Z]` cycles size sorting off, ascending, and descending;
+  unknown folders remain after known sizes.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. Youta does not attempt thumbnail
@@ -56,10 +60,20 @@ chapters, or a future waveform sends IPC commands to the same player process.
 The backend requires `mpv` 0.38 or newer so resume positions and extractor
 options can be applied atomically through `loadfile` per-file options.
 
+`[A] Autoplay` is off by default and persists its state in
+`playback.autoplay`. When enabled, EOF advances through the same YouTube,
+YouTube Music, subscription-channel, Local, or MOD/tracker list. Items added
+with **Play next** or **Add to queue** always run first; Youta then resumes the
+original source list. Replacing a live search stops that list's continuation
+instead of accidentally playing an unrelated new result.
+
 Description timecodes become exact chapter split and mouse-seek targets. Dense
 chapter labels grow to as many as four rows when the terminal has spare height;
 `T` toggles between timestamps plus names and names only without moving those
-targets. This label preference is restored with the previous session.
+targets. This label preference is restored with the previous session. By
+default, Youta hides and skips only chapters whose normalized title is
+exactly `Реклама`; set `playback.skip_advertisement_chapters` to `false` to
+retain them.
 
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player
@@ -84,6 +98,8 @@ The initial `0.1.0` work establishes:
 - a two-panel terminal UI and restartable screen state;
 - official YouTube Data API v3 or Invidious video/channel search and video
   details, with description-link extraction;
+- an independent YouTube Music tab that searches playable tracks through
+  `yt-dlp` without requiring a YouTube Data API key;
 - lazy Wikidata enrichment for exact YouTube, SoundCloud, and Bilibili
   external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
@@ -314,6 +330,16 @@ These are distinct integration modes:
   `providers.youtube_backend = 'auto'` prefers the official adapter when
   `providers.youtube_api_key` is set, then uses
   `providers.invidious_base_url`.
+- The separate **YouTube Music** tab searches the public
+  `music.youtube.com` catalog through
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp), so discovery and playback do not
+  require a YouTube Data API key. Youta recursively resolves music browse
+  containers but retains only playable track-level video IDs, with strict
+  process, output, timeout, and result limits. Its query, results, and selected
+  row are saved independently from the normal YouTube and MOD/tracker tabs.
+  When an official or Invidious metadata provider is configured, it may enrich
+  the selected track with full public video details; basic music search and
+  playback remain keyless.
 - `[N] Sort: relevance/newest` changes the order and reloads the current
   YouTube search. The official adapter sends `order=date` for newest-first
   searches. Invidious currently
@@ -410,15 +436,39 @@ and rendering, and `on` attempts supported terminal artwork but still falls
 back without fetching when no supported protocol is available. Thumbnail
 height defaults to 20 rows and is reduced automatically when the Details panel
 needs space for metadata, links, or description text.
-`prefetch_search_thumbnails = false` disables background cache warming; the
-equivalent environment override is
-`YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Unsupported terminals and plain
-TTYs perform no thumbnail network work regardless of this preference. To
-exclude the renderer and its image dependencies from the binary, use
+`prefetch_search_thumbnails = false` disables background warming for global
+YouTube and YouTube Music search results; the equivalent environment override
+is `YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Previously learned channel
+artwork for local subscriptions is warmed independently, so moving between
+known channels can reuse the persistent cache without a foreground network
+request. Unsupported terminals and plain TTYs perform no thumbnail network
+work regardless of this preference. To exclude the renderer and its image
+dependencies from the binary, use
 `--no-default-features` and omit `thumbnails` from `--features`; include
 `thumbnails` explicitly in a custom feature list to restore it. The rendering
 integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
+
+## Mouse input on a Linux virtual console
+
+The default build includes the small `gpm` feature. When Youta is attached
+directly to `/dev/ttyN`, it opportunistically connects to an already-running
+[GPM](https://www.nico.schottelius.org/software/gpm/) daemon through
+`/dev/gpmctl`. Move, press, release, drag, and wheel packets use the same
+hitboxes and actions as Crossterm mouse events. The client is safe Rust, waits
+for descriptor readiness instead of polling in a loop, and does not link
+`libgpm`; therefore enabling it adds no mandatory system library or daemon
+dependency. A missing or inaccessible socket falls back silently to keyboard
+input.
+
+Youta does not open GPM from `/dev/pts/*`, so terminal emulators retain their
+normal mouse-capture behavior. `F8` provides a keyboard pointer on every
+terminal: arrow keys move its reversed cell cursor, `Enter` clicks the current
+cell, and `Esc` or `F8` exits. This remains available when GPM is not installed
+or not running. Minimal builds can omit the Linux-console client with
+`--no-default-features` or by leaving `gpm` out of their feature list. See the
+[GPM protocol definitions](https://sources.debian.org/src/gpm/1.20.7-12/src/headers/gpm.h/)
+for the control-socket contract.
 
 ## Subscriptions and local data
 
@@ -434,8 +484,11 @@ OAuth-based synchronization remains roadmap work. In Details, `[O] xdg-open`
 opens the selected YouTube channel's webpage, while lowercase `[o] Open video`
 opens the selected video's webpage.
 
-`Tab` is the global Subscriptions shortcut from every main screen and always
-returns to the subscription-source root. Youta provides two layouts:
+`Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
+cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
+aliases when the terminal reports those combinations distinctly. Uppercase
+`S` is the global Subscriptions shortcut and always returns to the
+subscription-source root. Youta provides two layouts:
 
 - `drill-down` is the default for narrow terminals. Sources appear on the
   left with channel information on the right. Press `Enter` to load the
@@ -448,18 +501,34 @@ returns to the subscription-source root. Youta provides two layouts:
   `Esc` returns to the video list.
 
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
-Drill-down or Split, and press `Enter` to save. This popup currently edits only
-the subscriptions layout; the remaining settings stay in `config.toml`. The
-same preference can be configured directly:
+Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
+skipped, choose whether Local folder sizes are measured, and press `Enter` to
+save. These preferences can be configured directly:
 
 ```toml
+[playback]
+autoplay = false
+skip_advertisement_chapters = true
+
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
+show_local_folder_sizes = true
 ```
 
-`YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` overrides the TOML value. While this
-environment variable is present, the Preferences popup shows the override and
-does not replace it in `config.toml`.
+`YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
+`YOUTA_PLAYBACK__AUTOPLAY=true` and
+`YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` override the corresponding
+TOML values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
+work, hides cached folder sizes, and removes the Local size-sort control.
+While any of these environment variables is present, the Preferences popup
+shows the override and does not partially replace its draft in `config.toml`.
+
+One Local visit schedules at most 256 folder measurements, with one request in
+flight. A folder traversal inspects at most 25,000 entries to depth 64; a
+bounded or failed traversal displays no partial value and is not retried for
+60 seconds. Later visits rotate through folders that did not fit in the first
+batch. Complete results use a 512-entry, 60-second RAM-only cache keyed by
+path and filesystem identity; it is never written to disk.
 
 Video pages are requested only after `Enter` activates the selected channel,
 so moving through a long source list cannot spend API quota. The official adapter
@@ -516,9 +585,12 @@ Useful future open/self-hosted sources include
 [ListenBrainz](https://listenbrainz.org/),
 [MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API).
 
-Tracker playback depends on
-[libopenmpt](https://lib.openmpt.org/libopenmpt/documentation/). The Mod
-Archive API key is never bundled; users request and store their own key.
+Tracker results are downloaded and inspected into Youta's bounded private
+cache before playback; compressed payloads are never passed to `yt-dlp`.
+Playback depends on
+[libopenmpt](https://lib.openmpt.org/libopenmpt/documentation/), normally
+through FFmpeg/mpv. The Mod Archive API key is never bundled; users request and
+store their own key.
 See the [tracker archive matrix](docs/FEASIBILITY.md#tracker-music) before
 enabling another catalog: several archives have no supported API, and Mirsoft
 has no HTTPS endpoint.

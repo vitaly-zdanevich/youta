@@ -3,6 +3,8 @@
 //! Youta owns the user interface. Playback engines such as mpv run without a
 //! terminal interface and are controlled through this module.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -43,6 +45,46 @@ pub enum PlaybackError {
 /// Convenient result type for playback operations.
 pub type Result<T> = std::result::Result<T, PlaybackError>;
 
+/// HTTP headers required by one short-lived resolved media URL.
+///
+/// Values are deliberately redacted from [`Debug`] output because yt-dlp may
+/// return cookies or authorization material. Controllers must keep this value
+/// in memory only and discard it with the resolved URL.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PlaybackHttpHeaders(BTreeMap<String, String>);
+
+impl PlaybackHttpHeaders {
+    /// Wraps extractor-provided headers without logging their values.
+    #[must_use]
+    pub fn new(headers: BTreeMap<String, String>) -> Self {
+        Self(headers)
+    }
+
+    /// Returns whether no additional request headers are required.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates over header names and their sensitive values.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+impl fmt::Debug for PlaybackHttpHeaders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = self.0.keys().map(String::as_str).collect::<Vec<_>>();
+        formatter
+            .debug_struct("PlaybackHttpHeaders")
+            .field("names", &names)
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A media item to load into a playback backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaybackInput {
@@ -58,6 +100,10 @@ pub struct PlaybackInput {
     /// rejects the extractor's initial URL. Normal loads keep it disabled to
     /// avoid an extra remote format check.
     pub verify_remote_format: bool,
+    /// Sensitive headers required by a freshly resolved direct media URL.
+    pub http_headers: PlaybackHttpHeaders,
+    /// Skip mpv's yt-dlp hook because [`Self::location`] is already resolved.
+    pub bypass_ytdl: bool,
 }
 
 impl PlaybackInput {
@@ -69,6 +115,8 @@ impl PlaybackInput {
             start_at: Duration::ZERO,
             title: None,
             verify_remote_format: false,
+            http_headers: PlaybackHttpHeaders::default(),
+            bypass_ytdl: false,
         }
     }
 }

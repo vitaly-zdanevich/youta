@@ -5,11 +5,12 @@
 //! progress updates do not block UI reads. SQL statements used by normal CRUD
 //! operations are prepared through rusqlite's bounded statement cache.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -18,10 +19,11 @@ use crate::domain::{
     Bookmark, CommentTarget, HistoryEntry, MediaId, MediaItem, PlaybackProgress, PrivateComment,
     SessionState, SourceKind, WikidataLink,
 };
-use crate::providers::{SearchItem, SearchRequest, SearchTarget, VideoOrientation};
+use crate::providers::{ChannelSummary, SearchItem, SearchRequest, SearchTarget, VideoOrientation};
 
 const MAX_SAVED_SEARCH_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SAVED_SEARCH_RESULTS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SAVED_MUSIC_QUERY_BYTES: usize = 512;
 
 /// Maximum number of `YouTube` summaries retained in one restart snapshot.
 ///
@@ -128,10 +130,28 @@ const MIGRATIONS: &[&str] = &[
 		updated_at INTEGER NOT NULL
 	) WITHOUT ROWID;
 	",
+    r"
+	CREATE TABLE channel_summary_cache (
+		channel_id TEXT PRIMARY KEY,
+		summary_json TEXT NOT NULL,
+		fetched_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL
+	) WITHOUT ROWID;
+	CREATE INDEX channel_summary_cache_expiry
+		ON channel_summary_cache(expires_at);
+	",
+    r"
+	CREATE TABLE youtube_music_search_state (
+		slot INTEGER PRIMARY KEY CHECK (slot = 1),
+		query TEXT NOT NULL,
+		results_json TEXT NOT NULL,
+		updated_at INTEGER NOT NULL
+	) WITHOUT ROWID;
+	",
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// One bounded `YouTube` search snapshot retained across application restarts.
 ///
@@ -146,6 +166,15 @@ pub struct SavedYouTubeSearch {
     pub results: Vec<SearchItem>,
     /// Next provider page to request when the user reaches the list boundary.
     pub next_page: Option<u32>,
+}
+
+/// One bounded `YouTube Music` search snapshot retained across restarts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedYouTubeMusicSearch {
+    /// Exact trimmed query sent to the music-search adapter.
+    pub query: String,
+    /// Playable video summaries shown in the music result list.
+    pub results: Vec<SearchItem>,
 }
 
 /// A provenance record attached to cached provider metadata.
@@ -184,6 +213,30 @@ pub struct CachedWikidataLookup {
     pub fetched_at: i64,
     /// Expiration time as Unix seconds.
     pub expires_at: i64,
+}
+
+/// Restart-safe provider metadata for one `YouTube` channel.
+///
+/// The summary remains readable after it expires so the terminal can restore
+/// channel artwork and headings without waiting for the network. Callers should
+/// use [`Self::is_fresh_at`] to decide whether to schedule a background refresh.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CachedChannelSummary {
+    /// Compact channel metadata shared by official-API and Invidious adapters.
+    pub summary: ChannelSummary,
+    /// Fetch completion time as seconds since the Unix epoch.
+    pub fetched_at: i64,
+    /// Expiration time as seconds since the Unix epoch.
+    pub expires_at: i64,
+}
+
+impl CachedChannelSummary {
+    /// Returns whether the cached summary may be reused without refreshing at
+    /// `now`.
+    #[must_use]
+    pub const fn is_fresh_at(&self, now: i64) -> bool {
+        self.expires_at > now
+    }
 }
 
 impl CachedWikidataLookup {
@@ -348,6 +401,50 @@ impl StateStore {
             )
             .optional()?;
         Ok(result)
+    }
+
+    /// Loads progress for a bounded set of provider-qualified media IDs.
+    ///
+    /// Requests are chunked below `SQLite`'s conservative bind-variable limit,
+    /// allowing directory views to hydrate all visible progress with a small
+    /// number of queries instead of one query per row. Missing IDs are omitted
+    /// from the returned map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a database row cannot be read.
+    pub fn progress_for_media_ids(
+        &self,
+        media_ids: &[MediaId],
+    ) -> Result<HashMap<MediaId, PlaybackProgress>, PersistenceError> {
+        const IDS_PER_QUERY: usize = 400;
+
+        let mut progress_by_id = HashMap::with_capacity(media_ids.len());
+        for chunk in media_ids.chunks(IDS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicates = std::iter::repeat_n("(source = ? AND external_id = ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let statement = format!(
+                "SELECT source, external_id, position_seconds, duration_seconds, \
+				 played_override, updated_at FROM playback_progress WHERE {predicates}"
+            );
+            let parameters = chunk.iter().flat_map(|media_id| {
+                [
+                    media_id.source.as_str().to_owned(),
+                    media_id.external_id.clone(),
+                ]
+            });
+            let mut query = self.connection.prepare(&statement)?;
+            let rows = query.query_map(params_from_iter(parameters), playback_progress_from_row)?;
+            for row in rows {
+                let progress = row?;
+                progress_by_id.insert(progress.media_id.clone(), progress);
+            }
+        }
+        Ok(progress_by_id)
     }
 
     /// Removes stored progress and returns whether a row existed.
@@ -873,6 +970,106 @@ impl StateStore {
             > 0)
     }
 
+    /// Replaces the restart snapshot for the latest `YouTube Music` search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query or results violate resource bounds,
+    /// contain a non-video item, cannot be encoded, or cannot be written.
+    pub fn save_youtube_music_search(
+        &self,
+        search: &SavedYouTubeMusicSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        validate_saved_youtube_music_search(search)?;
+        let results_json = serde_json::to_string(&search.results)?;
+        ensure_saved_search_json_bound(
+            "results",
+            results_json.len(),
+            MAX_SAVED_SEARCH_RESULTS_BYTES,
+        )?;
+        self.connection
+            .prepare_cached(
+                r"
+				INSERT INTO youtube_music_search_state (
+					slot, query, results_json, updated_at
+				) VALUES (1, ?1, ?2, ?3)
+				ON CONFLICT(slot) DO UPDATE SET
+					query = excluded.query,
+					results_json = excluded.results_json,
+					updated_at = excluded.updated_at
+				",
+            )?
+            .execute(params![search.query, results_json, updated_at])?;
+        Ok(())
+    }
+
+    /// Loads the bounded restart snapshot for the latest `YouTube Music` search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persisted fields exceed their limits, cannot be
+    /// decoded, contain non-video results, or cannot be read.
+    pub fn youtube_music_search(
+        &self,
+    ) -> Result<Option<SavedYouTubeMusicSearch>, PersistenceError> {
+        let lengths: Option<(i64, i64)> = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT
+					length(CAST(query AS BLOB)),
+					length(CAST(results_json AS BLOB))
+				FROM youtube_music_search_state
+				WHERE slot = 1
+				",
+            )?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((query_bytes, results_bytes)) = lengths else {
+            return Ok(None);
+        };
+        ensure_saved_search_json_bound(
+            "query",
+            usize::try_from(query_bytes).unwrap_or(usize::MAX),
+            MAX_SAVED_MUSIC_QUERY_BYTES,
+        )?;
+        ensure_saved_search_json_bound(
+            "results",
+            usize::try_from(results_bytes).unwrap_or(usize::MAX),
+            MAX_SAVED_SEARCH_RESULTS_BYTES,
+        )?;
+        let (query, results_json): (String, String) = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT query, results_json
+				FROM youtube_music_search_state
+				WHERE slot = 1
+				",
+            )?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let search = SavedYouTubeMusicSearch {
+            query,
+            results: serde_json::from_str(&results_json)?,
+        };
+        validate_saved_youtube_music_search(&search)?;
+        Ok(Some(search))
+    }
+
+    /// Removes the restart snapshot for `YouTube Music`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be removed.
+    pub fn clear_youtube_music_search(&self) -> Result<bool, PersistenceError> {
+        Ok(self
+            .connection
+            .prepare_cached("DELETE FROM youtube_music_search_state WHERE slot = 1")?
+            .execute([])?
+            > 0)
+    }
+
     /// Adds listened seconds to a source using an atomic upsert.
     ///
     /// # Errors
@@ -1041,6 +1238,93 @@ impl StateStore {
             .prepare_cached(
                 "DELETE FROM metadata_cache WHERE expires_at IS NOT NULL AND expires_at <= ?1",
             )?
+            .execute([now])?)
+    }
+
+    /// Inserts or replaces one restart-safe channel summary.
+    ///
+    /// Official-API and Invidious adapters use the same stable `YouTube`
+    /// channel identifier, so either adapter can refresh an existing row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the summary cannot be encoded or written.
+    pub fn put_cached_channel_summary(
+        &self,
+        cached: &CachedChannelSummary,
+    ) -> Result<(), PersistenceError> {
+        let summary_json = serde_json::to_string(&cached.summary)?;
+        self.connection
+            .prepare_cached(
+                r"
+				INSERT INTO channel_summary_cache (
+					channel_id, summary_json, fetched_at, expires_at
+				) VALUES (?1, ?2, ?3, ?4)
+				ON CONFLICT(channel_id) DO UPDATE SET
+					summary_json = excluded.summary_json,
+					fetched_at = excluded.fetched_at,
+					expires_at = excluded.expires_at
+				",
+            )?
+            .execute(params![
+                cached.summary.channel_id,
+                summary_json,
+                cached.fetched_at,
+                cached.expires_at,
+            ])?;
+        Ok(())
+    }
+
+    /// Loads a cached channel summary without applying its expiry policy.
+    ///
+    /// Returning stale rows is intentional: the UI can render their artwork
+    /// and headings immediately, then use [`CachedChannelSummary::is_fresh_at`]
+    /// to decide whether to refresh the entry in the background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row or summary JSON cannot be read and
+    /// decoded.
+    pub fn cached_channel_summary(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<CachedChannelSummary>, PersistenceError> {
+        type CacheColumns = (String, i64, i64);
+        let columns: Option<CacheColumns> = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT summary_json, fetched_at, expires_at
+				FROM channel_summary_cache
+				WHERE channel_id = ?1
+				",
+            )?
+            .query_row([channel_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((summary_json, fetched_at, expires_at)) = columns else {
+            return Ok(None);
+        };
+        Ok(Some(CachedChannelSummary {
+            summary: serde_json::from_str(&summary_json)?,
+            fetched_at,
+            expires_at,
+        }))
+    }
+
+    /// Deletes expired channel-summary rows and returns the number removed.
+    ///
+    /// Normal startup should not call this before hydrating visible channels,
+    /// because stale rows are useful while a background refresh is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when expired rows cannot be removed.
+    pub fn delete_expired_channel_summaries(&self, now: i64) -> Result<usize, PersistenceError> {
+        Ok(self
+            .connection
+            .prepare_cached("DELETE FROM channel_summary_cache WHERE expires_at <= ?1")?
             .execute([now])?)
     }
 
@@ -1231,6 +1515,41 @@ fn validate_saved_youtube_search(search: &SavedYouTubeSearch) -> Result<(), Pers
     Ok(())
 }
 
+fn validate_saved_youtube_music_search(
+    search: &SavedYouTubeMusicSearch,
+) -> Result<(), PersistenceError> {
+    if search.query.trim().is_empty()
+        || search.query.trim() != search.query
+        || search.query.len() > MAX_SAVED_MUSIC_QUERY_BYTES
+        || search.query.chars().any(char::is_control)
+    {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: format!(
+                "YouTube Music query must be trimmed, printable, and at most \
+                 {MAX_SAVED_MUSIC_QUERY_BYTES} bytes"
+            ),
+        });
+    }
+    if search.results.len() > MAX_SAVED_YOUTUBE_SEARCH_RESULTS {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: format!(
+                "result count {} exceeds the {MAX_SAVED_YOUTUBE_SEARCH_RESULTS}-item limit",
+                search.results.len()
+            ),
+        });
+    }
+    if search
+        .results
+        .iter()
+        .any(|item| !matches!(item, SearchItem::Video(_)))
+    {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: "YouTube Music snapshots may contain only playable videos".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn run_migrations(connection: &Connection) -> Result<(), PersistenceError> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current > SCHEMA_VERSION {
@@ -1357,7 +1676,7 @@ mod tests {
     use crate::domain::{
         MediaKind, MediaLicense, MediaStatistics, PanelFocus, Screen, SearchQuery,
     };
-    use crate::providers::{ChannelSummary, SearchSort, VideoSummary};
+    use crate::providers::{ChannelSummary, SearchSort, Thumbnail, VideoSummary};
 
     fn id(value: &str) -> MediaId {
         MediaId::new(SourceKind::YouTube, value)
@@ -1437,9 +1756,9 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v3_preserves_session_and_adds_youtube_search_state() {
+    fn migration_from_v4_preserves_session_and_adds_channel_summary_cache() {
         let connection = Connection::open_in_memory().expect("open SQLite");
-        for version in 1..=3_u32 {
+        for version in 1..=4_u32 {
             connection
                 .execute_batch(MIGRATIONS[(version - 1) as usize])
                 .expect("apply historical migration");
@@ -1466,13 +1785,68 @@ mod tests {
 				",
                 [serde_json::to_string(&session).expect("encode session")],
             )
-            .expect("seed version-three session");
+            .expect("seed version-four session");
 
         run_migrations(&connection).expect("migrate to current schema");
         let store = StateStore { connection };
-        assert_eq!(store.schema_version().expect("schema version"), 4);
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
         assert_eq!(store.session().expect("preserved session"), Some(session));
-        assert_eq!(store.youtube_search().expect("new search table"), None);
+        assert_eq!(
+            store
+                .cached_channel_summary("UCmissing")
+                .expect("new channel cache table"),
+            None
+        );
+    }
+
+    #[test]
+    fn migration_from_v5_preserves_state_and_adds_youtube_music_search() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=5_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        let session = SessionState {
+            screen: Screen::History,
+            search_text: "preserved after v5".to_owned(),
+            ..SessionState::default()
+        };
+        connection
+            .execute(
+                r"
+				INSERT INTO session_state (slot, state_json, updated_at)
+				VALUES ('active', ?1, 5)
+				",
+                [serde_json::to_string(&session).expect("encode session")],
+            )
+            .expect("seed version-five session");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.session().expect("preserved session"), Some(session));
+        assert_eq!(
+            store
+                .youtube_music_search()
+                .expect("new YouTube Music search table"),
+            None
+        );
     }
 
     #[test]
@@ -1496,6 +1870,40 @@ mod tests {
         );
         assert!(store.delete_progress(&progress.media_id).expect("delete"));
         assert_eq!(store.progress(&progress.media_id).expect("read"), None);
+    }
+
+    #[test]
+    fn bulk_progress_lookup_chunks_mixed_sources_and_omits_missing_ids() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let requested = (0..405)
+            .map(|index| {
+                MediaId::new(
+                    if index % 2 == 0 {
+                        SourceKind::Local
+                    } else {
+                        SourceKind::YouTube
+                    },
+                    format!("item-{index:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for media_id in requested.iter().step_by(3) {
+            let mut progress = PlaybackProgress::new(media_id.clone(), Some(100), 1);
+            progress.record_position(50, 2);
+            store.upsert_progress(&progress).expect("seed progress");
+        }
+        let mut with_duplicate_and_missing = requested.clone();
+        with_duplicate_and_missing.push(requested[0].clone());
+        with_duplicate_and_missing.push(MediaId::new(SourceKind::Local, "missing"));
+
+        let loaded = store
+            .progress_for_media_ids(&with_duplicate_and_missing)
+            .expect("bulk progress");
+
+        assert_eq!(loaded.len(), 135);
+        assert!(loaded.contains_key(&requested[0]));
+        assert!(!loaded.contains_key(&requested[1]));
+        assert!(!loaded.contains_key(&MediaId::new(SourceKind::Local, "missing")));
     }
 
     #[test]
@@ -1689,6 +2097,7 @@ mod tests {
                 description: "Mock channel".to_owned(),
                 subscriber_count: Some(42),
                 video_count: Some(7),
+                created_at: None,
                 auto_generated: false,
                 thumbnails: Vec::new(),
                 webpage_url: None,
@@ -1705,6 +2114,46 @@ mod tests {
         assert!(store.clear_youtube_search().expect("clear search"));
         assert!(!store.clear_youtube_search().expect("clear absent search"));
         assert_eq!(store.youtube_search().expect("empty search"), None);
+    }
+
+    #[test]
+    fn youtube_music_search_snapshot_round_trips_and_rejects_channels() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let saved = SavedYouTubeMusicSearch {
+            query: "mock ambient".to_owned(),
+            results: vec![search_video("first"), search_video("second")],
+        };
+        store
+            .save_youtube_music_search(&saved, 10)
+            .expect("save music search");
+        assert_eq!(
+            store.youtube_music_search().expect("load music search"),
+            Some(saved)
+        );
+
+        let invalid = SavedYouTubeMusicSearch {
+            query: "channel result".to_owned(),
+            results: vec![SearchItem::Channel(ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture".to_owned(),
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                created_at: None,
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: None,
+            })],
+        };
+        assert!(matches!(
+            store.save_youtube_music_search(&invalid, 20),
+            Err(PersistenceError::InvalidSavedSearch { .. })
+        ));
+        assert!(store.clear_youtube_music_search().expect("clear search"));
+        assert_eq!(
+            store.youtube_music_search().expect("empty music search"),
+            None
+        );
     }
 
     #[test]
@@ -1856,6 +2305,84 @@ mod tests {
             store
                 .cached_metadata(&cached.media.id)
                 .expect("load metadata"),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_summary_cache_survives_restart_and_retains_stale_rows() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let cached = CachedChannelSummary {
+            summary: ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture channel".to_owned(),
+                description: "Mock channel description".to_owned(),
+                subscriber_count: Some(1_850_000),
+                video_count: Some(321),
+                created_at: Some(1_100_000_000),
+                auto_generated: false,
+                thumbnails: vec![Thumbnail {
+                    url: Url::parse("https://example.test/channel-avatar.jpg")
+                        .expect("valid thumbnail URL"),
+                    quality: Some("high".to_owned()),
+                    width: Some(800),
+                    height: Some(800),
+                }],
+                webpage_url: Some(
+                    Url::parse("https://www.youtube.com/channel/UCfixture")
+                        .expect("valid channel URL"),
+                ),
+            },
+            fetched_at: 100,
+            expires_at: 200,
+        };
+
+        {
+            let store = StateStore::open(&config).expect("open initial store");
+            store
+                .put_cached_channel_summary(&cached)
+                .expect("cache channel summary");
+        }
+
+        let store = StateStore::open(&config).expect("reopen store");
+        let restored = store
+            .cached_channel_summary("UCfixture")
+            .expect("load channel summary after restart")
+            .expect("cached channel row");
+        assert_eq!(restored, cached);
+        assert!(restored.is_fresh_at(199));
+        assert!(!restored.is_fresh_at(200));
+        assert_eq!(
+            store
+                .cached_channel_summary("UCmissing")
+                .expect("load absent channel"),
+            None
+        );
+
+        let mut replacement = cached;
+        replacement.summary.subscriber_count = Some(1_900_000);
+        replacement.fetched_at = 200;
+        replacement.expires_at = 300;
+        store
+            .put_cached_channel_summary(&replacement)
+            .expect("replace channel summary");
+        assert_eq!(
+            store
+                .cached_channel_summary("UCfixture")
+                .expect("load stale channel"),
+            Some(replacement)
+        );
+        assert_eq!(
+            store
+                .delete_expired_channel_summaries(300)
+                .expect("delete expired channel"),
+            1
+        );
+        assert_eq!(
+            store
+                .cached_channel_summary("UCfixture")
+                .expect("load deleted channel"),
             None
         );
     }

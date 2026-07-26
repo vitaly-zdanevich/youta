@@ -24,6 +24,16 @@ volume_percent = 80
 speed_percent = 100
 resume_rewind_seconds = 30
 
+# Continue with the next playable item from the same YouTube, local, or
+# MOD/tracker list after explicitly queued items.
+# YOUTA_PLAYBACK__AUTOPLAY has higher precedence.
+autoplay = false
+
+# Hide seek-bar entries and automatically skip only chapters whose normalized
+# Russian title is exactly `Реклама`. Set this to false to retain and play them.
+# YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS has higher precedence.
+skip_advertisement_chapters = true
+
 [playback.audiophile]
 # These settings affect Youta/player arguments only. Youta never changes the
 # CPU governor, real-time scheduler, kernel parameters, or device permissions.
@@ -64,8 +74,17 @@ thumbnail_height = 20
 
 # Warm the persistent cache for all currently loaded global Search results in
 # one low-priority worker. The selected artwork always has queue priority.
+# Persisted artwork for local subscription channels is warmed independently to
+# make channel switching reuse cached bytes without foreground network work.
 # YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false disables this without editing TOML.
 prefetch_search_thumbnails = true
+
+# Measure complete recursive sizes for at most 256 Local folders per visit.
+# Work is asynchronous, one folder at a time, never follows symbolic links,
+# and uses a short-lived bounded RAM cache. Disable this to perform no size
+# scans and remove the Local [Z] size-sort control.
+# YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false has higher precedence.
+show_local_folder_sizes = true
 seekbar_color = 'cyan'
 nyan_cat_seekbar = false
 dos_rpg_mode = false

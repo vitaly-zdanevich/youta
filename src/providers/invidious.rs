@@ -364,6 +364,7 @@ impl InvidiousProvider {
             description: raw.description,
             subscriber_count: raw.sub_count,
             video_count: raw.video_count,
+            created_at: None,
             auto_generated: raw.auto_generated,
             thumbnails: self.convert_thumbnails(raw.author_thumbnails),
             webpage_url,
@@ -404,6 +405,7 @@ impl InvidiousProvider {
             description: raw.description,
             subscriber_count: raw.sub_count,
             video_count: None,
+            created_at: raw.joined,
             auto_generated: raw.auto_generated,
             thumbnails: self.convert_thumbnails(raw.author_thumbnails),
             webpage_url: youtube_channel_url(requested_id),
@@ -764,6 +766,8 @@ struct RawChannelDetails {
     auto_generated: bool,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     sub_count: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    joined: Option<i64>,
     #[serde(default)]
     description: String,
 }

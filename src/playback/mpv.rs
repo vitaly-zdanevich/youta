@@ -25,6 +25,8 @@ mod unix {
     const MAX_PENDING_EVENTS: usize = 32;
     const MAX_WARNING_LINES: usize = 12;
     const MAX_DIAGNOSTIC_CHARS: usize = 512;
+    const MAX_RESOLVED_HTTP_HEADERS: usize = 32;
+    const MAX_RESOLVED_HTTP_HEADER_BYTES: usize = 16 * 1024;
 
     struct MpvIpc {
         reader: BufReader<UnixStream>,
@@ -397,7 +399,17 @@ mod unix {
         (start < end).then_some(BufferedRange { start, end })
     }
 
-    fn loadfile_command(input: &PlaybackInput) -> Vec<Value> {
+    fn loadfile_command(input: &PlaybackInput) -> Result<Vec<Value>> {
+        if input.verify_remote_format && input.bypass_ytdl {
+            return Err(PlaybackError::InvalidValue(
+                "a resolved direct stream cannot request yt-dlp format verification".to_owned(),
+            ));
+        }
+        if !input.bypass_ytdl && !input.http_headers.is_empty() {
+            return Err(PlaybackError::InvalidValue(
+                "resolved HTTP headers require yt-dlp bypass".to_owned(),
+            ));
+        }
         let mut command = vec![json!("loadfile"), json!(input.location), json!("replace")];
         let mut options = serde_json::Map::new();
         if !input.start_at.is_zero() {
@@ -415,6 +427,12 @@ mod unix {
                 Value::String("check-formats=".to_owned()),
             );
         }
+        if input.bypass_ytdl {
+            options.insert("ytdl".to_owned(), Value::String("no".to_owned()));
+            if let Some(headers) = mpv_http_header_fields(input)? {
+                options.insert("http-header-fields".to_owned(), Value::String(headers));
+            }
+        }
         if !options.is_empty() {
             // mpv 0.38 and newer reserve the third optional argument for a
             // playlist insertion index. Per-file options therefore occupy the
@@ -422,7 +440,77 @@ mod unix {
             command.push(json!(-1));
             command.push(Value::Object(options));
         }
-        command
+        Ok(command)
+    }
+
+    /// Validates extractor-provided fields and encodes mpv's comma-separated
+    /// string-list syntax without exposing values in an error.
+    fn mpv_http_header_fields(input: &PlaybackInput) -> Result<Option<String>> {
+        if input.http_headers.is_empty() {
+            return Ok(None);
+        }
+        if input.http_headers.iter().len() > MAX_RESOLVED_HTTP_HEADERS {
+            return Err(PlaybackError::InvalidValue(
+                "resolved media returned too many HTTP headers".to_owned(),
+            ));
+        }
+        let mut total_bytes = 0_usize;
+        let mut fields = Vec::with_capacity(input.http_headers.iter().len());
+        for (name, value) in input.http_headers.iter() {
+            if name.is_empty()
+                || !name.bytes().all(is_http_token_byte)
+                || value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+            {
+                return Err(PlaybackError::InvalidValue(
+                    "resolved media returned an invalid HTTP header".to_owned(),
+                ));
+            }
+            total_bytes = total_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(2);
+            if total_bytes > MAX_RESOLVED_HTTP_HEADER_BYTES {
+                return Err(PlaybackError::InvalidValue(
+                    "resolved media HTTP headers exceed the in-memory limit".to_owned(),
+                ));
+            }
+            fields.push(escape_mpv_string_list_element(&format!("{name}: {value}")));
+        }
+        Ok(Some(fields.join(",")))
+    }
+
+    const fn is_http_token_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    fn escape_mpv_string_list_element(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for character in value.chars() {
+            if matches!(character, '\\' | ',') {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+        }
+        escaped
     }
 
     fn mpv_command(config: &ProcessPlaybackConfig, socket_path: &Path) -> Result<Command> {
@@ -499,7 +587,7 @@ mod unix {
                     "media location cannot be empty".to_owned(),
                 ));
             }
-            self.send(&loadfile_command(input))?;
+            self.send(&loadfile_command(input)?)?;
             Ok(())
         }
 
@@ -724,7 +812,7 @@ mod unix {
         use std::sync::mpsc;
 
         use super::*;
-        use crate::playback::AudiophilePlaybackOptions;
+        use crate::playback::{AudiophilePlaybackOptions, PlaybackHttpHeaders};
 
         fn process_config(
             profile: PlaybackProfile,
@@ -870,7 +958,7 @@ mod unix {
             let input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
 
             assert_eq!(
-                loadfile_command(&input),
+                loadfile_command(&input).expect("normal loadfile command"),
                 vec![
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
@@ -885,7 +973,7 @@ mod unix {
             input.verify_remote_format = true;
 
             assert_eq!(
-                loadfile_command(&input),
+                loadfile_command(&input).expect("verified loadfile command"),
                 vec![
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
@@ -902,7 +990,7 @@ mod unix {
             input.start_at = Duration::from_secs(30);
 
             assert_eq!(
-                loadfile_command(&input),
+                loadfile_command(&input).expect("resumed loadfile command"),
                 vec![
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
@@ -920,7 +1008,7 @@ mod unix {
             input.verify_remote_format = true;
 
             assert_eq!(
-                loadfile_command(&input),
+                loadfile_command(&input).expect("resumed verified loadfile command"),
                 vec![
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
@@ -932,6 +1020,49 @@ mod unix {
                     }),
                 ]
             );
+        }
+
+        #[test]
+        fn resolved_loadfile_bypasses_ytdl_and_escapes_sensitive_headers() {
+            let mut input = PlaybackInput::new("https://cdn.example/audio");
+            input.bypass_ytdl = true;
+            input.http_headers = PlaybackHttpHeaders::new(std::collections::BTreeMap::from([
+                ("Accept".to_owned(), "audio/webm,audio/ogg".to_owned()),
+                ("X-Path".to_owned(), r"one\two".to_owned()),
+            ]));
+
+            assert_eq!(
+                loadfile_command(&input).expect("resolved loadfile command"),
+                vec![
+                    json!("loadfile"),
+                    json!("https://cdn.example/audio"),
+                    json!("replace"),
+                    json!(-1),
+                    json!({
+                        "http-header-fields": r"Accept: audio/webm\,audio/ogg,X-Path: one\\two",
+                        "ytdl": "no",
+                    }),
+                ]
+            );
+            let debug = format!("{:?}", input.http_headers);
+            assert!(debug.contains("Accept"));
+            assert!(!debug.contains("audio/webm"));
+        }
+
+        #[test]
+        fn resolved_header_validation_rejects_injection_without_echoing_values() {
+            let secret = "secret-value\r\nX-Injected: yes";
+            let mut input = PlaybackInput::new("https://cdn.example/audio");
+            input.bypass_ytdl = true;
+            input.http_headers = PlaybackHttpHeaders::new(std::collections::BTreeMap::from([(
+                "Cookie".to_owned(),
+                secret.to_owned(),
+            )]));
+
+            let error = loadfile_command(&input).expect_err("header injection must be rejected");
+
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{input:?}").contains(secret));
         }
 
         #[test]

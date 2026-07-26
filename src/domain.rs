@@ -918,6 +918,10 @@ pub enum Screen {
     /// Search results and details.
     #[default]
     Search,
+    /// Music-focused `YouTube Music` search results and details.
+    YouTubeMusic,
+    /// Local folders and supported media files.
+    Local,
     /// Local subscription tree.
     Subscriptions,
     /// Offline media.
@@ -966,10 +970,22 @@ pub struct SessionState {
     pub selected_media: Option<MediaId>,
     /// Selected zero-based row in the active list.
     pub selected_row: usize,
+    /// Last selected row in the independent `YouTube` result list.
+    #[serde(default)]
+    pub youtube_selected_row: Option<usize>,
+    /// Last selected row in the independent `YouTube Music` result list.
+    #[serde(default)]
+    pub youtube_music_selected_row: Option<usize>,
     /// Vertical scroll offset in the details panel.
     pub details_scroll: u64,
     /// Last search text.
     pub search_text: String,
+    /// Last search text entered on the independent `YouTube Music` tab.
+    #[serde(default)]
+    pub youtube_music_search_text: String,
+    /// Last canonical folder shown by the Local screen.
+    #[serde(default)]
+    pub local_path: Option<String>,
     /// Whether the waveform replaces the normal seek bar.
     pub waveform_visible: bool,
     /// Whether chapter timestamps are omitted from seek-bar labels.

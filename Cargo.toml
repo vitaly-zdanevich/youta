@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 [features]
 default = [
     "tui",
+    "gpm",
     "thumbnails",
     "local",
     "rss",
@@ -29,6 +30,7 @@ default = [
     "jamendo",
     "soundcloud",
     "soundstream",
+    "youtube-music",
     "apple-podcasts",
     "litres",
     "sponsorblock",
@@ -42,6 +44,9 @@ default = [
 
 # User interface and playback backends.
 tui = ["dep:chrono", "dep:crossterm", "dep:ratatui", "dep:toml_edit"]
+# Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
+# This links no system GPM library and silently falls back when no daemon runs.
+gpm = ["tui", "dep:mio"]
 backend-mpv = []
 backend-native = []
 alsa = []
@@ -60,13 +65,14 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
-local = ["dep:lofty"]
+local = ["dep:lofty", "dep:trash"]
 rss = ["network", "dep:feed-rs"]
 invidious = ["network"]
 peertube = ["network"]
 vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
+youtube-music = ["yt-dlp"]
 yt-dlp = []
 sponsorblock = ["network"]
 dearrow = ["network"]
@@ -85,7 +91,14 @@ jamendo = ["network"]
 soundcloud = ["network", "yt-dlp"]
 soundstream = ["network"]
 generic-ytdlp = ["yt-dlp"]
-tracker-music = ["network", "dep:quick-xml"]
+tracker-music = [
+    "archive-zip",
+    "network",
+    "dep:delharc",
+    "dep:flate2",
+    "dep:quick-xml",
+    "dep:sha2",
+]
 lastfm = ["network"]
 discord = []
 
@@ -104,7 +117,7 @@ yandex-music = ["network"]
 vk = ["network"]
 
 # Optional archive and peer-to-peer support.
-archive-zip = []
+archive-zip = ["dep:zip"]
 archive-rar = []
 torrent = []
 
@@ -128,14 +141,19 @@ toml_edit = { version = "0.22.27", optional = true }
 url = { version = "2.5.8", features = ["serde"] }
 
 crossterm = { version = "0.29.0", optional = true }
+delharc = { version = "0.7.0", optional = true }
 feed-rs = { version = "2.4.0", optional = true }
+flate2 = { version = "1.1.9", optional = true }
 lofty = { version = "0.24.0", optional = true }
+mio = { version = "1.2.0", features = ["net", "os-ext", "os-poll"], optional = true }
+trash = { version = "5.2.5", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros"], optional = true }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"], optional = true }
 quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
 ureq = { version = "3.3.0", features = ["json"], optional = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"], optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

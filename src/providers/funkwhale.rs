@@ -281,6 +281,7 @@ impl FunkwhaleProvider {
             description: content_text(raw.description),
             subscriber_count: None,
             video_count: raw.tracks_count,
+            created_at: None,
             auto_generated: false,
             thumbnails: self.cover_thumbnails(raw.cover.as_ref()),
             webpage_url: self.local_webpage("artists", raw.id),

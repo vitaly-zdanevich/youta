@@ -142,6 +142,14 @@ its key and Cargo feature are present, then falls back to Invidious. Explicit
 shared by the TUI and CLI search paths. It does not select playback:
 `yt-dlp` resolution and `mpv` playback remain separate workers.
 
+YouTube Music discovery is a separate provider route and persistent result
+snapshot. It invokes the configured `yt-dlp` executable on the public
+`music.youtube.com` search page from the blocking provider worker, recursively
+resolves browse containers, and accepts only playable YouTube video leaves.
+The child process, retained output, metadata fields, timeout, and result count
+are bounded. This route needs no Data API key and never overwrites the normal
+YouTube or MOD/tracker query, rows, or selection.
+
 Jamendo uses its fixed HTTPS v3 tracks endpoint rather than a configurable
 mirror or page extractor. The adapter sends only the user's application client
 ID, bounds every blocking response, and validates page, artwork, stream, and
@@ -231,10 +239,12 @@ The TUI reducer owns two subscription layouts over the same state:
 - drill-down starts with sources and enters one source's list-and-Details view;
 - split retains the source list while showing the selected source's videos.
 
-`Tab` resets either layout to the source root from any main screen. The
-Preferences popup changes `ui.subscriptions_layout`; the environment override
-`YOUTA_UI__SUBSCRIPTIONS_LAYOUT` has higher precedence and prevents an in-app
-save until it is removed. The targeted configuration writer preserves
+Uppercase `S` resets either layout to the source root from any main screen;
+`Tab` and `Shift+Tab` cycle the enabled top-level screens. The
+Preferences popup changes `ui.subscriptions_layout` together with
+`playback.skip_advertisement_chapters`; their `YOUTA_` environment overrides
+have higher precedence and prevent a partial in-app save until removed. The
+targeted configuration writer updates both tables atomically and preserves
 unrelated TOML content instead of serializing secret-bearing configuration
 state again.
 
@@ -355,6 +365,13 @@ Mouse regions are derived from the same layout rectangles used to render
 widgets, avoiding invisible or stale click targets. Every mouse action has a
 keyboard equivalent. Buttons can include their hotkey, and `?` opens the
 context-sensitive help layer.
+
+On a real Linux `/dev/ttyN`, the optional `gpm` feature registers both standard
+input and `/dev/gpmctl` with one readiness poll. Native-endian GPM packets are
+decoded in safe Rust and converted into the same mouse-event path as terminal
+emulator reporting. PTYs never open GPM. Socket absence or disconnect is a
+silent capability loss, and the `F8` keyboard pointer continues to drive the
+rendered hit map without a daemon.
 
 Waveform rendering is a separate library-shaped module (**roadmap**). It
 produces a resolution-independent peak envelope cached by media fingerprint,

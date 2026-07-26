@@ -1157,6 +1157,10 @@ fn video_summary_from_resource(raw: RawVideoResource) -> Result<VideoSummary, Pr
 }
 
 fn channel_summary_from_search(channel_id: String, snippet: RawSnippet) -> ChannelSummary {
+    let created_at = snippet
+        .published_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch);
     ChannelSummary {
         webpage_url: youtube_channel_url(&channel_id),
         channel_id,
@@ -1164,6 +1168,7 @@ fn channel_summary_from_search(channel_id: String, snippet: RawSnippet) -> Chann
         description: snippet.description,
         subscriber_count: None,
         video_count: None,
+        created_at,
         auto_generated: false,
         thumbnails: convert_thumbnails(snippet.thumbnails),
     }
@@ -1176,6 +1181,11 @@ fn channel_summary_from_resource(raw: RawChannelResource) -> Result<ChannelSumma
             "channel title cannot be empty".to_owned(),
         ));
     }
+    let created_at = raw
+        .snippet
+        .published_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch);
     Ok(ChannelSummary {
         webpage_url: youtube_channel_url(&raw.id),
         channel_id: raw.id,
@@ -1185,6 +1195,7 @@ fn channel_summary_from_resource(raw: RawChannelResource) -> Result<ChannelSumma
             .then_some(raw.statistics.subscriber_count)
             .flatten(),
         video_count: raw.statistics.video_count,
+        created_at,
         auto_generated: false,
         thumbnails: convert_thumbnails(raw.snippet.thumbnails),
     })

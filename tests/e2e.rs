@@ -338,7 +338,7 @@ fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
         &opened_links,
         None,
         &[
-            (b"\t", 300),
+            (b"S", 300),
             (b"O", 300),
             (b"p", 300),
             (b"s", 200),

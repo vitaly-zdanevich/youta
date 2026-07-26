@@ -1,16 +1,20 @@
 //! Application controller connecting providers, persistence, playback, and TUI.
 //!
-//! Network requests run on one blocking worker thread. The terminal event loop
-//! therefore never waits for a provider response, while the process avoids an
-//! asynchronous runtime and its additional idle bookkeeping.
+//! Network requests run on one blocking worker thread. Local directory listing
+//! uses a separate worker so recursive size scans and remote requests cannot
+//! delay foreground folder navigation. The terminal event loop therefore never
+//! waits for either class of response, while the process avoids an asynchronous
+//! runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 #[cfg(feature = "yt-dlp")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +22,8 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 
 use crate::config::{
-    Config, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, YouTubeBackend, YouTubeProviderSetting,
+    Config, LOCAL_FOLDER_SIZES_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
+    SubscriptionsLayout, YouTubeBackend, YouTubeProviderSetting,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 use crate::domain::{
@@ -27,11 +32,14 @@ use crate::domain::{
     SourceKind,
 };
 use crate::links::{
-    LinkTarget, normalize_description_chapter_lines, parse_description_chapters,
-    parse_description_links, parse_youtube_url,
+    LinkTarget, is_advertisement_chapter_title, normalize_description_chapter_lines,
+    parse_description_chapters, parse_description_links, parse_description_video_links,
+    parse_youtube_url,
 };
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
+#[cfg(feature = "youtube-music")]
+use crate::persistence::SavedYouTubeMusicSearch;
 use crate::persistence::{MAX_SAVED_YOUTUBE_SEARCH_RESULTS, SavedYouTubeSearch, StateStore};
 #[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
@@ -40,6 +48,10 @@ use crate::playback::ytdlp::{
 use crate::playback::{
     PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent, PlaybackInput,
     PlaybackStatus, PlayerCommand, Result as PlaybackResult,
+};
+#[cfg(feature = "youtube-music")]
+use crate::providers::youtube_music::{
+    YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
 };
 use crate::providers::{
     ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest, Provider,
@@ -56,12 +68,12 @@ use crate::tui::DetailLinkView;
 #[cfg(feature = "yt-dlp")]
 use crate::tui::DownloadView;
 use crate::tui::{
-    DetailTimecodeView, DetailView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll,
-    ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL,
-    MAX_DETAILS_SELECTION_BYTES, PreferencesPopupView, RightPanelMode, RowView, Screen,
-    SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
-    ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
+    DetailTimecodeView, DetailVideoLinkView, DetailView, DetailsScroll, DetailsTextSelection,
+    ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL,
+    LocalFilePopupView, LocalSizeSort, MAX_DETAILS_SELECTION_BYTES, PreferencesPopupView,
+    RightPanelMode, RowView, Screen, SearchActivity, SearchKind, SubscriptionPane,
+    SubscriptionRoute, UiAction, UiController, ViewModel, YOUTUBE_API_KEY_GUIDE_URL,
+    YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
 
 /// Truncates a clipboard payload without splitting a UTF-8 character.
@@ -132,6 +144,8 @@ impl DiagnosticActionHandler for SystemReportActions {
 pub enum SearchRoute {
     /// The normal search screen queries only the configured YouTube provider.
     YouTube,
+    /// The music tab queries `music.youtube.com` through the installed `yt-dlp`.
+    YouTubeMusic,
     /// The dedicated tracker screen queries only module archives.
     TrackerArchives,
     /// The screen does not perform remote search.
@@ -289,8 +303,40 @@ struct TrackerItem {
     title: String,
     subtitle: String,
     webpage_url: url::Url,
-    playback_url: Option<url::Url>,
+    #[cfg_attr(
+        not(feature = "tracker-music"),
+        allow(
+            dead_code,
+            reason = "remote preparation is unavailable without tracker-music"
+        )
+    )]
+    download_url: Option<url::Url>,
+    #[cfg_attr(
+        not(feature = "tracker-music"),
+        allow(
+            dead_code,
+            reason = "format hints are consumed only by tracker preparation"
+        )
+    )]
+    expected_format: Option<String>,
+    access: TrackerAccess,
+    prepared_path: Option<PathBuf>,
     insecure_transport: bool,
+}
+
+#[cfg_attr(
+    not(feature = "tracker-music"),
+    allow(
+        dead_code,
+        reason = "tracker result access kinds are constructed by tracker providers"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackerAccess {
+    DirectModule,
+    ArchiveNeedsInspection,
+    MetadataOnly,
+    Directory,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +345,10 @@ struct LocalMediaItem {
     title: String,
     artist: Option<String>,
     album: Option<String>,
+    genre: Option<String>,
+    comment: Option<String>,
+    metadata_url: Option<String>,
+    acoustid_id: Option<String>,
     duration_seconds: Option<u64>,
     size_bytes: u64,
     codec: String,
@@ -306,6 +356,45 @@ struct LocalMediaItem {
     sample_rate_hz: Option<u32>,
     channels: Option<u8>,
     embedded_artwork: bool,
+}
+
+/// One process-local folder-size result valid only for its Local generation.
+#[derive(Clone, Debug)]
+struct CachedLocalFolderSize {
+    /// Filesystem identity preventing a result from surviving path replacement.
+    identity: crate::local_browser::LocalDirectoryIdentity,
+    /// Complete recursive logical size.
+    bytes: u64,
+    /// Time of the last complete traversal; cached validation does not renew it.
+    measured_at: Instant,
+    /// Local generation in which a background identity check last succeeded.
+    validated_generation: u64,
+}
+
+/// One bounded negative cache entry suppressing repeated failed traversals.
+struct CachedLocalFolderSizeFailure {
+    /// Directory identity from the listing that scheduled the failed work.
+    identity: Option<crate::local_browser::LocalDirectoryIdentity>,
+    /// Time after which the directory may be attempted again.
+    failed_at: Instant,
+}
+
+/// Background result distinguishing a traversal from cheap cache validation.
+struct LocalFolderSizeWorkerResult {
+    /// Complete size and stable real-directory identity.
+    measurement: crate::local_browser::LocalFolderSizeMeasurement,
+    /// Whether the worker reused a cached traversal after checking identity.
+    reused: bool,
+}
+
+/// Lazy artwork lookup selected for one Local Details target.
+#[cfg(all(feature = "local", feature = "thumbnails"))]
+#[derive(Clone, Copy)]
+enum LocalArtworkKind {
+    /// Extracts bounded embedded artwork from a playable media file.
+    EmbeddedMedia,
+    /// Discovers a conventional cover file without opening image contents.
+    FolderCover,
 }
 
 /// Parses a bare YouTube ID or an official YouTube video URL.
@@ -508,8 +597,10 @@ fn is_supported_media_path(path: &str) -> bool {
 pub const fn search_route(screen: Screen) -> SearchRoute {
     match screen {
         Screen::Search => SearchRoute::YouTube,
+        Screen::YouTubeMusic => SearchRoute::YouTubeMusic,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
         Screen::Subscriptions
+        | Screen::Local
         | Screen::Downloaded
         | Screen::History
         | Screen::Playlists
@@ -524,6 +615,11 @@ enum ProviderRequest {
     Search {
         generation: u64,
         request: SearchRequest,
+    },
+    #[cfg(feature = "youtube-music")]
+    YouTubeMusicSearch {
+        generation: u64,
+        query: String,
     },
     ChannelVideos {
         generation: u64,
@@ -554,9 +650,28 @@ enum ProviderRequest {
         generation: u64,
         query: String,
     },
+    #[cfg(feature = "tracker-music")]
+    PrepareTracker {
+        generation: u64,
+        item_key: String,
+        request: crate::tracker_media::TrackerMediaRequest,
+    },
     ScanLocal {
         generation: u64,
         root: PathBuf,
+    },
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    LocalArtwork {
+        generation: u64,
+        path: PathBuf,
+        cache_directory: PathBuf,
+        kind: LocalArtworkKind,
+    },
+    LocalFolderSize {
+        generation: u64,
+        path: PathBuf,
+        cancellation: Arc<AtomicU64>,
+        cached: Option<crate::local_browser::LocalFolderSizeMeasurement>,
     },
     #[cfg(feature = "wikidata")]
     Wikidata {
@@ -572,6 +687,12 @@ enum ProviderResponse {
         generation: u64,
         request: SearchRequest,
         result: Result<SearchPage, String>,
+    },
+    #[cfg(feature = "youtube-music")]
+    YouTubeMusicSearch {
+        generation: u64,
+        query: String,
+        result: Result<Vec<YouTubeMusicTrack>, String>,
     },
     ChannelVideos {
         generation: u64,
@@ -610,10 +731,27 @@ enum ProviderResponse {
     TrackerComplete {
         generation: u64,
     },
+    #[cfg(feature = "tracker-music")]
+    TrackerPrepared {
+        generation: u64,
+        item_key: String,
+        result: Result<Vec<crate::tracker_media::PreparedTrackerModule>, String>,
+    },
     LocalScan {
         generation: u64,
         root: PathBuf,
         result: Result<Vec<LocalMediaItem>, String>,
+    },
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    LocalArtwork {
+        generation: u64,
+        path: PathBuf,
+        result: Result<Option<url::Url>, String>,
+    },
+    LocalFolderSize {
+        generation: u64,
+        path: PathBuf,
+        result: Result<LocalFolderSizeWorkerResult, String>,
     },
     #[cfg(feature = "wikidata")]
     Wikidata {
@@ -622,6 +760,26 @@ enum ProviderResponse {
         external_id: String,
         result: Result<Vec<crate::domain::WikidataLink>, String>,
     },
+}
+
+/// One foreground directory-listing command for the isolated Local worker.
+enum LocalBrowseRequest {
+    /// Reads a bounded directory snapshot and optionally retains one child.
+    Browse {
+        generation: u64,
+        directory: PathBuf,
+        preferred_child: Option<PathBuf>,
+    },
+    /// Stops the isolated worker after queued listing work completes.
+    Shutdown,
+}
+
+/// One directory-listing result returned by the isolated Local worker.
+struct LocalBrowseResponse {
+    /// Route generation that owns the result.
+    generation: u64,
+    /// Bounded listing or a user-facing filesystem error.
+    result: Result<crate::local_browser::LocalDirectoryListing, String>,
 }
 
 #[cfg(feature = "yt-dlp")]
@@ -917,6 +1075,70 @@ enum PlaybackPhase {
     Playing,
 }
 
+/// Stable position in a same-source list used for automatic continuation.
+///
+/// Keeping an index avoids confusing duplicate media identifiers, which are
+/// possible when one tracker archive expands into several module files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutoplayOrigin {
+    YouTube {
+        generation: u64,
+        index: usize,
+    },
+    YouTubeMusic {
+        generation: u64,
+        index: usize,
+    },
+    Subscription {
+        channel_id: String,
+        index: usize,
+    },
+    LocalBrowser {
+        directory: PathBuf,
+        entries: Arc<[PathBuf]>,
+        index: usize,
+    },
+    LocalScan {
+        generation: u64,
+        index: usize,
+    },
+    Tracker {
+        generation: u64,
+        index: usize,
+    },
+}
+
+/// One bounded action selected after an autoplay-owned item reaches EOF.
+enum AutoplayStep {
+    Play {
+        item: Box<QueueItem>,
+        origin: AutoplayOrigin,
+    },
+    #[cfg(feature = "tracker-music")]
+    PrepareTracker {
+        index: usize,
+        origin: AutoplayOrigin,
+    },
+    SourceChanged,
+    Exhausted,
+}
+
+#[cfg(feature = "tracker-music")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TrackerPreparationOwner {
+    Manual,
+    Autoplay(AutoplayOrigin),
+    CanceledAutoplay,
+}
+
+#[cfg(feature = "tracker-music")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTrackerPreparation {
+    generation: u64,
+    item_key: String,
+    owner: TrackerPreparationOwner,
+}
+
 /// Maximum channel collections retained by the process-local LRU cache.
 const MAX_CACHED_SUBSCRIPTION_CHANNELS: usize = 24;
 /// Maximum playable summaries retained for one subscribed channel.
@@ -935,6 +1157,22 @@ const MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES: u32 = 3;
 const CHANNEL_DETAILS_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Maximum compact channel records retained by the process.
 const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
+/// Provider channel metadata remains fresh for seven days, but stale artwork
+/// is still rendered immediately while a background refresh runs.
+const CHANNEL_DETAILS_CACHE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Maximum directory measurements scheduled from one Local listing.
+const MAX_LAZY_LOCAL_FOLDER_SIZES: usize = 256;
+/// Maximum completed directory sizes retained across Local navigation.
+const MAX_CACHED_LOCAL_FOLDER_SIZES: usize = 512;
+/// Maximum positive or negative embedded-artwork lookups retained in RAM.
+#[cfg(all(feature = "local", feature = "thumbnails"))]
+const MAX_CACHED_LOCAL_ARTWORK: usize = 256;
+/// Maximum time a traversal can be reused when nested changes may be invisible.
+const LOCAL_FOLDER_SIZE_CACHE_TTL: Duration = Duration::from_mins(1);
+/// Retry delay for inaccessible or resource-limited directory trees.
+const LOCAL_FOLDER_SIZE_FAILURE_TTL: Duration = Duration::from_mins(1);
+/// Maximum listing cursors retained to rotate bounded measurement batches.
+const MAX_LOCAL_FOLDER_SIZE_BATCH_CURSORS: usize = 64;
 
 /// Bounded, non-persistent channel collection and its next sequential page.
 #[derive(Clone, Debug, Default)]
@@ -968,15 +1206,105 @@ struct ScheduledChannelDetails {
     due_at: Instant,
 }
 
+/// Maximum number of internal Details pages retained in either direction.
+const MAX_DETAIL_NAVIGATION_HISTORY: usize = 16;
+/// Stable marker for a linked video whose provider details are still pending.
+const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video…";
+/// Stable marker rendered below the pending linked-video title.
+const LINKED_VIDEO_LOADING_DESCRIPTION: &str = "Loading video details…";
+
+/// `YouTube` video currently displayed independently of the left-hand list.
+#[derive(Debug, Eq, PartialEq)]
+struct ActiveDescriptionVideo {
+    video_id: String,
+    start_seconds: Option<u64>,
+}
+
+/// One bounded, move-only browser-style Details location.
+///
+/// Large description strings move between the current view and the two
+/// history deques. They are never cloned when navigating.
+#[derive(Debug)]
+struct DetailNavigationSnapshot {
+    screen: Screen,
+    selected: usize,
+    subscription_route: SubscriptionRoute,
+    subscription_focus: SubscriptionPane,
+    subscription_selected_source: usize,
+    subscription_selected_item: usize,
+    subscription_description_expanded: bool,
+    details: Option<DetailView>,
+    previous_detail: Option<DetailView>,
+    details_scroll: usize,
+    details_focused: bool,
+    text_selection_mode: bool,
+    details_text_selection: Option<DetailsTextSelection>,
+    selected_detail_link: Option<usize>,
+    right_panel_mode: RightPanelMode,
+    active_description_video: Option<ActiveDescriptionVideo>,
+}
+
 /// Default application state used by the interactive terminal.
 pub struct AppController {
     config: Config,
     store: StateStore,
     view: ViewModel,
+    /// Query retained independently for the YouTube tab.
+    youtube_search_query: String,
+    /// Selected YouTube row retained while another tab is visible.
+    youtube_selected: usize,
+    /// Query retained independently for the `YouTube Music` tab.
+    youtube_music_search_query: String,
+    /// Selected `YouTube Music` row retained while another tab is visible.
+    youtube_music_selected: usize,
+    /// Query retained independently for the tracker-archive tab.
+    tracker_search_query: String,
+    /// Selected tracker row retained while another tab is visible.
+    tracker_selected: usize,
     youtube_results: Vec<SearchItem>,
+    /// Track summaries returned by the independent `YouTube Music` search.
+    youtube_music_results: Vec<SearchItem>,
     direct_item: Option<DirectSourceInput>,
     resolved_direct: Option<ResolvedDirectMedia>,
     local_results: Vec<LocalMediaItem>,
+    /// Current bounded, non-recursive directory snapshot for the Local tab.
+    local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// Watched percentages hydrated once for the current Local listing.
+    local_progress_cache: HashMap<MediaId, u8>,
+    /// Generation rejecting directory responses for an older Local route.
+    local_generation: u64,
+    /// Shared cancellation generation checked during recursive folder walks.
+    local_folder_size_generation: Arc<AtomicU64>,
+    /// Complete RAM-only sizes for real directories in the current listing.
+    local_folder_size_cache: HashMap<PathBuf, CachedLocalFolderSize>,
+    /// Least-recently-validated order for bounded folder-size eviction.
+    local_folder_size_cache_order: VecDeque<PathBuf>,
+    /// Bounded failures preventing repeated scans of unavailable folders.
+    local_folder_size_failures: HashMap<PathBuf, CachedLocalFolderSizeFailure>,
+    /// Least-recent failure order for bounded negative-cache eviction.
+    local_folder_size_failure_order: VecDeque<PathBuf>,
+    /// Next directory index for each recently visited listing's bounded batch.
+    local_folder_size_batch_cursors: HashMap<PathBuf, usize>,
+    /// Least-recent listing order for bounded cursor eviction.
+    local_folder_size_batch_cursor_order: VecDeque<PathBuf>,
+    /// Bounded current-listing directories awaiting lazy measurement.
+    local_folder_size_queue: VecDeque<PathBuf>,
+    /// The sole directory currently owned by the provider worker.
+    local_folder_size_pending: Option<PathBuf>,
+    /// Child path reselected after an asynchronous move to its parent.
+    pending_local_reselection: Option<(u64, PathBuf)>,
+    /// Monotonic owner for the sole embedded-artwork extraction request.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    local_artwork_generation: u64,
+    /// Media path currently being inspected by the provider worker.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    pending_local_artwork: Option<(u64, PathBuf)>,
+    /// Process-local positive and negative artwork results by exact path.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    local_artwork_cache: HashMap<PathBuf, Option<url::Url>>,
+    /// Insertion order bounding the process-local artwork result cache.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    local_artwork_cache_order: VecDeque<PathBuf>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
     /// Current OPML leaves in stable folder order.
@@ -996,13 +1324,23 @@ pub struct AppController {
     provider_requests: Option<Sender<ProviderRequest>>,
     provider_responses: Receiver<ProviderResponse>,
     provider_thread: Option<JoinHandle<()>>,
+    /// Foreground Local listings isolated from recursive and remote work.
+    local_browse_requests: Option<Sender<LocalBrowseRequest>>,
+    /// Completed foreground Local listings from the isolated worker.
+    local_browse_responses: Receiver<LocalBrowseResponse>,
+    /// Dedicated worker ensuring Local listings do not wait behind scans.
+    local_browse_thread: Option<JoinHandle<()>>,
     provider_disconnect_reported: bool,
+    /// Prevents repeated diagnostics after the Local worker disconnects.
+    local_browse_disconnect_reported: bool,
     youtube_channel_statistics_mode: ChannelStatisticsMode,
     youtube_provider_generation: u64,
     channel_subscriber_cache: HashMap<String, Option<u64>>,
     pending_channel_subscribers: HashSet<String>,
     /// Compact positive and negative channel metadata cached for this process.
     channel_details_cache: HashMap<String, Option<ChannelSummary>>,
+    /// Expiration timestamps for positive RAM entries hydrated from SQLite.
+    channel_details_fresh_until: HashMap<String, i64>,
     /// Least-recently-used order for compact channel metadata.
     channel_details_cache_order: VecDeque<String>,
     /// Channel identifiers currently owned by the provider worker.
@@ -1028,10 +1366,26 @@ pub struct AppController {
     pending_history: Option<HistoryEntry>,
     ignore_replaced_stop: bool,
     checked_format_retry_for: Option<MediaId>,
+    /// Advertisement chapter most recently skipped while backend status catches up.
+    skipped_advertisement_chapter: Option<(MediaId, u64)>,
     current_media: Option<MediaId>,
+    /// Same-source position owning the active queue item.
+    current_autoplay_origin: Option<AutoplayOrigin>,
+    /// Same-source position resumed after explicit queued items finish.
+    queued_autoplay_resume_origin: Option<AutoplayOrigin>,
+    /// Sole tracker preparation request and the action allowed on completion.
+    #[cfg(feature = "tracker-music")]
+    pending_tracker_preparation: Option<PendingTrackerPreparation>,
     selected_start_override: Option<u64>,
+    youtube_music_start_override: Option<u64>,
     seek_back: VecDeque<(MediaId, Duration)>,
     previous_detail: Option<DetailView>,
+    /// Internal Details pages behind the current description link.
+    detail_navigation_back: VecDeque<DetailNavigationSnapshot>,
+    /// Internal Details pages available after going back.
+    detail_navigation_forward: VecDeque<DetailNavigationSnapshot>,
+    /// Linked video whose provider response owns the current Details panel.
+    active_description_video: Option<ActiveDescriptionVideo>,
     last_position_save: Instant,
     last_session_save: Instant,
     last_tick: Instant,
@@ -1066,9 +1420,14 @@ impl AppController {
         };
         let (response_sender, provider_responses) = unbounded();
         let (request_sender, request_receiver) = unbounded();
+        let (local_browse_response_sender, local_browse_responses) = unbounded();
+        let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
+        #[cfg(feature = "youtube-music")]
+        let youtube_music_executable = config.providers.yt_dlp_executable.clone();
+        let provider_storage_root = config.config_dir().to_owned();
         let provider_thread_result = thread::Builder::new()
             .name("youta-provider-worker".to_owned())
             .spawn(move || {
@@ -1079,6 +1438,9 @@ impl AppController {
                     allow_insecure_http,
                     mod_archive_api_key,
                     jamendo_client_id,
+                    #[cfg(feature = "youtube-music")]
+                    youtube_music_executable,
+                    provider_storage_root,
                 );
             });
         let (provider_thread, provider_thread_error) = match provider_thread_result {
@@ -1086,6 +1448,18 @@ impl AppController {
             Err(error) => (None, Some(error)),
         };
         let provider_requests = provider_thread.as_ref().map(|_| request_sender);
+        let local_browse_thread_result = thread::Builder::new()
+            .name("youta-local-browser".to_owned())
+            .spawn(move || {
+                local_browse_worker(local_browse_request_receiver, local_browse_response_sender);
+            });
+        let (local_browse_thread, local_browse_thread_error) = match local_browse_thread_result {
+            Ok(handle) => (Some(handle), None),
+            Err(error) => (None, Some(error)),
+        };
+        let local_browse_requests = local_browse_thread
+            .as_ref()
+            .map(|_| local_browse_request_sender);
 
         let (saved, session_restore_error) = match store.session() {
             Ok(saved) => (saved.unwrap_or_default(), None),
@@ -1095,9 +1469,18 @@ impl AppController {
             Ok(saved) => (saved, None),
             Err(error) => (None, Some(error)),
         };
+        let (saved_music_search, music_search_restore_error) = match store.youtube_music_search() {
+            Ok(saved) => (saved, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut view = ViewModel {
             screen: tui_screen_from_stored(&saved.screen),
-            search_query: saved.search_text,
+            local_path: saved.local_path.clone().unwrap_or_default(),
+            search_query: if matches!(saved.screen, StoredScreen::YouTubeMusic) {
+                saved.youtube_music_search_text.clone()
+            } else {
+                saved.search_text.clone()
+            },
             selected: saved.selected_row,
             details_focused: saved.focus == PanelFocus::Right,
             details_scroll: usize::try_from(saved.details_scroll).unwrap_or(usize::MAX),
@@ -1111,7 +1494,9 @@ impl AppController {
         };
         view.subscriptions.layout = config.ui.subscriptions_layout;
         if let Some(search) = saved_search.as_ref() {
-            view.search_query.clone_from(&search.request.query);
+            if view.screen == Screen::Search {
+                view.search_query.clone_from(&search.request.query);
+            }
             view.search_kind = match search.request.target {
                 SearchTarget::Videos => SearchKind::Videos,
                 SearchTarget::Channels => SearchKind::Channels,
@@ -1128,8 +1513,16 @@ impl AppController {
                 .features
                 .contains(&SearchFeature::CreativeCommons);
         }
+        if view.screen == Screen::YouTubeMusic
+            && let Some(search) = saved_music_search.as_ref()
+        {
+            view.search_query.clone_from(&search.query);
+        }
         view.playback.volume = config.playback.volume_percent;
         view.playback.speed = f64::from(config.playback.speed_percent) / 100.0;
+        view.skip_advertisement_chapters = config.playback.skip_advertisement_chapters;
+        view.autoplay = config.playback.autoplay;
+        view.local_folder_sizes_enabled = config.ui.show_local_folder_sizes;
         view.status_line = if youtube_provider_available {
             "Default search: YouTube videos only".to_owned()
         } else {
@@ -1155,14 +1548,76 @@ impl AppController {
             }
         }
 
+        let youtube_search_query = saved.search_text.clone();
+        let youtube_selected = saved.youtube_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::Search {
+                view.selected
+            } else {
+                0
+            }
+        });
+        let youtube_music_search_query = saved.youtube_music_search_text.clone();
+        let (youtube_music_search_query, mut youtube_music_results) = saved_music_search
+            .map_or_else(
+                || (youtube_music_search_query, Vec::new()),
+                |search| (search.query, search.results),
+            );
+        for item in &mut youtube_music_results {
+            if let SearchItem::Video(video) = item {
+                video.stream_url = None;
+            }
+        }
+        let youtube_music_selected = saved.youtube_music_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::YouTubeMusic {
+                view.selected
+            } else {
+                0
+            }
+        });
+        let tracker_selected = if view.screen == Screen::TrackerMusic {
+            view.selected
+        } else {
+            0
+        };
+        if view.screen == Screen::TrackerMusic {
+            view.search_query.clear();
+        }
         let mut controller = Self {
             config,
             store,
             view,
+            youtube_search_query,
+            youtube_selected,
+            youtube_music_search_query,
+            youtube_music_selected,
+            tracker_search_query: String::new(),
+            tracker_selected,
             youtube_results,
+            youtube_music_results,
             direct_item: None,
             resolved_direct: None,
             local_results: Vec::new(),
+            local_listing: None,
+            local_progress_cache: HashMap::new(),
+            local_generation: 0,
+            local_folder_size_generation: Arc::new(AtomicU64::new(0)),
+            local_folder_size_cache: HashMap::new(),
+            local_folder_size_cache_order: VecDeque::new(),
+            local_folder_size_failures: HashMap::new(),
+            local_folder_size_failure_order: VecDeque::new(),
+            local_folder_size_batch_cursors: HashMap::new(),
+            local_folder_size_batch_cursor_order: VecDeque::new(),
+            local_folder_size_queue: VecDeque::new(),
+            local_folder_size_pending: None,
+            pending_local_reselection: None,
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            local_artwork_generation: 0,
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            pending_local_artwork: None,
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            local_artwork_cache: HashMap::new(),
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            local_artwork_cache_order: VecDeque::new(),
             tracker_results: Vec::new(),
             subscription_tree,
             subscription_entries: Vec::new(),
@@ -1180,12 +1635,17 @@ impl AppController {
             provider_requests,
             provider_responses,
             provider_thread,
+            local_browse_requests,
+            local_browse_responses,
+            local_browse_thread,
             provider_disconnect_reported: false,
+            local_browse_disconnect_reported: false,
             youtube_channel_statistics_mode,
             youtube_provider_generation: 0,
             channel_subscriber_cache: HashMap::new(),
             pending_channel_subscribers: HashSet::new(),
             channel_details_cache: HashMap::new(),
+            channel_details_fresh_until: HashMap::new(),
             channel_details_cache_order: VecDeque::new(),
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
@@ -1207,10 +1667,19 @@ impl AppController {
             pending_history: None,
             ignore_replaced_stop: false,
             checked_format_retry_for: None,
+            skipped_advertisement_chapter: None,
             current_media: saved.selected_media,
+            current_autoplay_origin: None,
+            queued_autoplay_resume_origin: None,
+            #[cfg(feature = "tracker-music")]
+            pending_tracker_preparation: None,
             selected_start_override: None,
+            youtube_music_start_override: None,
             seek_back: VecDeque::new(),
             previous_detail: None,
+            detail_navigation_back: VecDeque::new(),
+            detail_navigation_forward: VecDeque::new(),
+            active_description_video: None,
             last_position_save: Instant::now(),
             last_session_save: Instant::now(),
             last_tick: Instant::now(),
@@ -1233,6 +1702,20 @@ impl AppController {
                     "s"
                 }
             );
+        } else if controller.view.screen == Screen::YouTubeMusic
+            && !controller.youtube_music_results.is_empty()
+        {
+            controller.refresh_youtube_music_rows();
+            controller.request_selected_details();
+            controller.view.status_line = format!(
+                "{} saved YouTube Music track{} restored",
+                controller.youtube_music_results.len(),
+                if controller.youtube_music_results.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
         }
         if let Some(error) = subscription_load_error {
             controller.show_error("Could not restore local subscriptions", &error);
@@ -1243,8 +1726,17 @@ impl AppController {
         if let Some(error) = search_restore_error {
             controller.show_error("Could not restore the previous YouTube search", &error);
         }
+        if let Some(error) = music_search_restore_error {
+            controller.show_error(
+                "Could not restore the previous YouTube Music search",
+                &error,
+            );
+        }
         if let Some(error) = provider_thread_error {
             controller.show_error("Could not start the provider worker", &error);
+        }
+        if let Some(error) = local_browse_thread_error {
+            controller.show_error("Could not start the Local browser worker", &error);
         }
         controller
     }
@@ -1267,10 +1759,33 @@ impl AppController {
         true
     }
 
+    /// Sends one foreground directory listing to its isolated worker.
+    fn send_local_browse_request(&mut self, request: LocalBrowseRequest, operation: &str) -> bool {
+        let Some(sender) = &self.local_browse_requests else {
+            self.show_error_message(
+                operation,
+                "the Local browser worker is unavailable; it may have failed during startup",
+            );
+            return false;
+        };
+        if sender.send(request).is_err() {
+            self.show_error_message(
+                operation,
+                "the Local browser worker stopped before accepting the request",
+            );
+            return false;
+        }
+        true
+    }
+
     /// Invalidates responses from an older input route and stops its animation.
     fn supersede_search_generation(&mut self) {
         self.search_generation = self.search_generation.wrapping_add(1);
         self.clear_search_activity();
+        #[cfg(feature = "tracker-music")]
+        if self.pending_tracker_preparation.take().is_some() {
+            self.clear_playback_start_activity();
+        }
     }
 
     /// Starts a submitted provider search at its first animation frame.
@@ -1499,6 +2014,11 @@ impl AppController {
                 },
                 Err(error) => self.view.status_line = error.to_string(),
             },
+            SearchRoute::YouTubeMusic => match parse_direct_youtube_input(&query) {
+                Ok(Some(direct)) => self.open_direct_youtube_music(direct),
+                Ok(None) => self.submit_youtube_music_search(query),
+                Err(error) => self.view.status_line = error.to_owned(),
+            },
             SearchRoute::TrackerArchives => self.submit_tracker_search(query),
             SearchRoute::None => {
                 self.view.status_line = "Search is not available on this screen".to_owned();
@@ -1511,7 +2031,6 @@ impl AppController {
         self.direct_item = None;
         self.resolved_direct = None;
         self.local_results.clear();
-        self.tracker_results.clear();
         self.supersede_search_generation();
         self.selected_start_override = direct.start_seconds;
         let webpage_url = url::Url::parse(&youtube_video_url(&direct.video_id)).ok();
@@ -1540,13 +2059,51 @@ impl AppController {
         );
     }
 
+    fn open_direct_youtube_music(&mut self, direct: DirectVideoInput) {
+        self.supersede_search_generation();
+        self.youtube_music_results = vec![SearchItem::Video(VideoSummary {
+            video_id: direct.video_id.clone(),
+            title: format!("YouTube Music track {}", direct.video_id),
+            channel_name: "loading…".to_owned(),
+            channel_id: String::new(),
+            description: String::new(),
+            duration_seconds: None,
+            view_count: None,
+            published_at: None,
+            published_text: None,
+            live: false,
+            orientation: VideoOrientation::Unknown,
+            thumbnails: Vec::new(),
+            webpage_url: url::Url::parse(&format!(
+                "https://music.youtube.com/watch?v={}",
+                direct.video_id
+            ))
+            .ok(),
+            stream_url: None,
+        })];
+        self.youtube_music_start_override = direct.start_seconds;
+        self.refresh_youtube_music_rows();
+        self.view.selected = 0;
+        self.youtube_music_selected = 0;
+        self.request_selected_details();
+        self.view.status_line = direct.start_seconds.map_or_else(
+            || format!("Loaded YouTube Music track {}", direct.video_id),
+            |seconds| {
+                format!(
+                    "Loaded YouTube Music track {} at {}",
+                    direct.video_id,
+                    format_seconds(seconds)
+                )
+            },
+        );
+    }
+
     fn open_direct_source(&mut self, direct: DirectSourceInput) {
         self.supersede_search_generation();
         self.clear_youtube_search_snapshot();
         self.youtube_results.clear();
         self.resolved_direct = None;
         self.local_results.clear();
-        self.tracker_results.clear();
         self.direct_item = Some(direct.clone());
         let host = direct.url.host_str().unwrap_or("remote source");
         self.view.rows = vec![RowView {
@@ -1634,7 +2191,6 @@ impl AppController {
         self.youtube_results.clear();
         self.direct_item = None;
         self.resolved_direct = None;
-        self.tracker_results.clear();
         self.local_results.clear();
         self.view.selected = 0;
         self.view.details = Some(DetailView {
@@ -1675,15 +2231,12 @@ impl AppController {
 
     fn submit_tracker_search(&mut self, query: String) {
         self.supersede_search_generation();
-        self.clear_youtube_search_snapshot();
-        self.youtube_results.clear();
-        self.direct_item = None;
-        self.resolved_direct = None;
-        self.local_results.clear();
+        self.tracker_search_query.clone_from(&query);
         self.tracker_results.clear();
         self.view.rows.clear();
         self.view.details = None;
         self.view.selected = 0;
+        self.tracker_selected = 0;
         if !self.send_provider_request(
             ProviderRequest::TrackerSearch {
                 generation: self.search_generation,
@@ -1696,6 +2249,38 @@ impl AppController {
         self.begin_search_activity(SearchActivity::TrackerArchives);
         self.view.status_line =
             "Searching enabled MOD/tracker archives (separate from YouTube)…".to_owned();
+    }
+
+    #[cfg(feature = "youtube-music")]
+    fn submit_youtube_music_search(&mut self, query: String) {
+        self.supersede_search_generation();
+        self.youtube_music_search_query.clone_from(&query);
+        self.youtube_music_start_override = None;
+        self.youtube_music_results.clear();
+        if let Err(error) = self.store.clear_youtube_music_search() {
+            self.show_error("Could not clear the saved YouTube Music search", &error);
+        }
+        self.view.rows.clear();
+        self.view.details = None;
+        self.view.selected = 0;
+        self.youtube_music_selected = 0;
+        if !self.send_provider_request(
+            ProviderRequest::YouTubeMusicSearch {
+                generation: self.search_generation,
+                query,
+            },
+            "Could not start the YouTube Music search",
+        ) {
+            return;
+        }
+        self.begin_search_activity(SearchActivity::YouTubeMusic);
+        self.view.status_line = "Searching YouTube Music through yt-dlp…".to_owned();
+    }
+
+    #[cfg(not(feature = "youtube-music"))]
+    fn submit_youtube_music_search(&mut self, _query: String) {
+        self.view.status_line =
+            "This build omits the `youtube-music` feature; rebuild with it enabled".to_owned();
     }
 
     fn submit_youtube_search(&mut self, page: u32) {
@@ -1712,15 +2297,17 @@ impl AppController {
         }
         if page == 1 {
             self.clear_youtube_search_snapshot();
+            self.youtube_search_query
+                .clone_from(&self.view.search_query);
             self.selected_start_override = None;
             self.direct_item = None;
             self.resolved_direct = None;
             self.local_results.clear();
-            self.tracker_results.clear();
             self.youtube_results.clear();
             self.view.rows.clear();
             self.view.details = None;
             self.view.selected = 0;
+            self.youtube_selected = 0;
         }
         let target = match self.view.search_kind {
             SearchKind::Videos => SearchTarget::Videos,
@@ -1775,6 +2362,7 @@ impl AppController {
     }
 
     fn request_selected_details(&mut self) {
+        self.clear_detail_navigation_history();
         self.previous_detail = None;
         self.view.details_scroll = 0;
         self.details_generation = self.details_generation.wrapping_add(1);
@@ -1782,7 +2370,11 @@ impl AppController {
             self.view.details = None;
             return;
         };
-        self.view.details = Some(preliminary_detail(&selected, &self.subscription_tree));
+        let mut detail = preliminary_detail(&selected, &self.subscription_tree);
+        if self.view.screen == Screen::YouTubeMusic {
+            detail.source = "YouTube Music".to_owned();
+        }
+        self.view.details = Some(detail);
         if let SearchItem::Video(video) = &selected
             && self.youtube_provider_available
         {
@@ -1913,12 +2505,35 @@ impl AppController {
         let Some(channel_id) = entry.subscription.youtube_channel_id() else {
             return;
         };
+        let now_unix = unix_time();
         if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
             self.touch_channel_details_cache(&channel_id);
             if let Some(channel) = cached {
                 self.apply_channel_details_to_view(&channel);
+                if self
+                    .channel_details_fresh_until
+                    .get(&channel_id)
+                    .is_some_and(|expires_at| *expires_at > now_unix)
+                {
+                    return;
+                }
             }
-            return;
+        } else {
+            match self.store.cached_channel_summary(&channel_id) {
+                Ok(Some(cached)) => {
+                    self.channel_details_fresh_until
+                        .insert(channel_id.clone(), cached.expires_at);
+                    self.cache_channel_details(channel_id.clone(), Some(cached.summary.clone()));
+                    self.apply_channel_details_to_view(&cached.summary);
+                    if cached.is_fresh_at(now_unix) {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.show_error("Could not read cached channel info", &error);
+                }
+            }
         }
         if self.pending_channel_details.contains(&channel_id) {
             return;
@@ -1960,23 +2575,31 @@ impl AppController {
     /// Sends one exact channel-details request or applies the bounded RAM cache.
     fn request_channel_details(&mut self, channel_id: String, generation: u64, interactive: bool) {
         if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
-            if let Some(channel) = cached {
+            if let Some(channel) = cached.as_ref() {
                 self.touch_channel_details_cache(&channel_id);
                 if generation == self.channel_details_generation
                     && self.visible_channel_id() == Some(channel_id.as_str())
                 {
-                    self.apply_channel_details_to_view(&channel);
+                    self.apply_channel_details_to_view(channel);
                     self.view.status_line =
                         format!("Using cached channel info for {}", channel.name);
                 }
+                if self
+                    .channel_details_fresh_until
+                    .get(&channel_id)
+                    .is_some_and(|expires_at| *expires_at > unix_time())
+                {
+                    return;
+                }
+            }
+            if cached.is_none() && !interactive {
                 return;
             }
-            if !interactive {
-                return;
+            if cached.is_none() {
+                self.channel_details_cache.remove(&channel_id);
+                self.channel_details_cache_order
+                    .retain(|cached| cached != &channel_id);
             }
-            self.channel_details_cache.remove(&channel_id);
-            self.channel_details_cache_order
-                .retain(|cached| cached != &channel_id);
         }
         if self.pending_channel_details.contains(&channel_id) {
             if interactive {
@@ -2021,6 +2644,7 @@ impl AppController {
                     break;
                 };
                 self.channel_details_cache.remove(&oldest);
+                self.channel_details_fresh_until.remove(&oldest);
             }
         }
         self.channel_details_cache
@@ -2038,6 +2662,7 @@ impl AppController {
 
     /// Applies provider metadata only to a matching visible Channel panel.
     fn apply_channel_details_to_view(&mut self, channel: &ChannelSummary) {
+        self.apply_channel_artwork_to_subscription_source(channel);
         let is_visible_subscription_source = self.view.screen == Screen::Subscriptions
             && self.visible_channel_id() == Some(channel.channel_id.as_str());
         let Some(details) = self
@@ -2062,10 +2687,27 @@ impl AppController {
             .contains_youtube_channel(&channel.channel_id);
         if is_visible_subscription_source {
             self.view.subscriptions.source_subscriber_count = channel.subscriber_count;
+            self.view.subscriptions.source_created = channel
+                .created_at
+                .map(format_unix_utc_date)
+                .unwrap_or_default();
         }
         self.refresh_youtube_rows();
         if self.active_subscription_channel_id.is_some() {
             self.refresh_subscription_video_rows();
+        }
+    }
+
+    /// Updates the matching source row so the thumbnail worker can warm channel
+    /// artwork before that source becomes selected.
+    fn apply_channel_artwork_to_subscription_source(&mut self, channel: &ChannelSummary) {
+        let Some(index) = self.subscription_entries.iter().position(|entry| {
+            entry.subscription.youtube_channel_id().as_deref() == Some(&channel.channel_id)
+        }) else {
+            return;
+        };
+        if let Some(row) = self.view.subscriptions.sources.get_mut(index) {
+            row.thumbnail_url = preferred_thumbnail_url(&channel.thumbnails);
         }
     }
 
@@ -2112,6 +2754,7 @@ impl AppController {
             description: entry.subscription.description.clone().unwrap_or_default(),
             subscriber_count: None,
             video_count: None,
+            created_at: None,
             auto_generated: false,
             thumbnails: Vec::new(),
             webpage_url: entry.subscription.website_url.clone(),
@@ -2236,7 +2879,6 @@ impl AppController {
                             page.next_page
                         };
                         self.cache_search_channel_subscriber_counts();
-                        self.refresh_youtube_rows();
                         let saved_search = SavedYouTubeSearch {
                             request: request.clone(),
                             results: std::mem::take(&mut self.youtube_results),
@@ -2249,27 +2891,81 @@ impl AppController {
                         if let Err(error) = save_result {
                             self.show_error("Could not save the YouTube search", &error);
                         }
-                        self.request_visible_channel_subscriber_counts();
-                        self.view.status_line = if search_limit_reached {
-                            format!(
-                                "{} YouTube results loaded; restart-safe limit reached",
-                                self.youtube_results.len()
-                            )
-                        } else {
-                            format!(
-                                "{} YouTube result{} loaded",
-                                self.youtube_results.len(),
-                                if self.youtube_results.len() == 1 {
+                        if self.view.screen == Screen::Search {
+                            self.refresh_youtube_rows();
+                            self.request_visible_channel_subscriber_counts();
+                            self.view.status_line = if search_limit_reached {
+                                format!(
+                                    "{} YouTube results loaded; restart-safe limit reached",
+                                    self.youtube_results.len()
+                                )
+                            } else {
+                                format!(
+                                    "{} YouTube result{} loaded",
+                                    self.youtube_results.len(),
+                                    if self.youtube_results.len() == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                )
+                            };
+                            self.request_selected_details();
+                        }
+                    }
+                    Err(error) => {
+                        if self.view.screen == Screen::Search {
+                            self.show_error_message("YouTube search failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "youtube-music")]
+            ProviderResponse::YouTubeMusicSearch {
+                generation,
+                query,
+                result,
+            } => {
+                if generation != self.search_generation {
+                    return;
+                }
+                self.finish_search_activity(SearchActivity::YouTubeMusic);
+                match result {
+                    Ok(tracks) => {
+                        self.youtube_music_search_query = query;
+                        self.youtube_music_results = tracks
+                            .into_iter()
+                            .map(search_item_from_youtube_music_track)
+                            .collect();
+                        let saved_search = SavedYouTubeMusicSearch {
+                            query: self.youtube_music_search_query.clone(),
+                            results: self.youtube_music_results.clone(),
+                        };
+                        if let Err(error) = self
+                            .store
+                            .save_youtube_music_search(&saved_search, unix_time())
+                            && self.view.screen == Screen::YouTubeMusic
+                        {
+                            self.show_error("Could not save the YouTube Music search", &error);
+                        }
+                        if self.view.screen == Screen::YouTubeMusic {
+                            self.refresh_youtube_music_rows();
+                            self.view.status_line = format!(
+                                "{} YouTube Music track{} loaded",
+                                self.youtube_music_results.len(),
+                                if self.youtube_music_results.len() == 1 {
                                     ""
                                 } else {
                                     "s"
                                 }
-                            )
-                        };
-                        self.request_selected_details();
+                            );
+                            self.request_selected_details();
+                        }
                     }
                     Err(error) => {
-                        self.show_error_message("YouTube search failed", error);
+                        if self.view.screen == Screen::YouTubeMusic {
+                            self.show_error_message("YouTube Music search failed", error);
+                        }
                     }
                 }
             }
@@ -2286,7 +2982,7 @@ impl AppController {
                 }
                 self.view.subscriptions.loading = false;
                 match result {
-                    Ok(page) => {
+                    Ok(mut page) => {
                         if page.page != request.page
                             || page.next_page.is_some_and(|next_page| {
                                 request.page.checked_add(1) != Some(next_page) || next_page > 10_000
@@ -2302,6 +2998,13 @@ impl AppController {
                             );
                             return;
                         }
+                        page.items.retain(|item| {
+                            !matches!(
+                                item,
+                                SearchItem::Video(video)
+                                    if video.duration_seconds == Some(0) && !video.live
+                            )
+                        });
                         let received_page_empty = page.items.is_empty();
                         self.cache_subscription_video_page(&request.channel_id, page);
                         if self.view.screen != Screen::Subscriptions {
@@ -2423,6 +3126,20 @@ impl AppController {
                             return;
                         }
                         compact_channel_summary(&mut channel);
+                        let fetched_at = unix_time();
+                        let expires_at =
+                            fetched_at.saturating_add(CHANNEL_DETAILS_CACHE_TTL_SECONDS);
+                        if let Err(error) = self.store.put_cached_channel_summary(
+                            &crate::persistence::CachedChannelSummary {
+                                summary: channel.clone(),
+                                fetched_at,
+                                expires_at,
+                            },
+                        ) {
+                            self.show_error("Could not cache channel info", &error);
+                        }
+                        self.channel_details_fresh_until
+                            .insert(channel_id.clone(), expires_at);
                         self.channel_subscriber_cache
                             .insert(channel_id.clone(), channel.subscriber_count);
                         self.cache_channel_details(channel_id.clone(), Some(channel.clone()));
@@ -2432,6 +3149,8 @@ impl AppController {
                             self.apply_channel_details_to_view(&channel);
                             self.view.status_line =
                                 format!("Loaded channel info for {}", channel.name);
+                        } else {
+                            self.apply_channel_artwork_to_subscription_source(&channel);
                         }
                     }
                     Err(_) => {
@@ -2459,6 +3178,7 @@ impl AppController {
                         let known_orientation = self
                             .youtube_results
                             .iter()
+                            .chain(self.youtube_music_results.iter())
                             .chain(
                                 self.subscription_video_cache
                                     .values()
@@ -2526,6 +3246,18 @@ impl AppController {
                                 *summary = updated_summary.clone();
                             }
                         }
+                        for item in &mut self.youtube_music_results {
+                            if let SearchItem::Video(summary) = item
+                                && summary.video_id == details.video_id
+                            {
+                                *summary = updated_summary.clone();
+                                summary.webpage_url = url::Url::parse(&format!(
+                                    "https://music.youtube.com/watch?v={}",
+                                    details.video_id
+                                ))
+                                .ok();
+                            }
+                        }
                         let mut updated_cached_channels = Vec::new();
                         for (channel_id, cached) in &mut self.subscription_video_cache {
                             let mut channel_updated = false;
@@ -2552,6 +3284,8 @@ impl AppController {
                         }
                         if self.view.screen == Screen::Search {
                             self.refresh_youtube_rows();
+                        } else if self.view.screen == Screen::YouTubeMusic {
+                            self.refresh_youtube_music_rows();
                         } else if self.view.screen == Screen::Subscriptions {
                             self.refresh_subscription_video_rows();
                         }
@@ -2561,7 +3295,12 @@ impl AppController {
                                 SearchItem::Video(video) if video.video_id == details.video_id
                             )
                         });
-                        if selected_matches && self.view.right_panel_mode != RightPanelMode::Channel
+                        let linked_matches = self
+                            .active_description_video
+                            .as_ref()
+                            .is_some_and(|linked| linked.video_id == details.video_id);
+                        if (selected_matches || linked_matches)
+                            && self.view.right_panel_mode != RightPanelMode::Channel
                         {
                             let wikidata = self
                                 .view
@@ -2576,9 +3315,28 @@ impl AppController {
                                 .map(|view| view.links.clone())
                                 .unwrap_or_default();
                             let mut detail = detail_from_video(&details, &self.subscription_tree);
+                            if !linked_matches && self.view.screen == Screen::YouTubeMusic {
+                                detail.source = "YouTube Music".to_owned();
+                            }
                             detail.wikidata = wikidata;
                             detail.links = links;
                             self.view.details = Some(detail);
+                            if linked_matches {
+                                self.view.status_line = self
+                                    .active_description_video
+                                    .as_ref()
+                                    .and_then(|linked| linked.start_seconds)
+                                    .map_or_else(
+                                        || format!("Opened {} in Details", details.title),
+                                        |seconds| {
+                                            format!(
+                                                "Opened {} in Details at {}",
+                                                details.title,
+                                                format_seconds(seconds)
+                                            )
+                                        },
+                                    );
+                            }
                         }
                     }
                     Err(error) => {
@@ -2626,19 +3384,24 @@ impl AppController {
                 source,
                 result,
             } => {
-                if generation != self.search_generation || self.view.screen != Screen::TrackerMusic
-                {
+                if generation != self.search_generation {
                     return;
                 }
                 match result {
                     Ok(mut items) => {
                         self.tracker_results.append(&mut items);
-                        self.refresh_tracker_rows();
-                        self.view.status_line =
-                            format!("Loaded {} result(s) through {source}", self.view.rows.len());
+                        if self.view.screen == Screen::TrackerMusic {
+                            self.refresh_tracker_rows();
+                            self.view.status_line = format!(
+                                "Loaded {} result(s) through {source}",
+                                self.view.rows.len()
+                            );
+                        }
                     }
                     Err(error) => {
-                        self.show_error_message(&format!("{source} search failed"), error);
+                        if self.view.screen == Screen::TrackerMusic {
+                            self.show_error_message(&format!("{source} search failed"), error);
+                        }
                     }
                 }
             }
@@ -2652,6 +3415,52 @@ impl AppController {
                         "{} MOD/tracker result(s) loaded from enabled archives",
                         self.tracker_results.len()
                     );
+                }
+            }
+            #[cfg(feature = "tracker-music")]
+            ProviderResponse::TrackerPrepared {
+                generation,
+                item_key,
+                result,
+            } => {
+                let owns_response =
+                    self.pending_tracker_preparation
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.generation == generation && pending.item_key == item_key
+                        });
+                if !owns_response {
+                    return;
+                }
+                let pending = self
+                    .pending_tracker_preparation
+                    .take()
+                    .expect("matching tracker preparation was checked above");
+                self.clear_playback_start_activity();
+                if generation != self.search_generation {
+                    return;
+                }
+                match result {
+                    Ok(modules) => {
+                        self.finish_tracker_preparation(&item_key, modules, pending.owner);
+                    }
+                    Err(error) => match pending.owner {
+                        TrackerPreparationOwner::Autoplay(origin)
+                            if self.config.playback.autoplay =>
+                        {
+                            self.view.status_line =
+                                format!("Autoplay skipped an unavailable tracker item: {error}");
+                            self.continue_autoplay(origin);
+                        }
+                        TrackerPreparationOwner::Autoplay(_)
+                        | TrackerPreparationOwner::CanceledAutoplay => {
+                            self.view.status_line =
+                                "Canceled tracker preparation did not change playback".to_owned();
+                        }
+                        TrackerPreparationOwner::Manual => {
+                            self.show_error_message("Tracker module preparation failed", error);
+                        }
+                    },
                 }
             }
             ProviderResponse::LocalScan {
@@ -2677,6 +3486,59 @@ impl AppController {
                         self.show_error_message("Local folder scan failed", error);
                     }
                 }
+            }
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            ProviderResponse::LocalArtwork {
+                generation,
+                path,
+                result,
+            } => {
+                if self.pending_local_artwork.as_ref() != Some(&(generation, path.clone())) {
+                    return;
+                }
+                self.pending_local_artwork = None;
+                self.view.local_artwork_pending = false;
+                self.cache_local_artwork(path.clone(), result.unwrap_or(None));
+                self.apply_cached_local_artwork(&path);
+                self.request_selected_local_artwork();
+            }
+            ProviderResponse::LocalFolderSize {
+                generation,
+                path,
+                result,
+            } => {
+                if generation
+                    != self
+                        .local_folder_size_generation
+                        .load(AtomicOrdering::Relaxed)
+                    || self.local_folder_size_pending.as_deref() != Some(path.as_path())
+                {
+                    return;
+                }
+                self.local_folder_size_pending = None;
+                let selected_path = self.selected_local_path();
+                let still_visible = self.local_listing.as_ref().is_some_and(|listing| {
+                    listing
+                        .entries
+                        .iter()
+                        .any(|entry| entry.is_directory() && entry.path == path)
+                });
+                if self.config.ui.show_local_folder_sizes && still_visible {
+                    match result {
+                        Ok(worker_result) => {
+                            let reused = worker_result.reused;
+                            if self.store_local_folder_size(&path, generation, worker_result) {
+                                self.sort_local_listing();
+                                self.select_local_path(selected_path.as_deref());
+                                self.refresh_local_browser_rows_without_detail();
+                            } else if reused {
+                                self.local_folder_size_queue.push_front(path);
+                            }
+                        }
+                        Err(_) => self.store_local_folder_size_failure(path),
+                    }
+                }
+                self.request_next_local_folder_size();
             }
             #[cfg(feature = "wikidata")]
             ProviderResponse::Wikidata {
@@ -2751,6 +3613,28 @@ impl AppController {
             .min(self.view.rows.len().saturating_sub(1));
     }
 
+    fn refresh_youtube_music_rows(&mut self) {
+        let today = Local::now().date_naive();
+        self.view.rows = self
+            .youtube_music_results
+            .iter()
+            .map(|item| {
+                row_from_search_item(
+                    item,
+                    &self.store,
+                    &self.subscription_tree,
+                    &self.channel_subscriber_cache,
+                    SearchRowContext::YouTubeMusic,
+                    today,
+                )
+            })
+            .collect();
+        self.view.selected = self
+            .view
+            .selected
+            .min(self.view.rows.len().saturating_sub(1));
+    }
+
     fn refresh_local_rows(&mut self) {
         self.view.rows = self
             .local_results
@@ -2773,12 +3657,734 @@ impl AppController {
         self.update_non_youtube_detail();
     }
 
+    /// Starts one lazy artwork lookup for selected Local media or a folder.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    fn request_selected_local_artwork(&mut self) {
+        let selected = if self.view.screen == Screen::Local {
+            self.local_entry_index()
+                .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
+                .and_then(|entry| {
+                    if entry.is_directory() {
+                        Some((entry.path.clone(), LocalArtworkKind::FolderCover))
+                    } else if entry.kind.is_playable() {
+                        Some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            self.view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .filter(|media_id| media_id.source == SourceKind::Local)
+                .map(|media_id| {
+                    (
+                        PathBuf::from(&media_id.external_id),
+                        LocalArtworkKind::EmbeddedMedia,
+                    )
+                })
+        };
+        let Some((path, kind)) = selected else {
+            if self.pending_local_artwork.is_none() {
+                self.view.local_artwork_pending = false;
+            }
+            return;
+        };
+        if self.local_artwork_cache.contains_key(&path) {
+            self.apply_cached_local_artwork(&path);
+            if self.pending_local_artwork.is_none() {
+                self.view.local_artwork_pending = false;
+            }
+            return;
+        }
+        if self.pending_local_artwork.is_some() {
+            self.view.local_artwork_pending = true;
+            return;
+        }
+        let Some(sender) = self.provider_requests.as_ref() else {
+            self.view.local_artwork_pending = false;
+            return;
+        };
+        self.local_artwork_generation = self.local_artwork_generation.wrapping_add(1);
+        let generation = self.local_artwork_generation;
+        let request = ProviderRequest::LocalArtwork {
+            generation,
+            path: path.clone(),
+            cache_directory: self.config.thumbnail_cache_dir(),
+            kind,
+        };
+        if sender.send(request).is_ok() {
+            self.pending_local_artwork = Some((generation, path));
+            self.view.local_artwork_pending = true;
+        } else {
+            self.view.local_artwork_pending = false;
+        }
+    }
+
+    /// Stores one process-local artwork result with deterministic FIFO eviction.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    fn cache_local_artwork(&mut self, path: PathBuf, artwork: Option<url::Url>) {
+        self.local_artwork_cache.insert(path.clone(), artwork);
+        self.local_artwork_cache_order
+            .retain(|cached_path| cached_path != &path);
+        self.local_artwork_cache_order.push_back(path);
+        while self.local_artwork_cache.len() > MAX_CACHED_LOCAL_ARTWORK {
+            let Some(oldest) = self.local_artwork_cache_order.pop_front() else {
+                break;
+            };
+            self.local_artwork_cache.remove(&oldest);
+        }
+    }
+
+    /// Applies a cached cover only when the same Local path still owns Details.
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    fn apply_cached_local_artwork(&mut self, path: &Path) {
+        let Some(artwork) = self.local_artwork_cache.get(path) else {
+            return;
+        };
+        let selected_local_path_matches = self.selected_local_path().as_deref() == Some(path);
+        let Some(details) = self.view.details.as_mut() else {
+            return;
+        };
+        let selected_matches = selected_local_path_matches
+            || details.media_id.as_ref().is_some_and(|media_id| {
+                media_id.source == SourceKind::Local && Path::new(&media_id.external_id) == path
+            });
+        if selected_matches {
+            details.thumbnail_url.clone_from(artwork);
+        }
+    }
+
+    fn browse_local_directory(&mut self, directory: PathBuf) {
+        self.browse_local_directory_with_reselection(directory, None);
+    }
+
+    /// Applies one isolated Local listing only when its route is still current.
+    fn handle_local_browse_response(&mut self, response: LocalBrowseResponse) {
+        if response.generation != self.local_generation {
+            return;
+        }
+        self.view.local_browse_pending = false;
+        match response.result {
+            Ok(listing) => {
+                let truncated = listing.truncated;
+                let path = listing.path.display().to_string();
+                let reselected_path = self
+                    .pending_local_reselection
+                    .take()
+                    .filter(|(pending_generation, _)| *pending_generation == response.generation)
+                    .map(|(_, child)| child);
+                self.local_listing = Some(listing);
+                self.sort_local_listing();
+                self.view.selected = 0;
+                self.select_local_path(reselected_path.as_deref());
+                self.hydrate_local_progress_cache();
+                self.refresh_local_browser_rows();
+                self.schedule_local_folder_sizes();
+                self.view.status_line = if truncated {
+                    format!("Showing a bounded partial listing of {path}")
+                } else {
+                    format!("Local folder: {path}")
+                };
+            }
+            Err(error) => {
+                self.pending_local_reselection = None;
+                self.view.rows.clear();
+                self.view.selected = 0;
+                self.show_error_message("Local folder could not be opened", error);
+            }
+        }
+    }
+
+    /// Starts one directory load and optionally remembers a direct child that
+    /// should be selected when the response arrives.
+    fn browse_local_directory_with_reselection(
+        &mut self,
+        directory: PathBuf,
+        reselect_child: Option<PathBuf>,
+    ) {
+        let keep_noninteractive_rows = self.view.screen == Screen::Local
+            && self.local_listing.is_some()
+            && !self.view.rows.is_empty();
+        self.local_generation = self.local_generation.wrapping_add(1);
+        self.invalidate_local_folder_sizes();
+        self.pending_local_reselection = reselect_child
+            .clone()
+            .map(|child| (self.local_generation, child));
+        self.local_listing = None;
+        if !keep_noninteractive_rows {
+            self.view.rows.clear();
+            self.view.selected = 0;
+        }
+        self.view.details = None;
+        self.view.local_path = directory.display().to_string();
+        let status_line = format!("Reading {}…", directory.display());
+        self.view.local_browse_pending = false;
+        if self.send_local_browse_request(
+            LocalBrowseRequest::Browse {
+                generation: self.local_generation,
+                directory,
+                preferred_child: reselect_child,
+            },
+            "Could not open the local folder",
+        ) {
+            self.view.local_browse_pending = true;
+            self.view.status_line = status_line;
+        } else {
+            self.pending_local_reselection = None;
+        }
+    }
+
+    /// Cancels older recursive work without discarding bounded RAM cache data.
+    fn invalidate_local_folder_sizes(&mut self) {
+        self.local_folder_size_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.local_folder_size_queue.clear();
+        self.local_folder_size_pending = None;
+    }
+
+    /// Queues one rotating, fixed-size batch of current child directories.
+    fn schedule_local_folder_sizes(&mut self) {
+        if self.view.screen != Screen::Local || !self.config.ui.show_local_folder_sizes {
+            return;
+        }
+        if self.local_folder_size_pending.is_some() || !self.local_folder_size_queue.is_empty() {
+            return;
+        }
+        let Some(listing) = self.local_listing.as_ref() else {
+            return;
+        };
+        let listing_path = listing.path.clone();
+        let directories = listing
+            .entries
+            .iter()
+            .filter(|entry| entry.is_directory())
+            .map(|entry| (entry.path.clone(), entry.directory_identity.clone()))
+            .collect::<Vec<_>>();
+        if directories.is_empty() {
+            return;
+        }
+        let generation = self
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let now = Instant::now();
+        let mut reused_complete_size = false;
+
+        for (path, identity) in &directories {
+            let complete_is_fresh = self
+                .local_folder_size_cache
+                .get(path)
+                .is_some_and(|cached| {
+                    identity.as_ref() == Some(&cached.identity)
+                        && now.saturating_duration_since(cached.measured_at)
+                            <= LOCAL_FOLDER_SIZE_CACHE_TTL
+                });
+            if complete_is_fresh {
+                if let Some(cached) = self.local_folder_size_cache.get_mut(path) {
+                    cached.validated_generation = generation;
+                }
+                reused_complete_size = true;
+                self.local_folder_size_cache_order
+                    .retain(|cached_path| cached_path != path);
+                self.local_folder_size_cache_order.push_back(path.clone());
+            } else if self.local_folder_size_cache.remove(path).is_some() {
+                self.local_folder_size_cache_order
+                    .retain(|cached_path| cached_path != path);
+            }
+
+            let failure_is_fresh =
+                self.local_folder_size_failures
+                    .get(path)
+                    .is_some_and(|failure| {
+                        failure.identity.as_ref() == identity.as_ref()
+                            && now.saturating_duration_since(failure.failed_at)
+                                <= LOCAL_FOLDER_SIZE_FAILURE_TTL
+                    });
+            if !failure_is_fresh && self.local_folder_size_failures.remove(path).is_some() {
+                self.local_folder_size_failure_order
+                    .retain(|failed_path| failed_path != path);
+            }
+        }
+
+        let start = self
+            .local_folder_size_batch_cursors
+            .get(&listing_path)
+            .copied()
+            .unwrap_or_default()
+            % directories.len();
+        let mut next_cursor = start;
+        for offset in 0..directories.len() {
+            let index = start.saturating_add(offset) % directories.len();
+            next_cursor = index.saturating_add(1) % directories.len();
+            let (path, _) = &directories[index];
+            let complete = self
+                .local_folder_size_cache
+                .get(path)
+                .is_some_and(|cached| cached.validated_generation == generation);
+            if complete || self.local_folder_size_failures.contains_key(path) {
+                continue;
+            }
+            self.local_folder_size_queue.push_back(path.clone());
+            if self.local_folder_size_queue.len() >= MAX_LAZY_LOCAL_FOLDER_SIZES {
+                break;
+            }
+        }
+        self.local_folder_size_batch_cursors
+            .insert(listing_path.clone(), next_cursor);
+        self.local_folder_size_batch_cursor_order
+            .retain(|path| path != &listing_path);
+        self.local_folder_size_batch_cursor_order
+            .push_back(listing_path);
+        while self.local_folder_size_batch_cursors.len() > MAX_LOCAL_FOLDER_SIZE_BATCH_CURSORS {
+            let Some(oldest) = self.local_folder_size_batch_cursor_order.pop_front() else {
+                break;
+            };
+            self.local_folder_size_batch_cursors.remove(&oldest);
+        }
+        if reused_complete_size {
+            let selected_path = self.selected_local_path();
+            self.sort_local_listing();
+            self.select_local_path(selected_path.as_deref());
+            self.refresh_local_browser_rows_without_detail();
+        }
+        self.request_next_local_folder_size();
+    }
+
+    /// Dispatches at most one lazy folder-size request at a time.
+    fn request_next_local_folder_size(&mut self) {
+        if !self.config.ui.show_local_folder_sizes || self.local_folder_size_pending.is_some() {
+            return;
+        }
+        let Some(path) = self.local_folder_size_queue.pop_front() else {
+            return;
+        };
+        let generation = self
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let now = Instant::now();
+        let cached = self
+            .local_folder_size_cache
+            .get(&path)
+            .filter(|cached| {
+                now.saturating_duration_since(cached.measured_at) <= LOCAL_FOLDER_SIZE_CACHE_TTL
+            })
+            .map(|cached| crate::local_browser::LocalFolderSizeMeasurement {
+                bytes: cached.bytes,
+                identity: cached.identity.clone(),
+            });
+        if self.send_provider_request(
+            ProviderRequest::LocalFolderSize {
+                generation,
+                path: path.clone(),
+                cancellation: Arc::clone(&self.local_folder_size_generation),
+                cached,
+            },
+            "Could not measure the local folder",
+        ) {
+            self.local_folder_size_pending = Some(path);
+        }
+    }
+
+    /// Returns a complete current-generation size for one Local entry.
+    fn known_local_entry_size(&self, entry: &crate::local_browser::LocalEntry) -> Option<u64> {
+        if !entry.is_directory() {
+            return entry.size_bytes;
+        }
+        if !self.config.ui.show_local_folder_sizes {
+            return None;
+        }
+        let generation = self
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let now = Instant::now();
+        self.local_folder_size_cache
+            .get(&entry.path)
+            .filter(|cached| {
+                cached.validated_generation == generation
+                    && now.saturating_duration_since(cached.measured_at)
+                        <= LOCAL_FOLDER_SIZE_CACHE_TTL
+            })
+            .map(|cached| cached.bytes)
+    }
+
+    /// Stores one worker-validated size and enforces the global RAM bound.
+    fn store_local_folder_size(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        result: LocalFolderSizeWorkerResult,
+    ) -> bool {
+        let now = Instant::now();
+        if result.reused {
+            let Some(cached) = self.local_folder_size_cache.get_mut(path) else {
+                return false;
+            };
+            if cached.identity != result.measurement.identity
+                || now.saturating_duration_since(cached.measured_at) > LOCAL_FOLDER_SIZE_CACHE_TTL
+            {
+                self.local_folder_size_cache.remove(path);
+                self.local_folder_size_cache_order
+                    .retain(|cached_path| cached_path != path);
+                return false;
+            }
+            cached.bytes = result.measurement.bytes;
+            cached.validated_generation = generation;
+        } else {
+            self.local_folder_size_cache.insert(
+                path.to_owned(),
+                CachedLocalFolderSize {
+                    identity: result.measurement.identity,
+                    bytes: result.measurement.bytes,
+                    measured_at: now,
+                    validated_generation: generation,
+                },
+            );
+        }
+
+        self.local_folder_size_cache_order
+            .retain(|cached_path| cached_path != path);
+        self.local_folder_size_cache_order
+            .push_back(path.to_owned());
+        self.local_folder_size_failures.remove(path);
+        self.local_folder_size_failure_order
+            .retain(|failed_path| failed_path != path);
+        while self.local_folder_size_cache.len() > MAX_CACHED_LOCAL_FOLDER_SIZES {
+            let Some(oldest) = self.local_folder_size_cache_order.pop_front() else {
+                break;
+            };
+            self.local_folder_size_cache.remove(&oldest);
+        }
+        true
+    }
+
+    /// Caches one bounded failure so navigation does not hammer the same tree.
+    fn store_local_folder_size_failure(&mut self, path: PathBuf) {
+        let identity = self.local_listing.as_ref().and_then(|listing| {
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .and_then(|entry| entry.directory_identity.clone())
+        });
+        self.local_folder_size_failures.insert(
+            path.clone(),
+            CachedLocalFolderSizeFailure {
+                identity,
+                failed_at: Instant::now(),
+            },
+        );
+        self.local_folder_size_failure_order
+            .retain(|failed_path| failed_path != &path);
+        self.local_folder_size_failure_order.push_back(path);
+        while self.local_folder_size_failures.len() > MAX_CACHED_LOCAL_FOLDER_SIZES {
+            let Some(oldest) = self.local_folder_size_failure_order.pop_front() else {
+                break;
+            };
+            self.local_folder_size_failures.remove(&oldest);
+        }
+    }
+
+    /// Returns the path represented by the selected Local row.
+    fn selected_local_path(&self) -> Option<PathBuf> {
+        let listing = self.local_listing.as_ref()?;
+        if listing.parent.is_some() && self.view.selected == 0 {
+            return listing.parent.clone();
+        }
+        self.local_entry_index()
+            .and_then(|index| listing.entries.get(index))
+            .map(|entry| entry.path.clone())
+    }
+
+    /// Restores one exact Local path after lazy size sorting reorders rows.
+    fn select_local_path(&mut self, selected_path: Option<&Path>) {
+        let Some(selected_path) = selected_path else {
+            return;
+        };
+        let Some(listing) = self.local_listing.as_ref() else {
+            return;
+        };
+        if listing
+            .parent
+            .as_deref()
+            .is_some_and(|parent| parent == selected_path)
+        {
+            self.view.selected = 0;
+            return;
+        }
+        if let Some(index) = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == selected_path)
+        {
+            self.view.selected = index.saturating_add(usize::from(listing.parent.is_some()));
+        }
+    }
+
+    /// Applies the selected deterministic Local ordering to the listing.
+    fn sort_local_listing(&mut self) {
+        let sizes_enabled = self.config.ui.show_local_folder_sizes;
+        let mode = if sizes_enabled {
+            self.view.local_size_sort
+        } else {
+            LocalSizeSort::Off
+        };
+        let generation = self
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let now = Instant::now();
+        let cache = &self.local_folder_size_cache;
+        let Some(listing) = self.local_listing.as_mut() else {
+            return;
+        };
+        listing.entries.sort_by(|left, right| {
+            if mode == LocalSizeSort::Off {
+                return right
+                    .is_directory()
+                    .cmp(&left.is_directory())
+                    .then_with(|| left.name.cmp(&right.name));
+            }
+            let known_size = |entry: &crate::local_browser::LocalEntry| {
+                if entry.is_directory() {
+                    sizes_enabled
+                        .then(|| cache.get(&entry.path))
+                        .flatten()
+                        .filter(|cached| {
+                            cached.validated_generation == generation
+                                && now.saturating_duration_since(cached.measured_at)
+                                    <= LOCAL_FOLDER_SIZE_CACHE_TTL
+                        })
+                        .map(|cached| cached.bytes)
+                } else {
+                    entry.size_bytes
+                }
+            };
+            match (known_size(left), known_size(right)) {
+                (Some(left_size), Some(right_size)) => {
+                    let size_order = match mode {
+                        LocalSizeSort::Ascending => left_size.cmp(&right_size),
+                        LocalSizeSort::Descending => right_size.cmp(&left_size),
+                        LocalSizeSort::Off => std::cmp::Ordering::Equal,
+                    };
+                    size_order.then_with(|| left.name.cmp(&right.name))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left.name.cmp(&right.name),
+            }
+        });
+    }
+
+    /// Rebuilds visible Local rows and refreshes the selected entry's metadata.
+    fn refresh_local_browser_rows(&mut self) {
+        self.rebuild_local_browser_rows();
+        self.update_local_browser_detail();
+    }
+
+    /// Rebuilds Local rows while retaining details for the same selected path.
+    ///
+    /// Lazy folder-size responses may arrive hundreds of times for one
+    /// listing. They update row subtitles and ordering but must not repeatedly
+    /// reopen a selected media file to parse its tags.
+    fn refresh_local_browser_rows_without_detail(&mut self) {
+        self.rebuild_local_browser_rows();
+    }
+
+    /// Hydrates watched percentages once for the accepted Local listing.
+    fn hydrate_local_progress_cache(&mut self) {
+        self.local_progress_cache.clear();
+        let Some(listing) = self.local_listing.as_ref() else {
+            return;
+        };
+        let progress_ids = listing
+            .entries
+            .iter()
+            .filter(|entry| entry.kind.is_playable())
+            .map(|entry| MediaId::new(SourceKind::Local, entry.path.display().to_string()))
+            .collect::<Vec<_>>();
+        let Ok(progress) = self.store.progress_for_media_ids(&progress_ids) else {
+            return;
+        };
+        self.local_progress_cache.extend(
+            progress
+                .into_iter()
+                .map(|(media_id, progress)| (media_id, progress.watched_percent())),
+        );
+    }
+
+    /// Rebuilds the Local row model from listing-scoped RAM state.
+    fn rebuild_local_browser_rows(&mut self) {
+        use crate::local_browser::LocalEntryKind;
+
+        let Some(listing) = self.local_listing.as_ref() else {
+            self.view.rows.clear();
+            return;
+        };
+        self.view.local_path = listing.path.display().to_string();
+        let mut rows = Vec::with_capacity(
+            listing
+                .entries
+                .len()
+                .saturating_add(usize::from(listing.parent.is_some())),
+        );
+        if listing.parent.is_some() {
+            rows.push(RowView {
+                title: "..".to_owned(),
+                subtitle: String::new(),
+                source: "Local folder".to_owned(),
+                compact: true,
+                ..RowView::default()
+            });
+        }
+        rows.extend(listing.entries.iter().map(|entry| {
+            let source = match entry.kind {
+                LocalEntryKind::Directory => "Local folder",
+                LocalEntryKind::Audio => "Local audio",
+                LocalEntryKind::Video => "Local video (audio playback)",
+                LocalEntryKind::TrackerModule => "Local tracker module",
+                LocalEntryKind::Image => "Local image",
+            };
+            let media_id = entry
+                .kind
+                .is_playable()
+                .then(|| MediaId::new(SourceKind::Local, entry.path.display().to_string()));
+            let watched_percent = media_id
+                .as_ref()
+                .and_then(|id| self.local_progress_cache.get(id))
+                .copied()
+                .unwrap_or_default();
+            let subtitle = match entry.kind {
+                LocalEntryKind::Directory => self
+                    .known_local_entry_size(entry)
+                    .map_or_else(String::new, human_bytes),
+                LocalEntryKind::Image => entry.image_dimensions.map_or_else(
+                    || entry.size_bytes.map_or_else(String::new, human_bytes),
+                    |dimensions| {
+                        format!(
+                            "{}×{} · {}",
+                            dimensions.width,
+                            dimensions.height,
+                            human_bytes(entry.size_bytes.unwrap_or_default())
+                        )
+                    },
+                ),
+                _ => entry.size_bytes.map_or_else(String::new, human_bytes),
+            };
+            RowView {
+                media_id,
+                title: entry.display_name().into_owned(),
+                subtitle,
+                source: source.to_owned(),
+                watched_percent,
+                thumbnail_url: (entry.kind == LocalEntryKind::Image)
+                    .then(|| url::Url::from_file_path(&entry.path).ok())
+                    .flatten(),
+                compact: true,
+                ..RowView::default()
+            }
+        }));
+        self.view.rows = rows;
+        self.view.selected = self
+            .view
+            .selected
+            .min(self.view.rows.len().saturating_sub(1));
+    }
+
+    fn local_entry_index(&self) -> Option<usize> {
+        let listing = self.local_listing.as_ref()?;
+        self.view
+            .selected
+            .checked_sub(usize::from(listing.parent.is_some()))
+            .filter(|index| *index < listing.entries.len())
+    }
+
+    fn update_local_browser_detail(&mut self) {
+        use crate::local_browser::LocalEntryKind;
+
+        let Some(listing) = self.local_listing.as_ref() else {
+            self.view.details = None;
+            return;
+        };
+        if self.view.selected == 0
+            && let Some(parent) = listing.parent.as_ref()
+        {
+            self.view.details = Some(DetailView {
+                title: "..".to_owned(),
+                source: "Local folder".to_owned(),
+                description: format!("Full path: {}", parent.display()),
+                ..DetailView::default()
+            });
+            return;
+        }
+        let Some(index) = self.local_entry_index() else {
+            self.view.details = None;
+            return;
+        };
+        let entry = &listing.entries[index];
+        if entry.kind.is_playable() {
+            let item = local_media_item(entry.path.clone());
+            self.view.details = Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::Local,
+                    entry.path.display().to_string(),
+                )),
+                title: item.title.clone(),
+                source: match entry.kind {
+                    LocalEntryKind::Video => "Local video (audio playback)",
+                    LocalEntryKind::TrackerModule => "Local tracker module",
+                    _ => "Local audio",
+                }
+                .to_owned(),
+                length: item
+                    .duration_seconds
+                    .map_or_else(|| "unknown".to_owned(), format_seconds),
+                description: local_media_description(&item),
+                local_renamable: true,
+                local_trashable: true,
+                ..DetailView::default()
+            });
+        } else {
+            let is_directory = entry.kind == LocalEntryKind::Directory;
+            let known_size = (!is_directory)
+                .then(|| self.known_local_entry_size(entry))
+                .flatten();
+            self.view.details = Some(DetailView {
+                title: entry.display_name().into_owned(),
+                source: if entry.kind == LocalEntryKind::Image {
+                    "Local image"
+                } else {
+                    "Local folder"
+                }
+                .to_owned(),
+                description: format!(
+                    "Full path: {}{}{}",
+                    entry.path.display(),
+                    known_size
+                        .map_or_else(String::new, |size| format!("\nSize: {}", human_bytes(size))),
+                    entry
+                        .image_dimensions
+                        .map_or_else(String::new, |dimensions| {
+                            format!("\nDimensions: {}×{}", dimensions.width, dimensions.height)
+                        })
+                ),
+                thumbnail_url: (entry.kind == LocalEntryKind::Image)
+                    .then(|| url::Url::from_file_path(&entry.path).ok())
+                    .flatten(),
+                local_renamable: !is_directory,
+                local_trashable: true,
+                ..DetailView::default()
+            });
+        }
+        #[cfg(all(feature = "local", feature = "thumbnails"))]
+        self.request_selected_local_artwork();
+    }
+
     fn refresh_tracker_rows(&mut self) {
         self.view.rows =
             self.tracker_results
                 .iter()
                 .map(|item| RowView {
-                    media_id: item.playback_url.as_ref().map(|_| {
+                    media_id: item.prepared_path.as_ref().map(|_| {
                         MediaId::new(SourceKind::ModArchive, item.webpage_url.to_string())
                     }),
                     title: item.title.clone(),
@@ -2794,33 +4400,155 @@ impl AppController {
         self.update_non_youtube_detail();
     }
 
+    #[cfg(feature = "tracker-music")]
+    fn finish_tracker_preparation(
+        &mut self,
+        item_key: &str,
+        modules: Vec<crate::tracker_media::PreparedTrackerModule>,
+        owner: TrackerPreparationOwner,
+    ) {
+        let autoplay_origin = match &owner {
+            TrackerPreparationOwner::Autoplay(origin) if self.config.playback.autoplay => {
+                Some(origin.clone())
+            }
+            _ => None,
+        };
+        let Some(index) = self
+            .tracker_results
+            .iter()
+            .position(|item| item.webpage_url.as_str() == item_key)
+        else {
+            if let Some(origin) = autoplay_origin {
+                self.continue_autoplay(origin);
+            } else if owner == TrackerPreparationOwner::Manual {
+                self.show_error_message(
+                    "Tracker module preparation failed",
+                    "the prepared result no longer exists in the current tracker search",
+                );
+            }
+            return;
+        };
+        let template = self.tracker_results[index].clone();
+        let mut prepared = modules
+            .into_iter()
+            .map(|module| {
+                let mut item = template.clone();
+                item.title = module.display_name;
+                item.expected_format = Some(module.format.clone());
+                item.subtitle = format!(
+                    "{} · {}",
+                    module.format.to_ascii_uppercase(),
+                    human_bytes(module.size_bytes)
+                );
+                item.prepared_path = Some(module.path);
+                item.access = TrackerAccess::DirectModule;
+                item
+            })
+            .collect::<Vec<_>>();
+        if prepared.is_empty() {
+            if let Some(origin) = autoplay_origin {
+                self.view.status_line =
+                    "Autoplay skipped a payload with no supported tracker module".to_owned();
+                self.continue_autoplay(origin);
+            } else if owner == TrackerPreparationOwner::Manual {
+                self.show_error_message(
+                    "Tracker module preparation failed",
+                    "the selected payload contained no supported tracker module",
+                );
+            } else {
+                self.view.status_line =
+                    "Canceled tracker preparation contained no playable module".to_owned();
+            }
+            return;
+        }
+        let prepared_count = prepared.len();
+        self.tracker_results
+            .splice(index..=index, prepared.drain(..));
+        self.view.selected = index;
+        self.tracker_selected = index;
+        if self.view.screen == Screen::TrackerMusic {
+            self.refresh_tracker_rows();
+        }
+        if owner == TrackerPreparationOwner::CanceledAutoplay
+            || (matches!(&owner, TrackerPreparationOwner::Autoplay(_))
+                && !self.config.playback.autoplay)
+        {
+            self.view.status_line =
+                format!("Prepared {prepared_count} tracker module(s); autoplay remains off");
+            return;
+        }
+        if prepared_count > 1 && owner == TrackerPreparationOwner::Manual {
+            self.view.status_line =
+                format!("Prepared {prepared_count} modules; select the extracted entry to play");
+            return;
+        }
+        let item = match queue_item_from_tracker(&self.tracker_results[index]) {
+            Ok(item) => item,
+            Err(error) => {
+                self.show_error_message("Tracker module preparation failed", error);
+                return;
+            }
+        };
+        match owner {
+            TrackerPreparationOwner::Autoplay(_) => self.play_queue_item_with_origin(
+                item,
+                false,
+                Some(AutoplayOrigin::Tracker {
+                    generation: self.search_generation,
+                    index,
+                }),
+            ),
+            TrackerPreparationOwner::Manual => self.play_queue_item(item, false),
+            TrackerPreparationOwner::CanceledAutoplay => {
+                unreachable!("canceled preparation returned before queue activation")
+            }
+        }
+    }
+
     fn update_non_youtube_detail(&mut self) {
-        if let Some(item) = self.local_results.get(self.view.selected) {
+        match self.view.screen {
+            Screen::Local => {
+                self.update_local_browser_detail();
+                return;
+            }
+            Screen::History => {
+                self.update_history_detail();
+                return;
+            }
+            Screen::Search | Screen::TrackerMusic => {}
+            Screen::YouTubeMusic
+            | Screen::Subscriptions
+            | Screen::Downloaded
+            | Screen::Playlists
+            | Screen::Statistics => {
+                self.view.details = None;
+                return;
+            }
+        }
+        if self.view.screen == Screen::Search
+            && let Some(item) = self.local_results.get(self.view.selected)
+        {
             self.view.details = Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::Local,
+                    item.path.display().to_string(),
+                )),
                 title: item.title.clone(),
                 source: "Local".to_owned(),
                 length: item
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
-                description: format!(
-                    "{}\n{}\n{}{}{}",
-                    item.path.display(),
-                    local_media_subtitle(item),
-                    item.artist
-                        .as_ref()
-                        .map_or_else(String::new, |artist| format!("Artist: {artist}")),
-                    item.album
-                        .as_ref()
-                        .map_or_else(String::new, |album| format!("\nAlbum: {album}")),
-                    item.sample_rate_hz
-                        .map_or_else(String::new, |rate| format!("\nSample rate: {rate} Hz"))
-                ),
+                description: local_media_description(item),
                 license: "local file".to_owned(),
                 wikidata: "not applicable".to_owned(),
                 thumbnail_url: None,
                 ..DetailView::default()
             });
-        } else if let Some(item) = self.tracker_results.get(self.view.selected) {
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            self.request_selected_local_artwork();
+        } else if self.view.screen == Screen::TrackerMusic
+            && let Some(item) = self.tracker_results.get(self.view.selected)
+        {
             self.view.details = Some(DetailView {
                 title: item.title.clone(),
                 source: item.source.clone(),
@@ -2838,6 +4566,24 @@ impl AppController {
                 ..DetailView::default()
             });
         }
+    }
+
+    /// Rebuilds History Details exclusively from the selected persisted row.
+    ///
+    /// History must not index into stale Local-search or tracker-search arrays:
+    /// those arrays can retain unrelated URLs after the user changes screens.
+    fn update_history_detail(&mut self) {
+        let Some(row) = self.view.rows.get(self.view.selected).cloned() else {
+            self.view.details = None;
+            return;
+        };
+        self.view.details = Some(DetailView {
+            media_id: row.media_id,
+            title: row.title,
+            source: row.source,
+            description: row.subtitle,
+            ..DetailView::default()
+        });
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -2882,23 +4628,28 @@ impl AppController {
         } else {
             self.view.selected.saturating_add(delta as usize).min(last)
         };
-        if self.view.screen == Screen::Search {
-            if self.local_results.is_empty()
-                && self.direct_item.is_none()
-                && self.resolved_direct.is_none()
-            {
+        if matches!(self.view.screen, Screen::Search | Screen::YouTubeMusic) {
+            let youtube_list_active = self.view.screen == Screen::YouTubeMusic
+                || (self.local_results.is_empty()
+                    && self.direct_item.is_none()
+                    && self.resolved_direct.is_none());
+            if youtube_list_active {
                 self.request_selected_details();
             } else {
                 self.update_non_youtube_detail();
             }
-            if self.local_results.is_empty()
+            if self.view.screen == Screen::Search
+                && self.local_results.is_empty()
                 && self.direct_item.is_none()
                 && self.view.selected.saturating_add(2) >= self.view.rows.len()
                 && let Some(page) = self.next_youtube_page
             {
                 self.submit_youtube_search(page);
             }
-        } else if self.view.screen == Screen::TrackerMusic {
+        } else if matches!(
+            self.view.screen,
+            Screen::TrackerMusic | Screen::Local | Screen::History
+        ) {
             self.update_non_youtube_detail();
         }
     }
@@ -2908,10 +4659,11 @@ impl AppController {
             return;
         }
         self.view.selected = row;
-        if self.view.screen == Screen::Search
-            && self.local_results.is_empty()
-            && self.direct_item.is_none()
-        {
+        let youtube_list_active = self.view.screen == Screen::YouTubeMusic
+            || (self.view.screen == Screen::Search
+                && self.local_results.is_empty()
+                && self.direct_item.is_none());
+        if youtube_list_active {
             self.request_selected_details();
         } else {
             self.update_non_youtube_detail();
@@ -2965,8 +4717,19 @@ impl AppController {
                 None => Err("No subscription video is selected".to_owned()),
             };
         }
-        if self.view.screen != Screen::Search {
+        if !matches!(self.view.screen, Screen::Search | Screen::YouTubeMusic) {
             return Err("Queue actions are available for playable search results".to_owned());
+        }
+        if self.view.screen == Screen::YouTubeMusic {
+            return match self.youtube_music_results.get(self.view.selected) {
+                Some(SearchItem::Video(video)) => {
+                    Ok(self.selected_video_queue_item(video, self.youtube_music_start_override))
+                }
+                Some(SearchItem::Channel(_)) => {
+                    Err("YouTube Music channels cannot be queued".to_owned())
+                }
+                None => Err("No playable YouTube Music track is selected".to_owned()),
+            };
         }
         if let Some(item) = self.local_results.get(self.view.selected) {
             return queue_item_from_local(item);
@@ -3209,6 +4972,10 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::Local {
+            self.activate_local_browser_selection();
+            return;
+        }
         if self.view.screen == Screen::Subscriptions {
             match (
                 self.view.subscriptions.layout,
@@ -3254,6 +5021,10 @@ impl AppController {
                 return;
             }
         }
+        #[cfg(feature = "tracker-music")]
+        if self.view.screen == Screen::TrackerMusic && self.prepare_selected_tracker_item() {
+            return;
+        }
         let item = match self.selected_queue_item() {
             Ok(item) => item,
             Err(error) => {
@@ -3266,9 +5037,129 @@ impl AppController {
             }
         };
         if item.media.id.source == SourceKind::YouTube {
-            self.selected_start_override = None;
+            if self.view.screen == Screen::YouTubeMusic {
+                self.youtube_music_start_override = None;
+            } else {
+                self.selected_start_override = None;
+            }
         }
         self.play_queue_item(item, false);
+    }
+
+    fn activate_local_browser_selection(&mut self) {
+        use crate::local_browser::LocalEntryKind;
+
+        let Some(listing) = self.local_listing.as_ref() else {
+            self.view.status_line = "No local folder is loaded".to_owned();
+            return;
+        };
+        if listing.parent.is_some() && self.view.selected == 0 {
+            let parent = listing.parent.clone().expect("parent checked above");
+            let child = listing.path.clone();
+            self.browse_local_directory_with_reselection(parent, Some(child));
+            return;
+        }
+        let Some(index) = self.local_entry_index() else {
+            self.view.status_line = "No local entry is selected".to_owned();
+            return;
+        };
+        let entry = listing.entries[index].clone();
+        match entry.kind {
+            LocalEntryKind::Directory => self.browse_local_directory(entry.path),
+            LocalEntryKind::Image => {
+                self.view.status_line =
+                    "Image preview selected; only audio and video entries are playable".to_owned();
+            }
+            LocalEntryKind::Audio | LocalEntryKind::Video | LocalEntryKind::TrackerModule => {
+                let item = local_media_item(entry.path);
+                match queue_item_from_local(&item) {
+                    Ok(item) => self.play_queue_item(item, false),
+                    Err(error) => self.show_error_message("Local media could not be played", error),
+                }
+            }
+        }
+    }
+
+    /// Starts bounded background preparation for a selected remote module.
+    ///
+    /// Returns `true` when activation was fully handled without immediately
+    /// entering the ordinary queue path.
+    #[cfg(feature = "tracker-music")]
+    fn prepare_selected_tracker_item(&mut self) -> bool {
+        if self.view.selected >= self.tracker_results.len() {
+            self.view.status_line = "No tracker item is selected".to_owned();
+            return true;
+        }
+        self.prepare_tracker_item(self.view.selected, None)
+    }
+
+    /// Starts one selected or autoplay-owned tracker preparation.
+    ///
+    /// Returns `true` when the request was handled without entering the
+    /// ordinary immediate-play path.
+    #[cfg(feature = "tracker-music")]
+    fn prepare_tracker_item(
+        &mut self,
+        index: usize,
+        autoplay_origin: Option<AutoplayOrigin>,
+    ) -> bool {
+        if self.pending_tracker_preparation.is_some() {
+            self.view.status_line =
+                "One tracker module is already being prepared in the background".to_owned();
+            return true;
+        }
+        let Some(item) = self.tracker_results.get(index) else {
+            return true;
+        };
+        if item.prepared_path.is_some() {
+            return false;
+        }
+        let Some(download_url) = item.download_url.clone() else {
+            self.view.status_line = match item.access {
+                TrackerAccess::Directory => {
+                    "This tracker result is a directory; open its source page to browse it"
+                        .to_owned()
+                }
+                _ => "This tracker result is metadata only; press o to open its source page"
+                    .to_owned(),
+            };
+            return true;
+        };
+        let item_key = item.webpage_url.to_string();
+        let title = item.title.clone();
+        let mut request = crate::tracker_media::TrackerMediaRequest::new(download_url);
+        request.source_label = Some(item.source.clone());
+        request.expected_format.clone_from(&item.expected_format);
+        request.display_name = Some(title.clone());
+        request.allow_insecure_http =
+            item.insecure_transport && self.config.providers.allow_insecure_http;
+        if !self.send_provider_request(
+            ProviderRequest::PrepareTracker {
+                generation: self.search_generation,
+                item_key: item_key.clone(),
+                request,
+            },
+            "Could not prepare the tracker module",
+        ) {
+            return true;
+        }
+        let autoplay = autoplay_origin.is_some();
+        let owner = autoplay_origin.map_or(
+            TrackerPreparationOwner::Manual,
+            TrackerPreparationOwner::Autoplay,
+        );
+        self.pending_tracker_preparation = Some(PendingTrackerPreparation {
+            generation: self.search_generation,
+            item_key,
+            owner,
+        });
+        self.begin_playback_start_activity();
+        self.view.status_line = if autoplay {
+            format!("Autoplay is downloading and inspecting {title}…")
+        } else {
+            format!("Downloading and inspecting {title}…")
+        };
+        true
     }
 
     fn show_now_playing(&mut self) {
@@ -3276,6 +5167,26 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
         };
+        let music_origin = item.media.webpage_url.host_str() == Some("music.youtube.com");
+
+        if item.media.id.source == SourceKind::YouTube
+            && (self.view.screen == Screen::YouTubeMusic || music_origin)
+            && let Some(index) = self.youtube_music_results.iter().position(|candidate| {
+                matches!(
+                    candidate,
+                    SearchItem::Video(video)
+                        if video.video_id == item.media.id.external_id
+                )
+            })
+        {
+            self.view.screen = Screen::YouTubeMusic;
+            self.refresh_youtube_music_rows();
+            self.view.selected = index;
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.request_selected_details();
+            self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            return;
+        }
 
         if item.media.id.source == SourceKind::YouTube
             && let Some(index) = self.youtube_results.iter().position(|candidate| {
@@ -3288,6 +5199,24 @@ impl AppController {
         {
             self.view.screen = Screen::Search;
             self.refresh_youtube_rows();
+            self.view.selected = index;
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.request_selected_details();
+            self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            return;
+        }
+
+        if item.media.id.source == SourceKind::YouTube
+            && let Some(index) = self.youtube_music_results.iter().position(|candidate| {
+                matches!(
+                    candidate,
+                    SearchItem::Video(video)
+                        if video.video_id == item.media.id.external_id
+                )
+            })
+        {
+            self.view.screen = Screen::YouTubeMusic;
+            self.refresh_youtube_music_rows();
             self.view.selected = index;
             self.view.right_panel_mode = RightPanelMode::Details;
             self.request_selected_details();
@@ -3340,6 +5269,35 @@ impl AppController {
                     return;
                 }
             }
+        }
+
+        if item.media.id.source == SourceKind::Local
+            && let Some(listing) = self.local_listing.as_ref()
+            && let Some(index) = listing
+                .entries
+                .iter()
+                .position(|entry| entry.path.display().to_string() == item.media.id.external_id)
+        {
+            self.view.screen = Screen::Local;
+            self.view.selected = index.saturating_add(usize::from(listing.parent.is_some()));
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.update_local_browser_detail();
+            self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            return;
+        }
+
+        if item.media.id.source == SourceKind::ModArchive
+            && let Some(index) = self
+                .tracker_results
+                .iter()
+                .position(|candidate| candidate.webpage_url.as_str() == item.media.id.external_id)
+        {
+            self.view.screen = Screen::TrackerMusic;
+            self.view.selected = index;
+            self.refresh_tracker_rows();
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            return;
         }
 
         self.view.right_panel_mode = RightPanelMode::Details;
@@ -3501,7 +5459,191 @@ impl AppController {
         );
     }
 
+    /// Drops internal Details history when a list or top-level route changes.
+    fn clear_detail_navigation_history(&mut self) {
+        self.detail_navigation_back.clear();
+        self.detail_navigation_forward.clear();
+        self.active_description_video = None;
+    }
+
+    /// Moves the current Details location into a bounded history stack.
+    fn push_detail_navigation_snapshot(
+        history: &mut VecDeque<DetailNavigationSnapshot>,
+        snapshot: DetailNavigationSnapshot,
+    ) {
+        if history.len() >= MAX_DETAIL_NAVIGATION_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(snapshot);
+    }
+
+    /// Takes the current location without cloning its potentially large text.
+    fn take_detail_navigation_snapshot(&mut self) -> DetailNavigationSnapshot {
+        DetailNavigationSnapshot {
+            screen: self.view.screen,
+            selected: self.view.selected,
+            subscription_route: self.view.subscriptions.route,
+            subscription_focus: self.view.subscriptions.focus,
+            subscription_selected_source: self.view.subscriptions.selected_source,
+            subscription_selected_item: self.view.subscriptions.selected_item,
+            subscription_description_expanded: self.view.subscriptions.description_expanded,
+            details: self.view.details.take(),
+            previous_detail: self.previous_detail.take(),
+            details_scroll: self.view.details_scroll,
+            details_focused: self.view.details_focused,
+            text_selection_mode: self.view.text_selection_mode,
+            details_text_selection: self.view.details_text_selection.take(),
+            selected_detail_link: self.view.selected_detail_link,
+            right_panel_mode: self.view.right_panel_mode,
+            active_description_video: self.active_description_video.take(),
+        }
+    }
+
+    /// Restores one move-only Details location and invalidates stale responses.
+    fn restore_detail_navigation_snapshot(&mut self, snapshot: DetailNavigationSnapshot) {
+        self.details_generation = self.details_generation.wrapping_add(1);
+        #[cfg(feature = "wikidata")]
+        {
+            self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
+        }
+        self.view.screen = snapshot.screen;
+        self.view.selected = snapshot.selected;
+        self.view.subscriptions.route = snapshot.subscription_route;
+        self.view.subscriptions.focus = snapshot.subscription_focus;
+        self.view.subscriptions.selected_source = snapshot.subscription_selected_source;
+        self.view.subscriptions.selected_item = snapshot.subscription_selected_item;
+        self.view.subscriptions.description_expanded = snapshot.subscription_description_expanded;
+        self.view.details = snapshot.details;
+        self.previous_detail = snapshot.previous_detail;
+        self.view.details_scroll = snapshot.details_scroll;
+        self.view.details_focused = snapshot.details_focused;
+        self.view.text_selection_mode = snapshot.text_selection_mode;
+        self.view.details_text_selection = snapshot.details_text_selection;
+        self.view.selected_detail_link = snapshot.selected_detail_link;
+        self.view.right_panel_mode = snapshot.right_panel_mode;
+        self.active_description_video = snapshot.active_description_video;
+
+        let pending_video_id = self.active_description_video.as_ref().and_then(|linked| {
+            self.view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.title == LINKED_VIDEO_LOADING_TITLE)
+                .then(|| linked.video_id.clone())
+        });
+        if let Some(video_id) = pending_video_id
+            && self.youtube_provider_available
+        {
+            self.send_provider_request(
+                ProviderRequest::Details {
+                    generation: self.details_generation,
+                    video_id: video_id.clone(),
+                },
+                "Could not resume loading linked YouTube video",
+            );
+        }
+        #[cfg(feature = "wikidata")]
+        if let Some(video_id) = self
+            .active_description_video
+            .as_ref()
+            .map(|linked| linked.video_id.clone())
+        {
+            self.request_wikidata(
+                crate::providers::wikidata::WikidataExternalKind::YouTubeVideo,
+                &video_id,
+            );
+        }
+    }
+
+    /// Opens a description-linked `YouTube` video in the existing Details pane.
+    fn activate_description_video(&mut self, video_id: String, start_seconds: Option<u64>) {
+        if let Err(error) = validate_youtube_video_id(&video_id) {
+            self.show_error_message("Cannot open description video", error.to_string());
+            return;
+        }
+        if !self.youtube_provider_available {
+            self.open_youtube_setup();
+            return;
+        }
+
+        let generation = self.details_generation.wrapping_add(1);
+        if !self.send_provider_request(
+            ProviderRequest::Details {
+                generation,
+                video_id: video_id.clone(),
+            },
+            "Could not load linked YouTube video",
+        ) {
+            return;
+        }
+
+        let current = self.take_detail_navigation_snapshot();
+        Self::push_detail_navigation_snapshot(&mut self.detail_navigation_back, current);
+        self.detail_navigation_forward.clear();
+        self.details_generation = generation;
+        self.previous_detail = None;
+        self.active_description_video = Some(ActiveDescriptionVideo {
+            video_id: video_id.clone(),
+            start_seconds,
+        });
+        self.view.details_focused = true;
+        self.view.details_scroll = 0;
+        self.view.text_selection_mode = false;
+        self.view.details_text_selection = None;
+        self.view.selected_detail_link = None;
+        self.view.right_panel_mode = RightPanelMode::Details;
+        self.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, &video_id)),
+            title: LINKED_VIDEO_LOADING_TITLE.to_owned(),
+            source: "YouTube".to_owned(),
+            description: LINKED_VIDEO_LOADING_DESCRIPTION.to_owned(),
+            wikidata: "not loaded".to_owned(),
+            ..DetailView::default()
+        });
+        self.view.status_line = start_seconds.map_or_else(
+            || "Loading linked YouTube video…".to_owned(),
+            |seconds| {
+                format!(
+                    "Loading linked YouTube video at {}…",
+                    format_seconds(seconds)
+                )
+            },
+        );
+        #[cfg(feature = "wikidata")]
+        self.request_wikidata(
+            crate::providers::wikidata::WikidataExternalKind::YouTubeVideo,
+            &video_id,
+        );
+    }
+
+    /// Restores a previous or later internal Details location.
+    fn move_detail_navigation(&mut self, forward: bool) -> bool {
+        let destination = if forward {
+            self.detail_navigation_forward.pop_back()
+        } else {
+            self.detail_navigation_back.pop_back()
+        };
+        let Some(destination) = destination else {
+            return false;
+        };
+        let current = self.take_detail_navigation_snapshot();
+        if forward {
+            Self::push_detail_navigation_snapshot(&mut self.detail_navigation_back, current);
+        } else {
+            Self::push_detail_navigation_snapshot(&mut self.detail_navigation_forward, current);
+        }
+        self.restore_detail_navigation_snapshot(destination);
+        self.view.status_line = if forward {
+            "Moved forward in Details".to_owned()
+        } else {
+            "Moved back in Details".to_owned()
+        };
+        true
+    }
+
     fn go_back(&mut self) {
+        if self.move_detail_navigation(false) {
+            return;
+        }
         if self.view.screen == Screen::Subscriptions {
             if self.view.subscriptions.description_expanded {
                 self.view.subscriptions.description_expanded = false;
@@ -3547,6 +5689,12 @@ impl AppController {
         self.view.right_panel_mode = RightPanelMode::Details;
         if let Some(selected) = self.selected_youtube_item().cloned() {
             self.request_selected_wikidata(&selected);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if !self.move_detail_navigation(true) {
+            self.view.status_line = "No later Details page".to_owned();
         }
     }
 
@@ -3599,21 +5747,37 @@ impl AppController {
             self.player_command(PlayerCommand::ChangeChapter(delta));
             return;
         }
-        let current = self
+        let navigable = self
             .view
             .playback_chapters
-            .partition_point(|chapter| {
-                chapter.start_seconds <= self.view.playback.position.as_secs()
+            .iter()
+            .enumerate()
+            .filter(|(_, chapter)| {
+                !self.config.playback.skip_advertisement_chapters
+                    || !is_advertisement_chapter_title(&chapter.title)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if navigable.is_empty() {
+            return;
+        }
+        let current = navigable
+            .partition_point(|index| {
+                self.view.playback_chapters[*index].start_seconds
+                    <= self.view.playback.position.as_secs()
             })
             .saturating_sub(1);
-        let destination = if delta.is_negative() {
+        let destination_position = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs() as usize)
         } else {
             current
                 .saturating_add(delta as usize)
-                .min(self.view.playback_chapters.len().saturating_sub(1))
+                .min(navigable.len().saturating_sub(1))
         };
-        let Some(chapter) = self.view.playback_chapters.get(destination) else {
+        let Some(chapter) = navigable
+            .get(destination_position)
+            .and_then(|index| self.view.playback_chapters.get(*index))
+        else {
             return;
         };
         let Some(media_id) = self.current_media.clone() else {
@@ -3623,7 +5787,332 @@ impl AppController {
         self.activate_timecode(media_id, chapter.start_seconds);
     }
 
+    /// Identifies the same-source cursor represented by a queue item.
+    fn autoplay_origin_for_media(&self, media_id: &MediaId) -> Option<AutoplayOrigin> {
+        let video_at = |items: &[SearchItem], index: usize| {
+            items.get(index).is_some_and(|item| {
+                matches!(
+                    item,
+                    SearchItem::Video(video)
+                        if media_id.source == SourceKind::YouTube
+                            && video.video_id == media_id.external_id
+                )
+            })
+        };
+
+        match self.view.screen {
+            Screen::Search if video_at(&self.youtube_results, self.view.selected) => {
+                return Some(AutoplayOrigin::YouTube {
+                    generation: self.search_generation,
+                    index: self.view.selected,
+                });
+            }
+            Screen::YouTubeMusic if video_at(&self.youtube_music_results, self.view.selected) => {
+                return Some(AutoplayOrigin::YouTubeMusic {
+                    generation: self.search_generation,
+                    index: self.view.selected,
+                });
+            }
+            Screen::Subscriptions => {
+                if let Some(channel_id) = self.active_subscription_channel_id.as_ref()
+                    && let Some(items) = self.subscription_video_cache.get(channel_id)
+                    && video_at(&items.items, self.view.subscriptions.selected_item)
+                {
+                    return Some(AutoplayOrigin::Subscription {
+                        channel_id: channel_id.clone(),
+                        index: self.view.subscriptions.selected_item,
+                    });
+                }
+            }
+            Screen::Local => {
+                if let Some(listing) = self.local_listing.as_ref() {
+                    let entries = listing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.kind.is_playable())
+                        .map(|entry| entry.path.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(index) = entries
+                        .iter()
+                        .position(|path| local_path_matches_media_id(path, media_id))
+                    {
+                        return Some(AutoplayOrigin::LocalBrowser {
+                            directory: listing.path.clone(),
+                            entries: entries.into(),
+                            index,
+                        });
+                    }
+                }
+            }
+            Screen::TrackerMusic => {
+                if self
+                    .tracker_results
+                    .get(self.view.selected)
+                    .is_some_and(|item| tracker_item_matches_media_id(item, media_id))
+                {
+                    return Some(AutoplayOrigin::Tracker {
+                        generation: self.search_generation,
+                        index: self.view.selected,
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        if media_id.source == SourceKind::YouTube {
+            if let Some(index) = self.youtube_results.iter().position(|item| {
+                matches!(item, SearchItem::Video(video) if video.video_id == media_id.external_id)
+            }) {
+                return Some(AutoplayOrigin::YouTube {
+                    generation: self.search_generation,
+                    index,
+                });
+            }
+            if let Some(index) = self.youtube_music_results.iter().position(|item| {
+                matches!(item, SearchItem::Video(video) if video.video_id == media_id.external_id)
+            }) {
+                return Some(AutoplayOrigin::YouTubeMusic {
+                    generation: self.search_generation,
+                    index,
+                });
+            }
+            for channel_id in self.subscription_cache_order.iter().rev() {
+                if let Some(items) = self.subscription_video_cache.get(channel_id)
+                    && let Some(index) = items.items.iter().position(|item| {
+                        matches!(
+                            item,
+                            SearchItem::Video(video) if video.video_id == media_id.external_id
+                        )
+                    })
+                {
+                    return Some(AutoplayOrigin::Subscription {
+                        channel_id: channel_id.clone(),
+                        index,
+                    });
+                }
+            }
+        }
+        if media_id.source == SourceKind::Local {
+            if let Some(index) = self
+                .local_results
+                .iter()
+                .position(|item| local_path_matches_media_id(&item.path, media_id))
+            {
+                return Some(AutoplayOrigin::LocalScan {
+                    generation: self.search_generation,
+                    index,
+                });
+            }
+        }
+        if media_id.source == SourceKind::ModArchive
+            && let Some(index) = self
+                .tracker_results
+                .iter()
+                .position(|item| tracker_item_matches_media_id(item, media_id))
+        {
+            return Some(AutoplayOrigin::Tracker {
+                generation: self.search_generation,
+                index,
+            });
+        }
+        None
+    }
+
+    /// Chooses the next playable entry without changing queue or player state.
+    fn next_autoplay_step(&self, origin: &AutoplayOrigin) -> AutoplayStep {
+        match origin {
+            AutoplayOrigin::YouTube { generation, index } => {
+                if *generation != self.search_generation {
+                    return AutoplayStep::SourceChanged;
+                }
+                self.youtube_results
+                    .iter()
+                    .enumerate()
+                    .skip(index.saturating_add(1))
+                    .find_map(|(index, item)| match item {
+                        SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                            Some(AutoplayStep::Play {
+                                item: Box::new(queue_item_from_video(video, None)),
+                                origin: AutoplayOrigin::YouTube {
+                                    generation: *generation,
+                                    index,
+                                },
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(AutoplayStep::Exhausted)
+            }
+            AutoplayOrigin::YouTubeMusic { generation, index } => {
+                if *generation != self.search_generation {
+                    return AutoplayStep::SourceChanged;
+                }
+                self.youtube_music_results
+                    .iter()
+                    .enumerate()
+                    .skip(index.saturating_add(1))
+                    .find_map(|(index, item)| match item {
+                        SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                            Some(AutoplayStep::Play {
+                                item: Box::new(queue_item_from_video(video, None)),
+                                origin: AutoplayOrigin::YouTubeMusic {
+                                    generation: *generation,
+                                    index,
+                                },
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(AutoplayStep::Exhausted)
+            }
+            AutoplayOrigin::Subscription { channel_id, index } => self
+                .subscription_video_cache
+                .get(channel_id)
+                .and_then(|cached| {
+                    cached
+                        .items
+                        .iter()
+                        .enumerate()
+                        .skip(index.saturating_add(1))
+                        .find_map(|(index, item)| match item {
+                            SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                                Some(AutoplayStep::Play {
+                                    item: Box::new(queue_item_from_video(video, None)),
+                                    origin: AutoplayOrigin::Subscription {
+                                        channel_id: channel_id.clone(),
+                                        index,
+                                    },
+                                })
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or(AutoplayStep::Exhausted),
+            AutoplayOrigin::LocalBrowser {
+                directory,
+                entries,
+                index,
+            } => entries
+                .iter()
+                .enumerate()
+                .skip(index.saturating_add(1))
+                .find_map(|(index, path)| {
+                    queue_item_from_local(&local_media_item(path.clone()))
+                        .ok()
+                        .map(|item| AutoplayStep::Play {
+                            item: Box::new(item),
+                            origin: AutoplayOrigin::LocalBrowser {
+                                directory: directory.clone(),
+                                entries: Arc::clone(entries),
+                                index,
+                            },
+                        })
+                })
+                .unwrap_or(AutoplayStep::Exhausted),
+            AutoplayOrigin::LocalScan { generation, index } => {
+                if *generation != self.search_generation {
+                    return AutoplayStep::SourceChanged;
+                }
+                self.local_results
+                    .iter()
+                    .enumerate()
+                    .skip(index.saturating_add(1))
+                    .find_map(|(index, item)| {
+                        queue_item_from_local(item)
+                            .ok()
+                            .map(|item| AutoplayStep::Play {
+                                item: Box::new(item),
+                                origin: AutoplayOrigin::LocalScan {
+                                    generation: *generation,
+                                    index,
+                                },
+                            })
+                    })
+                    .unwrap_or(AutoplayStep::Exhausted)
+            }
+            AutoplayOrigin::Tracker { generation, index } => {
+                if *generation != self.search_generation {
+                    return AutoplayStep::SourceChanged;
+                }
+                for (index, item) in self
+                    .tracker_results
+                    .iter()
+                    .enumerate()
+                    .skip(index.saturating_add(1))
+                {
+                    if let Ok(item) = queue_item_from_tracker(item) {
+                        return AutoplayStep::Play {
+                            item: Box::new(item),
+                            origin: AutoplayOrigin::Tracker {
+                                generation: *generation,
+                                index,
+                            },
+                        };
+                    }
+                    #[cfg(feature = "tracker-music")]
+                    if item.download_url.is_some()
+                        && matches!(
+                            item.access,
+                            TrackerAccess::DirectModule | TrackerAccess::ArchiveNeedsInspection
+                        )
+                    {
+                        return AutoplayStep::PrepareTracker {
+                            index,
+                            origin: AutoplayOrigin::Tracker {
+                                generation: *generation,
+                                index,
+                            },
+                        };
+                    }
+                }
+                AutoplayStep::Exhausted
+            }
+        }
+    }
+
+    /// Continues an exhausted explicit queue from one same-source position.
+    fn continue_autoplay(&mut self, origin: AutoplayOrigin) {
+        match self.next_autoplay_step(&origin) {
+            AutoplayStep::Play { item, origin } => {
+                self.play_queue_item_with_origin(*item, false, Some(origin));
+            }
+            #[cfg(feature = "tracker-music")]
+            AutoplayStep::PrepareTracker { index, origin } => {
+                self.prepare_tracker_item(index, Some(origin));
+            }
+            AutoplayStep::SourceChanged => {
+                self.view.status_line =
+                    "Autoplay stopped because the source list changed".to_owned();
+            }
+            AutoplayStep::Exhausted => {
+                self.view.status_line = "Autoplay reached the end of this list".to_owned();
+            }
+        }
+    }
+
     fn play_queue_item(&mut self, item: QueueItem, queue_cursor_already_positioned: bool) {
+        let origin = self
+            .config
+            .playback
+            .autoplay
+            .then(|| self.autoplay_origin_for_media(&item.media.id))
+            .flatten();
+        self.play_queue_item_with_origin(item, queue_cursor_already_positioned, origin);
+    }
+
+    /// Starts one queue item while retaining its same-source continuation
+    /// position only after the playback backend accepts the input.
+    fn play_queue_item_with_origin(
+        &mut self,
+        item: QueueItem,
+        queue_cursor_already_positioned: bool,
+        origin: Option<AutoplayOrigin>,
+    ) {
+        if !queue_cursor_already_positioned {
+            self.queued_autoplay_resume_origin = None;
+            #[cfg(feature = "tracker-music")]
+            self.cancel_pending_tracker_autoplay();
+        }
         if !queue_cursor_already_positioned
             || self
                 .checked_format_retry_for
@@ -3662,6 +6151,9 @@ impl AppController {
         }
         let media_id = item.media.id.clone();
         let media_changed = self.current_media.as_ref() != Some(&media_id);
+        if media_changed {
+            self.skipped_advertisement_chapter = None;
+        }
         let chapters = item.media.chapters.clone();
         let start_at = if let Some(start_at) = item.start_at_seconds {
             start_at
@@ -3696,6 +6188,7 @@ impl AppController {
                         .begin_now(item.clone(), had_active_media);
                 }
                 self.current_media = Some(media_id.clone());
+                self.current_autoplay_origin = origin;
                 self.playback_phase = PlaybackPhase::Loading;
                 self.begin_playback_start_activity();
                 self.ignore_replaced_stop = had_active_media;
@@ -3783,6 +6276,7 @@ impl AppController {
                 }
                 self.view.playback = status;
                 if self.playback_phase == PlaybackPhase::Playing {
+                    self.skip_current_advertisement_chapter();
                     self.account_listen_time(elapsed);
                     if self.last_position_save.elapsed()
                         >= Duration::from_secs(
@@ -3801,6 +6295,41 @@ impl AppController {
                 self.fail_player("Playback status failed", &error, elapsed);
             }
         }
+    }
+
+    /// Skips one exact `Реклама` chapter and suppresses duplicate commands
+    /// while the backend still reports its stale pre-seek position.
+    fn skip_current_advertisement_chapter(&mut self) {
+        if !self.config.playback.skip_advertisement_chapters {
+            self.skipped_advertisement_chapter = None;
+            return;
+        }
+        let Some(media_id) = self.current_media.clone() else {
+            return;
+        };
+        let position = self.view.playback.position.as_secs();
+        let matching = self.view.playback_chapters.iter().find(|chapter| {
+            is_advertisement_chapter_title(&chapter.title)
+                && chapter.end_seconds.is_some_and(|end| {
+                    chapter.start_seconds <= position
+                        && position < end
+                        && end > chapter.start_seconds
+                })
+        });
+        let Some(chapter) = matching else {
+            self.skipped_advertisement_chapter = None;
+            return;
+        };
+        let key = (media_id, chapter.start_seconds);
+        if self.skipped_advertisement_chapter.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(end) = chapter.end_seconds else {
+            return;
+        };
+        self.skipped_advertisement_chapter = Some(key);
+        self.player_command(PlayerCommand::SeekAbsolute(Duration::from_secs(end)));
+        self.view.status_line = format!("Skipped advertisement section to {}", format_seconds(end));
     }
 
     fn drain_player_events(&mut self, elapsed: Duration) -> bool {
@@ -3881,10 +6410,17 @@ impl AppController {
             return;
         }
         let playback_started = self.playback_phase == PlaybackPhase::Playing;
+        let tracker_module = self
+            .current_media
+            .as_ref()
+            .is_some_and(|media| media.source == SourceKind::ModArchive);
         self.prepare_to_clear_playback(elapsed);
         match end.reason.clone() {
             PlaybackEndReason::Eof if !playback_started => {
-                let message = playback_before_start_message(&end);
+                let message = playback_before_start_message_for_media(&end, tracker_module);
+                self.queued_autoplay_resume_origin = None;
+                #[cfg(feature = "tracker-music")]
+                self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
                 self.show_error_message("Playback did not start", message);
             }
@@ -3893,18 +6429,53 @@ impl AppController {
                     self.view.playback.position = duration;
                     self.persist_position();
                 }
+                let autoplay_origin = self.current_autoplay_origin.clone();
                 self.reset_playback_state();
                 match self.playback_queue.advance().cloned() {
-                    Some(next) => self.play_queue_item(next, true),
-                    None => self.view.status_line = "Playback queue finished".to_owned(),
+                    Some(next) => {
+                        if self.config.playback.autoplay
+                            && self.queued_autoplay_resume_origin.is_none()
+                            && autoplay_origin.is_some()
+                        {
+                            self.queued_autoplay_resume_origin = autoplay_origin;
+                        }
+                        self.play_queue_item_with_origin(next, true, None);
+                    }
+                    None if self.config.playback.autoplay => {
+                        let origin = self
+                            .queued_autoplay_resume_origin
+                            .take()
+                            .or(autoplay_origin);
+                        if let Some(origin) = origin {
+                            self.continue_autoplay(origin);
+                        } else {
+                            self.view.status_line =
+                                "Playback queue finished; this item has no autoplay list"
+                                    .to_owned();
+                        }
+                    }
+                    None => {
+                        self.queued_autoplay_resume_origin = None;
+                        self.view.status_line = "Playback queue finished".to_owned();
+                    }
                 }
             }
             PlaybackEndReason::Stop => {
+                self.queued_autoplay_resume_origin = None;
+                #[cfg(feature = "tracker-music")]
+                self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
                 self.view.status_line = "Playback stopped".to_owned();
             }
             PlaybackEndReason::Error => {
-                let message = playback_end_message(&end);
+                let message = if tracker_module && playback_end_reports_unsupported_format(&end) {
+                    tracker_decoder_help(&playback_end_message(&end))
+                } else {
+                    playback_end_message(&end)
+                };
+                self.queued_autoplay_resume_origin = None;
+                #[cfg(feature = "tracker-music")]
+                self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
                 self.show_error_message("Playback failed", message);
             }
@@ -3912,6 +6483,9 @@ impl AppController {
                 let message = format!(
                     "the playback backend ended the media for an unexpected reason: {reason}"
                 );
+                self.queued_autoplay_resume_origin = None;
+                #[cfg(feature = "tracker-music")]
+                self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
                 self.show_error_message("Playback ended unexpectedly", message);
             }
@@ -3978,6 +6552,7 @@ impl AppController {
         self.pending_history = None;
         self.ignore_replaced_stop = false;
         self.current_media = None;
+        self.current_autoplay_origin = None;
         self.seek_back.clear();
         self.view.playback_chapters.clear();
         self.view.playback = PlaybackStatus {
@@ -4043,12 +6618,42 @@ impl AppController {
         };
         progress.duration_seconds = duration.or(progress.duration_seconds);
         progress.record_position(self.view.playback.position.as_secs(), now);
-        if let Err(error) = self.store.upsert_progress(&progress) {
-            self.show_error("Could not save playback position", &error);
+        match self.store.upsert_progress(&progress) {
+            Ok(()) => {
+                if progress.media_id.source == SourceKind::Local
+                    && self.local_progress_cache.contains_key(&progress.media_id)
+                {
+                    self.local_progress_cache
+                        .insert(progress.media_id.clone(), progress.watched_percent());
+                }
+            }
+            Err(error) => self.show_error("Could not save playback position", &error),
         }
     }
 
     fn show_screen(&mut self, screen: Screen) {
+        self.clear_detail_navigation_history();
+        if self.view.screen == Screen::Local && screen != Screen::Local {
+            self.invalidate_local_folder_sizes();
+        }
+        match self.view.screen {
+            Screen::Search => {
+                self.youtube_search_query
+                    .clone_from(&self.view.search_query);
+                self.youtube_selected = self.view.selected;
+            }
+            Screen::YouTubeMusic => {
+                self.youtube_music_search_query
+                    .clone_from(&self.view.search_query);
+                self.youtube_music_selected = self.view.selected;
+            }
+            Screen::TrackerMusic => {
+                self.tracker_search_query
+                    .clone_from(&self.view.search_query);
+                self.tracker_selected = self.view.selected;
+            }
+            _ => {}
+        }
         self.details_generation = self.details_generation.wrapping_add(1);
         #[cfg(feature = "wikidata")]
         {
@@ -4057,7 +6662,30 @@ impl AppController {
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
         self.view.screen = screen;
-        self.view.selected = 0;
+        if self.view.right_panel_mode == RightPanelMode::Channel {
+            self.view.right_panel_mode = RightPanelMode::Details;
+        }
+        match screen {
+            Screen::Search => {
+                self.view
+                    .search_query
+                    .clone_from(&self.youtube_search_query);
+                self.view.selected = self.youtube_selected;
+            }
+            Screen::YouTubeMusic => {
+                self.view
+                    .search_query
+                    .clone_from(&self.youtube_music_search_query);
+                self.view.selected = self.youtube_music_selected;
+            }
+            Screen::TrackerMusic => {
+                self.view
+                    .search_query
+                    .clone_from(&self.tracker_search_query);
+                self.view.selected = self.tracker_selected;
+            }
+            _ => self.view.selected = 0,
+        }
         if screen == Screen::Subscriptions {
             self.view.subscriptions.selected_source = 0;
             self.view.subscriptions.selected_item = 0;
@@ -4071,6 +6699,8 @@ impl AppController {
         self.populate_local_screen();
         if screen == Screen::Search && !self.youtube_results.is_empty() {
             self.request_visible_channel_subscriber_counts();
+            self.request_selected_details();
+        } else if screen == Screen::YouTubeMusic && !self.youtube_music_results.is_empty() {
             self.request_selected_details();
         }
     }
@@ -4107,10 +6737,43 @@ impl AppController {
                 }
                 self.view.status_line = "Default search: YouTube videos only".to_owned();
             }
+            Screen::YouTubeMusic => {
+                self.refresh_youtube_music_rows();
+                self.view.status_line = if self.youtube_music_results.is_empty() {
+                    "YouTube Music uses yt-dlp and does not require a YouTube API key; press / to search"
+                        .to_owned()
+                } else {
+                    format!(
+                        "{} YouTube Music track{}",
+                        self.youtube_music_results.len(),
+                        if self.youtube_music_results.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                };
+            }
             Screen::TrackerMusic => {
                 self.refresh_tracker_rows();
                 self.view.status_line =
                     "MOD/tracker search uses its own archive sources; press / to search".to_owned();
+            }
+            Screen::Local => {
+                if self.local_listing.is_some() {
+                    self.sort_local_listing();
+                    self.refresh_local_browser_rows();
+                    self.schedule_local_folder_sizes();
+                    self.view.status_line = format!("Local folder: {}", self.view.local_path);
+                } else {
+                    let restored = PathBuf::from(&self.view.local_path);
+                    let directory = if !self.view.local_path.is_empty() && restored.is_dir() {
+                        restored
+                    } else {
+                        default_local_browse_root()
+                    };
+                    self.browse_local_directory(directory);
+                }
             }
             Screen::Subscriptions => self.populate_subscriptions(),
             Screen::Downloaded => self.populate_downloads(),
@@ -4137,6 +6800,7 @@ impl AppController {
             .iter()
             .map(subscription_source_row)
             .collect();
+        self.restore_cached_subscription_source_artwork();
         self.view.subscriptions.selected_source = self
             .view
             .subscriptions
@@ -4164,6 +6828,40 @@ impl AppController {
         }
     }
 
+    /// Restores known channel-artwork URLs for every subscription source.
+    ///
+    /// Reading compact local SQLite rows here lets the thumbnail worker warm
+    /// image bytes before keyboard or mouse navigation selects another
+    /// channel. Provider requests remain lazy and independently debounced.
+    fn restore_cached_subscription_source_artwork(&mut self) {
+        let channel_rows = self
+            .subscription_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry
+                    .subscription
+                    .youtube_channel_id()
+                    .map(|channel_id| (index, channel_id))
+            })
+            .collect::<Vec<_>>();
+        for (index, channel_id) in channel_rows {
+            let cached = match self.store.cached_channel_summary(&channel_id) {
+                Ok(cached) => cached,
+                Err(error) => {
+                    self.show_error("Could not read cached channel artwork", &error);
+                    return;
+                }
+            };
+            let Some(cached) = cached else {
+                continue;
+            };
+            if let Some(row) = self.view.subscriptions.sources.get_mut(index) {
+                row.thumbnail_url = preferred_thumbnail_url(&cached.summary.thumbnails);
+            }
+        }
+    }
+
     fn update_selected_subscription_source(&mut self) {
         let Some(entry) = self
             .subscription_entries
@@ -4173,6 +6871,7 @@ impl AppController {
             self.view.details = None;
             self.view.subscriptions.source_title.clear();
             self.view.subscriptions.source_subscriber_count = None;
+            self.view.subscriptions.source_created.clear();
             return;
         };
         let subscription = entry.subscription;
@@ -4187,6 +6886,7 @@ impl AppController {
             .copied()
             .flatten();
         self.view.subscriptions.source_subscriber_count = cached_subscribers;
+        self.view.subscriptions.source_created.clear();
         self.view.details = Some(DetailView {
             title: subscription.title.clone(),
             source: subscription_kind_label(subscription.kind).to_owned(),
@@ -4484,6 +7184,7 @@ impl AppController {
             {
                 self.youtube_results.get(self.view.selected)
             }
+            Screen::YouTubeMusic => self.youtube_music_results.get(self.view.selected),
             Screen::Subscriptions
                 if self.view.subscriptions.route == SubscriptionRoute::Items
                     || (self.view.subscriptions.layout == SubscriptionsLayout::Split
@@ -4580,8 +7281,12 @@ impl AppController {
                     })
                     .collect();
                 self.view.status_line = format!("{} history item(s)", self.view.rows.len());
+                self.update_history_detail();
             }
-            Err(error) => self.show_error("Cannot load history", &error),
+            Err(error) => {
+                self.view.details = None;
+                self.show_error("Cannot load history", &error);
+            }
         }
     }
 
@@ -4605,6 +7310,14 @@ impl AppController {
     }
 
     fn current_url(&self) -> Option<String> {
+        if let Some(linked) = self.active_description_video.as_ref() {
+            return LinkTarget::YouTubeVideo {
+                video_id: linked.video_id.clone(),
+                start_seconds: linked.start_seconds,
+            }
+            .canonical_url()
+            .map(|url| url.to_string());
+        }
         if self.view.screen == Screen::TrackerMusic {
             return self
                 .tracker_results
@@ -4629,6 +7342,9 @@ impl AppController {
                         .unwrap_or(&entry.subscription.url)
                         .to_string()
                 });
+        }
+        if self.view.screen == Screen::YouTubeMusic {
+            return search_item_url(self.youtube_music_results.get(self.view.selected)?);
         }
         if self.view.screen != Screen::Search {
             return None;
@@ -4765,8 +7481,15 @@ impl AppController {
         if let Some(mut player) = self.player.take() {
             let _ = player.shutdown();
         }
+        self.invalidate_local_folder_sizes();
+        if let Some(sender) = self.local_browse_requests.take() {
+            let _ = sender.send(LocalBrowseRequest::Shutdown);
+        }
         if let Some(sender) = self.provider_requests.take() {
             let _ = sender.send(ProviderRequest::Shutdown);
+        }
+        if let Some(handle) = self.local_browse_thread.take() {
+            let _ = handle.join();
         }
         if let Some(handle) = self.provider_thread.take() {
             let _ = handle.join();
@@ -4900,18 +7623,255 @@ impl AppController {
         self.open_external_url(&url);
     }
 
+    fn selected_local_regular_file(&self) -> Option<PathBuf> {
+        let listing = self.local_listing.as_ref()?;
+        let index = self.local_entry_index()?;
+        let entry = listing.entries.get(index)?;
+        (!entry.is_directory()).then(|| entry.path.clone())
+    }
+
+    fn selected_local_trash_target(&self) -> Option<(PathBuf, PathBuf)> {
+        let listing = self.local_listing.as_ref()?;
+        let index = self.local_entry_index()?;
+        let entry = listing.entries.get(index)?;
+        Some((listing.path.clone(), entry.path.clone()))
+    }
+
+    fn begin_local_rename(&mut self) {
+        let Some(path) = self.selected_local_regular_file() else {
+            self.view.status_line = "Select a local file before renaming".to_owned();
+            return;
+        };
+        let Some(name) = path.file_name() else {
+            self.view.status_line = "The selected file has no basename".to_owned();
+            return;
+        };
+        self.view.local_file_popup = Some(LocalFilePopupView::Rename {
+            value: name.to_string_lossy().into_owned(),
+            error: None,
+        });
+    }
+
+    fn append_local_rename_character(&mut self, character: char) {
+        let Some(LocalFilePopupView::Rename { value, error }) = self.view.local_file_popup.as_mut()
+        else {
+            return;
+        };
+        if value.len().saturating_add(character.len_utf8()) <= 255 {
+            value.push(character);
+            *error = None;
+        }
+    }
+
+    fn delete_local_rename_character(&mut self) {
+        if let Some(LocalFilePopupView::Rename { value, error }) =
+            self.view.local_file_popup.as_mut()
+        {
+            value.pop();
+            *error = None;
+        }
+    }
+
+    fn submit_local_rename(&mut self) {
+        let value = match self.view.local_file_popup.as_ref() {
+            Some(LocalFilePopupView::Rename { value, .. }) => value.clone(),
+            _ => return,
+        };
+        let Some(source) = self.selected_local_regular_file() else {
+            self.view.local_file_popup = None;
+            self.view.status_line = "The selected local file is no longer available".to_owned();
+            return;
+        };
+        #[cfg(not(feature = "local"))]
+        let _ = (&value, &source);
+        #[cfg(feature = "local")]
+        {
+            let mut actions = crate::local_browser::SystemLocalFileActions;
+            match crate::local_browser::rename_local_file(
+                &mut actions,
+                &source,
+                std::ffi::OsStr::new(&value),
+            ) {
+                Ok(target) => {
+                    self.view.local_file_popup = None;
+                    self.view.status_line = format!("Renamed to {}", target.display());
+                    if let Some(directory) = self
+                        .local_listing
+                        .as_ref()
+                        .map(|listing| listing.path.clone())
+                    {
+                        self.browse_local_directory(directory);
+                    }
+                }
+                Err(error) => {
+                    if let Some(LocalFilePopupView::Rename {
+                        error: popup_error, ..
+                    }) = self.view.local_file_popup.as_mut()
+                    {
+                        *popup_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "local"))]
+        if let Some(LocalFilePopupView::Rename {
+            error: popup_error, ..
+        }) = self.view.local_file_popup.as_mut()
+        {
+            *popup_error = Some("this build omits the `local` feature".to_owned());
+        }
+    }
+
+    fn request_local_trash(&mut self) {
+        let Some((_, path)) = self.selected_local_trash_target() else {
+            self.view.status_line =
+                "Select a local file or folder before moving it to Trash".to_owned();
+            return;
+        };
+        self.view.local_file_popup = Some(LocalFilePopupView::Trash {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path: path.display().to_string(),
+            error: None,
+        });
+    }
+
+    /// Removes a confirmed Trash target from the visible snapshot immediately.
+    ///
+    /// The following background refresh remains authoritative, while this
+    /// optimistic update avoids a blank or already-deleted row. Unchanged
+    /// sibling cache entries remain available for identity validation.
+    fn remove_confirmed_local_trash_target(&mut self, source: &Path) -> Option<PathBuf> {
+        let listing = self.local_listing.as_mut()?;
+        let removed_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == source)?;
+        listing.entries.remove(removed_index);
+        let reselected_path = listing
+            .entries
+            .get(removed_index)
+            .or_else(|| {
+                removed_index
+                    .checked_sub(1)
+                    .and_then(|index| listing.entries.get(index))
+            })
+            .map(|entry| entry.path.clone())
+            .or_else(|| listing.parent.clone());
+
+        self.local_folder_size_cache.remove(source);
+        self.local_folder_size_cache_order
+            .retain(|cached_path| cached_path != source);
+        self.local_folder_size_failures.remove(source);
+        self.local_folder_size_failure_order
+            .retain(|failed_path| failed_path != source);
+        self.local_folder_size_queue
+            .retain(|queued_path| queued_path != source);
+        if self.local_folder_size_pending.as_deref() == Some(source) {
+            self.local_folder_size_pending = None;
+        }
+
+        self.select_local_path(reselected_path.as_deref());
+        self.refresh_local_browser_rows();
+        reselected_path
+    }
+
+    fn confirm_local_trash(&mut self) {
+        let Some((directory, source)) = self.selected_local_trash_target() else {
+            self.view.local_file_popup = None;
+            self.view.status_line = "The selected local entry is no longer available".to_owned();
+            return;
+        };
+        #[cfg(not(feature = "local"))]
+        let _ = (&directory, &source);
+        #[cfg(feature = "local")]
+        {
+            let mut actions = crate::local_browser::SystemLocalFileActions;
+            match crate::local_browser::trash_local_entry(&mut actions, &directory, &source) {
+                Ok(()) => {
+                    self.view.local_file_popup = None;
+                    self.view.status_line = format!("Moved {} to system Trash", source.display());
+                    let reselected_path = self.remove_confirmed_local_trash_target(&source);
+                    self.browse_local_directory_with_reselection(directory, reselected_path);
+                }
+                Err(error) => {
+                    if let Some(LocalFilePopupView::Trash {
+                        error: popup_error, ..
+                    }) = self.view.local_file_popup.as_mut()
+                    {
+                        *popup_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "local"))]
+        if let Some(LocalFilePopupView::Trash {
+            error: popup_error, ..
+        }) = self.view.local_file_popup.as_mut()
+        {
+            *popup_error = Some("this build omits the `local` feature".to_owned());
+        }
+    }
+
     fn open_preferences(&mut self) {
         self.view.search_editing = false;
         self.view.help_open = false;
         self.view.text_selection_mode = false;
+        let environment_override = [
+            SUBSCRIPTIONS_LAYOUT_ENV,
+            SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            LOCAL_FOLDER_SIZES_ENV,
+        ]
+        .into_iter()
+        .filter(|variable| std::env::var_os(variable).is_some())
+        .collect::<Vec<_>>()
+        .join(", ");
         self.view.preferences_popup = Some(PreferencesPopupView {
             subscriptions_layout: self.config.ui.subscriptions_layout,
+            skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
+            show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             config_path: self.config.config_file().display().to_string(),
-            environment_override: std::env::var_os(SUBSCRIPTIONS_LAYOUT_ENV)
-                .map(|_| SUBSCRIPTIONS_LAYOUT_ENV.to_owned()),
+            environment_override: (!environment_override.is_empty())
+                .then_some(environment_override),
             validation_error: None,
         });
         self.view.status_line = "Editing Youta preferences".to_owned();
+    }
+
+    /// Persists and applies same-source automatic continuation immediately.
+    fn toggle_autoplay(&mut self) {
+        let autoplay = !self.config.playback.autoplay;
+        if let Err(error) = self.config.save_autoplay(autoplay) {
+            self.show_error("Could not save autoplay", &error);
+            return;
+        }
+        if !autoplay {
+            self.queued_autoplay_resume_origin = None;
+            #[cfg(feature = "tracker-music")]
+            self.cancel_pending_tracker_autoplay();
+        } else if self.current_autoplay_origin.is_none()
+            && let Some(media_id) = self.current_media.clone()
+        {
+            self.current_autoplay_origin = self.autoplay_origin_for_media(&media_id);
+        }
+        self.view.autoplay = autoplay;
+        self.view.status_line =
+            format!("Autoplay {}", if autoplay { "enabled" } else { "disabled" });
+    }
+
+    /// Revokes playback ownership without losing a safe completed extraction.
+    #[cfg(feature = "tracker-music")]
+    fn cancel_pending_tracker_autoplay(&mut self) {
+        let Some(pending) = self.pending_tracker_preparation.as_mut() else {
+            return;
+        };
+        if matches!(&pending.owner, TrackerPreparationOwner::Autoplay(_)) {
+            pending.owner = TrackerPreparationOwner::CanceledAutoplay;
+            self.clear_playback_start_activity();
+        }
     }
 
     fn set_draft_subscriptions_layout(&mut self, layout: SubscriptionsLayout) {
@@ -4928,20 +7888,70 @@ impl AppController {
         preferences.validation_error = None;
     }
 
+    fn toggle_draft_skip_advertisement_chapters(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.skip_advertisement_chapters = !preferences.skip_advertisement_chapters;
+        preferences.validation_error = None;
+    }
+
+    fn toggle_draft_local_folder_sizes(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.show_local_folder_sizes = !preferences.show_local_folder_sizes;
+        preferences.validation_error = None;
+    }
+
+    /// Cycles Local size ordering while retaining the exact selected path.
+    fn toggle_local_size_sort(&mut self) {
+        if self.view.screen != Screen::Local || !self.config.ui.show_local_folder_sizes {
+            return;
+        }
+        let selected_path = self.selected_local_path();
+        self.view.local_size_sort = self.view.local_size_sort.next();
+        self.sort_local_listing();
+        self.select_local_path(selected_path.as_deref());
+        self.refresh_local_browser_rows();
+        self.view
+            .local_size_sort
+            .label()
+            .clone_into(&mut self.view.status_line);
+    }
+
     fn submit_preferences(&mut self) {
         let Some(preferences) = self.view.preferences_popup.as_ref() else {
             return;
         };
         if preferences.environment_override.is_some() {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
-                preferences.validation_error = Some(format!(
-                    "change or remove {SUBSCRIPTIONS_LAYOUT_ENV} before saving"
-                ));
+                preferences.validation_error = Some(
+                    "change or remove the listed environment override before saving".to_owned(),
+                );
             }
             return;
         }
         let layout = preferences.subscriptions_layout;
-        if let Err(error) = self.config.save_subscriptions_layout(layout) {
+        let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
+        let show_local_folder_sizes = preferences.show_local_folder_sizes;
+        let local_folder_size_preference_changed =
+            self.config.ui.show_local_folder_sizes != show_local_folder_sizes;
+        if let Err(error) = self.config.save_tui_preferences(
+            layout,
+            skip_advertisement_chapters,
+            show_local_folder_sizes,
+        ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
             }
@@ -4949,11 +7959,34 @@ impl AppController {
             return;
         }
         self.view.subscriptions.layout = layout;
+        self.view.skip_advertisement_chapters = skip_advertisement_chapters;
+        if local_folder_size_preference_changed {
+            let selected_path = self.selected_local_path();
+            self.invalidate_local_folder_sizes();
+            self.view.local_folder_sizes_enabled = show_local_folder_sizes;
+            if !show_local_folder_sizes {
+                self.view.local_size_sort = LocalSizeSort::Off;
+            }
+            self.sort_local_listing();
+            self.select_local_path(selected_path.as_deref());
+            if self.view.screen == Screen::Local {
+                self.refresh_local_browser_rows();
+            }
+            self.schedule_local_folder_sizes();
+        }
         self.view.preferences_popup = None;
         if self.view.screen == Screen::Subscriptions {
             self.populate_subscriptions();
         }
-        self.view.status_line = format!("Subscriptions layout saved: {}", layout.as_config_value());
+        self.view.status_line = format!(
+            "Preferences saved: subscriptions {}; advertisement skipping {}",
+            layout.as_config_value(),
+            if skip_advertisement_chapters {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     fn toggle_subscription_description(&mut self) {
@@ -5014,6 +8047,19 @@ impl AppController {
     }
 
     fn save_session(&mut self) {
+        if self.view.screen == Screen::Search {
+            self.youtube_search_query
+                .clone_from(&self.view.search_query);
+            self.youtube_selected = self.view.selected;
+        } else if self.view.screen == Screen::YouTubeMusic {
+            self.youtube_music_search_query
+                .clone_from(&self.view.search_query);
+            self.youtube_music_selected = self.view.selected;
+        } else if self.view.screen == Screen::TrackerMusic {
+            self.tracker_search_query
+                .clone_from(&self.view.search_query);
+            self.tracker_selected = self.view.selected;
+        }
         let state = SessionState {
             screen: stored_screen_from_tui(self.view.screen),
             focus: if self.view.details_focused {
@@ -5023,8 +8069,12 @@ impl AppController {
             },
             selected_media: self.current_media.clone(),
             selected_row: self.view.selected,
+            youtube_selected_row: Some(self.youtube_selected),
+            youtube_music_selected_row: Some(self.youtube_music_selected),
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
-            search_text: self.view.search_query.clone(),
+            search_text: self.youtube_search_query.clone(),
+            youtube_music_search_text: self.youtube_music_search_query.clone(),
+            local_path: (!self.view.local_path.is_empty()).then(|| self.view.local_path.clone()),
             waveform_visible: self.view.right_panel_mode == RightPanelMode::Waveform,
             chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
             ..SessionState::default()
@@ -5057,8 +8107,15 @@ impl AppController {
         if let Some(player) = self.player.as_mut() {
             let _ = player.shutdown();
         }
+        self.invalidate_local_folder_sizes();
+        if let Some(sender) = self.local_browse_requests.take() {
+            let _ = sender.send(LocalBrowseRequest::Shutdown);
+        }
         if let Some(sender) = self.provider_requests.take() {
             let _ = sender.send(ProviderRequest::Shutdown);
+        }
+        if let Some(handle) = self.local_browse_thread.take() {
+            let _ = handle.join();
         }
         if let Some(handle) = self.provider_thread.take() {
             let _ = handle.join();
@@ -5272,6 +8329,10 @@ impl UiController for AppController {
             UiAction::ActivateTimecode { media_id, seconds } => {
                 self.activate_timecode(media_id, seconds);
             }
+            UiAction::ActivateDescriptionVideo {
+                video_id,
+                start_seconds,
+            } => self.activate_description_video(video_id, start_seconds),
             UiAction::TogglePause => self.player_command(PlayerCommand::TogglePause),
             UiAction::SeekRelative(seconds) => {
                 self.player_command(PlayerCommand::SeekRelative(seconds));
@@ -5319,6 +8380,8 @@ impl UiController for AppController {
                     );
                 }
             }
+            UiAction::ToggleAutoplay => self.toggle_autoplay(),
+            UiAction::ToggleLocalSizeSort => self.toggle_local_size_sort(),
             UiAction::ToggleWaveform => {
                 self.view.right_panel_mode =
                     if self.view.right_panel_mode == RightPanelMode::Waveform {
@@ -5329,6 +8392,7 @@ impl UiController for AppController {
             }
             UiAction::ShowChannel => self.show_selected_channel(),
             UiAction::GoBack => self.go_back(),
+            UiAction::GoForward => self.go_forward(),
             UiAction::OpenInBrowser => self.open_current_in_browser(),
             UiAction::OpenChannelInBrowser => self.open_current_channel_in_browser(),
             UiAction::CopyLink => {
@@ -5388,10 +8452,28 @@ impl UiController for AppController {
             UiAction::SetSubscriptionsLayout(layout) => {
                 self.set_draft_subscriptions_layout(layout);
             }
+            UiAction::ToggleSkipAdvertisementChapters => {
+                self.toggle_draft_skip_advertisement_chapters();
+            }
+            UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
             UiAction::SubmitPreferences => self.submit_preferences(),
             UiAction::DismissPreferences => {
                 self.view.preferences_popup = None;
                 self.view.status_line = "Preferences were not changed".to_owned();
+            }
+            UiAction::BeginLocalRename => self.begin_local_rename(),
+            UiAction::AppendLocalRenameCharacter(character) => {
+                self.append_local_rename_character(character);
+            }
+            UiAction::DeleteLocalRenameCharacter => {
+                self.delete_local_rename_character();
+            }
+            UiAction::SubmitLocalRename => self.submit_local_rename(),
+            UiAction::RequestLocalTrash => self.request_local_trash(),
+            UiAction::ConfirmLocalTrash => self.confirm_local_trash(),
+            UiAction::DismissLocalFilePopup => {
+                self.view.local_file_popup = None;
+                self.view.status_line = "Local file was not changed".to_owned();
             }
             UiAction::SelectSubscriptionSource(index) => {
                 self.view.details_focused = false;
@@ -5413,6 +8495,23 @@ impl UiController for AppController {
     fn tick(&mut self) {
         if self.diagnostic_only {
             return;
+        }
+        loop {
+            match self.local_browse_responses.try_recv() {
+                Ok(response) => self.handle_local_browse_response(response),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.view.local_browse_pending = false;
+                    if !self.local_browse_disconnect_reported {
+                        self.local_browse_disconnect_reported = true;
+                        self.show_error_message(
+                            "Local browser worker stopped",
+                            "the background Local browser channel disconnected unexpectedly",
+                        );
+                    }
+                    break;
+                }
+            }
         }
         loop {
             match self.provider_responses.try_recv() {
@@ -5449,6 +8548,35 @@ impl Drop for AppController {
     }
 }
 
+/// Runs foreground Local listings independently of recursive and remote work.
+fn local_browse_worker(
+    requests: Receiver<LocalBrowseRequest>,
+    responses: Sender<LocalBrowseResponse>,
+) {
+    while let Ok(request) = requests.recv() {
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+        } = request
+        else {
+            break;
+        };
+        let result = crate::local_browser::list_local_directory_with_preferred_child(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+        )
+        .map_err(|error| error.to_string());
+        if responses
+            .send(LocalBrowseResponse { generation, result })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 fn provider_worker(
     provider: Option<Box<dyn Provider>>,
     requests: Receiver<ProviderRequest>,
@@ -5456,6 +8584,8 @@ fn provider_worker(
     allow_insecure_http: bool,
     mod_archive_api_key: Option<String>,
     jamendo_client_id: Option<String>,
+    #[cfg(feature = "youtube-music")] youtube_music_executable: PathBuf,
+    provider_storage_root: PathBuf,
 ) {
     let mut provider = provider;
     #[cfg(feature = "apple-podcasts")]
@@ -5472,12 +8602,38 @@ fn provider_worker(
     #[cfg(feature = "tracker-music")]
     let tracker = crate::providers::tracker::TrackerArchiveHub::new(allow_insecure_http);
     #[cfg(feature = "tracker-music")]
+    let mut tracker_preparer = {
+        let limits = crate::tracker_media::TrackerMediaLimits::default();
+        crate::tracker_media::UreqTrackerTransport::for_limits(
+            crate::providers::DEFAULT_REQUEST_TIMEOUT,
+            limits,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|transport| {
+            crate::tracker_media::TrackerMediaPreparer::new(
+                &provider_storage_root,
+                transport,
+                limits,
+            )
+            .map_err(|error| error.to_string())
+        })
+    };
+    #[cfg(feature = "tracker-music")]
     let mod_archive = mod_archive_api_key
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
+    #[cfg(feature = "youtube-music")]
+    let youtube_music = YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
+        executable: youtube_music_executable,
+        ..YouTubeMusicSearchConfig::default()
+    });
     #[cfg(not(feature = "tracker-music"))]
-    let _ = (allow_insecure_http, mod_archive_api_key);
+    let _ = (
+        allow_insecure_http,
+        mod_archive_api_key,
+        provider_storage_root,
+    );
     #[cfg(not(feature = "jamendo"))]
     let _ = jamendo_client_id;
 
@@ -5500,6 +8656,22 @@ fn provider_worker(
                     .send(ProviderResponse::Search {
                         generation,
                         request,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "youtube-music")]
+            ProviderRequest::YouTubeMusicSearch { generation, query } => {
+                let result = youtube_music
+                    .search(&query, 30)
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::YouTubeMusicSearch {
+                        generation,
+                        query,
                         result,
                     })
                     .is_err()
@@ -5706,7 +8878,10 @@ fn provider_worker(
                                             )
                                         ),
                                         webpage_url: module.webpage_url,
-                                        playback_url: Some(module.download_url),
+                                        download_url: Some(module.download_url),
+                                        expected_format: Some(module.format),
+                                        access: TrackerAccess::DirectModule,
+                                        prepared_path: None,
                                         insecure_transport: false,
                                     })
                                     .collect()
@@ -5769,12 +8944,114 @@ fn provider_worker(
                     break;
                 }
             }
+            #[cfg(feature = "tracker-music")]
+            ProviderRequest::PrepareTracker {
+                generation,
+                item_key,
+                request,
+            } => {
+                let result = match tracker_preparer.as_mut() {
+                    Ok(preparer) => preparer
+                        .prepare(&request)
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.clone()),
+                };
+                if responses
+                    .send(ProviderResponse::TrackerPrepared {
+                        generation,
+                        item_key,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ProviderRequest::ScanLocal { generation, root } => {
                 let result = scan_local_media(&root);
                 if responses
                     .send(ProviderResponse::LocalScan {
                         generation,
                         root,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            ProviderRequest::LocalArtwork {
+                generation,
+                path,
+                cache_directory,
+                kind,
+            } => {
+                let result = match kind {
+                    LocalArtworkKind::EmbeddedMedia => {
+                        crate::thumbnails::cached_local_artwork(&path, &cache_directory)
+                            .map_err(|error| error.to_string())
+                    }
+                    LocalArtworkKind::FolderCover => {
+                        crate::local_browser::find_local_folder_cover(&path)
+                            .map(|cover| {
+                                cover.and_then(|cover| url::Url::from_file_path(cover).ok())
+                            })
+                            .map_err(|error| error.to_string())
+                    }
+                };
+                if responses
+                    .send(ProviderResponse::LocalArtwork {
+                        generation,
+                        path,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ProviderRequest::LocalFolderSize {
+                generation,
+                path,
+                cancellation,
+                cached,
+            } => {
+                let cancelled = || cancellation.load(AtomicOrdering::Relaxed) != generation;
+                let reusable = (!cancelled())
+                    .then_some(cached)
+                    .flatten()
+                    .filter(|measurement| {
+                        crate::local_browser::local_directory_identity(&path)
+                            .is_ok_and(|identity| identity == measurement.identity)
+                    });
+                let result = reusable
+                    .map_or_else(
+                        || {
+                            crate::local_browser::measure_local_folder_size(
+                                &path,
+                                crate::local_browser::LocalFolderSizeLimits::default(),
+                                cancelled,
+                            )
+                            .map(|measurement| {
+                                LocalFolderSizeWorkerResult {
+                                    measurement,
+                                    reused: false,
+                                }
+                            })
+                        },
+                        |measurement| {
+                            Ok(LocalFolderSizeWorkerResult {
+                                measurement,
+                                reused: true,
+                            })
+                        },
+                    )
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::LocalFolderSize {
+                        generation,
+                        path,
                         result,
                     })
                     .is_err()
@@ -6199,7 +9476,8 @@ fn jamendo_track_id(url: &url::Url) -> Result<String, String> {
 
 #[cfg(feature = "tracker-music")]
 fn tracker_item_from_provider(item: crate::providers::tracker::TrackerSearchResult) -> TrackerItem {
-    let playback_url = item.direct_play_url().cloned();
+    use crate::providers::tracker::TrackerMediaAccess;
+
     TrackerItem {
         source: item.source.descriptor().display_name.to_owned(),
         title: item.title,
@@ -6213,7 +9491,15 @@ fn tracker_item_from_provider(item: crate::providers::tracker::TrackerSearchResu
                 .map_or_else(String::new, |size| format!(" · {}", human_bytes(size)))
         ),
         webpage_url: item.webpage_url,
-        playback_url,
+        download_url: item.download_url,
+        expected_format: item.format,
+        access: match item.access {
+            TrackerMediaAccess::DirectModule => TrackerAccess::DirectModule,
+            TrackerMediaAccess::ArchiveNeedsInspection => TrackerAccess::ArchiveNeedsInspection,
+            TrackerMediaAccess::MetadataOnly => TrackerAccess::MetadataOnly,
+            TrackerMediaAccess::Directory => TrackerAccess::Directory,
+        },
+        prepared_path: None,
         insecure_transport: item.insecure_transport,
     }
 }
@@ -6238,6 +9524,10 @@ fn local_media_item(path: PathBuf) -> LocalMediaItem {
         title,
         artist: None,
         album: None,
+        genre: None,
+        comment: None,
+        metadata_url: None,
+        acoustid_id: None,
         duration_seconds: None,
         size_bytes,
         codec,
@@ -6250,12 +9540,45 @@ fn local_media_item(path: PathBuf) -> LocalMediaItem {
     item
 }
 
+/// Selects `~/Music` when it exists, otherwise the user's home directory.
+fn default_local_browse_root() -> PathBuf {
+    directories::BaseDirs::new().map_or_else(
+        || PathBuf::from("."),
+        |directories| {
+            let music = directories.home_dir().join("Music");
+            if music.is_dir() {
+                music
+            } else {
+                directories.home_dir().to_owned()
+            }
+        },
+    )
+}
+
 #[cfg(feature = "local")]
 fn read_local_tags(item: &mut LocalMediaItem) {
+    use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
-    use lofty::tag::Accessor;
+    use lofty::probe::Probe;
+    use lofty::tag::{Accessor, ItemKey};
 
-    let Ok(tagged) = lofty::read_from_path(&item.path) else {
+    if item
+        .path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+        && read_local_flac_tags(item)
+    {
+        return;
+    }
+
+    let options = ParseOptions::new()
+        .read_properties(true)
+        .read_cover_art(false);
+    let Ok(tagged) = Probe::open(&item.path)
+        .map(|probe| probe.options(options))
+        .and_then(Probe::read)
+    else {
         return;
     };
     let properties = tagged.properties();
@@ -6267,25 +9590,101 @@ fn read_local_tags(item: &mut LocalMediaItem) {
     item.codec = format!("{:?}", tagged.file_type());
 
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        if let Some(title) = tag.title().map(|title| title.into_owned())
-            && !title.trim().is_empty()
-        {
+        if let Some(title) = trimmed_tag_value(tag.title().as_deref()) {
             item.title = title;
         }
-        item.artist = tag
-            .artist()
-            .map(|artist| artist.into_owned())
-            .filter(|artist| !artist.trim().is_empty());
-        item.album = tag
-            .album()
-            .map(|album| album.into_owned())
-            .filter(|album| !album.trim().is_empty());
-        item.embedded_artwork = !tag.pictures().is_empty();
+        item.artist = trimmed_tag_value(tag.get_string(ItemKey::TrackArtists))
+            .or_else(|| trimmed_tag_value(tag.artist().as_deref()));
+        item.album = trimmed_tag_value(tag.album().as_deref());
+        item.genre = trimmed_tag_value(tag.genre().as_deref());
+        item.comment = trimmed_tag_value(tag.comment().as_deref());
+        item.metadata_url = local_standard_tag_url(tag);
+        item.acoustid_id = trimmed_tag_value(tag.get_string(ItemKey::AcoustId));
     }
 }
 
 #[cfg(not(feature = "local"))]
 fn read_local_tags(_item: &mut LocalMediaItem) {}
+
+#[cfg(feature = "local")]
+fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+
+    let Ok(mut file) = std::fs::File::open(&item.path) else {
+        return false;
+    };
+    let options = ParseOptions::new()
+        .read_properties(true)
+        .read_cover_art(false);
+    let Ok(flac) = FlacFile::read_from(&mut file, options) else {
+        return false;
+    };
+    let properties = flac.properties();
+    item.duration_seconds =
+        (!properties.duration().is_zero()).then(|| properties.duration().as_secs());
+    item.bitrate_kbps = (properties.audio_bitrate() > 0)
+        .then(|| properties.audio_bitrate())
+        .or_else(|| (properties.overall_bitrate() > 0).then(|| properties.overall_bitrate()));
+    item.sample_rate_hz = (properties.sample_rate() > 0).then(|| properties.sample_rate());
+    item.channels = (properties.channels() > 0).then(|| properties.channels());
+    item.codec = "FLAC".to_owned();
+
+    if let Some(tag) = flac.vorbis_comments() {
+        apply_local_vorbis_comments(item, tag);
+    }
+    true
+}
+
+#[cfg(feature = "local")]
+fn apply_local_vorbis_comments(item: &mut LocalMediaItem, tag: &lofty::ogg::VorbisComments) {
+    if let Some(title) = trimmed_tag_value(tag.get("TITLE")) {
+        item.title = title;
+    }
+    item.artist = joined_tag_values(tag.get_all("ARTISTS"))
+        .or_else(|| joined_tag_values(tag.get_all("ARTIST")));
+    item.album = trimmed_tag_value(tag.get("ALBUM"));
+    item.genre = joined_tag_values(tag.get_all("GENRE"));
+    item.comment = joined_tag_values(tag.get_all("COMMENT"));
+    item.metadata_url = trimmed_tag_value(tag.get("URL"));
+    item.acoustid_id = trimmed_tag_value(tag.get("ACOUSTID_ID"));
+}
+
+#[cfg(feature = "local")]
+fn trimmed_tag_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(feature = "local")]
+fn joined_tag_values<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let values = values
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
+#[cfg(feature = "local")]
+fn local_standard_tag_url(tag: &lofty::tag::Tag) -> Option<String> {
+    use lofty::tag::ItemKey;
+
+    [
+        ItemKey::AudioFileUrl,
+        ItemKey::AudioSourceUrl,
+        ItemKey::TrackArtistUrl,
+        ItemKey::PublisherUrl,
+        ItemKey::CommercialInformationUrl,
+        ItemKey::CopyrightUrl,
+        ItemKey::PodcastUrl,
+        ItemKey::RadioStationUrl,
+    ]
+    .into_iter()
+    .find_map(|key| trimmed_tag_value(tag.get_string(key)))
+}
 
 fn local_media_subtitle(item: &LocalMediaItem) -> String {
     let mut fields = Vec::new();
@@ -6313,6 +9712,42 @@ fn local_media_subtitle(item: &LocalMediaItem) -> String {
         fields.push("embedded artwork".to_owned());
     }
     fields.join(" · ")
+}
+
+/// Formats human and technical metadata for one playable Local Details panel.
+fn local_media_description(item: &LocalMediaItem) -> String {
+    let mut lines = vec![format!("Full path: {}", item.path.display())];
+    if let Some(artist) = &item.artist {
+        lines.push(format!("Artists: {artist}"));
+    }
+    if let Some(album) = &item.album {
+        lines.push(format!("Album: {album}"));
+    }
+    if let Some(genre) = &item.genre {
+        lines.push(format!("Genre: {genre}"));
+    }
+    if let Some(comment) = &item.comment {
+        lines.push(format!("Comment: {comment}"));
+    }
+    if let Some(url) = &item.metadata_url {
+        lines.push(format!("URL: {url}"));
+    }
+    if let Some(acoustid_id) = &item.acoustid_id {
+        lines.push("Identifiers:".to_owned());
+        lines.push(format!("AcoustID ID: {acoustid_id}"));
+    }
+    lines.push(format!("Codec: {}", item.codec));
+    lines.push(format!("Size: {}", human_bytes(item.size_bytes)));
+    if let Some(value) = item.bitrate_kbps {
+        lines.push(format!("Bitrate: {value} kb/s"));
+    }
+    if let Some(value) = item.sample_rate_hz {
+        lines.push(format!("Sample rate: {value} Hz"));
+    }
+    if let Some(value) = item.channels {
+        lines.push(format!("Channels: {value}"));
+    }
+    lines.join("\n")
 }
 
 fn scan_local_media(root: &Path) -> Result<Vec<LocalMediaItem>, String> {
@@ -6365,6 +9800,8 @@ fn scan_local_media(root: &Path) -> Result<Vec<LocalMediaItem>, String> {
 enum SearchRowContext {
     /// A cross-channel result on the global Search screen.
     GlobalSearch,
+    /// A playable track returned by the dedicated `YouTube Music` tab.
+    YouTubeMusic,
     /// A video inside one locally subscribed channel's feed.
     SubscriptionFeed,
 }
@@ -6389,18 +9826,23 @@ fn row_from_search_item(
                     .get(&video.channel_id)
                     .copied()
                     .flatten(),
-                SearchRowContext::SubscriptionFeed => None,
+                SearchRowContext::YouTubeMusic | SearchRowContext::SubscriptionFeed => None,
             };
             RowView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
                 title: video.title.clone(),
                 subtitle: youtube_video_row_subtitle(video, subscriber_count, context, today),
-                source: "YouTube".to_owned(),
+                source: if matches!(context, SearchRowContext::YouTubeMusic) {
+                    "YouTube Music".to_owned()
+                } else {
+                    "YouTube".to_owned()
+                },
                 watched_percent: progress.map_or(0, |value| value.watched_percent()),
                 subscribed: matches!(context, SearchRowContext::GlobalSearch)
                     && subscriptions.contains_youtube_channel(&video.channel_id),
                 thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
                 vertical: video.orientation == VideoOrientation::Vertical,
+                compact: false,
             }
         }
         SearchItem::Channel(channel) => RowView {
@@ -6430,7 +9872,11 @@ fn youtube_video_row_subtitle(
 ) -> String {
     let mut fields = Vec::with_capacity(4);
     let channel_name = video.channel_name.trim();
-    if matches!(context, SearchRowContext::GlobalSearch) && !channel_name.is_empty() {
+    if matches!(
+        context,
+        SearchRowContext::GlobalSearch | SearchRowContext::YouTubeMusic
+    ) && !channel_name.is_empty()
+    {
         fields.push(channel_name.to_owned());
     }
     if matches!(context, SearchRowContext::GlobalSearch)
@@ -6450,10 +9896,39 @@ fn youtube_video_row_subtitle(
     fields.join(" · ")
 }
 
+#[cfg(feature = "youtube-music")]
+fn search_item_from_youtube_music_track(track: YouTubeMusicTrack) -> SearchItem {
+    SearchItem::Video(VideoSummary {
+        video_id: track.video_id,
+        title: track.title,
+        channel_name: track.artist.unwrap_or_else(|| "YouTube Music".to_owned()),
+        channel_id: String::new(),
+        description: String::new(),
+        duration_seconds: track.duration_seconds,
+        view_count: None,
+        published_at: None,
+        published_text: None,
+        live: false,
+        orientation: VideoOrientation::Unknown,
+        thumbnails: vec![Thumbnail {
+            url: track.thumbnail_url,
+            quality: Some("YouTube Music search".to_owned()),
+            width: None,
+            height: None,
+        }],
+        webpage_url: Some(track.webpage_url),
+        stream_url: None,
+    })
+}
+
 /// Returns bounded, clickable timestamp spans for a Details description.
 fn detail_timecodes(description: &str) -> Vec<DetailTimecodeView> {
     const MAX_DESCRIPTION_TIMECODES: usize = 512;
 
+    let chapter_timestamps = parse_description_chapters(description, None)
+        .into_iter()
+        .map(|chapter| (chapter.timestamp_start_byte, chapter.timestamp_end_byte))
+        .collect::<HashSet<_>>();
     parse_description_links(description)
         .into_iter()
         .filter_map(|link| match link.target {
@@ -6461,10 +9936,27 @@ fn detail_timecodes(description: &str) -> Vec<DetailTimecodeView> {
                 start_byte: link.start_byte,
                 end_byte: link.end_byte,
                 seconds,
+                is_chapter: chapter_timestamps.contains(&(link.start_byte, link.end_byte)),
             }),
             _ => None,
         })
         .take(MAX_DESCRIPTION_TIMECODES)
+        .collect()
+}
+
+/// Returns bounded internal actions for `YouTube` video URLs in Details text.
+fn detail_video_links(description: &str) -> Vec<DetailVideoLinkView> {
+    const MAX_DESCRIPTION_VIDEO_LINKS: usize = 256;
+
+    parse_description_video_links(description)
+        .into_iter()
+        .take(MAX_DESCRIPTION_VIDEO_LINKS)
+        .map(|link| DetailVideoLinkView {
+            start_byte: link.start_byte,
+            end_byte: link.end_byte,
+            video_id: link.video_id,
+            start_seconds: link.start_seconds,
+        })
         .collect()
 }
 
@@ -6499,6 +9991,7 @@ fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> De
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
                 timecodes: detail_timecodes(&description),
+                video_links: detail_video_links(&description),
                 description,
                 views: video
                     .view_count
@@ -6708,6 +10201,7 @@ fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> 
             .duration_seconds
             .map_or_else(|| "unknown".to_owned(), format_seconds),
         timecodes: detail_timecodes(&description),
+        video_links: detail_video_links(&description),
         description,
         likes: video
             .like_count
@@ -6727,6 +10221,7 @@ fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> 
         wikidata: "not loaded (lazy)".to_owned(),
         thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
         links: Vec::new(),
+        ..DetailView::default()
     }
 }
 
@@ -6742,6 +10237,7 @@ fn detail_from_media_item(media: &MediaItem) -> DetailView {
             .map_or_else(String::new, format_seconds),
         description: description.clone(),
         timecodes: detail_timecodes(&description),
+        video_links: detail_video_links(&description),
         likes: media
             .statistics
             .likes
@@ -6888,6 +10384,11 @@ fn search_item_url(item: &SearchItem) -> Option<String> {
 fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
     match screen {
         Screen::Search => StoredScreen::Search,
+        #[cfg(feature = "youtube-music")]
+        Screen::YouTubeMusic => StoredScreen::YouTubeMusic,
+        #[cfg(not(feature = "youtube-music"))]
+        Screen::YouTubeMusic => StoredScreen::Search,
+        Screen::Local => StoredScreen::Local,
         Screen::Subscriptions => StoredScreen::Subscriptions,
         Screen::Downloaded => StoredScreen::Downloaded,
         Screen::History => StoredScreen::History,
@@ -6900,6 +10401,11 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
 fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
     match screen {
         StoredScreen::Search => Screen::Search,
+        #[cfg(feature = "youtube-music")]
+        StoredScreen::YouTubeMusic => Screen::YouTubeMusic,
+        #[cfg(not(feature = "youtube-music"))]
+        StoredScreen::YouTubeMusic => Screen::Search,
+        StoredScreen::Local => Screen::Local,
         StoredScreen::Subscriptions => Screen::Subscriptions,
         StoredScreen::Downloaded => Screen::Downloaded,
         StoredScreen::History => Screen::History,
@@ -7070,6 +10576,23 @@ fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) ->
     }
 }
 
+/// Returns whether a YouTube result can start without representing a scheduled
+/// zero-duration placeholder.
+fn video_is_autoplay_playable(video: &VideoSummary) -> bool {
+    video.duration_seconds != Some(0) || video.live
+}
+
+/// Matches the stable local path encoded in a queue media identifier.
+fn local_path_matches_media_id(path: &Path, media_id: &MediaId) -> bool {
+    media_id.source == SourceKind::Local && path.display().to_string() == media_id.external_id
+}
+
+/// Matches a prepared tracker row without relying on a possibly duplicated
+/// extracted filename.
+fn tracker_item_matches_media_id(item: &TrackerItem, media_id: &MediaId) -> bool {
+    media_id.source == SourceKind::ModArchive && item.webpage_url.as_str() == media_id.external_id
+}
+
 fn queue_item_from_direct(direct: &DirectSourceInput) -> QueueItem {
     QueueItem {
         media: MediaItem {
@@ -7154,9 +10677,21 @@ fn queue_item_from_local(item: &LocalMediaItem) -> Result<QueueItem, String> {
 }
 
 fn queue_item_from_tracker(item: &TrackerItem) -> Result<QueueItem, String> {
-    let playback_url = item.playback_url.as_ref().ok_or_else(|| {
-        "This tracker result exposes metadata only; open its source page to inspect it".to_owned()
-    })?;
+    let prepared_path = item
+        .prepared_path
+        .as_ref()
+        .ok_or_else(|| match item.access {
+            TrackerAccess::MetadataOnly => {
+                "This tracker result exposes metadata only; press o to open its source page"
+                    .to_owned()
+            }
+            TrackerAccess::Directory => {
+                "This tracker result is a directory and cannot be played".to_owned()
+            }
+            TrackerAccess::DirectModule | TrackerAccess::ArchiveNeedsInspection => {
+                "This tracker result must be prepared before playback".to_owned()
+            }
+        })?;
     Ok(QueueItem {
         media: MediaItem {
             id: MediaId::new(SourceKind::ModArchive, item.webpage_url.to_string()),
@@ -7173,7 +10708,7 @@ fn queue_item_from_tracker(item: &TrackerItem) -> Result<QueueItem, String> {
             chapters: Vec::new(),
             captions: Vec::new(),
         },
-        playback_location: playback_url.to_string(),
+        playback_location: prepared_path.display().to_string(),
         start_at_seconds: None,
         added_at: unix_time(),
     })
@@ -7429,6 +10964,39 @@ fn playback_before_start_message(end: &PlaybackEnd) -> String {
     )
 }
 
+fn playback_before_start_message_for_media(end: &PlaybackEnd, tracker_module: bool) -> String {
+    let message = playback_before_start_message(end);
+    if tracker_module && playback_end_reports_unsupported_format(end) {
+        tracker_decoder_help(&message)
+    } else {
+        message
+    }
+}
+
+fn playback_end_reports_unsupported_format(end: &PlaybackEnd) -> bool {
+    [
+        end.error.as_deref(),
+        end.file_error.as_deref(),
+        end.diagnostic.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_ascii_lowercase)
+    .any(|message| {
+        message.contains("unrecognized file format")
+            || message.contains("unsupported format")
+            || message.contains("no audio or video streams selected")
+    })
+}
+
+fn tracker_decoder_help(details: &str) -> String {
+    format!(
+        "The selected tracker module was downloaded and inspected correctly, but this mpv/FFmpeg \
+         build cannot decode it. On Gentoo, enable tracker-module support (typically FFmpeg's \
+         `openmpt` USE flag), rebuild FFmpeg/mpv, then retry.\n\n{details}"
+    )
+}
+
 fn playback_end_details(end: &PlaybackEnd) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(error) = end.error.as_deref() {
@@ -7508,6 +11076,15 @@ mod tests {
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
+        }
+    }
+
+    fn linked_video_details(video_id: &str, title: &str, description: &str) -> VideoDetails {
+        VideoDetails {
+            video_id: video_id.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            ..subscription_video_details(title)
         }
     }
 
@@ -7844,6 +11421,83 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "youtube-music")]
+    #[test]
+    fn saved_youtube_music_search_restores_screen_query_rows_selection_and_drops_streams() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let music_video = |video_id: &str, title: &str| {
+            let mut video = subscription_video_summary();
+            video.video_id = video_id.to_owned();
+            video.title = title.to_owned();
+            video.webpage_url = Some(
+                url::Url::parse(&format!("https://music.youtube.com/watch?v={video_id}"))
+                    .expect("fixture music URL"),
+            );
+            video.stream_url = Some(
+                url::Url::parse(&format!("https://streams.example/{video_id}.opus"))
+                    .expect("fixture expiring stream URL"),
+            );
+            SearchItem::Video(video)
+        };
+        let saved_search = SavedYouTubeMusicSearch {
+            query: "restored music fixture".to_owned(),
+            results: vec![
+                music_video("dQw4w9WgXcQ", "First restored track"),
+                music_video("aqz-KE-bpKQ", "Selected restored track"),
+            ],
+        };
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            store
+                .save_session(
+                    &SessionState {
+                        screen: StoredScreen::YouTubeMusic,
+                        selected_row: 1,
+                        youtube_music_selected_row: Some(1),
+                        youtube_music_search_text: "stale session music query".to_owned(),
+                        ..SessionState::default()
+                    },
+                    1,
+                )
+                .expect("save session");
+            store
+                .save_youtube_music_search(&saved_search, 2)
+                .expect("save YouTube Music search");
+        }
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let controller = AppController::new(config, store, None, None);
+
+        assert_eq!(controller.view.screen, Screen::YouTubeMusic);
+        assert_eq!(controller.view.search_query, saved_search.query);
+        assert_eq!(controller.youtube_music_search_query, saved_search.query);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.youtube_music_selected, 1);
+        assert_eq!(controller.view.rows.len(), 2);
+        assert_eq!(controller.view.rows[0].title, "First restored track");
+        assert_eq!(controller.view.rows[1].title, "Selected restored track");
+        assert!(
+            controller.youtube_music_results.iter().all(|item| {
+                matches!(item, SearchItem::Video(video) if video.stream_url.is_none())
+            }),
+            "restart-safe rows must discard every expiring direct stream URL"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Selected restored track")
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "2 saved YouTube Music tracks restored"
+        );
+        assert_eq!(controller.view.search_activity, None);
+    }
+
     #[test]
     fn youtube_detail_conversion_formats_counts_and_fallback_publication_dates() {
         let summary = VideoSummary {
@@ -7917,6 +11571,7 @@ mod tests {
             description: "Channel description".to_owned(),
             subscriber_count: Some(10),
             video_count: Some(2),
+            created_at: None,
             auto_generated: false,
             thumbnails: Vec::new(),
             webpage_url: Some(
@@ -8003,6 +11658,243 @@ mod tests {
         );
         assert_eq!(item.media.chapters[1].end_seconds, Some(3_771));
         assert_eq!(item.media.chapters[2].end_seconds, Some(4_000));
+    }
+
+    #[test]
+    fn description_video_navigation_restores_nested_details_and_clears_forward_history() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, _captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        let mut first = subscription_video_summary();
+        first.title = "First list row".to_owned();
+        let mut origin = subscription_video_summary();
+        origin.video_id = "aaaaaaaaaaa".to_owned();
+        origin.title = "Origin list row".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first), SearchItem::Video(origin.clone())];
+        controller.refresh_youtube_rows();
+        controller.view.selected = 1;
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, &origin.video_id)),
+            title: "Original Details".to_owned(),
+            description: "Original long description".to_owned(),
+            ..DetailView::default()
+        });
+        controller.view.details_scroll = 7;
+
+        controller.dispatch(UiAction::ActivateDescriptionVideo {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            start_seconds: Some(45),
+        });
+        let first_generation = controller.details_generation;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: first_generation,
+            result: Ok(linked_video_details(
+                "dQw4w9WgXcQ",
+                "Linked A",
+                "Nested https://youtu.be/9bZkp7q19f0?t=12",
+            )),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Linked A")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.video_links.len()),
+            Some(1)
+        );
+        assert_eq!(
+            controller.current_url().as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=45")
+        );
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.view.screen, Screen::Search);
+        controller.view.details_scroll = 4;
+
+        controller.dispatch(UiAction::ActivateDescriptionVideo {
+            video_id: "9bZkp7q19f0".to_owned(),
+            start_seconds: Some(12),
+        });
+        let second_generation = controller.details_generation;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: second_generation,
+            result: Ok(linked_video_details(
+                "9bZkp7q19f0",
+                "Linked B",
+                "Nested destination",
+            )),
+        });
+        assert_eq!(controller.detail_navigation_back.len(), 2);
+        assert!(controller.detail_navigation_forward.is_empty());
+
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Linked A")
+        );
+        assert_eq!(controller.view.details_scroll, 4);
+        assert_eq!(
+            controller
+                .active_description_video
+                .as_ref()
+                .map(|linked| (linked.video_id.as_str(), linked.start_seconds)),
+            Some(("dQw4w9WgXcQ", Some(45)))
+        );
+
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Original Details")
+        );
+        assert_eq!(controller.view.details_scroll, 7);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert!(controller.active_description_video.is_none());
+
+        controller.dispatch(UiAction::GoForward);
+        controller.dispatch(UiAction::GoForward);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Linked B")
+        );
+        assert_eq!(
+            controller
+                .active_description_video
+                .as_ref()
+                .map(|linked| linked.video_id.as_str()),
+            Some("9bZkp7q19f0")
+        );
+
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(controller.detail_navigation_forward.len(), 1);
+        controller.dispatch(UiAction::ActivateDescriptionVideo {
+            video_id: "M7lc1UVf-VE".to_owned(),
+            start_seconds: None,
+        });
+        assert!(
+            controller.detail_navigation_forward.is_empty(),
+            "a new nested navigation must discard the old forward branch"
+        );
+        assert_eq!(
+            controller
+                .active_description_video
+                .as_ref()
+                .map(|linked| linked.video_id.as_str()),
+            Some("M7lc1UVf-VE")
+        );
+    }
+
+    #[test]
+    fn description_video_navigation_history_is_bounded() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, _captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.details = Some(DetailView {
+            title: "Starting Details".to_owned(),
+            ..DetailView::default()
+        });
+
+        for index in 0..MAX_DETAIL_NAVIGATION_HISTORY.saturating_add(5) {
+            controller.dispatch(UiAction::ActivateDescriptionVideo {
+                video_id: format!("A{index:010}"),
+                start_seconds: None,
+            });
+        }
+
+        assert_eq!(
+            controller.detail_navigation_back.len(),
+            MAX_DETAIL_NAVIGATION_HISTORY
+        );
+        assert!(controller.detail_navigation_forward.is_empty());
+    }
+
+    #[test]
+    fn forwarding_to_a_pending_link_reissues_details_and_rejects_the_stale_response() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, _captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.details = Some(DetailView {
+            title: "Origin".to_owned(),
+            description: "Origin description".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::ActivateDescriptionVideo {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            start_seconds: None,
+        });
+        let stale_generation = controller.details_generation;
+        controller.dispatch(UiAction::GoBack);
+        controller.dispatch(UiAction::GoForward);
+        let resumed_generation = controller.details_generation;
+        assert_ne!(resumed_generation, stale_generation);
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: stale_generation,
+            result: Ok(linked_video_details(
+                "dQw4w9WgXcQ",
+                "Stale response",
+                "stale",
+            )),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some(LINKED_VIDEO_LOADING_TITLE)
+        );
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: resumed_generation,
+            result: Ok(linked_video_details(
+                "dQw4w9WgXcQ",
+                "Resumed response",
+                "fresh",
+            )),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Resumed response")
+        );
     }
 
     #[test]
@@ -8286,6 +12178,58 @@ mod tests {
             }),
         });
         assert_eq!(controller.view.subscriptions.items.len(), 1);
+    }
+
+    #[test]
+    fn subscription_feed_hides_zero_duration_non_live_placeholders() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let mut planned = subscription_video_summary();
+        planned.video_id = "planned0000".to_owned();
+        planned.title = "Scheduled stream".to_owned();
+        planned.duration_seconds = Some(0);
+        planned.live = false;
+        let mut live = subscription_video_summary();
+        live.video_id = "live0000000".to_owned();
+        live.title = "Live now".to_owned();
+        live.duration_seconds = Some(0);
+        live.live = true;
+        let playable = subscription_video_summary();
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(planned),
+                    SearchItem::Video(live),
+                    SearchItem::Video(playable),
+                ],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Live now", "Fixture video"]
+        );
     }
 
     #[test]
@@ -8651,6 +12595,8 @@ mod tests {
             panic!("expected channel details request");
         };
         assert_eq!(channel_id, "UCfixture");
+        let channel_artwork =
+            url::Url::parse("https://yt3.ggpht.com/provider-channel=s800").expect("artwork URL");
 
         controller.handle_provider_response(ProviderResponse::ChannelDetails {
             generation,
@@ -8662,8 +12608,14 @@ mod tests {
                 description: "Complete public channel description".to_owned(),
                 subscriber_count: Some(1_850_000),
                 video_count: Some(412),
+                created_at: None,
                 auto_generated: false,
-                thumbnails: Vec::new(),
+                thumbnails: vec![Thumbnail {
+                    url: channel_artwork.clone(),
+                    quality: Some("high".to_owned()),
+                    width: Some(800),
+                    height: Some(800),
+                }],
                 webpage_url: Some(
                     url::Url::parse("https://www.youtube.com/@fixture")
                         .expect("fixture channel URL"),
@@ -8679,6 +12631,13 @@ mod tests {
             controller.view.subscriptions.source_subscriber_count,
             Some(1_850_000)
         );
+        assert_eq!(
+            controller.view.subscriptions.sources[0]
+                .thumbnail_url
+                .as_ref(),
+            Some(&channel_artwork),
+            "new channel metadata must join the subscription-artwork prefetch backlog"
+        );
 
         controller.select_subscription_source(0);
         assert!(
@@ -8686,6 +12645,94 @@ mod tests {
             "a process-local cache hit must not schedule another provider request"
         );
         assert!(captured_requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscription_sources_restore_persisted_artwork_before_channel_switches() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
+        let first_artwork =
+            url::Url::parse("https://yt3.ggpht.com/first-channel=s800").expect("first artwork URL");
+        let second_artwork = url::Url::parse("https://yt3.ggpht.com/second-channel=s800")
+            .expect("second artwork URL");
+        let now = unix_time();
+        {
+            let store = StateStore::open(&config).expect("open initial state");
+            for (channel_id, name, artwork) in [
+                ("UCfixture", "Fixture channel 1", first_artwork.clone()),
+                ("UCsecond", "Fixture channel 2", second_artwork.clone()),
+            ] {
+                store
+                    .put_cached_channel_summary(&crate::persistence::CachedChannelSummary {
+                        summary: ChannelSummary {
+                            channel_id: channel_id.to_owned(),
+                            name: name.to_owned(),
+                            description: format!("Cached description for {name}"),
+                            subscriber_count: Some(13_045),
+                            video_count: Some(42),
+                            created_at: Some(1_100_000_000),
+                            auto_generated: false,
+                            thumbnails: vec![Thumbnail {
+                                url: artwork,
+                                quality: Some("high".to_owned()),
+                                width: Some(800),
+                                height: Some(800),
+                            }],
+                            webpage_url: canonical_youtube_channel_url(channel_id),
+                        },
+                        fetched_at: now.saturating_sub(1),
+                        expires_at: now.saturating_add(60),
+                    })
+                    .expect("persist channel summary");
+            }
+        }
+
+        let store = StateStore::open(&config).expect("reopen persisted state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .sources
+                .iter()
+                .map(|row| row.thumbnail_url.as_ref())
+                .collect::<Vec<_>>(),
+            [Some(&first_artwork), Some(&second_artwork)],
+            "every persisted source URL must be available to prefetch before selection"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&first_artwork)
+        );
+        assert!(controller.scheduled_channel_details.is_none());
+
+        controller.select_subscription_source(1);
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&second_artwork),
+            "switching must reuse the persisted channel summary immediately"
+        );
+        assert!(controller.scheduled_channel_details.is_none());
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "fresh persisted channel artwork must not trigger provider network work"
+        );
     }
 
     #[test]
@@ -8942,6 +12989,8 @@ mod tests {
             config.config_file().display().to_string()
         );
         controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
+        controller.view.local_size_sort = LocalSizeSort::Ascending;
+        controller.dispatch(UiAction::ToggleLocalFolderSizes);
         controller.dispatch(UiAction::SubmitPreferences);
 
         assert!(controller.view.preferences_popup.is_none());
@@ -8949,13 +12998,17 @@ mod tests {
             controller.view.subscriptions.layout,
             SubscriptionsLayout::Split
         );
+        assert!(!controller.view.local_folder_sizes_enabled);
+        assert_eq!(controller.view.local_size_sort, LocalSizeSort::Off);
         let contents =
             std::fs::read_to_string(config.config_file()).expect("saved preferences file");
         assert!(contents.contains("[ui]"));
         assert!(contents.contains("subscriptions_layout = \"split\""));
+        assert!(contents.contains("show_local_folder_sizes = false"));
         let reloaded =
             Config::load_from_dir(config.config_dir()).expect("reload saved preferences");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
+        assert!(!reloaded.ui.show_local_folder_sizes);
     }
 
     #[test]
@@ -9031,6 +13084,735 @@ mod tests {
         assert_eq!(restored.channel_name, "Fixture channel");
         assert!(restored.channel_subscribed);
         assert!(controller.view.rows[0].subscribed);
+    }
+
+    #[test]
+    fn switching_to_local_closes_a_stale_channel_panel() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.details = Some(DetailView {
+            title: "Remote channel".to_owned(),
+            source: "YouTube channel".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.show_screen(Screen::Local);
+
+        assert_eq!(controller.view.screen, Screen::Local);
+        assert_eq!(
+            controller.view.right_panel_mode,
+            RightPanelMode::Details,
+            "Local metadata must never render through the Channel panel"
+        );
+    }
+
+    #[test]
+    fn local_browser_rows_and_folder_actions_are_source_specific() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let album = fixture.path().join("A long album folder");
+        std::fs::create_dir(&album).expect("create album folder");
+        std::fs::write(fixture.path().join("song.flac"), b"fixture")
+            .expect("create local audio fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+
+        controller.refresh_local_browser_rows();
+
+        assert!(controller.view.rows.iter().all(|row| row.compact));
+        let parent_offset = usize::from(
+            controller
+                .local_listing
+                .as_ref()
+                .expect("listing")
+                .parent
+                .is_some(),
+        );
+        controller.view.selected = parent_offset;
+        controller.update_local_browser_detail();
+        let folder = controller.view.details.as_ref().expect("folder details");
+        assert_eq!(folder.title, "A long album folder");
+        assert!(!folder.local_renamable);
+        assert!(folder.local_trashable);
+
+        controller.view.selected = parent_offset.saturating_add(1);
+        controller.update_local_browser_detail();
+        let file = controller.view.details.as_ref().expect("file details");
+        assert!(file.local_renamable);
+        assert!(file.local_trashable);
+    }
+
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[test]
+    fn local_artwork_worker_response_updates_only_the_matching_details_path() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let media_path = PathBuf::from("/tmp/youta-local-artwork.flac");
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(
+                SourceKind::Local,
+                media_path.display().to_string(),
+            )),
+            ..DetailView::default()
+        });
+        controller.pending_local_artwork = Some((7, media_path.clone()));
+        let artwork =
+            url::Url::parse("file:///tmp/youta-local-artwork-cover.png").expect("artwork URL");
+
+        controller.handle_provider_response(ProviderResponse::LocalArtwork {
+            generation: 7,
+            path: media_path.clone(),
+            result: Ok(Some(artwork.clone())),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&artwork)
+        );
+        assert_eq!(
+            controller
+                .local_artwork_cache
+                .get(&media_path)
+                .and_then(Option::as_ref),
+            Some(&artwork)
+        );
+        assert!(controller.pending_local_artwork.is_none());
+        assert!(!controller.view.local_artwork_pending);
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn local_vorbis_metadata_maps_human_fields_and_identifiers() {
+        let mut item = LocalMediaItem {
+            path: PathBuf::from("/tmp/mock.flac"),
+            title: "mock".to_owned(),
+            artist: None,
+            album: None,
+            genre: None,
+            comment: None,
+            metadata_url: None,
+            acoustid_id: None,
+            duration_seconds: None,
+            size_bytes: 0,
+            codec: "FLAC".to_owned(),
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            channels: None,
+            embedded_artwork: false,
+        };
+        let mut tag = lofty::ogg::VorbisComments::new();
+        for (key, value) in [
+            ("TITLE", "Mock title"),
+            ("ARTISTS", "First artist"),
+            ("ARTISTS", "Second artist"),
+            ("ALBUM", "Mock album"),
+            ("GENRE", "Trip hop"),
+            ("COMMENT", "Visit https://artist.example"),
+            ("URL", " https://release.example\n"),
+            ("ACOUSTID_ID", "39e08d1e-ce43-465f-a802-041995e9d150"),
+        ] {
+            tag.push(key.to_owned(), value.to_owned());
+        }
+
+        apply_local_vorbis_comments(&mut item, &tag);
+
+        assert_eq!(item.title, "Mock title");
+        assert_eq!(item.artist.as_deref(), Some("First artist; Second artist"));
+        assert_eq!(item.album.as_deref(), Some("Mock album"));
+        assert_eq!(item.genre.as_deref(), Some("Trip hop"));
+        assert_eq!(
+            item.comment.as_deref(),
+            Some("Visit https://artist.example")
+        );
+        assert_eq!(
+            item.metadata_url.as_deref(),
+            Some("https://release.example")
+        );
+        assert_eq!(
+            item.acoustid_id.as_deref(),
+            Some("39e08d1e-ce43-465f-a802-041995e9d150")
+        );
+    }
+
+    #[test]
+    fn navigating_to_parent_reselects_the_folder_just_left() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let child = fixture.path().join("album");
+        std::fs::create_dir(&child).expect("create child folder");
+        let child_listing = crate::local_browser::list_local_directory(
+            &child,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("child listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.config.ui.show_local_folder_sizes = false;
+        controller.view.local_folder_sizes_enabled = false;
+        controller.local_listing = Some(child_listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = 0;
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.activate_local_browser_selection();
+
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+        } = captured.try_recv().expect("parent browse request")
+        else {
+            panic!("expected Local parent browse request");
+        };
+        assert_eq!(directory, fixture.path());
+        assert_eq!(preferred_child.as_deref(), Some(child.as_path()));
+        let parent_listing = crate::local_browser::list_local_directory_with_preferred_child(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+        )
+        .expect("parent listing");
+
+        controller.handle_local_browse_response(LocalBrowseResponse {
+            generation,
+            result: Ok(parent_listing),
+        });
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(child.as_path())
+        );
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .get(controller.view.selected)
+                .map(|row| row.title.as_str()),
+            Some("album")
+        );
+    }
+
+    #[test]
+    fn pending_local_navigation_keeps_rows_visible_but_noninteractive() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let child = fixture.path().join("album");
+        std::fs::create_dir(&child).expect("create child folder");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        let visible_rows = controller
+            .view
+            .rows
+            .iter()
+            .map(|row| row.title.clone())
+            .collect::<Vec<_>>();
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.browse_local_directory(child.clone());
+
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .map(|row| row.title.clone())
+                .collect::<Vec<_>>(),
+            visible_rows,
+            "foreground navigation must not blank the existing Local rows"
+        );
+        assert!(
+            controller.local_listing.is_none(),
+            "stale visible rows must have no activatable listing owner"
+        );
+        assert!(
+            controller.view.local_browse_pending,
+            "the TUI must use its short response-poll budget while listing"
+        );
+        controller.activate_local_browser_selection();
+        assert_eq!(controller.view.status_line, "No local folder is loaded");
+        let Ok(LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            ..
+        }) = captured.try_recv()
+        else {
+            panic!("expected Local browse request");
+        };
+        assert_eq!(directory, child);
+        let child_listing = crate::local_browser::list_local_directory(
+            &child,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("child listing");
+        controller.handle_local_browse_response(LocalBrowseResponse {
+            generation,
+            result: Ok(child_listing),
+        });
+        assert!(
+            !controller.view.local_browse_pending,
+            "accepted directory response must restore the idle cadence"
+        );
+    }
+
+    #[test]
+    fn trash_refresh_preserves_rows_and_reuses_unchanged_sibling_size() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let removed = fixture.path().join("remove-me");
+        let sibling = fixture.path().join("sibling");
+        std::fs::create_dir(&removed).expect("create removed folder");
+        std::fs::create_dir(&sibling).expect("create sibling folder");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.invalidate_local_folder_sizes();
+        let generation = controller
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let sibling_identity =
+            crate::local_browser::local_directory_identity(&sibling).expect("sibling identity");
+        assert!(controller.store_local_folder_size(
+            &sibling,
+            generation,
+            LocalFolderSizeWorkerResult {
+                measurement: crate::local_browser::LocalFolderSizeMeasurement {
+                    bytes: 42,
+                    identity: sibling_identity,
+                },
+                reused: false,
+            },
+        ));
+        controller.select_local_path(Some(&removed));
+        controller.refresh_local_browser_rows();
+        let (browse_requests, captured_browse) = unbounded();
+        controller.local_browse_requests = Some(browse_requests);
+        let (size_requests, captured_sizes) = unbounded();
+        controller.provider_requests = Some(size_requests);
+        std::fs::remove_dir(&removed).expect("simulate confirmed Trash");
+
+        let reselected = controller.remove_confirmed_local_trash_target(&removed);
+        controller.browse_local_directory_with_reselection(fixture.path().to_owned(), reselected);
+
+        assert!(!controller.view.rows.is_empty());
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| row.title != "remove-me"),
+            "a confirmed Trash target must disappear optimistically"
+        );
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+        } = captured_browse.try_recv().expect("refresh request")
+        else {
+            panic!("expected Local browse request");
+        };
+        let refreshed = crate::local_browser::list_local_directory_with_preferred_child(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+        )
+        .expect("refreshed listing");
+        controller.handle_local_browse_response(LocalBrowseResponse {
+            generation,
+            result: Ok(refreshed),
+        });
+
+        assert!(captured_sizes.try_recv().is_err());
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == "sibling")
+                .map(|row| row.subtitle.as_str()),
+            Some("42 B"),
+            "an identity-matching sibling must reuse its RAM-cached size"
+        );
+    }
+
+    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[test]
+    fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let album = fixture.path().join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let cover = album.join("CoVeR.JpG");
+        std::fs::write(&cover, b"cover bytes").expect("cover fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.invalidate_local_folder_sizes();
+        let generation = controller
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        let identity =
+            crate::local_browser::local_directory_identity(&album).expect("album identity");
+        assert!(controller.store_local_folder_size(
+            &album,
+            generation,
+            LocalFolderSizeWorkerResult {
+                measurement: crate::local_browser::LocalFolderSizeMeasurement {
+                    bytes: 11,
+                    identity,
+                },
+                reused: false,
+            },
+        ));
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.select_local_path(Some(&album));
+        controller.refresh_local_browser_rows();
+
+        let details = controller.view.details.as_ref().expect("folder details");
+        assert!(!details.description.contains("\nSize:"));
+        let ProviderRequest::LocalArtwork {
+            generation,
+            path,
+            kind,
+            ..
+        } = captured.try_recv().expect("lazy folder artwork request")
+        else {
+            panic!("expected Local artwork request");
+        };
+        assert!(controller.view.local_artwork_pending);
+        assert_eq!(path, album);
+        assert!(matches!(kind, LocalArtworkKind::FolderCover));
+        let cover_url = url::Url::from_file_path(&cover).expect("cover URL");
+        controller.handle_provider_response(ProviderResponse::LocalArtwork {
+            generation,
+            path,
+            result: Ok(Some(cover_url.clone())),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&cover_url)
+        );
+        assert!(!controller.view.local_artwork_pending);
+    }
+
+    #[test]
+    fn local_folder_size_batches_rotate_and_failures_do_not_retry_within_ttl() {
+        use crate::local_browser::{LocalDirectoryListing, LocalEntry, LocalEntryKind};
+
+        let root = PathBuf::from("/tmp/youta-folder-size-batch-test");
+        let entries = (0..300)
+            .map(|index| {
+                let name = std::ffi::OsString::from(format!("folder-{index:03}"));
+                LocalEntry {
+                    path: root.join(&name),
+                    name,
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: None,
+                    image_dimensions: None,
+                    directory_identity: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(LocalDirectoryListing {
+            path: root.clone(),
+            parent: root.parent().map(Path::to_owned),
+            entries,
+            truncated: false,
+            inspected_entries: 300,
+        });
+        controller.invalidate_local_folder_sizes();
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.schedule_local_folder_sizes();
+
+        assert_eq!(
+            controller.local_folder_size_queue.len()
+                + usize::from(controller.local_folder_size_pending.is_some()),
+            MAX_LAZY_LOCAL_FOLDER_SIZES
+        );
+        let ProviderRequest::LocalFolderSize {
+            path: first_path, ..
+        } = captured.try_recv().expect("first size request")
+        else {
+            panic!("expected Local folder-size request");
+        };
+        assert_eq!(first_path, root.join("folder-000"));
+
+        for index in 0..MAX_LAZY_LOCAL_FOLDER_SIZES {
+            controller.store_local_folder_size_failure(root.join(format!("folder-{index:03}")));
+        }
+        controller.invalidate_local_folder_sizes();
+        while captured.try_recv().is_ok() {}
+        controller.schedule_local_folder_sizes();
+
+        assert_eq!(
+            controller.local_folder_size_queue.len()
+                + usize::from(controller.local_folder_size_pending.is_some()),
+            300 - MAX_LAZY_LOCAL_FOLDER_SIZES,
+            "the next visit must advance beyond the bounded first batch"
+        );
+        let ProviderRequest::LocalFolderSize {
+            path: next_path, ..
+        } = captured.try_recv().expect("rotated size request")
+        else {
+            panic!("expected rotated Local folder-size request");
+        };
+        assert_eq!(next_path, root.join("folder-256"));
+        assert!(
+            !controller
+                .local_folder_size_queue
+                .iter()
+                .any(|path| path == &root.join("folder-000")),
+            "a fresh negative cache entry must suppress immediate retries"
+        );
+
+        controller.config.ui.show_local_folder_sizes = false;
+        controller.view.local_folder_sizes_enabled = false;
+        controller.invalidate_local_folder_sizes();
+        while captured.try_recv().is_ok() {}
+        controller.schedule_local_folder_sizes();
+        assert!(controller.local_folder_size_pending.is_none());
+        assert!(controller.local_folder_size_queue.is_empty());
+        assert!(captured.try_recv().is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture verifies both sort directions and cache reuse invariants"
+    )]
+    fn local_size_sort_keeps_unknown_folders_last_and_preserves_selected_path() {
+        use crate::local_browser::LocalEntryKind;
+
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let small = fixture.path().join("small");
+        let large = fixture.path().join("large");
+        let unknown = fixture.path().join("unknown");
+        for directory in [&small, &large, &unknown] {
+            std::fs::create_dir(directory).expect("create folder fixture");
+        }
+        std::fs::write(fixture.path().join("a.flac"), b"a").expect("small file fixture");
+        std::fs::write(fixture.path().join("b.flac"), b"bb").expect("large file fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.invalidate_local_folder_sizes();
+        let generation = controller
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        for (path, bytes) in [(&small, 10_u64), (&large, 100_u64)] {
+            let identity =
+                crate::local_browser::local_directory_identity(path).expect("folder identity");
+            assert!(controller.store_local_folder_size(
+                path,
+                generation,
+                LocalFolderSizeWorkerResult {
+                    measurement: crate::local_browser::LocalFolderSizeMeasurement {
+                        bytes,
+                        identity,
+                    },
+                    reused: false,
+                },
+            ));
+        }
+        controller.sort_local_listing();
+        controller.select_local_path(Some(&unknown));
+
+        controller.toggle_local_size_sort();
+
+        assert_eq!(controller.view.local_size_sort, LocalSizeSort::Ascending);
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(unknown.as_path())
+        );
+        let ascending = controller
+            .local_listing
+            .as_ref()
+            .expect("listing")
+            .entries
+            .iter()
+            .map(|entry| entry.display_name().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ascending, ["a.flac", "b.flac", "small", "large", "unknown"]);
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == "small")
+                .map(|row| row.subtitle.as_str()),
+            Some("10 B")
+        );
+
+        controller.toggle_local_size_sort();
+        let descending = controller
+            .local_listing
+            .as_ref()
+            .expect("listing")
+            .entries
+            .iter()
+            .map(|entry| entry.display_name().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            descending,
+            ["large", "small", "b.flac", "a.flac", "unknown"]
+        );
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(unknown.as_path())
+        );
+        assert!(
+            controller
+                .local_listing
+                .as_ref()
+                .expect("listing")
+                .entries
+                .last()
+                .is_some_and(|entry| {
+                    entry.kind == LocalEntryKind::Directory && entry.path == unknown
+                }),
+            "unknown folders must remain after known sizes in descending order"
+        );
+
+        controller.invalidate_local_folder_sizes();
+        controller.refresh_local_browser_rows();
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == "small")
+                .map(|row| row.subtitle.as_str()),
+            Some(""),
+            "a new generation must not display a cache entry before identity validation"
+        );
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.schedule_local_folder_sizes();
+        let ProviderRequest::LocalFolderSize {
+            path: requested, ..
+        } = captured.try_recv().expect("one missing folder request")
+        else {
+            panic!("expected Local folder-size request");
+        };
+        assert_eq!(requested, unknown);
+        assert_eq!(
+            controller
+                .local_folder_size_cache
+                .get(&small)
+                .map(|cached| cached.validated_generation),
+            Some(
+                controller
+                    .local_folder_size_generation
+                    .load(AtomicOrdering::Relaxed)
+            ),
+            "fresh identity-matching RAM cache entries must survive navigation"
+        );
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == "small")
+                .map(|row| row.subtitle.as_str()),
+            Some("10 B"),
+            "synchronous RAM-cache validation must refresh visible folder sizes"
+        );
+    }
+
+    #[test]
+    fn lazy_folder_size_response_reorders_without_moving_selection() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let measured = fixture.path().join("measured");
+        let selected = fixture.path().join("selected");
+        std::fs::create_dir(&measured).expect("create measured folder");
+        std::fs::create_dir(&selected).expect("create selected folder");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.local_size_sort = LocalSizeSort::Ascending;
+        controller.local_listing = Some(listing);
+        controller.invalidate_local_folder_sizes();
+        controller.select_local_path(Some(&selected));
+        let generation = controller
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+        controller.local_folder_size_pending = Some(measured.clone());
+        let identity =
+            crate::local_browser::local_directory_identity(&measured).expect("folder identity");
+
+        controller.handle_provider_response(ProviderResponse::LocalFolderSize {
+            generation,
+            path: measured,
+            result: Ok(LocalFolderSizeWorkerResult {
+                measurement: crate::local_browser::LocalFolderSizeMeasurement {
+                    bytes: 42,
+                    identity,
+                },
+                reused: false,
+            }),
+        });
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(selected.as_path())
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_an_inflight_local_folder_measurement_generation() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let before = controller
+            .local_folder_size_generation
+            .load(AtomicOrdering::Relaxed);
+
+        controller.shutdown();
+
+        assert_ne!(
+            controller
+                .local_folder_size_generation
+                .load(AtomicOrdering::Relaxed),
+            before
+        );
     }
 
     #[test]
@@ -9152,6 +13934,7 @@ mod tests {
             description: "Channel description".to_owned(),
             subscriber_count: Some(10),
             video_count: Some(2),
+            created_at: None,
             auto_generated: false,
             thumbnails: Vec::new(),
             webpage_url: None,
@@ -9237,6 +14020,7 @@ mod tests {
                 description: String::new(),
                 subscriber_count: None,
                 video_count: None,
+                created_at: None,
                 auto_generated: false,
                 thumbnails: candidates,
                 webpage_url: None,
@@ -9392,8 +14176,10 @@ mod tests {
         gh_available: bool,
     }
 
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     struct MockYouTubeProviderBuilder;
 
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     struct EmptyYouTubeProvider;
 
     struct CountingYouTubeProvider {
@@ -9401,6 +14187,7 @@ mod tests {
         details: Arc<AtomicUsize>,
     }
 
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     impl YouTubeProviderBuilder for MockYouTubeProviderBuilder {
         fn official(&self, _api_key: String) -> Result<Box<dyn Provider>, String> {
             Ok(Box::new(EmptyYouTubeProvider))
@@ -9411,6 +14198,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     impl Provider for EmptyYouTubeProvider {
         fn id(&self) -> &'static str {
             "mock-youtube"
@@ -9747,6 +14535,45 @@ mod tests {
         assert_eq!(state.played.len(), 1);
         assert_eq!(state.played[0].start_at, Duration::from_secs(95));
         assert!(controller.selected_start_override.is_none());
+    }
+
+    #[test]
+    fn advertisement_chapter_is_skipped_once_until_playback_leaves_it() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_direct_item("advertisement-skip"), false);
+        controller.view.playback_chapters = vec![
+            Chapter {
+                title: "Introduction".to_owned(),
+                start_seconds: 0,
+                end_seconds: Some(30),
+            },
+            Chapter {
+                title: "Реклама".to_owned(),
+                start_seconds: 30,
+                end_seconds: Some(45),
+            },
+            Chapter {
+                title: "Main section".to_owned(),
+                start_seconds: 45,
+                end_seconds: None,
+            },
+        ];
+        state.lock().expect("mock state").commands.clear();
+        controller.view.playback.position = Duration::from_secs(35);
+
+        controller.skip_current_advertisement_chapter();
+        controller.skip_current_advertisement_chapter();
+
+        assert_eq!(
+            state.lock().expect("mock state").commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(45))],
+            "a stale backend position inside the same advertisement must not issue duplicate seeks"
+        );
+        controller.view.playback.position = Duration::from_secs(50);
+        controller.skip_current_advertisement_chapter();
+        controller.view.playback.position = Duration::from_secs(35);
+        controller.skip_current_advertisement_chapter();
+        assert_eq!(state.lock().expect("mock state").commands.len(), 2);
     }
 
     /// Avoids external diagnostic probes in controller error-path tests.
@@ -10968,8 +15795,12 @@ mod tests {
         let local = LocalMediaItem {
             path: PathBuf::from("/tmp/youta-fixture.flac"),
             title: "Local".to_owned(),
-            artist: Some("Artist".to_owned()),
-            album: None,
+            artist: Some("Artist One; Artist Two".to_owned()),
+            album: Some("Album".to_owned()),
+            genre: Some("Trip hop".to_owned()),
+            comment: Some("Visit the artist website".to_owned()),
+            metadata_url: Some("https://artist.example".to_owned()),
+            acoustid_id: Some("39e08d1e-ce43-465f-a802-041995e9d150".to_owned()),
             duration_seconds: Some(10),
             size_bytes: 1,
             codec: "FLAC".to_owned(),
@@ -10980,6 +15811,20 @@ mod tests {
         };
         let queued_local = queue_item_from_local(&local).expect("local queue item");
         assert_eq!(queued_local.media.id.source, SourceKind::Local);
+        let local_details = local_media_description(&local);
+        for expected in [
+            "Artists: Artist One; Artist Two",
+            "Album: Album",
+            "Genre: Trip hop",
+            "Comment: Visit the artist website",
+            "URL: https://artist.example",
+            "Identifiers:\nAcoustID ID: 39e08d1e-ce43-465f-a802-041995e9d150",
+        ] {
+            assert!(
+                local_details.contains(expected),
+                "Local Details omitted {expected:?}"
+            );
+        }
         assert_eq!(queued_local.playback_location, "/tmp/youta-fixture.flac");
 
         let tracker = TrackerItem {
@@ -10987,17 +15832,17 @@ mod tests {
             title: "Module".to_owned(),
             subtitle: "XM".to_owned(),
             webpage_url: url::Url::parse("https://modarchive.org/module/1").expect("page URL"),
-            playback_url: Some(
+            download_url: Some(
                 url::Url::parse("https://cdn.example/module.xm").expect("module URL"),
             ),
+            expected_format: Some("xm".to_owned()),
+            access: TrackerAccess::DirectModule,
+            prepared_path: Some(PathBuf::from("/tmp/youta-module.xm")),
             insecure_transport: false,
         };
         let queued_tracker = queue_item_from_tracker(&tracker).expect("tracker queue item");
         assert_eq!(queued_tracker.media.id.source, SourceKind::ModArchive);
-        assert_eq!(
-            queued_tracker.playback_location,
-            "https://cdn.example/module.xm"
-        );
+        assert_eq!(queued_tracker.playback_location, "/tmp/youta-module.xm");
     }
 
     #[test]
@@ -11036,6 +15881,78 @@ mod tests {
             Some("Fixture description")
         );
         assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+    }
+
+    #[test]
+    fn history_details_never_reuse_a_stale_tracker_result() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let stale_url =
+            url::Url::parse("https://aminet.net/package/mods/atmos/Life").expect("tracker URL");
+        controller.tracker_results = vec![TrackerItem {
+            source: "Aminet mods".to_owned(),
+            title: "Unrelated module".to_owned(),
+            subtitle: "lha · 80.00 KiB".to_owned(),
+            webpage_url: stale_url.clone(),
+            download_url: None,
+            expected_format: Some("lha".to_owned()),
+            access: TrackerAccess::ArchiveNeedsInspection,
+            prepared_path: None,
+            insecure_transport: false,
+        }];
+        controller.view.screen = Screen::TrackerMusic;
+        controller.refresh_tracker_rows();
+        controller
+            .store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"),
+                title: "Дед инсайд".to_owned(),
+                started_at: 10,
+                last_played_at: 11,
+                position_seconds: 0,
+                duration_seconds: None,
+                finished: false,
+            })
+            .expect("history fixture");
+
+        controller.show_screen(Screen::History);
+
+        let details = controller.view.details.as_ref().expect("History details");
+        assert_eq!(details.title, "Дед инсайд");
+        assert_eq!(details.source, "local");
+        assert_eq!(details.description, "stopped at 0:00");
+        assert_eq!(
+            details.media_id,
+            Some(MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"))
+        );
+        assert!(!details.description.contains(stale_url.as_str()));
+    }
+
+    #[cfg(feature = "youtube-music")]
+    #[test]
+    fn show_now_playing_prefers_music_tab_for_music_youtube_url() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let mut music = subscription_video_summary();
+        music.webpage_url = Some(
+            url::Url::parse("https://music.youtube.com/watch?v=dQw4w9WgXcQ").expect("music URL"),
+        );
+        controller.youtube_results = vec![SearchItem::Video(music.clone())];
+        controller.youtube_music_results = vec![SearchItem::Video(music.clone())];
+        controller.play_queue_item(queue_item_from_video(&music, None), false);
+        controller.show_screen(Screen::History);
+
+        controller.dispatch(UiAction::ShowNowPlaying);
+
+        assert_eq!(controller.view.screen, Screen::YouTubeMusic);
+        assert_eq!(controller.view.selected, 0);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Fixture video")
+        );
     }
 
     #[test]
@@ -11109,6 +16026,477 @@ mod tests {
                 .view
                 .status_line
                 .contains("not in the current list")
+        );
+    }
+
+    #[test]
+    fn autoplay_advances_youtube_and_skips_scheduled_zero_duration_rows() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut scheduled = first.clone();
+        scheduled.video_id = "planned0000".to_owned();
+        scheduled.title = "Scheduled placeholder".to_owned();
+        scheduled.duration_seconds = Some(0);
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(scheduled),
+            SearchItem::Video(second),
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_queue_item_has_priority_over_autoplay_source_continuation() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Automatic second video".to_owned();
+        let mut explicit_first = first.clone();
+        explicit_first.video_id = "queued00001".to_owned();
+        explicit_first.title = "Explicit YouTube item one".to_owned();
+        let mut explicit_second = first.clone();
+        explicit_second.video_id = "queued00002".to_owned();
+        explicit_second.title = "Explicit YouTube item two".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(second),
+            SearchItem::Video(explicit_first.clone()),
+            SearchItem::Video(explicit_second.clone()),
+        ];
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&explicit_first, None));
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&explicit_second, None));
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Explicit YouTube item one"]
+        );
+
+        for _ in 0..2 {
+            events.lock().expect("mock events").extend([
+                PlaybackEvent::MediaLoaded,
+                PlaybackEvent::PlaybackStarted,
+                PlaybackEvent::Ended(PlaybackEnd {
+                    reason: PlaybackEndReason::Eof,
+                    error: None,
+                    file_error: None,
+                    diagnostic: None,
+                }),
+            ]);
+            controller.update_player();
+        }
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                "Fixture video",
+                "Explicit YouTube item one",
+                "Explicit YouTube item two",
+                "Automatic second video"
+            ],
+            "queued items with their own list origins must not replace the original resume point"
+        );
+    }
+
+    #[test]
+    fn disabled_autoplay_stops_at_the_end_of_a_youtube_list() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(
+            state.lock().expect("mock state").played.len(),
+            1,
+            "the default must never start a second list item"
+        );
+        assert_eq!(controller.view.status_line, "Playback queue finished");
+    }
+
+    #[test]
+    fn autoplay_never_uses_replaced_search_results() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut former_next = first.clone();
+        former_next.video_id = "former-next".to_owned();
+        former_next.title = "Former next result".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(former_next),
+        ];
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+
+        controller.supersede_search_generation();
+        let mut unrelated = first.clone();
+        unrelated.video_id = "unrelated01".to_owned();
+        unrelated.title = "Unrelated replacement".to_owned();
+        controller.youtube_results = vec![SearchItem::Video(unrelated)];
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(state.lock().expect("mock state").played.len(), 1);
+        assert_eq!(
+            controller.view.status_line,
+            "Autoplay stopped because the source list changed"
+        );
+    }
+
+    #[test]
+    fn autoplay_advances_local_browser_files_in_listing_order() {
+        let directory = tempfile::tempdir().expect("temporary local folder");
+        let first_path = directory.path().join("first.mp3");
+        let second_path = directory.path().join("second.flac");
+        std::fs::write(&first_path, b"first").expect("first fixture");
+        std::fs::write(&second_path, b"second").expect("second fixture");
+        let listing = crate::local_browser::list_local_directory(
+            directory.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local listing");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = usize::from(
+            controller
+                .local_listing
+                .as_ref()
+                .is_some_and(|listing| listing.parent.is_some()),
+        );
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .map(|input| input.location.clone())
+                .collect::<Vec<_>>(),
+            [
+                first_path.display().to_string(),
+                second_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn autoplay_advances_prepared_tracker_modules_and_skips_metadata_rows() {
+        let directory = tempfile::tempdir().expect("temporary tracker folder");
+        let first_path = directory.path().join("first.mod");
+        let second_path = directory.path().join("second.xm");
+        std::fs::write(&first_path, b"first").expect("first fixture");
+        std::fs::write(&second_path, b"second").expect("second fixture");
+        let tracker = |title: &str, page: &str, path: Option<PathBuf>, access| TrackerItem {
+            source: "Fixture archive".to_owned(),
+            title: title.to_owned(),
+            subtitle: String::new(),
+            webpage_url: url::Url::parse(page).expect("tracker page URL"),
+            download_url: None,
+            expected_format: None,
+            access,
+            prepared_path: path,
+            insecure_transport: false,
+        };
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::TrackerMusic;
+        controller.tracker_results = vec![
+            tracker(
+                "First module",
+                "https://mods.example/first",
+                Some(first_path),
+                TrackerAccess::DirectModule,
+            ),
+            tracker(
+                "Metadata only",
+                "https://mods.example/info",
+                None,
+                TrackerAccess::MetadataOnly,
+            ),
+            tracker(
+                "Second module",
+                "https://mods.example/second",
+                Some(second_path),
+                TrackerAccess::DirectModule,
+            ),
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(
+            queue_item_from_tracker(&controller.tracker_results[0]).expect("first queue item"),
+            false,
+        );
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First module", "Second module"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::Tracker {
+                generation: controller.search_generation,
+                index: 2,
+            })
+        );
+    }
+
+    #[cfg(feature = "tracker-music")]
+    #[test]
+    fn manual_playback_revokes_pending_tracker_autoplay_ownership() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        let item_key = "https://mods.example/remote-archive";
+        controller.tracker_results = vec![TrackerItem {
+            source: "Fixture archive".to_owned(),
+            title: "Remote archive".to_owned(),
+            subtitle: String::new(),
+            webpage_url: url::Url::parse(item_key).expect("tracker page URL"),
+            download_url: url::Url::parse("https://mods.example/archive.zip").ok(),
+            expected_format: None,
+            access: TrackerAccess::ArchiveNeedsInspection,
+            prepared_path: None,
+            insecure_transport: false,
+        }];
+        controller.pending_tracker_preparation = Some(PendingTrackerPreparation {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            owner: TrackerPreparationOwner::Autoplay(AutoplayOrigin::Tracker {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+        });
+
+        controller.play_queue_item(fixture_direct_item("manual replacement"), false);
+        assert_eq!(
+            controller
+                .pending_tracker_preparation
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(&TrackerPreparationOwner::CanceledAutoplay)
+        );
+
+        controller.handle_provider_response(ProviderResponse::TrackerPrepared {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            result: Ok(vec![crate::tracker_media::PreparedTrackerModule {
+                path: PathBuf::from("/tmp/youta-prepared-fixture.mod"),
+                display_name: "Prepared module".to_owned(),
+                format: "mod".to_owned(),
+                size_bytes: 42,
+            }]),
+        });
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["manual replacement"],
+            "a canceled background response must never replace manual playback"
+        );
+        assert!(controller.pending_tracker_preparation.is_none());
+        assert_eq!(
+            controller.tracker_results[0]
+                .prepared_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some("youta-prepared-fixture.mod")
         );
     }
 
@@ -11931,8 +17319,12 @@ mod tests {
     }
 
     #[test]
-    fn default_and_tracker_searches_are_strictly_separate() {
+    fn provider_search_routes_are_strictly_separate() {
         assert_eq!(search_route(Screen::Search), SearchRoute::YouTube);
+        assert_eq!(
+            search_route(Screen::YouTubeMusic),
+            SearchRoute::YouTubeMusic
+        );
         assert_eq!(
             search_route(Screen::TrackerMusic),
             SearchRoute::TrackerArchives
@@ -11940,10 +17332,111 @@ mod tests {
         assert_eq!(search_route(Screen::Subscriptions), SearchRoute::None);
     }
 
+    #[cfg(feature = "youtube-music")]
+    #[test]
+    fn youtube_and_youtube_music_keep_independent_queries_rows_and_selection() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let youtube = subscription_video_summary();
+        let mut second_youtube = youtube.clone();
+        second_youtube.video_id = "aqz-KE-bpKQ".to_owned();
+        second_youtube.title = "Second YouTube result".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(youtube.clone()),
+            SearchItem::Video(second_youtube.clone()),
+        ];
+        controller.youtube_search_query = "documentary".to_owned();
+        controller.view.search_query = "documentary".to_owned();
+        controller.refresh_youtube_rows();
+        controller.view.selected = 1;
+        controller.tracker_search_query = "tracker fixture".to_owned();
+        controller.tracker_results = ["first.mod", "second.xm"]
+            .into_iter()
+            .map(|name| TrackerItem {
+                source: "Mock archive".to_owned(),
+                title: name.to_owned(),
+                subtitle: "mock module".to_owned(),
+                webpage_url: url::Url::parse(&format!("https://mods.example/{name}"))
+                    .expect("tracker page"),
+                download_url: None,
+                expected_format: None,
+                access: TrackerAccess::MetadataOnly,
+                prepared_path: None,
+                insecure_transport: false,
+            })
+            .collect();
+        controller.tracker_selected = 1;
+
+        controller.show_screen(Screen::YouTubeMusic);
+        controller.view.search_query = "mock music".to_owned();
+        controller.youtube_music_search_query = "mock music".to_owned();
+        let music_track = |video_id: &str, title: &str| YouTubeMusicTrack {
+            video_id: video_id.to_owned(),
+            title: title.to_owned(),
+            artist: Some("Mock artist".to_owned()),
+            duration_seconds: Some(213),
+            webpage_url: url::Url::parse(&format!("https://music.youtube.com/watch?v={video_id}"))
+                .expect("music URL"),
+            thumbnail_url: url::Url::parse(&format!(
+                "https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+            ))
+            .expect("thumbnail URL"),
+        };
+        controller.handle_provider_response(ProviderResponse::YouTubeMusicSearch {
+            generation: controller.search_generation,
+            query: "mock music".to_owned(),
+            result: Ok(vec![
+                music_track("dQw4w9WgXcQ", "Mock track"),
+                music_track("aqz-KE-bpKQ", "Second mock track"),
+            ]),
+        });
+        assert_eq!(controller.view.rows[0].title, "Mock track");
+        assert_eq!(controller.view.rows[0].source, "YouTube Music");
+        controller.view.selected = 1;
+
+        controller.show_screen(Screen::TrackerMusic);
+        assert_eq!(controller.view.search_query, "tracker fixture");
+        assert_eq!(controller.view.selected, 1);
+        controller.show_screen(Screen::Search);
+        assert_eq!(controller.view.search_query, "documentary");
+        assert_eq!(controller.view.rows[1].title, second_youtube.title);
+        assert_eq!(controller.view.selected, 1);
+        controller.show_screen(Screen::YouTubeMusic);
+        assert_eq!(controller.view.search_query, "mock music");
+        assert_eq!(controller.view.rows[1].title, "Second mock track");
+        assert_eq!(controller.view.selected, 1);
+        controller.show_screen(Screen::TrackerMusic);
+        assert_eq!(controller.view.search_query, "tracker fixture");
+        assert_eq!(controller.view.rows[1].title, "second.xm");
+        assert_eq!(controller.view.selected, 1);
+
+        controller.show_screen(Screen::Search);
+        let visible_youtube = controller.view.clone();
+        controller.handle_provider_response(ProviderResponse::YouTubeMusicSearch {
+            generation: controller.search_generation,
+            query: "offscreen replacement".to_owned(),
+            result: Ok(vec![music_track("9bZkp7q19f0", "Offscreen track")]),
+        });
+        assert_eq!(
+            controller.view, visible_youtube,
+            "an offscreen Music response must not mutate the visible YouTube tab"
+        );
+        assert_eq!(
+            controller
+                .store
+                .youtube_music_search()
+                .expect("load saved Music search")
+                .expect("saved Music search")
+                .query,
+            "offscreen replacement"
+        );
+    }
+
     #[test]
     fn restored_tracker_and_playlist_screens_round_trip() {
         for screen in [
             Screen::Search,
+            #[cfg(feature = "youtube-music")]
+            Screen::YouTubeMusic,
             Screen::Subscriptions,
             Screen::Downloaded,
             Screen::History,
@@ -11956,6 +17449,11 @@ mod tests {
                 screen
             );
         }
+        #[cfg(not(feature = "youtube-music"))]
+        assert_eq!(
+            tui_screen_from_stored(&StoredScreen::YouTubeMusic),
+            Screen::Search
+        );
     }
 
     #[test]
@@ -12276,8 +17774,20 @@ mod tests {
     fn provider_worker_reports_missing_jamendo_configuration_without_network() {
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
+        let storage = tempfile::tempdir().expect("tracker storage");
+        let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
-            provider_worker(None, request_receiver, response_sender, false, None, None);
+            provider_worker(
+                None,
+                request_receiver,
+                response_sender,
+                false,
+                None,
+                None,
+                #[cfg(feature = "youtube-music")]
+                PathBuf::from("yt-dlp"),
+                storage_path,
+            );
         });
         let direct = DirectSourceInput {
             url: url::Url::parse("https://www.jamendo.com/track/1848357")

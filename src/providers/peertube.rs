@@ -289,6 +289,7 @@ impl PeerTubeProvider {
             description: raw.description.unwrap_or_default(),
             subscriber_count: raw.followers_count,
             video_count: raw.videos_count,
+            created_at: None,
             auto_generated: false,
             thumbnails: self.convert_images(raw.avatars, None),
             webpage_url,

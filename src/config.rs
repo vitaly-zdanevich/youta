@@ -36,6 +36,15 @@ pub const CONFIG_DIR_ENV: &str = "YOUTA_CONFIG_DIR";
 /// Environment variable that overrides the Subscriptions screen layout.
 pub const SUBSCRIPTIONS_LAYOUT_ENV: &str = "YOUTA_UI__SUBSCRIPTIONS_LAYOUT";
 
+/// Environment variable that overrides automatic advertisement-chapter skipping.
+pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS";
+
+/// Environment variable that overrides automatic same-source queue continuation.
+pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
+
+/// Environment variable that overrides lazy Local-folder size measurement.
+pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
+
 /// Default maximum thumbnail height in terminal rows.
 pub const DEFAULT_THUMBNAIL_HEIGHT: u16 = 20;
 
@@ -335,6 +344,119 @@ impl Config {
         self.ui.subscriptions_layout = layout;
         Ok(())
     }
+
+    /// Persists the preferences currently exposed by the in-app editor.
+    ///
+    /// The Subscriptions layout, advertisement-chapter behavior, and lazy
+    /// Local-folder size preference are written together so confirming the
+    /// popup cannot save only part of the draft.
+    /// Existing unrelated keys, comments, and credentials are preserved.
+    /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
+    /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
+    /// [`LOCAL_FOLDER_SIZES_ENV`] retain precedence and therefore prevent this
+    /// writer from storing a shadowed draft.
+    ///
+    /// The layout-only [`Self::save_subscriptions_layout`] method remains
+    /// available for callers that do not edit the playback preference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any relevant environment override is active, the
+    /// existing file is too large or malformed, or an atomic private-file
+    /// update fails.
+    #[cfg(feature = "tui")]
+    pub fn save_tui_preferences(
+        &mut self,
+        layout: SubscriptionsLayout,
+        skip_advertisement_chapters: bool,
+        show_local_folder_sizes: bool,
+    ) -> Result<(), ConfigError> {
+        for variable in [
+            SUBSCRIPTIONS_LAYOUT_ENV,
+            SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            LOCAL_FOLDER_SIZES_ENV,
+        ] {
+            if std::env::var_os(variable).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{variable} overrides config.toml; change or remove it before saving these preferences"
+                )));
+            }
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        {
+            let ui = document
+                .as_table_mut()
+                .entry("ui")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`ui` must be a TOML table before Youta can update it".to_owned(),
+                    )
+                })?;
+            ui["subscriptions_layout"] = value(layout.as_config_value());
+            ui["show_local_folder_sizes"] = value(show_local_folder_sizes);
+        }
+        {
+            let playback = document
+                .as_table_mut()
+                .entry("playback")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`playback` must be a TOML table before Youta can update it".to_owned(),
+                    )
+                })?;
+            playback["skip_advertisement_chapters"] = value(skip_advertisement_chapters);
+        }
+        write_private_config(&path, document.to_string().as_bytes())?;
+
+        self.ui.subscriptions_layout = layout;
+        self.ui.show_local_folder_sizes = show_local_folder_sizes;
+        self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
+        Ok(())
+    }
+
+    /// Persists automatic same-source playback in `config.toml`.
+    ///
+    /// Existing unrelated settings, comments, and credentials are preserved.
+    /// [`AUTOPLAY_ENV`] retains precedence and therefore prevents this writer
+    /// from storing a value that the environment would immediately shadow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the environment override is active, the existing
+    /// file is too large or malformed, or the private atomic update fails.
+    #[cfg(feature = "tui")]
+    pub fn save_autoplay(&mut self, autoplay: bool) -> Result<(), ConfigError> {
+        if std::env::var_os(AUTOPLAY_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{AUTOPLAY_ENV} overrides config.toml; change or remove it before toggling autoplay"
+            )));
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let playback = document
+            .as_table_mut()
+            .entry("playback")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`playback` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        playback["autoplay"] = value(autoplay);
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.playback.autoplay = autoplay;
+        Ok(())
+    }
 }
 
 /// Player and audio-output settings.
@@ -353,6 +475,10 @@ pub struct PlaybackConfig {
     pub speed_percent: u16,
     /// Context rewound when an interrupted stream is resumed.
     pub resume_rewind_seconds: u64,
+    /// Continue with the next playable entry from the active source list.
+    pub autoplay: bool,
+    /// Hide and skip chapters whose normalized title is exactly `Реклама`.
+    pub skip_advertisement_chapters: bool,
     /// Settings that favor stable direct-device playback.
     pub audiophile: AudiophileConfig,
 }
@@ -366,6 +492,8 @@ impl Default for PlaybackConfig {
             volume_percent: 80,
             speed_percent: 100,
             resume_rewind_seconds: DEFAULT_RESUME_REWIND_SECONDS,
+            autoplay: false,
+            skip_advertisement_chapters: true,
             audiophile: AudiophileConfig::default(),
         }
     }
@@ -442,6 +570,10 @@ impl Default for SubscriptionConfig {
 /// Terminal rendering preferences.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent stable TOML switches are clearer as booleans"
+)]
 pub struct UiConfig {
     /// Show hotkey labels inside clickable controls.
     pub show_button_hotkeys: bool,
@@ -453,6 +585,8 @@ pub struct UiConfig {
     pub thumbnail_height: u16,
     /// Prefetch currently loaded Search-result thumbnails into the disk cache.
     pub prefetch_search_thumbnails: bool,
+    /// Measure visible Local folders lazily and show complete recursive sizes.
+    pub show_local_folder_sizes: bool,
     /// Seek-bar foreground color name or terminal palette index.
     pub seekbar_color: String,
     /// Replace the standard seek indicator with Nyan Cat.
@@ -471,6 +605,7 @@ impl Default for UiConfig {
             thumbnails: ThumbnailMode::Auto,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
+            show_local_folder_sizes: true,
             seekbar_color: "cyan".to_owned(),
             nyan_cat_seekbar: false,
             dos_rpg_mode: false,
@@ -841,9 +976,12 @@ mod tests {
         assert!(config.subscriptions.auto_download);
         assert_eq!(config.subscriptions.audio_format, "opus");
         assert_eq!(config.playback.resume_rewind_seconds, 30);
+        assert!(!config.playback.autoplay);
+        assert!(config.playback.skip_advertisement_chapters);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
         assert!(config.ui.prefetch_search_thumbnails);
+        assert!(config.ui.show_local_folder_sizes);
         assert_eq!(
             config.ui.subscriptions_layout,
             SubscriptionsLayout::DrillDown
@@ -867,6 +1005,8 @@ mod tests {
 [playback]
 volume_percent = 35
 speed_percent = 120
+autoplay = true
+skip_advertisement_chapters = false
 
 [subscriptions]
 auto_download = false
@@ -875,6 +1015,7 @@ auto_download = false
 theme = "light"
 thumbnail_height = 14
 prefetch_search_thumbnails = false
+show_local_folder_sizes = false
 subscriptions_layout = "split"
 "#,
         )
@@ -884,10 +1025,13 @@ subscriptions_layout = "split"
             .expect("load TOML");
         assert_eq!(config.playback.volume_percent, 35);
         assert_eq!(config.playback.speed_percent, 120);
+        assert!(config.playback.autoplay);
+        assert!(!config.playback.skip_advertisement_chapters);
         assert!(!config.subscriptions.auto_download);
         assert_eq!(config.ui.theme, ThemeMode::Light);
         assert_eq!(config.ui.thumbnail_height, 14);
         assert!(!config.ui.prefetch_search_thumbnails);
+        assert!(!config.ui.show_local_folder_sizes);
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert_eq!(config.config_dir(), directory.path());
     }
@@ -898,9 +1042,12 @@ subscriptions_layout = "split"
         if std::env::var_os(CHILD_MARKER).is_some() {
             let config = Config::load().expect("load child configuration");
             assert_eq!(config.playback.volume_percent, 62);
+            assert!(config.playback.autoplay);
+            assert!(!config.playback.skip_advertisement_chapters);
             assert!(config.ui.nyan_cat_seekbar);
             assert_eq!(config.ui.thumbnail_height, 16);
             assert!(!config.ui.prefetch_search_thumbnails);
+            assert!(!config.ui.show_local_folder_sizes);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
             return;
         }
@@ -920,9 +1067,12 @@ subscriptions_layout = "split"
             .env(CHILD_MARKER, "1")
             .env(CONFIG_DIR_ENV, directory.path())
             .env("YOUTA_PLAYBACK__VOLUME_PERCENT", "62")
+            .env(AUTOPLAY_ENV, "true")
+            .env(SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false")
             .env("YOUTA_UI__NYAN_CAT_SEEKBAR", "true")
             .env("YOUTA_UI__THUMBNAIL_HEIGHT", "16")
             .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
+            .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .output()
             .expect("run environment test child");
@@ -965,6 +1115,173 @@ youtube_api_key = "keep-this-existing-secret"
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_preferences_save_both_tables_atomically_and_preserve_unrelated_content() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# keep this comment
+[playback]
+volume_percent = 35
+
+[ui]
+theme = "dark"
+subscriptions_layout = "drill-down"
+
+[providers]
+youtube_api_key = "keep-this-existing-secret"
+"#,
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_tui_preferences(SubscriptionsLayout::Split, false, false)
+            .expect("save TUI preferences");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("volume_percent = 35"));
+        assert!(contents.contains("theme = \"dark\""));
+        assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
+        assert!(contents.contains("subscriptions_layout = \"split\""));
+        assert!(contents.contains("skip_advertisement_chapters = false"));
+        assert!(contents.contains("show_local_folder_sizes = false"));
+        assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
+        assert!(!config.ui.show_local_folder_sizes);
+        assert!(!config.playback.skip_advertisement_chapters);
+
+        let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("reload configuration");
+        assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
+        assert!(!reloaded.ui.show_local_folder_sizes);
+        assert!(!reloaded.playback.skip_advertisement_chapters);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn autoplay_save_preserves_unrelated_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# keep this comment
+[playback]
+volume_percent = 35
+
+[providers]
+youtube_api_key = "keep-this-existing-secret"
+"#,
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config.save_autoplay(true).expect("save autoplay");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("volume_percent = 35"));
+        assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
+        assert!(contents.contains("autoplay = true"));
+        assert!(config.playback.autoplay);
+        let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("reload configuration");
+        assert!(reloaded.playback.autoplay);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn autoplay_environment_override_prevents_file_and_memory_mutation() {
+        const CHILD_MARKER: &str = "YOUTA_AUTOPLAY_SAVE_TEST_CHILD";
+        const TEST_DIRECTORY: &str = "YOUTA_AUTOPLAY_SAVE_TEST_DIR";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory =
+                PathBuf::from(std::env::var(TEST_DIRECTORY).expect("child test directory"));
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            assert!(config.playback.autoplay);
+
+            let error = config
+                .save_autoplay(false)
+                .expect_err("the environment override must lock autoplay");
+
+            assert!(error.to_string().contains(AUTOPLAY_ENV));
+            assert!(config.playback.autoplay);
+            assert!(!directory.join("config.toml").exists());
+            return;
+        }
+
+        let directory = tempdir().expect("temporary directory");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "config::tests::autoplay_environment_override_prevents_file_and_memory_mutation",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(TEST_DIRECTORY, directory.path())
+            .env(CONFIG_DIR_ENV, directory.path())
+            .env(AUTOPLAY_ENV, "true")
+            .output()
+            .expect("run autoplay environment-lock child");
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_preferences_environment_overrides_prevent_any_partial_write() {
+        const CHILD_MARKER: &str = "YOUTA_PREFERENCES_SAVE_TEST_CHILD";
+        const OVERRIDE_NAME: &str = "YOUTA_PREFERENCES_SAVE_TEST_OVERRIDE";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory = PathBuf::from(
+                std::env::var("YOUTA_PREFERENCES_SAVE_TEST_DIR").expect("child test directory"),
+            );
+            let override_name = std::env::var(OVERRIDE_NAME).expect("override name");
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            let error = config
+                .save_tui_preferences(SubscriptionsLayout::Split, false, true)
+                .expect_err("an environment override must lock the atomic writer");
+            assert!(error.to_string().contains(&override_name));
+            assert!(!directory.join("config.toml").exists());
+            return;
+        }
+
+        for (override_name, override_value) in [
+            (SUBSCRIPTIONS_LAYOUT_ENV, "split"),
+            (SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false"),
+            (LOCAL_FOLDER_SIZES_ENV, "false"),
+        ] {
+            let directory = tempdir().expect("temporary directory");
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "config::tests::tui_preferences_environment_overrides_prevent_any_partial_write",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(OVERRIDE_NAME, override_name)
+                .env("YOUTA_PREFERENCES_SAVE_TEST_DIR", directory.path())
+                .env(CONFIG_DIR_ENV, directory.path())
+                .env(override_name, override_value)
+                .output()
+                .expect("run environment-lock child");
+            assert!(
+                output.status.success(),
+                "child test failed for {override_name}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(feature = "tui")]

@@ -39,6 +39,8 @@ pub mod sponsorblock;
 pub mod tracker;
 #[cfg(feature = "wikidata")]
 pub mod wikidata;
+#[cfg(feature = "youtube-music")]
+pub mod youtube_music;
 #[cfg(feature = "youtube-official")]
 pub mod youtube_official;
 
@@ -432,6 +434,9 @@ pub struct ChannelSummary {
     pub subscriber_count: Option<u64>,
     /// Public video count, when exposed.
     pub video_count: Option<u64>,
+    /// Channel creation time as Unix seconds, when exposed.
+    #[serde(default)]
+    pub created_at: Option<i64>,
     /// Whether `YouTube` generated the channel automatically.
     pub auto_generated: bool,
     /// Available channel avatars, in provider order.

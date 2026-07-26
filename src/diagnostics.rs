@@ -462,6 +462,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "funkwhale",
         "generic-ytdlp",
         "google-drive",
+        "gpm",
         "gpodder",
         "invidious",
         "jack",

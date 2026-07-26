@@ -139,6 +139,22 @@ impl DescriptionLink {
     }
 }
 
+/// A `YouTube` video URL that may be opened inside the Details panel.
+///
+/// The byte range identifies the original URL. Renderers place their compact
+/// action immediately after `end_byte` without rewriting the description.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DescriptionVideoLink {
+    /// Inclusive UTF-8 byte offset of the original URL.
+    pub start_byte: usize,
+    /// Exclusive UTF-8 byte offset of the original URL.
+    pub end_byte: usize,
+    /// Stable eleven-character `YouTube` video identifier.
+    pub video_id: String,
+    /// Optional initial position encoded in the URL.
+    pub start_seconds: Option<u64>,
+}
+
 /// A chapter inferred from a line-leading timecode in a media description.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DescriptionChapter {
@@ -173,6 +189,29 @@ pub fn parse_description_links(description: &str) -> Vec<DescriptionLink> {
     parse_hashtags(description, &mut links);
     links.sort_unstable_by_key(|link| (link.start_byte, link.end_byte));
     links
+}
+
+/// Extracts only `YouTube` video URLs eligible for internal Details navigation.
+///
+/// Channel and playlist URLs intentionally remain ordinary text because their
+/// internal screens have different state and provider requirements.
+#[must_use]
+pub fn parse_description_video_links(description: &str) -> Vec<DescriptionVideoLink> {
+    parse_description_links(description)
+        .into_iter()
+        .filter_map(|link| match link.target {
+            LinkTarget::YouTubeVideo {
+                video_id,
+                start_seconds,
+            } => Some(DescriptionVideoLink {
+                start_byte: link.start_byte,
+                end_byte: link.end_byte,
+                video_id,
+                start_seconds,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Infers ordered chapters from line-leading timecodes in a description.
@@ -251,6 +290,17 @@ pub fn chapter_title_for_display(title: &str) -> &str {
     } else {
         title
     }
+}
+
+/// Returns whether a chapter title is the exact Russian advertisement label.
+///
+/// Surrounding whitespace and one sentence-ending period are ignored in the
+/// same way as seek-bar labels. Matching deliberately remains case-sensitive
+/// and language-specific so titles such as `Реклама 2`, `РЕКЛАМА`, or
+/// `Advertisement` are never skipped accidentally.
+#[must_use]
+pub fn is_advertisement_chapter_title(title: &str) -> bool {
+    chapter_title_for_display(title.trim()) == "Реклама"
 }
 
 /// Normalizes recognized chapter lines for display in media Details.
@@ -751,6 +801,45 @@ mod tests {
     }
 
     #[test]
+    fn internal_video_links_include_short_and_watch_urls_only() {
+        let description = "\
+short https://youtu.be/dQw4w9WgXcQ?t=45
+watch https://www.youtube.com/watch?v=9bZkp7q19f0
+channel https://www.youtube.com/@Example
+playlist https://www.youtube.com/playlist?list=PL123_test";
+
+        let links = parse_description_video_links(description);
+
+        assert_eq!(
+            links,
+            [
+                DescriptionVideoLink {
+                    start_byte: description
+                        .find("https://youtu.be/dQw4w9WgXcQ?t=45")
+                        .expect("short URL should exist"),
+                    end_byte: description
+                        .find("https://youtu.be/dQw4w9WgXcQ?t=45")
+                        .expect("short URL should exist")
+                        + "https://youtu.be/dQw4w9WgXcQ?t=45".len(),
+                    video_id: "dQw4w9WgXcQ".to_owned(),
+                    start_seconds: Some(45),
+                },
+                DescriptionVideoLink {
+                    start_byte: description
+                        .find("https://www.youtube.com/watch?v=9bZkp7q19f0")
+                        .expect("watch URL should exist"),
+                    end_byte: description
+                        .find("https://www.youtube.com/watch?v=9bZkp7q19f0")
+                        .expect("watch URL should exist")
+                        + "https://www.youtube.com/watch?v=9bZkp7q19f0".len(),
+                    video_id: "9bZkp7q19f0".to_owned(),
+                    start_seconds: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn lookalike_hosts_credentials_and_invalid_ids_are_rejected() {
         for raw in [
             "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
@@ -996,6 +1085,35 @@ Inline ➤ 07:25 remains unchanged\r
         );
         assert_eq!(chapter_title_for_display("Title.  "), "Title");
         assert_eq!(chapter_title_for_display("Wait..."), "Wait...");
+    }
+
+    #[test]
+    fn advertisement_chapter_title_matching_is_normalized_but_intentionally_exact() {
+        for title in ["Реклама", " Реклама ", "Реклама.", "Реклама.  "]
+        {
+            assert!(
+                is_advertisement_chapter_title(title),
+                "`{title}` should be the exact normalized advertisement label"
+            );
+        }
+        for title in [
+            "реклама",
+            "РЕКЛАМА",
+            "Реклама!",
+            "Реклама...",
+            "Реклама 2",
+            "Рекламная интеграция",
+            "Advertisement",
+        ] {
+            assert!(
+                !is_advertisement_chapter_title(title),
+                "`{title}` must not be classified as the exact advertisement label"
+            );
+        }
+
+        let chapters = parse_description_chapters("➤ 00:00 — Реклама.\n00:10 Programme", Some(20));
+        assert!(is_advertisement_chapter_title(&chapters[0].title));
+        assert!(!is_advertisement_chapter_title(&chapters[1].title));
     }
 
     #[test]
