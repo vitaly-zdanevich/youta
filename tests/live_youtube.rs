@@ -2,8 +2,8 @@
 //!
 //! Unlike the deterministic process tests in `e2e.rs`, this target exercises
 //! Youta's production mpv/yt-dlp integration and therefore needs network
-//! access. CI invokes it explicitly; ordinary local `cargo test` runs compile
-//! it but leave the ignored test dormant.
+//! access. `scripts/test-live-youtube.sh` invokes it explicitly; ordinary
+//! `cargo test` runs compile it but leave the ignored test dormant.
 
 #![cfg(all(unix, feature = "backend-mpv", feature = "yt-dlp"))]
 
@@ -26,10 +26,10 @@ const RESUME_AT: Duration = Duration::from_secs(30);
 ///
 /// The default fixture is the Blender Foundation's Creative Commons-licensed
 /// *Big Buck Bunny* upload. Set `YOUTA_LIVE_YOUTUBE_URL` to exercise another
-/// public video. CI uses mpv's null output, while a local opt-in can set
+/// public video. The local helper uses mpv's null output by default; set
 /// `YOUTA_LIVE_YOUTUBE_AUDIBLE=1` to use the machine's default audio output.
 #[test]
-#[ignore = "requires YouTube, yt-dlp, and mpv; CI invokes this target explicitly"]
+#[ignore = "requires YouTube, yt-dlp, and mpv; run scripts/test-live-youtube.sh"]
 fn youtube_audio_playback_advances_and_shuts_down() {
     assert_eq!(
         std::env::var(LIVE_TEST_OPT_IN).as_deref(),

@@ -524,31 +524,31 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
-required live YouTube, Apple Podcasts, and Wikidata jobs; a newer push does not
-cancel the older revision's suite. Clippy blocks compiler hygiene plus its
-correctness, suspicious-code, and performance groups; style, complexity, and
-pedantic findings remain visible as advisory output while that backlog is
-reduced in focused changes. The YouTube job uses Youta's production
-mpv/yt-dlp integration to decode a short segment through mpv's null audio
-output. Apple Podcasts is checked from public Apple metadata through its RSS
-enclosure and silent audio decode. Wikidata is checked through a live exact
-P1651 lookup. Each live job retries once for a transient network failure; a
-second failure fails CI. Tagged releases build on native amd64 and arm64
-runners and publish:
+required live Apple Podcasts and Wikidata jobs; a newer push does not cancel
+the older revision's suite. Clippy blocks compiler hygiene plus its correctness,
+suspicious-code, and performance groups; style, complexity, and pedantic
+findings remain visible as advisory output while that backlog is reduced in
+focused changes. Apple Podcasts is checked from public Apple metadata through
+its RSS enclosure and silent audio decode. Wikidata is checked through a live
+exact P1651 lookup. Each enabled live job retries once for a transient network
+failure; a second failure fails CI. Tagged releases build on native amd64 and
+arm64 runners and publish:
 
 - a binary archive for each architecture; and
 - a Cargo vendor archive for offline/external build systems.
 
-The live YouTube job does not use a Google account or cookies. It runs the
-account-free [bgutil PO-token
-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) in an
-isolated, version-and-digest-pinned Deno container bound only to localhost.
-The matching Python plugin gives yt-dlp short-lived, video-bound tokens, and
-the job removes the container after playback. The fixture is embeddable, so
-the test also enables yt-dlp's account-free `web_embedded` fallback alongside
-its default clients. This follows yt-dlp's [PO-token
-guidance](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), but the
-provider cannot guarantee that YouTube will accept every runner address.
+Live YouTube playback is temporarily excluded from automatic hosted CI because
+YouTube returns `LOGIN_REQUIRED` for GitHub-hosted runner addresses even with
+the account-free [bgutil PO-token
+provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). The
+disabled job remains in the workflow so it can be re-enabled when that path is
+reliable by setting the repository Actions variable `RUN_LIVE_YOUTUBE` to
+`true`; it does not use a Google account or cookies. Until then,
+`scripts/test-live-youtube.sh` is the required local pre-commit check. It
+exercises Youta's production mpv/yt-dlp integration and decodes a short segment
+through mpv's null audio output. This setup follows yt-dlp's [PO-token
+guidance](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), whose provider
+documentation notes that not every runner address can be accepted.
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and
 consumes the release vendor archive. GitHub Actions use Node 24-based action
@@ -561,7 +561,8 @@ scripts/package-release.sh
 scripts/package-vendor.sh
 ```
 
-Run the live playback check locally without sending audio to a device:
+Before each commit, run the live YouTube playback check locally without sending
+audio to a device:
 
 ```sh
 scripts/test-live-youtube.sh

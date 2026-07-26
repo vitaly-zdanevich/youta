@@ -129,6 +129,12 @@ jobs:
 
   live-youtube:
     name: Live YouTube playback
+    # GitHub-hosted egress currently receives YouTube's LOGIN_REQUIRED
+    # response even with the account-free PO-token provider. Keep this job
+    # ready to re-enable, and run scripts/test-live-youtube.sh locally before
+    # each commit in the meantime. Set the repository Actions variable
+    # RUN_LIVE_YOUTUBE to true when the hosted check is reliable again.
+    if: ${{ vars.RUN_LIVE_YOUTUBE == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
