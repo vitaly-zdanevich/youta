@@ -180,7 +180,7 @@ jobs:
           {
             printf '%s\n' '#!/bin/sh'
             printf '%s\n' \
-              'exec /tmp/youta-live-venv/bin/yt-dlp --extractor-args "youtube:player_client=mweb" "$@"'
+              'exec /tmp/youta-live-venv/bin/yt-dlp --verbose --extractor-args "youtube:player_client=default,web_embedded" "$@"'
           } > "${yt_dlp_wrapper}"
           chmod 700 "${yt_dlp_wrapper}"
           echo "YOUTA_TEST_YT_DLP=${yt_dlp_wrapper}" >> "${GITHUB_ENV}"

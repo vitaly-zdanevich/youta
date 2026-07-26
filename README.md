@@ -544,10 +544,11 @@ account-free [bgutil PO-token
 provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) in an
 isolated, version-and-digest-pinned Deno container bound only to localhost.
 The matching Python plugin gives yt-dlp short-lived, video-bound tokens, and
-the job removes the container after playback. This follows yt-dlp's
-[recommended `mweb` PO-token
-setup](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), but the provider
-cannot guarantee that YouTube will accept every runner address.
+the job removes the container after playback. The fixture is embeddable, so
+the test also enables yt-dlp's account-free `web_embedded` fallback alongside
+its default clients. This follows yt-dlp's [PO-token
+guidance](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), but the
+provider cannot guarantee that YouTube will accept every runner address.
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and
 consumes the release vendor archive. GitHub Actions use Node 24-based action
