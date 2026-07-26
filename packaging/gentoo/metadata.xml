@@ -8,7 +8,8 @@
 	<longdescription lang="en">
 		Youta is a low-resource Rust terminal YouTube audio player and local
 		subscription manager. It can supervise mpv and yt-dlp while keeping
-		playback controls, queue state, and persistence in one TUI.
+		playback controls, queue state, local subscriptions, and listening
+		progress in one TUI.
 	</longdescription>
 	<use>
 		<flag name="archive-rar">Index supported RAR audio archives through an external unpacker</flag>

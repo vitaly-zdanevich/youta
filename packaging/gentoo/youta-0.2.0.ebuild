@@ -6,11 +6,11 @@ EAPI=8
 # Release builds use the upstream cargo-vendor archive rather than hundreds of
 # individual crate distfiles. Cargo.lock remains authoritative.
 CRATES=""
-RUST_MIN_VER="1.90.0"
+RUST_MIN_VER="1.95.0"
 
 inherit cargo
 
-DESCRIPTION="Low-resource terminal YouTube audio player and subscriptions manager"
+DESCRIPTION="Low-resource YouTube audio player TUI with local subscriptions and progress"
 HOMEPAGE="https://github.com/vitaly-zdanevich/youta"
 SRC_URI="
 	https://github.com/vitaly-zdanevich/youta/archive/refs/tags/v${PV}.tar.gz
