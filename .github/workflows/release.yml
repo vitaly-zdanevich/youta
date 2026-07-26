@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.90.0
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out the release revision
+        uses: actions/checkout@v6
+
+      - name: Require a matching version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package_version=$(
+            sed -n \
+              '/^\[package\]$/,/^\[/s/^version = "\(.*\)"/\1/p' \
+              Cargo.toml |
+              head -n 1
+          )
+          expected_tag="v${package_version}"
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Release tag ${RELEASE_TAG} does not match ${expected_tag}." >&2
+            exit 1
+          fi
+
+  binaries:
+    name: Linux ${{ matrix.architecture }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set reproducible archive timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+
+      - name: Build the architecture-specific archive
+        run: scripts/package-release.sh "${{ matrix.target }}" dist
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: youta-linux-${{ matrix.architecture }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  vendor:
+    name: Vendored Cargo dependencies
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: vendor-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set reproducible archive timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+
+      - name: Create dependency archive
+        run: scripts/package-vendor.sh dist
+
+      - name: Upload dependency archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: youta-vendor
+          path: |
+            dist/*-vendor.tar.xz
+            dist/*-vendor.tar.xz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - binaries
+      - vendor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # GitHub CLI is preinstalled on the hosted runner. Using it avoids a
+      # third-party release action and keeps token permissions explicit.
+      - name: Create or update the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -d '' assets < <(find dist -maxdepth 1 -type f -print0 | sort -z)
+          ((${#assets[@]} > 0)) || {
+            echo 'No release assets were downloaded.' >&2
+            exit 1
+          }
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              "${assets[@]}" \
+              --verify-tag \
+              --generate-notes
+          fi

@@ -1,5 +1,7 @@
 # Youta
 
+[![CI](https://github.com/vitaly-zdanevich/youta/actions/workflows/ci.yml/badge.svg)](https://github.com/vitaly-zdanevich/youta/actions/workflows/ci.yml)
+
 Youta is a low-resource terminal YouTube audio player and subscription manager
 written in Rust. It uses an invisible `mpv` process for playback, communicates
 with it over JSON IPC, and can use `yt-dlp` as an explicitly enabled media

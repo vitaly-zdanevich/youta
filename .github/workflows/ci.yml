@@ -1,0 +1,341 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.sha }}
+  # Every pushed revision must finish the complete suite, including live
+  # service checks, even when another revision is pushed soon afterwards.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RUST_VERSION: 1.90.0
+
+jobs:
+  lint:
+    name: Formatting, Clippy, and Rustdoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      # Use shell-based rustup so CI does not pull in a Node 20 setup action.
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" \
+            --profile minimal \
+            --component clippy,rustfmt
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run blocking Clippy lint groups
+        # The manifest still reports style, complexity, and pedantic advice.
+        # CI blocks compiler hygiene plus Clippy's bug-risk and performance
+        # groups while that advisory backlog is reduced in focused changes.
+        run: >-
+          cargo clippy --locked --all-targets --all-features --
+          -D unused
+          -D future-incompatible
+          -D clippy::correctness
+          -D clippy::suspicious
+          -D clippy::perf
+
+      - name: Check Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+  test:
+    name: Deterministic tests (${{ matrix.feature_set }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature_set: default features
+            feature_arguments: ''
+          - feature_set: no default features
+            feature_arguments: --no-default-features
+          - feature_set: all features
+            feature_arguments: --all-features
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run all deterministic test targets
+        run: cargo test --locked --all-targets ${{ matrix.feature_arguments }}
+
+      - name: Run Rustdoc tests
+        run: cargo test --locked --doc ${{ matrix.feature_arguments }}
+
+  e2e:
+    name: End-to-end terminal test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run the explicit end-to-end target
+        env:
+          TERM: xterm-256color
+        run: cargo test --locked --test e2e --all-features
+
+  live-youtube:
+    name: Live YouTube playback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install playback helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mpv python3-venv
+          python3 -m venv /tmp/youta-live-venv
+          /tmp/youta-live-venv/bin/pip \
+            install \
+            --disable-pip-version-check \
+            yt-dlp
+
+      - name: Resolve and decode real YouTube audio
+        env:
+          YOUTA_RUN_LIVE_YOUTUBE_TEST: '1'
+          YOUTA_TEST_YT_DLP: /tmp/youta-live-venv/bin/yt-dlp
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_youtube \
+              --all-features \
+              -- \
+              --ignored \
+              --exact youtube_audio_playback_advances_and_shuts_down \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Fetch and render a real YouTube thumbnail
+        env:
+          YOUTA_RUN_LIVE_THUMBNAIL_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --lib \
+              --all-features \
+              -- \
+              --ignored \
+              --exact thumbnails::tests::live_youtube_thumbnail_leaves_loading_with_a_ready_protocol \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+  live-apple-podcasts:
+    name: Live Apple Podcasts playback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the playback helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mpv
+
+      - name: Resolve Apple metadata, RSS, and audio
+        env:
+          YOUTA_RUN_LIVE_APPLE_PODCASTS_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features apple-podcasts,backend-mpv \
+              -- \
+              --ignored \
+              --exact apple_podcasts_lookup_rss_and_audio_are_usable \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+  live-wikidata:
+    name: Live Wikidata lookup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Query the public Wikidata service
+        env:
+          YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features wikidata \
+              -- \
+              --ignored \
+              --exact wikidata_finds_the_youtube_fixture_item \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install Rust with coverage tools
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component llvm-tools-preview
+          rustup default stable
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-stable-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the pinned coverage runner
+        run: cargo install cargo-llvm-cov --locked --version 0.8.7
+
+      - name: Generate LCOV report
+        run: |
+          cargo llvm-cov \
+            --locked \
+            --workspace \
+            --all-features \
+            --all-targets \
+            --fail-under-lines 70 \
+            --lcov \
+            --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
