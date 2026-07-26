@@ -1708,9 +1708,14 @@ fn render_row_list(
             } else {
                 theme.accent
             };
+            let subscription_marker = if show_source {
+                format!("{marker} ")
+            } else {
+                " ".to_owned()
+            };
             let line = Line::from(vec![
                 Span::styled(format!("{} ", if playing { "▶" } else { " " }), row_style),
-                Span::styled(format!("{marker} "), source_style),
+                Span::styled(subscription_marker, source_style),
                 Span::styled(
                     format!(
                         "{} ",
@@ -5717,6 +5722,7 @@ mod tests {
         view.subscriptions.items = vec![subscription_row("Fixture video", true)];
         view.subscriptions.source_title = "Fixture channel".to_owned();
         view.subscriptions.source_subscriber_count = Some(13_045);
+        view.playing_media_id = view.subscriptions.items[0].media_id.clone();
         let mut hit_map = HitMap::default();
 
         terminal
@@ -5751,6 +5757,10 @@ mod tests {
             !rendered.contains('◆'),
             "subscription videos must omit the redundant channel marker"
         );
+        assert!(
+            rendered.contains("▶  ● Fixture video"),
+            "playing subscription videos keep exactly two spaces before the watched marker"
+        );
         assert!(rendered.contains("Expanded fixture description"));
         assert!(hit_map.subscription_item_rows.width > 0);
 
@@ -5767,6 +5777,10 @@ mod tests {
         assert!(
             !rendered.contains("YouTube · 2026 July 25"),
             "split subscription rows must also omit the repeated source"
+        );
+        assert!(
+            rendered.contains("▶  ● Fixture video"),
+            "split subscription rows keep the same compact marker spacing"
         );
         assert!(rendered.contains("[i] Description"));
         assert!(hit_map.subscription_source_rows.width > 0);
