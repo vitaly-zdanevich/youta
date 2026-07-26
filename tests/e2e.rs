@@ -129,7 +129,9 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
             "--log-out",
         ])
         .arg(&transcript)
-        .arg("--")
+        // Ubuntu 24.04's util-linux 2.39 supports `--command`, but not the
+        // newer `-- <command> [arguments...]` invocation form.
+        .arg("--command")
         .arg(&launcher)
         .env_clear()
         .env("TERM", "xterm-256color")
@@ -285,7 +287,9 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
             "--log-out",
         ])
         .arg(&transcript)
-        .arg("--")
+        // Ubuntu 24.04's util-linux 2.39 supports `--command`, but not the
+        // newer `-- <command> [arguments...]` invocation form.
+        .arg("--command")
         .arg(&launcher)
         .env_clear()
         .env("TERM", "xterm-256color")
