@@ -149,9 +149,17 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install playback helpers
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes mpv python3-venv
+          sudo apt-get install --yes python3-venv
+          /home/linuxbrew/.linuxbrew/bin/brew install mpv
+          mpv_path="$(
+            /home/linuxbrew/.linuxbrew/bin/brew --prefix mpv
+          )/bin/mpv"
+          "${mpv_path}" --version
+          echo "YOUTA_TEST_MPV=${mpv_path}" >> "${GITHUB_ENV}"
           python3 -m venv /tmp/youta-live-venv
           /tmp/youta-live-venv/bin/pip \
             install \
