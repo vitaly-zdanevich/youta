@@ -44,8 +44,8 @@ use crate::playback::{
 use crate::providers::{
     ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest, Provider,
     SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoSummary, invidious_youtube_provider,
-    official_youtube_provider, validate_youtube_video_id,
+    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary,
+    invidious_youtube_provider, official_youtube_provider, validate_youtube_video_id,
 };
 use crate::report_actions::SystemReportActions;
 #[cfg(test)]
@@ -1106,6 +1106,7 @@ impl AppController {
             } else {
                 RightPanelMode::Details
             },
+            show_chapter_timestamps: !saved.chapter_timestamps_hidden,
             ..ViewModel::default()
         };
         view.subscriptions.layout = config.ui.subscriptions_layout;
@@ -1525,6 +1526,7 @@ impl AppController {
             published_at: None,
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url,
             stream_url: None,
@@ -2454,11 +2456,55 @@ impl AppController {
                 }
                 match result {
                     Ok(details) => {
-                        let updated_summary = summary_from_details(&details);
+                        let known_orientation = self
+                            .youtube_results
+                            .iter()
+                            .chain(
+                                self.subscription_video_cache
+                                    .values()
+                                    .flat_map(|cached| cached.items.iter()),
+                            )
+                            .find_map(|item| match item {
+                                SearchItem::Video(summary)
+                                    if summary.video_id == details.video_id
+                                        && summary.orientation != VideoOrientation::Unknown =>
+                                {
+                                    Some(summary.orientation)
+                                }
+                                _ => None,
+                            });
+                        let mut updated_summary = summary_from_details(&details);
+                        if updated_summary.orientation == VideoOrientation::Unknown
+                            && let Some(orientation) = known_orientation
+                        {
+                            updated_summary.orientation = orientation;
+                        }
                         let detailed_chapters =
                             description_chapters(&details.description, details.duration_seconds);
                         let detailed_media_id =
                             MediaId::new(SourceKind::YouTube, details.video_id.clone());
+                        let orientation_changed = details.orientation != VideoOrientation::Unknown
+                            && self.youtube_results.iter().any(|item| {
+                                matches!(
+                                    item,
+                                    SearchItem::Video(summary)
+                                        if summary.video_id == details.video_id
+                                            && summary.orientation != details.orientation
+                                )
+                            });
+                        if orientation_changed
+                            && self.youtube_search_request.is_some()
+                            && let Err(error) = self.store.update_saved_youtube_video_orientation(
+                                &details.video_id,
+                                details.orientation,
+                                unix_time(),
+                            )
+                        {
+                            self.show_error(
+                                "Could not cache the YouTube video orientation",
+                                &error,
+                            );
+                        }
                         for queued in &mut self.playback_queue.items {
                             if queued.media.id == detailed_media_id {
                                 queued.media.chapters.clone_from(&detailed_chapters);
@@ -4980,6 +5026,7 @@ impl AppController {
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.view.search_query.clone(),
             waveform_visible: self.view.right_panel_mode == RightPanelMode::Waveform,
+            chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
             ..SessionState::default()
         };
         match self.store.save_session(&state, unix_time()) {
@@ -5244,6 +5291,17 @@ impl UiController for AppController {
             }
             UiAction::ChangeChapter(delta) => {
                 self.change_chapter(delta);
+            }
+            UiAction::ToggleChapterTimestamps => {
+                self.view.show_chapter_timestamps = !self.view.show_chapter_timestamps;
+                self.view.status_line = format!(
+                    "Chapter timestamps {}",
+                    if self.view.show_chapter_timestamps {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                );
             }
             UiAction::ToggleRepeat => {
                 self.view.repeating = !self.view.repeating;
@@ -6342,6 +6400,7 @@ fn row_from_search_item(
                 subscribed: matches!(context, SearchRowContext::GlobalSearch)
                     && subscriptions.contains_youtube_channel(&video.channel_id),
                 thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
+                vertical: video.orientation == VideoOrientation::Vertical,
             }
         }
         SearchItem::Channel(channel) => RowView {
@@ -6715,6 +6774,7 @@ fn summary_from_details(video: &VideoDetails) -> VideoSummary {
         published_at: video.published_at,
         published_text: video.published_text.clone(),
         live: video.live,
+        orientation: video.orientation,
         thumbnails: video.thumbnails.clone(),
         webpage_url: video.webpage_url.clone(),
         stream_url: video.stream_url.clone(),
@@ -7420,6 +7480,7 @@ mod tests {
             published_at: Some(1_729_003_672),
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
@@ -7443,6 +7504,7 @@ mod tests {
             ratings_allowed: Some(true),
             live: false,
             keywords: Vec::new(),
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
@@ -7795,6 +7857,7 @@ mod tests {
             published_at: Some(1_729_003_672),
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
@@ -7827,6 +7890,7 @@ mod tests {
             ratings_allowed: Some(true),
             live: false,
             keywords: Vec::new(),
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
@@ -9193,6 +9257,100 @@ mod tests {
     }
 
     #[test]
+    fn lazy_video_details_recolor_a_confirmed_vertical_search_row() {
+        let config = Config::for_dir("/tmp/youta-vertical-details-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_results = vec![SearchItem::Video(subscription_video_summary())];
+        controller.refresh_youtube_rows();
+        assert!(!controller.view.rows[0].vertical);
+
+        let mut details = subscription_video_details("Vertical fixture");
+        details.orientation = VideoOrientation::Vertical;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(details),
+        });
+
+        assert!(controller.view.rows[0].vertical);
+        assert!(matches!(
+            &controller.youtube_results[0],
+            SearchItem::Video(video) if video.orientation == VideoOrientation::Vertical
+        ));
+    }
+
+    #[test]
+    fn incomplete_details_preserve_known_and_saved_video_orientation() {
+        let config = Config::for_dir("/tmp/youta-preserved-orientation-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let request = SearchRequest::new("vertical fixture", SearchTarget::Videos);
+        let mut summary = subscription_video_summary();
+        summary.orientation = VideoOrientation::Vertical;
+        controller.youtube_search_request = Some(request.clone());
+        controller.youtube_results = vec![SearchItem::Video(summary.clone())];
+        controller
+            .store
+            .save_youtube_search(
+                &SavedYouTubeSearch {
+                    request,
+                    results: vec![SearchItem::Video(summary)],
+                    next_page: None,
+                },
+                1,
+            )
+            .expect("save search fixture");
+        controller.refresh_youtube_rows();
+
+        let mut details = subscription_video_details("Incomplete orientation fixture");
+        details.orientation = VideoOrientation::Unknown;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(details),
+        });
+
+        assert!(controller.view.rows[0].vertical);
+        assert!(matches!(
+            &controller.youtube_results[0],
+            SearchItem::Video(video) if video.orientation == VideoOrientation::Vertical
+        ));
+        let saved = controller
+            .store
+            .youtube_search()
+            .expect("read saved search")
+            .expect("saved search fixture");
+        assert!(matches!(
+            &saved.results[0],
+            SearchItem::Video(video) if video.orientation == VideoOrientation::Vertical
+        ));
+    }
+
+    #[test]
+    fn only_provider_confirmed_vertical_videos_mark_youtube_rows() {
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let subscriptions = SubscriptionTree::default();
+        let subscribers = HashMap::new();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date");
+        let row_for = |orientation| {
+            let mut video = subscription_video_summary();
+            video.orientation = orientation;
+            row_from_search_item(
+                &SearchItem::Video(video),
+                &store,
+                &subscriptions,
+                &subscribers,
+                SearchRowContext::GlobalSearch,
+                today,
+            )
+        };
+
+        assert!(row_for(VideoOrientation::Vertical).vertical);
+        assert!(!row_for(VideoOrientation::Horizontal).vertical);
+        assert!(!row_for(VideoOrientation::Square).vertical);
+        assert!(!row_for(VideoOrientation::Unknown).vertical);
+    }
+
+    #[test]
     fn hiding_non_cc_license_rows_does_not_change_commons_upload_gating() {
         assert!(
             media_license_from_label("Creative Commons Attribution")
@@ -9493,6 +9651,35 @@ mod tests {
             status_queue,
             event_queue,
         )
+    }
+
+    #[test]
+    fn chapter_timestamp_toggle_changes_only_labels_and_survives_restart() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.playback_chapters = vec![Chapter {
+            title: "Introduction".to_owned(),
+            start_seconds: 10,
+            end_seconds: None,
+        }];
+        let chapters = controller.view.playback_chapters.clone();
+
+        controller.dispatch(UiAction::ToggleChapterTimestamps);
+        assert!(!controller.view.show_chapter_timestamps);
+        assert_eq!(controller.view.playback_chapters, chapters);
+        assert_eq!(controller.view.status_line, "Chapter timestamps hidden");
+        controller.save_session();
+        let config = controller.config.clone();
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let mut restored = AppController::new(config, store, None, None);
+        assert!(!restored.view.show_chapter_timestamps);
+        restored.dispatch(UiAction::ToggleChapterTimestamps);
+        assert!(restored.view.show_chapter_timestamps);
+        assert_eq!(restored.view.status_line, "Chapter timestamps shown");
     }
 
     #[test]
@@ -10172,6 +10359,7 @@ mod tests {
             published_at: None,
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: Some(
                 url::Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -10722,6 +10910,7 @@ mod tests {
             published_at: Some(1),
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: Some(

@@ -21,7 +21,8 @@ use url::Url;
 use super::{
     DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
     SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoSummary, get_bounded_json, provider_agent,
+    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary, get_bounded_json,
+    provider_agent,
 };
 
 const API_ENDPOINT: &str = "https://api.jamendo.com/v3.0/tracks/";
@@ -115,6 +116,7 @@ impl JamendoTrack {
             published_at,
             published_text: self.release_date,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails,
             webpage_url: Some(self.share_url),
             stream_url: Some(self.audio_stream_url),
@@ -155,6 +157,7 @@ impl JamendoTrack {
             ratings_allowed: None,
             live: false,
             keywords: self.tags,
+            orientation: VideoOrientation::Unknown,
             thumbnails,
             webpage_url: Some(self.share_url),
             stream_url: Some(self.audio_stream_url),

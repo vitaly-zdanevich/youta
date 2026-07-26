@@ -202,7 +202,18 @@ for an old selection is cached but not painted over the new selection.
 Description links, hashtags, timecodes, and YouTube IDs are parsed into typed
 spans. Following an internal media link pushes the current detail state onto a
 bounded navigation stack. Back restores the exact selection and scroll offset.
-Timecode navigation also records a previous playback position.
+Timecode navigation also records a previous playback position. Chapter labels
+may reserve up to four rows when the terminal has height to spare, and the
+timestamp prefix can be hidden without changing exact seek targets. The
+inverse visibility bit is stored in the restart-safe session so older session
+documents keep timestamps visible by default.
+
+Video orientation is provider metadata, never a thumbnail-ratio heuristic.
+Official YouTube results use `player` embed dimensions returned by the existing
+batched video-resource request. Invidious selected-video details use encoded
+format dimensions. Unknown rows retain the normal title color, avoiding
+per-result network fan-out and false portrait classifications from letterboxed
+artwork.
 
 Wikidata matching is advisory. Exact external-ID claims rank above URL and
 normalized-title matches. Ambiguous title matches are displayed as suggestions,

@@ -21,8 +21,8 @@ use super::{
     ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest,
     DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
     SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoSummary, parse_rfc3339_epoch, provider_agent,
-    validate_base_url, validate_youtube_video_id,
+    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary, parse_rfc3339_epoch,
+    provider_agent, validate_base_url, validate_youtube_video_id,
 };
 
 const API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
@@ -38,6 +38,8 @@ const MAX_TOKENS_PER_CHANNEL: usize = 32;
 const MAX_SERVICE_REASON_CHARS: usize = 96;
 const MAX_SERVICE_MESSAGE_CHARS: usize = 512;
 const MAX_CHANNEL_STATISTICS_IDS: usize = 50;
+/// Equal player bounds let the API preserve landscape and portrait ratios.
+const PLAYER_EMBED_BOUND: &str = "1920";
 
 /// Blocking provider backed by the official `YouTube` Data API v3.
 ///
@@ -340,9 +342,13 @@ impl YouTubeOfficialProvider {
         let mut url = self.endpoint("videos")?;
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("part", "snippet,contentDetails,statistics,status");
+            query.append_pair("part", "snippet,contentDetails,statistics,status,player");
             query.append_pair("id", &ids.join(","));
             query.append_pair("maxResults", &ids.len().to_string());
+            // Equal bounds preserve either orientation while requesting the
+            // player dimensions needed to classify the encoded video.
+            query.append_pair("maxWidth", PLAYER_EMBED_BOUND);
+            query.append_pair("maxHeight", PLAYER_EMBED_BOUND);
         }
         let response: RawVideoListResponse = self.request_json(&url)?;
         response
@@ -1124,6 +1130,7 @@ fn video_summary_from_search(
             .and_then(parse_rfc3339_epoch),
         published_text: None,
         live: snippet.live_broadcast_content.as_deref() == Some("live"),
+        orientation: VideoOrientation::Unknown,
         thumbnails: convert_thumbnails(snippet.thumbnails),
         stream_url: None,
     })
@@ -1142,6 +1149,7 @@ fn video_summary_from_resource(raw: RawVideoResource) -> Result<VideoSummary, Pr
         published_at: details.published_at,
         published_text: details.published_text,
         live: details.live,
+        orientation: details.orientation,
         thumbnails: details.thumbnails,
         webpage_url: details.webpage_url,
         stream_url: None,
@@ -1196,6 +1204,7 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         .as_deref()
         .and_then(parse_iso8601_duration);
     let license = raw.status.license.as_deref().and_then(map_license);
+    let orientation = raw.player.orientation();
     Ok(VideoDetails {
         webpage_url: youtube_video_url(&raw.id),
         video_id: raw.id,
@@ -1216,6 +1225,7 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         rating: None,
         ratings_allowed: None,
         live: raw.snippet.live_broadcast_content.as_deref() == Some("live"),
+        orientation,
         keywords: raw.snippet.tags,
         thumbnails: convert_thumbnails(raw.snippet.thumbnails),
         stream_url: None,
@@ -1490,6 +1500,8 @@ struct RawVideoResource {
     statistics: RawVideoStatistics,
     #[serde(default)]
     status: RawVideoStatus,
+    #[serde(default)]
+    player: RawVideoPlayer,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1511,6 +1523,30 @@ struct RawVideoStatistics {
 struct RawVideoStatus {
     #[serde(default)]
     license: Option<String>,
+}
+
+/// Player dimensions returned when a square embed bound is requested.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawVideoPlayer {
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    embed_width: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    embed_height: Option<u64>,
+}
+
+impl RawVideoPlayer {
+    /// Classifies usable embed dimensions without consulting artwork.
+    fn orientation(&self) -> VideoOrientation {
+        self.embed_width
+            .zip(self.embed_height)
+            .and_then(|(width, height)| {
+                Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+            })
+            .map_or(VideoOrientation::Unknown, |(width, height)| {
+                VideoOrientation::from_dimensions(width, height)
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1662,7 +1698,8 @@ mod tests {
             },
             "contentDetails": {"duration": "P1DT2H3M4S"},
             "statistics": {"viewCount": "123456", "likeCount": 789},
-            "status": {"license": "creativeCommon"}
+            "status": {"license": "creativeCommon"},
+            "player": {"embedWidth": "1080", "embedHeight": 1920}
         }]
     }"#;
 
@@ -1741,7 +1778,8 @@ mod tests {
             },
             "contentDetails": {"duration": "PT3M2S"},
             "statistics": {"viewCount": "456"},
-            "status": {"license": "youtube"}
+            "status": {"license": "youtube"},
+            "player": {"embedWidth": 1920, "embedHeight": 1080}
         }]
     }"#;
 
@@ -1932,6 +1970,7 @@ mod tests {
         assert_eq!(video.channel_name, "Enriched channel");
         assert_eq!(video.duration_seconds, Some(93_784));
         assert_eq!(video.view_count, Some(123_456));
+        assert_eq!(video.orientation, VideoOrientation::Vertical);
         assert_eq!(video.thumbnails.len(), 2);
         assert_eq!(
             video.thumbnails[0].quality.as_deref(),
@@ -1942,8 +1981,17 @@ mod tests {
         assert!(requests[1].starts_with("/videos?"));
         assert!(requests_contain_part(
             &requests,
-            "snippet%2CcontentDetails%2Cstatistics%2Cstatus"
+            "snippet%2CcontentDetails%2Cstatistics%2Cstatus%2Cplayer"
         ));
+        let resource_pairs = query_pairs(&requests[1]);
+        assert_eq!(
+            resource_pairs.get("maxWidth").map(String::as_str),
+            Some(PLAYER_EMBED_BOUND)
+        );
+        assert_eq!(
+            resource_pairs.get("maxHeight").map(String::as_str),
+            Some(PLAYER_EMBED_BOUND)
+        );
         for request in &requests {
             assert!(request.contains(&format!("key={TEST_KEY}")));
         }
@@ -2357,6 +2405,7 @@ mod tests {
             Some("Creative Commons Attribution")
         );
         assert_eq!(details.published_at, Some(1_704_164_645));
+        assert_eq!(details.orientation, VideoOrientation::Vertical);
         assert!(requests[0].contains("id=dQw4w9WgXcQ"));
         assert!(requests[0].contains(&format!("key={TEST_KEY}")));
     }
@@ -2434,6 +2483,7 @@ mod tests {
         };
         assert_eq!(video.title, "Search title");
         assert_eq!(video.duration_seconds, None);
+        assert_eq!(video.orientation, VideoOrientation::Unknown);
     }
 
     #[test]

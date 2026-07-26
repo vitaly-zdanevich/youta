@@ -18,8 +18,8 @@ use url::Url;
 use super::{
     ChannelSummary, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
     ProviderCapabilities, ProviderError, SearchFilters, SearchItem, SearchPage, SearchRequest,
-    SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoSummary, get_bounded_json,
-    parse_rfc3339_epoch, provider_agent, resolve_http_url, validate_base_url,
+    SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary,
+    get_bounded_json, parse_rfc3339_epoch, provider_agent, resolve_http_url, validate_base_url,
 };
 
 const RESULTS_PER_PAGE: u32 = 20;
@@ -261,6 +261,7 @@ impl FunkwhaleProvider {
             published_at,
             published_text: raw.creation_date,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails,
             webpage_url,
             stream_url,
@@ -310,6 +311,7 @@ impl FunkwhaleProvider {
             ratings_allowed: None,
             live: false,
             keywords: raw.tags,
+            orientation: VideoOrientation::Unknown,
             thumbnails,
             webpage_url,
             stream_url,

@@ -972,6 +972,12 @@ pub struct SessionState {
     pub search_text: String,
     /// Whether the waveform replaces the normal seek bar.
     pub waveform_visible: bool,
+    /// Whether chapter timestamps are omitted from seek-bar labels.
+    ///
+    /// The stored value is the inverse of the visible UI setting so older
+    /// session documents naturally retain the timestamped default.
+    #[serde(default)]
+    pub chapter_timestamps_hidden: bool,
 }
 
 impl SessionState {
@@ -1171,6 +1177,21 @@ mod tests {
         assert!(state.navigate_back());
         assert_eq!(state.screen, Screen::Search);
         assert!(!state.navigate_back());
+    }
+
+    #[test]
+    fn older_sessions_default_to_visible_chapter_timestamps() {
+        let mut encoded =
+            serde_json::to_value(SessionState::default()).expect("encode session fixture");
+        encoded
+            .as_object_mut()
+            .expect("session must encode as an object")
+            .remove("chapter_timestamps_hidden");
+
+        let restored: SessionState =
+            serde_json::from_value(encoded).expect("decode pre-toggle session");
+
+        assert!(!restored.chapter_timestamps_hidden);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::domain::{
     Bookmark, CommentTarget, HistoryEntry, MediaId, MediaItem, PlaybackProgress, PrivateComment,
     SessionState, SourceKind, WikidataLink,
 };
-use crate::providers::{SearchItem, SearchRequest, SearchTarget};
+use crate::providers::{SearchItem, SearchRequest, SearchTarget, VideoOrientation};
 
 const MAX_SAVED_SEARCH_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SAVED_SEARCH_RESULTS_BYTES: usize = 4 * 1024 * 1024;
@@ -713,8 +713,9 @@ impl StateStore {
     /// Replaces the restart snapshot for the active `YouTube` search.
     ///
     /// The request, accumulated summaries, and continuation page are validated
-    /// and byte-bounded before `SQLite` receives them. Enriched details are not
-    /// part of this snapshot.
+    /// and byte-bounded before `SQLite` receives them. Full enriched details
+    /// are not part of this snapshot, though compact summary fields such as
+    /// provider-confirmed orientation can be updated separately.
     ///
     /// # Errors
     ///
@@ -822,6 +823,41 @@ impl StateStore {
         };
         validate_saved_youtube_search(&search)?;
         Ok(Some(search))
+    }
+
+    /// Updates one provider-confirmed video orientation in the restart-safe
+    /// search snapshot.
+    ///
+    /// This reads and rewrites only the existing bounded summary snapshot; it
+    /// never copies a full video description into persistent search state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the saved snapshot cannot be loaded, validated,
+    /// encoded, or written.
+    pub fn update_saved_youtube_video_orientation(
+        &self,
+        video_id: &str,
+        orientation: VideoOrientation,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError> {
+        let Some(mut search) = self.youtube_search()? else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        for item in &mut search.results {
+            if let SearchItem::Video(video) = item
+                && video.video_id == video_id
+                && video.orientation != orientation
+            {
+                video.orientation = orientation;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_youtube_search(&search, updated_at)?;
+        }
+        Ok(changed)
     }
 
     /// Removes the saved `YouTube` search and reports whether one existed.
@@ -1361,6 +1397,7 @@ mod tests {
             published_at: Some(100),
             published_text: None,
             live: false,
+            orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
@@ -1578,6 +1615,7 @@ mod tests {
             screen: Screen::History,
             focus: PanelFocus::Right,
             search_text: SearchQuery::new("ambient").text,
+            chapter_timestamps_hidden: true,
             ..SessionState::default()
         };
         store.save_session(&state, 10).expect("save session");
@@ -1667,6 +1705,48 @@ mod tests {
         assert!(store.clear_youtube_search().expect("clear search"));
         assert!(!store.clear_youtube_search().expect("clear absent search"));
         assert_eq!(store.youtube_search().expect("empty search"), None);
+    }
+
+    #[test]
+    fn youtube_orientation_enrichment_updates_only_the_matching_saved_summary() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let saved = SavedYouTubeSearch {
+            request: SearchRequest::new("vertical fixture", SearchTarget::Videos),
+            results: vec![search_video("vertical"), search_video("unchanged")],
+            next_page: None,
+        };
+        store.save_youtube_search(&saved, 10).expect("save search");
+
+        assert!(
+            store
+                .update_saved_youtube_video_orientation("vertical", VideoOrientation::Vertical, 20,)
+                .expect("cache orientation")
+        );
+        assert!(
+            !store
+                .update_saved_youtube_video_orientation(
+                    "missing",
+                    VideoOrientation::Horizontal,
+                    30,
+                )
+                .expect("ignore absent video")
+        );
+        let restored = store
+            .youtube_search()
+            .expect("load enriched search")
+            .expect("saved search");
+        let orientations = restored
+            .results
+            .iter()
+            .map(|item| match item {
+                SearchItem::Video(video) => video.orientation,
+                SearchItem::Channel(_) => unreachable!("video fixture"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            orientations,
+            [VideoOrientation::Vertical, VideoOrientation::Unknown]
+        );
     }
 
     #[test]

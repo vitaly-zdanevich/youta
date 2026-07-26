@@ -18,8 +18,8 @@ use super::{
     ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest,
     DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
     SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoSummary, get_bounded_json, provider_agent,
-    resolve_http_url, validate_base_url, validate_youtube_video_id,
+    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary, get_bounded_json,
+    provider_agent, resolve_http_url, validate_base_url, validate_youtube_video_id,
 };
 
 const MAX_CONFIGURED_JSON_BYTES: usize = 64 * 1024 * 1024;
@@ -343,6 +343,7 @@ impl InvidiousProvider {
             published_at: raw.published,
             published_text: nonempty(raw.published_text),
             live: raw.live_now,
+            orientation: VideoOrientation::Unknown,
             thumbnails: self.convert_thumbnails(raw.video_thumbnails),
             webpage_url,
             stream_url: None,
@@ -417,6 +418,7 @@ impl InvidiousProvider {
         require_nonempty(&raw.title, "video title")?;
         require_nonempty(&raw.author, "video author")?;
         let webpage_url = youtube_video_url(&raw.video_id);
+        let orientation = orientation_from_formats(&raw.adaptive_formats, &raw.format_streams);
 
         Ok(VideoDetails {
             video_id: raw.video_id,
@@ -433,6 +435,7 @@ impl InvidiousProvider {
             rating: raw.rating,
             ratings_allowed: raw.allow_ratings,
             live: raw.live_now,
+            orientation,
             keywords: raw.keywords,
             thumbnails: self.convert_thumbnails(raw.video_thumbnails),
             webpage_url,
@@ -796,6 +799,55 @@ struct RawVideoDetails {
     live_now: bool,
     #[serde(default)]
     license: Option<String>,
+    #[serde(default)]
+    adaptive_formats: Vec<RawVideoFormat>,
+    #[serde(default)]
+    format_streams: Vec<RawVideoFormat>,
+}
+
+/// Video dimensions exposed by one Invidious playback format.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawVideoFormat {
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    width: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    height: Option<u64>,
+    #[serde(default)]
+    size: Option<String>,
+}
+
+fn orientation_from_formats(
+    adaptive_formats: &[RawVideoFormat],
+    format_streams: &[RawVideoFormat],
+) -> VideoOrientation {
+    adaptive_formats
+        .iter()
+        .chain(format_streams)
+        .filter_map(RawVideoFormat::dimensions)
+        .max_by_key(|(width, height)| u64::from(*width) * u64::from(*height))
+        .map_or(VideoOrientation::Unknown, |(width, height)| {
+            VideoOrientation::from_dimensions(width, height)
+        })
+}
+
+impl RawVideoFormat {
+    /// Returns explicit dimensions, falling back to Invidious's `WIDTHxHEIGHT` field.
+    fn dimensions(&self) -> Option<(u32, u32)> {
+        self.width
+            .zip(self.height)
+            .and_then(|(width, height)| {
+                Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+            })
+            .or_else(|| self.size.as_deref().and_then(parse_video_size))
+            .filter(|(width, height)| *width > 0 && *height > 0)
+    }
+}
+
+/// Parses Invidious's documented `WIDTHxHEIGHT` size representation.
+fn parse_video_size(size: &str) -> Option<(u32, u32)> {
+    let (width, height) = size.trim().split_once('x')?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -936,7 +988,12 @@ mod tests {
 		"allowRatings": true,
 		"rating": "4.75",
 		"liveNow": false,
-		"license": "Creative Commons Attribution licence"
+		"license": "Creative Commons Attribution licence",
+		"adaptiveFormats": [
+			{"width": "1080", "height": 1920},
+			{"size": "360x640"}
+		],
+		"formatStreams": [{"size": "720x1280"}]
 	}"#;
 
     const CHANNEL_DETAILS_FIXTURE: &str = r#"{
@@ -1339,6 +1396,32 @@ mod tests {
             Some("Creative Commons Attribution licence")
         );
         assert_eq!(details.keywords, ["music", "example"]);
+        assert_eq!(details.orientation, VideoOrientation::Vertical);
+    }
+
+    #[test]
+    fn video_format_dimensions_cover_explicit_size_and_missing_metadata() {
+        let explicit: Vec<RawVideoFormat> =
+            serde_json::from_str(r#"[{"width":"1920","height":1080}]"#)
+                .expect("explicit dimensions should parse");
+        let square: Vec<RawVideoFormat> =
+            serde_json::from_str(r#"[{"size":"720x720"}]"#).expect("size dimensions should parse");
+        let malformed: Vec<RawVideoFormat> =
+            serde_json::from_str(r#"[{"size":"audio-only"},{"width":0,"height":1080}]"#)
+                .expect("missing video dimensions should parse");
+
+        assert_eq!(
+            orientation_from_formats(&explicit, &[]),
+            VideoOrientation::Horizontal
+        );
+        assert_eq!(
+            orientation_from_formats(&[], &square),
+            VideoOrientation::Square
+        );
+        assert_eq!(
+            orientation_from_formats(&malformed, &[]),
+            VideoOrientation::Unknown
+        );
     }
 
     #[test]

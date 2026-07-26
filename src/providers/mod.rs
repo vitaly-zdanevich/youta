@@ -338,6 +338,45 @@ pub struct Thumbnail {
     pub height: Option<u32>,
 }
 
+/// Display orientation derived from provider-reported video dimensions.
+///
+/// Thumbnail proportions are deliberately not used because providers can crop
+/// or letterbox thumbnails independently of the encoded video. Unknown and
+/// future serialized values safely fall back to [`Self::Unknown`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoOrientation {
+    /// Width is greater than height.
+    Horizontal,
+    /// Height is greater than width.
+    Vertical,
+    /// Width and height are equal.
+    Square,
+    /// The provider did not expose usable dimensions.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl VideoOrientation {
+    /// Classifies non-zero pixel dimensions.
+    ///
+    /// Zero dimensions are treated as unknown because they cannot describe a
+    /// decodable video frame.
+    #[must_use]
+    pub const fn from_dimensions(width: u32, height: u32) -> Self {
+        if width == 0 || height == 0 {
+            Self::Unknown
+        } else if width > height {
+            Self::Horizontal
+        } else if height > width {
+            Self::Vertical
+        } else {
+            Self::Square
+        }
+    }
+}
+
 /// Compact video metadata suitable for a search-result list.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VideoSummary {
@@ -361,6 +400,9 @@ pub struct VideoSummary {
     pub published_text: Option<String>,
     /// Whether this is currently live.
     pub live: bool,
+    /// Provider-derived display orientation, when dimensions are available.
+    #[serde(default)]
+    pub orientation: VideoOrientation,
     /// Available thumbnails, in provider order.
     pub thumbnails: Vec<Thumbnail>,
     /// Canonical browser page advertised by the provider, when available.
@@ -456,6 +498,9 @@ pub struct VideoDetails {
     pub ratings_allowed: Option<bool>,
     /// Whether this is currently live.
     pub live: bool,
+    /// Provider-derived display orientation, when dimensions are available.
+    #[serde(default)]
+    pub orientation: VideoOrientation,
     /// Video keywords.
     pub keywords: Vec<String>,
     /// Available thumbnails, in provider order.
@@ -1155,6 +1200,51 @@ mod tests {
                 Err(ProviderError::InvalidRequest(_))
             ));
         }
+    }
+
+    #[test]
+    fn video_orientation_classifies_dimensions_and_defaults_during_deserialization() {
+        assert_eq!(
+            VideoOrientation::from_dimensions(1_920, 1_080),
+            VideoOrientation::Horizontal
+        );
+        assert_eq!(
+            VideoOrientation::from_dimensions(1_080, 1_920),
+            VideoOrientation::Vertical
+        );
+        assert_eq!(
+            VideoOrientation::from_dimensions(1_080, 1_080),
+            VideoOrientation::Square
+        );
+        assert_eq!(
+            VideoOrientation::from_dimensions(0, 1_080),
+            VideoOrientation::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<VideoOrientation>(r#""future_shape""#)
+                .expect("future variants should remain readable"),
+            VideoOrientation::Unknown
+        );
+
+        let summary: VideoSummary = serde_json::from_str(
+            r#"{
+                "video_id":"dQw4w9WgXcQ",
+                "title":"Legacy",
+                "channel_name":"Channel",
+                "channel_id":"UC_fixture",
+                "description":"",
+                "duration_seconds":null,
+                "view_count":null,
+                "published_at":null,
+                "published_text":null,
+                "live":false,
+                "thumbnails":[],
+                "webpage_url":null,
+                "stream_url":null
+            }"#,
+        )
+        .expect("saved summaries from before orientation support should remain readable");
+        assert_eq!(summary.orientation, VideoOrientation::Unknown);
     }
 
     #[test]

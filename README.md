@@ -56,6 +56,18 @@ chapters, or a future waveform sends IPC commands to the same player process.
 The backend requires `mpv` 0.38 or newer so resume positions and extractor
 options can be applied atomically through `loadfile` per-file options.
 
+Description timecodes become exact chapter split and mouse-seek targets. Dense
+chapter labels grow to as many as four rows when the terminal has spare height;
+`T` toggles between timestamps plus names and names only without moving those
+targets. This label preference is restored with the previous session.
+
+Vertical YouTube videos use a distinct title color once the configured
+provider reports a portrait aspect ratio. The official adapter uses player
+dimensions already returned by its batched video request, while Invidious
+enriches the selected row from its existing video-format response. Youta does
+not infer orientation from YouTube's often letterboxed thumbnail canvas or
+issue one metadata request per search result.
+
 `mpv` is a playback engine, not a second UI. It is intentionally kept out of
 the terminal and never parses Youta's keystrokes. A future native backend can
 implement the same playback interface without changing screens or history.

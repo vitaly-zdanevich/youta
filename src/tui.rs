@@ -50,6 +50,12 @@ pub const GOOGLE_CLOUD_CREDENTIALS_URL: &str = "https://console.cloud.google.com
 /// Official Invidious documentation listing public instances.
 pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
 
+/// Most chapter-label rows Youta may reserve above the seek track.
+const MAX_CHAPTER_LABEL_ROWS: u16 = 4;
+
+/// Body rows retained even when a dense chapter timeline requests more space.
+const MIN_BODY_ROWS: u16 = 8;
+
 /// Top-level Youta screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Screen {
@@ -211,6 +217,8 @@ pub struct RowView {
     pub subscribed: bool,
     /// Preferred artwork URL available for selected rendering or prefetch.
     pub thumbnail_url: Option<url::Url>,
+    /// Whether provider metadata identifies this as a vertical video.
+    pub vertical: bool,
 }
 
 /// Details for the selected media item.
@@ -518,6 +526,8 @@ pub struct ViewModel {
     pub playback: PlaybackStatus,
     /// Chapters inferred for the authoritative playing media.
     pub playback_chapters: Vec<Chapter>,
+    /// Whether chapter labels include their timestamps.
+    pub show_chapter_timestamps: bool,
     /// Repeat-current-item state.
     pub repeating: bool,
     /// Status or error message.
@@ -563,6 +573,7 @@ impl Default for ViewModel {
             waveform: Vec::new(),
             playback: PlaybackStatus::default(),
             playback_chapters: Vec::new(),
+            show_chapter_timestamps: true,
             repeating: false,
             status_line: "Press / to search or ? for help".to_owned(),
             help_open: false,
@@ -680,6 +691,8 @@ pub enum UiAction {
     ChangeSpeed(f64),
     /// Select the previous or next chapter.
     ChangeChapter(i32),
+    /// Toggle timestamps inside chapter labels without changing seek targets.
+    ToggleChapterTimestamps,
     /// Toggle repeat-current-item.
     ToggleRepeat,
     /// Toggle between details and waveform.
@@ -1196,6 +1209,108 @@ fn render(frame: &mut Frame<'_>, view: &ViewModel, settings: &UiSettings, hit_ma
     render_frame(frame, view, settings, hit_map, None);
 }
 
+/// Chooses a bounded chapter-label height without taking space from the
+/// minimum usable body, seek track, playback status, or controls.
+fn chapter_label_row_count(
+    view: &ViewModel,
+    terminal_width: u16,
+    terminal_height: u16,
+    has_download: bool,
+) -> u16 {
+    if view.playback_chapters.is_empty() {
+        return 0;
+    }
+
+    let fixed_rows = 2_u16
+        .saturating_add(MIN_BODY_ROWS)
+        .saturating_add(if has_download { 2 } else { 0 })
+        .saturating_add(2)
+        .saturating_add(2);
+    let available_rows = terminal_height
+        .saturating_sub(fixed_rows)
+        .min(MAX_CHAPTER_LABEL_ROWS);
+    if available_rows == 0 {
+        return 0;
+    }
+
+    let duration = view.playback.duration.unwrap_or(Duration::ZERO);
+    if duration.is_zero() {
+        return 1;
+    }
+    let duration_seconds = duration.as_secs();
+    let visible_chapters = view
+        .playback_chapters
+        .iter()
+        .filter(|chapter| chapter.start_seconds < duration_seconds)
+        .count();
+    if visible_chapters == 0 {
+        return 0;
+    }
+    if visible_chapters == 1 {
+        return 1;
+    }
+
+    required_chapter_label_rows(view, duration, terminal_width)
+        .min(available_rows)
+        .min(MAX_CHAPTER_LABEL_ROWS)
+}
+
+/// Simulates the renderer's interval placement to reserve enough label rows.
+///
+/// Using the real truncated label widths keeps timestamped and names-only
+/// layouts consistent with the number of rows they receive.
+fn required_chapter_label_rows(view: &ViewModel, duration: Duration, width: u16) -> u16 {
+    if duration.is_zero() || width == 0 {
+        return u16::from(!view.playback_chapters.is_empty() && width > 0);
+    }
+
+    let current = current_chapter_index(&view.playback_chapters, view.playback.position);
+    let show_hours = duration.as_secs() >= 60 * 60;
+    let mut label_order = current.into_iter().collect::<Vec<_>>();
+    label_order.extend((0..view.playback_chapters.len()).filter(|index| Some(*index) != current));
+    let mut occupied = vec![Vec::<(u16, u16)>::new(); usize::from(MAX_CHAPTER_LABEL_ROWS)];
+    let mut used_rows = 0_u16;
+
+    for index in label_order {
+        let chapter = &view.playback_chapters[index];
+        if chapter.start_seconds >= duration.as_secs() {
+            continue;
+        }
+        let marker_column = rounded_duration_column(
+            Duration::from_secs(chapter.start_seconds),
+            duration,
+            width.saturating_sub(1),
+        );
+        let maximum_width = usize::from(width).min(if Some(index) == current { 36 } else { 20 });
+        let text = truncate_terminal_text(
+            &chapter_timeline_label(
+                chapter,
+                Some(index) == current,
+                view.show_chapter_timestamps,
+                show_hours,
+            ),
+            maximum_width,
+        );
+        let label_width = terminal_text_width(&text).min(width);
+        if label_width == 0 {
+            continue;
+        }
+        let start = marker_column.min(width.saturating_sub(label_width));
+        let end = start.saturating_add(label_width);
+        let Some(row) = occupied.iter().position(|ranges| {
+            ranges
+                .iter()
+                .all(|(used_start, used_end)| start >= *used_end || end <= *used_start)
+        }) else {
+            return MAX_CHAPTER_LABEL_ROWS;
+        };
+        occupied[row].push((start, end));
+        used_rows = used_rows.max(u16::try_from(row + 1).unwrap_or(MAX_CHAPTER_LABEL_ROWS));
+    }
+
+    used_rows
+}
+
 fn render_frame(
     frame: &mut Frame<'_>,
     view: &ViewModel,
@@ -1206,17 +1321,19 @@ fn render_frame(
     let theme = Theme::new(settings.funny_mode);
     frame.render_widget(Block::default().style(theme.base), frame.area());
 
+    let chapter_label_rows = chapter_label_row_count(
+        view,
+        frame.area().width,
+        frame.area().height,
+        view.download.is_some(),
+    );
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(8),
             Constraint::Length(if view.download.is_some() { 2 } else { 0 }),
-            Constraint::Length(if view.playback_chapters.is_empty() {
-                2
-            } else {
-                4
-            }),
+            Constraint::Length(2_u16.saturating_add(chapter_label_rows)),
             Constraint::Length(2),
         ])
         .split(frame.area());
@@ -1263,6 +1380,7 @@ fn render_frame(
         &theme,
         view.youtube_search_sort,
         view.youtube_creative_commons_only,
+        view.show_chapter_timestamps,
         &status_line,
         !view.playback.idle,
         hit_map,
@@ -1478,6 +1596,7 @@ fn render_body(
         panes[0],
         search_title.trim(),
         &view.rows,
+        true,
         view.selected,
         view.playing_media_id.as_ref(),
         theme.heading,
@@ -1527,6 +1646,7 @@ fn render_row_list(
     area: Rect,
     title: &str,
     rows: &[RowView],
+    show_source: bool,
     selected_index: usize,
     playing_media_id: Option<&MediaId>,
     heading_style: Style,
@@ -1553,6 +1673,16 @@ fn render_row_list(
                 theme.accent.add_modifier(Modifier::BOLD)
             } else {
                 theme.base
+            };
+            let title_style = if !selected && row.vertical {
+                let style = theme.vertical_video;
+                if playing {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                }
+            } else {
+                row_style
             };
             let marker = if row.subscribed { "◆" } else { " " };
             let has_playback_progress = row.media_id.is_some();
@@ -1592,15 +1722,20 @@ fn render_row_list(
                     ),
                     watched_style,
                 ),
-                Span::styled(&row.title, row_style),
+                Span::styled(&row.title, title_style),
                 Span::styled(progress, secondary_style),
             ]);
-            let subtitle = Line::from(vec![
-                Span::styled("    ", row_style),
-                Span::styled(&row.source, source_style),
-                Span::styled(" · ", row_style),
-                Span::styled(&row.subtitle, secondary_style),
-            ]);
+            let mut subtitle_spans = vec![Span::styled("    ", row_style)];
+            if show_source && !row.source.is_empty() {
+                subtitle_spans.push(Span::styled(&row.source, source_style));
+                if !row.subtitle.is_empty() {
+                    subtitle_spans.push(Span::styled(" · ", row_style));
+                }
+            }
+            if !row.subtitle.is_empty() {
+                subtitle_spans.push(Span::styled(&row.subtitle, secondary_style));
+            }
+            let subtitle = Line::from(subtitle_spans);
             ListItem::new(vec![line, subtitle]).style(row_style)
         })
         .collect::<Vec<_>>();
@@ -1641,6 +1776,7 @@ fn render_subscriptions_body(
                 panes[0],
                 &subscription_videos_heading(subscriptions),
                 &subscriptions.items,
+                false,
                 subscriptions.selected_item,
                 view.playing_media_id.as_ref(),
                 theme.heading,
@@ -1674,6 +1810,7 @@ fn render_subscriptions_body(
                 panes[0],
                 "Subscription sources",
                 &subscriptions.sources,
+                true,
                 subscriptions.selected_source,
                 view.playing_media_id.as_ref(),
                 theme.heading,
@@ -1714,6 +1851,7 @@ fn render_subscriptions_body(
                 panes[0],
                 "Subscription sources",
                 &subscriptions.sources,
+                true,
                 subscriptions.selected_source,
                 view.playing_media_id.as_ref(),
                 source_heading,
@@ -1763,6 +1901,7 @@ fn render_subscriptions_body(
                     sections[0],
                     &heading,
                     &subscriptions.items,
+                    false,
                     subscriptions.selected_item,
                     view.playing_media_id.as_ref(),
                     item_heading,
@@ -2647,11 +2786,15 @@ fn render_chapter_timeline(
         {
             let chapter = &view.playback_chapters[index];
             let label = truncate_terminal_text(
-                &format!(
-                    "▶ {} {}",
-                    format_duration(Duration::from_secs(chapter.start_seconds)),
-                    chapter_title_for_display(&chapter.title)
-                ),
+                &if view.show_chapter_timestamps {
+                    format!(
+                        "▶ {} {}",
+                        format_duration(Duration::from_secs(chapter.start_seconds)),
+                        chapter_title_for_display(&chapter.title)
+                    )
+                } else {
+                    format!("▶ {}", chapter_title_for_display(&chapter.title))
+                },
                 usize::from(label_area.width),
             );
             frame.render_widget(Paragraph::new(label).style(theme.accent), label_area);
@@ -2721,7 +2864,8 @@ fn render_chapter_timeline(
 
     let mut label_order = current.into_iter().collect::<Vec<_>>();
     label_order.extend((0..view.playback_chapters.len()).filter(|index| Some(*index) != current));
-    let mut occupied = vec![Vec::<(u16, u16)>::new(); usize::from(label_area.height.min(2))];
+    let mut occupied =
+        vec![Vec::<(u16, u16)>::new(); usize::from(label_area.height.min(MAX_CHAPTER_LABEL_ROWS))];
     let show_hours = duration.as_secs() >= 60 * 60;
     for index in label_order {
         let chapter = &view.playback_chapters[index];
@@ -2735,12 +2879,12 @@ fn render_chapter_timeline(
         );
         let maximum_width =
             usize::from(label_area.width).min(if Some(index) == current { 36 } else { 20 });
-        let prefix = if Some(index) == current { "▶ " } else { "" };
         let text = truncate_terminal_text(
-            &format!(
-                "{prefix}{} {}",
-                format_timeline_timestamp(chapter.start_seconds, show_hours),
-                chapter_title_for_display(&chapter.title)
+            &chapter_timeline_label(
+                chapter,
+                Some(index) == current,
+                view.show_chapter_timestamps,
+                show_hours,
             ),
             maximum_width,
         );
@@ -2777,6 +2921,26 @@ fn render_chapter_timeline(
             hit_map.seek_markers.push((action, label_rect));
         }
         occupied[label_row].push((start, end));
+    }
+}
+
+/// Formats one chapter label while keeping its seek position independent from
+/// the user's timestamp-visibility preference.
+fn chapter_timeline_label(
+    chapter: &Chapter,
+    current: bool,
+    show_timestamp: bool,
+    show_hours: bool,
+) -> String {
+    let prefix = if current { "▶ " } else { "" };
+    if show_timestamp {
+        format!(
+            "{prefix}{} {}",
+            format_timeline_timestamp(chapter.start_seconds, show_hours),
+            chapter_title_for_display(&chapter.title)
+        )
+    } else {
+        format!("{prefix}{}", chapter_title_for_display(&chapter.title))
     }
 }
 
@@ -2914,6 +3078,7 @@ fn render_buttons(
     theme: &Theme,
     youtube_search_sort: YouTubeSearchSort,
     youtube_creative_commons_only: bool,
+    show_chapter_timestamps: bool,
     status: &str,
     playback_active: bool,
     hit_map: &mut HitMap,
@@ -2979,7 +3144,7 @@ fn render_buttons(
             UiAction::ToggleWaveform,
         ),
     ];
-    let navigation_buttons = [
+    let full_navigation_buttons = [
         (
             button("k", "Move up", settings.show_hotkeys),
             UiAction::MoveSelection(-1),
@@ -3000,7 +3165,62 @@ fn render_buttons(
             button("Enter", "Start", settings.show_hotkeys),
             UiAction::ActivateSelection,
         ),
+        (
+            button(
+                "T",
+                if show_chapter_timestamps {
+                    "Chapter times: on"
+                } else {
+                    "Chapter times: off"
+                },
+                settings.show_hotkeys,
+            ),
+            UiAction::ToggleChapterTimestamps,
+        ),
     ];
+    let full_navigation_width = full_navigation_buttons
+        .iter()
+        .map(|(label, _)| usize::from(terminal_text_width(label)))
+        .sum::<usize>()
+        .saturating_add((full_navigation_buttons.len() - 1) * 2);
+    let navigation_buttons = if full_navigation_width <= usize::from(area.width) {
+        full_navigation_buttons
+    } else {
+        [
+            (
+                button("k", "Up", settings.show_hotkeys),
+                UiAction::MoveSelection(-1),
+            ),
+            (
+                button("j", "Down", settings.show_hotkeys),
+                UiAction::MoveSelection(1),
+            ),
+            (
+                button("↑", "Vol+", settings.show_hotkeys),
+                UiAction::ChangeVolume(5),
+            ),
+            (
+                button("↓", "Vol-", settings.show_hotkeys),
+                UiAction::ChangeVolume(-5),
+            ),
+            (
+                button("Enter", "Start", settings.show_hotkeys),
+                UiAction::ActivateSelection,
+            ),
+            (
+                button(
+                    "T",
+                    if show_chapter_timestamps {
+                        "Time:on"
+                    } else {
+                        "Time:off"
+                    },
+                    settings.show_hotkeys,
+                ),
+                UiAction::ToggleChapterTimestamps,
+            ),
+        ]
+    };
     let primary_controls = primary_buttons
         .iter()
         .map(|(label, _)| label.as_str())
@@ -3046,13 +3266,16 @@ fn render_buttons(
     };
     hit_map.buttons.clear();
     for (buttons, line, y) in button_rows {
-        let line_width = u16::try_from(line.chars().count()).unwrap_or(u16::MAX);
+        let line_width = terminal_text_width(line);
         let mut button_x = centered_line_x(area, line_width);
         for (label, action) in buttons {
-            let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-            hit_map
-                .buttons
-                .push((action.clone(), Rect::new(button_x, y, width, 1)));
+            let width = terminal_text_width(label);
+            let visible_width = area.right().saturating_sub(button_x).min(width);
+            if visible_width > 0 {
+                hit_map
+                    .buttons
+                    .push((action.clone(), Rect::new(button_x, y, visible_width, 1)));
+            }
             button_x = button_x.saturating_add(width).saturating_add(2);
         }
     }
@@ -3098,7 +3321,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "",
         "Playback",
         "  Space pause     ←/→ 5 s     Alt+←/→ 20 s     0–9 seek by 10%",
-        "  ↑/↓ volume     </> speed 10%     [/] chapter     r repeat",
+        "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times     r repeat",
         "  w waveform     Backspace back to previous link/position",
         "",
         "Actions",
@@ -3781,7 +4004,8 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             return (!shift).then_some(UiAction::Quit);
         }
         return match key.code {
-            KeyCode::Esc | KeyCode::Char('t' | 'T') => Some(UiAction::ToggleTextSelectionMode),
+            KeyCode::Esc | KeyCode::Char('t') => Some(UiAction::ToggleTextSelectionMode),
+            KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
             _ => None,
         };
     }
@@ -3857,6 +4081,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('v') => Some(UiAction::ToggleSearchKind),
         KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         KeyCode::Char('C') => Some(UiAction::ToggleYouTubeCreativeCommons),
+        KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         KeyCode::Char('i')
             if view.screen == Screen::Subscriptions && !view.subscriptions.items.is_empty() =>
         {
@@ -4268,6 +4493,7 @@ struct Theme {
     heading: Style,
     selected: Style,
     accent: Style,
+    vertical_video: Style,
     muted: Style,
     cached: Style,
     progress: Style,
@@ -4287,6 +4513,7 @@ impl Theme {
                     .bg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
                 accent: Style::default().fg(Color::LightMagenta),
+                vertical_video: Style::default().fg(Color::LightCyan),
                 muted: Style::default().fg(Color::DarkGray),
                 cached: Style::default().fg(Color::DarkGray).bg(Color::Reset),
                 progress: Style::default().fg(Color::LightMagenta).bg(Color::Black),
@@ -4301,6 +4528,7 @@ impl Theme {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 accent: Style::default().fg(Color::Cyan),
+                vertical_video: Style::default().fg(Color::Rgb(255, 105, 180)),
                 muted: Style::default().fg(Color::DarkGray),
                 cached: Style::default().fg(Color::DarkGray).bg(Color::Reset),
                 progress: Style::default().fg(Color::Cyan),
@@ -4650,6 +4878,71 @@ mod tests {
     }
 
     #[test]
+    fn vertical_video_titles_keep_playing_and_selection_precedence() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let playing = MediaId::new(SourceKind::YouTube, "playing-vertical");
+        let view = ViewModel {
+            rows: vec![
+                RowView {
+                    media_id: Some(playing.clone()),
+                    title: "Playing vertical".to_owned(),
+                    source: "YouTube".to_owned(),
+                    vertical: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "idle-vertical")),
+                    title: "Vertical idle".to_owned(),
+                    source: "YouTube".to_owned(),
+                    vertical: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "selected-vertical")),
+                    title: "Selected vertical".to_owned(),
+                    source: "YouTube".to_owned(),
+                    vertical: true,
+                    ..RowView::default()
+                },
+            ],
+            selected: 2,
+            playing_media_id: Some(playing),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw vertical-video colors");
+        let buffer = terminal.backend().buffer();
+        let playing_title = &buffer[(6, 1)];
+        assert_eq!(playing_title.symbol(), "P");
+        assert_eq!(playing_title.fg, Color::Rgb(255, 105, 180));
+        assert!(playing_title.modifier.contains(Modifier::BOLD));
+        let idle_title = &buffer[(6, 3)];
+        assert_eq!(idle_title.symbol(), "V");
+        assert_eq!(idle_title.fg, Color::Rgb(255, 105, 180));
+        assert!(!idle_title.modifier.contains(Modifier::BOLD));
+        let selected_title = &buffer[(6, 5)];
+        assert_eq!(selected_title.symbol(), "S");
+        assert_eq!(selected_title.fg, Color::Black);
+        assert_eq!(selected_title.bg, Color::Cyan);
+        assert_eq!(buffer[(0, 1)].symbol(), "▶");
+    }
+
+    #[test]
     fn selected_row_has_no_play_marker_when_nothing_is_playing() {
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -4990,7 +5283,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
                 &active
             ),
-            Some(UiAction::ToggleTextSelectionMode)
+            Some(UiAction::ToggleChapterTimestamps)
         );
         assert_eq!(
             key_action(
@@ -5297,6 +5590,26 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_t_toggles_chapter_timestamps_without_replacing_text_selection() {
+        let view = ViewModel {
+            details: Some(DetailView::default()),
+            text_selection_mode: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::ToggleChapterTimestamps)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleTextSelectionMode)
+        );
+    }
+
+    #[test]
     fn render_contains_player_and_hotkey_controls() {
         let backend = TestBackend::new(240, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -5342,6 +5655,7 @@ mod tests {
         assert!(rendered.contains("[↑] Volume up"));
         assert!(rendered.contains("[↓] Volume down"));
         assert!(rendered.contains("[Enter] Start"));
+        assert!(rendered.contains("[T] Chapter times: on"));
         assert!(rendered.contains("0:30 / 2:00"));
         for expected in [
             UiAction::MoveSelection(-1),
@@ -5430,6 +5744,10 @@ mod tests {
         assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
         assert!(rendered.contains("Fixture video"));
         assert!(
+            !rendered.contains("YouTube · 2026 July 25"),
+            "the subscription heading already identifies the video source"
+        );
+        assert!(
             !rendered.contains('◆'),
             "subscription videos must omit the redundant channel marker"
         );
@@ -5446,6 +5764,10 @@ mod tests {
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Subscription sources"));
         assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
+        assert!(
+            !rendered.contains("YouTube · 2026 July 25"),
+            "split subscription rows must also omit the repeated source"
+        );
         assert!(rendered.contains("[i] Description"));
         assert!(hit_map.subscription_source_rows.width > 0);
         assert!(hit_map.subscription_item_rows.width > 0);
@@ -6865,7 +7187,7 @@ mod tests {
 
     #[test]
     fn bottom_controls_hide_hotkey_values_without_hiding_action_labels() {
-        let backend = TestBackend::new(100, 2);
+        let backend = TestBackend::new(240, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let settings = UiSettings {
             show_hotkeys: false,
@@ -6882,6 +7204,7 @@ mod tests {
                     &Theme::new(false),
                     YouTubeSearchSort::Relevance,
                     false,
+                    true,
                     "",
                     false,
                     &mut hit_map,
@@ -6903,15 +7226,17 @@ mod tests {
         assert!(rendered.contains("Start"));
         assert!(rendered.contains("Sort: relevance"));
         assert!(rendered.contains("Preferences"));
-        for hidden in ["[N]", "[C]", "[p]", "[k]", "[j]", "[↑]", "[↓]", "[Enter]"] {
+        for hidden in [
+            "[N]", "[C]", "[p]", "[k]", "[j]", "[↑]", "[↓]", "[Enter]", "[T]",
+        ] {
             assert!(!rendered.contains(hidden));
         }
-        assert_eq!(hit_map.buttons.len(), 16);
+        assert_eq!(hit_map.buttons.len(), 17);
     }
 
     #[test]
     fn one_line_bottom_controls_keep_navigation_click_targets_aligned() {
-        let backend = TestBackend::new(100, 1);
+        let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
 
@@ -6924,6 +7249,7 @@ mod tests {
                     &Theme::new(false),
                     YouTubeSearchSort::Relevance,
                     false,
+                    true,
                     "",
                     false,
                     &mut hit_map,
@@ -6931,13 +7257,18 @@ mod tests {
             })
             .expect("draw");
 
-        assert_eq!(hit_map.buttons.len(), 5);
+        assert_eq!(hit_map.buttons.len(), 6);
+        assert!(rendered_text(&terminal).contains("[T] Time:on"));
         assert!(
             hit_map
                 .buttons
                 .iter()
                 .all(|(_, target)| target.y == terminal.backend().buffer().area.y)
         );
+        assert!(hit_map.buttons.iter().all(|(_, target)| {
+            target.x >= terminal.backend().buffer().area.x
+                && target.right() <= terminal.backend().buffer().area.right()
+        }));
         assert!(
             hit_map
                 .buttons
@@ -6982,6 +7313,66 @@ mod tests {
         assert!(
             status_row.contains("0:00 / --:--"),
             "playback status must render below, rather than over, the seek track"
+        );
+    }
+
+    #[test]
+    fn chapter_label_height_adapts_to_density_mode_and_terminal_space() {
+        let chapters = (0..29)
+            .map(|index| Chapter {
+                title: format!("Chapter {index}"),
+                start_seconds: index * 10,
+                end_seconds: None,
+            })
+            .collect();
+        let mut view = ViewModel {
+            playback: PlaybackStatus {
+                duration: Some(Duration::from_secs(1_000)),
+                ..PlaybackStatus::default()
+            },
+            playback_chapters: chapters,
+            ..ViewModel::default()
+        };
+
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 4);
+        assert_eq!(chapter_label_row_count(&view, 80, 32, false), 4);
+        assert_eq!(chapter_label_row_count(&view, 240, 15, false), 1);
+        assert_eq!(chapter_label_row_count(&view, 240, 14, false), 0);
+        assert_eq!(chapter_label_row_count(&view, 240, 16, true), 0);
+        view.show_chapter_timestamps = false;
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 4);
+        view.playback.duration = None;
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 1);
+        view.playback_chapters.clear();
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 0);
+    }
+
+    #[test]
+    fn chapter_label_sizing_uses_fractional_duration_like_rendering() {
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                duration: Some(Duration::from_millis(31_900)),
+                ..PlaybackStatus::default()
+            },
+            playback_chapters: vec![
+                Chapter {
+                    title: "First boundary chapter title".to_owned(),
+                    start_seconds: 14,
+                    end_seconds: None,
+                },
+                Chapter {
+                    title: "Second boundary chapter title".to_owned(),
+                    start_seconds: 22,
+                    end_seconds: None,
+                },
+            ],
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            chapter_label_row_count(&view, 80, 32, false),
+            2,
+            "the sizing pass must preserve the renderer's fractional column geometry"
         );
     }
 
@@ -7192,6 +7583,116 @@ prose 07:25 remains clickable but is not a chapter";
             .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
             .collect::<String>();
         assert!(status_row.contains("0:10 / 1:40"));
+    }
+
+    #[test]
+    fn dense_chapter_labels_use_four_clickable_rows_when_space_allows() {
+        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                position: Duration::from_secs(17),
+                duration: Some(Duration::from_secs(100)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(media_id),
+            playback_chapters: (10..18)
+                .map(|seconds| Chapter {
+                    title: format!("Clustered chapter {seconds}"),
+                    start_seconds: seconds,
+                    end_seconds: None,
+                })
+                .collect(),
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw adaptive chapter labels");
+
+        let mut label_rows = hit_map
+            .seek_markers
+            .iter()
+            .filter_map(|(_, area)| (area.y < hit_map.seek_bar.y).then_some(area.y))
+            .collect::<Vec<_>>();
+        label_rows.sort_unstable();
+        label_rows.dedup();
+        assert_eq!(label_rows, [0, 1, 2, 3]);
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 4, 80, 1));
+        let status_row = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 5)].symbol())
+            .collect::<String>();
+        assert!(status_row.contains("0:17 / 1:40"));
+    }
+
+    #[test]
+    fn chapter_timestamp_toggle_changes_labels_but_not_exact_seek_targets() {
+        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        let mut view = ViewModel {
+            playback: PlaybackStatus {
+                duration: Some(Duration::from_secs(100)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(media_id.clone()),
+            playback_chapters: vec![Chapter {
+                title: "Introduction".to_owned(),
+                start_seconds: 10,
+                end_seconds: Some(100),
+            }],
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw timestamped chapter");
+        assert!(rendered_text(&terminal).contains("00:10 Introduction"));
+
+        view.show_chapter_timestamps = false;
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw names-only chapter");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Introduction"));
+        assert!(!rendered.contains("00:10 Introduction"));
+        assert!(hit_map.seek_markers.iter().any(|(action, _)| {
+            action
+                == &UiAction::ActivateTimecode {
+                    media_id: media_id.clone(),
+                    seconds: 10,
+                }
+        }));
     }
 
     #[test]
@@ -7481,6 +7982,7 @@ prose 07:25 remains clickable but is not a chapter";
                     &Theme::new(false),
                     YouTubeSearchSort::Relevance,
                     false,
+                    true,
                     status,
                     true,
                     &mut hit_map,
@@ -7516,6 +8018,7 @@ prose 07:25 remains clickable but is not a chapter";
                     &Theme::new(false),
                     YouTubeSearchSort::Relevance,
                     false,
+                    true,
                     status,
                     false,
                     &mut hit_map,

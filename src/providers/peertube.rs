@@ -13,8 +13,9 @@ use url::Url;
 use super::{
     ChannelSummary, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
     ProviderCapabilities, ProviderError, SearchDate, SearchDuration, SearchFeature, SearchItem,
-    SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoSummary,
-    get_bounded_json, parse_rfc3339_epoch, provider_agent, resolve_http_url, validate_base_url,
+    SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoOrientation,
+    VideoSummary, get_bounded_json, parse_rfc3339_epoch, provider_agent, resolve_http_url,
+    validate_base_url,
 };
 
 const RESULTS_PER_PAGE: u32 = 20;
@@ -265,6 +266,7 @@ impl PeerTubeProvider {
             published_at: raw.published_at.as_deref().and_then(parse_rfc3339_epoch),
             published_text: raw.published_at,
             live: raw.is_live,
+            orientation: VideoOrientation::Unknown,
             thumbnails: self.convert_images(raw.thumbnails, raw.thumbnail_path),
             webpage_url,
             stream_url: None,
@@ -327,6 +329,7 @@ impl PeerTubeProvider {
             ratings_allowed: Some(true),
             live: raw.is_live,
             keywords: raw.tags,
+            orientation: VideoOrientation::Unknown,
             thumbnails: self.convert_images(raw.thumbnails, raw.thumbnail_path),
             webpage_url,
             stream_url: None,
