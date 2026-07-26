@@ -58,6 +58,11 @@ fn youtube_audio_playback_advances_and_shuts_down() {
     let mut input = PlaybackInput::new(url);
     input.title = Some("Youta live YouTube smoke test".to_owned());
     input.start_at = RESUME_AT;
+    // The application retries a pre-playback YouTube HTTP 403 with yt-dlp's
+    // format verification enabled. Cloud CI egress commonly needs that path,
+    // while this backend-level test does not instantiate the controller that
+    // performs the retry.
+    input.verify_remote_format = true;
     backend
         .play(&input)
         .expect("send the real YouTube URL to Youta's backend");
@@ -114,8 +119,12 @@ fn youtube_audio_playback_advances_and_shuts_down() {
     backend
         .shutdown()
         .expect("stop the live playback process cleanly");
-    let first_started_position =
-        first_started_position.expect("real playback never exposed a started position");
+    let first_started_position = first_started_position.unwrap_or_else(|| {
+        panic!(
+            "real playback never exposed a started position; backend error: {}",
+            last_error.as_deref().unwrap_or("none")
+        )
+    });
     assert!(
         first_started_position >= RESUME_AT.saturating_sub(Duration::from_secs(1)),
         "real playback ignored the requested resume position; first started position: \
