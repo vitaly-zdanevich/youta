@@ -6,6 +6,68 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// Runs one deterministic key sequence against Youta in a pseudo-terminal.
+#[cfg(all(target_os = "linux", feature = "tui"))]
+fn run_tui_session(
+    launcher: &std::path::Path,
+    binary: &std::path::Path,
+    config_directory: &std::path::Path,
+    helpers: &std::path::Path,
+    transcript: &std::path::Path,
+    opened_links: &std::path::Path,
+    subscriptions_layout_override: Option<&str>,
+    inputs: &[(&[u8], u64)],
+) -> std::process::Output {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    let mut command = Command::new("/usr/bin/timeout");
+    command
+        .args([
+            "--signal=TERM",
+            "--kill-after=2",
+            "20",
+            "/usr/bin/script",
+            "--quiet",
+            "--return",
+            "--flush",
+            "--echo",
+            "never",
+            "--output-limit",
+            "2MiB",
+            "--log-out",
+        ])
+        .arg(transcript)
+        .arg("--command")
+        .arg(launcher)
+        .env_clear()
+        .env("TERM", "xterm-256color")
+        .env("PATH", helpers)
+        .env("YOUTA_TEST_BINARY", binary)
+        .env("YOUTA_TEST_CONFIG_DIR", config_directory)
+        .env("YOUTA_TEST_OPEN_LOG", opened_links)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(layout) = subscriptions_layout_override {
+        command.env("YOUTA_UI__SUBSCRIPTIONS_LAYOUT", layout);
+    }
+    let mut child = command.spawn().expect("launch Youta in a pseudo-terminal");
+    {
+        let input = child.stdin.as_mut().expect("pseudo-terminal input");
+        thread::sleep(Duration::from_millis(500));
+        for (bytes, delay_millis) in inputs {
+            input.write_all(bytes).expect("write pseudo-terminal input");
+            input.flush().expect("flush pseudo-terminal input");
+            thread::sleep(Duration::from_millis(*delay_millis));
+        }
+    }
+    child.stdin.take();
+    child.wait_with_output().expect("wait for pseudo-terminal")
+}
+
 #[test]
 fn help_identifies_youtube_and_ytdlp() {
     cargo_bin_cmd!("youta")
@@ -172,7 +234,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
     let terminal_output = fs::read_to_string(&transcript).expect("terminal transcript");
     let config_path = config_directory.join("config.toml").display().to_string();
     for expected in [
-        "Configure YouTube search",
+        "Configure YouTube metadata",
         "YouTube API key (masked)",
         "Invidious instance URL",
         "create/select",
@@ -217,6 +279,133 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
             youta::tui::GOOGLE_CLOUD_CREDENTIALS_URL,
             youta::tui::INVIDIOUS_INSTANCES_URL,
         ]
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = tempdir().expect("temporary directory");
+    let config_directory = temporary.path().join("configuration");
+    let helpers = temporary.path().join("helpers");
+    let launcher = temporary.path().join("launch-youta");
+    let opened_links = temporary.path().join("opened-links.txt");
+    let first_transcript = temporary.path().join("first-typescript.txt");
+    let locked_transcript = temporary.path().join("locked-typescript.txt");
+    fs::create_dir_all(&config_directory).expect("configuration directory");
+    fs::create_dir(&helpers).expect("helper directory");
+    fs::write(
+        config_directory.join("subscriptions.opml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head><title>Youta subscriptions</title></head>
+  <body>
+    <outline text="Fixture channel" title="Fixture channel" type="rss"
+      xmlUrl="https://www.youtube.com/feeds/videos.xml?channel_id=UCfixture"
+      htmlUrl="https://www.youtube.com/channel/UCfixture"
+      description="Fixture subscription"/>
+  </body>
+</opml>
+"#,
+    )
+    .expect("subscription fixture");
+    let xdg_open = helpers.join("xdg-open");
+    fs::write(
+        &xdg_open,
+        "#!/bin/sh\n[ \"$1\" = '--' ] || exit 64\nprintf '%s\\n' \"$2\" >> \"$YOUTA_TEST_OPEN_LOG\"\n",
+    )
+    .expect("browser helper");
+    fs::set_permissions(&xdg_open, fs::Permissions::from_mode(0o700))
+        .expect("browser helper permissions");
+    fs::write(
+        &launcher,
+        "#!/bin/sh\n/bin/stty cols 140 rows 42\n\
+         exec \"$YOUTA_TEST_BINARY\" --config-dir \"$YOUTA_TEST_CONFIG_DIR\" tui\n",
+    )
+    .expect("launcher fixture");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))
+        .expect("launcher permissions");
+    let binary = assert_cmd::cargo_bin!("youta");
+
+    let output = run_tui_session(
+        &launcher,
+        binary,
+        &config_directory,
+        &helpers,
+        &first_transcript,
+        &opened_links,
+        None,
+        &[
+            (b"\t", 300),
+            (b"O", 300),
+            (b"p", 300),
+            (b"s", 200),
+            (b"\r", 400),
+            (b"q", 200),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "first TUI process failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_output = fs::read_to_string(&first_transcript).expect("first transcript");
+    for expected in [
+        "Subscription sources",
+        "Fixture channel",
+        "Youta preferences",
+        "Split",
+    ] {
+        assert!(
+            first_output.contains(expected),
+            "first transcript omitted `{expected}`:\n{first_output}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&opened_links)
+            .expect("opened channel link")
+            .lines()
+            .collect::<Vec<_>>(),
+        ["https://www.youtube.com/channel/UCfixture"]
+    );
+    let config_path = config_directory.join("config.toml");
+    let saved_config = fs::read_to_string(&config_path).expect("saved preferences");
+    assert!(saved_config.contains("[ui]"));
+    assert!(saved_config.contains("subscriptions_layout = \"split\""));
+
+    let output = run_tui_session(
+        &launcher,
+        binary,
+        &config_directory,
+        &helpers,
+        &locked_transcript,
+        &opened_links,
+        Some("drill-down"),
+        &[
+            (b"p", 300),
+            (b"s", 200),
+            (b"\r", 300),
+            (b"\x1b", 200),
+            (b"q", 200),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "locked TUI process failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let locked_output = fs::read_to_string(&locked_transcript).expect("locked transcript");
+    assert!(locked_output.contains("YOUTA_UI__SUBSCRIPTIONS_LAYOUT"));
+    assert!(
+        locked_output.contains("change or remove")
+            || locked_output.contains("controls this preference")
+    );
+    assert_eq!(
+        fs::read_to_string(config_path).expect("unchanged preferences"),
+        saved_config,
+        "an environment-locked preference must not rewrite TOML"
     );
 }
 

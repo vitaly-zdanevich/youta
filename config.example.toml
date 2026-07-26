@@ -44,6 +44,13 @@ download_thumbnails = true
 [ui]
 show_button_hotkeys = true
 
+# Subscriptions navigation. `drill-down` is the low-width default: Enter opens
+# one source's videos in the normal list + Details layout. `split` keeps
+# sources and videos visible together; Enter explicitly loads an uncached
+# source. The in-app [p] Preferences popup edits this field.
+# YOUTA_UI__SUBSCRIPTIONS_LAYOUT has higher precedence.
+subscriptions_layout = 'drill-down'
+
 # One of: `auto`, `dark`, or `light`.
 theme = 'auto'
 
@@ -54,6 +61,11 @@ thumbnails = 'auto'
 # Maximum artwork height in terminal rows. Youta reduces it when the Details
 # panel is shorter so metadata, links, and description text retain space.
 thumbnail_height = 20
+
+# Warm the persistent cache for all currently loaded global Search results in
+# one low-priority worker. The selected artwork always has queue priority.
+# YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false disables this without editing TOML.
+prefetch_search_thumbnails = true
 seekbar_color = 'cyan'
 nyan_cat_seekbar = false
 dos_rpg_mode = false

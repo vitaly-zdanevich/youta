@@ -263,6 +263,68 @@ impl SearchRequest {
     }
 }
 
+/// A validated-on-use request for one channel's newest uploaded videos.
+///
+/// Providers expose numbered pages even when the remote API uses opaque
+/// continuation tokens. Callers must request pages sequentially, beginning
+/// with page one, so an adapter can retain those tokens without exposing
+/// provider-specific pagination details.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChannelVideosRequest {
+    /// Stable channel identifier in the provider's namespace.
+    pub channel_id: String,
+    /// One-based page number.
+    pub page: u32,
+}
+
+impl ChannelVideosRequest {
+    /// Creates a first-page request for a stable channel identifier.
+    #[must_use]
+    pub fn new(channel_id: impl Into<String>) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            page: 1,
+        }
+    }
+
+    /// Checks bounds shared by all channel-video providers.
+    ///
+    /// Provider adapters may apply a narrower identifier alphabet after these
+    /// transport-independent checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidRequest`] when the channel identifier
+    /// is empty, has surrounding whitespace, contains control characters,
+    /// exceeds 128 bytes, or when the page is outside `1..=10_000`.
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        if self.channel_id.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "channel identifier cannot be empty".to_owned(),
+            ));
+        }
+        if self.channel_id.len() > 128 {
+            return Err(ProviderError::InvalidRequest(
+                "channel identifier cannot exceed 128 bytes".to_owned(),
+            ));
+        }
+        if self.channel_id.trim() != self.channel_id
+            || self.channel_id.chars().any(char::is_control)
+        {
+            return Err(ProviderError::InvalidRequest(
+                "channel identifier cannot contain surrounding whitespace or control characters"
+                    .to_owned(),
+            ));
+        }
+        if !(1..=10_000).contains(&self.page) {
+            return Err(ProviderError::InvalidRequest(
+                "channel video page must be between 1 and 10000".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A thumbnail candidate returned by a provider.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Thumbnail {
@@ -353,10 +415,10 @@ pub struct SearchPage {
     pub page: u32,
     /// Parsed results.
     pub items: Vec<SearchItem>,
-    /// Next page to request, or `None` when this page was empty.
+    /// Next sequential page to request, or `None` at the end.
     ///
-    /// YouTube-compatible APIs do not expose a final-page marker, so consumers
-    /// may receive one empty page at the end of lazy loading.
+    /// A page can contain no playable items and still provide a continuation
+    /// when the remote collection contains private or unavailable entries.
     pub next_page: Option<u32>,
 }
 
@@ -469,7 +531,8 @@ pub enum YouTubeProviderConfigurationError {
 ///
 /// Implementations must be `Send + Sync`, but calls are not expected to be
 /// non-blocking. Never invoke [`Provider::search`] or
-/// [`Provider::video_details`] or [`Provider::channel_subscriber_counts`] from
+/// [`Provider::channel_videos`], [`Provider::channel_details`],
+/// [`Provider::video_details`], or [`Provider::channel_subscriber_counts`] from
 /// the terminal rendering/event thread.
 pub trait Provider: Send + Sync {
     /// Stable provider identifier used in configuration and diagnostics.
@@ -497,6 +560,42 @@ pub trait Provider: Send + Sync {
     /// Returns a [`ProviderError`] for invalid input, transport failure, an
     /// unsuccessful status, or an invalid bounded response.
     fn search(&self, request: &SearchRequest) -> Result<SearchPage, ProviderError>;
+
+    /// Loads one sequential page of videos uploaded by a channel.
+    ///
+    /// Successful implementations return only [`SearchItem::Video`] entries.
+    /// Providers backed by opaque continuation tokens may reject a page when
+    /// its preceding page has not been loaded by this provider instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] by default after validating the
+    /// request. Implementations can also return a provider error for an
+    /// invalid identifier, missing pagination context, transport failure,
+    /// unsuccessful status, or malformed bounded response.
+    fn channel_videos(&self, request: &ChannelVideosRequest) -> Result<SearchPage, ProviderError> {
+        request.validate()?;
+        Err(ProviderError::Unsupported)
+    }
+
+    /// Loads full public metadata for one exact channel identifier.
+    ///
+    /// The returned [`ChannelSummary`] contains the provider's current name,
+    /// description, public subscriber and video counts, thumbnails, and
+    /// canonical webpage when those fields are exposed. This selected-only
+    /// lookup is separate from [`Provider::channel_subscriber_counts`] so
+    /// callers can retain the latter's low-bandwidth batching behavior for
+    /// search rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] by default. Implementations can
+    /// also return a provider error for an invalid identifier, transport
+    /// failure, an unsuccessful status, a missing channel, or malformed
+    /// bounded data.
+    fn channel_details(&self, _channel_id: &str) -> Result<ChannelSummary, ProviderError> {
+        Err(ProviderError::Unsupported)
+    }
 
     /// Performs one blocking video-details fetch.
     ///
@@ -928,6 +1027,38 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
 
+    struct MinimalProvider;
+
+    impl Provider for MinimalProvider {
+        fn id(&self) -> &'static str {
+            "minimal"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Minimal"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        fn search(&self, _request: &SearchRequest) -> Result<SearchPage, ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+
+        fn video_details(&self, _video_id: &str) -> Result<VideoDetails, ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn full_channel_details_are_unsupported_by_default() {
+        assert!(matches!(
+            MinimalProvider.channel_details("channel"),
+            Err(ProviderError::Unsupported)
+        ));
+    }
+
     #[test]
     fn base_url_is_normalized_without_losing_a_subpath() {
         let url = validate_base_url(
@@ -974,6 +1105,45 @@ mod tests {
 
         request.filters.region = Some("ge".to_owned());
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn channel_videos_request_checks_identifier_and_page_bounds() {
+        let request = ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw");
+        assert!(request.validate().is_ok());
+        assert_eq!(request.page, 1);
+
+        for channel_id in [
+            "",
+            " \t",
+            " UC_x5XG1OV2P6uZZ5FSM9Ttw",
+            "UC_x5XG1OV2P6uZZ5FSM9Ttw ",
+            "UC_fixture\ninjected",
+        ] {
+            assert!(
+                matches!(
+                    ChannelVideosRequest::new(channel_id).validate(),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "{channel_id:?}"
+            );
+        }
+        assert!(matches!(
+            ChannelVideosRequest::new("x".repeat(129)).validate(),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        let mut request = ChannelVideosRequest::new("UC_fixture");
+        request.page = 0;
+        assert!(matches!(
+            request.validate(),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+        request.page = 10_001;
+        assert!(matches!(
+            request.validate(),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]

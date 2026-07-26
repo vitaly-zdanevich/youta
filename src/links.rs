@@ -177,11 +177,12 @@ pub fn parse_description_links(description: &str) -> Vec<DescriptionLink> {
 
 /// Infers ordered chapters from line-leading timecodes in a description.
 ///
-/// A marker may be indented with whitespace and its nonempty title may follow
-/// whitespace directly or an optional `-`, `–`, or `—` separator. Inline
-/// timecodes, malformed markers, duplicates, decreasing starts, and markers at
-/// or beyond a known media duration are ignored. Each chapter ends at the next
-/// accepted marker; the final chapter ends at `duration_seconds` when known.
+/// A timecode may be indented with whitespace or preceded by one common list
+/// marker, such as `➤`, `•`, or `-`. Its nonempty title may follow whitespace
+/// directly or an optional `-`, `–`, or `—` separator. Inline timecodes,
+/// malformed markers, duplicates, decreasing starts, and markers at or beyond
+/// a known media duration are ignored. Each chapter ends at the next accepted
+/// marker; the final chapter ends at `duration_seconds` when known.
 #[must_use]
 pub fn parse_description_chapters(
     description: &str,
@@ -204,10 +205,7 @@ pub fn parse_description_chapters(
         let line_start = description[..link.start_byte]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
-        if !description[line_start..link.start_byte]
-            .chars()
-            .all(char::is_whitespace)
-        {
+        if !is_supported_chapter_line_prefix(&description[line_start..link.start_byte]) {
             continue;
         }
 
@@ -239,6 +237,91 @@ pub fn parse_description_chapters(
             .or(duration_seconds);
     }
     chapters
+}
+
+/// Returns a compact chapter title suitable for a seek bar or chapter line.
+///
+/// One sentence-ending period is removed, while an ellipsis and all source
+/// text outside the returned slice remain unchanged.
+#[must_use]
+pub fn chapter_title_for_display(title: &str) -> &str {
+    let title = title.trim_end();
+    if title.ends_with('.') && !title.ends_with("..") {
+        title.strip_suffix('.').map_or(title, str::trim_end)
+    } else {
+        title
+    }
+}
+
+/// Normalizes recognized chapter lines for display in media Details.
+///
+/// An optional list marker and indentation are removed, the timestamp remains
+/// exact and clickable, and [`chapter_title_for_display`] compacts the title.
+/// Ordinary lines, line endings, and inline timecodes are preserved.
+#[must_use]
+pub fn normalize_description_chapter_lines(description: &str) -> String {
+    let chapters = parse_description_chapters(description, None);
+    if chapters.is_empty() {
+        return description.to_owned();
+    }
+
+    let mut normalized = String::with_capacity(description.len());
+    let mut copied_until = 0;
+    for chapter in chapters {
+        let line_start = description[..chapter.timestamp_start_byte]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        if line_start < copied_until {
+            continue;
+        }
+        let line_break = description[chapter.timestamp_end_byte..]
+            .find('\n')
+            .map_or(description.len(), |offset| {
+                chapter.timestamp_end_byte + offset
+            });
+        let content_end = line_break
+            .checked_sub(1)
+            .filter(|index| description.as_bytes().get(*index) == Some(&b'\r'))
+            .unwrap_or(line_break);
+        let Some(timestamp) = chapter.timestamp_text(description) else {
+            continue;
+        };
+
+        normalized.push_str(&description[copied_until..line_start]);
+        normalized.push_str(timestamp);
+        let title = chapter_title_for_display(&chapter.title);
+        if !title.is_empty() {
+            normalized.push(' ');
+            normalized.push_str(title);
+        }
+        copied_until = content_end;
+    }
+    normalized.push_str(&description[copied_until..]);
+    normalized
+}
+
+/// Returns whether text before a line's timecode is safe chapter-list syntax.
+///
+/// Keeping this allowlist narrow prevents ordinary prose containing a
+/// timestamp from becoming a seek-bar chapter.
+fn is_supported_chapter_line_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix.trim(),
+        "" | "-"
+            | "*"
+            | "•"
+            | "◦"
+            | "▪"
+            | "▫"
+            | "‣"
+            | "⁃"
+            | "➤"
+            | "▶"
+            | "►"
+            | "→"
+            | "➡"
+            | "➡️"
+    )
 }
 
 /// Validates and classifies a `YouTube` URL.
@@ -863,6 +946,56 @@ mod tests {
                 ("Четвёртый", 30, Some(40), Some("00:30")),
             ]
         );
+    }
+
+    #[test]
+    fn common_list_markers_before_timecodes_become_chapters() {
+        let description = "\
+➤ 00:00 Вступление
+  • 05:45 Дело не в фамилиях, а в системе
+	- 07:25 Двойное подчинение
+Prose → 09:20 remains an inline timecode";
+
+        let chapters = parse_description_chapters(description, Some(600));
+
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|chapter| (
+                    chapter.title.as_str(),
+                    chapter.start_seconds,
+                    chapter.timestamp_text(description),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("Вступление", 0, Some("00:00")),
+                ("Дело не в фамилиях, а в системе", 345, Some("05:45")),
+                ("Двойное подчинение", 445, Some("07:25")),
+            ]
+        );
+        assert_eq!(chapters[2].end_seconds, Some(600));
+    }
+
+    #[test]
+    fn displayed_chapter_lines_drop_markers_and_one_final_period() {
+        let description = "\
+➤ 00:00 Обновленный формат эфира.
+Ordinary sentence.
+  • 05:45 Wait...
+Inline ➤ 07:25 remains unchanged\r
+";
+
+        assert_eq!(
+            normalize_description_chapter_lines(description),
+            "\
+00:00 Обновленный формат эфира
+Ordinary sentence.
+05:45 Wait...
+Inline ➤ 07:25 remains unchanged\r
+"
+        );
+        assert_eq!(chapter_title_for_display("Title.  "), "Title");
+        assert_eq!(chapter_title_for_display("Wait..."), "Wait...");
     }
 
     #[test]

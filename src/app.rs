@@ -14,9 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 
-use crate::config::{Config, YouTubeBackend, YouTubeProviderSetting};
+use crate::config::{
+    Config, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, YouTubeBackend, YouTubeProviderSetting,
+};
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 use crate::domain::{
     Chapter, HistoryEntry, MediaId, MediaItem, MediaKind, MediaLicense, MediaStatistics,
@@ -24,7 +27,8 @@ use crate::domain::{
     SourceKind,
 };
 use crate::links::{
-    LinkTarget, parse_description_chapters, parse_description_links, parse_youtube_url,
+    LinkTarget, normalize_description_chapter_lines, parse_description_chapters,
+    parse_description_links, parse_youtube_url,
 };
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
@@ -38,21 +42,26 @@ use crate::playback::{
     PlaybackStatus, PlayerCommand, Result as PlaybackResult,
 };
 use crate::providers::{
-    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, Provider, SearchFeature,
-    SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort, SearchTarget,
-    Thumbnail, VideoDetails, VideoSummary, invidious_youtube_provider, official_youtube_provider,
-    validate_youtube_video_id,
+    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest, Provider,
+    SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort,
+    SearchTarget, Thumbnail, VideoDetails, VideoSummary, invidious_youtube_provider,
+    official_youtube_provider, validate_youtube_video_id,
 };
 use crate::report_actions::SystemReportActions;
-use crate::subscriptions::{self, SubscriptionKind, SubscriptionNode, SubscriptionTree};
+#[cfg(test)]
+use crate::subscriptions::SubscriptionNode;
+use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
+#[cfg(any(feature = "wikidata", test))]
+use crate::tui::DetailLinkView;
 #[cfg(feature = "yt-dlp")]
 use crate::tui::DownloadView;
 use crate::tui::{
-    DetailLinkView, DetailTimecodeView, DetailView, DetailsScroll, DetailsTextSelection,
-    ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL,
-    MAX_DETAILS_SELECTION_BYTES, RightPanelMode, RowView, Screen, SearchActivity, SearchKind,
-    UiAction, UiController, ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort,
-    YouTubeSetupField, YouTubeSetupPopupView,
+    DetailTimecodeView, DetailView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll,
+    ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL,
+    MAX_DETAILS_SELECTION_BYTES, PreferencesPopupView, RightPanelMode, RowView, Screen,
+    SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
+    ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
+    YouTubeSetupPopupView,
 };
 
 /// Truncates a clipboard payload without splitting a UTF-8 character.
@@ -516,9 +525,18 @@ enum ProviderRequest {
         generation: u64,
         request: SearchRequest,
     },
+    ChannelVideos {
+        generation: u64,
+        request: ChannelVideosRequest,
+    },
     Details {
         generation: u64,
         video_id: String,
+    },
+    ChannelDetails {
+        generation: u64,
+        provider_generation: u64,
+        channel_id: String,
     },
     ChannelSubscriberCounts {
         provider_generation: u64,
@@ -555,9 +573,20 @@ enum ProviderResponse {
         request: SearchRequest,
         result: Result<SearchPage, String>,
     },
+    ChannelVideos {
+        generation: u64,
+        request: ChannelVideosRequest,
+        result: Result<SearchPage, String>,
+    },
     Details {
         generation: u64,
         result: Result<VideoDetails, String>,
+    },
+    ChannelDetails {
+        generation: u64,
+        provider_generation: u64,
+        channel_id: String,
+        result: Result<ChannelSummary, String>,
     },
     ChannelSubscriberCounts {
         provider_generation: u64,
@@ -888,6 +917,57 @@ enum PlaybackPhase {
     Playing,
 }
 
+/// Maximum channel collections retained by the process-local LRU cache.
+const MAX_CACHED_SUBSCRIPTION_CHANNELS: usize = 24;
+/// Maximum playable summaries retained for one subscribed channel.
+const MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL: usize = 250;
+/// Approximate heap budget shared by all process-local channel summaries.
+const MAX_CACHED_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
+/// Description excerpt retained until the selected-video details request wins.
+const MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Bound for a cached title or channel display name.
+const MAX_CACHED_SUBSCRIPTION_LABEL_BYTES: usize = 2 * 1024;
+/// Bound for a cached optional URL or publication-age string.
+const MAX_CACHED_SUBSCRIPTION_FIELD_BYTES: usize = 2 * 1024;
+/// Consecutive empty pages followed before requiring explicit continuation.
+const MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES: u32 = 3;
+/// Stable channel selections wait briefly before optional metadata traffic.
+const CHANNEL_DETAILS_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Maximum compact channel records retained by the process.
+const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
+
+/// Bounded, non-persistent channel collection and its next sequential page.
+#[derive(Clone, Debug, Default)]
+struct CachedSubscriptionVideos {
+    /// Playable videos accumulated in provider order.
+    items: Vec<SearchItem>,
+    /// Next sequential provider page, when one remains.
+    next_page: Option<u32>,
+    /// Consecutive empty remote pages since the last playable page.
+    consecutive_empty_pages: u8,
+}
+
+impl CachedSubscriptionVideos {
+    /// Returns a conservative approximation of owned heap bytes.
+    fn estimated_heap_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .map(subscription_item_estimated_heap_bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
+/// One channel record scheduled after the selected source settles.
+#[derive(Clone, Debug)]
+struct ScheduledChannelDetails {
+    /// Selection generation that owns the eventual visible update.
+    generation: u64,
+    /// Exact provider channel identifier.
+    channel_id: String,
+    /// Earliest instant at which the background request may start.
+    due_at: Instant,
+}
+
 /// Default application state used by the interactive terminal.
 pub struct AppController {
     config: Config,
@@ -899,6 +979,16 @@ pub struct AppController {
     local_results: Vec<LocalMediaItem>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
+    /// Current OPML leaves in stable folder order.
+    subscription_entries: Vec<FlattenedSubscription>,
+    /// Process-local bounded channel-video pages keyed by channel identifier.
+    subscription_video_cache: HashMap<String, CachedSubscriptionVideos>,
+    /// Least-recently-used eviction order for channel-video pages.
+    subscription_cache_order: VecDeque<String>,
+    /// Channel whose cached rows and in-flight response own the item pane.
+    active_subscription_channel_id: Option<String>,
+    /// Generation rejecting responses queued for an older source selection.
+    subscription_generation: u64,
     next_youtube_page: Option<u32>,
     youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
@@ -911,6 +1001,16 @@ pub struct AppController {
     youtube_provider_generation: u64,
     channel_subscriber_cache: HashMap<String, Option<u64>>,
     pending_channel_subscribers: HashSet<String>,
+    /// Compact positive and negative channel metadata cached for this process.
+    channel_details_cache: HashMap<String, Option<ChannelSummary>>,
+    /// Least-recently-used order for compact channel metadata.
+    channel_details_cache_order: VecDeque<String>,
+    /// Channel identifiers currently owned by the provider worker.
+    pending_channel_details: HashSet<String>,
+    /// Selection generation rejecting metadata for a different visible source.
+    channel_details_generation: u64,
+    /// Debounced metadata request for the stable subscription source.
+    scheduled_channel_details: Option<ScheduledChannelDetails>,
     search_generation: u64,
     details_generation: u64,
     #[cfg(feature = "wikidata")]
@@ -1008,6 +1108,7 @@ impl AppController {
             },
             ..ViewModel::default()
         };
+        view.subscriptions.layout = config.ui.subscriptions_layout;
         if let Some(search) = saved_search.as_ref() {
             view.search_query.clone_from(&search.request.query);
             view.search_kind = match search.request.target {
@@ -1063,6 +1164,11 @@ impl AppController {
             local_results: Vec::new(),
             tracker_results: Vec::new(),
             subscription_tree,
+            subscription_entries: Vec::new(),
+            subscription_video_cache: HashMap::new(),
+            subscription_cache_order: VecDeque::new(),
+            active_subscription_channel_id: None,
+            subscription_generation: 0,
             // Official YouTube pagination uses opaque tokens retained only by
             // the live provider. Restored rows remain instant and safe, while
             // a new explicit search rebuilds the continuation chain.
@@ -1078,6 +1184,11 @@ impl AppController {
             youtube_provider_generation: 0,
             channel_subscriber_cache: HashMap::new(),
             pending_channel_subscribers: HashSet::new(),
+            channel_details_cache: HashMap::new(),
+            channel_details_cache_order: VecDeque::new(),
+            pending_channel_details: HashSet::new(),
+            channel_details_generation: 0,
+            scheduled_channel_details: None,
             search_generation: 0,
             details_generation: 0,
             #[cfg(feature = "wikidata")]
@@ -1343,10 +1454,22 @@ impl AppController {
         self.youtube_provider_generation = self.youtube_provider_generation.wrapping_add(1);
         self.channel_subscriber_cache.clear();
         self.pending_channel_subscribers.clear();
+        self.channel_details_cache.clear();
+        self.channel_details_cache_order.clear();
+        self.pending_channel_details.clear();
+        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
+        self.scheduled_channel_details = None;
+        self.subscription_video_cache.clear();
+        self.subscription_cache_order.clear();
         self.youtube_provider_available = true;
         self.view.youtube_setup_popup = None;
-        self.view.status_line = format!("Using {provider_name}; retrying YouTube search…");
-        self.submit_youtube_search(1);
+        if self.view.screen == Screen::Subscriptions {
+            self.view.status_line = format!("Using {provider_name}; retrying subscription videos…");
+            self.load_selected_subscription_videos();
+        } else {
+            self.view.status_line = format!("Using {provider_name}; retrying YouTube search…");
+            self.submit_youtube_search(1);
+        }
     }
 
     fn submit_search(&mut self) {
@@ -1653,26 +1776,24 @@ impl AppController {
         self.previous_detail = None;
         self.view.details_scroll = 0;
         self.details_generation = self.details_generation.wrapping_add(1);
-        let Some(selected) = self.youtube_results.get(self.view.selected).cloned() else {
+        let Some(selected) = self.selected_youtube_item().cloned() else {
             self.view.details = None;
             return;
         };
         self.view.details = Some(preliminary_detail(&selected, &self.subscription_tree));
+        if let SearchItem::Video(video) = &selected
+            && self.youtube_provider_available
+        {
+            self.send_provider_request(
+                ProviderRequest::Details {
+                    generation: self.details_generation,
+                    video_id: video.video_id.clone(),
+                },
+                "Could not load YouTube video details",
+            );
+        }
         self.request_selected_channel_subscriber_count(&selected);
         self.request_selected_wikidata(&selected);
-        let SearchItem::Video(video) = selected else {
-            return;
-        };
-        if !self.youtube_provider_available {
-            return;
-        }
-        self.send_provider_request(
-            ProviderRequest::Details {
-                generation: self.details_generation,
-                video_id: video.video_id.clone(),
-            },
-            "Could not load YouTube video details",
-        );
     }
 
     /// Seeds subscriber counts already present in channel-search results.
@@ -1758,6 +1879,194 @@ impl AppController {
         }
     }
 
+    /// Returns the exact channel represented by the visible Channel panel.
+    fn visible_channel_id(&self) -> Option<&str> {
+        (self.view.right_panel_mode == RightPanelMode::Channel)
+            .then(|| self.view.details.as_ref())
+            .flatten()
+            .map(|details| details.channel_id.as_str())
+            .filter(|channel_id| !channel_id.is_empty())
+    }
+
+    /// Returns the YouTube channel owning the active Subscriptions view.
+    fn selected_subscription_channel_id(&self) -> Option<String> {
+        self.subscription_entries
+            .get(self.view.subscriptions.selected_source)
+            .and_then(|entry| entry.subscription.youtube_channel_id())
+            .or_else(|| self.active_subscription_channel_id.clone())
+    }
+
+    /// Schedules metadata only after the selected subscription source settles.
+    fn schedule_selected_subscription_channel_details(&mut self, now: Instant) {
+        self.scheduled_channel_details = None;
+        let Some(entry) = self
+            .subscription_entries
+            .get(self.view.subscriptions.selected_source)
+        else {
+            return;
+        };
+        if entry.subscription.kind != SubscriptionKind::YouTube {
+            return;
+        }
+        let Some(channel_id) = entry.subscription.youtube_channel_id() else {
+            return;
+        };
+        if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
+            self.touch_channel_details_cache(&channel_id);
+            if let Some(channel) = cached {
+                self.apply_channel_details_to_view(&channel);
+            }
+            return;
+        }
+        if self.pending_channel_details.contains(&channel_id) {
+            return;
+        }
+        self.scheduled_channel_details = Some(ScheduledChannelDetails {
+            generation: self.channel_details_generation,
+            channel_id,
+            due_at: now + CHANNEL_DETAILS_DEBOUNCE,
+        });
+    }
+
+    /// Starts the settled-source request without blocking the terminal thread.
+    fn request_due_subscription_channel_details(&mut self, now: Instant) {
+        let Some(scheduled) = self.scheduled_channel_details.take() else {
+            return;
+        };
+        if now < scheduled.due_at {
+            self.scheduled_channel_details = Some(scheduled);
+            return;
+        }
+        let source_is_visible = self.view.screen == Screen::Subscriptions
+            && self.view.subscriptions.route == SubscriptionRoute::Sources
+            && self.visible_channel_id() == Some(scheduled.channel_id.as_str());
+        if scheduled.generation != self.channel_details_generation || !source_is_visible {
+            return;
+        }
+        self.request_channel_details(scheduled.channel_id, scheduled.generation, false);
+    }
+
+    /// Loads the currently visible channel immediately after explicit `c`.
+    fn request_visible_channel_details(&mut self) {
+        let Some(channel_id) = self.visible_channel_id().map(str::to_owned) else {
+            return;
+        };
+        self.scheduled_channel_details = None;
+        self.request_channel_details(channel_id, self.channel_details_generation, true);
+    }
+
+    /// Sends one exact channel-details request or applies the bounded RAM cache.
+    fn request_channel_details(&mut self, channel_id: String, generation: u64, interactive: bool) {
+        if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
+            if let Some(channel) = cached {
+                self.touch_channel_details_cache(&channel_id);
+                if generation == self.channel_details_generation
+                    && self.visible_channel_id() == Some(channel_id.as_str())
+                {
+                    self.apply_channel_details_to_view(&channel);
+                    self.view.status_line =
+                        format!("Using cached channel info for {}", channel.name);
+                }
+                return;
+            }
+            if !interactive {
+                return;
+            }
+            self.channel_details_cache.remove(&channel_id);
+            self.channel_details_cache_order
+                .retain(|cached| cached != &channel_id);
+        }
+        if self.pending_channel_details.contains(&channel_id) {
+            if interactive {
+                self.view.status_line = "Channel info is already loading…".to_owned();
+            }
+            return;
+        }
+        if !self.youtube_provider_available {
+            if interactive {
+                self.open_youtube_setup();
+            }
+            return;
+        }
+        let request = ProviderRequest::ChannelDetails {
+            generation,
+            provider_generation: self.youtube_provider_generation,
+            channel_id: channel_id.clone(),
+        };
+        let sent = if interactive {
+            self.send_provider_request(request, "Could not load channel info")
+        } else {
+            self.provider_requests
+                .as_ref()
+                .is_some_and(|sender| sender.send(request).is_ok())
+        };
+        if !sent {
+            return;
+        }
+        self.pending_channel_details.insert(channel_id.clone());
+        if generation == self.channel_details_generation
+            && self.visible_channel_id() == Some(channel_id.as_str())
+        {
+            self.view.status_line = "Loading channel info…".to_owned();
+        }
+    }
+
+    /// Inserts one compact positive or negative entry into the bounded LRU.
+    fn cache_channel_details(&mut self, channel_id: String, channel: Option<ChannelSummary>) {
+        if !self.channel_details_cache.contains_key(&channel_id) {
+            while self.channel_details_cache.len() >= MAX_CACHED_CHANNEL_DETAILS {
+                let Some(oldest) = self.channel_details_cache_order.pop_front() else {
+                    break;
+                };
+                self.channel_details_cache.remove(&oldest);
+            }
+        }
+        self.channel_details_cache
+            .insert(channel_id.clone(), channel);
+        self.touch_channel_details_cache(&channel_id);
+    }
+
+    /// Marks one channel record as most recently used.
+    fn touch_channel_details_cache(&mut self, channel_id: &str) {
+        self.channel_details_cache_order
+            .retain(|cached| cached != channel_id);
+        self.channel_details_cache_order
+            .push_back(channel_id.to_owned());
+    }
+
+    /// Applies provider metadata only to a matching visible Channel panel.
+    fn apply_channel_details_to_view(&mut self, channel: &ChannelSummary) {
+        let is_visible_subscription_source = self.view.screen == Screen::Subscriptions
+            && self.visible_channel_id() == Some(channel.channel_id.as_str());
+        let Some(details) = self
+            .view
+            .details
+            .as_mut()
+            .filter(|details| details.channel_id == channel.channel_id)
+        else {
+            return;
+        };
+        if self.view.screen != Screen::Subscriptions {
+            details.title.clone_from(&channel.name);
+        }
+        details.channel_name.clone_from(&channel.name);
+        details.channel_subscriber_count = channel.subscriber_count;
+        details.description.clone_from(&channel.description);
+        details.thumbnail_url = preferred_thumbnail_url(&channel.thumbnails);
+        details.channel_webpage_url =
+            youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone());
+        details.channel_subscribed = self
+            .subscription_tree
+            .contains_youtube_channel(&channel.channel_id);
+        if is_visible_subscription_source {
+            self.view.subscriptions.source_subscriber_count = channel.subscriber_count;
+        }
+        self.refresh_youtube_rows();
+        if self.active_subscription_channel_id.is_some() {
+            self.refresh_subscription_video_rows();
+        }
+    }
+
     #[cfg(feature = "wikidata")]
     fn request_selected_wikidata(&mut self, selected: &SearchItem) {
         use crate::providers::wikidata::WikidataExternalKind;
@@ -1782,6 +2091,30 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = "disabled at build time".to_owned();
         }
+    }
+
+    /// Starts the exact YouTube-channel Wikidata lookup for source full-info.
+    fn request_selected_subscription_wikidata(&mut self) {
+        let Some(entry) = self
+            .subscription_entries
+            .get(self.view.subscriptions.selected_source)
+        else {
+            return;
+        };
+        let Some(channel_id) = entry.subscription.youtube_channel_id() else {
+            return;
+        };
+        let selected = SearchItem::Channel(ChannelSummary {
+            channel_id,
+            name: entry.subscription.title.clone(),
+            description: entry.subscription.description.clone().unwrap_or_default(),
+            subscriber_count: None,
+            video_count: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: entry.subscription.website_url.clone(),
+        });
+        self.request_selected_wikidata(&selected);
     }
 
     #[cfg(feature = "wikidata")]
@@ -1938,6 +2271,88 @@ impl AppController {
                     }
                 }
             }
+            ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result,
+            } => {
+                if generation != self.subscription_generation
+                    || self.active_subscription_channel_id.as_deref()
+                        != Some(request.channel_id.as_str())
+                {
+                    return;
+                }
+                self.view.subscriptions.loading = false;
+                match result {
+                    Ok(page) => {
+                        if page.page != request.page
+                            || page.next_page.is_some_and(|next_page| {
+                                request.page.checked_add(1) != Some(next_page) || next_page > 10_000
+                            })
+                            || page
+                                .items
+                                .iter()
+                                .any(|item| !matches!(item, SearchItem::Video(_)))
+                        {
+                            self.show_error_message(
+                                "Subscription videos failed",
+                                "the provider returned inconsistent channel-video pagination",
+                            );
+                            return;
+                        }
+                        let received_page_empty = page.items.is_empty();
+                        self.cache_subscription_video_page(&request.channel_id, page);
+                        if self.view.screen != Screen::Subscriptions {
+                            return;
+                        }
+                        self.refresh_subscription_video_rows();
+                        let count = self.view.subscriptions.items.len();
+                        self.view.status_line = format!(
+                            "{count} video{} loaded for {}",
+                            if count == 1 { "" } else { "s" },
+                            self.view.subscriptions.source_title
+                        );
+                        let next_page = self
+                            .subscription_video_cache
+                            .get(&request.channel_id)
+                            .and_then(|cached| cached.next_page);
+                        let consecutive_empty_pages = self
+                            .subscription_video_cache
+                            .get(&request.channel_id)
+                            .map_or(0, |cached| cached.consecutive_empty_pages);
+                        if received_page_empty
+                            && u32::from(consecutive_empty_pages)
+                                < MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES
+                            && let Some(next_page) = next_page
+                        {
+                            self.request_subscription_videos(request.channel_id.clone(), next_page);
+                            return;
+                        }
+                        if received_page_empty && next_page.is_some() {
+                            self.view.status_line = if count == 0 {
+                                format!(
+                                    "No playable videos through page {}; press Enter to continue",
+                                    request.page
+                                )
+                            } else {
+                                format!(
+                                    "No additional playable videos through page {}; press j to continue",
+                                    request.page
+                                )
+                            };
+                        }
+                        if count > 0
+                            && (self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
+                                || self.view.subscriptions.focus == SubscriptionPane::Items)
+                        {
+                            self.request_selected_details();
+                        }
+                    }
+                    Err(error) => {
+                        self.show_error_message("Subscription videos failed", error);
+                    }
+                }
+            }
             ProviderResponse::ChannelSubscriberCounts {
                 provider_generation,
                 requested_ids,
@@ -1969,6 +2384,69 @@ impl AppController {
                     }
                 }
                 self.refresh_youtube_rows();
+                let visible_subscription_channel = if self.view.screen == Screen::Subscriptions {
+                    self.selected_subscription_channel_id()
+                } else {
+                    None
+                };
+                if let Some(channel_id) = visible_subscription_channel {
+                    self.view.subscriptions.source_subscriber_count = self
+                        .channel_subscriber_cache
+                        .get(&channel_id)
+                        .copied()
+                        .flatten();
+                }
+                if self.active_subscription_channel_id.is_some() {
+                    self.refresh_subscription_video_rows();
+                }
+            }
+            ProviderResponse::ChannelDetails {
+                generation,
+                provider_generation,
+                channel_id,
+                result,
+            } => {
+                if provider_generation != self.youtube_provider_generation {
+                    return;
+                }
+                self.pending_channel_details.remove(&channel_id);
+                match result {
+                    Ok(mut channel) => {
+                        if channel.channel_id != channel_id {
+                            if generation == self.channel_details_generation {
+                                self.view.status_line =
+                                    "Channel metadata returned a mismatched identifier".to_owned();
+                            }
+                            self.cache_channel_details(channel_id, None);
+                            return;
+                        }
+                        compact_channel_summary(&mut channel);
+                        self.channel_subscriber_cache
+                            .insert(channel_id.clone(), channel.subscriber_count);
+                        self.cache_channel_details(channel_id.clone(), Some(channel.clone()));
+                        if generation == self.channel_details_generation
+                            && self.visible_channel_id() == Some(channel_id.as_str())
+                        {
+                            self.apply_channel_details_to_view(&channel);
+                            self.view.status_line =
+                                format!("Loaded channel info for {}", channel.name);
+                        }
+                    }
+                    Err(_) => {
+                        self.cache_channel_details(channel_id.clone(), None);
+                        if generation == self.channel_details_generation
+                            && self.visible_channel_id() == Some(channel_id.as_str())
+                        {
+                            if let Some(details) = self.view.details.as_mut().filter(|details| {
+                                details.description == "Loading channel description…"
+                            }) {
+                                details.description.clear();
+                            }
+                            self.view.status_line =
+                                "Channel info is unavailable; press c to retry".to_owned();
+                        }
+                    }
+                }
             }
             ProviderResponse::Details { generation, result } => {
                 if generation != self.details_generation {
@@ -1976,14 +2454,69 @@ impl AppController {
                 }
                 match result {
                     Ok(details) => {
-                        if let Some(SearchItem::Video(summary)) =
-                            self.youtube_results.get_mut(self.view.selected)
-                            && summary.video_id == details.video_id
-                        {
-                            *summary = summary_from_details(&details);
-                            self.refresh_youtube_rows();
+                        let updated_summary = summary_from_details(&details);
+                        let detailed_chapters =
+                            description_chapters(&details.description, details.duration_seconds);
+                        let detailed_media_id =
+                            MediaId::new(SourceKind::YouTube, details.video_id.clone());
+                        for queued in &mut self.playback_queue.items {
+                            if queued.media.id == detailed_media_id {
+                                queued.media.chapters.clone_from(&detailed_chapters);
+                            }
                         }
-                        if self.view.right_panel_mode != RightPanelMode::Channel {
+                        if self.current_media.as_ref() == Some(&detailed_media_id) {
+                            self.view.playback_chapters.clone_from(&detailed_chapters);
+                        }
+                        let mut compacted_cache_item = SearchItem::Video(updated_summary.clone());
+                        compact_subscription_item(&mut compacted_cache_item);
+                        let SearchItem::Video(compacted_cache_summary) = compacted_cache_item
+                        else {
+                            unreachable!("video details must produce a video summary");
+                        };
+                        for item in &mut self.youtube_results {
+                            if let SearchItem::Video(summary) = item
+                                && summary.video_id == details.video_id
+                            {
+                                *summary = updated_summary.clone();
+                            }
+                        }
+                        let mut updated_cached_channels = Vec::new();
+                        for (channel_id, cached) in &mut self.subscription_video_cache {
+                            let mut channel_updated = false;
+                            for item in &mut cached.items {
+                                if let SearchItem::Video(summary) = item
+                                    && summary.video_id == details.video_id
+                                {
+                                    *summary = compacted_cache_summary.clone();
+                                    channel_updated = true;
+                                }
+                            }
+                            if channel_updated {
+                                updated_cached_channels.push(channel_id.clone());
+                            }
+                        }
+                        let preserved_channel = self
+                            .active_subscription_channel_id
+                            .clone()
+                            .filter(|channel_id| updated_cached_channels.contains(channel_id))
+                            .or_else(|| updated_cached_channels.first().cloned());
+                        if let Some(channel_id) = preserved_channel {
+                            self.touch_subscription_cache(&channel_id);
+                            self.enforce_subscription_cache_byte_budget(&channel_id);
+                        }
+                        if self.view.screen == Screen::Search {
+                            self.refresh_youtube_rows();
+                        } else if self.view.screen == Screen::Subscriptions {
+                            self.refresh_subscription_video_rows();
+                        }
+                        let selected_matches = self.selected_youtube_item().is_some_and(|item| {
+                            matches!(
+                                item,
+                                SearchItem::Video(video) if video.video_id == details.video_id
+                            )
+                        });
+                        if selected_matches && self.view.right_panel_mode != RightPanelMode::Channel
+                        {
                             let wikidata = self
                                 .view
                                 .details
@@ -2151,6 +2684,7 @@ impl AppController {
     }
 
     fn refresh_youtube_rows(&mut self) {
+        let today = Local::now().date_naive();
         self.view.rows = self
             .youtube_results
             .iter()
@@ -2160,6 +2694,8 @@ impl AppController {
                     &self.store,
                     &self.subscription_tree,
                     &self.channel_subscriber_cache,
+                    SearchRowContext::GlobalSearch,
+                    today,
                 )
             })
             .collect();
@@ -2259,6 +2795,36 @@ impl AppController {
     }
 
     fn move_selection(&mut self, delta: i32) {
+        if self.view.screen == Screen::Subscriptions {
+            match (
+                self.view.subscriptions.layout,
+                self.view.subscriptions.route,
+                self.view.subscriptions.focus,
+            ) {
+                (SubscriptionsLayout::DrillDown, SubscriptionRoute::Sources, _)
+                | (SubscriptionsLayout::Split, _, SubscriptionPane::Sources) => {
+                    let Some(index) = moved_index(
+                        self.view.subscriptions.selected_source,
+                        self.subscription_entries.len(),
+                        delta,
+                    ) else {
+                        return;
+                    };
+                    self.select_subscription_source(index);
+                }
+                _ => {
+                    let Some(index) = moved_index(
+                        self.view.subscriptions.selected_item,
+                        self.view.subscriptions.items.len(),
+                        delta,
+                    ) else {
+                        return;
+                    };
+                    self.select_subscription_item(index);
+                }
+            }
+            return;
+        }
         if self.view.rows.is_empty() {
             return;
         }
@@ -2306,6 +2872,26 @@ impl AppController {
         }
     }
 
+    /// Builds a queue entry using full visible description chapters when ready.
+    fn selected_video_queue_item(
+        &self,
+        video: &VideoSummary,
+        start_at_seconds: Option<u64>,
+    ) -> QueueItem {
+        let mut item = queue_item_from_video(video, start_at_seconds);
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        if let Some(details) = self
+            .view
+            .details
+            .as_ref()
+            .filter(|details| details.media_id.as_ref() == Some(&media_id))
+        {
+            item.media.chapters =
+                description_chapters(&details.description, video.duration_seconds);
+        }
+        item
+    }
+
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen == Screen::TrackerMusic {
             let item = self
@@ -2313,6 +2899,25 @@ impl AppController {
                 .get(self.view.selected)
                 .ok_or_else(|| "No tracker item is selected".to_owned())?;
             return queue_item_from_tracker(item);
+        }
+        if self.view.screen == Screen::Subscriptions {
+            let video_is_active = match self.view.subscriptions.layout {
+                SubscriptionsLayout::DrillDown => {
+                    self.view.subscriptions.route == SubscriptionRoute::Items
+                }
+                SubscriptionsLayout::Split => {
+                    self.view.subscriptions.focus == SubscriptionPane::Items
+                        || self.view.subscriptions.description_expanded
+                }
+            };
+            if !video_is_active {
+                return Err("Focus a subscription video before using queue actions".to_owned());
+            }
+            return match self.selected_subscription_item() {
+                Some(SearchItem::Video(video)) => Ok(self.selected_video_queue_item(video, None)),
+                Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
+                None => Err("No subscription video is selected".to_owned()),
+            };
         }
         if self.view.screen != Screen::Search {
             return Err("Queue actions are available for playable search results".to_owned());
@@ -2336,7 +2941,7 @@ impl AppController {
         }
         match self.youtube_results.get(self.view.selected) {
             Some(SearchItem::Video(video)) => {
-                Ok(queue_item_from_video(video, self.selected_start_override))
+                Ok(self.selected_video_queue_item(video, self.selected_start_override))
             }
             Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
             None => Err("No playable item is selected".to_owned()),
@@ -2558,13 +3163,55 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::Subscriptions {
+            match (
+                self.view.subscriptions.layout,
+                self.view.subscriptions.route,
+                self.view.subscriptions.focus,
+            ) {
+                (SubscriptionsLayout::DrillDown, SubscriptionRoute::Sources, _) => {
+                    self.view.subscriptions.route = SubscriptionRoute::Items;
+                    self.view.subscriptions.focus = SubscriptionPane::Items;
+                    self.view.right_panel_mode = RightPanelMode::Details;
+                    self.load_selected_subscription_videos();
+                    if self.view.subscriptions.loading {
+                        self.view.status_line = format!(
+                            "Loading videos for {}…",
+                            self.view.subscriptions.source_title
+                        );
+                    }
+                    return;
+                }
+                (SubscriptionsLayout::Split, _, SubscriptionPane::Sources) => {
+                    self.view.subscriptions.focus = SubscriptionPane::Items;
+                    self.view.right_panel_mode = RightPanelMode::Details;
+                    self.load_selected_subscription_videos();
+                    if self.view.subscriptions.items.is_empty() && !self.view.subscriptions.loading
+                    {
+                        self.view.status_line =
+                            "This subscription has no loaded playable videos".to_owned();
+                    } else if !self.view.subscriptions.items.is_empty() {
+                        self.request_selected_details();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            if self.view.subscriptions.focus == SubscriptionPane::Items
+                && self.view.subscriptions.items.is_empty()
+            {
+                self.load_next_subscription_page_if_needed();
+                if !self.view.subscriptions.loading {
+                    self.view.status_line =
+                        "This subscription has no loaded playable videos".to_owned();
+                }
+                return;
+            }
+        }
         let item = match self.selected_queue_item() {
             Ok(item) => item,
             Err(error) => {
-                if matches!(
-                    self.youtube_results.get(self.view.selected),
-                    Some(SearchItem::Channel(_))
-                ) {
+                if matches!(self.selected_youtube_item(), Some(SearchItem::Channel(_))) {
                     self.show_selected_channel();
                 } else {
                     self.view.status_line = error;
@@ -2602,6 +3249,53 @@ impl AppController {
             return;
         }
 
+        if item.media.id.source == SourceKind::YouTube {
+            let cached_subscription_match =
+                self.subscription_video_cache
+                    .iter()
+                    .find_map(|(channel_id, cached)| {
+                        cached
+                            .items
+                            .iter()
+                            .position(|candidate| {
+                                matches!(
+                                    candidate,
+                                    SearchItem::Video(video)
+                                        if video.video_id == item.media.id.external_id
+                                )
+                            })
+                            .map(|index| (channel_id.clone(), index))
+                    });
+            if let Some((channel_id, index)) = cached_subscription_match
+                && self.subscription_tree.contains_youtube_channel(&channel_id)
+            {
+                self.subscription_entries = self.subscription_tree.flattened_subscriptions();
+                if let Some(source_index) = self.subscription_entries.iter().position(|entry| {
+                    entry.subscription.youtube_channel_id().as_deref() == Some(&channel_id)
+                }) {
+                    self.view.screen = Screen::Subscriptions;
+                    self.view.subscriptions.sources = self
+                        .subscription_entries
+                        .iter()
+                        .map(subscription_source_row)
+                        .collect();
+                    self.view.subscriptions.selected_source = source_index;
+                    self.update_selected_subscription_source();
+                    self.active_subscription_channel_id = Some(channel_id);
+                    self.view.subscriptions.route = SubscriptionRoute::Items;
+                    self.view.subscriptions.focus = SubscriptionPane::Items;
+                    self.view.subscriptions.selected_item = index;
+                    self.view.subscriptions.description_expanded =
+                        self.view.subscriptions.layout == SubscriptionsLayout::Split;
+                    self.refresh_subscription_video_rows();
+                    self.view.right_panel_mode = RightPanelMode::Details;
+                    self.request_selected_details();
+                    self.view.status_line = format!("Selected playing item: {}", item.media.title);
+                    return;
+                }
+            }
+        }
+
         self.view.right_panel_mode = RightPanelMode::Details;
         self.view.details_focused = true;
         self.view.details_scroll = 0;
@@ -2614,23 +3308,48 @@ impl AppController {
     }
 
     fn show_selected_channel(&mut self) {
-        let Some(selected) = self.youtube_results.get(self.view.selected).cloned() else {
+        if self.view.screen == Screen::Subscriptions
+            && self.view.subscriptions.focus == SubscriptionPane::Sources
+        {
+            self.update_selected_subscription_source();
+            self.request_selected_subscription_wikidata();
+            self.view.details_focused = true;
+            self.view.right_panel_mode = RightPanelMode::Channel;
+            self.view.status_line =
+                format!("Channel selected: {}", self.view.subscriptions.source_title);
+            self.request_visible_channel_details();
+            return;
+        }
+        let Some(selected) = self.selected_youtube_item().cloned() else {
             self.view.status_line = "No channel information is available for this item".to_owned();
             return;
         };
-        let (channel_id, name, description) = match selected {
+        let (channel_id, name, description, channel_webpage_url) = match selected {
             SearchItem::Video(video) if !video.channel_id.is_empty() => {
                 self.previous_detail = self.view.details.take();
-                (video.channel_id, video.channel_name, String::new())
+                let channel_webpage_url = canonical_youtube_channel_url(&video.channel_id);
+                (
+                    video.channel_id,
+                    video.channel_name,
+                    String::new(),
+                    channel_webpage_url,
+                )
             }
             SearchItem::Video(_) => {
                 self.view.status_line =
                     "The video provider has not returned a channel ID yet".to_owned();
                 return;
             }
-            SearchItem::Channel(channel) => (channel.channel_id, channel.name, channel.description),
+            SearchItem::Channel(channel) => (
+                channel.channel_id.clone(),
+                channel.name,
+                channel.description,
+                youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url),
+            ),
         };
         self.details_generation = self.details_generation.wrapping_add(1);
+        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
+        self.scheduled_channel_details = None;
         self.view.details_focused = true;
         self.view.details_scroll = 0;
         self.view.details = Some(DetailView {
@@ -2638,6 +3357,7 @@ impl AppController {
             source: "YouTube channel".to_owned(),
             channel_name: name.clone(),
             channel_id: channel_id.clone(),
+            channel_webpage_url,
             channel_subscribed: self.subscription_tree.contains_youtube_channel(&channel_id),
             description: if description.is_empty() {
                 format!("YouTube channel ID: {channel_id}")
@@ -2659,6 +3379,7 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = "disabled at build time".to_owned();
         }
+        self.request_visible_channel_details();
     }
 
     fn toggle_local_subscription(&mut self) {
@@ -2719,7 +3440,11 @@ impl AppController {
         {
             details.channel_subscribed = now_subscribed;
         }
-        self.refresh_youtube_rows();
+        if self.view.screen == Screen::Subscriptions {
+            self.populate_subscriptions();
+        } else {
+            self.refresh_youtube_rows();
+        }
         self.view.status_line = format!(
             "{} {channel_name} locally",
             if now_subscribed {
@@ -2731,6 +3456,32 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        if self.view.screen == Screen::Subscriptions {
+            if self.view.subscriptions.description_expanded {
+                self.view.subscriptions.description_expanded = false;
+                self.view.subscriptions.focus = SubscriptionPane::Items;
+                self.view.details_focused = false;
+                self.view.status_line = "Returned to subscription videos".to_owned();
+                return;
+            }
+            if self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
+                && self.view.subscriptions.route == SubscriptionRoute::Items
+            {
+                self.view.subscriptions.route = SubscriptionRoute::Sources;
+                self.view.subscriptions.focus = SubscriptionPane::Sources;
+                self.update_selected_subscription_source();
+                self.view.status_line = "Returned to subscription sources".to_owned();
+                return;
+            }
+            if self.view.subscriptions.layout == SubscriptionsLayout::Split
+                && self.view.subscriptions.focus == SubscriptionPane::Items
+            {
+                self.view.subscriptions.focus = SubscriptionPane::Sources;
+                self.update_selected_subscription_source();
+                self.view.status_line = "Subscription source list focused".to_owned();
+                return;
+            }
+        }
         if let Some(media_id) = self.current_media.clone()
             && let Some((_, position)) = self
                 .seek_back
@@ -2748,7 +3499,7 @@ impl AppController {
         }
         self.view.details_scroll = 0;
         self.view.right_panel_mode = RightPanelMode::Details;
-        if let Some(selected) = self.youtube_results.get(self.view.selected).cloned() {
+        if let Some(selected) = self.selected_youtube_item().cloned() {
             self.request_selected_wikidata(&selected);
         }
     }
@@ -3252,8 +4003,22 @@ impl AppController {
     }
 
     fn show_screen(&mut self, screen: Screen) {
+        self.details_generation = self.details_generation.wrapping_add(1);
+        #[cfg(feature = "wikidata")]
+        {
+            self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
+        }
+        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
+        self.scheduled_channel_details = None;
         self.view.screen = screen;
         self.view.selected = 0;
+        if screen == Screen::Subscriptions {
+            self.view.subscriptions.selected_source = 0;
+            self.view.subscriptions.selected_item = 0;
+            self.view.subscriptions.route = SubscriptionRoute::Sources;
+            self.view.subscriptions.focus = SubscriptionPane::Sources;
+            self.view.subscriptions.description_expanded = false;
+        }
         self.view.details = None;
         self.view.details_focused = false;
         self.view.details_scroll = 0;
@@ -3313,7 +4078,6 @@ impl AppController {
     }
 
     fn populate_subscriptions(&mut self) {
-        self.view.rows.clear();
         match subscriptions::load(&self.config) {
             Ok(tree) => self.subscription_tree = tree,
             Err(error) => {
@@ -3321,11 +4085,368 @@ impl AppController {
                 return;
             }
         }
-        flatten_subscription_nodes(&self.subscription_tree.items, 0, &mut self.view.rows);
+        self.subscription_entries = self.subscription_tree.flattened_subscriptions();
+        self.view.subscriptions.sources = self
+            .subscription_entries
+            .iter()
+            .map(subscription_source_row)
+            .collect();
+        self.view.subscriptions.selected_source = self
+            .view
+            .subscriptions
+            .selected_source
+            .min(self.subscription_entries.len().saturating_sub(1));
+        self.view.subscriptions.route = SubscriptionRoute::Sources;
+        self.view.subscriptions.focus = SubscriptionPane::Sources;
+        self.view.subscriptions.description_expanded = false;
+        self.view.subscriptions.loading = false;
+        self.view.subscriptions.items.clear();
+        self.view.subscriptions.selected_item = 0;
+        self.active_subscription_channel_id = None;
+        self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
+        self.scheduled_channel_details = None;
+        self.update_selected_subscription_source();
         self.view.status_line = format!(
             "{} local subscription(s)",
             self.subscription_tree.subscription_count()
         );
+        if self.view.subscriptions.layout == SubscriptionsLayout::Split
+            && !self.subscription_entries.is_empty()
+        {
+            self.show_cached_selected_subscription_videos();
+        }
+    }
+
+    fn update_selected_subscription_source(&mut self) {
+        let Some(entry) = self
+            .subscription_entries
+            .get(self.view.subscriptions.selected_source)
+            .cloned()
+        else {
+            self.view.details = None;
+            self.view.subscriptions.source_title.clear();
+            self.view.subscriptions.source_subscriber_count = None;
+            return;
+        };
+        let subscription = entry.subscription;
+        let channel_id = subscription.youtube_channel_id().unwrap_or_default();
+        let channel_webpage_url = (subscription.kind == SubscriptionKind::YouTube)
+            .then(|| youtube_channel_webpage_url(&channel_id, subscription.website_url.clone()))
+            .flatten();
+        self.view.subscriptions.source_title = subscription.title.clone();
+        let cached_subscribers = self
+            .channel_subscriber_cache
+            .get(&channel_id)
+            .copied()
+            .flatten();
+        self.view.subscriptions.source_subscriber_count = cached_subscribers;
+        self.view.details = Some(DetailView {
+            title: subscription.title.clone(),
+            source: subscription_kind_label(subscription.kind).to_owned(),
+            channel_name: subscription.title,
+            channel_id: channel_id.clone(),
+            channel_webpage_url,
+            channel_subscribed: true,
+            channel_subscriber_count: cached_subscribers,
+            description: subscription
+                .description
+                .unwrap_or_else(|| "Loading channel description…".to_owned()),
+            ..DetailView::default()
+        });
+        self.view.right_panel_mode = RightPanelMode::Channel;
+        self.view.details_scroll = 0;
+        self.schedule_selected_subscription_channel_details(Instant::now());
+    }
+
+    fn select_subscription_source(&mut self, index: usize) {
+        if index >= self.subscription_entries.len() {
+            return;
+        }
+        self.view.subscriptions.selected_source = index;
+        self.view.subscriptions.selected_item = 0;
+        self.view.subscriptions.description_expanded = false;
+        self.view.subscriptions.focus = SubscriptionPane::Sources;
+        self.view.subscriptions.loading = false;
+        self.view.subscriptions.items.clear();
+        self.active_subscription_channel_id = None;
+        self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
+        self.scheduled_channel_details = None;
+        self.update_selected_subscription_source();
+        if self.view.subscriptions.layout == SubscriptionsLayout::Split {
+            self.show_cached_selected_subscription_videos();
+        }
+    }
+
+    /// Shows cached split-view rows without spending quota while sources move.
+    ///
+    /// An uncached source remains explicit: Enter starts its provider request.
+    fn show_cached_selected_subscription_videos(&mut self) {
+        let Some(entry) = self
+            .subscription_entries
+            .get(self.view.subscriptions.selected_source)
+        else {
+            return;
+        };
+        if entry.subscription.kind != SubscriptionKind::YouTube {
+            self.view.status_line =
+                "This source is retained in OPML; its episode list is not implemented yet"
+                    .to_owned();
+            return;
+        }
+        let Some(channel_id) = entry.subscription.youtube_channel_id() else {
+            self.view.status_line =
+                "This imported YouTube source has no exact channel ID to load".to_owned();
+            return;
+        };
+        self.active_subscription_channel_id = Some(channel_id.clone());
+        if self.subscription_video_cache.contains_key(&channel_id) {
+            self.touch_subscription_cache(&channel_id);
+            self.refresh_subscription_video_rows();
+            self.view.status_line = format!(
+                "{} cached video{} for {}",
+                self.view.subscriptions.items.len(),
+                if self.view.subscriptions.items.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                self.view.subscriptions.source_title
+            );
+        } else {
+            self.view.status_line = format!(
+                "Press Enter to load videos for {}",
+                self.view.subscriptions.source_title
+            );
+        }
+    }
+
+    fn select_subscription_item(&mut self, index: usize) {
+        if index >= self.view.subscriptions.items.len() {
+            return;
+        }
+        self.view.subscriptions.selected_item = index;
+        self.view.subscriptions.focus = SubscriptionPane::Items;
+        self.view.right_panel_mode = RightPanelMode::Details;
+        self.request_selected_details();
+        self.load_next_subscription_page_if_needed();
+    }
+
+    fn load_selected_subscription_videos(&mut self) {
+        let Some(entry) = self
+            .subscription_entries
+            .get(self.view.subscriptions.selected_source)
+        else {
+            return;
+        };
+        if entry.subscription.kind != SubscriptionKind::YouTube {
+            self.view.subscriptions.items.clear();
+            self.active_subscription_channel_id = None;
+            self.view.status_line =
+                "This source is retained in OPML; its episode list is not implemented yet"
+                    .to_owned();
+            return;
+        }
+        let Some(channel_id) = entry.subscription.youtube_channel_id() else {
+            self.view.subscriptions.items.clear();
+            self.active_subscription_channel_id = None;
+            self.view.status_line =
+                "This imported YouTube source has no exact channel ID to load".to_owned();
+            return;
+        };
+        self.active_subscription_channel_id = Some(channel_id.clone());
+        if self.subscription_video_cache.contains_key(&channel_id) {
+            self.touch_subscription_cache(&channel_id);
+            self.refresh_subscription_video_rows();
+            if !self.view.subscriptions.items.is_empty()
+                && (self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
+                    || self.view.subscriptions.focus == SubscriptionPane::Items)
+            {
+                self.request_selected_details();
+            }
+            return;
+        }
+        self.request_subscription_videos(channel_id, 1);
+    }
+
+    /// Queues one guarded sequential channel page and marks the pane loading.
+    fn request_subscription_videos(&mut self, channel_id: String, page: u32) {
+        if !self.youtube_provider_available {
+            self.open_youtube_setup();
+            return;
+        }
+        if self.view.subscriptions.loading {
+            return;
+        }
+        self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        let request = ChannelVideosRequest { channel_id, page };
+        if !self.send_provider_request(
+            ProviderRequest::ChannelVideos {
+                generation: self.subscription_generation,
+                request,
+            },
+            "Could not load subscription videos",
+        ) {
+            return;
+        }
+        self.view.subscriptions.loading = true;
+        self.view.status_line = format!(
+            "Loading videos for {}…",
+            self.view.subscriptions.source_title
+        );
+    }
+
+    /// Loads the next page near the visible end or after empty-list Enter.
+    fn load_next_subscription_page_if_needed(&mut self) {
+        if self.view.subscriptions.loading
+            || self.view.subscriptions.selected_item.saturating_add(2)
+                < self.view.subscriptions.items.len()
+        {
+            return;
+        }
+        let Some(channel_id) = self.active_subscription_channel_id.clone() else {
+            return;
+        };
+        let next_page = self
+            .subscription_video_cache
+            .get(&channel_id)
+            .and_then(|cached| cached.next_page);
+        if let Some(page) = next_page {
+            self.request_subscription_videos(channel_id, page);
+        }
+    }
+
+    /// Replaces page one or appends a later page within the per-channel cap.
+    ///
+    /// Touching the separate order deque maintains bounded LRU eviction across
+    /// channels. Empty pages retain their continuation because private videos
+    /// can otherwise hide a later playable page.
+    fn cache_subscription_video_page(&mut self, channel_id: &str, mut page: SearchPage) {
+        if page.page == 1 && !self.subscription_video_cache.contains_key(channel_id) {
+            while self.subscription_video_cache.len() >= MAX_CACHED_SUBSCRIPTION_CHANNELS {
+                let Some(oldest) = self.subscription_cache_order.pop_front() else {
+                    break;
+                };
+                if oldest != channel_id {
+                    self.subscription_video_cache.remove(&oldest);
+                }
+            }
+        }
+        let cached = self
+            .subscription_video_cache
+            .entry(channel_id.to_owned())
+            .or_default();
+        if page.page == 1 {
+            cached.items.clear();
+            cached.consecutive_empty_pages = 0;
+        }
+        for item in &mut page.items {
+            compact_subscription_item(item);
+        }
+        let remaining =
+            MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL.saturating_sub(cached.items.len());
+        let page_is_empty = page.items.is_empty();
+        cached.items.extend(page.items.into_iter().take(remaining));
+        cached.consecutive_empty_pages = if page_is_empty {
+            cached.consecutive_empty_pages.saturating_add(1)
+        } else {
+            0
+        };
+        cached.next_page = (cached.items.len() < MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
+            .then_some(page.next_page)
+            .flatten();
+        self.touch_subscription_cache(channel_id);
+        self.enforce_subscription_cache_byte_budget(channel_id);
+    }
+
+    /// Evicts least-recently-used channels until the shared byte budget holds.
+    fn enforce_subscription_cache_byte_budget(&mut self, preserved_channel_id: &str) {
+        while self.subscription_cache_estimated_heap_bytes() > MAX_CACHED_SUBSCRIPTION_BYTES
+            && self.subscription_video_cache.len() > 1
+        {
+            let Some(eviction_index) = self
+                .subscription_cache_order
+                .iter()
+                .position(|channel_id| channel_id != preserved_channel_id)
+            else {
+                break;
+            };
+            let Some(oldest) = self.subscription_cache_order.remove(eviction_index) else {
+                break;
+            };
+            self.subscription_video_cache.remove(&oldest);
+        }
+    }
+
+    /// Returns the approximate heap bytes owned by all channel summaries.
+    fn subscription_cache_estimated_heap_bytes(&self) -> usize {
+        self.subscription_video_cache
+            .values()
+            .map(CachedSubscriptionVideos::estimated_heap_bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn touch_subscription_cache(&mut self, channel_id: &str) {
+        self.subscription_cache_order
+            .retain(|cached| cached != channel_id);
+        self.subscription_cache_order
+            .push_back(channel_id.to_owned());
+    }
+
+    fn refresh_subscription_video_rows(&mut self) {
+        let today = Local::now().date_naive();
+        let items = self
+            .active_subscription_channel_id
+            .as_deref()
+            .and_then(|channel_id| self.subscription_video_cache.get(channel_id))
+            .map_or(&[][..], |cached| cached.items.as_slice());
+        self.view.subscriptions.items = items
+            .iter()
+            .map(|item| {
+                row_from_search_item(
+                    item,
+                    &self.store,
+                    &self.subscription_tree,
+                    &self.channel_subscriber_cache,
+                    SearchRowContext::SubscriptionFeed,
+                    today,
+                )
+            })
+            .collect();
+        self.view.subscriptions.selected_item = self
+            .view
+            .subscriptions
+            .selected_item
+            .min(self.view.subscriptions.items.len().saturating_sub(1));
+    }
+
+    fn selected_subscription_item(&self) -> Option<&SearchItem> {
+        let channel_id = self.active_subscription_channel_id.as_deref()?;
+        self.subscription_video_cache
+            .get(channel_id)?
+            .items
+            .get(self.view.subscriptions.selected_item)
+    }
+
+    fn selected_youtube_item(&self) -> Option<&SearchItem> {
+        match self.view.screen {
+            Screen::Search
+                if self.local_results.is_empty()
+                    && self.direct_item.is_none()
+                    && self.resolved_direct.is_none() =>
+            {
+                self.youtube_results.get(self.view.selected)
+            }
+            Screen::Subscriptions
+                if self.view.subscriptions.route == SubscriptionRoute::Items
+                    || (self.view.subscriptions.layout == SubscriptionsLayout::Split
+                        && self.view.subscriptions.focus == SubscriptionPane::Items) =>
+            {
+                self.selected_subscription_item()
+            }
+            _ => None,
+        }
     }
 
     fn populate_downloads(&mut self) {
@@ -3444,6 +4565,28 @@ impl AppController {
                 .get(self.view.selected)
                 .map(|item| item.webpage_url.to_string());
         }
+        if self.view.screen == Screen::Subscriptions {
+            if let Some(item) = self.selected_subscription_item()
+                && (self.view.subscriptions.route == SubscriptionRoute::Items
+                    || self.view.subscriptions.focus == SubscriptionPane::Items)
+            {
+                return search_item_url(item);
+            }
+            return self
+                .subscription_entries
+                .get(self.view.subscriptions.selected_source)
+                .map(|entry| {
+                    entry
+                        .subscription
+                        .website_url
+                        .as_ref()
+                        .unwrap_or(&entry.subscription.url)
+                        .to_string()
+                });
+        }
+        if self.view.screen != Screen::Search {
+            return None;
+        }
         if let Some(item) = self.local_results.get(self.view.selected) {
             return Some(item.path.display().to_string());
         }
@@ -3455,16 +4598,16 @@ impl AppController {
         if let Some(direct) = &self.direct_item {
             return Some(direct.url.to_string());
         }
-        match self.youtube_results.get(self.view.selected)? {
-            SearchItem::Video(video) => Some(
-                video
-                    .webpage_url
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| youtube_video_url(&video.video_id)),
-            ),
-            SearchItem::Channel(channel) => channel.webpage_url.as_ref().map(ToString::to_string),
-        }
+        search_item_url(self.youtube_results.get(self.view.selected)?)
+    }
+
+    fn current_channel_url(&self) -> Option<String> {
+        self.view
+            .details
+            .as_ref()?
+            .channel_webpage_url
+            .as_ref()
+            .map(ToString::to_string)
     }
 
     fn move_detail_link(&mut self, delta: i32) {
@@ -3703,6 +4846,96 @@ impl AppController {
         self.spawn_url_opener(&url);
     }
 
+    fn open_current_channel_in_browser(&mut self) {
+        let Some(url) = self.current_channel_url() else {
+            self.view.status_line = "No channel webpage is available".to_owned();
+            return;
+        };
+        self.open_external_url(&url);
+    }
+
+    fn open_preferences(&mut self) {
+        self.view.search_editing = false;
+        self.view.help_open = false;
+        self.view.text_selection_mode = false;
+        self.view.preferences_popup = Some(PreferencesPopupView {
+            subscriptions_layout: self.config.ui.subscriptions_layout,
+            config_path: self.config.config_file().display().to_string(),
+            environment_override: std::env::var_os(SUBSCRIPTIONS_LAYOUT_ENV)
+                .map(|_| SUBSCRIPTIONS_LAYOUT_ENV.to_owned()),
+            validation_error: None,
+        });
+        self.view.status_line = "Editing Youta preferences".to_owned();
+    }
+
+    fn set_draft_subscriptions_layout(&mut self, layout: SubscriptionsLayout) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error = Some(format!(
+                "{SUBSCRIPTIONS_LAYOUT_ENV} controls this preference"
+            ));
+            return;
+        }
+        preferences.subscriptions_layout = layout;
+        preferences.validation_error = None;
+    }
+
+    fn submit_preferences(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_ref() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            if let Some(preferences) = self.view.preferences_popup.as_mut() {
+                preferences.validation_error = Some(format!(
+                    "change or remove {SUBSCRIPTIONS_LAYOUT_ENV} before saving"
+                ));
+            }
+            return;
+        }
+        let layout = preferences.subscriptions_layout;
+        if let Err(error) = self.config.save_subscriptions_layout(layout) {
+            if let Some(preferences) = self.view.preferences_popup.as_mut() {
+                preferences.validation_error = Some(error.to_string());
+            }
+            self.show_error("Could not save Youta preferences", &error);
+            return;
+        }
+        self.view.subscriptions.layout = layout;
+        self.view.preferences_popup = None;
+        if self.view.screen == Screen::Subscriptions {
+            self.populate_subscriptions();
+        }
+        self.view.status_line = format!("Subscriptions layout saved: {}", layout.as_config_value());
+    }
+
+    fn toggle_subscription_description(&mut self) {
+        if self.view.screen != Screen::Subscriptions || self.view.subscriptions.items.is_empty() {
+            self.view.status_line = "No subscription video description is available".to_owned();
+            return;
+        }
+        if self.view.subscriptions.layout == SubscriptionsLayout::Split {
+            self.view.subscriptions.description_expanded =
+                !self.view.subscriptions.description_expanded;
+            self.view.subscriptions.focus = SubscriptionPane::Items;
+            self.view.details_focused = self.view.subscriptions.description_expanded;
+            self.view.right_panel_mode = RightPanelMode::Details;
+            if self.view.subscriptions.description_expanded {
+                self.request_selected_details();
+                self.view.status_line =
+                    "Expanded the selected subscription video description".to_owned();
+            } else {
+                self.view.status_line = "Returned to subscription videos".to_owned();
+            }
+        } else {
+            self.view.details_focused = true;
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.view.status_line =
+                "Details focused; use PageUp/PageDown or the mouse wheel to scroll".to_owned();
+        }
+    }
+
     fn open_external_url(&mut self, raw_url: &str) {
         let Ok(url) = url::Url::parse(raw_url) else {
             self.view.status_line = "External link is malformed".to_owned();
@@ -3912,6 +5145,11 @@ impl UiController for AppController {
                 self.view.details_text_selection = None;
                 self.scroll_details(movement);
             }
+            UiAction::SetDetailsScroll(offset) => {
+                self.view.details_text_selection = None;
+                self.view.details_focused = true;
+                self.view.details_scroll = offset;
+            }
             UiAction::ToggleTextSelectionMode => {
                 if self.view.text_selection_mode {
                     self.view.text_selection_mode = false;
@@ -4034,6 +5272,7 @@ impl UiController for AppController {
             UiAction::ShowChannel => self.show_selected_channel(),
             UiAction::GoBack => self.go_back(),
             UiAction::OpenInBrowser => self.open_current_in_browser(),
+            UiAction::OpenChannelInBrowser => self.open_current_channel_in_browser(),
             UiAction::CopyLink => {
                 self.view.status_line = self.current_url().map_or_else(
                     || "No link is selected".to_owned(),
@@ -4085,7 +5324,26 @@ impl UiController for AppController {
             UiAction::DismissYouTubeSetup => {
                 self.view.youtube_setup_popup = None;
                 self.view.status_line =
-                    "YouTube search provider setup cancelled; your query was kept".to_owned();
+                    "YouTube provider setup cancelled; your selection was kept".to_owned();
+            }
+            UiAction::OpenPreferences => self.open_preferences(),
+            UiAction::SetSubscriptionsLayout(layout) => {
+                self.set_draft_subscriptions_layout(layout);
+            }
+            UiAction::SubmitPreferences => self.submit_preferences(),
+            UiAction::DismissPreferences => {
+                self.view.preferences_popup = None;
+                self.view.status_line = "Preferences were not changed".to_owned();
+            }
+            UiAction::SelectSubscriptionSource(index) => {
+                self.view.details_focused = false;
+                self.select_subscription_source(index);
+            }
+            UiAction::SelectSubscriptionItem(index) => {
+                self.select_subscription_item(index);
+            }
+            UiAction::ToggleSubscriptionDescription => {
+                self.toggle_subscription_description();
             }
         }
         self.session_dirty |= !self.diagnostic_only;
@@ -4117,6 +5375,7 @@ impl UiController for AppController {
         }
         self.advance_search_animation();
         self.advance_playback_start_animation();
+        self.request_due_subscription_channel_details(Instant::now());
         #[cfg(feature = "yt-dlp")]
         self.poll_download();
         self.update_player();
@@ -4190,6 +5449,29 @@ fn provider_worker(
                     break;
                 }
             }
+            ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } => {
+                let result = provider.as_ref().map_or_else(
+                    || Err("YouTube provider is not configured".to_owned()),
+                    |provider| {
+                        provider
+                            .channel_videos(&request)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if responses
+                    .send(ProviderResponse::ChannelVideos {
+                        generation,
+                        request,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ProviderRequest::Details {
                 generation,
                 video_id,
@@ -4204,6 +5486,31 @@ fn provider_worker(
                 );
                 if responses
                     .send(ProviderResponse::Details { generation, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ProviderRequest::ChannelDetails {
+                generation,
+                provider_generation,
+                channel_id,
+            } => {
+                let result = provider.as_ref().map_or_else(
+                    || Err("YouTube provider is not configured".to_owned()),
+                    |provider| {
+                        provider
+                            .channel_details(&channel_id)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if responses
+                    .send(ProviderResponse::ChannelDetails {
+                        generation,
+                        provider_generation,
+                        channel_id,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -4993,11 +6300,25 @@ fn scan_local_media(root: &Path) -> Result<Vec<LocalMediaItem>, String> {
     Ok(media)
 }
 
+/// Presentation context for one YouTube result row.
+///
+/// A subscription feed omits channel facts already expressed by its heading.
+#[derive(Clone, Copy)]
+enum SearchRowContext {
+    /// A cross-channel result on the global Search screen.
+    GlobalSearch,
+    /// A video inside one locally subscribed channel's feed.
+    SubscriptionFeed,
+}
+
+/// Converts one provider item into a compact row for its presentation context.
 fn row_from_search_item(
     item: &SearchItem,
     store: &StateStore,
     subscriptions: &SubscriptionTree,
     channel_subscribers: &HashMap<String, Option<u64>>,
+    context: SearchRowContext,
+    today: NaiveDate,
 ) -> RowView {
     match item {
         SearchItem::Video(video) => {
@@ -5005,19 +6326,22 @@ fn row_from_search_item(
                 .progress(&MediaId::new(SourceKind::YouTube, &video.video_id))
                 .ok()
                 .flatten();
+            let subscriber_count = match context {
+                SearchRowContext::GlobalSearch => channel_subscribers
+                    .get(&video.channel_id)
+                    .copied()
+                    .flatten(),
+                SearchRowContext::SubscriptionFeed => None,
+            };
             RowView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
                 title: video.title.clone(),
-                subtitle: youtube_video_row_subtitle(
-                    video,
-                    channel_subscribers
-                        .get(&video.channel_id)
-                        .copied()
-                        .flatten(),
-                ),
+                subtitle: youtube_video_row_subtitle(video, subscriber_count, context, today),
                 source: "YouTube".to_owned(),
                 watched_percent: progress.map_or(0, |value| value.watched_percent()),
-                subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
+                subscribed: matches!(context, SearchRowContext::GlobalSearch)
+                    && subscriptions.contains_youtube_channel(&video.channel_id),
+                thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
             }
         }
         SearchItem::Channel(channel) => RowView {
@@ -5028,22 +6352,35 @@ fn row_from_search_item(
             ),
             source: "YouTube channel".to_owned(),
             subscribed: subscriptions.contains_youtube_channel(&channel.channel_id),
+            thumbnail_url: preferred_thumbnail_url(&channel.thumbnails),
             ..RowView::default()
         },
     }
 }
 
-fn youtube_video_row_subtitle(video: &VideoSummary, subscriber_count: Option<u64>) -> String {
+/// Formats context-aware metadata beneath one YouTube video title.
+///
+/// Global Search retains the channel identity and selected-only subscriber
+/// count. A subscription feed omits both because its heading already owns
+/// those facts.
+fn youtube_video_row_subtitle(
+    video: &VideoSummary,
+    subscriber_count: Option<u64>,
+    context: SearchRowContext,
+    today: NaiveDate,
+) -> String {
     let mut fields = Vec::with_capacity(4);
     let channel_name = video.channel_name.trim();
-    if !channel_name.is_empty() {
+    if matches!(context, SearchRowContext::GlobalSearch) && !channel_name.is_empty() {
         fields.push(channel_name.to_owned());
     }
-    if let Some(count) = subscriber_count {
+    if matches!(context, SearchRowContext::GlobalSearch)
+        && let Some(count) = subscriber_count
+    {
         fields.push(format!("{} subscribers", format_count(count)));
     }
     if let Some(timestamp) = video.published_at {
-        let date = format_unix_utc_date(timestamp);
+        let date = format_unix_local_date_relative(timestamp, today);
         if date != "unknown" {
             fields.push(date);
         }
@@ -5089,31 +6426,35 @@ fn description_chapters(description: &str, duration_seconds: Option<u64>) -> Vec
 
 fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> DetailView {
     match item {
-        SearchItem::Video(video) => DetailView {
-            media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
-            title: video.title.clone(),
-            source: "YouTube".to_owned(),
-            channel_name: video.channel_name.clone(),
-            channel_id: video.channel_id.clone(),
-            channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
-            length: video
-                .duration_seconds
-                .map_or_else(|| "unknown".to_owned(), format_seconds),
-            description: video.description.clone(),
-            timecodes: detail_timecodes(&video.description),
-            views: video
-                .view_count
-                .map_or_else(|| "unknown".to_owned(), format_count),
-            published: video
-                .published_text
-                .clone()
-                .or_else(|| video.published_at.map(format_unix_utc_date))
-                .unwrap_or_else(|| "unknown".to_owned()),
-            license: "loading…".to_owned(),
-            wikidata: "not loaded".to_owned(),
-            thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
-            ..DetailView::default()
-        },
+        SearchItem::Video(video) => {
+            let description = normalize_description_chapter_lines(&video.description);
+            DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
+                title: video.title.clone(),
+                source: "YouTube".to_owned(),
+                channel_name: video.channel_name.clone(),
+                channel_id: video.channel_id.clone(),
+                channel_webpage_url: canonical_youtube_channel_url(&video.channel_id),
+                channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
+                length: video
+                    .duration_seconds
+                    .map_or_else(|| "unknown".to_owned(), format_seconds),
+                timecodes: detail_timecodes(&description),
+                description,
+                views: video
+                    .view_count
+                    .map_or_else(|| "unknown".to_owned(), format_count),
+                published: video
+                    .published_text
+                    .clone()
+                    .or_else(|| video.published_at.map(format_unix_utc_date))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                license: "loading…".to_owned(),
+                wikidata: "not loaded".to_owned(),
+                thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
+                ..DetailView::default()
+            }
+        }
         SearchItem::Channel(channel) => detail_from_channel(channel, subscriptions),
     }
 }
@@ -5146,22 +6487,146 @@ fn preferred_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
     selected.map(|thumbnail| thumbnail.url.clone())
 }
 
+/// Compacts selected-only channel metadata before process-local caching.
+fn compact_channel_summary(channel: &mut ChannelSummary) {
+    compact_cached_string(&mut channel.channel_id, 128);
+    compact_cached_string(&mut channel.name, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+    compact_cached_string(
+        &mut channel.description,
+        MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES,
+    );
+    channel
+        .webpage_url
+        .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+    let preferred_thumbnail = preferred_thumbnail_url(&channel.thumbnails);
+    channel.thumbnails.retain(|thumbnail| {
+        preferred_thumbnail.as_ref() == Some(&thumbnail.url)
+            && thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES
+    });
+    channel.thumbnails.truncate(1);
+    channel.thumbnails.shrink_to_fit();
+    if let Some(thumbnail) = channel.thumbnails.first_mut()
+        && let Some(quality) = thumbnail.quality.as_mut()
+    {
+        compact_cached_string(quality, 128);
+    }
+}
+
+/// Compacts provider list metadata before it enters the low-RAM channel cache.
+fn compact_subscription_item(item: &mut SearchItem) {
+    let SearchItem::Video(video) = item else {
+        return;
+    };
+    compact_cached_string(&mut video.video_id, 128);
+    compact_cached_string(&mut video.channel_id, 128);
+    compact_cached_string(&mut video.title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+    compact_cached_string(&mut video.channel_name, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+    compact_cached_string(
+        &mut video.description,
+        MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES,
+    );
+    if let Some(published) = video.published_text.as_mut() {
+        compact_cached_string(published, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+    }
+    video
+        .webpage_url
+        .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+    video
+        .stream_url
+        .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+
+    let preferred_thumbnail = preferred_thumbnail_url(&video.thumbnails);
+    video.thumbnails.retain(|thumbnail| {
+        preferred_thumbnail.as_ref() == Some(&thumbnail.url)
+            && thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES
+    });
+    video.thumbnails.truncate(1);
+    video.thumbnails.shrink_to_fit();
+    if let Some(thumbnail) = video.thumbnails.first_mut()
+        && let Some(quality) = thumbnail.quality.as_mut()
+    {
+        compact_cached_string(quality, 128);
+    }
+}
+
+/// Truncates one cached string at a UTF-8 boundary and releases spare capacity.
+fn compact_cached_string(value: &mut String, maximum_bytes: usize) {
+    truncate_utf8_bytes(value, maximum_bytes);
+    value.shrink_to_fit();
+}
+
+/// Estimates heap ownership for enforcing the global subscription-cache cap.
+fn subscription_item_estimated_heap_bytes(item: &SearchItem) -> usize {
+    let base = std::mem::size_of::<SearchItem>();
+    match item {
+        SearchItem::Video(video) => {
+            let strings = [
+                video.video_id.capacity(),
+                video.title.capacity(),
+                video.channel_name.capacity(),
+                video.channel_id.capacity(),
+                video.description.capacity(),
+                video.published_text.as_ref().map_or(0, String::capacity),
+                video
+                    .webpage_url
+                    .as_ref()
+                    .map_or(0, |url| url.as_str().len()),
+                video
+                    .stream_url
+                    .as_ref()
+                    .map_or(0, |url| url.as_str().len()),
+            ]
+            .into_iter()
+            .fold(0usize, usize::saturating_add);
+            let thumbnails = video
+                .thumbnails
+                .iter()
+                .map(|thumbnail| {
+                    thumbnail
+                        .url
+                        .as_str()
+                        .len()
+                        .saturating_add(thumbnail.quality.as_ref().map_or(0, String::capacity))
+                })
+                .fold(
+                    video
+                        .thumbnails
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Thumbnail>()),
+                    usize::saturating_add,
+                );
+            base.saturating_add(strings).saturating_add(thumbnails)
+        }
+        SearchItem::Channel(channel) => {
+            let strings = channel
+                .channel_id
+                .capacity()
+                .saturating_add(channel.name.capacity())
+                .saturating_add(channel.description.capacity())
+                .saturating_add(
+                    channel
+                        .webpage_url
+                        .as_ref()
+                        .map_or(0, |url| url.as_str().len()),
+                );
+            base.saturating_add(strings)
+        }
+    }
+}
+
 fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTree) -> DetailView {
     DetailView {
         title: channel.name.clone(),
         source: "YouTube channel".to_owned(),
         channel_name: channel.name.clone(),
         channel_id: channel.channel_id.clone(),
+        channel_webpage_url: youtube_channel_webpage_url(
+            &channel.channel_id,
+            channel.webpage_url.clone(),
+        ),
         channel_subscribed: subscriptions.contains_youtube_channel(&channel.channel_id),
+        channel_subscriber_count: channel.subscriber_count,
         description: channel.description.clone(),
-        views: channel.video_count.map_or_else(
-            || "unknown videos".to_owned(),
-            |value| format!("{} videos", format_count(value)),
-        ),
-        likes: channel.subscriber_count.map_or_else(
-            || "unknown subscribers".to_owned(),
-            |value| format!("{} subscribers", format_count(value)),
-        ),
         license: "not applicable".to_owned(),
         wikidata: "not loaded".to_owned(),
         thumbnail_url: preferred_thumbnail_url(&channel.thumbnails),
@@ -5170,18 +6635,21 @@ fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTre
 }
 
 fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> DetailView {
+    let description = normalize_description_chapter_lines(&video.description);
     DetailView {
         media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
         title: video.title.clone(),
         source: "YouTube".to_owned(),
         channel_name: video.channel_name.clone(),
         channel_id: video.channel_id.clone(),
+        channel_webpage_url: canonical_youtube_channel_url(&video.channel_id),
         channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
+        channel_subscriber_count: None,
         length: video
             .duration_seconds
             .map_or_else(|| "unknown".to_owned(), format_seconds),
-        description: video.description.clone(),
-        timecodes: detail_timecodes(&video.description),
+        timecodes: detail_timecodes(&description),
+        description,
         likes: video
             .like_count
             .map_or_else(|| "unknown".to_owned(), format_count),
@@ -5253,34 +6721,107 @@ fn summary_from_details(video: &VideoDetails) -> VideoSummary {
     }
 }
 
-fn flatten_subscription_nodes(nodes: &[SubscriptionNode], depth: usize, rows: &mut Vec<RowView>) {
-    for node in nodes {
-        match node {
-            SubscriptionNode::Folder(folder) => {
-                rows.push(RowView {
-                    title: format!("{}{}/", "  ".repeat(depth), folder.title),
-                    subtitle: format!("{} item(s)", folder.children.len()),
-                    source: "Local folder".to_owned(),
-                    subscribed: true,
-                    ..RowView::default()
-                });
-                flatten_subscription_nodes(&folder.children, depth.saturating_add(1), rows);
-            }
-            SubscriptionNode::Subscription(subscription) => {
-                rows.push(RowView {
-                    title: format!("{}{}", "  ".repeat(depth), subscription.title),
-                    subtitle: subscription.url.to_string(),
-                    source: match subscription.kind {
-                        SubscriptionKind::YouTube => "YouTube subscription",
-                        SubscriptionKind::Rss => "RSS podcast",
-                        SubscriptionKind::Other => "Subscription",
-                    }
-                    .to_owned(),
-                    subscribed: true,
-                    ..RowView::default()
-                });
-            }
+fn subscription_source_row(entry: &FlattenedSubscription) -> RowView {
+    RowView {
+        title: format!("{}{}", "  ".repeat(entry.depth), entry.subscription.title),
+        subtitle: entry.subscription.url.to_string(),
+        source: subscription_kind_label(entry.subscription.kind).to_owned(),
+        subscribed: true,
+        ..RowView::default()
+    }
+}
+
+const fn subscription_kind_label(kind: SubscriptionKind) -> &'static str {
+    match kind {
+        SubscriptionKind::YouTube => "YouTube channel",
+        SubscriptionKind::Rss => "RSS podcast",
+        SubscriptionKind::Other => "Subscription",
+    }
+}
+
+fn moved_index(current: usize, length: usize, delta: i32) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+    let last = length.saturating_sub(1);
+    Some(if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        current.saturating_add(delta as usize).min(last)
+    })
+}
+
+/// Builds a canonical channel page only from a bounded path-safe identifier.
+fn canonical_youtube_channel_url(channel_id: &str) -> Option<url::Url> {
+    if channel_id.is_empty()
+        || channel_id.len() > 128
+        || !channel_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let mut url = url::Url::parse("https://www.youtube.com/channel/").ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .push(channel_id);
+    Some(url)
+}
+
+/// Accepts a provider channel page from a strict YouTube allowlist.
+///
+/// Unsafe, unrelated, or mismatched pages fall back to the canonical channel
+/// identifier instead of reaching `xdg-open`.
+fn youtube_channel_webpage_url(channel_id: &str, preferred: Option<url::Url>) -> Option<url::Url> {
+    preferred
+        .filter(|url| is_safe_youtube_channel_webpage(url, channel_id))
+        .or_else(|| canonical_youtube_channel_url(channel_id))
+}
+
+/// Checks that a preferred URL is an exact credential-free YouTube channel page.
+fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("youtube.com" | "www.youtube.com"))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments.collect::<Vec<_>>();
+    match segments.as_slice() {
+        [handle] => handle
+            .strip_prefix('@')
+            .is_some_and(|handle| !handle.is_empty() && handle.len() <= 128),
+        ["channel", candidate] => {
+            canonical_youtube_channel_url(candidate).is_some()
+                && (channel_id.is_empty() || *candidate == channel_id)
         }
+        ["c" | "user", legacy_name] => !legacy_name.is_empty() && legacy_name.len() <= 128,
+        _ => false,
+    }
+}
+
+fn search_item_url(item: &SearchItem) -> Option<String> {
+    match item {
+        SearchItem::Video(video) => Some(
+            video
+                .webpage_url
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| youtube_video_url(&video.video_id)),
+        ),
+        SearchItem::Channel(channel) => channel
+            .webpage_url
+            .clone()
+            .or_else(|| canonical_youtube_channel_url(&channel.channel_id))
+            .map(|url| url.to_string()),
     }
 }
 
@@ -5649,6 +7190,42 @@ fn format_unix_utc_date(timestamp: i64) -> String {
     const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
     const MIN_SUPPORTED_TIMESTAMP: i64 = -62_135_596_800;
     const MAX_SUPPORTED_TIMESTAMP: i64 = 253_402_300_799;
+
+    if !(MIN_SUPPORTED_TIMESTAMP..=MAX_SUPPORTED_TIMESTAMP).contains(&timestamp) {
+        return "unknown".to_owned();
+    }
+    let days_since_epoch = timestamp.div_euclid(SECONDS_PER_DAY);
+    let (year, month, day) = civil_date_from_unix_days(days_since_epoch);
+    format_civil_date(year, month, day).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Formats one publication timestamp in the user's local calendar.
+///
+/// Relative labels are computed from injected `today`, which keeps date
+/// boundaries deterministic in tests and avoids consulting the clock per row.
+fn format_unix_local_date_relative(timestamp: i64, today: NaiveDate) -> String {
+    let Some(published) =
+        DateTime::from_timestamp(timestamp, 0).map(|date| date.with_timezone(&Local).date_naive())
+    else {
+        return "unknown".to_owned();
+    };
+    let Some(mut formatted) = format_civil_date(
+        i64::from(published.year()),
+        i64::from(published.month()),
+        i64::from(published.day()),
+    ) else {
+        return "unknown".to_owned();
+    };
+    if published == today {
+        formatted.push_str(" (today)");
+    } else if today.pred_opt() == Some(published) {
+        formatted.push_str(" (yesterday)");
+    }
+    formatted
+}
+
+/// Formats a validated civil date with an English month name.
+fn format_civil_date(year: i64, month: i64, day: i64) -> Option<String> {
     const MONTHS: [&str; 12] = [
         "January",
         "February",
@@ -5664,22 +7241,13 @@ fn format_unix_utc_date(timestamp: i64) -> String {
         "December",
     ];
 
-    if !(MIN_SUPPORTED_TIMESTAMP..=MAX_SUPPORTED_TIMESTAMP).contains(&timestamp) {
-        return "unknown".to_owned();
-    }
-    let days_since_epoch = timestamp.div_euclid(SECONDS_PER_DAY);
-    let (year, month, day) = civil_date_from_unix_days(days_since_epoch);
-    let Some(month_name) = month
+    let month_name = month
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| MONTHS.get(index))
-    else {
-        return "unknown".to_owned();
-    };
-    if !(1..=31).contains(&day) {
-        return "unknown".to_owned();
-    }
-    format!("{year} {month_name} {day}")
+        .and_then(|index| MONTHS.get(index))?;
+    (1..=31)
+        .contains(&day)
+        .then(|| format!("{year} {month_name} {day}"))
 }
 
 // Converts a day offset from 1970-01-01 using Howard Hinnant's civil-date
@@ -5913,21 +7481,85 @@ mod tests {
     }
 
     #[test]
+    fn local_relative_dates_cross_month_and_year_boundaries() {
+        let today = NaiveDate::from_ymd_opt(2027, 1, 1).expect("valid fixture date");
+        let timestamp = |date: NaiveDate| {
+            date.and_hms_opt(12, 0, 0)
+                .expect("valid local noon")
+                .and_local_timezone(Local)
+                .single()
+                .expect("local noon must be unambiguous")
+                .timestamp()
+        };
+
+        assert_eq!(
+            format_unix_local_date_relative(timestamp(today), today),
+            "2027 January 1 (today)"
+        );
+        assert_eq!(
+            format_unix_local_date_relative(
+                timestamp(NaiveDate::from_ymd_opt(2026, 12, 31).expect("valid fixture date")),
+                today,
+            ),
+            "2026 December 31 (yesterday)"
+        );
+        assert_eq!(
+            format_unix_local_date_relative(
+                timestamp(NaiveDate::from_ymd_opt(2026, 12, 30).expect("valid fixture date")),
+                today,
+            ),
+            "2026 December 30"
+        );
+    }
+
+    #[test]
     fn youtube_video_row_subtitle_orders_and_collapses_available_metadata() {
         let mut video = subscription_video_summary();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date");
+        video.published_at = Some(
+            today
+                .and_hms_opt(12, 0, 0)
+                .expect("valid local noon")
+                .and_local_timezone(Local)
+                .single()
+                .expect("local noon must be unambiguous")
+                .timestamp(),
+        );
         assert_eq!(
-            youtube_video_row_subtitle(&video, Some(13_045)),
-            "Fixture channel · 13,045 subscribers · 2024 October 15 · 0:42"
+            youtube_video_row_subtitle(&video, Some(13_045), SearchRowContext::GlobalSearch, today,),
+            "Fixture channel · 13,045 subscribers · 2026 July 26 (today) · 0:42"
+        );
+        assert_eq!(
+            youtube_video_row_subtitle(
+                &video,
+                Some(13_045),
+                SearchRowContext::SubscriptionFeed,
+                today,
+            ),
+            "2026 July 26 (today) · 0:42",
+            "a subscription heading already owns the channel name and subscriber count"
+        );
+
+        let yesterday = today.pred_opt().expect("fixture has a preceding date");
+        video.published_at = Some(
+            yesterday
+                .and_hms_opt(12, 0, 0)
+                .expect("valid local noon")
+                .and_local_timezone(Local)
+                .single()
+                .expect("local noon must be unambiguous")
+                .timestamp(),
+        );
+        assert_eq!(
+            youtube_video_row_subtitle(&video, None, SearchRowContext::SubscriptionFeed, today,),
+            "2026 July 25 (yesterday) · 0:42"
         );
 
         video.channel_name = "  ".to_owned();
-        video.published_at = None;
-        assert_eq!(youtube_video_row_subtitle(&video, None), "0:42");
-
         video.duration_seconds = None;
         video.published_at = Some(i64::MAX);
         assert_eq!(
-            youtube_video_row_subtitle(&video, None),
+            youtube_video_row_subtitle(&video, None, SearchRowContext::GlobalSearch, today,),
             "",
             "missing or invalid fields must not leave separators or `unknown`"
         );
@@ -6171,6 +7803,13 @@ mod tests {
             preliminary_detail(&SearchItem::Video(summary), &SubscriptionTree::default());
         assert_eq!(preliminary.views, "887,263");
         assert_eq!(preliminary.published, "2024 October 15");
+        assert_eq!(
+            preliminary
+                .channel_webpage_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/channel/UCfixture")
+        );
 
         let details = VideoDetails {
             video_id: "dQw4w9WgXcQ".to_owned(),
@@ -6199,7 +7838,64 @@ mod tests {
         assert_eq!(rendered.license, "Creative Commons Attribution");
         assert_eq!(rendered.channel_name, "Channel");
         assert_eq!(rendered.channel_id, "UCfixture");
+        assert_eq!(
+            rendered.channel_webpage_url.as_ref().map(url::Url::as_str),
+            Some("https://www.youtube.com/channel/UCfixture")
+        );
         assert!(!rendered.channel_subscribed);
+    }
+
+    #[test]
+    fn channel_details_prefer_the_provider_webpage_over_a_synthesized_url() {
+        let channel = ChannelSummary {
+            channel_id: "UCfixture".to_owned(),
+            name: "Fixture".to_owned(),
+            description: "Channel description".to_owned(),
+            subscriber_count: Some(10),
+            video_count: Some(2),
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: Some(
+                url::Url::parse("https://www.youtube.com/@fixture").expect("fixture channel URL"),
+            ),
+        };
+
+        let details = detail_from_channel(&channel, &SubscriptionTree::default());
+
+        assert_eq!(
+            details.channel_webpage_url.as_ref().map(url::Url::as_str),
+            Some("https://www.youtube.com/@fixture")
+        );
+    }
+
+    #[test]
+    fn channel_webpage_rejects_unsafe_provider_urls_and_channel_ids() {
+        let unsafe_provider_url =
+            url::Url::parse("https://youtube.com@example.org/channel/UCfixture")
+                .expect("unsafe fixture URL");
+        let watch_url =
+            url::Url::parse("https://www.youtube.com/watch?v=fixture").expect("watch fixture URL");
+        let redirect_url =
+            url::Url::parse("https://www.youtube.com/redirect").expect("redirect fixture URL");
+        let mismatched_channel_url = url::Url::parse("https://www.youtube.com/channel/UCother")
+            .expect("mismatched channel fixture URL");
+
+        assert_eq!(
+            youtube_channel_webpage_url("UCfixture", Some(unsafe_provider_url))
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/channel/UCfixture")
+        );
+        for unsafe_url in [watch_url, redirect_url, mismatched_channel_url] {
+            assert_eq!(
+                youtube_channel_webpage_url("UCfixture", Some(unsafe_url))
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some("https://www.youtube.com/channel/UCfixture")
+            );
+        }
+        assert!(youtube_channel_webpage_url("../watch", None).is_none());
+        assert!(canonical_youtube_channel_url(&"x".repeat(129)).is_none());
     }
 
     #[test]
@@ -6320,6 +8016,882 @@ mod tests {
                 .subscription_count(),
             0
         );
+    }
+
+    fn save_fixture_subscriptions(config: &Config, channel_ids: &[&str]) {
+        let mut tree = SubscriptionTree::default();
+        for (index, channel_id) in channel_ids.iter().enumerate() {
+            assert!(tree.subscribe_youtube_channel(
+                format!("Fixture channel {}", index.saturating_add(1)),
+                channel_id,
+            ));
+        }
+        subscriptions::save(config, &tree).expect("save fixture subscriptions");
+    }
+
+    fn receive_channel_request(
+        captured_requests: &Receiver<ProviderRequest>,
+    ) -> (u64, ChannelVideosRequest) {
+        for _ in 0..8 {
+            if let ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } = captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("channel videos request")
+            {
+                return (generation, request);
+            }
+        }
+        panic!("provider queue did not contain a channel videos request");
+    }
+
+    fn assert_no_channel_request(captured_requests: &Receiver<ProviderRequest>, context: &str) {
+        while let Ok(request) = captured_requests.try_recv() {
+            assert!(
+                !matches!(request, ProviderRequest::ChannelVideos { .. }),
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn drill_down_subscriptions_load_only_after_enter_and_tab_returns_to_sources() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_eq!(
+            controller.view.subscriptions.route,
+            SubscriptionRoute::Sources
+        );
+        assert_eq!(controller.view.subscriptions.sources.len(), 1);
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "drill-down mode must not spend quota before a source is activated"
+        );
+        assert_eq!(
+            controller.current_channel_url().as_deref(),
+            Some("https://www.youtube.com/channel/UCfixture")
+        );
+
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("channel videos request")
+        {
+            ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } => (generation, request),
+            _ => panic!("expected channel videos request"),
+        };
+        assert_eq!(request.channel_id, "UCfixture");
+        assert_eq!(request.page, 1);
+        assert_eq!(
+            controller.view.subscriptions.route,
+            SubscriptionRoute::Items
+        );
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("dQw4w9WgXcQ")
+        );
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lazy details request"),
+            ProviderRequest::Details { .. }
+        ));
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_eq!(
+            controller.view.subscriptions.route,
+            SubscriptionRoute::Sources,
+            "global Tab's screen action must always return to the subscriptions root"
+        );
+        assert_no_channel_request(
+            &captured_requests,
+            "returning to a drill-down root must not refetch the channel",
+        );
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn subscription_channel_full_info_starts_exact_lazy_wikidata_lookup() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ShowChannel);
+        let request = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Wikidata request");
+        assert!(matches!(
+            request,
+            ProviderRequest::Wikidata {
+                kind: WikidataExternalKind::YouTubeChannel,
+                external_id,
+                ..
+            } if external_id == "UCfixture"
+        ));
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.wikidata.contains("loading P2397 lazily"))
+        );
+    }
+
+    #[test]
+    fn empty_subscription_pages_continue_boundedly_and_enter_resumes_pagination() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        for page in 1..=MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES {
+            let (generation, request) = receive_channel_request(&captured_requests);
+            assert_eq!(request.page, page);
+            controller.handle_provider_response(ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result: Ok(SearchPage {
+                    page,
+                    items: Vec::new(),
+                    next_page: Some(page.saturating_add(1)),
+                }),
+            });
+        }
+        assert!(captured_requests.try_recv().is_err());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("press Enter to continue")
+        );
+
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(
+            request.page,
+            MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES.saturating_add(1)
+        );
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request: request.clone(),
+            result: Ok(SearchPage {
+                page: request.page,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+    }
+
+    #[test]
+    fn empty_later_subscription_page_reaches_the_next_playable_page() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: Some(2),
+            }),
+        });
+        controller.dispatch(UiAction::SelectSubscriptionItem(0));
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 2,
+                items: Vec::new(),
+                next_page: Some(3),
+            }),
+        });
+
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 3);
+        let mut later_video = subscription_video_summary();
+        later_video.video_id = "abcdefghijk".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 3,
+                items: vec![SearchItem::Video(later_video)],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(controller.view.subscriptions.items.len(), 2);
+    }
+
+    #[test]
+    fn subscription_pages_reject_skipped_continuations() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: Vec::new(),
+                next_page: Some(3),
+            }),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str()),
+            Some("Subscription videos failed")
+        );
+        assert!(controller.subscription_video_cache.is_empty());
+    }
+
+    #[test]
+    fn subscription_response_is_cached_without_mutating_another_screen() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.dispatch(UiAction::ShowScreen(Screen::Search));
+        controller.view.status_line = "Search state remains active".to_owned();
+        controller.view.details = Some(DetailView {
+            title: "Search details".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert_eq!(controller.view.status_line, "Search state remains active");
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Search details")
+        );
+        assert_eq!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .map(|cached| cached.items.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn subscription_cache_compacts_summaries_and_obeys_global_byte_budget() {
+        let config = Config::for_dir("/tmp/youta-subscription-byte-cache-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for channel_index in 0..MAX_CACHED_SUBSCRIPTION_CHANNELS {
+            let channel_id = format!("UCcache{channel_index:02}");
+            let items = (0..80)
+                .map(|item_index| {
+                    let mut video = subscription_video_summary();
+                    video.title = "T".repeat(MAX_CACHED_SUBSCRIPTION_LABEL_BYTES * 2);
+                    video.description =
+                        "D".repeat(MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES * 2);
+                    video.thumbnails = ["one", "two"]
+                        .into_iter()
+                        .map(|quality| Thumbnail {
+                            url: url::Url::parse(&format!(
+                                "https://i.ytimg.com/vi/dQw4w9WgXcQ/{channel_index}-{item_index}-{quality}.jpg"
+                            ))
+                            .expect("fixture thumbnail"),
+                            quality: Some(quality.repeat(100)),
+                            width: Some(480),
+                            height: Some(270),
+                        })
+                        .collect();
+                    SearchItem::Video(video)
+                })
+                .collect();
+            controller.cache_subscription_video_page(
+                &channel_id,
+                SearchPage {
+                    page: 1,
+                    items,
+                    next_page: None,
+                },
+            );
+        }
+
+        assert!(
+            controller.subscription_cache_estimated_heap_bytes() <= MAX_CACHED_SUBSCRIPTION_BYTES
+        );
+        assert!(
+            controller.subscription_video_cache.len() < MAX_CACHED_SUBSCRIPTION_CHANNELS,
+            "the byte budget must evict before the entry-count limit"
+        );
+        assert!(
+            controller
+                .subscription_video_cache
+                .contains_key("UCcache23")
+        );
+        for cached in controller.subscription_video_cache.values() {
+            for item in &cached.items {
+                let SearchItem::Video(video) = item else {
+                    panic!("channel cache contains a non-video item");
+                };
+                assert!(video.title.len() <= MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+                assert!(video.description.len() <= MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES);
+                assert!(video.thumbnails.len() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn full_video_details_keep_visible_text_but_not_unbounded_cached_fields() {
+        let config = Config::for_dir("/tmp/youta-subscription-details-cache-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+
+        let full_description = "D".repeat(MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES * 2);
+        let mut details =
+            subscription_video_details(&"T".repeat(MAX_CACHED_SUBSCRIPTION_LABEL_BYTES * 2));
+        details.description = full_description.clone();
+        details.published_text = Some("P".repeat(MAX_CACHED_SUBSCRIPTION_FIELD_BYTES * 2));
+        details.thumbnails = ["first", "second"]
+            .into_iter()
+            .map(|quality| Thumbnail {
+                url: url::Url::parse(&format!("https://i.ytimg.com/vi/dQw4w9WgXcQ/{quality}.jpg"))
+                    .expect("fixture thumbnail"),
+                quality: Some(quality.repeat(100)),
+                width: Some(480),
+                height: Some(270),
+            })
+            .collect();
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(details),
+        });
+
+        let cached = controller
+            .subscription_video_cache
+            .get("UCfixture")
+            .and_then(|entry| entry.items.first())
+            .expect("updated cached video");
+        let SearchItem::Video(cached) = cached else {
+            panic!("channel cache contains a non-video item");
+        };
+        assert!(cached.title.len() <= MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+        assert!(cached.description.len() <= MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES);
+        assert!(
+            cached
+                .published_text
+                .as_ref()
+                .is_none_or(|published| published.len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES)
+        );
+        assert!(cached.thumbnails.len() <= 1);
+        assert!(
+            controller.subscription_cache_estimated_heap_bytes() <= MAX_CACHED_SUBSCRIPTION_BYTES
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|view| view.description.as_str()),
+            Some(full_description.as_str()),
+            "the visible Details pane must retain the provider's full text"
+        );
+    }
+
+    #[test]
+    fn subscription_rows_omit_repeated_subscriber_count_and_subscription_marker() {
+        let config = Config::for_dir("/tmp/youta-subscription-subscriber-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        assert!(
+            !controller.view.subscriptions.items[0]
+                .subtitle
+                .contains("subscribers")
+        );
+        assert!(
+            !controller.view.subscriptions.items[0]
+                .subtitle
+                .contains("Fixture channel"),
+            "the channel name must appear only in the subscription heading"
+        );
+        assert!(!controller.view.subscriptions.items[0].subscribed);
+
+        controller.handle_provider_response(ProviderResponse::ChannelSubscriberCounts {
+            provider_generation: controller.youtube_provider_generation,
+            requested_ids: vec!["UCfixture".to_owned()],
+            result: Ok(vec![ChannelSubscriberCount {
+                channel_id: "UCfixture".to_owned(),
+                subscriber_count: Some(13_045),
+            }]),
+        });
+
+        assert_eq!(
+            controller.view.subscriptions.source_subscriber_count,
+            Some(13_045)
+        );
+        assert!(
+            !controller.view.subscriptions.items[0]
+                .subtitle
+                .contains("subscribers"),
+            "the channel-level count must not repeat on every subscription video"
+        );
+        assert!(
+            !controller.view.subscriptions.items[0].subscribed,
+            "subscription videos must omit the redundant diamond marker"
+        );
+    }
+
+    #[test]
+    fn subscription_channel_details_are_debounced_cached_and_applied_to_the_heading() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        let scheduled = controller
+            .scheduled_channel_details
+            .clone()
+            .expect("settled-source metadata schedule");
+        let before_due = scheduled
+            .due_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("scheduled deadline has a preceding instant");
+        controller.request_due_subscription_channel_details(before_due);
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "moving onto a source must not immediately spend provider quota"
+        );
+        controller.request_due_subscription_channel_details(scheduled.due_at);
+        let ProviderRequest::ChannelDetails {
+            generation,
+            provider_generation,
+            channel_id,
+        } = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("channel details request")
+        else {
+            panic!("expected channel details request");
+        };
+        assert_eq!(channel_id, "UCfixture");
+
+        controller.handle_provider_response(ProviderResponse::ChannelDetails {
+            generation,
+            provider_generation,
+            channel_id: channel_id.clone(),
+            result: Ok(ChannelSummary {
+                channel_id,
+                name: "Provider channel name".to_owned(),
+                description: "Complete public channel description".to_owned(),
+                subscriber_count: Some(1_850_000),
+                video_count: Some(412),
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+            }),
+        });
+
+        let details = controller.view.details.as_ref().expect("channel details");
+        assert_eq!(details.channel_name, "Provider channel name");
+        assert_eq!(details.description, "Complete public channel description");
+        assert_eq!(details.channel_subscriber_count, Some(1_850_000));
+        assert_eq!(
+            controller.view.subscriptions.source_subscriber_count,
+            Some(1_850_000)
+        );
+
+        controller.select_subscription_source(0);
+        assert!(
+            controller.scheduled_channel_details.is_none(),
+            "a process-local cache hit must not schedule another provider request"
+        );
+        assert!(captured_requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscription_channel_metadata_cache_has_a_fixed_lru_bound() {
+        let config = Config::for_dir("/tmp/youta-channel-metadata-cache-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for index in 0..=MAX_CACHED_CHANNEL_DETAILS {
+            controller.cache_channel_details(format!("UC{index}"), None);
+        }
+
+        assert_eq!(
+            controller.channel_details_cache.len(),
+            MAX_CACHED_CHANNEL_DETAILS
+        );
+        assert!(!controller.channel_details_cache.contains_key("UC0"));
+        assert!(
+            controller
+                .channel_details_cache
+                .contains_key(&format!("UC{MAX_CACHED_CHANNEL_DETAILS}"))
+        );
+    }
+
+    #[test]
+    fn full_subscription_description_replaces_summary_chapters_for_seekbar_and_queue() {
+        let config = Config::for_dir("/tmp/youta-subscription-chapter-details-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut summary = subscription_video_summary();
+        summary.duration_seconds = Some(4_000);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(summary.clone())],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(summary.clone()),
+            &controller.subscription_tree,
+        ));
+        let media_id = MediaId::new(SourceKind::YouTube, &summary.video_id);
+        controller.current_media = Some(media_id.clone());
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&summary, None));
+
+        let mut details = subscription_video_details("Fixture video");
+        details.duration_seconds = Some(4_000);
+        details.description =
+            "➤ 00:00 Introduction\n➤ 00:01:35 Батуми\n➤ 01:02:51 移住\ninline 01:03:00 ignored"
+                .to_owned();
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(details),
+        });
+
+        let expected = [("Introduction", 0), ("Батуми", 95), ("移住", 3_771)];
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.description.as_str()),
+            Some("00:00 Introduction\n00:01:35 Батуми\n01:02:51 移住\ninline 01:03:00 ignored"),
+            "display normalization must remove chapter-list markers without changing other lines"
+        );
+        assert_eq!(
+            controller
+                .view
+                .playback_chapters
+                .iter()
+                .map(|chapter| (chapter.title.as_str(), chapter.start_seconds))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            controller.playback_queue.items[0]
+                .media
+                .chapters
+                .iter()
+                .map(|chapter| (chapter.title.as_str(), chapter.start_seconds))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            controller
+                .selected_queue_item()
+                .expect("selected subscription queue item")
+                .media
+                .chapters
+                .iter()
+                .map(|chapter| (chapter.title.as_str(), chapter.start_seconds))
+                .collect::<Vec<_>>(),
+            expected,
+            "queueing after metadata arrives must use the full visible description"
+        );
+        assert_eq!(controller.current_media, Some(media_id));
+    }
+
+    #[test]
+    fn split_subscriptions_keep_independent_sources_videos_and_ram_cache() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.ui.subscriptions_layout = SubscriptionsLayout::Split;
+        save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_results = vec![SearchItem::Video(VideoSummary {
+            video_id: "stale123456".to_owned(),
+            title: "Stale search result".to_owned(),
+            ..subscription_video_summary()
+        })];
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "split navigation must not spend quota until Enter"
+        );
+        controller.dispatch(UiAction::ActivateSelection);
+        let (first_generation, first_request) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first channel request")
+        {
+            ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } => (generation, request),
+            _ => panic!("expected channel videos request"),
+        };
+        assert_eq!(first_request.channel_id, "UCfixture");
+        assert_eq!(
+            controller.current_url().as_deref(),
+            Some("https://www.youtube.com/channel/UCfixture"),
+            "Subscriptions must never reuse a stale Search row"
+        );
+
+        controller.dispatch(UiAction::SelectSubscriptionSource(1));
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "moving across uncached sources must not queue provider work"
+        );
+        controller.dispatch(UiAction::ActivateSelection);
+        let (second_generation, second_request) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second channel request")
+        {
+            ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } => (generation, request),
+            _ => panic!("expected second channel videos request"),
+        };
+        assert_eq!(second_request.channel_id, "UCsecond");
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: first_generation,
+            request: first_request.clone(),
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+        assert!(controller.view.subscriptions.items.is_empty());
+        assert_eq!(
+            controller.active_subscription_channel_id.as_deref(),
+            Some("UCsecond"),
+            "a stale response cannot replace the newly selected source"
+        );
+
+        let mut second_video = subscription_video_summary();
+        second_video.video_id = "abcdefghijk".to_owned();
+        second_video.channel_id = "UCsecond".to_owned();
+        second_video.channel_name = "Second channel".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: second_generation,
+            request: second_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(second_video)],
+                next_page: None,
+            }),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(controller.view.subscriptions.focus, SubscriptionPane::Items);
+        controller.dispatch(UiAction::ToggleSubscriptionDescription);
+        assert!(controller.view.subscriptions.description_expanded);
+        assert_eq!(
+            controller.current_url().as_deref(),
+            Some("https://www.youtube.com/watch?v=abcdefghijk")
+        );
+        while captured_requests.try_recv().is_ok() {}
+
+        controller.dispatch(UiAction::SelectSubscriptionSource(0));
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "selecting an uncached source remains local until Enter"
+        );
+        controller.dispatch(UiAction::ActivateSelection);
+        let (retry_generation, retry_request) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("uncached first channel retry")
+        {
+            ProviderRequest::ChannelVideos {
+                generation,
+                request,
+            } => (generation, request),
+            _ => panic!("expected first channel retry"),
+        };
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: retry_generation,
+            request: retry_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+        controller.dispatch(UiAction::SelectSubscriptionSource(1));
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_no_channel_request(
+            &captured_requests,
+            "reselecting a cached channel must not perform another channel request",
+        );
+    }
+
+    #[test]
+    fn preferences_popup_saves_only_the_implemented_layout_and_applies_it_live() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+
+        controller.view.text_selection_mode = true;
+        controller.dispatch(UiAction::OpenPreferences);
+        assert!(!controller.view.text_selection_mode);
+        assert_eq!(
+            controller
+                .view
+                .preferences_popup
+                .as_ref()
+                .expect("preferences popup")
+                .config_path,
+            config.config_file().display().to_string()
+        );
+        controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
+        controller.dispatch(UiAction::SubmitPreferences);
+
+        assert!(controller.view.preferences_popup.is_none());
+        assert_eq!(
+            controller.view.subscriptions.layout,
+            SubscriptionsLayout::Split
+        );
+        let contents =
+            std::fs::read_to_string(config.config_file()).expect("saved preferences file");
+        assert!(contents.contains("[ui]"));
+        assert!(contents.contains("subscriptions_layout = \"split\""));
+        let reloaded =
+            Config::load_from_dir(config.config_dir()).expect("reload saved preferences");
+        assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
     }
 
     #[test]
@@ -6565,6 +9137,59 @@ mod tests {
             .map(url::Url::as_str),
             Some("https://images.example/unknown-last.jpg")
         );
+    }
+
+    #[test]
+    fn global_search_rows_expose_preferred_video_and_channel_thumbnails_for_prefetch() {
+        let thumbnail = |name: &str, width| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{name}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(name.to_owned()),
+            width,
+            height: width.map(|value| value / 2),
+        };
+        let candidates = vec![
+            thumbnail("small", Some(320)),
+            thumbnail("maxres", Some(1_280)),
+            thumbnail("medium", Some(640)),
+        ];
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let subscriptions = SubscriptionTree::default();
+        let subscribers = HashMap::new();
+        let mut video = subscription_video_summary();
+        video.thumbnails.clone_from(&candidates);
+        let video_row = row_from_search_item(
+            &SearchItem::Video(video),
+            &store,
+            &subscriptions,
+            &subscribers,
+            SearchRowContext::GlobalSearch,
+            NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
+        );
+        let channel_row = row_from_search_item(
+            &SearchItem::Channel(ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture channel".to_owned(),
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                auto_generated: false,
+                thumbnails: candidates,
+                webpage_url: None,
+            }),
+            &store,
+            &subscriptions,
+            &subscribers,
+            SearchRowContext::GlobalSearch,
+            NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
+        );
+
+        for row in [video_row, channel_row] {
+            assert_eq!(
+                row.thumbnail_url.as_ref().map(url::Url::as_str),
+                Some("https://images.example/medium.jpg")
+            );
+        }
     }
 
     #[test]
@@ -7755,6 +10380,10 @@ mod tests {
         assert_eq!(controller.view.details_scroll, 40);
         controller.dispatch(UiAction::ScrollDetails(DetailsScroll::End));
         assert_eq!(controller.view.details_scroll, usize::MAX);
+        controller.view.details_text_selection = Some(DetailsTextSelection::default());
+        controller.dispatch(UiAction::SetDetailsScroll(7));
+        assert_eq!(controller.view.details_scroll, 7);
+        assert!(controller.view.details_text_selection.is_none());
         controller.dispatch(UiAction::ScrollDetails(DetailsScroll::Home));
         assert_eq!(controller.view.details_scroll, 0);
 
@@ -8218,6 +10847,59 @@ mod tests {
             Some("Fixture description")
         );
         assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+    }
+
+    #[test]
+    fn show_now_playing_reconciles_subscription_heading_and_ignores_unsubscribed_cache() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let playing = subscription_video_summary();
+        assert!(
+            controller
+                .subscription_tree
+                .subscribe_youtube_channel("Fixture channel", "UCfixture")
+        );
+        controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(playing.clone())],
+                next_page: None,
+            },
+        );
+        controller.play_queue_item(queue_item_from_video(&playing, None), false);
+        controller.view.subscriptions.source_title = "Wrong channel".to_owned();
+
+        controller.dispatch(UiAction::ShowNowPlaying);
+
+        assert_eq!(controller.view.screen, Screen::Subscriptions);
+        assert_eq!(
+            controller.view.subscriptions.source_title,
+            "Fixture channel"
+        );
+        assert_eq!(controller.view.subscriptions.selected_item, 0);
+
+        assert!(
+            controller
+                .subscription_tree
+                .unsubscribe_youtube_channel("UCfixture")
+        );
+        controller.show_screen(Screen::History);
+        controller.dispatch(UiAction::ShowNowPlaying);
+
+        assert_eq!(
+            controller.view.screen,
+            Screen::History,
+            "an unsubscribed channel's stale RAM cache must not select another source"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Fixture video")
+        );
     }
 
     #[test]

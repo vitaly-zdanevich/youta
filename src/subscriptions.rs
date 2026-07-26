@@ -88,6 +88,17 @@ impl SubscriptionTree {
             .sum()
     }
 
+    /// Returns selectable subscriptions in stable depth-first OPML order.
+    ///
+    /// Folder nodes are represented by the `depth` carried by each returned
+    /// subscription rather than becoming non-playable list rows.
+    #[must_use]
+    pub fn flattened_subscriptions(&self) -> Vec<FlattenedSubscription> {
+        let mut flattened = Vec::with_capacity(self.subscription_count());
+        flatten_subscriptions(&self.items, 0, &mut flattened);
+        flattened
+    }
+
     /// Returns whether the tree contains a subscription for a `YouTube` channel.
     ///
     /// Both the standard uploads-feed URL and the canonical channel website
@@ -190,22 +201,44 @@ fn subscription_matches_youtube_channel(subscription: &Subscription, channel_id:
 }
 
 fn url_matches_youtube_channel(url: &Url, channel_id: &str) -> bool {
+    youtube_channel_id_from_url(url).as_deref() == Some(channel_id)
+}
+
+fn youtube_channel_id_from_url(url: &Url) -> Option<String> {
     if !url
         .host_str()
         .is_some_and(|host| host == "youtube.com" || host.ends_with(".youtube.com"))
     {
-        return false;
+        return None;
     }
-    if url
-        .query_pairs()
-        .any(|(name, candidate)| name == "channel_id" && candidate == channel_id)
-    {
-        return true;
+    if url.path() == "/feeds/videos.xml" && url.fragment().is_none() {
+        let mut channel_ids = url
+            .query_pairs()
+            .filter_map(|(name, candidate)| (name == "channel_id").then(|| candidate.into_owned()));
+        if let Some(channel_id) = channel_ids.next()
+            && channel_ids.next().is_none()
+            && valid_youtube_channel_id(&channel_id)
+        {
+            return Some(channel_id);
+        }
     }
-    let Some(mut segments) = url.path_segments() else {
-        return false;
-    };
-    segments.next() == Some("channel") && segments.next() == Some(channel_id)
+    let mut segments = url.path_segments()?;
+    if segments.next() != Some("channel") {
+        return None;
+    }
+    let channel_id = segments.next()?;
+    (segments.next().is_none() && url.query().is_none() && url.fragment().is_none())
+        .then_some(channel_id)
+        .filter(|candidate| valid_youtube_channel_id(candidate))
+        .map(ToOwned::to_owned)
+}
+
+fn valid_youtube_channel_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// One outline in a subscription tree.
@@ -264,6 +297,52 @@ impl Subscription {
             website_url: None,
             description: None,
             kind,
+        }
+    }
+
+    /// Returns the exact `YouTube` channel identifier represented by this
+    /// subscription, when one is present.
+    ///
+    /// Standard uploads-feed `channel_id` parameters and canonical
+    /// `/channel/<id>` website paths are recognized. Handle-only links such as
+    /// `/@example` intentionally return `None`; resolving handles requires a
+    /// provider operation rather than guessing an identifier.
+    #[must_use]
+    pub fn youtube_channel_id(&self) -> Option<String> {
+        if self.kind != SubscriptionKind::YouTube {
+            return None;
+        }
+        std::iter::once(&self.url)
+            .chain(self.website_url.iter())
+            .find_map(youtube_channel_id_from_url)
+    }
+}
+
+/// One selectable subscription with its original OPML folder depth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlattenedSubscription {
+    /// Number of parent folders surrounding the subscription.
+    pub depth: usize,
+    /// Complete portable subscription record.
+    pub subscription: Subscription,
+}
+
+fn flatten_subscriptions(
+    nodes: &[SubscriptionNode],
+    depth: usize,
+    flattened: &mut Vec<FlattenedSubscription>,
+) {
+    for node in nodes {
+        match node {
+            SubscriptionNode::Folder(folder) => {
+                flatten_subscriptions(&folder.children, depth.saturating_add(1), flattened);
+            }
+            SubscriptionNode::Subscription(subscription) => {
+                flattened.push(FlattenedSubscription {
+                    depth,
+                    subscription: subscription.clone(),
+                });
+            }
         }
     }
 }
@@ -511,6 +590,75 @@ mod tests {
         assert_eq!(restored.subscription_count(), 2);
         assert!(xml.contains("channel_id=UCexample"));
         assert!(xml.contains("https://example.org/feed.xml"));
+    }
+
+    #[test]
+    fn flattened_subscriptions_keep_depth_first_source_identity() {
+        let flattened = sample_tree().flattened_subscriptions();
+
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].depth, 1);
+        assert_eq!(flattened[0].subscription.title, "Medical channel");
+        assert_eq!(
+            flattened[0].subscription.youtube_channel_id().as_deref(),
+            Some("UCexample")
+        );
+        assert_eq!(flattened[1].depth, 2);
+        assert_eq!(flattened[1].subscription.title, "Example podcast");
+        assert!(flattened[1].subscription.youtube_channel_id().is_none());
+    }
+
+    #[test]
+    fn youtube_channel_id_requires_an_exact_feed_or_channel_url() {
+        let fixtures = [
+            (
+                "https://www.youtube.com/feeds/videos.xml?channel_id=UC_feed-123",
+                None,
+                Some("UC_feed-123"),
+            ),
+            (
+                "https://www.youtube.com/@fixture",
+                Some("https://www.youtube.com/channel/UC_website-456"),
+                Some("UC_website-456"),
+            ),
+            ("https://www.youtube.com/@handle-only", None, None),
+            (
+                "https://notyoutube.example/feeds/videos.xml?channel_id=UClookalike",
+                None,
+                None,
+            ),
+            (
+                "https://www.youtube.com/feeds/videos.xml?channel_id=bad%2Fpath",
+                None,
+                None,
+            ),
+            (
+                "https://www.youtube.com/watch?v=fixture&channel_id=UCwrongpath",
+                None,
+                None,
+            ),
+            (
+                "https://www.youtube.com/feeds/videos.xml?channel_id=UCone&channel_id=UCtwo",
+                None,
+                None,
+            ),
+            (
+                "https://www.youtube.com/channel/UCfixture/videos",
+                None,
+                None,
+            ),
+        ];
+
+        for (source, website, expected) in fixtures {
+            let mut subscription = Subscription::new("Fixture", parse(source));
+            subscription.kind = SubscriptionKind::YouTube;
+            subscription.website_url = website.map(parse);
+            assert_eq!(
+                subscription.youtube_channel_id().as_deref(),
+                expected,
+                "source {source}"
+            );
+        }
     }
 
     #[test]

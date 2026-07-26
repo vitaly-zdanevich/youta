@@ -1,10 +1,14 @@
-//! Lazy, bounded terminal-thumbnail loading and protocol encoding.
+//! Lazy, bounded terminal-thumbnail loading, cache prefetching, and protocol
+//! encoding.
 //!
 //! Capability detection is conservative: automatic mode never writes a probe
 //! to the terminal, and unsupported terminals never start the network worker.
-//! Fetching, decoding, resizing, and protocol encoding all happen away from the
-//! TUI render thread.
+//! Fetching, bounded image validation, resizing, and protocol encoding all
+//! happen away from the TUI render thread. Background prefetch shares the
+//! selected-artwork worker, persists validated bytes only, and never requests
+//! a redraw.
 
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,8 +35,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const FALLBACK_FONT_SIZE: (u16, u16) = (10, 20);
 const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const CACHE_MAX_ENTRIES: usize = 256;
+// Retain a complete maximum search prefetch unless the independent 64 MiB
+// budget requires byte-based eviction.
+const CACHE_MAX_ENTRIES: usize = 512;
 const CACHE_FILE_EXTENSION: &str = "image";
+const MAX_PREFETCH_SOURCES: usize = 512;
+const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Graphics protocol selected for terminal artwork.
@@ -545,6 +553,9 @@ pub struct ThumbnailManager {
     cache_directory: Option<PathBuf>,
     request_sender: Option<Sender<WorkerRequest>>,
     request_discarder: Option<Receiver<WorkerRequest>>,
+    prefetch_sender: Option<Sender<Vec<Url>>>,
+    prefetch_discarder: Option<Receiver<Vec<Url>>>,
+    prefetch_sources: Vec<Url>,
     result_receiver: Option<Receiver<WorkerResult>>,
 }
 
@@ -615,6 +626,9 @@ impl ThumbnailManager {
             cache_directory,
             request_sender: None,
             request_discarder: None,
+            prefetch_sender: None,
+            prefetch_discarder: None,
+            prefetch_sources: Vec::new(),
             result_receiver: None,
         }
     }
@@ -635,6 +649,9 @@ impl ThumbnailManager {
             cache_directory: None,
             request_sender: None,
             request_discarder: None,
+            prefetch_sender: None,
+            prefetch_discarder: None,
+            prefetch_sources: Vec::new(),
             result_receiver: None,
         }
     }
@@ -688,6 +705,54 @@ impl ThumbnailManager {
         true
     }
 
+    /// Replaces the bounded background backlog of artwork to persist.
+    ///
+    /// Sources retain their caller-provided order after unsafe, oversized, and
+    /// duplicate URLs are removed. The currently visible source is omitted
+    /// because [`Self::synchronize`] already gives it display priority. A
+    /// background request validates and stores original image bytes in the
+    /// existing persistent cache; it does not encode a terminal image, change
+    /// [`Self::state`], or produce a redraw result.
+    ///
+    /// Passing an empty slice cancels work that has not started. At most one
+    /// blocking transfer can already be in progress. Unsupported terminals,
+    /// disabled artwork, and managers without a persistent cache ignore the
+    /// request without starting a worker.
+    ///
+    /// Returns `true` when the accepted backlog changed and was delivered to
+    /// the worker.
+    pub fn synchronize_prefetch(&mut self, sources: &[Url]) -> bool {
+        if !self.is_enabled() || self.cache_directory.is_none() {
+            return false;
+        }
+
+        let active_source = self.target.as_ref().map(|target| &target.source);
+        let mut seen = HashSet::with_capacity(sources.len().min(MAX_PREFETCH_SOURCES));
+        let accepted = sources
+            .iter()
+            .filter(|source| {
+                source.as_str().len() <= MAX_PREFETCH_URL_BYTES
+                    && is_safe_thumbnail_source(source)
+                    && active_source != Some(*source)
+                    && seen.insert(source.as_str())
+            })
+            .take(MAX_PREFETCH_SOURCES)
+            .cloned()
+            .collect::<Vec<_>>();
+        if accepted == self.prefetch_sources {
+            return false;
+        }
+        if accepted.is_empty() && self.prefetch_sender.is_none() {
+            self.prefetch_sources.clear();
+            return false;
+        }
+        if !self.ensure_worker() || !self.send_latest_prefetch(accepted.clone()) {
+            return false;
+        }
+        self.prefetch_sources = accepted;
+        true
+    }
+
     fn ensure_worker(&mut self) -> bool {
         if self.request_sender.is_some() {
             return true;
@@ -697,15 +762,20 @@ impl ThumbnailManager {
         };
         let (request_sender, request_receiver) = bounded(1);
         let request_discarder = request_receiver.clone();
+        let (prefetch_sender, prefetch_receiver) = bounded(1);
+        let prefetch_discarder = prefetch_receiver.clone();
         let (result_sender, result_receiver) = bounded(1);
         let spawned = spawn_worker(
             picker,
             request_receiver,
+            prefetch_receiver,
             result_sender,
             self.cache_directory.clone(),
         );
         self.request_sender = Some(request_sender);
         self.request_discarder = Some(request_discarder);
+        self.prefetch_sender = Some(prefetch_sender);
+        self.prefetch_discarder = Some(prefetch_discarder);
         self.result_receiver = Some(result_receiver);
         spawned
     }
@@ -722,6 +792,23 @@ impl ThumbnailManager {
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 let _ = discarder.try_recv();
                 sender.try_send(request).is_ok()
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn send_latest_prefetch(&mut self, sources: Vec<Url>) -> bool {
+        let (Some(sender), Some(discarder)) = (
+            self.prefetch_sender.as_ref(),
+            self.prefetch_discarder.as_ref(),
+        ) else {
+            return false;
+        };
+        match sender.try_send(sources) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(sources)) => {
+                let _ = discarder.try_recv();
+                sender.try_send(sources).is_ok()
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
         }
@@ -768,6 +855,9 @@ impl ThumbnailManager {
         if disconnected {
             self.request_sender = None;
             self.request_discarder = None;
+            self.prefetch_sender = None;
+            self.prefetch_discarder = None;
+            self.prefetch_sources.clear();
             self.result_receiver = None;
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
@@ -817,12 +907,14 @@ impl ThumbnailManager {
 fn spawn_worker(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
+    prefetch_updates: Receiver<Vec<Url>>,
     results: Sender<WorkerResult>,
     cache_directory: Option<PathBuf>,
 ) -> bool {
     spawn_worker_with_transport(
         picker,
         requests,
+        prefetch_updates,
         results,
         HttpThumbnailTransport {
             agent: thumbnail_agent(),
@@ -835,6 +927,7 @@ fn spawn_worker(
 fn spawn_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
+    prefetch_updates: Receiver<Vec<Url>>,
     results: Sender<WorkerResult>,
     mut transport: T,
     mut cache: Option<ThumbnailCache>,
@@ -843,50 +936,200 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
     thread::Builder::new()
         .name("youta-thumbnail".to_owned())
         .spawn(move || {
-            if let Some(cache) = cache.as_ref() {
-                let _ = cache.prepare();
-            }
-            while let Ok(mut request) = requests.recv() {
-                for newer in requests.try_iter() {
-                    request = newer;
+            let mut prefetch_cache_ready =
+                cache.as_ref().is_some_and(|cache| cache.prepare().is_ok());
+            let mut prefetch_backlog = VecDeque::new();
+            loop {
+                match latest_worker_request(&requests) {
+                    WorkerInput::Item(request) => {
+                        if !render_worker_request(
+                            request,
+                            &requests,
+                            &results,
+                            &mut transport,
+                            cache.as_mut(),
+                            &picker,
+                            debounce,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                    WorkerInput::Disconnected => break,
+                    WorkerInput::Empty => {}
                 }
-                if let Some(result) =
-                    load_cached_thumbnail(cache.as_mut(), &picker, &request.target)
-                {
-                    if results
-                        .send(WorkerResult {
-                            generation: request.generation,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        break;
+
+                match latest_prefetch_update(&prefetch_updates) {
+                    WorkerInput::Item(sources) => {
+                        prefetch_backlog = sources.into();
+                    }
+                    WorkerInput::Disconnected => break,
+                    WorkerInput::Empty => {}
+                }
+
+                if let Some(source) = prefetch_backlog.pop_front() {
+                    // A visible selection arriving between backlog updates and
+                    // transfers wins before the next blocking prefetch.
+                    match latest_worker_request(&requests) {
+                        WorkerInput::Item(request) => {
+                            prefetch_backlog.push_front(source);
+                            if !render_worker_request(
+                                request,
+                                &requests,
+                                &results,
+                                &mut transport,
+                                cache.as_mut(),
+                                &picker,
+                                debounce,
+                            ) {
+                                break;
+                            }
+                        }
+                        WorkerInput::Disconnected => break,
+                        WorkerInput::Empty if prefetch_cache_ready => {
+                            let Some(cache) = cache.as_mut() else {
+                                prefetch_cache_ready = false;
+                                continue;
+                            };
+                            if prefetch_thumbnail(&mut transport, cache, &source).is_err() {
+                                // Fetch and decode failures are intentionally
+                                // swallowed by the helper. An error here means
+                                // persistence itself stopped working, so avoid
+                                // downloading bytes that cannot be retained.
+                                prefetch_cache_ready = false;
+                                prefetch_backlog.clear();
+                            }
+                        }
+                        WorkerInput::Empty => {}
                     }
                     continue;
                 }
 
-                // Selection churn is useful to debounce before network I/O,
-                // but a validated disk-cache hit should never pay this delay.
-                if !debounce.is_zero() {
-                    thread::sleep(debounce);
-                }
-                for newer in requests.try_iter() {
-                    request = newer;
-                }
-                let result =
-                    load_thumbnail(&mut transport, cache.as_mut(), &picker, &request.target);
-                if results
-                    .send(WorkerResult {
-                        generation: request.generation,
-                        result,
-                    })
-                    .is_err()
-                {
-                    break;
+                crossbeam_channel::select! {
+                    recv(requests) -> request => {
+                        let Ok(request) = request else {
+                            break;
+                        };
+                        if !render_worker_request(
+                            request,
+                            &requests,
+                            &results,
+                            &mut transport,
+                            cache.as_mut(),
+                            &picker,
+                            debounce,
+                        ) {
+                            break;
+                        }
+                    }
+                    recv(prefetch_updates) -> sources => {
+                        let Ok(sources) = sources else {
+                            break;
+                        };
+                        prefetch_backlog = sources.into();
+                    }
                 }
             }
         })
         .is_ok()
+}
+
+enum WorkerInput<T> {
+    Item(T),
+    Empty,
+    Disconnected,
+}
+
+fn latest_worker_request(requests: &Receiver<WorkerRequest>) -> WorkerInput<WorkerRequest> {
+    match requests.try_recv() {
+        Ok(mut request) => {
+            for newer in requests.try_iter() {
+                request = newer;
+            }
+            WorkerInput::Item(request)
+        }
+        Err(TryRecvError::Empty) => WorkerInput::Empty,
+        Err(TryRecvError::Disconnected) => WorkerInput::Disconnected,
+    }
+}
+
+fn latest_prefetch_update(prefetch: &Receiver<Vec<Url>>) -> WorkerInput<Vec<Url>> {
+    match prefetch.try_recv() {
+        Ok(mut sources) => {
+            for newer in prefetch.try_iter() {
+                sources = newer;
+            }
+            WorkerInput::Item(sources)
+        }
+        Err(TryRecvError::Empty) => WorkerInput::Empty,
+        Err(TryRecvError::Disconnected) => WorkerInput::Disconnected,
+    }
+}
+
+fn render_worker_request<T: ThumbnailTransport>(
+    mut request: WorkerRequest,
+    requests: &Receiver<WorkerRequest>,
+    results: &Sender<WorkerResult>,
+    transport: &mut T,
+    cache: Option<&mut ThumbnailCache>,
+    picker: &Picker,
+    debounce: Duration,
+) -> bool {
+    let mut cache = cache;
+    if let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, &request.target) {
+        return results
+            .send(WorkerResult {
+                generation: request.generation,
+                result,
+            })
+            .is_ok();
+    }
+
+    // Selection churn is useful to debounce before network I/O, but a
+    // validated disk-cache hit should never pay this delay.
+    if !debounce.is_zero() {
+        thread::sleep(debounce);
+    }
+    for newer in requests.try_iter() {
+        request = newer;
+    }
+    let result = load_thumbnail(transport, cache, picker, &request.target);
+    results
+        .send(WorkerResult {
+            generation: request.generation,
+            result,
+        })
+        .is_ok()
+}
+
+/// Fetches one background source into the persistent byte cache.
+///
+/// Remote and decode failures are best-effort misses. The error return is
+/// reserved for cache I/O failures so the worker can stop downloading data it
+/// cannot retain.
+fn prefetch_thumbnail(
+    transport: &mut impl ThumbnailTransport,
+    cache: &mut ThumbnailCache,
+    source: &Url,
+) -> io::Result<()> {
+    match cache.read(source) {
+        Ok(Some(bytes)) => {
+            if decode_thumbnail(&bytes).is_ok() {
+                return Ok(());
+            }
+            cache.remove(source);
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+
+    let Ok(bytes) = transport.fetch(source) else {
+        return Ok(());
+    };
+    if decode_thumbnail(&bytes).is_err() {
+        return Ok(());
+    }
+    cache.store(source, &bytes)
 }
 
 fn thumbnail_agent() -> ureq::Agent {
@@ -1318,6 +1561,9 @@ pub(crate) mod tests {
             cache_directory: None,
             request_sender: Some(request_sender),
             request_discarder: Some(request_discarder),
+            prefetch_sender: None,
+            prefetch_discarder: None,
+            prefetch_sources: Vec::new(),
             result_receiver: Some(result_receiver),
         };
         let first = Url::parse("https://images.example/first.jpg").expect("first URL");
@@ -1404,6 +1650,257 @@ pub(crate) mod tests {
             ThumbnailState::Failed(ThumbnailFailure::InvalidImage)
         );
         assert!(manager.protocol().is_none());
+    }
+
+    #[test]
+    fn visible_thumbnail_precedes_sanitized_silent_prefetch_backlog() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory.clone()));
+        let selected = Url::parse("https://images.example/selected.png").expect("selected URL");
+        let first = Url::parse("https://images.example/first.png").expect("first URL");
+        let second = Url::parse("https://images.example/second.png").expect("second URL");
+        let unsafe_source = Url::parse("file:///tmp/not-remote.png").expect("unsafe URL");
+        let oversized = Url::parse(&format!(
+            "https://images.example/{}.png",
+            "x".repeat(MAX_PREFETCH_URL_BYTES)
+        ))
+        .expect("oversized URL");
+
+        assert!(manager.synchronize(Some(&selected), Rect::new(1, 1, 20, 8)));
+        assert!(manager.synchronize_prefetch(&[
+            selected.clone(),
+            first.clone(),
+            first.clone(),
+            unsafe_source,
+            oversized,
+            second.clone(),
+        ]));
+        assert_eq!(
+            manager.prefetch_sources,
+            [first.clone(), second.clone()],
+            "active, unsafe, oversized, and duplicate sources must be omitted"
+        );
+        assert!(
+            !manager.synchronize_prefetch(&[
+                selected.clone(),
+                first.clone(),
+                first.clone(),
+                second.clone(),
+            ]),
+            "an equivalent accepted backlog must not be sent again"
+        );
+
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible request"),
+            selected
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release visible request");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first prefetch request"),
+            first
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release first prefetch");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second prefetch request"),
+            second.clone()
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release second prefetch");
+
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        wait_for_cached_source(&cache_directory, &second);
+        assert!(
+            !manager.poll(),
+            "background completion must not emit a redraw result"
+        );
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+    }
+
+    #[test]
+    fn newest_prefetch_update_replaces_only_work_that_has_not_started() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory.clone()));
+        let active = Url::parse("https://images.example/active.png").expect("active URL");
+        let stale = Url::parse("https://images.example/stale.png").expect("stale URL");
+        let replacement =
+            Url::parse("https://images.example/replacement.png").expect("replacement URL");
+        let selected =
+            Url::parse("https://images.example/selected-next.png").expect("selected URL");
+
+        assert!(manager.synchronize_prefetch(&[active.clone(), stale.clone()]));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("active prefetch"),
+            active
+        );
+        assert!(manager.synchronize_prefetch(std::slice::from_ref(&replacement)));
+        assert!(manager.synchronize(Some(&selected), Rect::new(1, 1, 20, 8)));
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release active prefetch");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible selection between prefetches"),
+            selected
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release visible selection");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement prefetch after visible selection"),
+            replacement.clone()
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release replacement prefetch");
+        wait_for_cached_source(&cache_directory, &replacement);
+
+        assert!(
+            matches!(
+                observed.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "the stale queued source must not be fetched"
+        );
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(!manager.poll());
+    }
+
+    #[test]
+    fn prefetch_failures_are_silent_and_do_not_stop_later_sources() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory.clone()));
+        let failed = Url::parse("https://images.example/failed.png").expect("failed URL");
+        let successful =
+            Url::parse("https://images.example/successful.png").expect("successful URL");
+
+        assert!(manager.synchronize_prefetch(&[failed.clone(), successful.clone()]));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failed prefetch"),
+            failed
+        );
+        replies
+            .send(Err(ThumbnailFailure::DownloadFailed))
+            .expect("release failed prefetch");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("successful prefetch"),
+            successful.clone()
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release successful prefetch");
+        wait_for_cached_source(&cache_directory, &successful);
+
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Idle);
+        assert!(manager.protocol().is_none());
+    }
+
+    #[test]
+    fn prefetched_bytes_are_reused_by_a_restarted_visible_manager() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let source = Url::parse("https://images.example/prefetched.png").expect("fixture URL");
+
+        {
+            let (mut manager, replies, observed) =
+                manager_with_mock_transport_in_cache(Some(cache_directory.clone()));
+            assert!(manager.synchronize_prefetch(std::slice::from_ref(&source)));
+            assert_eq!(
+                observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("prefetch request"),
+                source
+            );
+            replies
+                .send(Ok(fixture_png()))
+                .expect("release prefetch request");
+            wait_for_cached_source(&cache_directory, &source);
+            assert!(!manager.poll());
+        }
+
+        let (mut restarted, _replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory));
+        assert!(restarted.synchronize(Some(&source), Rect::new(1, 1, 20, 8)));
+        assert_eq!(
+            wait_for_terminal_state(&mut restarted),
+            ThumbnailState::Ready
+        );
+        assert!(
+            matches!(
+                observed.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "a visible restart cache hit must not repeat the prefetched transfer"
+        );
+    }
+
+    #[test]
+    fn prefetch_requires_supported_artwork_and_a_persistent_cache() {
+        let source = Url::parse("https://images.example/unused.png").expect("fixture URL");
+        let mut no_cache =
+            ThumbnailManager::from_terminal_info(ThumbnailMode::Auto, &graphical_terminal());
+        assert!(!no_cache.synchronize_prefetch(std::slice::from_ref(&source)));
+        assert!(no_cache.request_sender.is_none());
+
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let mut disabled = ThumbnailManager::from_terminal_info_with_cache(
+            ThumbnailMode::Off,
+            &graphical_terminal(),
+            Some(cache_directory.clone()),
+        );
+        assert!(!disabled.synchronize_prefetch(std::slice::from_ref(&source)));
+        assert!(!cache_directory.exists());
+    }
+
+    #[test]
+    fn prefetch_backlog_has_a_fixed_source_limit() {
+        assert!(
+            ThumbnailCachePolicy::default().max_entries >= MAX_PREFETCH_SOURCES,
+            "entry-count eviction must not defeat one complete bounded prefetch"
+        );
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let (mut manager, _replies, _observed) =
+            manager_with_mock_transport_in_cache(Some(directory.path().join("thumbnail-cache")));
+        let sources = (0..MAX_PREFETCH_SOURCES + 20)
+            .map(|index| {
+                Url::parse(&format!("https://images.example/{index}.png")).expect("fixture URL")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(manager.synchronize_prefetch(&sources));
+        assert_eq!(manager.prefetch_sources.len(), MAX_PREFETCH_SOURCES);
+        assert_eq!(manager.prefetch_sources.first(), sources.first());
+        assert_eq!(
+            manager.prefetch_sources.last(),
+            sources.get(MAX_PREFETCH_SOURCES - 1)
+        );
     }
 
     #[test]
@@ -1717,6 +2214,9 @@ pub(crate) mod tests {
             cache_directory: None,
             request_sender: Some(request_sender),
             request_discarder: None,
+            prefetch_sender: None,
+            prefetch_discarder: None,
+            prefetch_sources: Vec::new(),
             result_receiver: Some(result_receiver),
         };
 
@@ -1791,6 +2291,8 @@ pub(crate) mod tests {
     ) -> MockManagerParts {
         let (request_sender, request_receiver) = bounded(1);
         let request_discarder = request_receiver.clone();
+        let (prefetch_sender, prefetch_receiver) = bounded(1);
+        let prefetch_discarder = prefetch_receiver.clone();
         let (result_sender, result_receiver) = bounded(1);
         let (observed_sender, observed_receiver) = bounded(4);
         let (reply_sender, reply_receiver) = bounded(4);
@@ -1798,12 +2300,13 @@ pub(crate) mod tests {
         assert!(spawn_worker_with_transport(
             picker,
             request_receiver,
+            prefetch_receiver,
             result_sender,
             MockTransport {
                 observed: observed_sender,
                 replies: reply_receiver,
             },
-            cache_directory.map(ThumbnailCache::new),
+            cache_directory.clone().map(ThumbnailCache::new),
             debounce,
         ));
         (
@@ -1814,9 +2317,12 @@ pub(crate) mod tests {
                 target: None,
                 protocol: None,
                 picker: None,
-                cache_directory: None,
+                cache_directory,
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
+                prefetch_sender: Some(prefetch_sender),
+                prefetch_discarder: Some(prefetch_discarder),
+                prefetch_sources: Vec::new(),
                 result_receiver: Some(result_receiver),
             },
             reply_sender,
@@ -1850,6 +2356,25 @@ pub(crate) mod tests {
             .filter_map(|entry| entry.metadata().ok())
             .map(|metadata| metadata.len())
             .sum()
+    }
+
+    fn wait_for_cached_source(cache_directory: &Path, source: &Url) {
+        let cache = ThumbnailCache::new(cache_directory.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if cache
+                .read(source)
+                .expect("read prefetched cache entry")
+                .is_some()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prefetch did not persist the expected source before its deadline"
+            );
+            thread::yield_now();
+        }
     }
 
     /// Encodes a small PNG fixture for thumbnail worker tests.

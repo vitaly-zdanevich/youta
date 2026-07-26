@@ -30,8 +30,11 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 #[cfg(feature = "thumbnails")]
 use ratatui_image::StatefulImage as TerminalImage;
 
-use crate::config::{DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, ThumbnailMode};
+use crate::config::{
+    DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
+};
 use crate::domain::{Chapter, MediaId};
+use crate::links::chapter_title_for_display;
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "thumbnails")]
 use crate::thumbnails::{ThumbnailManager, ThumbnailState};
@@ -165,6 +168,8 @@ pub struct UiSettings {
     pub thumbnails: ThumbnailMode,
     /// Maximum thumbnail height in terminal rows.
     pub thumbnail_height: u16,
+    /// Prefetch artwork for all currently loaded global Search rows.
+    pub prefetch_search_thumbnails: bool,
     /// Persistent thumbnail byte cache selected by the loaded configuration.
     pub thumbnail_cache_dir: Option<PathBuf>,
     /// Redraw period while playback is active.
@@ -181,6 +186,7 @@ impl Default for UiSettings {
             seek_bar_style: SeekBarStyle::Line,
             thumbnails: ThumbnailMode::Auto,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
+            prefetch_search_thumbnails: true,
             thumbnail_cache_dir: None,
             playing_tick: Duration::from_millis(250),
             idle_tick: Duration::from_secs(1),
@@ -203,6 +209,8 @@ pub struct RowView {
     pub watched_percent: u8,
     /// Whether the source is locally subscribed.
     pub subscribed: bool,
+    /// Preferred artwork URL available for selected rendering or prefetch.
+    pub thumbnail_url: Option<url::Url>,
 }
 
 /// Details for the selected media item.
@@ -218,8 +226,12 @@ pub struct DetailView {
     pub channel_name: String,
     /// Stable provider channel identifier used by local subscriptions.
     pub channel_id: String,
+    /// Exact public channel page opened by the channel browser action.
+    pub channel_webpage_url: Option<url::Url>,
     /// Whether the channel is present in Youta's local OPML subscriptions.
     pub channel_subscribed: bool,
+    /// Public channel subscriber count, when exposed by the provider.
+    pub channel_subscriber_count: Option<u64>,
     /// Human-readable length.
     pub length: String,
     /// Description text.
@@ -243,6 +255,84 @@ pub struct DetailView {
     /// The URL is never rendered as text. Unsupported terminals omit the
     /// image without fetching it.
     pub thumbnail_url: Option<url::Url>,
+}
+
+/// Current route inside the Subscriptions screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubscriptionRoute {
+    /// Selectable OPML sources.
+    #[default]
+    Sources,
+    /// Videos belonging to the activated source.
+    Items,
+}
+
+/// Pane receiving list navigation in split Subscriptions mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubscriptionPane {
+    /// The source list.
+    #[default]
+    Sources,
+    /// The selected source's media list.
+    Items,
+}
+
+/// Render-ready state owned by the Subscriptions screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionsView {
+    /// Configured navigation model.
+    pub layout: SubscriptionsLayout,
+    /// Active drill-down route.
+    pub route: SubscriptionRoute,
+    /// Selectable OPML sources in stable folder order.
+    pub sources: Vec<RowView>,
+    /// Selected source index.
+    pub selected_source: usize,
+    /// Videos loaded for the selected source.
+    pub items: Vec<RowView>,
+    /// Selected video index.
+    pub selected_item: usize,
+    /// List pane receiving `j`, `k`, and Enter in split mode.
+    pub focus: SubscriptionPane,
+    /// Whether split mode temporarily shows the selected item's Details.
+    pub description_expanded: bool,
+    /// Whether the selected source has a provider request in flight.
+    pub loading: bool,
+    /// Human-readable source name included in the item-list heading.
+    pub source_title: String,
+    /// Public subscriber count for the selected source, when exposed.
+    pub source_subscriber_count: Option<u64>,
+}
+
+impl Default for SubscriptionsView {
+    fn default() -> Self {
+        Self {
+            layout: SubscriptionsLayout::default(),
+            route: SubscriptionRoute::Sources,
+            sources: Vec::new(),
+            selected_source: 0,
+            items: Vec::new(),
+            selected_item: 0,
+            focus: SubscriptionPane::Sources,
+            description_expanded: false,
+            loading: false,
+            source_title: String::new(),
+            source_subscriber_count: None,
+        }
+    }
+}
+
+/// Focused in-app editor for preferences that are implemented at runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreferencesPopupView {
+    /// Draft Subscriptions layout saved only when the user confirms.
+    pub subscriptions_layout: SubscriptionsLayout,
+    /// Exact private TOML file updated by the save action.
+    pub config_path: String,
+    /// Environment variable shadowing the TOML value, when present.
+    pub environment_override: Option<String>,
+    /// Save or validation failure kept inside the popup.
+    pub validation_error: Option<String>,
 }
 
 /// One selectable timecode span inside the original Details description.
@@ -405,6 +495,8 @@ pub struct ViewModel {
     pub selected: usize,
     /// Selected item details.
     pub details: Option<DetailView>,
+    /// Dedicated Subscriptions navigation and list state.
+    pub subscriptions: SubscriptionsView,
     /// Whether Youta confines mouse-drag selection to visible Details text.
     pub text_selection_mode: bool,
     /// Active or most recently copied Details text range.
@@ -436,6 +528,8 @@ pub struct ViewModel {
     pub error_popup: Option<ErrorPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
+    /// Focused runtime preferences editor.
+    pub preferences_popup: Option<PreferencesPopupView>,
     /// Active or most recently completed supervised download.
     pub download: Option<DownloadView>,
     /// Whether the controller has requested application shutdown.
@@ -459,6 +553,7 @@ impl Default for ViewModel {
             rows: Vec::new(),
             selected: 0,
             details: None,
+            subscriptions: SubscriptionsView::default(),
             text_selection_mode: false,
             details_text_selection: None,
             details_focused: false,
@@ -473,6 +568,7 @@ impl Default for ViewModel {
             help_open: false,
             error_popup: None,
             youtube_setup_popup: None,
+            preferences_popup: None,
             download: None,
             quitting: false,
         }
@@ -548,6 +644,8 @@ pub enum UiAction {
     SetDetailsFocus(bool),
     /// Scroll the focused or pointer-targeted Details panel.
     ScrollDetails(DetailsScroll),
+    /// Set the Details panel to an exact renderer-clamped wrapped-line offset.
+    SetDetailsScroll(usize),
     /// Toggle Youta-owned mouse selection for text in the Details panel.
     ToggleTextSelectionMode,
     /// Start a text selection at an exact visible Details position.
@@ -598,6 +696,8 @@ pub enum UiAction {
     Download,
     /// Open the canonical item link in a browser.
     OpenInBrowser,
+    /// Open the selected item's exact channel page in a browser.
+    OpenChannelInBrowser,
     /// Copy the canonical item link.
     CopyLink,
     /// Edit a private local note.
@@ -630,6 +730,20 @@ pub enum UiAction {
     SubmitYouTubeSetup,
     /// Close the YouTube setup popup without saving.
     DismissYouTubeSetup,
+    /// Open the focused runtime preferences editor.
+    OpenPreferences,
+    /// Select one draft Subscriptions layout in the preferences editor.
+    SetSubscriptionsLayout(SubscriptionsLayout),
+    /// Persist the draft preference and close the editor.
+    SubmitPreferences,
+    /// Close the preferences editor without saving.
+    DismissPreferences,
+    /// Select an exact subscription source row.
+    SelectSubscriptionSource(usize),
+    /// Select an exact subscription item row.
+    SelectSubscriptionItem(usize),
+    /// Toggle the selected subscription item's expanded description.
+    ToggleSubscriptionDescription,
 }
 
 /// Controller used by the generic terminal event loop.
@@ -654,6 +768,10 @@ trait ThumbnailRenderer {
         false
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
+    /// Replaces the cache-only backlog for currently loaded Search rows.
+    fn synchronize_prefetch(&mut self, _rows: &[RowView]) -> bool {
+        false
+    }
     fn clear(&mut self) -> bool;
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, theme: &Theme);
 }
@@ -663,6 +781,9 @@ struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
     clear_before_ready: bool,
     followup_frame_pending: bool,
+    visible_source: Option<url::Url>,
+    prefetched_visible_source: Option<url::Url>,
+    prefetch_sources: Vec<url::Url>,
 }
 
 #[cfg(feature = "thumbnails")]
@@ -673,6 +794,9 @@ impl TerminalThumbnailRenderer {
             manager,
             clear_before_ready: false,
             followup_frame_pending: false,
+            visible_source: None,
+            prefetched_visible_source: None,
+            prefetch_sources: Vec::new(),
         }
     }
 }
@@ -701,6 +825,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+        self.visible_source = source.cloned();
         let changed = self.manager.synchronize(source, area);
         if changed {
             self.clear_before_ready = false;
@@ -709,7 +834,27 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         changed
     }
 
+    fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
+        let sources_unchanged = self
+            .prefetch_sources
+            .iter()
+            .eq(rows.iter().filter_map(|row| row.thumbnail_url.as_ref()));
+        if sources_unchanged && self.prefetched_visible_source == self.visible_source {
+            return false;
+        }
+        self.prefetch_sources.clear();
+        self.prefetch_sources.extend(
+            rows.iter()
+                .filter_map(|row| row.thumbnail_url.as_ref())
+                .cloned(),
+        );
+        self.prefetched_visible_source
+            .clone_from(&self.visible_source);
+        self.manager.synchronize_prefetch(&self.prefetch_sources)
+    }
+
     fn clear(&mut self) -> bool {
+        self.visible_source = None;
         self.clear_before_ready = false;
         self.followup_frame_pending = false;
         self.manager.clear()
@@ -808,6 +953,9 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
             })?;
         }
+        if let Some(renderer) = renderer.as_deref_mut() {
+            synchronize_search_thumbnail_prefetch(controller.view(), settings, renderer);
+        }
         if controller.view().quitting {
             break;
         }
@@ -834,6 +982,20 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         thumbnail_renderer = renderer;
     }
     Ok(())
+}
+
+/// Synchronizes cache-only artwork work with the visible global Search model.
+fn synchronize_search_thumbnail_prefetch(
+    view: &ViewModel,
+    settings: &UiSettings,
+    renderer: &mut dyn ThumbnailRenderer,
+) -> bool {
+    let rows = if settings.prefetch_search_thumbnails && view.screen == Screen::Search {
+        view.rows.as_slice()
+    } else {
+        &[]
+    };
+    renderer.synchronize_prefetch(rows)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -995,7 +1157,19 @@ impl Drop for TerminalSession {
 struct HitMap {
     tabs: Vec<(Screen, Rect)>,
     rows: Rect,
+    /// First model row represented by the visible main-list rectangle.
+    rows_first_index: usize,
+    subscription_source_rows: Rect,
+    /// First model source represented by the visible source-list rectangle.
+    subscription_source_first_index: usize,
+    subscription_item_rows: Rect,
+    /// First model item represented by the visible subscription-item rectangle.
+    subscription_item_first_index: usize,
     details_panel: Rect,
+    /// Actual wrapped-line offset rendered in the Details description.
+    details_scroll_offset: usize,
+    /// Largest wrapped-line offset that can change the visible description.
+    details_scroll_maximum: usize,
     detail_links: Vec<(usize, Rect)>,
     detail_buttons: Vec<(UiAction, Rect)>,
     detail_text_rows: Vec<SelectableDetailsRow>,
@@ -1006,6 +1180,7 @@ struct HitMap {
     error_buttons: Vec<(UiAction, Rect)>,
     youtube_setup_fields: Vec<(YouTubeSetupField, Rect)>,
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
+    preferences_buttons: Vec<(UiAction, Rect)>,
 }
 
 /// Exact terminal cells belonging to one visible, selectable Details row.
@@ -1040,14 +1215,16 @@ fn render_frame(
             Constraint::Length(if view.playback_chapters.is_empty() {
                 2
             } else {
-                3
+                4
             }),
             Constraint::Length(2),
         ])
         .split(frame.area());
     render_tabs(frame, sections[0], view, &theme, hit_map);
-    let thumbnail_is_obscured =
-        view.help_open || view.youtube_setup_popup.is_some() || view.error_popup.is_some();
+    let thumbnail_is_obscured = view.help_open
+        || view.youtube_setup_popup.is_some()
+        || view.preferences_popup.is_some()
+        || view.error_popup.is_some();
     if thumbnail_is_obscured {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
             renderer.clear();
@@ -1097,6 +1274,10 @@ fn render_frame(
     hit_map.youtube_setup_buttons.clear();
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
         render_youtube_setup_popup(frame, setup, &theme, hit_map);
+    }
+    hit_map.preferences_buttons.clear();
+    if let Some(preferences) = view.preferences_popup.as_ref() {
+        render_preferences_popup(frame, preferences, &theme, hit_map);
     }
     hit_map.error_buttons.clear();
     if let Some(error) = view.error_popup.as_ref() {
@@ -1258,6 +1439,29 @@ fn render_body(
     hit_map.detail_buttons.clear();
     hit_map.detail_text_rows.clear();
     hit_map.details_panel = Rect::default();
+    hit_map.details_scroll_offset = 0;
+    hit_map.details_scroll_maximum = 0;
+    hit_map.rows = Rect::default();
+    hit_map.rows_first_index = 0;
+    hit_map.subscription_source_rows = Rect::default();
+    hit_map.subscription_source_first_index = 0;
+    hit_map.subscription_item_rows = Rect::default();
+    hit_map.subscription_item_first_index = 0;
+
+    if view.screen == Screen::Subscriptions {
+        render_subscriptions_body(
+            frame,
+            area,
+            view,
+            show_hotkeys,
+            thumbnail_height,
+            theme,
+            hit_map,
+            thumbnail_renderer,
+        );
+        return;
+    }
+
     let horizontal = area.width >= 80;
     let panes = Layout::default()
         .direction(if horizontal {
@@ -1269,68 +1473,16 @@ fn render_body(
         .split(area);
 
     let search_title = search_panel_title(view);
-    let items = view
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let selected = index == view.selected;
-            let playing = view
-                .playing_media_id
-                .as_ref()
-                .is_some_and(|media_id| row.media_id.as_ref() == Some(media_id));
-            let row_style = if selected {
-                theme.selected.fg(Color::Black)
-            } else if playing {
-                theme.accent.add_modifier(Modifier::BOLD)
-            } else {
-                theme.base
-            };
-            let marker = if row.subscribed { "◆" } else { " " };
-            let progress = if row.watched_percent == 0 {
-                String::new()
-            } else {
-                format!(" {:>3}%", row.watched_percent)
-            };
-            let source_style = if selected || playing {
-                row_style
-            } else {
-                source_style(&row.source, theme)
-            };
-            let secondary_style = if selected || playing {
-                row_style
-            } else {
-                theme.muted
-            };
-            let watched_style = if selected || playing {
-                row_style
-            } else if row.watched_percent == 0 {
-                theme.muted
-            } else {
-                theme.accent
-            };
-            let line = Line::from(vec![
-                Span::styled(format!("{} ", if playing { "▶" } else { " " }), row_style),
-                Span::styled(format!("{marker} "), source_style),
-                Span::styled(
-                    format!("{} ", watched_marker(row.watched_percent)),
-                    watched_style,
-                ),
-                Span::styled(&row.title, row_style),
-                Span::styled(progress, secondary_style),
-            ]);
-            let subtitle = Line::from(vec![
-                Span::styled("    ", row_style),
-                Span::styled(&row.source, source_style),
-                Span::styled(" · ", row_style),
-                Span::styled(&row.subtitle, secondary_style),
-            ]);
-            ListItem::new(vec![line, subtitle]).style(row_style)
-        })
-        .collect::<Vec<_>>();
-    let rows_area = render_main_panel_heading(frame, panes[0], search_title.trim(), theme.heading);
-    frame.render_widget(List::new(items), rows_area);
-    hit_map.rows = rows_area;
+    (hit_map.rows, hit_map.rows_first_index) = render_row_list(
+        frame,
+        panes[0],
+        search_title.trim(),
+        &view.rows,
+        view.selected,
+        view.playing_media_id.as_ref(),
+        theme.heading,
+        theme,
+    );
 
     match view.right_panel_mode {
         RightPanelMode::Details => {
@@ -1366,6 +1518,309 @@ fn render_body(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the renderer keeps list data and presentation state explicit"
+)]
+fn render_row_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    rows: &[RowView],
+    selected_index: usize,
+    playing_media_id: Option<&MediaId>,
+    heading_style: Style,
+    theme: &Theme,
+) -> (Rect, usize) {
+    let rows_area = render_main_panel_heading(frame, area, title, heading_style);
+    let visible_rows = usize::from(rows_area.height / 2).max(usize::from(rows_area.height > 0));
+    let selected_index = selected_index.min(rows.len().saturating_sub(1));
+    let first_index = selected_index
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible_rows));
+    let items = rows
+        .iter()
+        .enumerate()
+        .skip(first_index)
+        .take(visible_rows)
+        .map(|(index, row)| {
+            let selected = index == selected_index;
+            let playing =
+                playing_media_id.is_some_and(|media_id| row.media_id.as_ref() == Some(media_id));
+            let row_style = if selected {
+                theme.selected.fg(Color::Black)
+            } else if playing {
+                theme.accent.add_modifier(Modifier::BOLD)
+            } else {
+                theme.base
+            };
+            let marker = if row.subscribed { "◆" } else { " " };
+            let has_playback_progress = row.media_id.is_some();
+            let progress = if !has_playback_progress || row.watched_percent == 0 {
+                String::new()
+            } else {
+                format!(" {:>3}%", row.watched_percent)
+            };
+            let source_style = if selected || playing {
+                row_style
+            } else {
+                source_style(&row.source, theme)
+            };
+            let secondary_style = if selected || playing {
+                row_style
+            } else {
+                theme.muted
+            };
+            let watched_style = if selected || playing {
+                row_style
+            } else if row.watched_percent == 0 {
+                theme.muted
+            } else {
+                theme.accent
+            };
+            let line = Line::from(vec![
+                Span::styled(format!("{} ", if playing { "▶" } else { " " }), row_style),
+                Span::styled(format!("{marker} "), source_style),
+                Span::styled(
+                    format!(
+                        "{} ",
+                        if has_playback_progress {
+                            watched_marker(row.watched_percent)
+                        } else {
+                            " "
+                        }
+                    ),
+                    watched_style,
+                ),
+                Span::styled(&row.title, row_style),
+                Span::styled(progress, secondary_style),
+            ]);
+            let subtitle = Line::from(vec![
+                Span::styled("    ", row_style),
+                Span::styled(&row.source, source_style),
+                Span::styled(" · ", row_style),
+                Span::styled(&row.subtitle, secondary_style),
+            ]);
+            ListItem::new(vec![line, subtitle]).style(row_style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), rows_area);
+    (rows_area, first_index)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the renderer receives the same explicit dependencies as the normal body"
+)]
+fn render_subscriptions_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    thumbnail_height: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
+) {
+    let subscriptions = &view.subscriptions;
+    match subscriptions.layout {
+        SubscriptionsLayout::DrillDown if subscriptions.route == SubscriptionRoute::Items => {
+            let panes = Layout::default()
+                .direction(if area.width >= 80 {
+                    Direction::Horizontal
+                } else {
+                    Direction::Vertical
+                })
+                .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                .split(area);
+            (
+                hit_map.subscription_item_rows,
+                hit_map.subscription_item_first_index,
+            ) = render_row_list(
+                frame,
+                panes[0],
+                &subscription_videos_heading(subscriptions),
+                &subscriptions.items,
+                subscriptions.selected_item,
+                view.playing_media_id.as_ref(),
+                theme.heading,
+                theme,
+            );
+            render_details(
+                frame,
+                panes[1],
+                view,
+                show_hotkeys,
+                thumbnail_height,
+                theme,
+                hit_map,
+                thumbnail_renderer,
+            );
+        }
+        SubscriptionsLayout::DrillDown => {
+            let panes = Layout::default()
+                .direction(if area.width >= 80 {
+                    Direction::Horizontal
+                } else {
+                    Direction::Vertical
+                })
+                .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                .split(area);
+            (
+                hit_map.subscription_source_rows,
+                hit_map.subscription_source_first_index,
+            ) = render_row_list(
+                frame,
+                panes[0],
+                "Subscription sources",
+                &subscriptions.sources,
+                subscriptions.selected_source,
+                view.playing_media_id.as_ref(),
+                theme.heading,
+                theme,
+            );
+            render_channel(
+                frame,
+                panes[1],
+                view,
+                show_hotkeys,
+                thumbnail_height,
+                theme,
+                hit_map,
+                thumbnail_renderer,
+            );
+        }
+        SubscriptionsLayout::Split => {
+            let panes = Layout::default()
+                .direction(if area.width >= 80 {
+                    Direction::Horizontal
+                } else {
+                    Direction::Vertical
+                })
+                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+                .split(area);
+            let source_heading = if subscriptions.focus == SubscriptionPane::Sources {
+                theme
+                    .accent
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                theme.heading
+            };
+            (
+                hit_map.subscription_source_rows,
+                hit_map.subscription_source_first_index,
+            ) = render_row_list(
+                frame,
+                panes[0],
+                "Subscription sources",
+                &subscriptions.sources,
+                subscriptions.selected_source,
+                view.playing_media_id.as_ref(),
+                source_heading,
+                theme,
+            );
+            if subscriptions.description_expanded {
+                render_details(
+                    frame,
+                    panes[1],
+                    view,
+                    show_hotkeys,
+                    thumbnail_height,
+                    theme,
+                    hit_map,
+                    thumbnail_renderer,
+                );
+                add_subscription_description_button(
+                    frame,
+                    panes[1],
+                    "i/Esc",
+                    "Back to videos",
+                    show_hotkeys,
+                    theme,
+                    hit_map,
+                );
+            } else {
+                if let Some(renderer) = thumbnail_renderer {
+                    renderer.clear();
+                }
+                let item_heading = if subscriptions.focus == SubscriptionPane::Items {
+                    theme
+                        .accent
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    theme.heading
+                };
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(panes[1]);
+                let heading = subscription_videos_heading(subscriptions);
+                (
+                    hit_map.subscription_item_rows,
+                    hit_map.subscription_item_first_index,
+                ) = render_row_list(
+                    frame,
+                    sections[0],
+                    &heading,
+                    &subscriptions.items,
+                    subscriptions.selected_item,
+                    view.playing_media_id.as_ref(),
+                    item_heading,
+                    theme,
+                );
+                let label = button("i", "Description", show_hotkeys);
+                frame.render_widget(
+                    Paragraph::new(label.clone()).style(theme.accent),
+                    sections[1],
+                );
+                let width = terminal_text_width(&label).min(sections[1].width);
+                if width > 0 && !subscriptions.items.is_empty() {
+                    hit_map.detail_buttons.push((
+                        UiAction::ToggleSubscriptionDescription,
+                        Rect::new(sections[1].x, sections[1].y, width, 1),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Builds the shared YouTube source heading for both subscription layouts.
+fn subscription_videos_heading(subscriptions: &SubscriptionsView) -> String {
+    let mut heading = if subscriptions.source_title.is_empty() {
+        "YouTube".to_owned()
+    } else {
+        format!("{} · YouTube", subscriptions.source_title)
+    };
+    if let Some(count) = subscriptions.source_subscriber_count {
+        heading.push_str(" · ");
+        heading.push_str(&format_count(count));
+        heading.push_str(" subscribers");
+    }
+    heading
+}
+
+fn add_subscription_description_button(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    key: &str,
+    label: &str,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let label = button(key, label, show_hotkeys);
+    let width = terminal_text_width(&label).min(area.width);
+    if width == 0 || area.height == 0 {
+        return;
+    }
+    let target = Rect::new(area.x, area.bottom().saturating_sub(1), width, 1);
+    frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+    hit_map
+        .detail_buttons
+        .push((UiAction::ToggleSubscriptionDescription, target));
+}
+
 fn render_details(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1385,10 +1840,20 @@ fn render_details(
         hit_map,
         " Details ",
         "Select an item to load details lazily.",
+        InformationPanelKind::Video,
         true,
         thumbnail_height,
         thumbnail_renderer,
     );
+}
+
+/// Source-specific metadata layout used by the shared information renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InformationPanelKind {
+    /// Media details with duration, likes, and views.
+    Video,
+    /// Channel details with subscriber metadata.
+    Channel,
 }
 
 fn render_information_panel(
@@ -1400,6 +1865,7 @@ fn render_information_panel(
     hit_map: &mut HitMap,
     title: &str,
     empty_message: &str,
+    kind: InformationPanelKind,
     show_text_selection: bool,
     thumbnail_height: u16,
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
@@ -1426,10 +1892,17 @@ fn render_information_panel(
         return;
     };
 
-    let mut lines = if show_text_selection {
-        Vec::new()
+    let title_already_visible = if view.screen == Screen::Subscriptions {
+        view.subscriptions.source_title == details.title
     } else {
+        view.rows
+            .get(view.selected)
+            .is_some_and(|row| row.title == details.title)
+    };
+    let mut lines = if !show_text_selection && !title_already_visible {
         vec![Line::styled(&details.title, theme.heading)]
+    } else {
+        Vec::new()
     };
     let text_selection_button = show_text_selection.then(|| {
         let label = button(
@@ -1476,18 +1949,40 @@ fn render_information_panel(
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenInBrowser)
     });
-    lines.extend([
-        Line::from(vec![
-            Span::styled("Length: ", theme.muted),
-            Span::raw(&details.length),
+    let open_channel_button = details.channel_webpage_url.is_some().then(|| {
+        let label = button("O", "xdg-open", show_hotkeys);
+        let line_index = lines.len();
+        lines.push(Line::styled(label.clone(), theme.accent));
+        (line_index, label, UiAction::OpenChannelInBrowser)
+    });
+    let load_channel_button = (kind == InformationPanelKind::Channel).then(|| {
+        let label = button("c", "Load channel info", show_hotkeys);
+        let line_index = lines.len();
+        lines.push(Line::styled(label.clone(), theme.accent));
+        (line_index, label, UiAction::ShowChannel)
+    });
+    match kind {
+        InformationPanelKind::Video => lines.extend([
+            Line::from(vec![
+                Span::styled("Length: ", theme.muted),
+                Span::raw(&details.length),
+            ]),
+            Line::from(vec![
+                Span::styled("Likes: ", theme.muted),
+                Span::raw(&details.likes),
+                Span::styled("  Views: ", theme.muted),
+                Span::raw(&details.views),
+            ]),
         ]),
-        Line::from(vec![
-            Span::styled("Likes: ", theme.muted),
-            Span::raw(&details.likes),
-            Span::styled("  Views: ", theme.muted),
-            Span::raw(&details.views),
-        ]),
-    ]);
+        InformationPanelKind::Channel => {
+            if let Some(count) = details.channel_subscriber_count {
+                lines.push(Line::from(vec![
+                    Span::styled("Subscribers: ", theme.muted),
+                    Span::raw(format_count(count)),
+                ]));
+            }
+        }
+    }
     if is_creative_commons_license(&details.license) {
         lines.push(Line::from(vec![
             Span::styled("License: ", theme.muted),
@@ -1515,10 +2010,14 @@ fn render_information_panel(
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
         let open_button_row = open_button.as_ref().map(|(line_index, _, _)| *line_index);
+        let open_channel_button_row = open_channel_button
+            .as_ref()
+            .map(|(line_index, _, _)| *line_index);
         for line_index in 0..usize::from(metadata_height) {
             if selection_button_row == Some(line_index)
                 || subscription_button_row == Some(line_index)
                 || open_button_row == Some(line_index)
+                || open_channel_button_row == Some(line_index)
             {
                 continue;
             }
@@ -1540,6 +2039,8 @@ fn render_information_panel(
         .into_iter()
         .chain(subscription_button)
         .chain(open_button)
+        .chain(open_channel_button)
+        .chain(load_channel_button)
     {
         if line_index >= usize::from(metadata_height) {
             continue;
@@ -1661,6 +2162,8 @@ fn render_information_panel(
         let visible_lines = usize::from(description_text_area.height);
         let maximum_offset = description_lines.len().saturating_sub(visible_lines);
         let offset = view.details_scroll.min(maximum_offset);
+        hit_map.details_scroll_offset = offset;
+        hit_map.details_scroll_maximum = maximum_offset;
         let visible = description_lines
             .iter()
             .skip(offset)
@@ -1904,6 +2407,19 @@ fn is_creative_commons_license(label: &str) -> bool {
     normalized.contains("creative commons") || normalized.contains("creativecommons.org")
 }
 
+/// Formats one non-negative count with comma-separated thousands groups.
+fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut formatted = String::with_capacity(digits.len().saturating_add(digits.len() / 3));
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
+}
+
 /// Canonicalizes `YouTube`'s localized spelling of its CC Attribution label.
 ///
 /// Exact licence URLs and other provider terms remain unchanged because they
@@ -1952,6 +2468,7 @@ fn render_channel(
         hit_map,
         " Channel ",
         "No channel is selected.",
+        InformationPanelKind::Channel,
         false,
         thumbnail_height,
         thumbnail_renderer,
@@ -2048,7 +2565,7 @@ fn render_seek_bar(
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -2065,6 +2582,35 @@ fn render_seek_bar(
         render_chapter_timeline(
             frame, label_area, track_area, view, duration, theme, hit_map,
         );
+        frame.render_widget(
+            Paragraph::new(label).alignment(Alignment::Center),
+            status_area,
+        );
+        hit_map.seek_bar = track_area;
+    } else if area.height >= 2 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+        let track_area = rows[0];
+        let status_area = rows[1];
+        let gauge = Gauge::default()
+            .gauge_style(theme.progress)
+            .ratio(ratio)
+            .label("");
+        frame.render_widget(gauge, track_area);
+        render_buffered_ranges(frame, track_area, &view.playback, duration, theme);
+        if !view.playback_chapters.is_empty() {
+            render_chapter_timeline(
+                frame,
+                Rect::new(track_area.x, track_area.y, track_area.width, 0),
+                track_area,
+                view,
+                duration,
+                theme,
+                hit_map,
+            );
+        }
         frame.render_widget(
             Paragraph::new(label).alignment(Alignment::Center),
             status_area,
@@ -2091,18 +2637,20 @@ fn render_chapter_timeline(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    if label_area.is_empty() || track_area.is_empty() {
+    if track_area.is_empty() {
         return;
     }
     let current = current_chapter_index(&view.playback_chapters, view.playback.position);
     if duration.is_zero() {
-        if let Some(index) = current {
+        if !label_area.is_empty()
+            && let Some(index) = current
+        {
             let chapter = &view.playback_chapters[index];
             let label = truncate_terminal_text(
                 &format!(
                     "▶ {} {}",
                     format_duration(Duration::from_secs(chapter.start_seconds)),
-                    chapter.title
+                    chapter_title_for_display(&chapter.title)
                 ),
                 usize::from(label_area.width),
             );
@@ -2167,9 +2715,13 @@ fn render_chapter_timeline(
         }
     }
 
+    if label_area.is_empty() {
+        return;
+    }
+
     let mut label_order = current.into_iter().collect::<Vec<_>>();
     label_order.extend((0..view.playback_chapters.len()).filter(|index| Some(*index) != current));
-    let mut occupied = Vec::<(u16, u16)>::new();
+    let mut occupied = vec![Vec::<(u16, u16)>::new(); usize::from(label_area.height.min(2))];
     let show_hours = duration.as_secs() >= 60 * 60;
     for index in label_order {
         let chapter = &view.playback_chapters[index];
@@ -2188,7 +2740,7 @@ fn render_chapter_timeline(
             &format!(
                 "{prefix}{} {}",
                 format_timeline_timestamp(chapter.start_seconds, show_hours),
-                chapter.title
+                chapter_title_for_display(&chapter.title)
             ),
             maximum_width,
         );
@@ -2198,13 +2750,21 @@ fn render_chapter_timeline(
         }
         let start = marker_column.min(label_area.width.saturating_sub(width));
         let end = start.saturating_add(width);
-        if occupied
-            .iter()
-            .any(|(used_start, used_end)| start < *used_end && end > *used_start)
-        {
+        let Some(label_row) = occupied.iter().position(|ranges| {
+            ranges
+                .iter()
+                .all(|(used_start, used_end)| start >= *used_end || end <= *used_start)
+        }) else {
             continue;
-        }
-        let label_rect = Rect::new(label_area.x.saturating_add(start), label_area.y, width, 1);
+        };
+        let label_rect = Rect::new(
+            label_area.x.saturating_add(start),
+            label_area
+                .y
+                .saturating_add(u16::try_from(label_row).unwrap_or_default()),
+            width,
+            1,
+        );
         frame.render_widget(
             Paragraph::new(text).style(if Some(index) == current {
                 theme.accent.add_modifier(Modifier::BOLD)
@@ -2216,7 +2776,7 @@ fn render_chapter_timeline(
         if let Some(action) = marker_action(chapter.start_seconds) {
             hit_map.seek_markers.push((action, label_rect));
         }
-        occupied.push((start, end));
+        occupied[label_row].push((start, end));
     }
 }
 
@@ -2380,12 +2940,12 @@ fn render_buttons(
             UiAction::ShowScreen(Screen::Subscriptions),
         ),
         (
-            button("M", "MOD/tracker music", settings.show_hotkeys),
-            UiAction::ShowScreen(Screen::TrackerMusic),
+            button("Space", "Pause", settings.show_hotkeys),
+            UiAction::TogglePause,
         ),
         (
-            button("v", "Videos/channels", settings.show_hotkeys),
-            UiAction::ToggleSearchKind,
+            button("p", "Preferences", settings.show_hotkeys),
+            UiAction::OpenPreferences,
         ),
         (
             button(
@@ -2399,8 +2959,16 @@ fn render_buttons(
             UiAction::ToggleYouTubeSearchSort,
         ),
         (
-            button("Space", "Pause", settings.show_hotkeys),
-            UiAction::TogglePause,
+            button("?", "Help", settings.show_hotkeys),
+            UiAction::ToggleHelp,
+        ),
+        (
+            button("M", "MOD/tracker music", settings.show_hotkeys),
+            UiAction::ShowScreen(Screen::TrackerMusic),
+        ),
+        (
+            button("v", "Videos/channels", settings.show_hotkeys),
+            UiAction::ToggleSearchKind,
         ),
         (
             button("d", "Download", settings.show_hotkeys),
@@ -2409,10 +2977,6 @@ fn render_buttons(
         (
             button("w", "Waveform", settings.show_hotkeys),
             UiAction::ToggleWaveform,
-        ),
-        (
-            button("?", "Help", settings.show_hotkeys),
-            UiAction::ToggleHelp,
         ),
     ];
     let navigation_buttons = [
@@ -2528,7 +3092,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
     let help = [
         "Navigation",
         "  / search     Tab subscriptions     F2 offline     F3 history",
-        "  F4 playlists     F5 stats     M/F6 MOD/tracker music",
+        "  F4 playlists     F5 stats     M/F6 MOD/tracker music     p preferences",
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
         "",
@@ -2538,7 +3102,8 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  w waveform     Backspace back to previous link/position",
         "",
         "Actions",
-        "  n play next     a add to queue     d download     o browser",
+        "  n play next     a add to queue     d download     o video page",
+        "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
         "  m private note     e equalizer     t Details-only text selection",
         "  Alt+j/k select external link     Alt+Enter open selected link",
@@ -2676,7 +3241,7 @@ fn render_error_popup(
         .collect::<Vec<_>>()
         .join("   ");
     frame.render_widget(
-        Paragraph::new(controls)
+        Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
         buttons_area,
@@ -2700,7 +3265,7 @@ fn render_youtube_setup_popup(
     let width_percent = if frame.area().width < 90 { 100 } else { 94 };
     let area = centered_rect(width_percent, height_percent, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" Configure YouTube search ", theme), area);
+    frame.render_widget(panel_block(" Configure YouTube metadata ", theme), area);
 
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 2,
@@ -2939,6 +3504,125 @@ fn render_youtube_setup_popup(
     }
 }
 
+fn render_preferences_popup(
+    frame: &mut Frame<'_>,
+    preferences: &PreferencesPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(76, 58, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Youta preferences ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("Subscriptions layout. Choose with d/s or ←/→, then press Enter to save.")
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let choices = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[1]);
+    let options = [
+        (
+            SubscriptionsLayout::DrillDown,
+            "[d] Drill-down",
+            "sources → videos + Details",
+        ),
+        (
+            SubscriptionsLayout::Split,
+            "[s] Split",
+            "sources and videos together",
+        ),
+    ];
+    for ((layout, label, description), choice_area) in options.into_iter().zip(choices.iter()) {
+        let selected = layout == preferences.subscriptions_layout;
+        frame.render_widget(
+            Paragraph::new(format!("{label}\n{description}"))
+                .style(if selected { theme.selected } else { theme.base })
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if selected { theme.accent } else { theme.border }),
+                ),
+            *choice_area,
+        );
+        hit_map
+            .preferences_buttons
+            .push((UiAction::SetSubscriptionsLayout(layout), *choice_area));
+    }
+
+    let mut notes = format!(
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nWill save only ui.subscriptions_layout in:\n{}",
+        preferences.config_path
+    );
+    if let Some(variable) = preferences.environment_override.as_deref() {
+        notes.push_str(&format!(
+            "\n\nLocked by environment: {variable}\nChange or remove it before saving."
+        ));
+    }
+    if let Some(error) = preferences.validation_error.as_deref() {
+        notes.push_str(&format!("\n\nError: {error}"));
+    }
+    frame.render_widget(
+        Paragraph::new(notes)
+            .style(
+                if preferences.validation_error.is_some()
+                    || preferences.environment_override.is_some()
+                {
+                    Style::default().fg(Color::Red)
+                } else {
+                    theme.muted
+                },
+            )
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+
+    let buttons = [
+        ("[Enter] Save", UiAction::SubmitPreferences),
+        ("[Esc] Cancel", UiAction::DismissPreferences),
+    ];
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[3],
+    );
+    let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
+    let mut x = centered_line_x(sections[3], total_width);
+    for (label, action) in buttons {
+        let width = terminal_text_width(label);
+        hit_map
+            .preferences_buttons
+            .push((action, Rect::new(x, sections[3].y, width, 1)));
+        x = x.saturating_add(width).saturating_add(3);
+    }
+}
+
 fn masked_setup_value(value: &str, width: usize) -> String {
     let length = value.chars().count();
     if length <= width {
@@ -3045,19 +3729,6 @@ fn wrap_diagnostic_report(report: &str, width: usize) -> Vec<String> {
 }
 
 fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
-    if view.text_selection_mode {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
-            // Terminals normally consume Ctrl+Shift+C as their Copy command.
-            // If one forwards it, do not reinterpret that copy chord as Quit.
-            return (!shift).then_some(UiAction::Quit);
-        }
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('t' | 'T') => Some(UiAction::ToggleTextSelectionMode),
-            _ => None,
-        };
-    }
     if view.error_popup.is_some() {
         return match key.code {
             KeyCode::Esc => Some(UiAction::DismissErrorPopup),
@@ -3081,6 +3752,36 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             KeyCode::PageDown => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(1))),
             KeyCode::Home => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Home)),
             KeyCode::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
+            _ => None,
+        };
+    }
+    if let Some(preferences) = view.preferences_popup.as_ref() {
+        let alternative = preferences.subscriptions_layout.toggled();
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('p') => Some(UiAction::DismissPreferences),
+            KeyCode::Enter => Some(UiAction::SubmitPreferences),
+            KeyCode::Char('d') => Some(UiAction::SetSubscriptionsLayout(
+                SubscriptionsLayout::DrillDown,
+            )),
+            KeyCode::Char('s') => {
+                Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
+                Some(UiAction::SetSubscriptionsLayout(alternative))
+            }
+            _ => None,
+        };
+    }
+    if view.text_selection_mode {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
+            // Terminals normally consume Ctrl+Shift+C as their Copy command.
+            // If one forwards it, do not reinterpret that copy chord as Quit.
+            return (!shift).then_some(UiAction::Quit);
+        }
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('t' | 'T') => Some(UiAction::ToggleTextSelectionMode),
             _ => None,
         };
     }
@@ -3145,6 +3846,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('q') => Some(UiAction::Quit),
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
         KeyCode::Char('/') => Some(UiAction::BeginSearch),
+        KeyCode::Char('p') | KeyCode::F(7) => Some(UiAction::OpenPreferences),
         KeyCode::Tab => Some(UiAction::ShowScreen(Screen::Subscriptions)),
         KeyCode::BackTab => Some(UiAction::ShowScreen(Screen::Search)),
         KeyCode::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
@@ -3155,6 +3857,11 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('v') => Some(UiAction::ToggleSearchKind),
         KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         KeyCode::Char('C') => Some(UiAction::ToggleYouTubeCreativeCommons),
+        KeyCode::Char('i')
+            if view.screen == Screen::Subscriptions && !view.subscriptions.items.is_empty() =>
+        {
+            Some(UiAction::ToggleSubscriptionDescription)
+        }
         KeyCode::Char('t')
             if view.details.is_some() && view.right_panel_mode == RightPanelMode::Details =>
         {
@@ -3165,6 +3872,13 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Home if alt && detail_link_count > 0 => Some(UiAction::SelectDetailLink(0)),
         KeyCode::End if alt && detail_link_count > 0 => {
             Some(UiAction::SelectDetailLink(detail_link_count - 1))
+        }
+        KeyCode::Esc
+            if view.screen == Screen::Subscriptions
+                && (view.subscriptions.description_expanded
+                    || view.subscriptions.focus == SubscriptionPane::Items) =>
+        {
+            Some(UiAction::GoBack)
         }
         KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
         KeyCode::PageUp if view.details_focused => {
@@ -3203,6 +3917,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('a') => Some(UiAction::AddToQueue),
         KeyCode::Char('d') => Some(UiAction::Download),
         KeyCode::Char('o') => Some(UiAction::OpenInBrowser),
+        KeyCode::Char('O') => Some(UiAction::OpenChannelInBrowser),
         KeyCode::Char('y') => Some(UiAction::CopyLink),
         KeyCode::Char('m') => Some(UiAction::EditPrivateNote),
         KeyCode::Char('e') => Some(UiAction::OpenEqualizer),
@@ -3220,6 +3935,52 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
         // selection even while mouse reporting is enabled. Never turn the
         // corresponding events into Youta actions if a terminal forwards them.
         return None;
+    }
+    if view.error_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .error_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown => {
+                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(3)))
+            }
+            MouseEventKind::ScrollUp => {
+                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
+            }
+            _ => None,
+        };
+    }
+    if view.youtube_setup_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((field, _)) = hit_map
+                    .youtube_setup_fields
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::SelectYouTubeSetupField(*field))
+                } else {
+                    hit_map
+                        .youtube_setup_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            _ => None,
+        };
+    }
+    if view.preferences_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            _ => None,
+        };
     }
     if view.text_selection_mode {
         match mouse.kind {
@@ -3258,42 +4019,6 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
             }
             _ => {}
         }
-    }
-    if view.error_popup.is_some() {
-        return match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => hit_map
-                .error_buttons
-                .iter()
-                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
-                .map(|(action, _)| action.clone()),
-            MouseEventKind::ScrollDown => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(3)))
-            }
-            MouseEventKind::ScrollUp => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
-            }
-            _ => None,
-        };
-    }
-    if view.youtube_setup_popup.is_some() {
-        return match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((field, _)) = hit_map
-                    .youtube_setup_fields
-                    .iter()
-                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
-                {
-                    Some(UiAction::SelectYouTubeSetupField(*field))
-                } else {
-                    hit_map
-                        .youtube_setup_buttons
-                        .iter()
-                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
-                        .map(|(action, _)| action.clone())
-                }
-            }
-            _ => None,
-        };
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -3339,16 +4064,41 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
             }
             if contains(hit_map.rows, mouse.column, mouse.row) {
                 let relative_row = mouse.row.saturating_sub(hit_map.rows.y);
-                let index = usize::from(relative_row / 2);
+                let index = hit_map
+                    .rows_first_index
+                    .saturating_add(usize::from(relative_row / 2));
                 if index < view.rows.len() {
                     return Some(UiAction::SelectRow(index));
+                }
+            }
+            if contains(hit_map.subscription_source_rows, mouse.column, mouse.row) {
+                let relative_row = mouse.row.saturating_sub(hit_map.subscription_source_rows.y);
+                let index = hit_map
+                    .subscription_source_first_index
+                    .saturating_add(usize::from(relative_row / 2));
+                if index < view.subscriptions.sources.len() {
+                    return Some(UiAction::SelectSubscriptionSource(index));
+                }
+            }
+            if contains(hit_map.subscription_item_rows, mouse.column, mouse.row) {
+                let relative_row = mouse.row.saturating_sub(hit_map.subscription_item_rows.y);
+                let index = hit_map
+                    .subscription_item_first_index
+                    .saturating_add(usize::from(relative_row / 2));
+                if index < view.subscriptions.items.len() {
+                    return Some(UiAction::SelectSubscriptionItem(index));
                 }
             }
             None
         }
         MouseEventKind::ScrollDown => {
             if contains(hit_map.details_panel, mouse.column, mouse.row) {
-                Some(UiAction::ScrollDetails(DetailsScroll::Lines(3)))
+                Some(UiAction::SetDetailsScroll(
+                    hit_map
+                        .details_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.details_scroll_maximum),
+                ))
             } else if hit_map
                 .detail_links
                 .iter()
@@ -3361,7 +4111,9 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
         }
         MouseEventKind::ScrollUp => {
             if contains(hit_map.details_panel, mouse.column, mouse.row) {
-                Some(UiAction::ScrollDetails(DetailsScroll::Lines(-3)))
+                Some(UiAction::SetDetailsScroll(
+                    hit_map.details_scroll_offset.saturating_sub(3),
+                ))
             } else if hit_map
                 .detail_links
                 .iter()
@@ -3572,6 +4324,7 @@ mod tests {
     struct MockThumbnailRenderer {
         enabled: bool,
         synchronized: Vec<(Option<url::Url>, Rect)>,
+        prefetch_batches: Vec<Vec<url::Url>>,
         clear_count: usize,
         pending: bool,
         immediate_redraw: bool,
@@ -3603,6 +4356,15 @@ mod tests {
 
         fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
             self.synchronized.push((source.cloned(), area));
+            true
+        }
+
+        fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
+            self.prefetch_batches.push(
+                rows.iter()
+                    .filter_map(|row| row.thumbnail_url.clone())
+                    .collect(),
+            );
             true
         }
 
@@ -3931,12 +4693,14 @@ mod tests {
         let view = ViewModel {
             rows: vec![
                 RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "unwatched")),
                     title: "Unsubscribed unwatched row".to_owned(),
                     source: "YouTube".to_owned(),
                     subscribed: false,
                     ..RowView::default()
                 },
                 RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "partial")),
                     title: "Unsubscribed partial row".to_owned(),
                     source: "YouTube".to_owned(),
                     watched_percent: 64,
@@ -3944,9 +4708,16 @@ mod tests {
                     ..RowView::default()
                 },
                 RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "watched")),
                     title: "Subscribed watched row".to_owned(),
                     source: "YouTube".to_owned(),
                     watched_percent: 91,
+                    subscribed: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    title: "Subscribed channel source".to_owned(),
+                    source: "YouTube channel".to_owned(),
                     subscribed: true,
                     ..RowView::default()
                 },
@@ -4004,6 +4775,11 @@ mod tests {
             buffer[(4, 5)].symbol(),
             "○",
             "more than 90 percent watched uses the completed marker"
+        );
+        assert_eq!(
+            buffer[(4, 7)].symbol(),
+            " ",
+            "a non-playable channel source has no watched-state marker"
         );
         assert!(
             rendered.contains(" 64%"),
@@ -4203,7 +4979,6 @@ mod tests {
 
         let active = ViewModel {
             text_selection_mode: true,
-            error_popup: Some(ErrorPopupView::default()),
             ..available
         };
         assert_eq!(
@@ -4440,11 +5215,42 @@ mod tests {
 
     #[test]
     fn tab_opens_subscriptions_as_requested() {
-        let view = ViewModel::default();
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        for screen in Screen::ALL {
+            let mut view = ViewModel {
+                screen,
+                ..ViewModel::default()
+            };
+            view.subscriptions.route = SubscriptionRoute::Items;
+            assert_eq!(
+                key_action(tab, &view),
+                Some(UiAction::ShowScreen(Screen::Subscriptions)),
+                "Tab must remain global on {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preferences_and_channel_page_have_distinct_global_shortcuts() {
+        let view = ViewModel::default();
         assert_eq!(
-            key_action(tab, &view),
-            Some(UiAction::ShowScreen(Screen::Subscriptions))
+            key_action(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenPreferences)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenPreferences)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenChannelInBrowser)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenInBrowser)
         );
     }
 
@@ -4492,7 +5298,7 @@ mod tests {
 
     #[test]
     fn render_contains_player_and_hotkey_controls() {
-        let backend = TestBackend::new(120, 32);
+        let backend = TestBackend::new(240, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
             rows: vec![RowView {
@@ -4552,6 +5358,316 @@ mod tests {
                 "missing clickable bottom-line action {expected:?}"
             );
         }
+    }
+
+    fn subscription_row(title: &str, video: bool) -> RowView {
+        RowView {
+            media_id: video.then(|| MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+            title: title.to_owned(),
+            subtitle: if video {
+                "2026 July 25 (yesterday) · 3:32".to_owned()
+            } else {
+                "https://www.youtube.com/feeds/videos.xml?channel_id=UCfixture".to_owned()
+            },
+            source: if video {
+                "YouTube".to_owned()
+            } else {
+                "YouTube channel".to_owned()
+            },
+            subscribed: !video,
+            ..RowView::default()
+        }
+    }
+
+    #[test]
+    fn subscriptions_render_both_drill_down_and_split_navigation_models() {
+        let backend = TestBackend::new(160, 34);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let details = DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+            title: "Fixture channel".to_owned(),
+            description: "Expanded fixture description".to_owned(),
+            channel_id: "UCfixture".to_owned(),
+            channel_webpage_url: Some(
+                url::Url::parse("https://www.youtube.com/@fixture").expect("fixture channel URL"),
+            ),
+            ..DetailView::default()
+        };
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            details: Some(details),
+            ..ViewModel::default()
+        };
+        // Leading spaces represent one nested OPML folder level in source rows.
+        view.subscriptions.sources = vec![subscription_row("  Fixture channel", false)];
+        view.subscriptions.items = vec![subscription_row("Fixture video", true)];
+        view.subscriptions.source_title = "Fixture channel".to_owned();
+        view.subscriptions.source_subscriber_count = Some(13_045);
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw drill-down sources");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Subscription sources"));
+        assert!(rendered.contains("Fixture channel"));
+        assert_eq!(
+            rendered.matches("Fixture channel").count(),
+            1,
+            "the channel title already visible in the source row must not repeat"
+        );
+        assert!(rendered.contains("[O] xdg-open"));
+        assert!(hit_map.subscription_source_rows.width > 0);
+        assert_eq!(hit_map.subscription_item_rows, Rect::default());
+
+        view.subscriptions.route = SubscriptionRoute::Items;
+        view.subscriptions.focus = SubscriptionPane::Items;
+        view.right_panel_mode = RightPanelMode::Details;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw drill-down items");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
+        assert!(rendered.contains("Fixture video"));
+        assert!(
+            !rendered.contains('◆'),
+            "subscription videos must omit the redundant channel marker"
+        );
+        assert!(rendered.contains("Expanded fixture description"));
+        assert!(hit_map.subscription_item_rows.width > 0);
+
+        view.subscriptions.layout = SubscriptionsLayout::Split;
+        view.subscriptions.route = SubscriptionRoute::Sources;
+        view.subscriptions.focus = SubscriptionPane::Items;
+        view.subscriptions.description_expanded = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw split lists");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Subscription sources"));
+        assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
+        assert!(rendered.contains("[i] Description"));
+        assert!(hit_map.subscription_source_rows.width > 0);
+        assert!(hit_map.subscription_item_rows.width > 0);
+        let (_, description_target) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleSubscriptionDescription)
+            .expect("description button target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: description_target.x,
+                    row: description_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleSubscriptionDescription)
+        );
+
+        view.subscriptions.description_expanded = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw split description");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Expanded fixture description"));
+
+        view.subscriptions.description_expanded = false;
+        view.subscriptions.source_subscriber_count = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw split list without public subscriber count");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Fixture channel · YouTube"));
+        assert!(!rendered.contains("Fixture channel · YouTube · "));
+        assert!(rendered.contains("[i] Description"));
+    }
+
+    #[test]
+    fn subscription_mouse_rows_target_their_independent_lists() {
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            subscriptions: SubscriptionsView {
+                layout: SubscriptionsLayout::Split,
+                sources: vec![subscription_row("Source", false)],
+                items: vec![subscription_row("Video", true)],
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let hit_map = HitMap {
+            subscription_source_rows: Rect::new(1, 2, 20, 4),
+            subscription_item_rows: Rect::new(30, 2, 20, 4),
+            ..HitMap::default()
+        };
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            mouse_action(click(1), &hit_map, &view),
+            Some(UiAction::SelectSubscriptionSource(0))
+        );
+        assert_eq!(
+            mouse_action(click(30), &hit_map, &view),
+            Some(UiAction::SelectSubscriptionItem(0))
+        );
+    }
+
+    #[test]
+    fn subscription_lists_keep_late_selection_visible_and_mouse_indexes_aligned() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            ..ViewModel::default()
+        };
+        view.subscriptions.sources = (0..20)
+            .map(|index| subscription_row(&format!("Source {index:02}"), false))
+            .collect();
+        view.subscriptions.selected_source = 17;
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw scrolled subscriptions");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Source 17"));
+        assert!(!rendered.contains("Source 00"));
+        assert!(hit_map.subscription_source_first_index > 0);
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit_map.subscription_source_rows.x,
+                    row: hit_map.subscription_source_rows.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SelectSubscriptionSource(
+                hit_map.subscription_source_first_index
+            ))
+        );
+    }
+
+    #[test]
+    fn preferences_popup_is_modal_selectable_and_clickable() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            preferences_popup: Some(PreferencesPopupView {
+                subscriptions_layout: SubscriptionsLayout::DrillDown,
+                config_path: "/tmp/youta/config.toml".to_owned(),
+                environment_override: None,
+                validation_error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw preferences");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Youta preferences"));
+        assert!(rendered.contains("[d] Drill-down"));
+        assert!(rendered.contains("[s] Split"));
+        assert!(rendered.contains("/tmp/youta/config.toml"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
+            Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitPreferences)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &view),
+            None,
+            "the modal must not leak the global Subscriptions shortcut"
+        );
+        let (_, split_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| {
+                action == &UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split)
+            })
+            .expect("split choice target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: split_target.x,
+                    row: split_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
+        );
+    }
+
+    #[test]
+    fn diagnostic_keyboard_routing_precedes_stacked_preferences_and_text_selection() {
+        let view = ViewModel {
+            text_selection_mode: true,
+            preferences_popup: Some(PreferencesPopupView {
+                subscriptions_layout: SubscriptionsLayout::DrillDown,
+                config_path: "/tmp/youta/config.toml".to_owned(),
+                environment_override: None,
+                validation_error: Some("save failed".to_owned()),
+            }),
+            error_popup: Some(ErrorPopupView {
+                title: "Preferences failed".to_owned(),
+                report: "complete report".to_owned(),
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissErrorPopup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &view),
+            Some(UiAction::CopyErrorReport)
+        );
+        let target = Rect::new(2, 3, 6, 1);
+        let hit_map = HitMap {
+            error_buttons: vec![(UiAction::CopyErrorReport, target)],
+            preferences_buttons: vec![(
+                UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split),
+                target,
+            )],
+            detail_text_rows: vec![SelectableDetailsRow {
+                x: target.x,
+                y: target.y,
+                cells: vec!["x".to_owned(); usize::from(target.width)],
+            }],
+            ..HitMap::default()
+        };
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CopyErrorReport)
+        );
     }
 
     #[test]
@@ -4759,7 +5875,7 @@ mod tests {
             .map(|line| format!("BOTTOM_SCROLL_LINE_{line:02}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let view = ViewModel {
+        let mut view = ViewModel {
             details: Some(DetailView {
                 title: "Long description".to_owned(),
                 source: "YouTube".to_owned(),
@@ -4796,6 +5912,40 @@ mod tests {
             buffer[scrollbar_bottom].symbol(),
             "█",
             "the scrollbar thumb must reach the final track cell"
+        );
+        assert_eq!(
+            hit_map.details_scroll_offset,
+            hit_map.details_scroll_maximum
+        );
+        assert!(hit_map.details_scroll_maximum >= 3);
+
+        let rendered_at_end = rendered;
+        let upward = mouse_action(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: hit_map.details_panel.x,
+                row: hit_map.details_panel.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hit_map,
+            &view,
+        );
+        let expected_offset = hit_map.details_scroll_maximum - 3;
+        assert_eq!(
+            upward,
+            Some(UiAction::SetDetailsScroll(expected_offset)),
+            "the first upward wheel notch must use the visible clamped offset"
+        );
+
+        view.details_scroll = expected_offset;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw one wheel notch above description end");
+        let rendered_after_wheel = rendered_text(&terminal);
+        assert_eq!(hit_map.details_scroll_offset, expected_offset);
+        assert_ne!(
+            rendered_after_wheel, rendered_at_end,
+            "one upward wheel notch must visibly change the wrapped text window"
         );
     }
 
@@ -4897,6 +6047,10 @@ mod tests {
                 source: "YouTube".to_owned(),
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
                 ..DetailView::default()
             }),
             ..ViewModel::default()
@@ -4928,6 +6082,7 @@ mod tests {
         );
         assert!(rendered.contains("[s] Subscribe (locally)"));
         assert!(rendered.contains("[o] Open video"));
+        assert!(rendered.contains("[O] xdg-open"));
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -4958,9 +6113,34 @@ mod tests {
             mouse_action(open_click, &hit_map, &view),
             Some(UiAction::OpenInBrowser)
         );
+        let (_, open_channel_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::OpenChannelInBrowser)
+            .expect("xdg-open channel hit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: open_channel_area.x,
+                    row: open_channel_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenChannelInBrowser)
+        );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleSubscription)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenChannelInBrowser)
         );
 
         view.details
@@ -5128,6 +6308,7 @@ mod tests {
         assert!(!rendered.contains("[t] Select Details text"));
         assert!(rendered.contains("Open video"));
         assert!(!rendered.contains("[o] Open video"));
+        assert!(!rendered.contains("[O] xdg-open"));
         assert_eq!(hit_map.detail_buttons.len(), 3);
         assert!(
             hit_map
@@ -5366,6 +6547,57 @@ mod tests {
             DEFAULT_THUMBNAIL_HEIGHT
         );
         assert_eq!(thumbnails.clear_count, 0);
+    }
+
+    #[test]
+    fn thumbnail_prefetch_uses_only_loaded_global_search_rows_and_honors_the_setting() {
+        let first = url::Url::parse("https://i.ytimg.com/vi/first/mqdefault.jpg")
+            .expect("first thumbnail URL");
+        let second = url::Url::parse("https://i.ytimg.com/vi/second/mqdefault.jpg")
+            .expect("second thumbnail URL");
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            rows: vec![
+                RowView {
+                    thumbnail_url: Some(first.clone()),
+                    ..RowView::default()
+                },
+                RowView::default(),
+                RowView {
+                    thumbnail_url: Some(second.clone()),
+                    ..RowView::default()
+                },
+            ],
+            ..ViewModel::default()
+        };
+        let mut renderer = MockThumbnailRenderer::default();
+
+        assert!(synchronize_search_thumbnail_prefetch(
+            &view,
+            &UiSettings::default(),
+            &mut renderer,
+        ));
+        assert_eq!(renderer.prefetch_batches, [vec![first, second]]);
+
+        view.screen = Screen::Subscriptions;
+        assert!(synchronize_search_thumbnail_prefetch(
+            &view,
+            &UiSettings::default(),
+            &mut renderer,
+        ));
+        assert!(renderer.prefetch_batches.last().is_some_and(Vec::is_empty));
+
+        view.screen = Screen::Search;
+        let disabled = UiSettings {
+            prefetch_search_thumbnails: false,
+            ..UiSettings::default()
+        };
+        assert!(synchronize_search_thumbnail_prefetch(
+            &view,
+            &disabled,
+            &mut renderer,
+        ));
+        assert!(renderer.prefetch_batches.last().is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -5670,10 +6902,11 @@ mod tests {
         assert!(rendered.contains("Volume down"));
         assert!(rendered.contains("Start"));
         assert!(rendered.contains("Sort: relevance"));
-        for hidden in ["[N]", "[C]", "[k]", "[j]", "[↑]", "[↓]", "[Enter]"] {
+        assert!(rendered.contains("Preferences"));
+        for hidden in ["[N]", "[C]", "[p]", "[k]", "[j]", "[↑]", "[↓]", "[Enter]"] {
             assert!(!rendered.contains(hidden));
         }
-        assert_eq!(hit_map.buttons.len(), 15);
+        assert_eq!(hit_map.buttons.len(), 16);
     }
 
     #[test]
@@ -5742,11 +6975,19 @@ mod tests {
 
         assert!(rendered.contains("0:00 / --:--"));
         assert!(!rendered.contains("────────"));
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 0, 80, 1));
+        let status_row = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(
+            status_row.contains("0:00 / --:--"),
+            "playback status must render below, rather than over, the seek track"
+        );
     }
 
     #[test]
     fn seek_bar_chapter_markers_and_labels_seek_to_exact_timecodes() {
-        let backend = TestBackend::new(80, 3);
+        let backend = TestBackend::new(80, 4);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
         let view = ViewModel {
@@ -5830,6 +7071,240 @@ mod tests {
             }),
             "an exact split must win over the generic percentage seek target"
         );
+    }
+
+    #[test]
+    fn list_prefixed_description_timecodes_render_on_the_seek_bar() {
+        let description = "\
+➤ 00:00 Introduction
+➤ 05:45 Дело не в фамилиях, а в системе
+prose 07:25 remains clickable but is not a chapter";
+        let chapters = crate::links::parse_description_chapters(description, Some(600))
+            .into_iter()
+            .map(|chapter| Chapter {
+                title: chapter.title,
+                start_seconds: chapter.start_seconds,
+                end_seconds: chapter.end_seconds,
+            })
+            .collect();
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(350),
+                duration: Some(Duration::from_mins(10)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(MediaId::new(SourceKind::YouTube, "abcdefghijk")),
+            playback_chapters: chapters,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw chapters parsed from a real description");
+
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("▶ 05:45 Дело не в фамилиях"),
+            "the active description chapter must be visible above the seek bar: {rendered}"
+        );
+        assert_eq!(
+            hit_map
+                .seek_markers
+                .iter()
+                .filter(|(action, area)| {
+                    area.y == hit_map.seek_bar.y
+                        && matches!(action, UiAction::ActivateTimecode { .. })
+                })
+                .count(),
+            2,
+            "only the two list-prefixed description timecodes must become exact seek markers"
+        );
+    }
+
+    #[test]
+    fn chapter_labels_use_two_rows_before_hiding_collisions() {
+        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                position: Duration::from_secs(10),
+                duration: Some(Duration::from_secs(100)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(media_id),
+            playback_chapters: vec![
+                Chapter {
+                    title: "First nearby chapter".to_owned(),
+                    start_seconds: 10,
+                    end_seconds: Some(11),
+                },
+                Chapter {
+                    title: "Second nearby chapter".to_owned(),
+                    start_seconds: 11,
+                    end_seconds: Some(100),
+                },
+            ],
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw two-line chapter labels");
+
+        let mut label_rows = hit_map
+            .seek_markers
+            .iter()
+            .filter_map(|(_, area)| (area.y < hit_map.seek_bar.y).then_some(area.y))
+            .collect::<Vec<_>>();
+        label_rows.sort_unstable();
+        label_rows.dedup();
+        assert_eq!(
+            label_rows,
+            [0, 1],
+            "overlapping chapter labels should use both rows before one is hidden"
+        );
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 2, 80, 1));
+        let status_row = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+            .collect::<String>();
+        assert!(status_row.contains("0:10 / 1:40"));
+    }
+
+    #[test]
+    fn chapter_labels_hide_one_final_period_but_preserve_ellipses() {
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                position: Duration::from_secs(10),
+                duration: Some(Duration::from_secs(100)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(MediaId::new(SourceKind::YouTube, "abcdefghijk")),
+            playback_chapters: vec![
+                Chapter {
+                    title: "Sentence title.".to_owned(),
+                    start_seconds: 10,
+                    end_seconds: Some(70),
+                },
+                Chapter {
+                    title: "Wait...".to_owned(),
+                    start_seconds: 70,
+                    end_seconds: Some(100),
+                },
+            ],
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw normalized chapter labels");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Sentence title"));
+        assert!(!rendered.contains("Sentence title."));
+        assert!(rendered.contains("Wait..."));
+    }
+
+    #[test]
+    fn short_chapter_seekbar_keeps_markers_and_places_exact_status_below_track() {
+        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                position: Duration::from_secs(18 * 60 + 28),
+                duration: Some(Duration::from_secs(60 * 60 + 33 * 60 + 6)),
+                paused: true,
+                volume: 80,
+                speed: 1.0,
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(media_id.clone()),
+            playback_chapters: vec![
+                Chapter {
+                    title: "Introduction".to_owned(),
+                    start_seconds: 0,
+                    end_seconds: Some(16 * 60),
+                },
+                Chapter {
+                    title: "Current chapter".to_owned(),
+                    start_seconds: 16 * 60,
+                    end_seconds: None,
+                },
+            ],
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw short chapter seek bar");
+
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 0, 120, 1));
+        assert!(
+            hit_map.seek_markers.iter().any(|(action, area)| {
+                area.y == hit_map.seek_bar.y
+                    && action
+                        == &UiAction::ActivateTimecode {
+                            media_id: media_id.clone(),
+                            seconds: 16 * 60,
+                        }
+            }),
+            "short terminals must retain exact chapter split click targets"
+        );
+        let track_row = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        let status_row = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        let expected = "18:28 / 1:33:06  paused  1×  vol 80%";
+        assert!(!track_row.contains(expected));
+        assert!(status_row.contains(expected));
     }
 
     #[test]
@@ -5969,14 +7444,15 @@ mod tests {
                 );
             }
 
-            let cached_label_cell = (24..64)
-                .map(|x| &buffer[(x, 1)])
-                .find(|cell| !matches!(cell.symbol(), " " | ratatui::symbols::block::FULL))
-                .expect("centered status label must cross a cached interval");
-            assert_eq!(
-                cached_label_cell.fg,
-                Color::DarkGray,
-                "restoring label glyphs must retain the cached interval style"
+            let status_row = (0..80).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+            assert!(
+                status_row.contains("0:10 / 1:40"),
+                "the status must remain readable below cached seek ranges"
+            );
+            assert_ne!(
+                buffer[(24, 1)].symbol(),
+                ratatui::symbols::block::FULL,
+                "cached seek styling must not bleed into the status row"
             );
             let rendered = buffer
                 .content()
@@ -6335,7 +7811,7 @@ mod tests {
             .collect::<String>();
         let normalized = printable.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(rendered.contains("Configure YouTube search"));
+        assert!(rendered.contains("Configure YouTube metadata"));
         assert!(rendered.contains("YouTube API key (masked)"));
         assert!(!rendered.contains(secret));
         assert!(rendered.contains(&"*".repeat(secret.len())));
@@ -6474,6 +7950,14 @@ mod tests {
             details: Some(DetailView {
                 title: "Mock channel".to_owned(),
                 source: "Bilibili channel".to_owned(),
+                channel_subscriber_count: Some(13_045),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/channel/UCfixture")
+                        .expect("fixture channel URL"),
+                ),
+                length: "must not render".to_owned(),
+                likes: "must not render".to_owned(),
+                views: "must not render".to_owned(),
                 description: "Full channel description".to_owned(),
                 wikidata: "Douglas Adams (Q42)".to_owned(),
                 links: vec![DetailLinkView {
@@ -6500,10 +7984,84 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Mock channel"));
+        assert!(rendered.contains("Subscribers: 13,045"));
+        assert!(!rendered.contains("Length:"));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+        assert!(rendered.contains("[O] xdg-open"));
+        assert!(rendered.contains("[c] Load channel info"));
         assert!(rendered.contains("Full channel description"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
         assert!(rendered.contains("Wikidata Q42"));
         assert_eq!(hit_map.detail_links.len(), 1);
+        let (_, load_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ShowChannel)
+            .expect("load-channel-info hit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: load_area.x,
+                    row: load_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ShowChannel)
+        );
+    }
+
+    #[test]
+    fn channel_panel_omits_unavailable_subscriber_count() {
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            right_panel_mode: RightPanelMode::Channel,
+            details: Some(DetailView {
+                title: "Hidden statistics".to_owned(),
+                description: "Channel description".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw channel without public subscribers");
+
+        assert!(!rendered_text(&terminal).contains("Subscribers:"));
+    }
+
+    #[test]
+    fn video_details_keep_length_likes_and_views() {
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            right_panel_mode: RightPanelMode::Details,
+            details: Some(DetailView {
+                title: "Mock video".to_owned(),
+                length: "4:05".to_owned(),
+                likes: "13,045".to_owned(),
+                views: "887,263".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw video details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("Length: 4:05"));
+        assert!(rendered.contains("Likes: 13,045"));
+        assert!(rendered.contains("Views: 887,263"));
+        assert!(!rendered.contains("Load channel info"));
     }
 
     #[test]
@@ -6691,6 +8249,8 @@ mod tests {
         let view = ViewModel::default();
         let hit_map = HitMap {
             details_panel: Rect::new(70, 5, 40, 12),
+            details_scroll_offset: 4,
+            details_scroll_maximum: 10,
             detail_links: vec![(2, Rect::new(70, 8, 30, 1))],
             ..HitMap::default()
         };
@@ -6713,7 +8273,7 @@ mod tests {
         };
         assert_eq!(
             mouse_action(scroll, &hit_map, &view),
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(3)))
+            Some(UiAction::SetDetailsScroll(7))
         );
 
         let click_panel = MouseEvent {

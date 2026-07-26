@@ -367,11 +367,13 @@ item's artwork only when it detects the [Kitty graphics
 protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), [iTerm2 inline
 images](https://iterm2.com/documentation-images.html), or
 [Sixel](https://vt100.net/docs/vt3xx-gp/chapter14.html). It downloads
-selected-item artwork lazily; off-screen search rows do not trigger thumbnail
-requests. Validated original image bytes are cached across restarts in
+selected-item artwork with queue priority. By default, one low-priority worker
+also warms the persistent cache for artwork from all currently loaded global
+Search rows; it does not load unseen pagination or subscription feeds.
+Validated original image bytes are cached across restarts in
 `~/.config/youta/thumbnail-cache` (or the selected Youta configuration
 directory). The private cache expires entries after 30 days and evicts its
-oldest files above 256 entries or 64 MiB. Corrupt entries are discarded and
+oldest files above 512 entries or 64 MiB. Corrupt entries are discarded and
 fetched again. The image URL is never printed as detail-panel text or stored as
 a filename.
 
@@ -388,14 +390,19 @@ Configure the runtime policy in `~/.config/youta/config.toml`:
 [ui]
 thumbnails = 'auto' # auto, off, or on
 thumbnail_height = 20 # maximum terminal rows; minimum 4
+prefetch_search_thumbnails = true
 ```
 
 `auto` uses conservative protocol detection, `off` disables thumbnail requests
 and rendering, and `on` attempts supported terminal artwork but still falls
 back without fetching when no supported protocol is available. Thumbnail
 height defaults to 20 rows and is reduced automatically when the Details panel
-needs space for metadata, links, or description text. To exclude the renderer
-and its image dependencies from the binary, use
+needs space for metadata, links, or description text.
+`prefetch_search_thumbnails = false` disables background cache warming; the
+equivalent environment override is
+`YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Unsupported terminals and plain
+TTYs perform no thumbnail network work regardless of this preference. To
+exclude the renderer and its image dependencies from the binary, use
 `--no-default-features` and omit `thumbnails` from `--features`; include
 `thumbnails` explicitly in a custom feature list to restore it. The rendering
 integration uses
@@ -407,6 +414,55 @@ OPML is the interchange format for RSS/podcast feeds and compatible channel
 feed URLs. It makes migration possible without a Youta-specific conversion.
 Private comments, folders, bookmarks, playback positions, and provider IDs do
 not fit OPML reliably, so they remain in SQLite and can be exported separately.
+
+YouTube subscriptions are currently local-only channel subscriptions. Choosing
+`Subscribe (locally)` while a video is selected adds its channel to Youta's
+OPML-backed source list; it does not subscribe the signed-in YouTube account.
+OAuth-based synchronization remains roadmap work. In Details, `[O] xdg-open`
+opens the selected YouTube channel's webpage, while lowercase `[o] Open video`
+opens the selected video's webpage.
+
+`Tab` is the global Subscriptions shortcut from every main screen and always
+returns to the subscription-source root. Youta provides two layouts:
+
+- `drill-down` is the default for narrow terminals. Sources appear on the
+  left with channel information on the right. Press `Enter` to load the
+  selected YouTube channel's videos in the usual list-and-Details view;
+  `Backspace` or `Esc` returns to the source list.
+- `split` keeps sources on the left and the selected source's videos on the
+  right. Moving across sources uses only cached rows; press `Enter` to load an
+  uncached source and move into its videos. The
+  `[i] Description` button expands the selected video's Details; `[i]` or
+  `Esc` returns to the video list.
+
+Open the current in-app preferences with `[p] Preferences` or `F7`, choose
+Drill-down or Split, and press `Enter` to save. This popup currently edits only
+the subscriptions layout; the remaining settings stay in `config.toml`. The
+same preference can be configured directly:
+
+```toml
+[ui]
+subscriptions_layout = 'drill-down' # drill-down or split
+```
+
+`YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` overrides the TOML value. While this
+environment variable is present, the Preferences popup shows the override and
+does not replace it in `config.toml`.
+
+Video pages are requested only after `Enter` activates the selected channel,
+so moving through a long source list cannot spend API quota. The official adapter
+resolves the channel's uploads playlist, calls
+[`playlistItems.list`](https://developers.google.com/youtube/v3/docs/playlistItems/list),
+then enriches the ordered rows through
+[`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list).
+The alternative adapter uses the documented [Invidious channel-videos
+endpoint](https://docs.invidious.io/api/channels_endpoint/). Youta loads
+another page when selection approaches the current page's end. It keeps a
+bounded, process-local cache of recently opened channels, so switching back
+does not immediately repeat the request. It retains at most 24 channels and
+250 videos per channel under a shared approximate 8 MiB heap budget; list
+descriptions and thumbnails are compacted before caching. The cache is
+discarded when Youta exits.
 
 Persistent writes stay under `~/.config/youta/`; transient IPC sockets may use
 the operating system's runtime directory. Downloads also default to a

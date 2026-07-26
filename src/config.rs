@@ -33,6 +33,9 @@ use crate::domain::{DEFAULT_RESUME_REWIND_SECONDS, PLAYED_THRESHOLD_PERCENT};
 /// Name of the environment variable that selects Youta's application folder.
 pub const CONFIG_DIR_ENV: &str = "YOUTA_CONFIG_DIR";
 
+/// Environment variable that overrides the Subscriptions screen layout.
+pub const SUBSCRIPTIONS_LAYOUT_ENV: &str = "YOUTA_UI__SUBSCRIPTIONS_LAYOUT";
+
 /// Default maximum thumbnail height in terminal rows.
 pub const DEFAULT_THUMBNAIL_HEIGHT: u16 = 20;
 
@@ -291,6 +294,47 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Persists the selected Subscriptions screen layout in `config.toml`.
+    ///
+    /// Existing unrelated keys, comments, and credentials are preserved.
+    /// Youta refuses to write a value while
+    /// [`SUBSCRIPTIONS_LAYOUT_ENV`] is present because that environment value
+    /// would shadow the saved preference on the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an environment override is active, the existing
+    /// file is too large or malformed, or an atomic private-file update fails.
+    #[cfg(feature = "tui")]
+    pub fn save_subscriptions_layout(
+        &mut self,
+        layout: SubscriptionsLayout,
+    ) -> Result<(), ConfigError> {
+        if std::env::var_os(SUBSCRIPTIONS_LAYOUT_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{SUBSCRIPTIONS_LAYOUT_ENV} overrides config.toml; change or remove it before saving this preference"
+            )));
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let ui = document
+            .as_table_mut()
+            .entry("ui")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`ui` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        ui["subscriptions_layout"] = value(layout.as_config_value());
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.ui.subscriptions_layout = layout;
+        Ok(())
+    }
 }
 
 /// Player and audio-output settings.
@@ -407,12 +451,16 @@ pub struct UiConfig {
     pub thumbnails: ThumbnailMode,
     /// Maximum thumbnail height in terminal rows.
     pub thumbnail_height: u16,
+    /// Prefetch currently loaded Search-result thumbnails into the disk cache.
+    pub prefetch_search_thumbnails: bool,
     /// Seek-bar foreground color name or terminal palette index.
     pub seekbar_color: String,
     /// Replace the standard seek indicator with Nyan Cat.
     pub nyan_cat_seekbar: bool,
     /// Enable the decorative DOS-RPG layout.
     pub dos_rpg_mode: bool,
+    /// Navigation model used by the Subscriptions screen.
+    pub subscriptions_layout: SubscriptionsLayout,
 }
 
 impl Default for UiConfig {
@@ -422,9 +470,43 @@ impl Default for UiConfig {
             theme: ThemeMode::Auto,
             thumbnails: ThumbnailMode::Auto,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
+            prefetch_search_thumbnails: true,
             seekbar_color: "cyan".to_owned(),
             nyan_cat_seekbar: false,
             dos_rpg_mode: false,
+            subscriptions_layout: SubscriptionsLayout::DrillDown,
+        }
+    }
+}
+
+/// Navigation model used by the Subscriptions screen.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionsLayout {
+    /// Enter a source to reuse the normal media-list and Details layout.
+    #[default]
+    DrillDown,
+    /// Keep sources and their recent media visible in adjacent panes.
+    Split,
+}
+
+impl SubscriptionsLayout {
+    /// Returns the stable TOML representation used by the focused in-app
+    /// preference writer.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::DrillDown => "drill-down",
+            Self::Split => "split",
+        }
+    }
+
+    /// Returns the alternative layout for a two-choice preference control.
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::DrillDown => Self::Split,
+            Self::Split => Self::DrillDown,
         }
     }
 }
@@ -761,6 +843,11 @@ mod tests {
         assert_eq!(config.playback.resume_rewind_seconds, 30);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
+        assert!(config.ui.prefetch_search_thumbnails);
+        assert_eq!(
+            config.ui.subscriptions_layout,
+            SubscriptionsLayout::DrillDown
+        );
         assert!(config.providers.allow_insecure_http);
         assert_eq!(config.providers.youtube_backend, YouTubeBackend::Auto);
         assert!(config.providers.jamendo_client_id.is_none());
@@ -787,6 +874,8 @@ auto_download = false
 [ui]
 theme = "light"
 thumbnail_height = 14
+prefetch_search_thumbnails = false
+subscriptions_layout = "split"
 "#,
         )
         .expect("write test TOML");
@@ -798,6 +887,8 @@ thumbnail_height = 14
         assert!(!config.subscriptions.auto_download);
         assert_eq!(config.ui.theme, ThemeMode::Light);
         assert_eq!(config.ui.thumbnail_height, 14);
+        assert!(!config.ui.prefetch_search_thumbnails);
+        assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert_eq!(config.config_dir(), directory.path());
     }
 
@@ -809,6 +900,8 @@ thumbnail_height = 14
             assert_eq!(config.playback.volume_percent, 62);
             assert!(config.ui.nyan_cat_seekbar);
             assert_eq!(config.ui.thumbnail_height, 16);
+            assert!(!config.ui.prefetch_search_thumbnails);
+            assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
             return;
         }
 
@@ -829,8 +922,83 @@ thumbnail_height = 14
             .env("YOUTA_PLAYBACK__VOLUME_PERCENT", "62")
             .env("YOUTA_UI__NYAN_CAT_SEEKBAR", "true")
             .env("YOUTA_UI__THUMBNAIL_HEIGHT", "16")
+            .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
+            .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .output()
             .expect("run environment test child");
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn subscriptions_layout_save_preserves_unrelated_toml_and_comments() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# keep this comment
+[ui]
+theme = "dark"
+subscriptions_layout = "drill-down"
+
+[providers]
+youtube_api_key = "keep-this-existing-secret"
+"#,
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_subscriptions_layout(SubscriptionsLayout::Split)
+            .expect("save subscriptions layout");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("theme = \"dark\""));
+        assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
+        assert!(contents.contains("subscriptions_layout = \"split\""));
+        let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("reload configuration");
+        assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn subscriptions_layout_environment_override_locks_in_app_save() {
+        const CHILD_MARKER: &str = "YOUTA_LAYOUT_SAVE_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory = PathBuf::from(
+                std::env::var("YOUTA_LAYOUT_SAVE_TEST_DIR").expect("child test directory"),
+            );
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
+            let error = config
+                .save_subscriptions_layout(SubscriptionsLayout::DrillDown)
+                .expect_err("environment override must lock the writer");
+            assert!(error.to_string().contains(SUBSCRIPTIONS_LAYOUT_ENV));
+            assert!(!directory.join("config.toml").exists());
+            return;
+        }
+
+        let directory = tempdir().expect("temporary directory");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "config::tests::subscriptions_layout_environment_override_locks_in_app_save",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("YOUTA_LAYOUT_SAVE_TEST_DIR", directory.path())
+            .env(CONFIG_DIR_ENV, directory.path())
+            .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
+            .output()
+            .expect("run environment-lock child");
         assert!(
             output.status.success(),
             "child test failed:\n{}",

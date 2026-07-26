@@ -149,6 +149,7 @@ fn run_tui(config: Config) -> Result<()> {
         },
         thumbnails: config.ui.thumbnails,
         thumbnail_height: config.ui.thumbnail_height,
+        prefetch_search_thumbnails: config.ui.prefetch_search_thumbnails,
         thumbnail_cache_dir: Some(config.thumbnail_cache_dir()),
         ..UiSettings::default()
     };

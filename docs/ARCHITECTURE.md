@@ -208,6 +208,46 @@ Wikidata matching is advisory. Exact external-ID claims rank above URL and
 normalized-title matches. Ambiguous title matches are displayed as suggestions,
 not asserted links.
 
+### Subscription navigation and channel videos
+
+Subscriptions are local OPML entries. Selecting `Subscribe (locally)` for a
+YouTube video stores its channel; an API key is public-metadata authentication,
+not authorization to mutate a YouTube account. Remote subscription sync
+therefore remains an OAuth-gated feature.
+
+The TUI reducer owns two subscription layouts over the same state:
+
+- drill-down starts with sources and enters one source's list-and-Details view;
+- split retains the source list while showing the selected source's videos.
+
+`Tab` resets either layout to the source root from any main screen. The
+Preferences popup changes `ui.subscriptions_layout`; the environment override
+`YOUTA_UI__SUBSCRIPTIONS_LAYOUT` has higher precedence and prevents an in-app
+save until it is removed. The targeted configuration writer preserves
+unrelated TOML content instead of serializing secret-bearing configuration
+state again.
+
+Channel-video work is selected-source lazy. For the official API, the worker
+uses `channels.list` to find the uploads playlist,
+[`playlistItems.list`](https://developers.google.com/youtube/v3/docs/playlistItems/list)
+to preserve upload order, and
+[`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list) to
+batch row metadata. The Invidious worker uses its documented [channel videos
+endpoint](https://docs.invidious.io/api/channels_endpoint/). Both adapters
+translate provider continuation tokens into sequential page numbers at the
+provider boundary.
+
+Moving across split-view sources performs no remote work; Enter explicitly
+activates an uncached source. The controller keeps a bounded least-recently-used
+RAM cache: at most 24 channels and 250 videos per channel under a shared
+approximate 8 MiB heap budget. Description excerpts and thumbnail sets are
+compacted before insertion. Approaching the end of visible rows requests the
+next page; bounded automatic continuation skips private/unavailable-only
+pages. Cache entries survive layout switches during the process but are not
+persisted across restarts. Every response carries a subscription generation;
+a response for an older selection is ignored and cannot replace the newly
+selected channel's rows.
+
 ## Playback
 
 `PlaybackBackend` owns loading, play/pause, seek, volume, speed, current
@@ -294,7 +334,10 @@ Thumbnail support is a separate feature and runtime capability:
 - supported graphics protocol detected: fetch a size-bounded thumbnail lazily;
 - Linux virtual console, serial/real TTY, `TERM=dumb`, or unknown protocol:
   show text details only;
-- no thumbnail fetch for off-screen rows;
+- selected artwork has priority; one bounded worker may then prefetch the
+  currently loaded global Search rows into the persistent cache;
+- unseen pagination, subscription feeds, and non-Search screens are excluded
+  from background prefetch;
 - cache has byte and entry limits and can be disabled.
 
 Mouse regions are derived from the same layout rectangles used to render
@@ -386,7 +429,8 @@ bidirectional sync.
 - Suspend auto-download on metered connection or low battery when detectable
   and configured.
 - Bound every cache by bytes as well as entry count.
-- Decode thumbnails and waveforms only for the selected item.
+- Encode terminal thumbnails and render waveforms only for the selected item;
+  background thumbnail work stops after bounded validation and cache storage.
 - Prefer event notifications from `mpv` over high-frequency property polling.
 
 The funny DOS-RPG theme and Nyan Cat seek bar are presentation modes. They must

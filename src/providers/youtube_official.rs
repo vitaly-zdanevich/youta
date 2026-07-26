@@ -1,10 +1,12 @@
 //! Official `YouTube` Data API v3 search and metadata provider.
 //!
 //! Search uses `search.list`, then enriches the ordered identifiers with one
-//! batched `videos.list` or `channels.list` request. `YouTube` exposes opaque
-//! page tokens rather than page numbers, so this adapter keeps a small,
-//! bounded token cache per canonical query. Callers must request pages
-//! sequentially, starting with page one.
+//! batched `videos.list` or `channels.list` request. Channel uploads use the
+//! documented uploads playlist: one cached `channels.list` lookup followed by
+//! `playlistItems.list` and a batched `videos.list`. `YouTube` exposes opaque
+//! page tokens rather than page numbers, so this adapter keeps small, bounded
+//! token caches. Callers must request pages sequentially, starting with page
+//! one.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -16,11 +18,11 @@ use serde_json::Value;
 use url::Url;
 
 use super::{
-    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, DEFAULT_MAX_JSON_BYTES,
-    DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError, SearchDate,
-    SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort, SearchTarget,
-    Thumbnail, VideoDetails, VideoSummary, parse_rfc3339_epoch, provider_agent, validate_base_url,
-    validate_youtube_video_id,
+    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest,
+    DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
+    SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
+    SearchTarget, Thumbnail, VideoDetails, VideoSummary, parse_rfc3339_epoch, provider_agent,
+    validate_base_url, validate_youtube_video_id,
 };
 
 const API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
@@ -31,6 +33,8 @@ const MIN_API_KEY_BYTES: usize = 16;
 const MAX_PAGE_TOKEN_BYTES: usize = 2 * 1024;
 const MAX_CACHED_SEARCHES: usize = 32;
 const MAX_TOKENS_PER_SEARCH: usize = 32;
+const MAX_CACHED_CHANNELS: usize = 32;
+const MAX_TOKENS_PER_CHANNEL: usize = 32;
 const MAX_SERVICE_REASON_CHARS: usize = 96;
 const MAX_SERVICE_MESSAGE_CHARS: usize = 512;
 const MAX_CHANNEL_STATISTICS_IDS: usize = 50;
@@ -47,6 +51,7 @@ pub struct YouTubeOfficialProvider {
     agent: ureq::Agent,
     max_json_bytes: usize,
     page_tokens: Arc<Mutex<PageTokenCache>>,
+    channel_page_tokens: Arc<Mutex<ChannelPageTokenCache>>,
 }
 
 impl YouTubeOfficialProvider {
@@ -102,6 +107,7 @@ impl YouTubeOfficialProvider {
             agent: provider_agent(timeout),
             max_json_bytes,
             page_tokens: Arc::new(Mutex::new(PageTokenCache::default())),
+            channel_page_tokens: Arc::new(Mutex::new(ChannelPageTokenCache::default())),
         })
     }
 
@@ -226,6 +232,16 @@ impl YouTubeOfficialProvider {
     fn lock_page_tokens(&self) -> Result<MutexGuard<'_, PageTokenCache>, ProviderError> {
         self.page_tokens.lock().map_err(|_| {
             ProviderError::Transport("YouTube pagination state lock was poisoned".to_owned())
+        })
+    }
+
+    fn lock_channel_page_tokens(
+        &self,
+    ) -> Result<MutexGuard<'_, ChannelPageTokenCache>, ProviderError> {
+        self.channel_page_tokens.lock().map_err(|_| {
+            ProviderError::Transport(
+                "YouTube channel pagination state lock was poisoned".to_owned(),
+            )
         })
     }
 
@@ -364,6 +380,129 @@ impl YouTubeOfficialProvider {
             .collect()
     }
 
+    /// Resolves and caches the system uploads playlist advertised by a
+    /// channel resource.
+    ///
+    /// This one-unit `channels.list` lookup replaces the substantially more
+    /// expensive `search.list` route for channel uploads. Subsequent pages can
+    /// reuse the playlist identifier.
+    fn uploads_playlist_id(&self, channel_id: &str) -> Result<String, ProviderError> {
+        if let Some(playlist_id) = self
+            .lock_channel_page_tokens()?
+            .uploads_playlist_id(channel_id)
+            .map(str::to_owned)
+        {
+            return Ok(playlist_id);
+        }
+
+        let mut url = self.endpoint("channels")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("part", "contentDetails");
+            query.append_pair("id", channel_id);
+            query.append_pair("maxResults", "1");
+        }
+        let response: RawChannelUploadsListResponse = self.request_json(&url)?;
+        let mut items = response.items.into_iter();
+        let resource = items.next().ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "YouTube channel was not found or has no uploads playlist".to_owned(),
+            )
+        })?;
+        validate_channel_id(&resource.id, "channel uploads resource ID")?;
+        if resource.id != channel_id {
+            return Err(ProviderError::InvalidResponse(
+                "channel uploads response identifier does not match the requested channel"
+                    .to_owned(),
+            ));
+        }
+        let playlist_id = resource.content_details.related_playlists.uploads;
+        validate_playlist_id(&playlist_id)?;
+        self.lock_channel_page_tokens()?
+            .remember_uploads_playlist(channel_id, &playlist_id);
+        Ok(playlist_id)
+    }
+
+    /// Returns the uploads playlist and opaque token needed for one numbered
+    /// channel page.
+    fn channel_page_context(
+        &self,
+        request: &ChannelVideosRequest,
+    ) -> Result<(String, Option<String>), ProviderError> {
+        request.validate()?;
+        validate_channel_id(&request.channel_id, "requested channel ID").map_err(|_| {
+            ProviderError::InvalidRequest(
+                "YouTube channel ID contains invalid characters".to_owned(),
+            )
+        })?;
+        if request.page == 1 {
+            return self
+                .uploads_playlist_id(&request.channel_id)
+                .map(|playlist_id| (playlist_id, None));
+        }
+        self.lock_channel_page_tokens()?
+            .page_context(&request.channel_id, request.page)
+            .map(|(playlist_id, token)| (playlist_id.to_owned(), Some(token.to_owned())))
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(format!(
+                    "YouTube channel pages must be loaded sequentially; load page {} first",
+                    request.page.saturating_sub(1)
+                ))
+            })
+    }
+
+    /// Fetches one uploads-playlist page and enriches its ordered video IDs in
+    /// one batched `videos.list` request.
+    fn channel_videos_page(
+        &self,
+        request: &ChannelVideosRequest,
+    ) -> Result<SearchPage, ProviderError> {
+        let (playlist_id, page_token) = self.channel_page_context(request)?;
+        let mut url = self.endpoint("playlistItems")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("part", "contentDetails");
+            query.append_pair("playlistId", &playlist_id);
+            query.append_pair("maxResults", &RESULTS_PER_PAGE.to_string());
+            if let Some(token) = page_token.as_deref() {
+                query.append_pair("pageToken", token);
+            }
+        }
+        let response: RawPlaylistItemsResponse = self.request_json(&url)?;
+        let next_token = response
+            .next_page_token
+            .map(validate_page_token)
+            .transpose()?
+            .flatten();
+        let next_page = next_token
+            .as_ref()
+            .filter(|_| request.page < 10_000)
+            .map(|_| request.page.saturating_add(1));
+        self.lock_channel_page_tokens()?.remember_next_page(
+            &request.channel_id,
+            request.page,
+            next_token,
+        );
+
+        let mut video_ids = Vec::with_capacity(response.items.len());
+        for item in response.items {
+            validate_response_video_id(&item.content_details.video_id)?;
+            video_ids.push(item.content_details.video_id);
+        }
+        let mut resources = self.fetch_video_resources(&video_ids)?;
+        let items = video_ids
+            .into_iter()
+            .filter_map(|video_id| resources.remove(&video_id))
+            .map(video_summary_from_resource)
+            .map(|result| result.map(SearchItem::Video))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SearchPage {
+            page: request.page,
+            items,
+            next_page,
+        })
+    }
+
     fn fetch_channel_subscriber_counts(
         &self,
         ids: &[String],
@@ -497,6 +636,7 @@ impl fmt::Debug for YouTubeOfficialProvider {
             .field("api_key", &"[REDACTED]")
             .field("max_json_bytes", &self.max_json_bytes)
             .field("page_tokens", &"[OPAQUE]")
+            .field("channel_page_tokens", &"[OPAQUE]")
             .finish_non_exhaustive()
     }
 }
@@ -536,6 +676,31 @@ impl Provider for YouTubeOfficialProvider {
         let now_epoch = i64::try_from(now_epoch)
             .map_err(|_| ProviderError::Transport("system time is out of range".to_owned()))?;
         self.search_at(request, now_epoch)
+    }
+
+    fn channel_videos(&self, request: &ChannelVideosRequest) -> Result<SearchPage, ProviderError> {
+        self.channel_videos_page(request)
+    }
+
+    fn channel_details(&self, channel_id: &str) -> Result<ChannelSummary, ProviderError> {
+        validate_channel_id(channel_id, "requested channel ID").map_err(|_| {
+            ProviderError::InvalidRequest(
+                "YouTube channel ID contains invalid characters".to_owned(),
+            )
+        })?;
+        let resources = self.fetch_channel_resources(&[channel_id.to_owned()])?;
+        let mut resources = resources.into_iter();
+        let Some((returned_id, resource)) = resources.next() else {
+            return Err(ProviderError::InvalidResponse(
+                "YouTube channel was not found".to_owned(),
+            ));
+        };
+        if returned_id != channel_id || resources.next().is_some() {
+            return Err(ProviderError::InvalidResponse(
+                "channel response identifier does not match the requested channel".to_owned(),
+            ));
+        }
+        channel_summary_from_resource(resource)
     }
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
@@ -674,6 +839,77 @@ impl PageTokenCache {
 struct PageCursor {
     token: String,
     published_after: Option<String>,
+}
+
+/// Bounded uploads-playlist and continuation state keyed by channel ID.
+#[derive(Default)]
+struct ChannelPageTokenCache {
+    channels: HashMap<String, CachedChannelPages>,
+    order: VecDeque<String>,
+}
+
+impl ChannelPageTokenCache {
+    fn uploads_playlist_id(&self, channel_id: &str) -> Option<&str> {
+        self.channels
+            .get(channel_id)
+            .map(|channel| channel.uploads_playlist_id.as_str())
+    }
+
+    fn page_context(&self, channel_id: &str, page: u32) -> Option<(&str, &str)> {
+        let channel = self.channels.get(channel_id)?;
+        let token = channel.page_tokens.get(&page)?;
+        Some((channel.uploads_playlist_id.as_str(), token.as_str()))
+    }
+
+    fn remember_uploads_playlist(&mut self, channel_id: &str, playlist_id: &str) {
+        if let Some(channel) = self.channels.get_mut(channel_id) {
+            if channel.uploads_playlist_id != playlist_id {
+                playlist_id.clone_into(&mut channel.uploads_playlist_id);
+                channel.page_tokens.clear();
+            }
+            return;
+        }
+        while self.channels.len() >= MAX_CACHED_CHANNELS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.channels.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(channel_id.to_owned());
+        self.channels.insert(
+            channel_id.to_owned(),
+            CachedChannelPages {
+                uploads_playlist_id: playlist_id.to_owned(),
+                page_tokens: BTreeMap::new(),
+            },
+        );
+    }
+
+    fn remember_next_page(&mut self, channel_id: &str, page: u32, next_token: Option<String>) {
+        let Some(channel) = self.channels.get_mut(channel_id) else {
+            return;
+        };
+        if page == 1 {
+            channel.page_tokens.clear();
+        }
+        if let Some(token) = next_token {
+            channel.page_tokens.insert(page.saturating_add(1), token);
+        } else {
+            channel.page_tokens.remove(&page.saturating_add(1));
+        }
+        while channel.page_tokens.len() > MAX_TOKENS_PER_CHANNEL {
+            let Some(oldest) = channel.page_tokens.keys().next().copied() else {
+                break;
+            };
+            channel.page_tokens.remove(&oldest);
+        }
+    }
+}
+
+struct CachedChannelPages {
+    uploads_playlist_id: String,
+    page_tokens: BTreeMap<u32, String>,
 }
 
 fn validate_official_filters(request: &SearchRequest) -> Result<(), ProviderError> {
@@ -818,6 +1054,20 @@ fn validate_page_token(token: String) -> Result<Option<String>, ProviderError> {
         ));
     }
     Ok(Some(token))
+}
+
+fn validate_playlist_id(playlist_id: &str) -> Result<(), ProviderError> {
+    if playlist_id.is_empty()
+        || playlist_id.len() > 128
+        || !playlist_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ProviderError::InvalidResponse(
+            "YouTube response contains an invalid uploads playlist ID".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_response_video_id(video_id: &str) -> Result<(), ProviderError> {
@@ -1134,6 +1384,51 @@ struct RawSearchResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawChannelUploadsListResponse {
+    #[serde(default)]
+    items: Vec<RawChannelUploadsResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChannelUploadsResource {
+    id: String,
+    #[serde(rename = "contentDetails")]
+    content_details: RawChannelContentDetails,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawChannelContentDetails {
+    related_playlists: RawRelatedPlaylists,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRelatedPlaylists {
+    uploads: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlaylistItemsResponse {
+    #[serde(default)]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    items: Vec<RawPlaylistItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPlaylistItem {
+    #[serde(rename = "contentDetails")]
+    content_details: RawPlaylistItemContentDetails,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlaylistItemContentDetails {
+    video_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawSearchItem {
     id: RawSearchId,
     snippet: RawSnippet,
@@ -1406,6 +1701,50 @@ mod tests {
         }]
     }"#;
 
+    const UPLOADS_PLAYLIST_ID: &str = "UU_x5XG1OV2P6uZZ5FSM9Ttw";
+
+    const CHANNEL_UPLOADS_RESOURCE: &str = r#"{
+        "items": [{
+            "id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+            "contentDetails": {
+                "relatedPlaylists": {
+                    "uploads": "UU_x5XG1OV2P6uZZ5FSM9Ttw"
+                }
+            }
+        }]
+    }"#;
+
+    const UPLOADS_PAGE_ONE: &str = r#"{
+        "nextPageToken": "uploads_page_2",
+        "items": [{
+            "contentDetails": {"videoId": "dQw4w9WgXcQ"}
+        }]
+    }"#;
+
+    const UPLOADS_PAGE_TWO: &str = r#"{
+        "items": [{
+            "contentDetails": {"videoId": "aaaaaaaaaaa"}
+        }]
+    }"#;
+
+    const SECOND_VIDEO_RESOURCE: &str = r#"{
+        "items": [{
+            "id": "aaaaaaaaaaa",
+            "snippet": {
+                "publishedAt": "2025-02-03T04:05:06Z",
+                "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+                "title": "Second upload",
+                "description": "Second description",
+                "channelTitle": "Enriched channel",
+                "liveBroadcastContent": "none",
+                "thumbnails": {}
+            },
+            "contentDetails": {"duration": "PT3M2S"},
+            "statistics": {"viewCount": "456"},
+            "status": {"license": "youtube"}
+        }]
+    }"#;
+
     fn provider_with_server(responses: Vec<String>) -> (YouTubeOfficialProvider, MockServer) {
         let server = MockServer::spawn(responses);
         let provider = YouTubeOfficialProvider::with_base_url(
@@ -1648,6 +1987,263 @@ mod tests {
                 .subscriber_count,
             None
         );
+    }
+
+    #[test]
+    fn channel_details_use_exact_id_and_map_public_metadata() {
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", CHANNEL_RESOURCE)]);
+
+        let channel = provider
+            .channel_details(CHANNEL_ID)
+            .expect("exact channel metadata should parse");
+        let requests = server.finish();
+
+        assert_eq!(channel.channel_id, CHANNEL_ID);
+        assert_eq!(channel.name, "Enriched channel");
+        assert_eq!(channel.description, "Full channel description");
+        assert_eq!(channel.subscriber_count, Some(9_001));
+        assert_eq!(channel.video_count, Some(42));
+        assert_eq!(channel.thumbnails.len(), 1);
+        assert_eq!(
+            channel.webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw")
+        );
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("/channels?"));
+        let pairs = query_pairs(&requests[0]);
+        assert_eq!(
+            pairs.get("part").map(String::as_str),
+            Some("snippet,statistics")
+        );
+        assert_eq!(pairs.get("id").map(String::as_str), Some(CHANNEL_ID));
+        assert_eq!(pairs.get("maxResults").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("key").map(String::as_str), Some(TEST_KEY));
+        assert_eq!(
+            pairs.len(),
+            4,
+            "exact lookup must not add search parameters"
+        );
+    }
+
+    #[test]
+    fn channel_details_preserve_hidden_and_missing_public_metadata() {
+        let hidden = format!(
+            r#"{{
+                "items": [{{
+                    "id": "{CHANNEL_ID}",
+                    "snippet": {{
+                        "title": "Hidden channel",
+                        "description": "",
+                        "thumbnails": {{}}
+                    }},
+                    "statistics": {{
+                        "subscriberCount": "99",
+                        "hiddenSubscriberCount": true
+                    }}
+                }}]
+            }}"#
+        );
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &hidden)]);
+
+        let channel = provider
+            .channel_details(CHANNEL_ID)
+            .expect("hidden optional metadata is still a valid channel");
+        server.finish();
+
+        assert_eq!(channel.description, "");
+        assert_eq!(channel.subscriber_count, None);
+        assert_eq!(channel.video_count, None);
+        assert!(channel.thumbnails.is_empty());
+    }
+
+    #[test]
+    fn channel_details_reject_invalid_mismatched_and_missing_identifiers() {
+        let provider =
+            YouTubeOfficialProvider::new(TEST_KEY).expect("test API key should be accepted");
+        for invalid in ["", "../channels", "UC fixture", "UCfixture?key=leak"] {
+            assert!(
+                matches!(
+                    provider.channel_details(invalid),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+
+        let mismatched = CHANNEL_RESOURCE.replace(CHANNEL_ID, "UCaaaaaaaaaaaaaaaaaaaaaa");
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &mismatched)]);
+        assert!(matches!(
+            provider.channel_details(CHANNEL_ID),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("does not match")
+        ));
+        server.finish();
+
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", r#"{"items":[]}"#)]);
+        assert!(matches!(
+            provider.channel_details(CHANNEL_ID),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("not found")
+        ));
+        server.finish();
+
+        let malformed = CHANNEL_RESOURCE.replace(CHANNEL_ID, "invalid channel id");
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &malformed)]);
+        assert!(matches!(
+            provider.channel_details(CHANNEL_ID),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        server.finish();
+    }
+
+    #[test]
+    fn channel_uploads_use_low_quota_playlist_pagination_and_video_batches() {
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", UPLOADS_PAGE_ONE),
+            json_response("200 OK", VIDEO_RESOURCE),
+            json_response("200 OK", UPLOADS_PAGE_TWO),
+            json_response("200 OK", SECOND_VIDEO_RESOURCE),
+        ]);
+        let mut request = ChannelVideosRequest::new(CHANNEL_ID);
+        let first = provider
+            .channel_videos(&request)
+            .expect("first uploads page should succeed");
+        request.page = 2;
+        let second = provider
+            .channel_videos(&request)
+            .expect("cached continuation should load page two");
+        let requests = server.finish();
+
+        assert_eq!(first.page, 1);
+        assert_eq!(first.next_page, Some(2));
+        let [SearchItem::Video(first_video)] = first.items.as_slice() else {
+            panic!("channel uploads must contain only videos");
+        };
+        assert_eq!(first_video.video_id, VIDEO_ID);
+        assert_eq!(first_video.title, "Enriched title");
+        assert_eq!(first_video.duration_seconds, Some(93_784));
+
+        assert_eq!(second.page, 2);
+        assert_eq!(second.next_page, None);
+        let [SearchItem::Video(second_video)] = second.items.as_slice() else {
+            panic!("channel uploads must contain only videos");
+        };
+        assert_eq!(second_video.video_id, "aaaaaaaaaaa");
+        assert_eq!(second_video.duration_seconds, Some(182));
+
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("/search?")),
+            "channel uploads must not spend search.list quota"
+        );
+        assert!(requests[0].starts_with("/channels?"));
+        let channel_pairs = query_pairs(&requests[0]);
+        assert_eq!(
+            channel_pairs.get("part").map(String::as_str),
+            Some("contentDetails")
+        );
+        assert_eq!(
+            channel_pairs.get("id").map(String::as_str),
+            Some(CHANNEL_ID)
+        );
+
+        assert!(requests[1].starts_with("/playlistItems?"));
+        let first_playlist_pairs = query_pairs(&requests[1]);
+        assert_eq!(
+            first_playlist_pairs.get("playlistId").map(String::as_str),
+            Some(UPLOADS_PLAYLIST_ID)
+        );
+        assert_eq!(
+            first_playlist_pairs.get("part").map(String::as_str),
+            Some("contentDetails")
+        );
+        assert!(!first_playlist_pairs.contains_key("pageToken"));
+        assert!(requests[2].starts_with("/videos?"));
+
+        assert!(requests[3].starts_with("/playlistItems?"));
+        let second_playlist_pairs = query_pairs(&requests[3]);
+        assert_eq!(
+            second_playlist_pairs.get("pageToken").map(String::as_str),
+            Some("uploads_page_2")
+        );
+        assert!(requests[4].starts_with("/videos?"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("/channels?"))
+                .count(),
+            1,
+            "the uploads playlist ID must be reused for continuation pages"
+        );
+    }
+
+    #[test]
+    fn channel_uploads_require_valid_identifiers_and_sequential_pages() {
+        let provider =
+            YouTubeOfficialProvider::new(TEST_KEY).expect("test API key should be accepted");
+        for channel_id in ["../channels", "UC fixture", "UCfixture?key=leak"] {
+            let error = provider
+                .channel_videos(&ChannelVideosRequest::new(channel_id))
+                .expect_err("path-like channel identifier must fail before transport");
+            assert!(matches!(error, ProviderError::InvalidRequest(_)));
+        }
+
+        let mut second_page = ChannelVideosRequest::new(CHANNEL_ID);
+        second_page.page = 2;
+        let error = provider
+            .channel_videos(&second_page)
+            .expect_err("page two needs the page-one continuation");
+        assert!(
+            matches!(
+                &error,
+                ProviderError::InvalidRequest(message) if message.contains("page 1")
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn channel_uploads_reject_malformed_playlist_metadata_and_tokens() {
+        let malformed_playlist =
+            CHANNEL_UPLOADS_RESOURCE.replace(UPLOADS_PLAYLIST_ID, "invalid uploads playlist");
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", &malformed_playlist)]);
+        let error = provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect_err("unsafe playlist identifier must fail");
+        server.finish();
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+
+        let malformed_token = UPLOADS_PAGE_ONE.replace("uploads_page_2", "bad continuation token");
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", &malformed_token),
+        ]);
+        let error = provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect_err("unsafe continuation token must fail");
+        server.finish();
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn unavailable_channel_upload_resources_are_omitted_without_changing_continuation() {
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", UPLOADS_PAGE_ONE),
+            json_response("200 OK", r#"{"items":[]}"#),
+        ]);
+        let page = provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect("private or deleted upload resources may be absent");
+        server.finish();
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_page, Some(2));
     }
 
     #[test]
@@ -1914,6 +2510,23 @@ mod tests {
             error,
             ProviderError::ResponseTooLarge { limit: 4 }
         ));
+
+        let server = MockServer::spawn(vec![json_response("200 OK", CHANNEL_RESOURCE)]);
+        let provider = YouTubeOfficialProvider::with_base_url(
+            TEST_KEY,
+            server.base_url.clone(),
+            Duration::from_secs(2),
+            32,
+        )
+        .expect("small bounded provider should construct");
+        let error = provider
+            .channel_details(CHANNEL_ID)
+            .expect_err("channel metadata must use the same response bound");
+        server.finish();
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge { limit: 32 }
+        ));
     }
 
     #[test]
@@ -2039,6 +2652,28 @@ mod tests {
             );
         }
         assert!(cache.searches[&key].len() <= MAX_TOKENS_PER_SEARCH);
+    }
+
+    #[test]
+    fn channel_token_cache_is_bounded_and_first_page_restarts_the_chain() {
+        let mut cache = ChannelPageTokenCache::default();
+        for index in 0..(MAX_CACHED_CHANNELS + 5) {
+            cache.remember_uploads_playlist(&format!("UC{index:022}"), &format!("UU{index:022}"));
+        }
+        assert_eq!(cache.channels.len(), MAX_CACHED_CHANNELS);
+
+        let channel_id = format!("UC{:022}", MAX_CACHED_CHANNELS + 4);
+        let final_page =
+            u32::try_from(MAX_TOKENS_PER_CHANNEL).expect("test cache limit should fit u32") + 8;
+        for page in 1..=final_page {
+            cache.remember_next_page(&channel_id, page, Some(format!("token-{page}")));
+        }
+        assert!(cache.channels[&channel_id].page_tokens.len() <= MAX_TOKENS_PER_CHANNEL);
+
+        cache.remember_next_page(&channel_id, 1, Some("fresh-token".to_owned()));
+        let pages = &cache.channels[&channel_id].page_tokens;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages.get(&2).map(String::as_str), Some("fresh-token"));
     }
 
     struct MockServer {

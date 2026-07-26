@@ -2,34 +2,41 @@
 //!
 //! The provider uses only the documented JSON API. Stream extraction remains a
 //! playback concern so an Invidious instance can be combined with `yt-dlp` or a
-//! different playback backend.
+//! different playback backend. Channel uploads use the documented
+//! `/api/v1/channels/:id/videos` endpoint; a bounded cache maps its opaque
+//! continuation tokens to Youta's sequential page numbers.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use super::ChannelSummary;
 use super::{
-    ChannelStatisticsMode, ChannelSubscriberCount, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT,
-    Provider, ProviderCapabilities, ProviderError, SearchDate, SearchDuration, SearchFeature,
-    SearchItem, SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails,
-    VideoSummary, get_bounded_json, provider_agent, resolve_http_url, validate_base_url,
-    validate_youtube_video_id,
+    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest,
+    DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
+    SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
+    SearchTarget, Thumbnail, VideoDetails, VideoSummary, get_bounded_json, provider_agent,
+    resolve_http_url, validate_base_url, validate_youtube_video_id,
 };
 
 const MAX_CONFIGURED_JSON_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTINUATION_TOKEN_BYTES: usize = 8 * 1024;
+const MAX_CACHED_CHANNELS: usize = 32;
+const MAX_TOKENS_PER_CHANNEL: usize = 32;
 
 /// Blocking client for a configurable Invidious instance.
 ///
-/// Clone the provider only when multiple worker threads need access; `ureq`
-/// clones share their connection pool.
+/// Clones share both the `ureq` connection pool and the bounded opaque
+/// continuation-token cache used for channel-video pagination.
 #[derive(Clone)]
 pub struct InvidiousProvider {
     base_url: Url,
     agent: ureq::Agent,
     max_json_bytes: usize,
+    channel_page_tokens: Arc<Mutex<ChannelPageTokenCache>>,
 }
 
 impl InvidiousProvider {
@@ -69,6 +76,7 @@ impl InvidiousProvider {
             base_url,
             agent: provider_agent(timeout),
             max_json_bytes,
+            channel_page_tokens: Arc::new(Mutex::new(ChannelPageTokenCache::default())),
         })
     }
 
@@ -150,6 +158,71 @@ impl InvidiousProvider {
         Ok(url)
     }
 
+    /// Builds the documented Invidious channel-videos endpoint.
+    ///
+    /// The remote API accepts an opaque continuation token. Youta's numbered
+    /// page is deliberately absent from the URL because it is translated to a
+    /// token by [`Self::channel_page_context`].
+    fn build_channel_videos_url(
+        &self,
+        request: &ChannelVideosRequest,
+        continuation: Option<&str>,
+    ) -> Result<Url, ProviderError> {
+        request.validate()?;
+        validate_resource_id(&request.channel_id, "channel ID").map_err(|_| {
+            ProviderError::InvalidRequest(
+                "Invidious channel ID contains invalid characters".to_owned(),
+            )
+        })?;
+        let mut url = self.endpoint("api/v1/channels/")?;
+        url.path_segments_mut()
+            .map_err(|()| ProviderError::InvalidBaseUrl("URL cannot contain API paths".to_owned()))?
+            .pop_if_empty()
+            .push(&request.channel_id)
+            .push("videos");
+        if let Some(continuation) = continuation {
+            url.query_pairs_mut()
+                .append_pair("continuation", continuation);
+        }
+        Ok(url)
+    }
+
+    /// Returns the opaque continuation needed for a numbered channel page.
+    fn channel_page_context(
+        &self,
+        request: &ChannelVideosRequest,
+    ) -> Result<Option<String>, ProviderError> {
+        request.validate()?;
+        validate_resource_id(&request.channel_id, "channel ID").map_err(|_| {
+            ProviderError::InvalidRequest(
+                "Invidious channel ID contains invalid characters".to_owned(),
+            )
+        })?;
+        if request.page == 1 {
+            return Ok(None);
+        }
+        self.lock_channel_page_tokens()?
+            .token(&request.channel_id, request.page)
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(format!(
+                    "Invidious channel pages must be loaded sequentially; load page {} first",
+                    request.page.saturating_sub(1)
+                ))
+            })
+    }
+
+    fn lock_channel_page_tokens(
+        &self,
+    ) -> Result<MutexGuard<'_, ChannelPageTokenCache>, ProviderError> {
+        self.channel_page_tokens.lock().map_err(|_| {
+            ProviderError::Transport(
+                "Invidious channel pagination state lock was poisoned".to_owned(),
+            )
+        })
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, ProviderError> {
         self.base_url
             .join(path)
@@ -207,6 +280,47 @@ impl InvidiousProvider {
             items,
             next_page,
         })
+    }
+
+    /// Converts one documented channel-videos response without exposing the
+    /// remote continuation token to callers.
+    fn convert_channel_videos_page(
+        &self,
+        raw: RawChannelVideosPage,
+        request: &ChannelVideosRequest,
+    ) -> Result<(SearchPage, Option<String>), ProviderError> {
+        let mut items = Vec::with_capacity(raw.videos.len());
+        for (index, value) in raw.videos.into_iter().enumerate() {
+            if value.get("type").and_then(Value::as_str) != Some("video") {
+                return Err(ProviderError::InvalidResponse(format!(
+                    "channel video result {index} has an invalid type"
+                )));
+            }
+            let raw: RawVideoSearch = serde_json::from_value(value).map_err(|error| {
+                ProviderError::InvalidResponse(format!(
+                    "channel video result {index} is malformed: {error}"
+                ))
+            })?;
+            if raw.author_id != request.channel_id {
+                return Err(ProviderError::InvalidResponse(format!(
+                    "channel video result {index} does not belong to the requested channel"
+                )));
+            }
+            items.push(SearchItem::Video(self.convert_video_summary(raw)?));
+        }
+        let continuation = validate_continuation_token(raw.continuation)?;
+        let next_page = continuation
+            .as_ref()
+            .filter(|_| request.page < 10_000)
+            .map(|_| request.page.saturating_add(1));
+        Ok((
+            SearchPage {
+                page: request.page,
+                items,
+                next_page,
+            },
+            continuation,
+        ))
     }
 
     fn convert_video_summary(&self, raw: RawVideoSearch) -> Result<VideoSummary, ProviderError> {
@@ -268,6 +382,30 @@ impl InvidiousProvider {
         Ok(ChannelSubscriberCount {
             channel_id: raw.author_id,
             subscriber_count: raw.sub_count,
+        })
+    }
+
+    fn convert_channel_details(
+        &self,
+        raw: RawChannelDetails,
+        requested_id: &str,
+    ) -> Result<ChannelSummary, ProviderError> {
+        validate_resource_id(&raw.author_id, "channel authorId")?;
+        if raw.author_id != requested_id {
+            return Err(ProviderError::InvalidResponse(
+                "channel response identifier does not match the requested channel".to_owned(),
+            ));
+        }
+        require_nonempty(&raw.author, "channel author")?;
+        Ok(ChannelSummary {
+            channel_id: raw.author_id,
+            name: raw.author,
+            description: raw.description,
+            subscriber_count: raw.sub_count,
+            video_count: None,
+            auto_generated: raw.auto_generated,
+            thumbnails: self.convert_thumbnails(raw.author_thumbnails),
+            webpage_url: youtube_channel_url(requested_id),
         })
     }
 
@@ -383,6 +521,25 @@ impl Provider for InvidiousProvider {
         self.parse_search_values(values, request)
     }
 
+    fn channel_videos(&self, request: &ChannelVideosRequest) -> Result<SearchPage, ProviderError> {
+        let continuation = self.channel_page_context(request)?;
+        let url = self.build_channel_videos_url(request, continuation.as_deref())?;
+        let raw: RawChannelVideosPage = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let (page, next_token) = self.convert_channel_videos_page(raw, request)?;
+        self.lock_channel_page_tokens()?.remember_next_page(
+            &request.channel_id,
+            request.page,
+            next_token,
+        );
+        Ok(page)
+    }
+
+    fn channel_details(&self, channel_id: &str) -> Result<ChannelSummary, ProviderError> {
+        let url = self.build_channel_url(channel_id)?;
+        let raw: RawChannelDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        self.convert_channel_details(raw, channel_id)
+    }
+
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
         let url = self.build_video_url(video_id)?;
         let raw: RawVideoDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
@@ -409,6 +566,57 @@ impl Provider for InvidiousProvider {
     }
 }
 
+/// Bounded opaque continuation state keyed by Invidious channel ID.
+#[derive(Default)]
+struct ChannelPageTokenCache {
+    channels: HashMap<String, BTreeMap<u32, String>>,
+    order: VecDeque<String>,
+}
+
+impl ChannelPageTokenCache {
+    /// Returns the token previously learned for one numbered page.
+    fn token(&self, channel_id: &str, page: u32) -> Option<&str> {
+        self.channels
+            .get(channel_id)
+            .and_then(|pages| pages.get(&page))
+            .map(String::as_str)
+    }
+
+    /// Records the next token while invalidating stale descendants.
+    ///
+    /// Re-fetching page one therefore starts a new continuation chain. Both
+    /// the number of channels and the tokens retained for each channel remain
+    /// bounded.
+    fn remember_next_page(&mut self, channel_id: &str, page: u32, next_token: Option<String>) {
+        if !self.channels.contains_key(channel_id) {
+            while self.channels.len() >= MAX_CACHED_CHANNELS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.channels.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(channel_id.to_owned());
+            self.channels.insert(channel_id.to_owned(), BTreeMap::new());
+        }
+
+        let pages = self
+            .channels
+            .get_mut(channel_id)
+            .expect("channel was inserted");
+        pages.retain(|cached_page, _| *cached_page <= page);
+        if let Some(token) = next_token {
+            pages.insert(page.saturating_add(1), token);
+        }
+        while pages.len() > MAX_TOKENS_PER_CHANNEL {
+            let Some(oldest) = pages.keys().next().copied() else {
+                break;
+            };
+            pages.remove(&oldest);
+        }
+    }
+}
+
 fn require_nonempty(value: &str, field: &str) -> Result<(), ProviderError> {
     if value.trim().is_empty() {
         return Err(ProviderError::InvalidResponse(format!(
@@ -416,6 +624,30 @@ fn require_nonempty(value: &str, field: &str) -> Result<(), ProviderError> {
         )));
     }
     Ok(())
+}
+
+/// Validates an opaque token without interpreting its provider-owned value.
+fn validate_continuation_token(value: Option<Value>) -> Result<Option<String>, ProviderError> {
+    let token = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(token)) if token.is_empty() => return Ok(None),
+        Some(Value::String(token)) => token,
+        Some(_) => {
+            return Err(ProviderError::InvalidResponse(
+                "Invidious returned a non-string continuation token".to_owned(),
+            ));
+        }
+    };
+    if token.len() > MAX_CONTINUATION_TOKEN_BYTES
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(ProviderError::InvalidResponse(
+            "Invidious returned an invalid continuation token".to_owned(),
+        ));
+    }
+    Ok(Some(token))
 }
 
 fn validate_resource_id(value: &str, field: &str) -> Result<(), ProviderError> {
@@ -472,6 +704,14 @@ const fn search_feature_value(feature: SearchFeature) -> &'static str {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RawChannelVideosPage {
+    videos: Vec<Value>,
+    #[serde(default)]
+    continuation: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawVideoSearch {
     video_id: String,
     title: String,
@@ -513,9 +753,16 @@ struct RawChannelSearch {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawChannelDetails {
+    author: String,
     author_id: String,
+    #[serde(default)]
+    author_thumbnails: Vec<RawThumbnail>,
+    #[serde(default)]
+    auto_generated: bool,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     sub_count: Option<u64>,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -631,6 +878,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::{self, JoinHandle};
+
     use super::*;
 
     const SEARCH_FIXTURE: &str = r#"[
@@ -690,8 +942,29 @@ mod tests {
     const CHANNEL_DETAILS_FIXTURE: &str = r#"{
 		"author": "Example channel",
 		"authorId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+		"authorThumbnails": [
+			{"url": "/ggpht/channel-details.jpg", "width": "512", "height": 512}
+		],
+		"autoGenerated": true,
 		"subCount": "12345",
-		"description": "Fields unrelated to this lookup are ignored"
+		"description": "Full channel description"
+	}"#;
+
+    const CHANNEL_VIDEO_FIXTURE: &str = r#"{
+		"type": "video",
+		"title": "A channel upload",
+		"videoId": "dQw4w9WgXcQ",
+		"author": "Example channel",
+		"authorId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+		"description": "Upload description",
+		"viewCount": "1234",
+		"published": 1700000000,
+		"publishedText": "2 years ago",
+		"lengthSeconds": 212,
+		"liveNow": false,
+		"videoThumbnails": [
+			{"quality": "medium", "url": "//i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg", "width": 320, "height": 180}
+		]
 	}"#;
 
     fn provider() -> InvidiousProvider {
@@ -924,6 +1197,133 @@ mod tests {
     }
 
     #[test]
+    fn channel_details_use_exact_endpoint_and_map_public_metadata() {
+        let server = MockServer::spawn(vec![json_response("200 OK", CHANNEL_DETAILS_FIXTURE)]);
+        let base_url = server
+            .base_url
+            .join("prefix/")
+            .expect("mock prefix should join");
+        let provider = InvidiousProvider::with_options(
+            base_url,
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider should construct");
+        let expected_thumbnail = server
+            .base_url
+            .join("ggpht/channel-details.jpg")
+            .expect("mock thumbnail URL should join")
+            .to_string();
+
+        let channel = provider
+            .channel_details("UC_x5XG1OV2P6uZZ5FSM9Ttw")
+            .expect("full channel metadata should parse");
+        let requests = server.finish();
+
+        assert_eq!(
+            requests,
+            ["/prefix/api/v1/channels/UC_x5XG1OV2P6uZZ5FSM9Ttw"]
+        );
+        assert_eq!(channel.channel_id, "UC_x5XG1OV2P6uZZ5FSM9Ttw");
+        assert_eq!(channel.name, "Example channel");
+        assert_eq!(channel.description, "Full channel description");
+        assert_eq!(channel.subscriber_count, Some(12_345));
+        assert_eq!(
+            channel.video_count, None,
+            "the documented full-channel response has no public video count"
+        );
+        assert!(channel.auto_generated);
+        assert_eq!(channel.thumbnails.len(), 1);
+        assert_eq!(channel.thumbnails[0].url.as_str(), expected_thumbnail);
+        assert_eq!(
+            channel.webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw")
+        );
+    }
+
+    #[test]
+    fn channel_details_preserve_missing_optional_metadata() {
+        let provider = provider();
+        let raw: RawChannelDetails = serde_json::from_str(
+            r#"{
+                "author": "Minimal channel",
+                "authorId": "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+            }"#,
+        )
+        .expect("minimal documented response should deserialize");
+        let channel = provider
+            .convert_channel_details(raw, "UC_x5XG1OV2P6uZZ5FSM9Ttw")
+            .expect("missing optional metadata should remain representable");
+
+        assert_eq!(channel.description, "");
+        assert_eq!(channel.subscriber_count, None);
+        assert_eq!(channel.video_count, None);
+        assert!(!channel.auto_generated);
+        assert!(channel.thumbnails.is_empty());
+    }
+
+    #[test]
+    fn channel_details_reject_invalid_malformed_and_mismatched_identifiers() {
+        let provider = provider();
+        for invalid in ["", "../channels", "UC fixture", "UCfixture?redirect=1"] {
+            assert!(
+                matches!(
+                    provider.channel_details(invalid),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+
+        let mismatched =
+            CHANNEL_DETAILS_FIXTURE.replace("UC_x5XG1OV2P6uZZ5FSM9Ttw", "UC_wrong_channel");
+        let raw = serde_json::from_str(&mismatched).expect("mismatch fixture should deserialize");
+        assert!(matches!(
+            provider.convert_channel_details(raw, "UC_x5XG1OV2P6uZZ5FSM9Ttw"),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("does not match")
+        ));
+
+        let malformed =
+            CHANNEL_DETAILS_FIXTURE.replace("UC_x5XG1OV2P6uZZ5FSM9Ttw", "invalid channel id");
+        let raw = serde_json::from_str(&malformed).expect("malformed fixture should deserialize");
+        assert!(matches!(
+            provider.convert_channel_details(raw, "UC_x5XG1OV2P6uZZ5FSM9Ttw"),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let missing_author =
+            CHANNEL_DETAILS_FIXTURE.replace("\"author\": \"Example channel\",", "");
+        let server = MockServer::spawn(vec![json_response("200 OK", &missing_author)]);
+        let provider = InvidiousProvider::with_options(
+            server.base_url.clone(),
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider should construct");
+        assert!(matches!(
+            provider.channel_details("UC_x5XG1OV2P6uZZ5FSM9Ttw"),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        server.finish();
+    }
+
+    #[test]
+    fn channel_details_enforce_the_configured_response_bound() {
+        let server = MockServer::spawn(vec![json_response("200 OK", CHANNEL_DETAILS_FIXTURE)]);
+        let provider =
+            InvidiousProvider::with_options(server.base_url.clone(), Duration::from_secs(2), 32)
+                .expect("small bounded provider should construct");
+        let error = provider
+            .channel_details("UC_x5XG1OV2P6uZZ5FSM9Ttw")
+            .expect_err("channel metadata must respect the response bound");
+        server.finish();
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge { limit: 32 }
+        ));
+    }
+
+    #[test]
     fn parses_full_video_details_and_optional_license() {
         let provider = provider();
         let raw = serde_json::from_str(DETAILS_FIXTURE).expect("fixture should parse");
@@ -971,5 +1371,297 @@ mod tests {
         assert!(capabilities.channel_search);
         assert!(capabilities.video_details);
         assert!(capabilities.pagination);
+    }
+
+    #[test]
+    fn channel_videos_use_documented_path_and_shared_continuation_cache() {
+        let first_body =
+            format!(r#"{{"videos":[{CHANNEL_VIDEO_FIXTURE}],"continuation":"opaque+/=_next_2"}}"#);
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &first_body),
+            json_response("200 OK", r#"{"videos":[],"continuation":""}"#),
+        ]);
+        let base_url = server
+            .base_url
+            .join("prefix/")
+            .expect("mock prefix should join");
+        let provider = InvidiousProvider::with_options(
+            base_url,
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider should construct");
+        let clone = provider.clone();
+        let mut request = ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw");
+
+        let first = provider
+            .channel_videos(&request)
+            .expect("first channel page should parse");
+        assert_eq!(first.page, 1);
+        assert_eq!(first.next_page, Some(2));
+        let [SearchItem::Video(video)] = first.items.as_slice() else {
+            panic!("channel pages must expose only videos");
+        };
+        assert_eq!(video.title, "A channel upload");
+
+        request.page = 2;
+        let second = clone
+            .channel_videos(&request)
+            .expect("clone should share the first page's continuation");
+        assert_eq!(second.page, 2);
+        assert_eq!(second.next_page, None);
+        assert!(second.items.is_empty());
+
+        let requests = server.finish();
+        assert_eq!(
+            requests[0],
+            "/prefix/api/v1/channels/UC_x5XG1OV2P6uZZ5FSM9Ttw/videos"
+        );
+        let second_url = Url::parse(&format!("http://mock.test{}", requests[1]))
+            .expect("captured target should parse");
+        assert_eq!(
+            second_url.path(),
+            "/prefix/api/v1/channels/UC_x5XG1OV2P6uZZ5FSM9Ttw/videos"
+        );
+        let query = second_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("continuation").map(AsRef::as_ref),
+            Some("opaque+/=_next_2")
+        );
+        assert_eq!(
+            query.len(),
+            1,
+            "remote pagination must not send page numbers"
+        );
+    }
+
+    #[test]
+    fn channel_pages_require_sequential_loading_and_provider_specific_ids() {
+        let provider = provider();
+        let mut request = ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw");
+        request.page = 2;
+        assert!(matches!(
+            provider.channel_videos(&request),
+            Err(ProviderError::InvalidRequest(message))
+                if message.contains("load page 1 first")
+        ));
+
+        let invalid = ChannelVideosRequest::new("../api/v1/stats");
+        assert!(matches!(
+            provider.channel_videos(&invalid),
+            Err(ProviderError::InvalidRequest(message))
+                if message.contains("invalid characters")
+        ));
+    }
+
+    #[test]
+    fn reloading_first_channel_page_discards_stale_descendants() {
+        let first_body =
+            format!(r#"{{"videos":[{CHANNEL_VIDEO_FIXTURE}],"continuation":"page-2-a"}}"#);
+        let second_body =
+            format!(r#"{{"videos":[{CHANNEL_VIDEO_FIXTURE}],"continuation":"page-3-a"}}"#);
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &first_body),
+            json_response("200 OK", &second_body),
+            json_response("200 OK", r#"{"videos":[],"continuation":null}"#),
+        ]);
+        let provider = InvidiousProvider::with_options(
+            server.base_url.clone(),
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider should construct");
+        let mut request = ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw");
+
+        provider
+            .channel_videos(&request)
+            .expect("first page should cache page two");
+        request.page = 2;
+        provider
+            .channel_videos(&request)
+            .expect("second page should cache page three");
+        request.page = 1;
+        provider
+            .channel_videos(&request)
+            .expect("reloaded first page should finish the new chain");
+        request.page = 2;
+        assert!(matches!(
+            provider.channel_videos(&request),
+            Err(ProviderError::InvalidRequest(message))
+                if message.contains("load page 1 first")
+        ));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn malformed_channel_video_items_and_continuations_are_rejected() {
+        let provider = provider();
+        let request = ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw");
+        let cases = [
+            r#"{"videos":[{"type":"video","title":"missing identifiers"}]}"#,
+            r#"{"videos":[{"type":"channel"}]}"#,
+            r#"{"videos":[],"continuation":42}"#,
+            r#"{"videos":[],"continuation":"bad token"}"#,
+        ];
+        for body in cases {
+            let raw: RawChannelVideosPage =
+                serde_json::from_str(body).expect("envelope fixture should deserialize");
+            assert!(
+                matches!(
+                    provider.convert_channel_videos_page(raw, &request),
+                    Err(ProviderError::InvalidResponse(_))
+                ),
+                "{body}"
+            );
+        }
+
+        let wrong_channel =
+            CHANNEL_VIDEO_FIXTURE.replace("UC_x5XG1OV2P6uZZ5FSM9Ttw", "UC_wrong_channel");
+        let body = format!(r#"{{"videos":[{wrong_channel}]}}"#);
+        let raw = serde_json::from_str(&body).expect("wrong-channel fixture should deserialize");
+        assert!(matches!(
+            provider.convert_channel_videos_page(raw, &request),
+            Err(ProviderError::InvalidResponse(message))
+                if message.contains("does not belong")
+        ));
+
+        assert!(matches!(
+            validate_continuation_token(Some(Value::String(
+                "x".repeat(MAX_CONTINUATION_TOKEN_BYTES + 1)
+            ))),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn channel_continuation_cache_is_bounded_and_reloads_replace_chains() {
+        let mut cache = ChannelPageTokenCache::default();
+        for index in 0..(MAX_CACHED_CHANNELS + 5) {
+            cache.remember_next_page(&format!("UC{index:022}"), 1, Some(format!("token-{index}")));
+        }
+        assert_eq!(cache.channels.len(), MAX_CACHED_CHANNELS);
+        assert!(cache.token("UC0000000000000000000000", 2).is_none());
+
+        let channel_id = "UC_token_bounds";
+        for page in 1..=(u32::try_from(MAX_TOKENS_PER_CHANNEL).expect("bound fits u32") + 8) {
+            cache.remember_next_page(channel_id, page, Some(format!("token-{page}")));
+        }
+        assert!(
+            cache.channels[channel_id].len() <= MAX_TOKENS_PER_CHANNEL,
+            "per-channel continuation storage must remain bounded"
+        );
+        cache.remember_next_page(channel_id, 1, Some("replacement".to_owned()));
+        assert_eq!(cache.token(channel_id, 2), Some("replacement"));
+        assert!(
+            cache.token(channel_id, 3).is_none(),
+            "page-one reload must clear the old continuation chain"
+        );
+    }
+
+    struct MockServer {
+        base_url: Url,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn spawn(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+            let address = listener.local_addr().expect("mock address should exist");
+            listener
+                .set_nonblocking(true)
+                .expect("mock listener should become nonblocking");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                for response in responses {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if thread_stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("mock should accept request: {error}"),
+                        }
+                    };
+                    let request = request_target(&stream);
+                    thread_requests
+                        .lock()
+                        .expect("request lock should not be poisoned")
+                        .push(request);
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("mock should write response");
+                    stream.flush().expect("mock should flush response");
+                }
+            });
+            Self {
+                base_url: Url::parse(&format!("http://{address}/")).expect("mock URL should parse"),
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn completed_requests(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .clone()
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("mock server should stop");
+            }
+            self.completed_requests()
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("mock server should stop");
+            }
+        }
+    }
+
+    fn request_target(stream: &TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("mock request line should be readable");
+        loop {
+            let mut header = String::new();
+            reader
+                .read_line(&mut header)
+                .expect("mock header should be readable");
+            if header == "\r\n" || header.is_empty() {
+                break;
+            }
+        }
+        request_line
+            .split_ascii_whitespace()
+            .nth(1)
+            .expect("request target should exist")
+            .to_owned()
+    }
+
+    fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 }
