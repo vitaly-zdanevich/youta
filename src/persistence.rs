@@ -18,6 +18,16 @@ use crate::domain::{
     Bookmark, CommentTarget, HistoryEntry, MediaId, MediaItem, PlaybackProgress, PrivateComment,
     SessionState, SourceKind, WikidataLink,
 };
+use crate::providers::{SearchItem, SearchRequest, SearchTarget};
+
+const MAX_SAVED_SEARCH_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_SAVED_SEARCH_RESULTS_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum number of `YouTube` summaries retained in one restart snapshot.
+///
+/// The application also uses this as its accumulated lazy-search limit so the
+/// visible list and its durable representation cannot diverge.
+pub const MAX_SAVED_YOUTUBE_SEARCH_RESULTS: usize = 500;
 
 const MIGRATIONS: &[&str] = &[
     r"
@@ -107,10 +117,36 @@ const MIGRATIONS: &[&str] = &[
 	) WITHOUT ROWID;
 	CREATE INDEX wikidata_cache_expiry ON wikidata_cache(expires_at);
 	",
+    r"
+	CREATE TABLE youtube_search_state (
+		slot INTEGER PRIMARY KEY CHECK (slot = 1),
+		request_json TEXT NOT NULL,
+		results_json TEXT NOT NULL,
+		next_page INTEGER CHECK (
+			next_page IS NULL OR next_page BETWEEN 1 AND 10000
+		),
+		updated_at INTEGER NOT NULL
+	) WITHOUT ROWID;
+	",
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+
+/// One bounded `YouTube` search snapshot retained across application restarts.
+///
+/// Search summaries intentionally exclude lazily fetched video details,
+/// subscriber enrichment, and Wikidata data. Those retain their independent
+/// cache and request policies after restoration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedYouTubeSearch {
+    /// Exact request that produced the most recently accepted page.
+    pub request: SearchRequest,
+    /// Accumulated video or channel summaries shown in the search list.
+    pub results: Vec<SearchItem>,
+    /// Next provider page to request when the user reaches the list boundary.
+    pub next_page: Option<u32>,
+}
 
 /// A provenance record attached to cached provider metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -674,6 +710,133 @@ impl StateStore {
             .transpose()
     }
 
+    /// Replaces the restart snapshot for the active `YouTube` search.
+    ///
+    /// The request, accumulated summaries, and continuation page are validated
+    /// and byte-bounded before `SQLite` receives them. Enriched details are not
+    /// part of this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is inconsistent, exceeds its
+    /// resource limits, cannot be encoded, or cannot be written.
+    pub fn save_youtube_search(
+        &self,
+        search: &SavedYouTubeSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        validate_saved_youtube_search(search)?;
+        let request_json = serde_json::to_string(&search.request)?;
+        ensure_saved_search_json_bound(
+            "request",
+            request_json.len(),
+            MAX_SAVED_SEARCH_REQUEST_BYTES,
+        )?;
+        let results_json = serde_json::to_string(&search.results)?;
+        ensure_saved_search_json_bound(
+            "results",
+            results_json.len(),
+            MAX_SAVED_SEARCH_RESULTS_BYTES,
+        )?;
+        self.connection
+            .prepare_cached(
+                r"
+				INSERT INTO youtube_search_state (
+					slot, request_json, results_json, next_page, updated_at
+				) VALUES (1, ?1, ?2, ?3, ?4)
+				ON CONFLICT(slot) DO UPDATE SET
+					request_json = excluded.request_json,
+					results_json = excluded.results_json,
+					next_page = excluded.next_page,
+					updated_at = excluded.updated_at
+				",
+            )?
+            .execute(params![
+                request_json,
+                results_json,
+                search.next_page.map(i64::from),
+                updated_at,
+            ])?;
+        Ok(())
+    }
+
+    /// Loads the bounded restart snapshot for the latest `YouTube` search.
+    ///
+    /// The JSON byte lengths are checked before either payload is copied out of
+    /// `SQLite`. The decoded request and summaries are then validated again so a
+    /// manually modified database cannot bypass current invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row exceeds its resource limits, contains
+    /// inconsistent data, cannot be decoded, or cannot be read.
+    pub fn youtube_search(&self) -> Result<Option<SavedYouTubeSearch>, PersistenceError> {
+        let lengths: Option<(i64, i64)> = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT
+					length(CAST(request_json AS BLOB)),
+					length(CAST(results_json AS BLOB))
+				FROM youtube_search_state
+				WHERE slot = 1
+				",
+            )?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((request_bytes, results_bytes)) = lengths else {
+            return Ok(None);
+        };
+        ensure_saved_search_json_bound(
+            "request",
+            usize::try_from(request_bytes).unwrap_or(usize::MAX),
+            MAX_SAVED_SEARCH_REQUEST_BYTES,
+        )?;
+        ensure_saved_search_json_bound(
+            "results",
+            usize::try_from(results_bytes).unwrap_or(usize::MAX),
+            MAX_SAVED_SEARCH_RESULTS_BYTES,
+        )?;
+
+        let (request_json, results_json, next_page): (String, String, Option<i64>) = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT request_json, results_json, next_page
+				FROM youtube_search_state
+				WHERE slot = 1
+				",
+            )?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let next_page = next_page
+            .map(|value| {
+                u32::try_from(value).map_err(|_| PersistenceError::InvalidSavedSearch {
+                    reason: "next page is outside the supported range".to_owned(),
+                })
+            })
+            .transpose()?;
+        let search = SavedYouTubeSearch {
+            request: serde_json::from_str(&request_json)?,
+            results: serde_json::from_str(&results_json)?,
+            next_page,
+        };
+        validate_saved_youtube_search(&search)?;
+        Ok(Some(search))
+    }
+
+    /// Removes the saved `YouTube` search and reports whether one existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be removed.
+    pub fn clear_youtube_search(&self) -> Result<bool, PersistenceError> {
+        Ok(self
+            .connection
+            .prepare_cached("DELETE FROM youtube_search_state WHERE slot = 1")?
+            .execute([])?
+            > 0)
+    }
+
     /// Adds listened seconds to a source using an atomic upsert.
     ///
     /// # Errors
@@ -948,6 +1111,20 @@ pub enum PersistenceError {
     /// A cached provenance URL is malformed.
     #[error("stored metadata provenance URL is invalid: {0}")]
     InvalidCachedUrl(url::ParseError),
+    /// A saved search JSON field exceeds its fixed persistence limit.
+    #[error("saved YouTube search {field} exceeds the {maximum_bytes}-byte limit")]
+    SavedSearchTooLarge {
+        /// Snapshot field that exceeded its bound.
+        field: &'static str,
+        /// Maximum accepted encoded size.
+        maximum_bytes: usize,
+    },
+    /// A saved search is internally inconsistent or outside provider limits.
+    #[error("saved YouTube search is invalid: {reason}")]
+    InvalidSavedSearch {
+        /// Invariant rejected while saving or restoring.
+        reason: String,
+    },
     /// An unsigned domain value is too large for `SQLite`'s signed integer.
     #[error("{field} is too large for SQLite")]
     IntegerOutOfRange {
@@ -965,6 +1142,57 @@ pub enum PersistenceError {
         /// Newest version this binary understands.
         supported: u32,
     },
+}
+
+fn ensure_saved_search_json_bound(
+    field: &'static str,
+    actual_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<(), PersistenceError> {
+    if actual_bytes > maximum_bytes {
+        return Err(PersistenceError::SavedSearchTooLarge {
+            field,
+            maximum_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_saved_youtube_search(search: &SavedYouTubeSearch) -> Result<(), PersistenceError> {
+    search
+        .request
+        .validate()
+        .map_err(|error| PersistenceError::InvalidSavedSearch {
+            reason: error.to_string(),
+        })?;
+    if search.results.len() > MAX_SAVED_YOUTUBE_SEARCH_RESULTS {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: format!(
+                "result count {} exceeds the {MAX_SAVED_YOUTUBE_SEARCH_RESULTS}-item limit",
+                search.results.len()
+            ),
+        });
+    }
+    if search.results.iter().any(|item| {
+        !matches!(
+            (search.request.target, item),
+            (SearchTarget::Videos, SearchItem::Video(_))
+                | (SearchTarget::Channels, SearchItem::Channel(_))
+        )
+    }) {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: "result kinds do not match the request target".to_owned(),
+        });
+    }
+    if let Some(next_page) = search.next_page
+        && (next_page <= search.request.page || next_page > 10_000)
+    {
+        return Err(PersistenceError::InvalidSavedSearch {
+            reason: "next page must follow the saved request page and remain at most 10000"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn run_migrations(connection: &Connection) -> Result<(), PersistenceError> {
@@ -1093,6 +1321,7 @@ mod tests {
     use crate::domain::{
         MediaKind, MediaLicense, MediaStatistics, PanelFocus, Screen, SearchQuery,
     };
+    use crate::providers::{ChannelSummary, SearchSort, VideoSummary};
 
     fn id(value: &str) -> MediaId {
         MediaId::new(SourceKind::YouTube, value)
@@ -1118,6 +1347,24 @@ mod tests {
             chapters: Vec::new(),
             captions: Vec::new(),
         }
+    }
+
+    fn search_video(value: &str) -> SearchItem {
+        SearchItem::Video(VideoSummary {
+            video_id: value.to_owned(),
+            title: format!("Fixture {value}"),
+            channel_name: "Fixture channel".to_owned(),
+            channel_id: "UCfixture".to_owned(),
+            description: "Mock search description".to_owned(),
+            duration_seconds: Some(90),
+            view_count: Some(1_234),
+            published_at: Some(100),
+            published_text: None,
+            live: false,
+            thumbnails: Vec::new(),
+            webpage_url: None,
+            stream_url: None,
+        })
     }
 
     fn disk_store() -> (tempfile::TempDir, Config, StateStore) {
@@ -1150,6 +1397,45 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn migration_from_v3_preserves_session_and_adds_youtube_search_state() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=3_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        let session = SessionState {
+            screen: Screen::History,
+            search_text: "preserved".to_owned(),
+            ..SessionState::default()
+        };
+        connection
+            .execute(
+                r"
+				INSERT INTO session_state (slot, state_json, updated_at)
+				VALUES ('active', ?1, 3)
+				",
+                [serde_json::to_string(&session).expect("encode session")],
+            )
+            .expect("seed version-three session");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+        assert_eq!(store.schema_version().expect("schema version"), 4);
+        assert_eq!(store.session().expect("preserved session"), Some(session));
+        assert_eq!(store.youtube_search().expect("new search table"), None);
     }
 
     #[test]
@@ -1336,6 +1622,127 @@ mod tests {
                 .expect("listened seconds"),
             0
         );
+    }
+
+    #[test]
+    fn youtube_search_snapshot_round_trips_overwrites_and_clears() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let mut request = SearchRequest::new("mock ambient", SearchTarget::Videos);
+        request.page = 2;
+        request.sort = SearchSort::UploadDate;
+        let first = SavedYouTubeSearch {
+            request,
+            results: vec![search_video("first"), search_video("second")],
+            next_page: Some(3),
+        };
+        store
+            .save_youtube_search(&first, 10)
+            .expect("save first search");
+        assert_eq!(
+            store.youtube_search().expect("load first search"),
+            Some(first)
+        );
+
+        let replacement = SavedYouTubeSearch {
+            request: SearchRequest::new("mock channels", SearchTarget::Channels),
+            results: vec![SearchItem::Channel(ChannelSummary {
+                channel_id: "UCreplacement".to_owned(),
+                name: "Replacement".to_owned(),
+                description: "Mock channel".to_owned(),
+                subscriber_count: Some(42),
+                video_count: Some(7),
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: None,
+            })],
+            next_page: None,
+        };
+        store
+            .save_youtube_search(&replacement, 20)
+            .expect("replace search");
+        assert_eq!(
+            store.youtube_search().expect("load replacement"),
+            Some(replacement)
+        );
+        assert!(store.clear_youtube_search().expect("clear search"));
+        assert!(!store.clear_youtube_search().expect("clear absent search"));
+        assert_eq!(store.youtube_search().expect("empty search"), None);
+    }
+
+    #[test]
+    fn youtube_search_snapshot_rejects_inconsistent_and_excessive_results() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let mismatched = SavedYouTubeSearch {
+            request: SearchRequest::new("channels", SearchTarget::Channels),
+            results: vec![search_video("video")],
+            next_page: None,
+        };
+        assert!(matches!(
+            store.save_youtube_search(&mismatched, 1),
+            Err(PersistenceError::InvalidSavedSearch { .. })
+        ));
+
+        let invalid_continuation = SavedYouTubeSearch {
+            request: SearchRequest::new("videos", SearchTarget::Videos),
+            results: vec![search_video("video")],
+            next_page: Some(1),
+        };
+        assert!(matches!(
+            store.save_youtube_search(&invalid_continuation, 1),
+            Err(PersistenceError::InvalidSavedSearch { .. })
+        ));
+
+        let excessive = SavedYouTubeSearch {
+            request: SearchRequest::new("videos", SearchTarget::Videos),
+            results: vec![search_video("bounded"); MAX_SAVED_YOUTUBE_SEARCH_RESULTS + 1],
+            next_page: None,
+        };
+        assert!(matches!(
+            store.save_youtube_search(&excessive, 1),
+            Err(PersistenceError::InvalidSavedSearch { .. })
+        ));
+
+        let mut oversized = search_video("oversized");
+        let SearchItem::Video(video) = &mut oversized else {
+            unreachable!("fixture is a video");
+        };
+        video.description = "x".repeat(MAX_SAVED_SEARCH_RESULTS_BYTES);
+        let oversized = SavedYouTubeSearch {
+            request: SearchRequest::new("videos", SearchTarget::Videos),
+            results: vec![oversized],
+            next_page: None,
+        };
+        assert!(matches!(
+            store.save_youtube_search(&oversized, 1),
+            Err(PersistenceError::SavedSearchTooLarge {
+                field: "results",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn youtube_search_load_checks_json_bytes_before_decoding() {
+        let store = StateStore::open_in_memory().expect("open store");
+        store
+            .connection
+            .execute(
+                r"
+				INSERT INTO youtube_search_state (
+					slot, request_json, results_json, next_page, updated_at
+				) VALUES (1, '{}', ?1, NULL, 1)
+				",
+                ["x".repeat(MAX_SAVED_SEARCH_RESULTS_BYTES + 1)],
+            )
+            .expect("insert oversized fixture");
+
+        assert!(matches!(
+            store.youtube_search(),
+            Err(PersistenceError::SavedSearchTooLarge {
+                field: "results",
+                ..
+            })
+        ));
     }
 
     #[test]

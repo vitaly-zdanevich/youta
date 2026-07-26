@@ -28,7 +28,7 @@ use crate::links::{
 };
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
-use crate::persistence::StateStore;
+use crate::persistence::{MAX_SAVED_YOUTUBE_SEARCH_RESULTS, SavedYouTubeSearch, StateStore};
 #[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
     DownloadFormat, DownloadProcess, DownloadRequest, YtDlp, YtDlpConfig, parse_download_event,
@@ -552,6 +552,7 @@ enum ProviderRequest {
 enum ProviderResponse {
     Search {
         generation: u64,
+        request: SearchRequest,
         result: Result<SearchPage, String>,
     },
     Details {
@@ -899,6 +900,7 @@ pub struct AppController {
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
     next_youtube_page: Option<u32>,
+    youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
     youtube_provider_builder: Box<dyn YouTubeProviderBuilder>,
     provider_requests: Option<Sender<ProviderRequest>>,
@@ -989,6 +991,10 @@ impl AppController {
             Ok(saved) => (saved.unwrap_or_default(), None),
             Err(error) => (SessionState::default(), Some(error)),
         };
+        let (saved_search, search_restore_error) = match store.youtube_search() {
+            Ok(saved) => (saved, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut view = ViewModel {
             screen: tui_screen_from_stored(&saved.screen),
             search_query: saved.search_text,
@@ -1002,6 +1008,24 @@ impl AppController {
             },
             ..ViewModel::default()
         };
+        if let Some(search) = saved_search.as_ref() {
+            view.search_query.clone_from(&search.request.query);
+            view.search_kind = match search.request.target {
+                SearchTarget::Videos => SearchKind::Videos,
+                SearchTarget::Channels => SearchKind::Channels,
+            };
+            view.youtube_search_sort = match search.request.sort {
+                ProviderSearchSort::UploadDate => YouTubeSearchSort::Newest,
+                ProviderSearchSort::Relevance | ProviderSearchSort::Views => {
+                    YouTubeSearchSort::Relevance
+                }
+            };
+            view.youtube_creative_commons_only = search
+                .request
+                .filters
+                .features
+                .contains(&SearchFeature::CreativeCommons);
+        }
         view.playback.volume = config.playback.volume_percent;
         view.playback.speed = f64::from(config.playback.speed_percent) / 100.0;
         view.status_line = if youtube_provider_available {
@@ -1016,18 +1040,34 @@ impl AppController {
                 ..YtDlpConfig::default()
             }),
         });
+        let (youtube_search_request, mut youtube_results) = saved_search.map_or_else(
+            || (None, Vec::new()),
+            |search| (Some(search.request), search.results),
+        );
+        for item in &mut youtube_results {
+            if let SearchItem::Video(video) = item {
+                // Direct stream URLs can expire between processes. Restored
+                // rows keep their canonical page and receive a fresh stream
+                // only through the normal lazy-details request.
+                video.stream_url = None;
+            }
+        }
 
         let mut controller = Self {
             config,
             store,
             view,
-            youtube_results: Vec::new(),
+            youtube_results,
             direct_item: None,
             resolved_direct: None,
             local_results: Vec::new(),
             tracker_results: Vec::new(),
             subscription_tree,
+            // Official YouTube pagination uses opaque tokens retained only by
+            // the live provider. Restored rows remain instant and safe, while
+            // a new explicit search rebuilds the continuation chain.
             next_youtube_page: None,
+            youtube_search_request,
             youtube_provider_available,
             youtube_provider_builder: Box::new(SystemYouTubeProviderBuilder),
             provider_requests,
@@ -1068,11 +1108,28 @@ impl AppController {
             quit_on_error_dismiss: false,
         };
         controller.populate_local_screen();
+        if controller.view.screen == Screen::Search && !controller.youtube_results.is_empty() {
+            controller.cache_search_channel_subscriber_counts();
+            controller.request_visible_channel_subscriber_counts();
+            controller.request_selected_details();
+            controller.view.status_line = format!(
+                "{} saved YouTube result{} restored",
+                controller.youtube_results.len(),
+                if controller.youtube_results.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
         if let Some(error) = subscription_load_error {
             controller.show_error("Could not restore local subscriptions", &error);
         }
         if let Some(error) = session_restore_error {
             controller.show_error("Could not restore the previous session", &error);
+        }
+        if let Some(error) = search_restore_error {
+            controller.show_error("Could not restore the previous YouTube search", &error);
         }
         if let Some(error) = provider_thread_error {
             controller.show_error("Could not start the provider worker", &error);
@@ -1326,6 +1383,7 @@ impl AppController {
     }
 
     fn open_direct_video(&mut self, direct: DirectVideoInput) {
+        self.clear_youtube_search_snapshot();
         self.direct_item = None;
         self.resolved_direct = None;
         self.local_results.clear();
@@ -1359,6 +1417,7 @@ impl AppController {
 
     fn open_direct_source(&mut self, direct: DirectSourceInput) {
         self.supersede_search_generation();
+        self.clear_youtube_search_snapshot();
         self.youtube_results.clear();
         self.resolved_direct = None;
         self.local_results.clear();
@@ -1446,6 +1505,7 @@ impl AppController {
 
     fn open_local_input(&mut self, local: DirectLocalInput) {
         self.supersede_search_generation();
+        self.clear_youtube_search_snapshot();
         self.youtube_results.clear();
         self.direct_item = None;
         self.resolved_direct = None;
@@ -1490,6 +1550,7 @@ impl AppController {
 
     fn submit_tracker_search(&mut self, query: String) {
         self.supersede_search_generation();
+        self.clear_youtube_search_snapshot();
         self.youtube_results.clear();
         self.direct_item = None;
         self.resolved_direct = None;
@@ -1525,6 +1586,7 @@ impl AppController {
             self.supersede_search_generation();
         }
         if page == 1 {
+            self.clear_youtube_search_snapshot();
             self.selected_start_override = None;
             self.direct_item = None;
             self.resolved_direct = None;
@@ -1539,17 +1601,25 @@ impl AppController {
             SearchKind::Videos => SearchTarget::Videos,
             SearchKind::Channels => SearchTarget::Channels,
         };
-        let mut request = SearchRequest::new(self.view.search_query.clone(), target);
-        request.page = page;
-        request.sort = match self.view.youtube_search_sort {
-            YouTubeSearchSort::Relevance => ProviderSearchSort::Relevance,
-            YouTubeSearchSort::Newest => ProviderSearchSort::UploadDate,
+        let mut request = if page > 1 {
+            self.youtube_search_request
+                .clone()
+                .unwrap_or_else(|| SearchRequest::new(self.view.search_query.clone(), target))
+        } else {
+            SearchRequest::new(self.view.search_query.clone(), target)
         };
-        if target == SearchTarget::Videos && self.view.youtube_creative_commons_only {
-            request
-                .filters
-                .features
-                .push(SearchFeature::CreativeCommons);
+        request.page = page;
+        if page == 1 {
+            request.sort = match self.view.youtube_search_sort {
+                YouTubeSearchSort::Relevance => ProviderSearchSort::Relevance,
+                YouTubeSearchSort::Newest => ProviderSearchSort::UploadDate,
+            };
+            if target == SearchTarget::Videos && self.view.youtube_creative_commons_only {
+                request
+                    .filters
+                    .features
+                    .push(SearchFeature::CreativeCommons);
+            }
         }
         if !self.send_provider_request(
             ProviderRequest::Search {
@@ -1568,6 +1638,15 @@ impl AppController {
                 SearchKind::Channels => "channels",
             }
         );
+    }
+
+    /// Drops a search snapshot when another input route replaces its rows.
+    fn clear_youtube_search_snapshot(&mut self) {
+        self.youtube_search_request = None;
+        self.next_youtube_page = None;
+        if let Err(error) = self.store.clear_youtube_search() {
+            self.show_error("Could not clear the saved YouTube search", &error);
+        }
     }
 
     fn request_selected_details(&mut self) {
@@ -1782,32 +1861,76 @@ impl AppController {
 
     fn handle_provider_response(&mut self, response: ProviderResponse) {
         match response {
-            ProviderResponse::Search { generation, result } => {
+            ProviderResponse::Search {
+                generation,
+                request,
+                result,
+            } => {
                 if generation != self.search_generation {
                     return;
                 }
                 self.finish_search_activity(SearchActivity::YouTube);
                 match result {
                     Ok(page) => {
-                        let page_number = page.page;
-                        self.next_youtube_page = page.next_page;
-                        if page_number == 1 {
-                            self.youtube_results = page.items;
-                        } else {
-                            self.youtube_results.extend(page.items);
+                        if page.page != request.page
+                            || page.next_page.is_some_and(|next_page| {
+                                next_page <= request.page || next_page > 10_000
+                            })
+                        {
+                            self.show_error_message(
+                                "YouTube search failed",
+                                "the provider returned inconsistent pagination state",
+                            );
+                            return;
                         }
+                        let page_number = page.page;
+                        if page_number == 1 {
+                            self.youtube_results.clear();
+                        }
+                        let remaining = MAX_SAVED_YOUTUBE_SEARCH_RESULTS
+                            .saturating_sub(self.youtube_results.len());
+                        let received_items = page.items.len();
+                        self.youtube_results
+                            .extend(page.items.into_iter().take(remaining));
+                        let search_limit_reached = received_items > remaining
+                            || (self.youtube_results.len() >= MAX_SAVED_YOUTUBE_SEARCH_RESULTS
+                                && page.next_page.is_some());
+                        self.next_youtube_page = if search_limit_reached {
+                            None
+                        } else {
+                            page.next_page
+                        };
                         self.cache_search_channel_subscriber_counts();
                         self.refresh_youtube_rows();
+                        let saved_search = SavedYouTubeSearch {
+                            request: request.clone(),
+                            results: std::mem::take(&mut self.youtube_results),
+                            next_page: self.next_youtube_page,
+                        };
+                        self.youtube_search_request = Some(request);
+                        let save_result =
+                            self.store.save_youtube_search(&saved_search, unix_time());
+                        self.youtube_results = saved_search.results;
+                        if let Err(error) = save_result {
+                            self.show_error("Could not save the YouTube search", &error);
+                        }
                         self.request_visible_channel_subscriber_counts();
-                        self.view.status_line = format!(
-                            "{} YouTube result{} loaded",
-                            self.youtube_results.len(),
-                            if self.youtube_results.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        );
+                        self.view.status_line = if search_limit_reached {
+                            format!(
+                                "{} YouTube results loaded; restart-safe limit reached",
+                                self.youtube_results.len()
+                            )
+                        } else {
+                            format!(
+                                "{} YouTube result{} loaded",
+                                self.youtube_results.len(),
+                                if self.youtube_results.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )
+                        };
                         self.request_selected_details();
                     }
                     Err(error) => {
@@ -3135,6 +3258,10 @@ impl AppController {
         self.view.details_focused = false;
         self.view.details_scroll = 0;
         self.populate_local_screen();
+        if screen == Screen::Search && !self.youtube_results.is_empty() {
+            self.request_visible_channel_subscriber_counts();
+            self.request_selected_details();
+        }
     }
 
     fn populate_local_screen(&mut self) {
@@ -4053,7 +4180,11 @@ fn provider_worker(
                     |provider| provider.search(&request).map_err(|error| error.to_string()),
                 );
                 if responses
-                    .send(ProviderResponse::Search { generation, result })
+                    .send(ProviderResponse::Search {
+                        generation,
+                        request,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -5703,7 +5834,8 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     use std::io::Cursor;
     #[cfg(feature = "yt-dlp")]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -5922,6 +6054,100 @@ mod tests {
         controller.refresh_youtube_rows();
 
         assert_eq!(controller.view.rows[0].watched_percent, 95);
+    }
+
+    #[test]
+    fn saved_youtube_search_restores_without_rerunning_and_keeps_details_lazy() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let mut request = SearchRequest::new("restored fixture", SearchTarget::Videos);
+        request.page = 2;
+        request.sort = ProviderSearchSort::UploadDate;
+        request.filters.features = vec![SearchFeature::CreativeCommons];
+        let mut restored_video = subscription_video_summary();
+        restored_video.stream_url =
+            Some(url::Url::parse("https://streams.example/expired").expect("fixture stream URL"));
+        let saved_search = SavedYouTubeSearch {
+            request: request.clone(),
+            results: vec![SearchItem::Video(restored_video)],
+            next_page: Some(3),
+        };
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            store
+                .save_session(
+                    &SessionState {
+                        screen: StoredScreen::Search,
+                        search_text: "stale session query".to_owned(),
+                        ..SessionState::default()
+                    },
+                    1,
+                )
+                .expect("save session");
+            store
+                .save_youtube_search(&saved_search, 2)
+                .expect("save search");
+            #[cfg(feature = "wikidata")]
+            store
+                .put_cached_wikidata(&CachedWikidataLookup {
+                    property_id: "P1651".to_owned(),
+                    external_id: "dQw4w9WgXcQ".to_owned(),
+                    items: Vec::new(),
+                    fetched_at: 2,
+                    expires_at: i64::MAX,
+                })
+                .expect("seed deterministic Wikidata cache");
+        }
+
+        let searches = Arc::new(AtomicUsize::new(0));
+        let details = Arc::new(AtomicUsize::new(0));
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let controller = AppController::new(
+            config,
+            store,
+            Some(Box::new(CountingYouTubeProvider {
+                searches: Arc::clone(&searches),
+                details: Arc::clone(&details),
+            })),
+            None,
+        );
+
+        for _ in 0..100 {
+            if details.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(searches.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            details.load(Ordering::SeqCst),
+            1,
+            "the restored selection should retain lazy details enrichment"
+        );
+        let SearchItem::Video(restored_video) = &controller.youtube_results[0] else {
+            panic!("restored result should be a video");
+        };
+        assert_eq!(restored_video.title, "Fixture video");
+        assert_eq!(
+            restored_video.stream_url, None,
+            "an expiring stream locator must be refreshed lazily"
+        );
+        assert_eq!(controller.youtube_search_request, Some(request));
+        assert_eq!(
+            controller.next_youtube_page, None,
+            "opaque Official API page tokens cannot survive a process restart"
+        );
+        assert_eq!(controller.view.search_query, "restored fixture");
+        assert_eq!(
+            controller.view.youtube_search_sort,
+            YouTubeSearchSort::Newest
+        );
+        assert!(controller.view.youtube_creative_commons_only);
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(
+            controller.view.status_line,
+            "1 saved YouTube result restored"
+        );
     }
 
     #[test]
@@ -6387,6 +6613,11 @@ mod tests {
 
     struct EmptyYouTubeProvider;
 
+    struct CountingYouTubeProvider {
+        searches: Arc<AtomicUsize>,
+        details: Arc<AtomicUsize>,
+    }
+
     impl YouTubeProviderBuilder for MockYouTubeProviderBuilder {
         fn official(&self, _api_key: String) -> Result<Box<dyn Provider>, String> {
             Ok(Box::new(EmptyYouTubeProvider))
@@ -6433,6 +6664,45 @@ mod tests {
             _video_id: &str,
         ) -> Result<VideoDetails, crate::providers::ProviderError> {
             Err(crate::providers::ProviderError::Unsupported)
+        }
+    }
+
+    impl Provider for CountingYouTubeProvider {
+        fn id(&self) -> &'static str {
+            "counting-youtube"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Counting YouTube"
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                video_search: true,
+                pagination: true,
+                video_details: true,
+                ..crate::providers::ProviderCapabilities::default()
+            }
+        }
+
+        fn search(
+            &self,
+            request: &SearchRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            self.searches.fetch_add(1, Ordering::SeqCst);
+            Ok(SearchPage {
+                page: request.page,
+                items: Vec::new(),
+                next_page: None,
+            })
+        }
+
+        fn video_details(
+            &self,
+            _video_id: &str,
+        ) -> Result<VideoDetails, crate::providers::ProviderError> {
+            self.details.fetch_add(1, Ordering::SeqCst);
+            Ok(subscription_video_details("Lazy restored details"))
         }
     }
 
@@ -6712,6 +6982,7 @@ mod tests {
 
         controller.handle_provider_response(ProviderResponse::Search {
             generation,
+            request,
             result: Ok(SearchPage {
                 page: 1,
                 items: Vec::new(),
@@ -6722,6 +6993,16 @@ mod tests {
         assert!(controller.view.search_activity.is_none());
         assert_eq!(controller.view.search_animation_frame, 0);
         assert_eq!(controller.view.status_line, "0 YouTube results loaded");
+        let saved = controller
+            .store
+            .youtube_search()
+            .expect("saved search read")
+            .expect("successful search should be saved");
+        assert_eq!(saved.request.query, "ambient");
+        assert_eq!(saved.request.target, SearchTarget::Videos);
+        assert_eq!(saved.request.page, 1);
+        assert!(saved.results.is_empty());
+        assert_eq!(saved.next_page, None);
 
         use_mock_diagnostics(&mut controller);
         controller.supersede_search_generation();
@@ -6729,6 +7010,7 @@ mod tests {
         let error_generation = controller.search_generation;
         controller.handle_provider_response(ProviderResponse::Search {
             generation: error_generation,
+            request: SearchRequest::new("ambient", SearchTarget::Videos),
             result: Err("mock failure".to_owned()),
         });
         assert!(controller.view.search_activity.is_none());
@@ -6741,6 +7023,64 @@ mod tests {
                 .map(|popup| popup.title.as_str()),
             Some("YouTube search failed")
         );
+    }
+
+    #[test]
+    fn accumulated_youtube_search_stops_at_the_restart_safe_result_limit() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (request_sender, requests) = unbounded();
+        controller.provider_requests = Some(request_sender);
+        controller.youtube_provider_available = true;
+        controller.view.search_query = "bounded".to_owned();
+        controller.submit_youtube_search(1);
+        let ProviderRequest::Search {
+            generation,
+            request,
+        } = requests.try_recv().expect("search request")
+        else {
+            panic!("unexpected provider request");
+        };
+        let items = (0..MAX_SAVED_YOUTUBE_SEARCH_RESULTS + 10)
+            .map(|index| {
+                SearchItem::Video(VideoSummary {
+                    video_id: format!("fixture-{index}"),
+                    title: format!("Fixture {index}"),
+                    ..subscription_video_summary()
+                })
+            })
+            .collect();
+
+        controller.handle_provider_response(ProviderResponse::Search {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items,
+                next_page: Some(2),
+            }),
+        });
+
+        assert_eq!(
+            controller.youtube_results.len(),
+            MAX_SAVED_YOUTUBE_SEARCH_RESULTS
+        );
+        assert_eq!(controller.next_youtube_page, None);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("restart-safe limit reached")
+        );
+        let saved = controller
+            .store
+            .youtube_search()
+            .expect("saved search")
+            .expect("snapshot");
+        assert_eq!(saved.results.len(), MAX_SAVED_YOUTUBE_SEARCH_RESULTS);
+        assert_eq!(saved.next_page, None);
     }
 
     #[test]
@@ -6771,6 +7111,7 @@ mod tests {
 
         controller.handle_provider_response(ProviderResponse::Search {
             generation,
+            request,
             result: Ok(SearchPage {
                 page: 1,
                 items: Vec::new(),
@@ -6828,6 +7169,7 @@ mod tests {
 
         controller.handle_provider_response(ProviderResponse::Search {
             generation,
+            request,
             result: Ok(SearchPage {
                 page: 1,
                 items: Vec::new(),
@@ -6912,6 +7254,7 @@ mod tests {
         controller.begin_search_activity(SearchActivity::TrackerArchives);
         controller.handle_provider_response(ProviderResponse::Search {
             generation: stale_generation,
+            request: SearchRequest::new("stale", SearchTarget::Videos),
             result: Ok(SearchPage {
                 page: 1,
                 items: Vec::new(),
