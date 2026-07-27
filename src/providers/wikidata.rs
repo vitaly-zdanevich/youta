@@ -23,11 +23,16 @@ const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RESULTS: usize = 20;
 const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LABEL_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_FORMATTER_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_STATEMENT_PROPERTIES: usize = 256;
 const MAX_VALUES_PER_PROPERTY: usize = 128;
 const MAX_STATEMENT_VALUES: usize = 1_024;
 const MAX_LABEL_IDS: usize = 50;
+const MAX_LABEL_ENTITY_IDS: usize = MAX_STATEMENT_PROPERTIES + MAX_STATEMENT_VALUES;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
+const COMMONS_FILE_PAGE_BASE: &str = "https://commons.wikimedia.org/wiki/File:";
+const COMMONS_FILE_PREVIEW_BASE: &str = "https://commons.wikimedia.org/wiki/Special:Redirect/file/";
+const COMMONS_PREVIEW_WIDTH: &str = "512";
 
 /// External media identifier property used for an exact Wikidata lookup.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +92,12 @@ pub struct WikidataEntityStatements {
     /// An oversized HTTP response remains an error because it cannot be safely
     /// parsed far enough to return a trustworthy partial result.
     pub truncated: bool,
+    /// Whether a documented structural or display-size hard bound was reached.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hard_bounds_reached: bool,
+    /// Whether an empty or unsupported structured value was omitted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unsupported_values_omitted: bool,
 }
 
 /// One Wikidata property and all bounded, human-facing main values.
@@ -110,6 +121,19 @@ pub struct WikidataStatementValue {
     /// The ID remains present when its human-facing label could not be loaded,
     /// so callers can still offer a stable link to the Wikidata item.
     pub item_id: Option<String>,
+    /// Provider page for an external identifier or Wikimedia Commons file.
+    ///
+    /// The field defaults to absent when older serialized statement data is
+    /// loaded, preserving compatibility with caches written before links were
+    /// exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<Url>,
+    /// Bounded-size raster preview distinct from the human-facing target.
+    ///
+    /// This is currently populated for Wikimedia Commons media. Older cached
+    /// values deserialize with no preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<Url>,
 }
 
 /// Bounded client for the public Wikidata Query Service.
@@ -119,8 +143,10 @@ pub struct WikidataProvider {
     max_response_bytes: usize,
     entity_data_base: Url,
     entity_api_endpoint: Url,
+    formatter_query_endpoint: Url,
     max_entity_response_bytes: usize,
     max_label_response_bytes: usize,
+    max_formatter_response_bytes: usize,
 }
 
 impl WikidataProvider {
@@ -140,8 +166,11 @@ impl WikidataProvider {
                 .expect("the compile-time Wikidata EntityData base URL is valid"),
             entity_api_endpoint: Url::parse(ENTITY_API_ENDPOINT)
                 .expect("the compile-time Wikidata entity API URL is valid"),
+            formatter_query_endpoint: Url::parse(ENDPOINT)
+                .expect("the compile-time Wikidata query endpoint is valid"),
             max_entity_response_bytes: MAX_ENTITY_RESPONSE_BYTES,
             max_label_response_bytes: MAX_LABEL_RESPONSE_BYTES,
+            max_formatter_response_bytes: MAX_FORMATTER_RESPONSE_BYTES,
         }
     }
 
@@ -167,11 +196,11 @@ impl WikidataProvider {
     /// Lazily loads bounded, human-facing statements for one Wikidata item.
     ///
     /// The first request uses Wikidata's HTTPS `Special:EntityData` JSON
-    /// representation. One additional bounded `wbgetentities` request resolves
-    /// as many labels as the anonymous API limit permits. Direct item-valued
-    /// claims are prioritized over supporting entities and property labels, so
-    /// useful linked-item labels are not starved by property-rich entities.
-    /// Unresolved IDs remain visible rather than causing data loss.
+    /// representation. Additional bounded `wbgetentities` requests resolve
+    /// labels in anonymous-API-sized batches and retrieve P1630 formatter URLs
+    /// for external-ID properties. Direct item-valued claims are requested
+    /// before supporting entities and property labels. Unresolved IDs remain
+    /// visible rather than causing data loss.
     ///
     /// # Errors
     ///
@@ -188,17 +217,34 @@ impl WikidataProvider {
         let mut pending = normalize_entity_claims(item_id, response)?;
 
         let (label_ids, labels_truncated) = collect_label_ids(&pending);
-        pending.truncated |= labels_truncated;
-        let (labels, label_values_truncated) = if label_ids.is_empty() {
-            (BTreeMap::new(), false)
-        } else {
-            let label_url = build_label_url(&self.entity_api_endpoint, &label_ids)?;
+        pending.omissions.hard_bounds_reached |= labels_truncated;
+        let mut labels = BTreeMap::new();
+        for label_batch in label_ids.chunks(MAX_LABEL_IDS) {
+            let label_url = build_label_url(&self.entity_api_endpoint, label_batch)?;
             let response: EntityLabelResponse =
                 get_bounded_json(&self.agent, &label_url, self.max_label_response_bytes)?;
-            normalize_labels(&label_ids, response)?
-        };
-        pending.truncated |= label_values_truncated;
-        Ok(render_entity_statements(pending, &labels))
+            let (batch_labels, batch_omissions) = normalize_labels(label_batch, response)?;
+            pending.omissions.merge(batch_omissions);
+            labels.extend(batch_labels);
+        }
+
+        let formatter_property_ids = collect_formatter_property_ids(&pending);
+        let mut formatter_urls = BTreeMap::new();
+        for formatter_batch in formatter_property_ids.chunks(MAX_LABEL_IDS) {
+            let formatter_url =
+                build_formatter_url(&self.formatter_query_endpoint, formatter_batch)?;
+            let response: FormatterSparqlResponse = get_bounded_json(
+                &self.agent,
+                &formatter_url,
+                self.max_formatter_response_bytes,
+            )?;
+            let (batch_formatters, formatter_omissions) =
+                normalize_formatter_urls(formatter_batch, response)?;
+            pending.omissions.merge(formatter_omissions);
+            formatter_urls.extend(batch_formatters);
+        }
+
+        Ok(render_entity_statements(pending, &labels, &formatter_urls))
     }
 
     #[cfg(test)]
@@ -208,13 +254,19 @@ impl WikidataProvider {
         max_entity_response_bytes: usize,
         max_label_response_bytes: usize,
     ) -> Self {
+        let formatter_query_endpoint = entity_api_endpoint
+            .join("/sparql")
+            .expect("a test entity API URL can form a sibling SPARQL endpoint");
         Self {
             agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
             max_response_bytes: MAX_RESPONSE_BYTES,
             entity_data_base,
             entity_api_endpoint,
+            formatter_query_endpoint,
             max_entity_response_bytes,
             max_label_response_bytes,
+            max_formatter_response_bytes: max_label_response_bytes
+                .min(MAX_FORMATTER_RESPONSE_BYTES),
         }
     }
 }
@@ -389,9 +441,49 @@ fn build_entity_data_url(base: &Url, item_id: &str) -> Result<Url, ProviderError
 }
 
 fn build_label_url(endpoint: &Url, entity_ids: &[String]) -> Result<Url, ProviderError> {
+    build_entity_api_url(endpoint, entity_ids, "labels")
+}
+
+/// Builds one bounded SPARQL request for P1630 formatter URLs.
+fn build_formatter_url(endpoint: &Url, property_ids: &[String]) -> Result<Url, ProviderError> {
+    if property_ids.is_empty() || property_ids.len() > MAX_LABEL_IDS {
+        return Err(ProviderError::InvalidRequest(format!(
+            "Wikidata formatter request must contain 1 to {MAX_LABEL_IDS} property IDs"
+        )));
+    }
+    for property_id in property_ids {
+        validate_property_id(property_id)?;
+    }
+    let properties = property_ids
+        .iter()
+        .map(|property_id| format!("wd:{property_id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!(
+        r"SELECT ?property (SAMPLE(?formatterUrl) AS ?formatter) WHERE {{
+  VALUES ?property {{ {properties} }}
+  ?property wdt:P1630 ?formatterUrl .
+}}
+GROUP BY ?property
+LIMIT {MAX_LABEL_IDS}"
+    );
+    let mut url = endpoint.clone();
+    url.query_pairs_mut()
+        .append_pair("query", &query)
+        .append_pair("format", "json")
+        .append_pair("maxlag", "5");
+    Ok(url)
+}
+
+/// Builds a `wbgetentities` request within the anonymous 50-ID limit.
+fn build_entity_api_url(
+    endpoint: &Url,
+    entity_ids: &[String],
+    props: &str,
+) -> Result<Url, ProviderError> {
     if entity_ids.is_empty() || entity_ids.len() > MAX_LABEL_IDS {
         return Err(ProviderError::InvalidRequest(format!(
-            "Wikidata label request must contain 1 to {MAX_LABEL_IDS} entity IDs"
+            "Wikidata entity request must contain 1 to {MAX_LABEL_IDS} entity IDs"
         )));
     }
     for entity_id in entity_ids {
@@ -402,10 +494,13 @@ fn build_label_url(endpoint: &Url, entity_ids: &[String]) -> Result<Url, Provide
         .append_pair("action", "wbgetentities")
         .append_pair("format", "json")
         .append_pair("formatversion", "2")
-        .append_pair("props", "labels")
-        .append_pair("languages", "en")
-        .append_pair("languagefallback", "1")
+        .append_pair("props", props)
         .append_pair("ids", &entity_ids.join("|"));
+    if props == "labels" {
+        url.query_pairs_mut()
+            .append_pair("languages", "en")
+            .append_pair("languagefallback", "1");
+    }
     Ok(url)
 }
 
@@ -457,7 +552,24 @@ fn valid_prefixed_decimal_id(value: &str, prefix: char) -> bool {
 struct PendingEntityStatements {
     item_id: String,
     statements: Vec<PendingStatement>,
-    truncated: bool,
+    omissions: OmissionState,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OmissionState {
+    hard_bounds_reached: bool,
+    unsupported_values_omitted: bool,
+}
+
+impl OmissionState {
+    fn merge(&mut self, other: Self) {
+        self.hard_bounds_reached |= other.hard_bounds_reached;
+        self.unsupported_values_omitted |= other.unsupported_values_omitted;
+    }
+
+    fn is_truncated(self) -> bool {
+        self.hard_bounds_reached || self.unsupported_values_omitted
+    }
 }
 
 #[derive(Debug)]
@@ -469,6 +581,8 @@ struct PendingStatement {
 #[derive(Debug)]
 enum PendingStatementValue {
     Plain(String),
+    ExternalId(String),
+    CommonsMedia(String),
     Entity(String),
     Quantity {
         amount: String,
@@ -495,6 +609,8 @@ impl PendingStatementValue {
         match self {
             Self::Entity(entity_id) => Some(entity_id),
             Self::Plain(_)
+            | Self::ExternalId(_)
+            | Self::CommonsMedia(_)
             | Self::Quantity { .. }
             | Self::Time { .. }
             | Self::Coordinate { .. } => None,
@@ -507,15 +623,36 @@ impl PendingStatementValue {
             Self::Quantity { unit_id, .. } => unit_id.as_deref(),
             Self::Time { calendar_id, .. } => calendar_id.as_deref(),
             Self::Coordinate { globe_id, .. } => globe_id.as_deref(),
-            Self::Plain(_) | Self::Entity(_) => None,
+            Self::Plain(_) | Self::ExternalId(_) | Self::CommonsMedia(_) | Self::Entity(_) => None,
         }
     }
 
-    fn render(&self, labels: &BTreeMap<String, String>) -> WikidataStatementValue {
+    fn render(
+        &self,
+        property_id: &str,
+        labels: &BTreeMap<String, String>,
+        formatter_urls: &BTreeMap<String, String>,
+    ) -> WikidataStatementValue {
         match self {
             Self::Plain(display) => WikidataStatementValue {
                 display: display.clone(),
                 item_id: None,
+                external_url: None,
+                preview_url: None,
+            },
+            Self::ExternalId(display) => WikidataStatementValue {
+                display: display.clone(),
+                item_id: None,
+                external_url: formatter_urls
+                    .get(property_id)
+                    .and_then(|formatter| formatted_external_url(formatter, display)),
+                preview_url: None,
+            },
+            Self::CommonsMedia(display) => WikidataStatementValue {
+                display: display.clone(),
+                item_id: None,
+                external_url: commons_file_page_url(display),
+                preview_url: commons_file_preview_url(display),
             },
             Self::Entity(entity_id) => WikidataStatementValue {
                 display: labels
@@ -523,6 +660,8 @@ impl PendingStatementValue {
                     .cloned()
                     .unwrap_or_else(|| entity_id.clone()),
                 item_id: entity_id.starts_with('Q').then(|| entity_id.clone()),
+                external_url: None,
+                preview_url: None,
             },
             Self::Quantity {
                 amount,
@@ -544,6 +683,8 @@ impl PendingStatementValue {
                 WikidataStatementValue {
                     display: format!("{amount}{bounds}{unit}"),
                     item_id: None,
+                    external_url: None,
+                    preview_url: None,
                 }
             }
             Self::Time { time, calendar_id } => {
@@ -560,6 +701,8 @@ impl PendingStatementValue {
                 WikidataStatementValue {
                     display: format!("{time}{calendar}"),
                     item_id: None,
+                    external_url: None,
+                    preview_url: None,
                 }
             }
             Self::Coordinate {
@@ -582,6 +725,8 @@ impl PendingStatementValue {
                 WikidataStatementValue {
                     display: format!("{latitude}, {longitude}{altitude}{globe}"),
                     item_id: None,
+                    external_url: None,
+                    preview_url: None,
                 }
             }
         }
@@ -605,18 +750,21 @@ fn normalize_entity_claims(
     let property_count = entity.claims.len();
     let mut statements = Vec::with_capacity(property_count.min(MAX_STATEMENT_PROPERTIES));
     let mut total_values = 0usize;
-    let mut truncated = property_count > MAX_STATEMENT_PROPERTIES;
+    let mut omissions = OmissionState {
+        hard_bounds_reached: property_count > MAX_STATEMENT_PROPERTIES,
+        unsupported_values_omitted: false,
+    };
 
     for (property_id, claims) in entity.claims.into_iter().take(MAX_STATEMENT_PROPERTIES) {
         validate_property_id(&property_id)?;
         let claim_count = claims.len();
         if claim_count > MAX_VALUES_PER_PROPERTY {
-            truncated = true;
+            omissions.hard_bounds_reached = true;
         }
         let mut values = Vec::with_capacity(claim_count.min(MAX_VALUES_PER_PROPERTY));
         for claim in claims.into_iter().take(MAX_VALUES_PER_PROPERTY) {
             if total_values >= MAX_STATEMENT_VALUES {
-                truncated = true;
+                omissions.hard_bounds_reached = true;
                 break;
             }
             if claim.mainsnak.property != property_id {
@@ -624,8 +772,8 @@ fn normalize_entity_claims(
                     "Wikidata claim property does not match its containing group".to_owned(),
                 ));
             }
-            let (value, value_truncated) = normalize_snak(claim.mainsnak)?;
-            truncated |= value_truncated;
+            let (value, value_omissions) = normalize_snak(claim.mainsnak)?;
+            omissions.merge(value_omissions);
             if let Some(value) = value {
                 values.push(value);
                 total_values = total_values.saturating_add(1);
@@ -638,7 +786,7 @@ fn normalize_entity_claims(
             });
         }
         if total_values >= MAX_STATEMENT_VALUES {
-            truncated |= statements.len() < property_count;
+            omissions.hard_bounds_reached |= statements.len() < property_count;
             break;
         }
     }
@@ -646,21 +794,21 @@ fn normalize_entity_claims(
     Ok(PendingEntityStatements {
         item_id: item_id.to_owned(),
         statements,
-        truncated,
+        omissions,
     })
 }
 
 fn normalize_snak(
     snak: RawMainSnak,
-) -> Result<(Option<PendingStatementValue>, bool), ProviderError> {
+) -> Result<(Option<PendingStatementValue>, OmissionState), ProviderError> {
     match snak.snak_type.as_str() {
         "novalue" => Ok((
             Some(PendingStatementValue::Plain("no value".to_owned())),
-            false,
+            OmissionState::default(),
         )),
         "somevalue" => Ok((
             Some(PendingStatementValue::Plain("unknown value".to_owned())),
-            false,
+            OmissionState::default(),
         )),
         "value" => {
             let data_value = snak.data_value.ok_or_else(|| {
@@ -668,7 +816,17 @@ fn normalize_snak(
                     "Wikidata value claim is missing its data value".to_owned(),
                 )
             })?;
-            normalize_data_value(data_value)
+            let (value, omissions) = normalize_data_value(data_value)?;
+            let value = match (snak.data_type.as_deref(), value) {
+                (Some("external-id"), Some(PendingStatementValue::Plain(display))) => {
+                    Some(PendingStatementValue::ExternalId(display))
+                }
+                (Some("commonsMedia"), Some(PendingStatementValue::Plain(display))) => {
+                    Some(PendingStatementValue::CommonsMedia(display))
+                }
+                (_, value) => value,
+            };
+            Ok((value, omissions))
         }
         _ => Err(ProviderError::InvalidResponse(
             "Wikidata claim contains an unknown snak type".to_owned(),
@@ -676,9 +834,64 @@ fn normalize_snak(
     }
 }
 
+/// Applies a Wikidata P1630 formatter URL to one percent-encoded identifier.
+fn formatted_external_url(formatter: &str, external_id: &str) -> Option<Url> {
+    if !formatter.contains("$1") {
+        return None;
+    }
+    let encoded_id = percent_encode_component(external_id);
+    let rendered = formatter.replace("$1", &encoded_id);
+    safe_external_url(&rendered)
+}
+
+/// Builds Wikimedia Commons' human-facing file page for a P18 value.
+fn commons_file_page_url(filename: &str) -> Option<Url> {
+    Url::parse(&format!(
+        "{COMMONS_FILE_PAGE_BASE}{}",
+        percent_encode_component(filename)
+    ))
+    .ok()
+}
+
+/// Builds a bounded-width Commons raster redirect suitable for TUI previews.
+fn commons_file_preview_url(filename: &str) -> Option<Url> {
+    let mut url = Url::parse(&format!(
+        "{COMMONS_FILE_PREVIEW_BASE}{}",
+        percent_encode_component(filename)
+    ))
+    .ok()?;
+    url.query_pairs_mut()
+        .append_pair("width", COMMONS_PREVIEW_WIDTH);
+    Some(url)
+}
+
+/// Accepts only credential-free HTTP(S) links with a network host.
+fn safe_external_url(raw_url: &str) -> Option<Url> {
+    let url = Url::parse(raw_url).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(url)
+}
+
+/// Percent-encodes one external identifier as a URL component.
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
 fn normalize_data_value(
     data_value: RawDataValue,
-) -> Result<(Option<PendingStatementValue>, bool), ProviderError> {
+) -> Result<(Option<PendingStatementValue>, OmissionState), ProviderError> {
     match data_value.value_type.as_str() {
         "wikibase-entityid" => {
             let raw: RawEntityId = serde_json::from_value(data_value.value)
@@ -688,7 +901,10 @@ fn normalize_data_value(
                     "Wikidata claim contains an invalid entity identifier".to_owned(),
                 ));
             }
-            Ok((Some(PendingStatementValue::Entity(raw.id)), false))
+            Ok((
+                Some(PendingStatementValue::Entity(raw.id)),
+                OmissionState::default(),
+            ))
         }
         "monolingualtext" => {
             let raw: RawMonolingualText = serde_json::from_value(data_value.value)
@@ -696,15 +912,18 @@ fn normalize_data_value(
             let language = normalize_language_code(&raw.language)?;
             let combined = format!("{} [{language}]", raw.text);
             bounded_display(&combined)
-                .map(|(display, truncated)| (display.map(PendingStatementValue::Plain), truncated))
+                .map(|(display, omissions)| (display.map(PendingStatementValue::Plain), omissions))
         }
         "quantity" => {
             let raw: RawQuantity = serde_json::from_value(data_value.value)
                 .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
             let unit_id = unit_entity_id(&raw.unit)?;
-            let (amount, amount_truncated) = required_bounded_text(&raw.amount, "quantity amount")?;
-            let (lower_bound, lower_truncated) = optional_bounded_text(raw.lower_bound.as_deref())?;
-            let (upper_bound, upper_truncated) = optional_bounded_text(raw.upper_bound.as_deref())?;
+            let (amount, amount_omissions) = required_bounded_text(&raw.amount, "quantity amount")?;
+            let (lower_bound, lower_omissions) = optional_bounded_text(raw.lower_bound.as_deref())?;
+            let (upper_bound, upper_omissions) = optional_bounded_text(raw.upper_bound.as_deref())?;
+            let mut omissions = amount_omissions;
+            omissions.merge(lower_omissions);
+            omissions.merge(upper_omissions);
             Ok((
                 Some(PendingStatementValue::Quantity {
                     amount,
@@ -712,7 +931,7 @@ fn normalize_data_value(
                     upper_bound,
                     unit_id,
                 }),
-                amount_truncated || lower_truncated || upper_truncated,
+                omissions,
             ))
         }
         "time" => {
@@ -720,10 +939,10 @@ fn normalize_data_value(
                 .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
             let calendar_id = unit_entity_id(&raw.calendar_model)?;
             let time = human_time(&raw.time, raw.precision)?;
-            let (time, truncated) = required_bounded_text(&time, "time value")?;
+            let (time, omissions) = required_bounded_text(&time, "time value")?;
             Ok((
                 Some(PendingStatementValue::Time { time, calendar_id }),
-                truncated,
+                omissions,
             ))
         }
         "globecoordinate" => {
@@ -745,7 +964,7 @@ fn normalize_data_value(
                     altitude: raw.altitude.map(|value| value.to_string()),
                     globe_id,
                 }),
-                false,
+                OmissionState::default(),
             ))
         }
         _ => bounded_plain_value(data_value.value),
@@ -754,18 +973,26 @@ fn normalize_data_value(
 
 fn bounded_plain_value(
     value: Value,
-) -> Result<(Option<PendingStatementValue>, bool), ProviderError> {
+) -> Result<(Option<PendingStatementValue>, OmissionState), ProviderError> {
     let text = match value {
         Value::String(text) => text,
         Value::Number(number) => number.to_string(),
         Value::Bool(value) => value.to_string(),
-        Value::Null | Value::Array(_) | Value::Object(_) => return Ok((None, true)),
+        Value::Null | Value::Array(_) | Value::Object(_) => {
+            return Ok((
+                None,
+                OmissionState {
+                    hard_bounds_reached: false,
+                    unsupported_values_omitted: true,
+                },
+            ));
+        }
     };
     bounded_display(&text)
-        .map(|(display, truncated)| (display.map(PendingStatementValue::Plain), truncated))
+        .map(|(display, omissions)| (display.map(PendingStatementValue::Plain), omissions))
 }
 
-fn bounded_display(text: &str) -> Result<(Option<String>, bool), ProviderError> {
+fn bounded_display(text: &str) -> Result<(Option<String>, OmissionState), ProviderError> {
     let normalized = text
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -773,10 +1000,16 @@ fn bounded_display(text: &str) -> Result<(Option<String>, bool), ProviderError> 
         .trim()
         .to_owned();
     if normalized.is_empty() {
-        return Ok((None, true));
+        return Ok((
+            None,
+            OmissionState {
+                hard_bounds_reached: false,
+                unsupported_values_omitted: true,
+            },
+        ));
     }
     if normalized.len() <= MAX_VALUE_BYTES {
-        return Ok((Some(normalized), false));
+        return Ok((Some(normalized), OmissionState::default()));
     }
     let boundary = normalized
         .char_indices()
@@ -791,17 +1024,28 @@ fn bounded_display(text: &str) -> Result<(Option<String>, bool), ProviderError> 
     }
     let mut bounded = normalized[..boundary].to_owned();
     bounded.push('…');
-    Ok((Some(bounded), true))
+    Ok((
+        Some(bounded),
+        OmissionState {
+            hard_bounds_reached: true,
+            unsupported_values_omitted: false,
+        },
+    ))
 }
 
-fn required_bounded_text(text: &str, field: &str) -> Result<(String, bool), ProviderError> {
-    let (text, truncated) = bounded_display(text)?;
-    text.map(|text| (text, truncated))
+fn required_bounded_text(
+    text: &str,
+    field: &str,
+) -> Result<(String, OmissionState), ProviderError> {
+    let (text, omissions) = bounded_display(text)?;
+    text.map(|text| (text, omissions))
         .ok_or_else(|| ProviderError::InvalidResponse(format!("Wikidata {field} cannot be empty")))
 }
 
-fn optional_bounded_text(text: Option<&str>) -> Result<(Option<String>, bool), ProviderError> {
-    text.map_or(Ok((None, false)), bounded_display)
+fn optional_bounded_text(
+    text: Option<&str>,
+) -> Result<(Option<String>, OmissionState), ProviderError> {
+    text.map_or(Ok((None, OmissionState::default())), bounded_display)
 }
 
 fn normalize_language_code(language: &str) -> Result<String, ProviderError> {
@@ -914,14 +1158,14 @@ fn human_time(time: &str, precision: u8) -> Result<String, ProviderError> {
     })
 }
 
-/// Selects one bounded label batch in descending order of UI value.
+/// Selects all structurally bounded label IDs in descending order of UI value.
 ///
 /// Direct entity-valued claims are collected across every statement before
-/// supporting unit/calendar/globe entities and property IDs. This ordering
-/// keeps late linked values readable without increasing the request count or
-/// exceeding Wikidata's anonymous 50-ID batch limit.
+/// supporting unit/calendar/globe entities and property IDs. The caller chunks
+/// the result to Wikidata's anonymous 50-ID request limit, so reaching a batch
+/// boundary does not make the entity result partial.
 fn collect_label_ids(pending: &PendingEntityStatements) -> (Vec<String>, bool) {
-    let mut identifiers = Vec::with_capacity(MAX_LABEL_IDS);
+    let mut identifiers = Vec::with_capacity(MAX_LABEL_ENTITY_IDS);
     let mut seen = BTreeSet::new();
     let mut truncated = false;
     let candidates = pending
@@ -948,7 +1192,7 @@ fn collect_label_ids(pending: &PendingEntityStatements) -> (Vec<String>, bool) {
         if !seen.insert(entity_id.to_owned()) {
             continue;
         }
-        if identifiers.len() >= MAX_LABEL_IDS {
+        if identifiers.len() >= MAX_LABEL_ENTITY_IDS {
             truncated = true;
             continue;
         }
@@ -957,10 +1201,25 @@ fn collect_label_ids(pending: &PendingEntityStatements) -> (Vec<String>, bool) {
     (identifiers, truncated)
 }
 
+/// Finds properties whose external-ID values may have a P1630 formatter.
+fn collect_formatter_property_ids(pending: &PendingEntityStatements) -> Vec<String> {
+    pending
+        .statements
+        .iter()
+        .filter(|statement| {
+            statement
+                .values
+                .iter()
+                .any(|value| matches!(value, PendingStatementValue::ExternalId(_)))
+        })
+        .map(|statement| statement.property_id.clone())
+        .collect()
+}
+
 fn normalize_labels(
     requested_ids: &[String],
     response: EntityLabelResponse,
-) -> Result<(BTreeMap<String, String>, bool), ProviderError> {
+) -> Result<(BTreeMap<String, String>, OmissionState), ProviderError> {
     if response.entities.len() > requested_ids.len() {
         return Err(ProviderError::InvalidResponse(
             "Wikidata returned more label entities than requested".to_owned(),
@@ -971,7 +1230,7 @@ fn normalize_labels(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut labels = BTreeMap::new();
-    let mut truncated = false;
+    let mut omissions = OmissionState::default();
     for (entity_id, entity) in response.entities {
         if !requested.contains(entity_id.as_str()) {
             return Err(ProviderError::InvalidResponse(
@@ -984,39 +1243,79 @@ fn normalize_labels(
             .or_else(|| entity.labels.values().next())
             .map(|label| label.value.clone());
         if let Some(label) = label {
-            let (label, label_truncated) = bounded_display(&label)?;
-            truncated |= label_truncated;
+            let (label, label_omissions) = bounded_display(&label)?;
+            omissions.merge(label_omissions);
             if let Some(label) = label {
                 labels.insert(entity_id, label);
             }
         }
     }
-    Ok((labels, truncated))
+    Ok((labels, omissions))
+}
+
+/// Extracts at most one safe, bounded P1630 template per requested property.
+fn normalize_formatter_urls(
+    requested_ids: &[String],
+    response: FormatterSparqlResponse,
+) -> Result<(BTreeMap<String, String>, OmissionState), ProviderError> {
+    if response.results.bindings.len() > requested_ids.len() {
+        return Err(ProviderError::InvalidResponse(
+            "Wikidata returned more formatter rows than requested".to_owned(),
+        ));
+    }
+    let requested = requested_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut formatters = BTreeMap::new();
+    let mut omissions = OmissionState::default();
+    for binding in response.results.bindings {
+        let property_id = wikidata_property_id(&binding.property.value)?;
+        if !requested.contains(property_id.as_str()) {
+            return Err(ProviderError::InvalidResponse(
+                "Wikidata returned an unrequested formatter property".to_owned(),
+            ));
+        }
+        let (formatter, formatter_omissions) = bounded_display(&binding.formatter.value)?;
+        omissions.merge(formatter_omissions);
+        if let Some(formatter) = formatter.filter(|value| value.contains("$1")) {
+            formatters.entry(property_id).or_insert(formatter);
+        }
+    }
+    Ok((formatters, omissions))
 }
 
 fn render_entity_statements(
     pending: PendingEntityStatements,
     labels: &BTreeMap<String, String>,
+    formatter_urls: &BTreeMap<String, String>,
 ) -> WikidataEntityStatements {
+    let omissions = pending.omissions;
     WikidataEntityStatements {
         item_id: pending.item_id,
         statements: pending
             .statements
             .into_iter()
-            .map(|statement| WikidataStatement {
-                property_label: labels
-                    .get(&statement.property_id)
-                    .cloned()
-                    .unwrap_or_else(|| statement.property_id.clone()),
-                property_id: statement.property_id,
-                values: statement
+            .map(|statement| {
+                let property_id = statement.property_id;
+                let values = statement
                     .values
                     .iter()
-                    .map(|value| value.render(labels))
-                    .collect(),
+                    .map(|value| value.render(&property_id, labels, formatter_urls))
+                    .collect();
+                WikidataStatement {
+                    property_label: labels
+                        .get(&property_id)
+                        .cloned()
+                        .unwrap_or_else(|| property_id.clone()),
+                    property_id,
+                    values,
+                }
             })
             .collect(),
-        truncated: pending.truncated,
+        truncated: omissions.is_truncated(),
+        hard_bounds_reached: omissions.hard_bounds_reached,
+        unsupported_values_omitted: omissions.unsupported_values_omitted,
     }
 }
 
@@ -1065,8 +1364,20 @@ fn normalize_response(
 }
 
 fn wikidata_item_id(uri: &str) -> Result<String, ProviderError> {
+    wikidata_entity_id(uri, 'Q', "item")
+}
+
+fn wikidata_property_id(uri: &str) -> Result<String, ProviderError> {
+    wikidata_entity_id(uri, 'P', "property")
+}
+
+fn wikidata_entity_id(
+    uri: &str,
+    expected_prefix: char,
+    kind: &str,
+) -> Result<String, ProviderError> {
     let url = Url::parse(uri)
-        .map_err(|error| ProviderError::InvalidResponse(format!("invalid item URI: {error}")))?;
+        .map_err(|error| ProviderError::InvalidResponse(format!("invalid {kind} URI: {error}")))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str() != Some("www.wikidata.org")
         || !url.username().is_empty()
@@ -1074,21 +1385,21 @@ fn wikidata_item_id(uri: &str) -> Result<String, ProviderError> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(ProviderError::InvalidResponse(
-            "Wikidata result contains a foreign item URI".to_owned(),
-        ));
+        return Err(ProviderError::InvalidResponse(format!(
+            "Wikidata result contains a foreign {kind} URI"
+        )));
     }
-    let Some(item_id) = url.path().strip_prefix("/entity/") else {
-        return Err(ProviderError::InvalidResponse(
-            "Wikidata item URI has an unexpected path".to_owned(),
-        ));
+    let Some(entity_id) = url.path().strip_prefix("/entity/") else {
+        return Err(ProviderError::InvalidResponse(format!(
+            "Wikidata {kind} URI has an unexpected path"
+        )));
     };
-    if !valid_prefixed_decimal_id(item_id, 'Q') {
-        return Err(ProviderError::InvalidResponse(
-            "Wikidata result contains an invalid Q identifier".to_owned(),
-        ));
+    if !valid_prefixed_decimal_id(entity_id, expected_prefix) {
+        return Err(ProviderError::InvalidResponse(format!(
+            "Wikidata result contains an invalid {kind} identifier"
+        )));
     }
-    Ok(item_id.to_owned())
+    Ok(entity_id.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,6 +1423,8 @@ struct RawMainSnak {
     #[serde(rename = "snaktype")]
     snak_type: String,
     property: String,
+    #[serde(default, rename = "datatype")]
+    data_type: Option<String>,
     #[serde(rename = "datavalue")]
     data_value: Option<RawDataValue>,
 }
@@ -1200,6 +1513,23 @@ struct SparqlBinding {
 #[derive(Debug, Deserialize)]
 struct SparqlValue {
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FormatterSparqlResponse {
+    results: FormatterSparqlResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct FormatterSparqlResults {
+    #[serde(default)]
+    bindings: Vec<FormatterSparqlBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FormatterSparqlBinding {
+    property: SparqlValue,
+    formatter: SparqlValue,
 }
 
 #[cfg(test)]
@@ -1498,10 +1828,14 @@ mod tests {
                 WikidataStatementValue {
                     display: "human".to_owned(),
                     item_id: Some("Q5".to_owned()),
+                    external_url: None,
+                    preview_url: None,
                 },
                 WikidataStatementValue {
                     display: "person".to_owned(),
                     item_id: Some("Q215627".to_owned()),
+                    external_url: None,
+                    preview_url: None,
                 },
             ]
         );
@@ -1533,6 +1867,231 @@ mod tests {
         assert!(!diagnostic.contains("qualifier-hash-must-not-leak"));
         assert!(!diagnostic.contains("reference-hash-must-not-leak"));
         assert!(!diagnostic.contains("preferred"));
+    }
+
+    #[test]
+    fn external_ids_and_commons_media_expose_safe_provider_links() {
+        let entity_fixture = serde_json::json!({
+            "entities": {
+                "Q42": {
+                    "claims": {
+                        "P18": [{
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "property": "P18",
+                                "datatype": "commonsMedia",
+                                "datavalue": {
+                                    "value": "Portrait with a space.jpg",
+                                    "type": "string"
+                                }
+                            }
+                        }],
+                        "P2002": [{
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "property": "P2002",
+                                "datatype": "external-id",
+                                "datavalue": {
+                                    "value": "name/with space",
+                                    "type": "string"
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string();
+        let label_fixture = serde_json::json!({
+            "entities": {
+                "P18": {
+                    "labels": {"en": {"value": "image"}}
+                },
+                "P2002": {
+                    "labels": {"en": {"value": "X username"}}
+                }
+            }
+        })
+        .to_string();
+        let formatter_fixture = serde_json::json!({
+            "results": {
+                "bindings": [{
+                    "property": {
+                        "type": "uri",
+                        "value": "http://www.wikidata.org/entity/P2002"
+                    },
+                    "formatter": {
+                        "type": "uri",
+                        "value": "https://x.com/$1"
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &entity_fixture),
+            json_response("200 OK", &label_fixture),
+            json_response("200 OK", &formatter_fixture),
+        ]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server
+                .base_url
+                .join("wiki/Special:EntityData/")
+                .expect("entity-data URL"),
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        let result = provider
+            .load_entity_statements("Q42")
+            .expect("linked statements should load");
+        let requests = server.finish();
+
+        assert_eq!(requests.len(), 3);
+        let formatter_url = server_url(&requests[2]);
+        let formatter_pairs = formatter_url.query_pairs().collect::<BTreeMap<_, _>>();
+        let formatter_query = formatter_pairs.get("query").expect("formatter query");
+        assert!(formatter_query.contains("VALUES ?property { wd:P2002 }"));
+        assert!(formatter_query.contains("?property wdt:P1630 ?formatterUrl"));
+        let image = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P18")
+            .and_then(|statement| statement.values.first())
+            .expect("image statement value");
+        assert_eq!(
+            image.external_url.as_ref().map(Url::as_str),
+            Some("https://commons.wikimedia.org/wiki/File:Portrait%20with%20a%20space.jpg")
+        );
+        assert_eq!(
+            image.preview_url.as_ref().map(Url::as_str),
+            Some(
+                "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
+                 Portrait%20with%20a%20space.jpg?width=512"
+            )
+        );
+        let username = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P2002")
+            .and_then(|statement| statement.values.first())
+            .expect("external-ID statement value");
+        assert_eq!(
+            username.external_url.as_ref().map(Url::as_str),
+            Some("https://x.com/name%2Fwith%20space")
+        );
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn many_external_ids_use_one_minimal_formatter_query() {
+        const EXTERNAL_PROPERTY_COUNT: usize = 20;
+        let mut claims = serde_json::Map::new();
+        let mut formatter_bindings = Vec::new();
+        for index in 1..=EXTERNAL_PROPERTY_COUNT {
+            let property_id = format!("P{index}");
+            claims.insert(
+                property_id.clone(),
+                serde_json::json!([{
+                    "mainsnak": {
+                        "snaktype": "value",
+                        "property": property_id,
+                        "datatype": "external-id",
+                        "datavalue": {
+                            "value": format!("fixture-{index}"),
+                            "type": "string"
+                        }
+                    }
+                }]),
+            );
+            formatter_bindings.push(serde_json::json!({
+                "property": {
+                    "type": "uri",
+                    "value": format!("http://www.wikidata.org/entity/P{index}")
+                },
+                "formatter": {
+                    "type": "uri",
+                    "value": format!("https://catalog.example/{index}/$1")
+                }
+            }));
+        }
+        let entity_fixture = serde_json::json!({
+            "entities": {
+                "Q42": {"claims": Value::Object(claims)}
+            }
+        })
+        .to_string();
+        let formatter_fixture = serde_json::json!({
+            "results": {"bindings": formatter_bindings}
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &entity_fixture),
+            json_response("200 OK", r#"{"entities": {}}"#),
+            json_response("200 OK", &formatter_fixture),
+        ]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server
+                .base_url
+                .join("wiki/Special:EntityData/")
+                .expect("entity-data URL"),
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        let result = provider
+            .load_entity_statements("Q42")
+            .expect("many formatter-backed IDs should remain below the bounded response");
+        let requests = server.finish();
+
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("/sparql?"));
+        let formatter_query = server_url(&requests[2])
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .expect("formatter query");
+        assert_eq!(
+            formatter_query.matches("wd:P").count(),
+            EXTERNAL_PROPERTY_COUNT
+        );
+        assert!(!formatter_query.contains("props=claims"));
+        assert_eq!(
+            result
+                .statements
+                .iter()
+                .filter_map(|statement| statement.values.first())
+                .filter(|value| value.external_url.is_some())
+                .count(),
+            EXTERNAL_PROPERTY_COUNT
+        );
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn serialized_statement_values_remain_compatible_without_external_url() {
+        let value: WikidataStatementValue =
+            serde_json::from_str(r#"{"display":"fixture","item_id":null}"#)
+                .expect("older cached value should deserialize");
+
+        assert_eq!(value.display, "fixture");
+        assert!(value.external_url.is_none());
+        assert!(value.preview_url.is_none());
+        assert_eq!(
+            serde_json::to_value(&value).expect("statement value should serialize"),
+            serde_json::json!({"display": "fixture", "item_id": null})
+        );
+
+        let entity: WikidataEntityStatements = serde_json::from_value(serde_json::json!({
+            "item_id": "Q42",
+            "statements": [],
+            "truncated": true
+        }))
+        .expect("older cached entity should deserialize");
+        assert!(!entity.hard_bounds_reached);
+        assert!(!entity.unsupported_values_omitted);
     }
 
     #[test]
@@ -1605,6 +2164,8 @@ mod tests {
             [WikidataStatementValue {
                 display: "L42".to_owned(),
                 item_id: None,
+                external_url: None,
+                preview_url: None,
             }]
         );
     }
@@ -1691,6 +2252,15 @@ mod tests {
         let server = MockServer::spawn(vec![
             json_response("200 OK", &entity_fixture),
             json_response("200 OK", &label_fixture),
+            json_response(
+                "200 OK",
+                r#"{
+                  "entities": {
+                    "P999": {"labels": {"en": {"value": "late fixture property"}}}
+                  },
+                  "success": 1
+                }"#,
+            ),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
             server
@@ -1707,7 +2277,7 @@ mod tests {
             .expect("property-rich fixture should load");
         let requests = server.finish();
 
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let label_url = server_url(&requests[1]);
         let requested_labels = label_url
             .query_pairs()
@@ -1719,12 +2289,22 @@ mod tests {
             &requested_labels[..3],
             ["Q15180".to_owned(), "Q212".to_owned(), "Q999".to_owned()]
         );
-        assert!(result.truncated);
+        let second_label_url = server_url(&requests[2]);
+        let second_requested_labels = second_label_url
+            .query_pairs()
+            .find(|(key, _)| key == "ids")
+            .map(|(_, value)| value.split('|').map(str::to_owned).collect::<Vec<_>>())
+            .expect("second label request IDs");
+        assert_eq!(second_requested_labels.len(), 4);
+        assert!(!result.truncated);
 
         let late_values = result
             .statements
             .iter()
             .find(|statement| statement.property_id == "P999")
+            .inspect(|statement| {
+                assert_eq!(statement.property_label, "late fixture property");
+            })
             .map(|statement| &statement.values)
             .expect("late direct-item statement");
         assert_eq!(
@@ -1733,14 +2313,20 @@ mod tests {
                 WikidataStatementValue {
                     display: "Soviet Union".to_owned(),
                     item_id: Some("Q15180".to_owned()),
+                    external_url: None,
+                    preview_url: None,
                 },
                 WikidataStatementValue {
                     display: "Ukraine".to_owned(),
                     item_id: Some("Q212".to_owned()),
+                    external_url: None,
+                    preview_url: None,
                 },
                 WikidataStatementValue {
                     display: "Q999".to_owned(),
                     item_id: Some("Q999".to_owned()),
+                    external_url: None,
+                    preview_url: None,
                 },
             ]
         );
@@ -1753,6 +2339,7 @@ mod tests {
                 mainsnak: RawMainSnak {
                     snak_type: "value".to_owned(),
                     property: "P1".to_owned(),
+                    data_type: Some("string".to_owned()),
                     data_value: Some(RawDataValue {
                         value_type: "string".to_owned(),
                         value: Value::String(format!("value {index}")),
@@ -1772,13 +2359,46 @@ mod tests {
         let pending =
             normalize_entity_claims("Q42", response).expect("bounded statements should normalize");
 
-        assert!(pending.truncated);
+        assert!(pending.omissions.hard_bounds_reached);
         assert_eq!(pending.statements.len(), 1);
         assert_eq!(pending.statements[0].values.len(), MAX_VALUES_PER_PROPERTY);
     }
 
     #[test]
-    fn label_request_is_capped_and_marked_truncated() {
+    fn unsupported_values_are_distinct_from_hard_bounds() {
+        let response = EntityDataResponse {
+            entities: BTreeMap::from([(
+                "Q42".to_owned(),
+                RawEntityData {
+                    claims: BTreeMap::from([(
+                        "P1".to_owned(),
+                        vec![RawClaim {
+                            mainsnak: RawMainSnak {
+                                snak_type: "value".to_owned(),
+                                property: "P1".to_owned(),
+                                data_type: Some("future-structured-type".to_owned()),
+                                data_value: Some(RawDataValue {
+                                    value_type: "future-structured-type".to_owned(),
+                                    value: serde_json::json!({"future": "shape"}),
+                                }),
+                            },
+                        }],
+                    )]),
+                },
+            )]),
+        };
+
+        let pending =
+            normalize_entity_claims("Q42", response).expect("unknown structured value is omitted");
+        let result = render_entity_statements(pending, &BTreeMap::new(), &BTreeMap::new());
+
+        assert!(result.truncated);
+        assert!(!result.hard_bounds_reached);
+        assert!(result.unsupported_values_omitted);
+    }
+
+    #[test]
+    fn label_ids_crossing_an_api_batch_are_not_marked_truncated() {
         let pending = PendingEntityStatements {
             item_id: "Q42".to_owned(),
             statements: (1..=MAX_LABEL_IDS + 1)
@@ -1787,18 +2407,20 @@ mod tests {
                     values: vec![PendingStatementValue::Plain("value".to_owned())],
                 })
                 .collect(),
-            truncated: false,
+            omissions: OmissionState::default(),
         };
 
         let (identifiers, truncated) = collect_label_ids(&pending);
 
-        assert!(truncated);
-        assert_eq!(identifiers.len(), MAX_LABEL_IDS);
+        assert!(!truncated);
+        assert_eq!(identifiers.len(), MAX_LABEL_IDS + 1);
         assert_eq!(identifiers.first().map(String::as_str), Some("P1"));
+        let expected_last = format!("P{}", MAX_LABEL_IDS + 1);
         assert_eq!(
             identifiers.last().map(String::as_str),
-            Some(&format!("P{MAX_LABEL_IDS}")).map(String::as_str)
+            Some(expected_last.as_str())
         );
+        assert_eq!(identifiers.chunks(MAX_LABEL_IDS).count(), 2);
     }
 
     #[test]

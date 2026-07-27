@@ -455,6 +455,32 @@ impl Default for SubscriptionsView {
     }
 }
 
+/// Focused editor for adding one portable audio or video podcast feed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RssSubscriptionPopupView {
+    /// Draft absolute HTTP(S) RSS or Atom feed URL, potentially with a private
+    /// query token. Its custom [`std::fmt::Debug`] implementation redacts it.
+    pub url: String,
+    /// Validation or OPML-persistence failure retained inside the popup.
+    pub validation_error: Option<String>,
+    /// Exact private OPML file that receives the new subscription.
+    pub config_path: String,
+}
+
+impl std::fmt::Debug for RssSubscriptionPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RssSubscriptionPopupView")
+            .field("url", &"[REDACTED]")
+            .field(
+                "validation_error",
+                &self.validation_error.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("config_path", &self.config_path)
+            .finish()
+    }
+}
+
 /// Focused in-app editor for preferences that are implemented at runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreferencesPopupView {
@@ -543,17 +569,19 @@ pub struct DetailWikidataEntityView {
     pub text: String,
     /// Item-valued statement spans that open canonical Wikidata pages.
     pub value_links: Vec<DetailWikidataValueLinkView>,
+    /// Commons P18 media shown while this property spoiler is expanded.
+    pub image_url: Option<url::Url>,
 }
 
-/// One clickable item-valued statement inside expanded Wikidata properties.
+/// One clickable item or external identifier inside Wikidata properties.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetailWikidataValueLinkView {
     /// Inclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
     pub start_byte: usize,
     /// Exclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
     pub end_byte: usize,
-    /// Validated Wikidata Q-ID used to construct the canonical target.
-    pub item_id: String,
+    /// Validated credential-free HTTP(S) target supplied by the provider.
+    pub url: String,
 }
 
 /// One terminal-cell position inside the visible, selectable Details text.
@@ -745,6 +773,8 @@ pub struct ViewModel {
     pub error_popup: Option<ErrorPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
+    /// Focused RSS/Atom podcast-subscription editor.
+    pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
     /// Focused runtime preferences editor.
     pub preferences_popup: Option<PreferencesPopupView>,
     /// Explicit rename or move-to-Trash confirmation for a local file.
@@ -795,6 +825,7 @@ impl Default for ViewModel {
             help_open: false,
             error_popup: None,
             youtube_setup_popup: None,
+            rss_subscription_popup: None,
             preferences_popup: None,
             local_file_popup: None,
             download: None,
@@ -870,8 +901,8 @@ pub enum UiAction {
     ActivateDetailLink(usize),
     /// Expand or collapse lazy Wikidata properties for an external-link row.
     ToggleWikidataStatements(usize),
-    /// Open one item-valued Wikidata statement through its validated Q-ID.
-    OpenWikidataItem(String),
+    /// Open one validated Wikidata item, external identifier, or Commons file.
+    OpenWikidataValue(String),
     /// Give or remove explicit keyboard focus from the Details panel.
     SetDetailsFocus(bool),
     /// Scroll the focused or pointer-targeted Details panel.
@@ -977,6 +1008,16 @@ pub enum UiAction {
     SubmitYouTubeSetup,
     /// Close the YouTube setup popup without saving.
     DismissYouTubeSetup,
+    /// Open or focus the RSS/Atom podcast-feed editor.
+    OpenRssSubscriptionPopup,
+    /// Add one printable character to the draft RSS feed URL.
+    AppendRssSubscriptionCharacter(char),
+    /// Remove the last character from the draft RSS feed URL.
+    DeleteRssSubscriptionCharacter,
+    /// Validate and persist the draft RSS subscription.
+    SubmitRssSubscription,
+    /// Close the RSS subscription popup without saving.
+    DismissRssSubscriptionPopup,
     /// Open the focused runtime preferences editor.
     OpenPreferences,
     /// Select one draft Subscriptions layout in the preferences editor.
@@ -1613,6 +1654,7 @@ struct HitMap {
     subscription_item_rows: Rect,
     /// First model item represented by the visible subscription-item rectangle.
     subscription_item_first_index: usize,
+    subscription_source_buttons: Vec<(UiAction, Rect)>,
     details_panel: Rect,
     /// Actual wrapped-line offset rendered in the Details description.
     details_scroll_offset: usize,
@@ -1630,6 +1672,8 @@ struct HitMap {
     error_buttons: Vec<(UiAction, Rect)>,
     youtube_setup_fields: Vec<(YouTubeSetupField, Rect)>,
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
+    rss_subscription_field: Option<Rect>,
+    rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
     local_file_buttons: Vec<(UiAction, Rect)>,
 }
@@ -1927,6 +1971,7 @@ fn render_frame(
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
         || view.youtube_setup_popup.is_some()
+        || view.rss_subscription_popup.is_some()
         || view.preferences_popup.is_some()
         || view.local_file_popup.is_some()
         || view.error_popup.is_some();
@@ -1984,6 +2029,11 @@ fn render_frame(
     hit_map.youtube_setup_buttons.clear();
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
         render_youtube_setup_popup(frame, setup, &theme, hit_map);
+    }
+    hit_map.rss_subscription_field = None;
+    hit_map.rss_subscription_buttons.clear();
+    if let Some(popup) = view.rss_subscription_popup.as_ref() {
+        render_rss_subscription_popup(frame, popup, &theme, hit_map);
     }
     hit_map.preferences_buttons.clear();
     if let Some(preferences) = view.preferences_popup.as_ref() {
@@ -2190,6 +2240,7 @@ fn render_body(
     hit_map.subscription_source_first_index = 0;
     hit_map.subscription_item_rows = Rect::default();
     hit_map.subscription_item_first_index = 0;
+    hit_map.subscription_source_buttons.clear();
 
     if view.screen == Screen::Subscriptions {
         render_subscriptions_body(
@@ -2450,7 +2501,7 @@ fn render_subscriptions_body(
             render_subscription_item_buttons(
                 frame,
                 list_sections[1],
-                !subscriptions.items.is_empty(),
+                false,
                 false,
                 show_hotkeys,
                 theme,
@@ -2479,16 +2530,14 @@ fn render_subscriptions_body(
             (
                 hit_map.subscription_source_rows,
                 hit_map.subscription_source_first_index,
-            ) = render_row_list(
+            ) = render_subscription_source_list(
                 frame,
                 panes[0],
-                "Subscription sources",
-                &subscriptions.sources,
-                true,
-                subscriptions.selected_source,
-                view.playing_media_id.as_ref(),
+                view,
+                show_hotkeys,
                 theme.heading,
                 theme,
+                hit_map,
             );
             render_channel(
                 frame,
@@ -2520,16 +2569,14 @@ fn render_subscriptions_body(
             (
                 hit_map.subscription_source_rows,
                 hit_map.subscription_source_first_index,
-            ) = render_row_list(
+            ) = render_subscription_source_list(
                 frame,
                 panes[0],
-                "Subscription sources",
-                &subscriptions.sources,
-                true,
-                subscriptions.selected_source,
-                view.playing_media_id.as_ref(),
+                view,
+                show_hotkeys,
                 source_heading,
                 theme,
+                hit_map,
             );
             if subscriptions.description_expanded {
                 render_details(
@@ -2599,6 +2646,45 @@ fn render_subscriptions_body(
             }
         }
     }
+}
+
+/// Renders the source list and its non-row RSS subscription control.
+fn render_subscription_source_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    heading_style: Style,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) -> (Rect, usize) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    let rendered = render_row_list(
+        frame,
+        sections[0],
+        "Subscription sources",
+        &view.subscriptions.sources,
+        true,
+        view.subscriptions.selected_source,
+        view.playing_media_id.as_ref(),
+        heading_style,
+        theme,
+    );
+    if !sections[1].is_empty() {
+        let label = button("a", "Add RSS feed", show_hotkeys);
+        let width = terminal_text_width(&label).min(sections[1].width);
+        if width > 0 {
+            let target = Rect::new(sections[1].x, sections[1].y, width, 1);
+            frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+            hit_map
+                .subscription_source_buttons
+                .push((UiAction::OpenRssSubscriptionPopup, target));
+        }
+    }
+    rendered
 }
 
 /// Builds the shared `YouTube` source heading for both subscription layouts.
@@ -2966,6 +3052,18 @@ fn render_information_panel(
         }
     }
 
+    let expanded_wikidata_entity = details
+        .expanded_wikidata_item
+        .as_deref()
+        .and_then(|item_id| {
+            details
+                .wikidata_entities
+                .iter()
+                .find(|entity| entity.item_id == item_id)
+        });
+    let visible_thumbnail_url = expanded_wikidata_entity
+        .and_then(|entity| entity.image_url.as_ref())
+        .or(details.thumbnail_url.as_ref());
     let mut cursor_y = metadata_area.bottom();
     let mut remaining_height = inner.bottom().saturating_sub(cursor_y);
     if let Some(renderer) = thumbnail_renderer.as_mut() {
@@ -2980,12 +3078,12 @@ fn render_information_panel(
             .saturating_sub(text_reserve)
             .min(preferred_thumbnail_height);
         if renderer.is_enabled()
-            && details.thumbnail_url.is_some()
+            && visible_thumbnail_url.is_some()
             && rendered_thumbnail_height >= MIN_THUMBNAIL_HEIGHT
         {
             let thumbnail_area =
                 Rect::new(inner.x, cursor_y, inner.width, rendered_thumbnail_height);
-            renderer.synchronize(details.thumbnail_url.as_ref(), thumbnail_area);
+            renderer.synchronize(visible_thumbnail_url, thumbnail_area);
             renderer.render(frame, thumbnail_area, theme);
             cursor_y = cursor_y.saturating_add(rendered_thumbnail_height);
             remaining_height = inner.bottom().saturating_sub(cursor_y);
@@ -3082,15 +3180,6 @@ fn render_information_panel(
         }
     }
 
-    let expanded_wikidata_entity = details
-        .expanded_wikidata_item
-        .as_deref()
-        .and_then(|item_id| {
-            details
-                .wikidata_entities
-                .iter()
-                .find(|entity| entity.item_id == item_id)
-        });
     let expanded_wikidata_text = details.expanded_wikidata_item.as_deref().map(|item_id| {
         expanded_wikidata_entity.map_or_else(
             || {
@@ -3294,7 +3383,7 @@ fn append_wikidata_source_spans<'a>(
         let target_width = linked_width.min(available);
         if target_width > 0 {
             hit_map.detail_buttons.push((
-                UiAction::OpenWikidataItem(link.item_id.clone()),
+                UiAction::OpenWikidataValue(link.url.clone()),
                 Rect::new(
                     description_area.x.saturating_add(*cell_cursor),
                     row,
@@ -4877,6 +4966,122 @@ fn render_youtube_setup_popup(
     }
 }
 
+fn render_rss_subscription_popup(
+    frame: &mut Frame<'_>,
+    popup: &RssSubscriptionPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let height = if popup.validation_error.is_some() {
+        14
+    } else {
+        12
+    };
+    let area = centered_sized_rect(96, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Add RSS podcast feed ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(2),
+            Constraint::Length(u16::from(popup.validation_error.is_some()) * 2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(
+            "Paste an absolute HTTP(S) RSS or Atom URL.\nSaves a portable audio/video podcast feed subscription to OPML.",
+        )
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    let url = if popup.url.is_empty() {
+        "https://example.org/podcast.xml"
+    } else {
+        popup.url.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(truncate_setup_value(
+            url,
+            usize::from(sections[1].width.saturating_sub(2)),
+        ))
+        .style(if popup.url.is_empty() {
+            theme.muted
+        } else {
+            theme.accent
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.accent)
+                .title(" ▶ Feed URL "),
+        ),
+        sections[1],
+    );
+    hit_map.rss_subscription_field = Some(sections[1]);
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Will save to: {}\nThe portable OPML file remains private to your Youta configuration.",
+            popup.config_path
+        ))
+        .style(theme.muted)
+        .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+    if let Some(error) = popup.validation_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {error}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            sections[3],
+        );
+    }
+
+    let buttons = [
+        ("[Enter] Add feed", UiAction::SubmitRssSubscription),
+        ("[Esc] Cancel", UiAction::DismissRssSubscriptionPopup),
+    ];
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls)
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[4],
+    );
+    let labels_width = buttons
+        .iter()
+        .map(|(label, _)| terminal_text_width(label))
+        .sum::<u16>()
+        .saturating_add(3);
+    let mut button_x = sections[4]
+        .x
+        .saturating_add(sections[4].width.saturating_sub(labels_width) / 2);
+    for (label, action) in buttons {
+        let width = terminal_text_width(label);
+        hit_map.rss_subscription_buttons.push((
+            action,
+            Rect::new(button_x, sections[4].y, width, sections[4].height),
+        ));
+        button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+}
+
 fn render_preferences_popup(
     frame: &mut Frame<'_>,
     preferences: &PreferencesPopupView,
@@ -5468,6 +5673,22 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             _ => None,
         };
     }
+    if view.rss_subscription_popup.is_some() {
+        return match key.code {
+            KeyCode::Esc => Some(UiAction::DismissRssSubscriptionPopup),
+            KeyCode::Enter => Some(UiAction::SubmitRssSubscription),
+            KeyCode::Backspace => Some(UiAction::DeleteRssSubscriptionCharacter),
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(UiAction::AppendRssSubscriptionCharacter(character))
+            }
+            _ => None,
+        };
+    }
     if let Some(preferences) = view.preferences_popup.as_ref() {
         let alternative = preferences.subscriptions_layout.toggled();
         return match key.code {
@@ -5586,9 +5807,20 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
         KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
         KeyCode::Char('i')
-            if view.screen == Screen::Subscriptions && !view.subscriptions.items.is_empty() =>
+            if view.screen == Screen::Subscriptions
+                && view.subscriptions.layout == SubscriptionsLayout::Split
+                && !view.subscriptions.items.is_empty() =>
         {
             Some(UiAction::ToggleSubscriptionDescription)
+        }
+        KeyCode::Char('a')
+            if view.screen == Screen::Subscriptions
+                && view.subscriptions.route == SubscriptionRoute::Sources
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(UiAction::OpenRssSubscriptionPopup)
         }
         KeyCode::Char('W')
             if view
@@ -5714,6 +5946,25 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
             _ => None,
         };
     }
+    if view.rss_subscription_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hit_map
+                    .rss_subscription_field
+                    .is_some_and(|area| contains(area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::OpenRssSubscriptionPopup)
+                } else {
+                    hit_map
+                        .rss_subscription_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            _ => None,
+        };
+    }
     if view.youtube_setup_popup.is_some() {
         return match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -5806,6 +6057,11 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
                 }
             }
             for (action, area) in &hit_map.detail_buttons {
+                if contains(*area, mouse.column, mouse.row) {
+                    return Some(action.clone());
+                }
+            }
+            for (action, area) in &hit_map.subscription_source_buttons {
                 if contains(*area, mouse.column, mouse.row) {
                     return Some(action.clone());
                 }
@@ -7373,6 +7629,68 @@ mod tests {
     }
 
     #[test]
+    fn rss_subscription_keys_open_only_from_sources_and_are_captured_by_popup() {
+        let mut sources = ViewModel {
+            screen: Screen::Subscriptions,
+            ..ViewModel::default()
+        };
+        let add = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            key_action(add, &sources),
+            Some(UiAction::OpenRssSubscriptionPopup)
+        );
+
+        sources.subscriptions.route = SubscriptionRoute::Items;
+        assert_eq!(
+            key_action(add, &sources),
+            Some(UiAction::AddToQueue),
+            "the global queue shortcut remains available outside the source route"
+        );
+        let search = ViewModel::default();
+        assert_eq!(key_action(add, &search), Some(UiAction::AddToQueue));
+
+        let popup = ViewModel {
+            screen: Screen::Subscriptions,
+            rss_subscription_popup: Some(RssSubscriptionPopupView {
+                url: "https://podcasts.example/feed".to_owned(),
+                config_path: "/config/subscriptions.opml".to_owned(),
+                validation_error: None,
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &popup
+            ),
+            Some(UiAction::AppendRssSubscriptionCharacter('x'))
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                &popup
+            ),
+            Some(UiAction::DeleteRssSubscriptionCharacter)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &popup),
+            Some(UiAction::SubmitRssSubscription)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &popup),
+            Some(UiAction::DismissRssSubscriptionPopup)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                &popup
+            ),
+            None,
+            "the focused URL editor must capture unrelated modified keys"
+        );
+    }
+
+    #[test]
     fn uppercase_m_opens_tracker_music_screen() {
         let view = ViewModel::default();
         let tracker = KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT);
@@ -7621,9 +7939,37 @@ mod tests {
             "the channel title already visible in the source row must not repeat"
         );
         assert!(rendered.contains("[O] xdg-open"));
+        assert!(rendered.contains("[a] Add RSS feed"));
         assert!(!rendered.contains("Refresh videos"));
         assert!(hit_map.subscription_source_rows.width > 0);
         assert_eq!(hit_map.subscription_item_rows, Rect::default());
+        let add_feed_target = hit_map
+            .subscription_source_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::OpenRssSubscriptionPopup)
+            .map(|(_, target)| *target)
+            .expect("drill-down RSS-feed button target");
+        assert!(
+            !contains(
+                hit_map.subscription_source_rows,
+                add_feed_target.x,
+                add_feed_target.y
+            ),
+            "the RSS action must not become a selectable source row"
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: add_feed_target.x,
+                    row: add_feed_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenRssSubscriptionPopup)
+        );
 
         view.subscriptions.route = SubscriptionRoute::Items;
         view.subscriptions.focus = SubscriptionPane::Items;
@@ -7648,6 +7994,15 @@ mod tests {
         );
         assert!(rendered.contains("Expanded fixture description"));
         assert!(rendered.contains("[R] Refresh videos"));
+        assert!(
+            !rendered.contains("[i] Description"),
+            "drill-down already renders Details beside the video list"
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            None,
+            "drill-down Details does not need a description toggle"
+        );
         assert!(hit_map.subscription_item_rows.width > 0);
 
         view.subscriptions.layout = SubscriptionsLayout::Split;
@@ -7659,6 +8014,7 @@ mod tests {
             .expect("draw split lists");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Subscription sources"));
+        assert!(rendered.contains("[a] Add RSS feed"));
         assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
         assert!(
             !rendered.contains("YouTube · 2026 July 25"),
@@ -7670,6 +8026,10 @@ mod tests {
         );
         assert!(rendered.contains("[R] Refresh videos"));
         assert!(rendered.contains("[i] Description"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleSubscriptionDescription)
+        );
         assert!(hit_map.subscription_source_rows.width > 0);
         assert!(hit_map.subscription_item_rows.width > 0);
         let (_, description_target) = hit_map
@@ -9142,6 +9502,52 @@ mod tests {
             DEFAULT_THUMBNAIL_HEIGHT
         );
         assert_eq!(thumbnails.clear_count, 0);
+    }
+
+    #[test]
+    fn expanded_wikidata_p18_replaces_the_source_thumbnail() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let source_thumbnail =
+            url::Url::parse("https://images.example/source.jpg").expect("source thumbnail URL");
+        let p18 = url::Url::parse(
+            "https://commons.wikimedia.org/wiki/Special:Redirect/file/Douglas%20Adams.jpg",
+        )
+        .expect("P18 fixture URL");
+        let view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_url: Some(source_thumbnail),
+                expanded_wikidata_item: Some("Q42".to_owned()),
+                wikidata_entities: vec![DetailWikidataEntityView {
+                    item_id: "Q42".to_owned(),
+                    text: "image (P18): Douglas Adams.jpg".to_owned(),
+                    value_links: Vec::new(),
+                    image_url: Some(p18.clone()),
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw expanded P18 image");
+
+        assert_eq!(thumbnails.synchronized.len(), 1);
+        assert_eq!(thumbnails.synchronized[0].0.as_ref(), Some(&p18));
     }
 
     #[test]
@@ -10997,6 +11403,106 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn rss_subscription_popup_renders_storage_validation_and_mouse_targets() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            rss_subscription_popup: Some(RssSubscriptionPopupView {
+                url: "https://podcasts.example/private-feed.xml".to_owned(),
+                validation_error: Some("feed URL must use HTTP or HTTPS".to_owned()),
+                config_path: "/home/listener/.config/youta/subscriptions.opml".to_owned(),
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw RSS subscription popup");
+        let normalized = rendered_text(&terminal)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "Add RSS podcast feed",
+            "Saves a portable audio/video podcast feed subscription to OPML",
+            "https://podcasts.example/private-feed.xml",
+            "Will save to: /home/listener/.config/youta/subscriptions.opml",
+            "Error: feed URL must use HTTP or HTTPS",
+            "[Enter] Add feed",
+            "[Esc] Cancel",
+        ] {
+            assert!(
+                normalized.contains(expected),
+                "RSS popup omitted `{expected}`:\n{normalized}"
+            );
+        }
+
+        let field = hit_map
+            .rss_subscription_field
+            .expect("RSS URL field target");
+        assert_eq!(hit_map.rss_subscription_buttons.len(), 2);
+        let click = |area: Rect| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(click(field), &hit_map, &view),
+            Some(UiAction::OpenRssSubscriptionPopup)
+        );
+        for expected in [
+            UiAction::SubmitRssSubscription,
+            UiAction::DismissRssSubscriptionPopup,
+        ] {
+            let target = hit_map
+                .rss_subscription_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .map(|(_, target)| *target)
+                .expect("RSS popup button target");
+            assert_eq!(mouse_action(click(target), &hit_map, &view), Some(expected));
+        }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            None,
+            "the modal popup must block underlying tabs"
+        );
+    }
+
+    #[test]
+    fn rss_subscription_popup_redacts_private_url_from_debug_output() {
+        let private_url =
+            "https://listener:secret@podcasts.example/private.xml?token=unprintable-secret";
+        let view = ViewModel {
+            rss_subscription_popup: Some(RssSubscriptionPopupView {
+                url: private_url.to_owned(),
+                validation_error: Some(format!("invalid private feed: {private_url}")),
+                ..RssSubscriptionPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        let debug_view = format!("{view:?}");
+        assert!(debug_view.contains("[REDACTED]"));
+        assert!(!debug_view.contains("listener"));
+        assert!(!debug_view.contains("secret"));
+        assert!(!debug_view.contains("token"));
+        assert!(!debug_view.contains(private_url));
+    }
+
+    #[test]
     fn youtube_setup_popup_keeps_provider_instructions_on_an_80_by_24_terminal() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -11118,7 +11624,7 @@ prose 07:25 remains clickable but is not a chapter";
 
         let details = view.details.as_mut().expect("fixture details");
         details.expanded_wikidata_item = Some("Q42".to_owned());
-        let text = "Wikidata properties for Q42\ninstance of (P31): human (Q5)".to_owned();
+        let text = "instance of (P31): human (Q5)".to_owned();
         let start_byte = text.find("human (Q5)").expect("linked value");
         details.wikidata_entities.push(DetailWikidataEntityView {
             item_id: "Q42".to_owned(),
@@ -11126,8 +11632,9 @@ prose 07:25 remains clickable but is not a chapter";
             value_links: vec![DetailWikidataValueLinkView {
                 start_byte,
                 end_byte: start_byte + "human (Q5)".len(),
-                item_id: "Q5".to_owned(),
+                url: "https://www.wikidata.org/wiki/Q5".to_owned(),
             }],
+            image_url: None,
         });
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
@@ -11137,7 +11644,10 @@ prose 07:25 remains clickable but is not a chapter";
         let (_, value_area) = hit_map
             .detail_buttons
             .iter()
-            .find(|(action, _)| action == &UiAction::OpenWikidataItem("Q5".to_owned()))
+            .find(|(action, _)| {
+                action
+                    == &UiAction::OpenWikidataValue("https://www.wikidata.org/wiki/Q5".to_owned())
+            })
             .expect("Wikidata value hit target");
         assert_eq!(
             mouse_action(
@@ -11150,7 +11660,9 @@ prose 07:25 remains clickable but is not a chapter";
                 &hit_map,
                 &view,
             ),
-            Some(UiAction::OpenWikidataItem("Q5".to_owned()))
+            Some(UiAction::OpenWikidataValue(
+                "https://www.wikidata.org/wiki/Q5".to_owned()
+            ))
         );
     }
 
@@ -11159,7 +11671,7 @@ prose 07:25 remains clickable but is not a chapter";
         let backend = TestBackend::new(56, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let value = "Україна з довгою тестовою назвою (Q212)";
-        let text = format!("Wikidata properties for Q61113\ncountry of citizenship (P27): {value}");
+        let text = format!("country of citizenship (P27): {value}");
         let start_byte = text.find(value).expect("linked Unicode value");
         let view = ViewModel {
             details: Some(DetailView {
@@ -11175,8 +11687,9 @@ prose 07:25 remains clickable but is not a chapter";
                     value_links: vec![DetailWikidataValueLinkView {
                         start_byte,
                         end_byte: start_byte + value.len(),
-                        item_id: "Q212".to_owned(),
+                        url: "https://www.wikidata.org/wiki/Q212".to_owned(),
                     }],
+                    image_url: None,
                 }],
                 ..DetailView::default()
             }),
@@ -11192,7 +11705,11 @@ prose 07:25 remains clickable but is not a chapter";
             .detail_buttons
             .iter()
             .filter_map(|(action, area)| {
-                (action == &UiAction::OpenWikidataItem("Q212".to_owned())).then_some(*area)
+                (action
+                    == &UiAction::OpenWikidataValue(
+                        "https://www.wikidata.org/wiki/Q212".to_owned(),
+                    ))
+                    .then_some(*area)
             })
             .collect::<Vec<_>>();
         assert!(
@@ -11215,7 +11732,9 @@ prose 07:25 remains clickable but is not a chapter";
                     &hit_map,
                     &view,
                 ),
-                Some(UiAction::OpenWikidataItem("Q212".to_owned()))
+                Some(UiAction::OpenWikidataValue(
+                    "https://www.wikidata.org/wiki/Q212".to_owned()
+                ))
             );
         }
     }

@@ -110,7 +110,8 @@ fn wikidata_finds_the_youtube_fixture_item() {
         Ok("1"),
         "set YOUTA_RUN_LIVE_WIKIDATA_TEST=1 when invoking this live test"
     );
-    let lookup = WikidataProvider::new()
+    let provider = WikidataProvider::new();
+    let lookup = provider
         .lookup_external(WikidataExternalKind::YouTubeVideo, "aqz-KE-bpKQ")
         .expect("query Wikidata for the real YouTube fixture");
     assert_eq!(lookup.kind, WikidataExternalKind::YouTubeVideo);
@@ -121,7 +122,7 @@ fn wikidata_finds_the_youtube_fixture_item() {
         lookup.items
     );
 
-    let channel_lookup = WikidataProvider::new()
+    let channel_lookup = provider
         .lookup_external(
             WikidataExternalKind::YouTubeChannel,
             "UC6R1juCB5ArnJGMmUlEE_fg",
@@ -136,6 +137,53 @@ fn wikidata_finds_the_youtube_fixture_item() {
             .any(|item| item.item_id == "Q61113"),
         "Wikidata no longer links the channel fixture to Q61113: {:?}",
         channel_lookup.items
+    );
+
+    // Keep the committed fixture non-political while allowing a developer to
+    // reproduce another public item through the same live regression path.
+    let statement_item =
+        std::env::var("YOUTA_LIVE_WIKIDATA_ITEM").unwrap_or_else(|_| "Q282456".to_owned());
+    let entity = provider
+        .load_entity_statements(&statement_item)
+        .expect("load labels, external-ID links, and Commons previews");
+    assert!(
+        !entity.statements.is_empty(),
+        "Wikidata returned no statements for {statement_item}"
+    );
+    assert!(
+        entity
+            .statements
+            .iter()
+            .all(|statement| statement.property_label != statement.property_id),
+        "at least one property label remained unresolved for {statement_item}: {:?}",
+        entity.statements
+    );
+    let image = entity
+        .statements
+        .iter()
+        .find(|statement| statement.property_id == "P18")
+        .and_then(|statement| statement.values.first())
+        .expect("the live fixture retains a P18 image");
+    assert!(
+        image.external_url.is_some(),
+        "P18 must link to its Commons file page"
+    );
+    assert!(
+        image.preview_url.is_some(),
+        "P18 must expose a bounded raster preview"
+    );
+    assert!(
+        entity
+            .statements
+            .iter()
+            .filter(|statement| statement.property_id != "P18")
+            .flat_map(|statement| &statement.values)
+            .any(|value| value.external_url.is_some()),
+        "the identifier-rich fixture exposed no formatter-backed external links"
+    );
+    assert!(
+        !entity.hard_bounds_reached,
+        "the ordinary live fixture unexpectedly reached a display hard bound"
     );
 }
 

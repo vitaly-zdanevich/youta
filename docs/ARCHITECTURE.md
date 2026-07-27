@@ -84,6 +84,15 @@ structure where possible. Youta-specific private notes, playback positions,
 colors, and bookmarks remain in SQLite rather than being smuggled into
 non-standard OPML attributes.
 
+From the subscription-source root, `[a] Add RSS feed` accepts an absolute
+HTTP(S) RSS or Atom URL, rejects embedded username/password credentials, strips
+its fragment, detects duplicates across the nested tree, and atomically saves
+the source in the private portable OPML file. Query parameters remain part of
+the stored URL because some private feeds require them; the popup's custom
+debug representation redacts both its draft and validation error. This path
+currently stores the subscription outline only. RSS episode browsing in the
+Subscriptions screen is not implemented.
+
 ## Source model
 
 Every source adapter advertises capabilities instead of requiring a large,
@@ -243,6 +252,11 @@ YouTube video stores its channel; an API key is public-metadata authentication,
 not authorization to mutate a YouTube account. Remote subscription sync
 therefore remains an OAuth-gated feature.
 
+The source root also exposes `[a] Add RSS feed`, whose validation and private
+OPML behavior are described above. RSS sources remain portable entries in this
+release; the channel-video list controller below is YouTube-specific and does
+not yet browse their episodes.
+
 The TUI reducer owns two subscription layouts over the same state:
 
 - drill-down starts with sources and enters one source's list-and-Details view;
@@ -295,16 +309,31 @@ endpoint](https://docs.invidious.io/api/channels_endpoint/). Both adapters
 translate provider continuation tokens into sequential page numbers at the
 provider boundary.
 
-Moving across split-view sources performs no remote work; Enter explicitly
-activates an uncached source. The controller keeps a bounded least-recently-used
-RAM cache: at most 24 channels and 250 videos per channel under a shared
-approximate 8 MiB heap budget. Description excerpts and thumbnail sets are
-compacted before insertion. Approaching the end of visible rows requests the
-next page; bounded automatic continuation skips private/unavailable-only
-pages. Cache entries survive layout switches during the process but are not
-persisted across restarts. Every response carries a subscription generation;
-a response for an older selection is ignored and cannot replace the newly
-selected channel's rows.
+Moving across split-view sources performs no remote work. Arrow navigation may
+render an existing RAM or restart snapshot, but only `Enter` activates a source
+and starts its initial provider load or page-one refresh. The controller keeps
+a bounded least-recently-used RAM cache: at most 24 channels and 250 videos per
+channel under a shared approximate 8 MiB heap budget. Description excerpts and
+thumbnail sets are compacted before insertion. Approaching the end of visible
+rows requests the next page; bounded automatic continuation skips
+private/unavailable-only pages. Every response carries a subscription
+generation; a response for an older selection is ignored and cannot replace
+the newly selected channel's rows.
+
+Successful YouTube page-one refreshes also replace a compact
+`subscription_items_cache` snapshot in SQLite. Each source retains at most 50
+provider-ordered items and 512 KiB of encoded item data; when the byte limit is
+reached, the longest whole-item prefix that fits is stored. SQLite keeps the 32
+most recently refreshed sources. Later pages remain process-local.
+
+On activation after a restart, Youta restores the first-page snapshot into RAM
+and renders it before issuing the background page-one refresh. The successful
+refresh replaces the visible and durable first page, reconciling both newly
+published and provider-deleted videos. Failed refreshes leave the restored rows
+and selection available. Direct `stream_url` values are removed before writing
+and again after reading because they may be short-lived, signed, or carry query
+secrets; the restart snapshot retains canonical video pages and compact public
+metadata instead.
 
 Inside an activated channel, uppercase `R` explicitly refreshes page one. This
 request bypasses the RAM list cache but does not clear the rendered rows while
@@ -489,9 +518,13 @@ copy. System-keyring and explicit secret-reference backends remain roadmap
 work.
 
 Diagnostics redact tokens, cookies, authorization headers, signed URLs, and
-provider query secrets. Secret values never enter SQLite, OPML, git sync,
+provider query secrets. API credentials never enter SQLite, OPML, git sync,
 crash-state snapshots, logs, LLM prompts, or child command lines when a safer
-file descriptor or environment channel exists.
+file descriptor or environment channel exists. One explicit exception is a
+user-supplied private RSS query parameter: it is part of the subscribed feed
+URL and is stored in the private OPML file, while its popup debug
+representation remains redacted. RSS URLs with embedded usernames or passwords
+are rejected.
 
 Future OAuth adapters should use a local callback with state and PKCE where the
 provider supports it. Refresh-token storage will be keyring-backed. Provider

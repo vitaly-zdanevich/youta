@@ -24,12 +24,21 @@ use crate::providers::{ChannelSummary, SearchItem, SearchRequest, SearchTarget, 
 const MAX_SAVED_SEARCH_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SAVED_SEARCH_RESULTS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SAVED_MUSIC_QUERY_BYTES: usize = 512;
+const MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES: usize = 512 * 1024;
+const MAX_SAVED_SUBSCRIPTION_SOURCE_BYTES: usize = 128;
+const MAX_SAVED_SUBSCRIPTION_SOURCE_ID_BYTES: usize = 2 * 1024;
 
 /// Maximum number of `YouTube` summaries retained in one restart snapshot.
 ///
 /// The application also uses this as its accumulated lazy-search limit so the
 /// visible list and its durable representation cannot diverge.
 pub const MAX_SAVED_YOUTUBE_SEARCH_RESULTS: usize = 500;
+
+/// Maximum number of first-page items retained for one subscribed source.
+pub const MAX_SAVED_SUBSCRIPTION_ITEMS: usize = 50;
+
+/// Maximum number of recently refreshed subscribed sources retained on disk.
+pub const MAX_SAVED_SUBSCRIPTION_SOURCES: usize = 32;
 
 const MIGRATIONS: &[&str] = &[
     r"
@@ -148,10 +157,27 @@ const MIGRATIONS: &[&str] = &[
 		updated_at INTEGER NOT NULL
 	) WITHOUT ROWID;
 	",
+    r"
+	CREATE TABLE subscription_items_cache (
+		source TEXT NOT NULL CHECK (
+			length(CAST(source AS BLOB)) BETWEEN 1 AND 128
+		),
+		source_id TEXT NOT NULL CHECK (
+			length(CAST(source_id AS BLOB)) BETWEEN 1 AND 2048
+		),
+		items_json TEXT NOT NULL CHECK (
+			length(CAST(items_json AS BLOB)) <= 524288
+		),
+		fetched_at INTEGER NOT NULL CHECK (fetched_at >= 0),
+		PRIMARY KEY (source, source_id)
+	) WITHOUT ROWID;
+	CREATE INDEX subscription_items_cache_recency
+		ON subscription_items_cache(fetched_at DESC, source, source_id);
+	",
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One bounded `YouTube` search snapshot retained across application restarts.
 ///
@@ -175,6 +201,23 @@ pub struct SavedYouTubeMusicSearch {
     pub query: String,
     /// Playable video summaries shown in the music result list.
     pub results: Vec<SearchItem>,
+}
+
+/// A bounded first-page snapshot for one subscribed source.
+///
+/// Snapshots are intentionally stale-while-revalidate: callers may render
+/// [`Self::items`] immediately, then refresh the source in the background and
+/// replace the row. Only compact [`SearchItem`] summaries are stored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedSubscriptionItems {
+    /// Provider family that owns the subscription.
+    pub source: SourceKind,
+    /// Stable channel, feed, or provider-specific subscription identifier.
+    pub source_id: String,
+    /// First-page playable item summaries in provider order.
+    pub items: Vec<SearchItem>,
+    /// Successful fetch completion time as seconds since the Unix epoch.
+    pub fetched_at: i64,
 }
 
 /// A provenance record attached to cached provider metadata.
@@ -1070,6 +1113,161 @@ impl StateStore {
             > 0)
     }
 
+    /// Replaces the first-page cache for one subscribed source.
+    ///
+    /// The item count is validated before writing. When the complete encoded
+    /// page would exceed the byte bound, the longest whole-item prefix that
+    /// fits is stored; this keeps provider order deterministic without
+    /// rejecting an otherwise valid refresh. After the upsert, the least
+    /// recently fetched rows are removed so databases cannot grow with every
+    /// source ever opened. The row being written wins deterministic timestamp
+    /// ties.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source identity or item count violates its
+    /// bounds, contains a channel result, cannot be encoded, or cannot be
+    /// written.
+    pub fn put_cached_subscription_items(
+        &self,
+        cached: &CachedSubscriptionItems,
+    ) -> Result<(), PersistenceError> {
+        validate_cached_subscription_items(cached)?;
+        let items_json = encode_bounded_subscription_items(&cached.items)?;
+        let source_limit = i64::try_from(MAX_SAVED_SUBSCRIPTION_SOURCES).map_err(|_| {
+            PersistenceError::IntegerOutOfRange {
+                field: "subscription source cache limit",
+            }
+        })?;
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), PersistenceError> {
+            self.connection
+                .prepare_cached(
+                    r"
+					INSERT INTO subscription_items_cache (
+						source, source_id, items_json, fetched_at
+					) VALUES (?1, ?2, ?3, ?4)
+					ON CONFLICT(source, source_id) DO UPDATE SET
+						items_json = excluded.items_json,
+						fetched_at = excluded.fetched_at
+					",
+                )?
+                .execute(params![
+                    cached.source.as_str(),
+                    cached.source_id,
+                    items_json,
+                    cached.fetched_at,
+                ])?;
+            self.connection
+                .prepare_cached(
+                    r"
+					DELETE FROM subscription_items_cache
+					WHERE (source, source_id) IN (
+						SELECT source, source_id
+						FROM subscription_items_cache
+						ORDER BY
+							fetched_at DESC,
+							(source = ?1 AND source_id = ?2) DESC,
+							source,
+							source_id
+						LIMIT -1 OFFSET ?3
+					)
+					",
+                )?
+                .execute(params![
+                    cached.source.as_str(),
+                    cached.source_id,
+                    source_limit,
+                ])?;
+            self.connection.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Loads the bounded first-page cache for one subscribed source.
+    ///
+    /// The encoded byte length is checked before copying JSON out of `SQLite`,
+    /// then all current invariants are revalidated. Stale rows are returned:
+    /// callers decide when to refresh by comparing [`CachedSubscriptionItems::fetched_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested identity is invalid, a stored row
+    /// exceeds current limits, cannot be decoded, or cannot be read.
+    pub fn cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<Option<CachedSubscriptionItems>, PersistenceError> {
+        validate_subscription_source_identity(source, source_id)?;
+        let items_bytes: Option<i64> = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT length(CAST(items_json AS BLOB))
+				FROM subscription_items_cache
+				WHERE source = ?1 AND source_id = ?2
+				",
+            )?
+            .query_row(params![source.as_str(), source_id], |row| row.get(0))
+            .optional()?;
+        let Some(items_bytes) = items_bytes else {
+            return Ok(None);
+        };
+        ensure_subscription_snapshot_json_bound(
+            usize::try_from(items_bytes).unwrap_or(usize::MAX),
+        )?;
+        let (items_json, fetched_at): (String, i64) = self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT items_json, fetched_at
+				FROM subscription_items_cache
+				WHERE source = ?1 AND source_id = ?2
+				",
+            )?
+            .query_row(params![source.as_str(), source_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let cached = CachedSubscriptionItems {
+            source: source.clone(),
+            source_id: source_id.to_owned(),
+            items: serde_json::from_str(&items_json)?,
+            fetched_at,
+        };
+        validate_cached_subscription_items(&cached)?;
+        Ok(Some(cached))
+    }
+
+    /// Removes one subscribed-source snapshot and reports whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source identity is invalid or the row cannot
+    /// be removed.
+    pub fn delete_cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<bool, PersistenceError> {
+        validate_subscription_source_identity(source, source_id)?;
+        Ok(self
+            .connection
+            .prepare_cached(
+                r"
+				DELETE FROM subscription_items_cache
+				WHERE source = ?1 AND source_id = ?2
+				",
+            )?
+            .execute(params![source.as_str(), source_id])?
+            > 0)
+    }
+
     /// Adds listened seconds to a source using an atomic upsert.
     ///
     /// # Errors
@@ -1445,6 +1643,18 @@ pub enum PersistenceError {
         /// Invariant rejected while saving or restoring.
         reason: String,
     },
+    /// A subscribed-source first-page JSON payload exceeds its fixed limit.
+    #[error("cached subscription items exceed the {maximum_bytes}-byte encoded limit")]
+    SubscriptionSnapshotTooLarge {
+        /// Maximum accepted encoded size.
+        maximum_bytes: usize,
+    },
+    /// A subscribed-source snapshot violates an identity or item invariant.
+    #[error("cached subscription items are invalid: {reason}")]
+    InvalidSubscriptionSnapshot {
+        /// Invariant rejected while saving, restoring, or deleting.
+        reason: String,
+    },
     /// An unsigned domain value is too large for `SQLite`'s signed integer.
     #[error("{field} is too large for SQLite")]
     IntegerOutOfRange {
@@ -1545,6 +1755,100 @@ fn validate_saved_youtube_music_search(
     {
         return Err(PersistenceError::InvalidSavedSearch {
             reason: "YouTube Music snapshots may contain only playable videos".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_subscription_snapshot_json_bound(actual_bytes: usize) -> Result<(), PersistenceError> {
+    if actual_bytes > MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES {
+        return Err(PersistenceError::SubscriptionSnapshotTooLarge {
+            maximum_bytes: MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Encodes the longest provider-ordered item prefix within the disk byte cap.
+fn encode_bounded_subscription_items(items: &[SearchItem]) -> Result<String, PersistenceError> {
+    let mut encoded_page = String::with_capacity(MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES.min(4096));
+    encoded_page.push('[');
+    for item in items {
+        let encoded_item = serde_json::to_string(item)?;
+        let separator_bytes = usize::from(encoded_page.len() > 1);
+        let candidate_bytes = encoded_page
+            .len()
+            .saturating_add(separator_bytes)
+            .saturating_add(encoded_item.len())
+            .saturating_add(1);
+        if candidate_bytes > MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES {
+            break;
+        }
+        if separator_bytes != 0 {
+            encoded_page.push(',');
+        }
+        encoded_page.push_str(&encoded_item);
+    }
+    encoded_page.push(']');
+    Ok(encoded_page)
+}
+
+fn validate_subscription_source_identity(
+    source: &SourceKind,
+    source_id: &str,
+) -> Result<(), PersistenceError> {
+    let source_name = source.as_str();
+    if source_name.is_empty()
+        || source_name.len() > MAX_SAVED_SUBSCRIPTION_SOURCE_BYTES
+        || source_name.trim() != source_name
+        || source_name.chars().any(char::is_control)
+    {
+        return Err(PersistenceError::InvalidSubscriptionSnapshot {
+            reason: format!(
+                "source must be trimmed, printable, and at most \
+                 {MAX_SAVED_SUBSCRIPTION_SOURCE_BYTES} bytes"
+            ),
+        });
+    }
+    if source_id.is_empty()
+        || source_id.len() > MAX_SAVED_SUBSCRIPTION_SOURCE_ID_BYTES
+        || source_id.trim() != source_id
+        || source_id.chars().any(char::is_control)
+    {
+        return Err(PersistenceError::InvalidSubscriptionSnapshot {
+            reason: format!(
+                "source ID must be trimmed, printable, and at most \
+                 {MAX_SAVED_SUBSCRIPTION_SOURCE_ID_BYTES} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_cached_subscription_items(
+    cached: &CachedSubscriptionItems,
+) -> Result<(), PersistenceError> {
+    validate_subscription_source_identity(&cached.source, &cached.source_id)?;
+    if cached.fetched_at < 0 {
+        return Err(PersistenceError::InvalidSubscriptionSnapshot {
+            reason: "fetch time cannot be negative".to_owned(),
+        });
+    }
+    if cached.items.len() > MAX_SAVED_SUBSCRIPTION_ITEMS {
+        return Err(PersistenceError::InvalidSubscriptionSnapshot {
+            reason: format!(
+                "item count {} exceeds the {MAX_SAVED_SUBSCRIPTION_ITEMS}-item limit",
+                cached.items.len()
+            ),
+        });
+    }
+    if cached
+        .items
+        .iter()
+        .any(|item| !matches!(item, SearchItem::Video(_)))
+    {
+        return Err(PersistenceError::InvalidSubscriptionSnapshot {
+            reason: "subscription snapshots may contain only playable items".to_owned(),
         });
     }
     Ok(())
@@ -1845,6 +2149,53 @@ mod tests {
             store
                 .youtube_music_search()
                 .expect("new YouTube Music search table"),
+            None
+        );
+    }
+
+    #[test]
+    fn migration_from_v6_preserves_state_and_adds_subscription_items_cache() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=6_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        let session = SessionState {
+            screen: Screen::Subscriptions,
+            search_text: "preserved after v6".to_owned(),
+            ..SessionState::default()
+        };
+        connection
+            .execute(
+                r"
+				INSERT INTO session_state (slot, state_json, updated_at)
+				VALUES ('active', ?1, 6)
+				",
+                [serde_json::to_string(&session).expect("encode session")],
+            )
+            .expect("seed version-six session");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.session().expect("preserved session"), Some(session));
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::YouTube, "UCmissing")
+                .expect("new subscription cache table"),
             None
         );
     }
@@ -2154,6 +2505,218 @@ mod tests {
             store.youtube_music_search().expect("empty music search"),
             None
         );
+    }
+
+    #[test]
+    fn subscription_items_snapshot_survives_restart_overwrites_and_deletes() {
+        let (directory, config, store) = disk_store();
+        let first = CachedSubscriptionItems {
+            source: SourceKind::YouTube,
+            source_id: "UCfixture".to_owned(),
+            items: vec![search_video("first"), search_video("second")],
+            fetched_at: 100,
+        };
+        store
+            .put_cached_subscription_items(&first)
+            .expect("save first-page snapshot");
+        drop(store);
+
+        let store = StateStore::open(&config).expect("reopen state store");
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("restore first-page snapshot"),
+            Some(first)
+        );
+
+        let replacement = CachedSubscriptionItems {
+            source: SourceKind::YouTube,
+            source_id: "UCfixture".to_owned(),
+            items: vec![search_video("newest")],
+            fetched_at: 200,
+        };
+        store
+            .put_cached_subscription_items(&replacement)
+            .expect("replace first-page snapshot");
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("load replacement"),
+            Some(replacement)
+        );
+        assert!(
+            store
+                .delete_cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("delete snapshot")
+        );
+        assert!(
+            !store
+                .delete_cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("delete absent snapshot")
+        );
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("snapshot is absent"),
+            None
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn subscription_items_snapshot_rejects_invalid_data_and_byte_fits_a_prefix() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let excessive = CachedSubscriptionItems {
+            source: SourceKind::YouTube,
+            source_id: "UCexcessive".to_owned(),
+            items: vec![search_video("bounded"); MAX_SAVED_SUBSCRIPTION_ITEMS + 1],
+            fetched_at: 1,
+        };
+        assert!(matches!(
+            store.put_cached_subscription_items(&excessive),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { .. })
+        ));
+
+        let channel = CachedSubscriptionItems {
+            source: SourceKind::YouTube,
+            source_id: "UCchannel".to_owned(),
+            items: vec![SearchItem::Channel(ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture".to_owned(),
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                created_at: None,
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: None,
+            })],
+            fetched_at: 2,
+        };
+        assert!(matches!(
+            store.put_cached_subscription_items(&channel),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { .. })
+        ));
+
+        let mut oversized_item = search_video("oversized");
+        let SearchItem::Video(video) = &mut oversized_item else {
+            unreachable!("fixture is a video");
+        };
+        video.description = "x".repeat(MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES);
+        let oversized = CachedSubscriptionItems {
+            source: SourceKind::Rss,
+            source_id: "https://podcasts.example/feed.xml".to_owned(),
+            items: vec![
+                search_video("retained"),
+                oversized_item,
+                search_video("not-reordered"),
+            ],
+            fetched_at: 3,
+        };
+        store
+            .put_cached_subscription_items(&oversized)
+            .expect("store longest bounded prefix");
+        let fitted = store
+            .cached_subscription_items(&SourceKind::Rss, "https://podcasts.example/feed.xml")
+            .expect("load fitted snapshot")
+            .expect("fitted snapshot");
+        assert_eq!(fitted.items, vec![search_video("retained")]);
+
+        let invalid_identity = CachedSubscriptionItems {
+            source: SourceKind::Rss,
+            source_id: " https://podcasts.example/feed.xml".to_owned(),
+            items: Vec::new(),
+            fetched_at: 4,
+        };
+        assert!(matches!(
+            store.put_cached_subscription_items(&invalid_identity),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { .. })
+        ));
+
+        let invalid_time = CachedSubscriptionItems {
+            source: SourceKind::Rss,
+            source_id: "https://podcasts.example/feed.xml".to_owned(),
+            items: Vec::new(),
+            fetched_at: -1,
+        };
+        assert!(matches!(
+            store.put_cached_subscription_items(&invalid_time),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn subscription_items_cache_evicts_the_oldest_sources_deterministically() {
+        let store = StateStore::open_in_memory().expect("open store");
+        for index in 0..=MAX_SAVED_SUBSCRIPTION_SOURCES {
+            let source_id = format!("UC{index:03}");
+            store
+                .put_cached_subscription_items(&CachedSubscriptionItems {
+                    source: SourceKind::YouTube,
+                    source_id,
+                    items: vec![search_video(&format!("video-{index:03}"))],
+                    fetched_at: i64::try_from(index).expect("fixture timestamp"),
+                })
+                .expect("save bounded snapshot");
+        }
+
+        let row_count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM subscription_items_cache", [], |row| {
+                row.get(0)
+            })
+            .expect("count retained snapshots");
+        assert_eq!(
+            row_count,
+            i64::try_from(MAX_SAVED_SUBSCRIPTION_SOURCES).expect("source bound fits SQLite")
+        );
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::YouTube, "UC000")
+                .expect("oldest lookup"),
+            None
+        );
+        assert!(
+            store
+                .cached_subscription_items(
+                    &SourceKind::YouTube,
+                    &format!("UC{MAX_SAVED_SUBSCRIPTION_SOURCES:03}"),
+                )
+                .expect("newest lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn subscription_items_load_revalidates_manually_modified_rows() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let invalid_items = vec![SearchItem::Channel(ChannelSummary {
+            channel_id: "UCfixture".to_owned(),
+            name: "Fixture".to_owned(),
+            description: String::new(),
+            subscriber_count: None,
+            video_count: None,
+            created_at: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: None,
+        })];
+        store
+            .connection
+            .execute(
+                r"
+				INSERT INTO subscription_items_cache (
+					source, source_id, items_json, fetched_at
+				) VALUES ('youtube', 'UCfixture', ?1, 1)
+				",
+                [serde_json::to_string(&invalid_items).expect("encode invalid fixture")],
+            )
+            .expect("insert manually modified row");
+
+        assert!(matches!(
+            store.cached_subscription_items(&SourceKind::YouTube, "UCfixture"),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { .. })
+        ));
     }
 
     #[test]

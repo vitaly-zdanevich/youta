@@ -151,6 +151,63 @@ impl SubscriptionTree {
         true
     }
 
+    /// Adds a top-level audio or video podcast feed.
+    ///
+    /// `feed_url` must be an absolute HTTP(S) URL. URL fragments are removed
+    /// because they are not sent to feed servers. `title` is trimmed; when it
+    /// is empty, the feed host becomes the portable OPML title until provider
+    /// metadata supplies a more descriptive name.
+    ///
+    /// The operation is idempotent across the complete nested tree. Existing
+    /// subscriptions with the same normalized primary URL are retained.
+    ///
+    /// Returns `true` when a new RSS subscription was added and `false` when
+    /// the feed was already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `feed_url` is malformed, does not use HTTP(S), or
+    /// contains embedded username/password credentials.
+    pub fn subscribe_rss_feed(
+        &mut self,
+        title: impl AsRef<str>,
+        feed_url: &str,
+    ) -> Result<bool, SubscriptionError> {
+        let feed_url = parse_http_feed_url(feed_url)?;
+        if self.contains_primary_url(&feed_url) {
+            return Ok(false);
+        }
+
+        let title = {
+            let candidate = title.as_ref().trim();
+            if candidate.is_empty() {
+                sensible_feed_title(&feed_url)
+            } else {
+                candidate.to_owned()
+            }
+        };
+        self.items
+            .push(SubscriptionNode::Subscription(Subscription {
+                title,
+                url: feed_url,
+                website_url: None,
+                description: None,
+                kind: SubscriptionKind::Rss,
+            }));
+        Ok(true)
+    }
+
+    /// Returns whether any nested subscription has `url` as its primary URL.
+    ///
+    /// URL fragments are ignored because they do not identify a different
+    /// HTTP resource to a feed server.
+    #[must_use]
+    pub fn contains_primary_url(&self, url: &Url) -> bool {
+        self.items
+            .iter()
+            .any(|node| node_contains_primary_url(node, url))
+    }
+
     /// Removes every subscription matching a `YouTube` channel ID.
     ///
     /// Empty user-created folders are preserved. Returns `true` when at least
@@ -161,6 +218,26 @@ impl SubscriptionTree {
         }
         remove_youtube_channel(&mut self.items, channel_id)
     }
+}
+
+fn node_contains_primary_url(node: &SubscriptionNode, url: &Url) -> bool {
+    match node {
+        SubscriptionNode::Folder(folder) => folder
+            .children
+            .iter()
+            .any(|child| node_contains_primary_url(child, url)),
+        SubscriptionNode::Subscription(subscription) => {
+            urls_refer_to_same_resource(&subscription.url, url)
+        }
+    }
+}
+
+fn urls_refer_to_same_resource(left: &Url, right: &Url) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.set_fragment(None);
+    right.set_fragment(None);
+    left == right
 }
 
 fn node_contains_youtube_channel(node: &SubscriptionNode, channel_id: &str) -> bool {
@@ -420,6 +497,15 @@ pub enum SubscriptionError {
         /// URL parser error.
         source: url::ParseError,
     },
+    /// A new podcast feed used a non-network URL scheme.
+    #[error("RSS feed URL must use HTTP or HTTPS, not {scheme:?}")]
+    UnsupportedFeedScheme {
+        /// Scheme parsed from the supplied URL.
+        scheme: String,
+    },
+    /// A new podcast feed URL included user-info credentials.
+    #[error("podcast URL must not contain embedded credentials")]
+    EmbeddedFeedCredentials,
 }
 
 fn node_from_outline(outline: Outline) -> Result<SubscriptionNode, SubscriptionError> {
@@ -530,6 +616,28 @@ fn parse_url(value: &str) -> Result<Url, SubscriptionError> {
         value: value.to_owned(),
         source,
     })
+}
+
+fn parse_http_feed_url(value: &str) -> Result<Url, SubscriptionError> {
+    let mut url = parse_url(value.trim())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(SubscriptionError::UnsupportedFeedScheme {
+            scheme: url.scheme().to_owned(),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SubscriptionError::EmbeddedFeedCredentials);
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn sensible_feed_title(url: &Url) -> String {
+    url.host_str()
+        .map_or("Podcast feed", |host| {
+            host.strip_prefix("www.").unwrap_or(host)
+        })
+        .to_owned()
 }
 
 #[cfg(unix)]
@@ -703,6 +811,136 @@ mod tests {
             panic!("expected imported folder");
         };
         assert!(folder.children.is_empty(), "user folder must be preserved");
+    }
+
+    #[test]
+    fn rss_feed_mutations_validate_normalize_and_detect_duplicates() {
+        let mut tree = SubscriptionTree::default();
+
+        assert!(
+            tree.subscribe_rss_feed(
+                "  Fixture podcast  ",
+                "https://EXAMPLE.org:443/private-feed?token=fixture#episodes",
+            )
+            .expect("add valid podcast feed")
+        );
+        let SubscriptionNode::Subscription(subscription) = &tree.items[0] else {
+            panic!("expected RSS subscription");
+        };
+        assert_eq!(subscription.title, "Fixture podcast");
+        assert_eq!(
+            subscription.url.as_str(),
+            "https://example.org/private-feed?token=fixture"
+        );
+        assert_eq!(subscription.kind, SubscriptionKind::Rss);
+        assert!(subscription.website_url.is_none());
+        assert!(subscription.description.is_none());
+
+        assert!(
+            !tree
+                .subscribe_rss_feed(
+                    "Replacement title",
+                    "https://example.org/private-feed?token=fixture#another-fragment",
+                )
+                .expect("detect existing feed")
+        );
+        assert_eq!(tree.subscription_count(), 1);
+        let SubscriptionNode::Subscription(subscription) = &tree.items[0] else {
+            panic!("expected retained RSS subscription");
+        };
+        assert_eq!(
+            subscription.title, "Fixture podcast",
+            "duplicates must retain imported metadata"
+        );
+    }
+
+    #[test]
+    fn rss_feed_uses_host_as_a_fallback_title() {
+        let mut tree = SubscriptionTree::default();
+
+        assert!(
+            tree.subscribe_rss_feed(" \t", "https://www.podcasts.example/series")
+                .expect("add feed with generated title")
+        );
+        let SubscriptionNode::Subscription(subscription) = &tree.items[0] else {
+            panic!("expected RSS subscription");
+        };
+        assert_eq!(subscription.title, "podcasts.example");
+    }
+
+    #[test]
+    fn rss_feed_duplicate_detection_searches_nested_imports() {
+        let mut tree = sample_tree();
+        let candidate = parse("https://example.org/feed.xml#directory");
+
+        assert!(tree.contains_primary_url(&candidate));
+        assert!(
+            !tree
+                .subscribe_rss_feed("Duplicate", candidate.as_str())
+                .expect("detect nested feed")
+        );
+        assert_eq!(tree.subscription_count(), 2);
+    }
+
+    #[test]
+    fn rss_feed_rejects_non_http_and_malformed_urls_without_mutating_tree() {
+        let mut tree = SubscriptionTree::default();
+
+        let scheme_error = tree
+            .subscribe_rss_feed("Local feed", "file:///tmp/podcast.xml")
+            .expect_err("reject local feed URL");
+        assert!(matches!(
+            scheme_error,
+            SubscriptionError::UnsupportedFeedScheme { scheme } if scheme == "file"
+        ));
+        assert!(tree.subscribe_rss_feed("Broken feed", "not a URL").is_err());
+        assert_eq!(tree.subscription_count(), 0);
+    }
+
+    #[test]
+    fn rss_feed_rejects_embedded_username_or_password_without_mutating_tree() {
+        let mut tree = SubscriptionTree::default();
+
+        for url in [
+            "https://listener@podcasts.example/private.xml",
+            "https://listener:secret@podcasts.example/private.xml",
+        ] {
+            let error = tree
+                .subscribe_rss_feed("Private feed", url)
+                .expect_err("reject embedded RSS credentials");
+            assert!(matches!(&error, SubscriptionError::EmbeddedFeedCredentials));
+            assert_eq!(
+                error.to_string(),
+                "podcast URL must not contain embedded credentials"
+            );
+        }
+        assert_eq!(tree.subscription_count(), 0);
+    }
+
+    #[test]
+    fn added_rss_feed_persists_as_portable_opml() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let mut tree = SubscriptionTree::default();
+        assert!(
+            tree.subscribe_rss_feed("", "https://media.example/podcast")
+                .expect("add podcast feed")
+        );
+
+        save(&config, &tree).expect("persist podcast feed");
+        let restored = load(&config).expect("restore podcast feed");
+        assert_eq!(restored, tree);
+
+        let xml = fs::read_to_string(config.subscriptions_file()).expect("read saved OPML");
+        assert!(xml.contains(r#"type="rss""#));
+        assert!(xml.contains(r#"xmlUrl="https://media.example/podcast""#));
+        assert!(
+            !config
+                .subscriptions_file()
+                .with_extension("opml.tmp")
+                .exists(),
+            "atomic-save temporary file should be replaced"
+        );
     }
 
     #[test]

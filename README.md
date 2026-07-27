@@ -497,6 +497,14 @@ feed URLs. It makes migration possible without a Youta-specific conversion.
 Private comments, folders, bookmarks, playback positions, and provider IDs do
 not fit OPML reliably, so they remain in SQLite and can be exported separately.
 
+At the Subscriptions source root, `[a] Add RSS feed` accepts an absolute
+HTTP(S) RSS or Atom URL without an embedded username or password. Youta removes
+the URL fragment and saves the subscription to the private portable OPML file
+shown in the popup. Query parameters are preserved because some private feeds
+use them for access; the popup redacts the draft URL from debug output. This
+currently saves and displays the source subscription only—RSS episode browsing
+inside the Subscriptions screen is not implemented yet.
+
 YouTube subscriptions are currently local-only channel subscriptions. Choosing
 `Subscribe (locally)` while a video is selected adds its channel to Youta's
 OPML-backed source list; it does not subscribe the signed-in YouTube account.
@@ -530,13 +538,15 @@ aliases when the terminal reports those combinations distinctly. Uppercase
 subscription-source root. Youta provides two layouts:
 
 - `drill-down` is the default for narrow terminals. Sources appear on the
-  left with channel information on the right. Press `Enter` to load the
-  selected YouTube channel's videos in the usual list-and-Details view;
-  `Backspace` or `Esc` returns to the source list. While inside the channel,
-  `[R] Refresh videos` requests its first page again.
+  left with channel information on the right. Press `Enter` to activate the
+  selected YouTube channel, render any restart snapshot, and refresh its videos
+  in the usual list-and-Details view; `Backspace` or `Esc` returns to the source
+  list. While inside the channel, `[R] Refresh videos` requests its first page
+  again.
 - `split` keeps sources on the left and the selected source's videos on the
-  right. Moving across sources uses only cached rows; press `Enter` to load an
-  uncached source and move into its videos. The
+  right. Moving across sources uses only cached rows and makes no provider
+  request; press `Enter` to activate the source, loading it initially or
+  refreshing its cached first page, and move into its videos. The
   `[i] Description` button expands the selected video's Details; `[i]` or
   `Esc` returns to the video list. `[R] Refresh videos` is available after the
   source has been opened.
@@ -580,8 +590,8 @@ batch. Complete results use a 512-entry, 60-second RAM-only cache keyed by
 path and filesystem identity; it is never written to disk.
 
 Video pages are requested only after `Enter` activates the selected channel,
-so moving through a long source list cannot spend API quota. The official adapter
-resolves the channel's uploads playlist, calls
+so moving through a long source list cannot spend API quota. The official
+adapter resolves the channel's uploads playlist, calls
 [`playlistItems.list`](https://developers.google.com/youtube/v3/docs/playlistItems/list),
 then enriches the ordered rows through
 [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list).
@@ -591,8 +601,17 @@ another page when selection approaches the current page's end. It keeps a
 bounded, process-local cache of recently opened channels, so switching back
 does not immediately repeat the request. It retains at most 24 channels and
 250 videos per channel under a shared approximate 8 MiB heap budget; list
-descriptions and thumbnails are compacted before caching. The cache is
-discarded when Youta exits.
+descriptions and thumbnails are compacted before caching.
+
+A compact first-page snapshot also survives restarts in SQLite. Activating a
+channel renders that snapshot immediately, then refreshes page one
+in the background so new videos appear and provider-deleted videos disappear.
+Moving between sources with the Split layout's arrow navigation remains
+request-free; `Enter` activates the source and starts the initial load or
+refresh. Short-lived or signed direct stream URLs are never persisted in this
+snapshot, so playback resolves a fresh stream from the canonical video page.
+The detailed disk bounds are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
 
 Persistent writes stay under `~/.config/youta/`; transient IPC sockets may use
 the operating system's runtime directory. Downloads also default to a

@@ -44,7 +44,10 @@ use crate::links::{
 use crate::persistence::CachedWikidataLookup;
 #[cfg(feature = "youtube-music")]
 use crate::persistence::SavedYouTubeMusicSearch;
-use crate::persistence::{MAX_SAVED_YOUTUBE_SEARCH_RESULTS, SavedYouTubeSearch, StateStore};
+use crate::persistence::{
+    CachedSubscriptionItems, MAX_SAVED_SUBSCRIPTION_ITEMS, MAX_SAVED_YOUTUBE_SEARCH_RESULTS,
+    SavedYouTubeSearch, StateStore,
+};
 #[cfg(feature = "yt-dlp")]
 use crate::playback::youtube_prewarm::{
     PrewarmedYouTubeAudio, YouTubePrewarmCancellation, YouTubePrewarmConfig, YouTubePrewarmError,
@@ -80,9 +83,9 @@ use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailsScroll, DetailsTextSelection,
     ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL,
     LocalFilePopupView, LocalSizeSort, MAX_DETAILS_SELECTION_BYTES, PreferencesPopupView,
-    RightPanelMode, RowView, Screen, SearchActivity, SearchKind, SubscriptionPane,
-    SubscriptionRoute, UiAction, UiController, ViewModel, YOUTUBE_API_KEY_GUIDE_URL,
-    YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
+    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
+    SubscriptionPane, SubscriptionRoute, UiAction, UiController, ViewModel,
+    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::tui::{DetailWikidataEntityView, DetailWikidataValueLinkView};
@@ -1352,6 +1355,8 @@ const MAX_DETAIL_NAVIGATION_HISTORY: usize = 16;
 const MAX_CACHED_WIKIDATA_ENTITIES: usize = 8;
 /// Maximum detached system-opener tasks accepted before earlier ones finish.
 const MAX_URL_OPEN_TASKS: usize = 4;
+/// Maximum draft RSS feed URL retained by the in-app subscription editor.
+const MAX_RSS_SUBSCRIPTION_URL_BYTES: usize = 8 * 1024;
 /// Stable marker for a linked video whose provider details are still pending.
 const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video…";
 /// Stable marker rendered below the pending linked-video title.
@@ -3640,7 +3645,7 @@ impl AppController {
                                         && (pending.staged_cache.is_some()
                                             || (request.page == 1 && received_page_empty))
                                 });
-                        if stage_refresh {
+                        let persist_snapshot = if stage_refresh {
                             let pending = self
                                 .pending_subscription_refresh
                                 .as_mut()
@@ -3674,8 +3679,24 @@ impl AppController {
                                 .insert(request.channel_id.clone(), staged);
                             self.touch_subscription_cache(&request.channel_id);
                             self.enforce_subscription_cache_byte_budget(&request.channel_id);
+                            true
                         } else {
+                            let first_page = request.page == 1;
+                            let first_playable_page_after_empty_prefix = request.page > 1
+                                && !received_page_empty
+                                && self
+                                    .subscription_video_cache
+                                    .get(&request.channel_id)
+                                    .is_some_and(|cached| cached.items.is_empty());
                             self.cache_subscription_video_page(&request.channel_id, page);
+                            first_page || first_playable_page_after_empty_prefix
+                        };
+                        if persist_snapshot
+                            && let Err(error) =
+                                self.persist_subscription_video_snapshot(&request.channel_id)
+                            && self.view.screen == Screen::Subscriptions
+                        {
+                            self.show_error("Could not save cached subscription videos", &error);
                         }
                         if self.view.screen != Screen::Subscriptions {
                             return;
@@ -6258,6 +6279,19 @@ impl AppController {
         }
 
         self.subscription_tree = candidate;
+        if !now_subscribed {
+            self.subscription_generation = self.subscription_generation.wrapping_add(1);
+            self.pending_subscription_refresh = None;
+            self.subscription_video_cache.remove(&channel_id);
+            self.subscription_cache_order
+                .retain(|cached| cached != &channel_id);
+            if let Err(error) = self
+                .store
+                .delete_cached_subscription_items(&SourceKind::YouTube, &channel_id)
+            {
+                self.show_error("Cannot remove cached subscription videos", &error);
+            }
+        }
         if let Some(details) = self.view.details.as_mut()
             && details.channel_id == channel_id
         {
@@ -6281,6 +6315,72 @@ impl AppController {
                 "Unsubscribed from"
             }
         );
+    }
+
+    /// Opens the focused RSS/Atom feed editor.
+    ///
+    /// Feed URLs can contain private query tokens, so the popup's custom
+    /// `Debug` implementation redacts both its draft and validation message.
+    fn open_rss_subscription_popup(&mut self) {
+        if self.view.rss_subscription_popup.is_some() {
+            return;
+        }
+        self.view.help_open = false;
+        self.view.text_selection_mode = false;
+        self.view.details_text_selection = None;
+        self.view.rss_subscription_popup = Some(RssSubscriptionPopupView {
+            url: String::new(),
+            validation_error: None,
+            config_path: self.config.subscriptions_file().display().to_string(),
+        });
+        self.view.status_line = "Enter an RSS or Atom podcast feed URL".to_owned();
+    }
+
+    /// Persists one validated feed without overwriting external OPML edits.
+    fn submit_rss_subscription(&mut self) {
+        let Some(url) = self
+            .view
+            .rss_subscription_popup
+            .as_ref()
+            .map(|popup| popup.url.clone())
+        else {
+            return;
+        };
+        let mut candidate = match subscriptions::load(&self.config) {
+            Ok(tree) => tree,
+            Err(error) => {
+                if let Some(popup) = self.view.rss_subscription_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        };
+        let changed = match candidate.subscribe_rss_feed("", &url) {
+            Ok(changed) => changed,
+            Err(error) => {
+                if let Some(popup) = self.view.rss_subscription_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        };
+        if !changed {
+            self.view.rss_subscription_popup = None;
+            self.subscription_tree = candidate;
+            self.populate_subscriptions();
+            self.view.status_line = "That RSS feed is already subscribed locally".to_owned();
+            return;
+        }
+        if let Err(error) = subscriptions::save(&self.config, &candidate) {
+            if let Some(popup) = self.view.rss_subscription_popup.as_mut() {
+                popup.validation_error = Some(error.to_string());
+            }
+            return;
+        }
+        self.view.rss_subscription_popup = None;
+        self.subscription_tree = candidate;
+        self.populate_subscriptions();
+        self.view.status_line = "RSS feed subscribed locally".to_owned();
     }
 
     /// Drops internal Details history when a list or top-level route changes.
@@ -7876,6 +7976,7 @@ impl AppController {
             return;
         };
         self.active_subscription_channel_id = Some(channel_id.clone());
+        self.restore_subscription_video_snapshot(&channel_id);
         if self.subscription_video_cache.contains_key(&channel_id) {
             self.touch_subscription_cache(&channel_id);
             self.refresh_subscription_video_rows();
@@ -7945,6 +8046,7 @@ impl AppController {
             return;
         };
         self.active_subscription_channel_id = Some(channel_id.clone());
+        self.restore_subscription_video_snapshot(&channel_id);
         if self.subscription_video_cache.contains_key(&channel_id) {
             self.touch_subscription_cache(&channel_id);
             self.refresh_subscription_video_rows();
@@ -7954,9 +8056,83 @@ impl AppController {
             {
                 self.request_selected_details();
             }
+            self.refresh_selected_subscription_videos();
             return;
         }
         self.request_subscription_videos(channel_id, 1);
+    }
+
+    /// Hydrates one compact first-page channel snapshot before network refresh.
+    ///
+    /// Invalid or unavailable disk rows are reported through the normal
+    /// recoverable-error popup. A process-local cache always wins because it
+    /// may already contain later pages loaded during this session.
+    fn restore_subscription_video_snapshot(&mut self, channel_id: &str) {
+        if self.subscription_video_cache.contains_key(channel_id) {
+            return;
+        }
+        let snapshot = match self
+            .store
+            .cached_subscription_items(&SourceKind::YouTube, channel_id)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.show_error("Could not read cached subscription videos", &error);
+                return;
+            }
+        };
+        let Some(mut snapshot) = snapshot else {
+            return;
+        };
+        for item in &mut snapshot.items {
+            if let SearchItem::Video(video) = item {
+                // Direct provider streams can expire between processes and may
+                // contain signed query material. Only the canonical page is
+                // restart-safe; lazy details obtains a current stream.
+                video.stream_url = None;
+            }
+        }
+        self.subscription_video_cache.insert(
+            channel_id.to_owned(),
+            CachedSubscriptionVideos {
+                items: snapshot.items,
+                next_page: None,
+                consecutive_empty_pages: 0,
+            },
+        );
+        self.touch_subscription_cache(channel_id);
+        self.enforce_subscription_cache_byte_budget(channel_id);
+    }
+
+    /// Replaces the restart snapshot with the current compact first page.
+    ///
+    /// Later in-memory pages remain process-local. This keeps restart cost and
+    /// database growth bounded while page-one refreshes still reconcile
+    /// episodes removed by the provider.
+    fn persist_subscription_video_snapshot(
+        &self,
+        channel_id: &str,
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let mut items: Vec<SearchItem> = self
+            .subscription_video_cache
+            .get(channel_id)
+            .map_or(&[][..], |cached| cached.items.as_slice())
+            .iter()
+            .take(MAX_SAVED_SUBSCRIPTION_ITEMS)
+            .cloned()
+            .collect();
+        for item in &mut items {
+            if let SearchItem::Video(video) = item {
+                video.stream_url = None;
+            }
+        }
+        self.store
+            .put_cached_subscription_items(&CachedSubscriptionItems {
+                source: SourceKind::YouTube,
+                source_id: channel_id.to_owned(),
+                items,
+                fetched_at: unix_time(),
+            })
     }
 
     /// Queues one guarded sequential channel page and marks the pane loading.
@@ -8444,14 +8620,9 @@ impl AppController {
         self.open_external_url(&link.url);
     }
 
-    /// Opens one structured Wikidata value without trusting its display text
-    /// as a URL.
-    fn open_wikidata_item(&mut self, item_id: &str) {
-        let Some(url) = canonical_wikidata_item_url(item_id) else {
-            self.view.status_line = "The selected Wikidata item ID is invalid".to_owned();
-            return;
-        };
-        self.open_external_url(&url);
+    /// Opens one provider-validated Wikidata value target.
+    fn open_wikidata_value(&mut self, url: &str) {
+        self.open_external_url(url);
     }
 
     /// Expands or collapses one linked Wikidata item's lazy property spoiler.
@@ -9490,8 +9661,8 @@ impl UiController for AppController {
             UiAction::ToggleWikidataStatements(index) => {
                 self.toggle_wikidata_statements(index);
             }
-            UiAction::OpenWikidataItem(item_id) => {
-                self.open_wikidata_item(&item_id);
+            UiAction::OpenWikidataValue(url) => {
+                self.open_wikidata_value(&url);
             }
             UiAction::SetDetailsFocus(focused) => self.view.details_focused = focused,
             UiAction::ScrollDetails(movement) => {
@@ -9696,6 +9867,27 @@ impl UiController for AppController {
                 self.view.youtube_setup_popup = None;
                 self.view.status_line =
                     "YouTube provider setup cancelled; your selection was kept".to_owned();
+            }
+            UiAction::OpenRssSubscriptionPopup => self.open_rss_subscription_popup(),
+            UiAction::AppendRssSubscriptionCharacter(character) => {
+                if let Some(popup) = self.view.rss_subscription_popup.as_mut()
+                    && popup.url.len() < MAX_RSS_SUBSCRIPTION_URL_BYTES
+                {
+                    popup.url.push(character);
+                    truncate_utf8_bytes(&mut popup.url, MAX_RSS_SUBSCRIPTION_URL_BYTES);
+                    popup.validation_error = None;
+                }
+            }
+            UiAction::DeleteRssSubscriptionCharacter => {
+                if let Some(popup) = self.view.rss_subscription_popup.as_mut() {
+                    popup.url.pop();
+                    popup.validation_error = None;
+                }
+            }
+            UiAction::SubmitRssSubscription => self.submit_rss_subscription(),
+            UiAction::DismissRssSubscriptionPopup => {
+                self.view.rss_subscription_popup = None;
+                self.view.status_line = "RSS subscription canceled".to_owned();
             }
             UiAction::OpenPreferences => self.open_preferences(),
             UiAction::SetSubscriptionsLayout(layout) => {
@@ -12334,8 +12526,9 @@ fn apply_wikidata_entity_to_details(
 fn format_wikidata_entity(
     entity: &crate::providers::wikidata::WikidataEntityStatements,
 ) -> DetailWikidataEntityView {
-    let mut text = format!("Wikidata properties for {}\n", entity.item_id);
+    let mut text = String::new();
     let mut value_links = Vec::new();
+    let mut image_url = None;
     if entity.statements.is_empty() {
         text.push_str("No human-facing statements were found.");
     } else {
@@ -12348,20 +12541,30 @@ fn format_wikidata_entity(
                 if index > 0 {
                     text.push_str("; ");
                 }
+                let start_byte = text.len();
                 if let Some(item_id) = value.item_id.as_ref() {
-                    let start_byte = text.len();
                     if value.display == *item_id {
                         text.push_str(item_id);
                     } else {
                         text.push_str(&format!("{} ({item_id})", value.display));
                     }
+                } else {
+                    text.push_str(&value.display);
+                }
+                let target_url = value
+                    .item_id
+                    .as_deref()
+                    .and_then(canonical_wikidata_item_url)
+                    .or_else(|| value.external_url.as_ref().map(url::Url::to_string));
+                if let Some(url) = target_url {
                     value_links.push(DetailWikidataValueLinkView {
                         start_byte,
                         end_byte: text.len(),
-                        item_id: item_id.clone(),
+                        url,
                     });
-                } else {
-                    text.push_str(&value.display);
+                }
+                if statement.property_id == "P18" && image_url.is_none() {
+                    image_url = value.preview_url.clone();
                 }
             }
             text.push('\n');
@@ -12370,13 +12573,23 @@ fn format_wikidata_entity(
             text.pop();
         }
     }
-    if entity.truncated {
-        text.push_str("\n\nSome properties, values, or labels were omitted by safety limits.");
+    if entity.hard_bounds_reached {
+        text.push_str(
+            "\n\nHard bounds were reached: 256 properties, 128 values per property, \
+             1,024 total values, or 4 KiB per displayed value or label.",
+        );
+    }
+    if entity.unsupported_values_omitted {
+        text.push_str(
+            "\n\nEmpty values or structured value types that Youta cannot display as one \
+             terminal field were omitted.",
+        );
     }
     DetailWikidataEntityView {
         item_id: entity.item_id.clone(),
         text,
         value_links,
+        image_url,
     }
 }
 
@@ -13410,7 +13623,7 @@ mod tests {
     fn local_channel_subscription_persists_and_updates_details_and_rows() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
-        let store = StateStore::open_in_memory().expect("in-memory state");
+        let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
         let video = subscription_video_summary();
         controller.youtube_results = vec![SearchItem::Video(video.clone())];
@@ -13465,6 +13678,17 @@ mod tests {
         );
         drop(restored);
 
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            },
+        );
+        controller
+            .persist_subscription_video_snapshot("UCfixture")
+            .expect("persist subscribed channel snapshot");
         controller.dispatch(UiAction::ToggleSubscription);
         assert!(
             !controller
@@ -13481,6 +13705,26 @@ mod tests {
                 .subscription_count(),
             0
         );
+        assert!(
+            !controller
+                .subscription_video_cache
+                .contains_key("UCfixture")
+        );
+        assert_eq!(
+            controller
+                .store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("read deleted snapshot"),
+            None
+        );
+        drop(controller);
+        assert_eq!(
+            StateStore::open(&config)
+                .expect("restart disk state")
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("read deleted snapshot after restart"),
+            None
+        );
     }
 
     fn save_fixture_subscriptions(config: &Config, channel_ids: &[&str]) {
@@ -13492,6 +13736,61 @@ mod tests {
             ));
         }
         subscriptions::save(config, &tree).expect("save fixture subscriptions");
+    }
+
+    #[test]
+    fn rss_subscription_popup_validates_and_persists_portable_feed() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+
+        controller.dispatch(UiAction::OpenRssSubscriptionPopup);
+        let popup = controller
+            .view
+            .rss_subscription_popup
+            .as_ref()
+            .expect("RSS subscription popup");
+        assert_eq!(
+            popup.config_path,
+            config.subscriptions_file().display().to_string()
+        );
+        controller
+            .view
+            .rss_subscription_popup
+            .as_mut()
+            .expect("RSS subscription popup")
+            .url = "file:///tmp/not-a-network-feed.xml".to_owned();
+        controller.dispatch(UiAction::SubmitRssSubscription);
+        assert!(
+            controller
+                .view
+                .rss_subscription_popup
+                .as_ref()
+                .and_then(|popup| popup.validation_error.as_deref())
+                .is_some_and(|error| error.contains("HTTP or HTTPS"))
+        );
+
+        controller
+            .view
+            .rss_subscription_popup
+            .as_mut()
+            .expect("retained RSS subscription popup")
+            .url = "https://podcasts.example/feed.xml".to_owned();
+        controller.dispatch(UiAction::SubmitRssSubscription);
+        assert!(controller.view.rss_subscription_popup.is_none());
+        let persisted = subscriptions::load(&config).expect("persisted RSS subscription");
+        assert_eq!(persisted.subscription_count(), 1);
+        let SubscriptionNode::Subscription(subscription) = &persisted.items[0] else {
+            panic!("expected top-level RSS subscription");
+        };
+        assert_eq!(subscription.kind, SubscriptionKind::Rss);
+        assert_eq!(
+            subscription.url.as_str(),
+            "https://podcasts.example/feed.xml"
+        );
+        assert_eq!(controller.view.subscriptions.sources.len(), 1);
     }
 
     fn receive_channel_request(
@@ -13599,6 +13898,250 @@ mod tests {
         assert_no_channel_request(
             &captured_requests,
             "returning to a drill-down root must not refetch the channel",
+        );
+    }
+
+    #[test]
+    fn subscriptions_restore_disk_snapshot_before_refresh_and_reconcile_removed_videos() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let mut first_summary = subscription_video_summary();
+        first_summary.stream_url = Some(
+            url::Url::parse("https://streams.example/signed?token=private-fixture")
+                .expect("fixture expiring stream URL"),
+        );
+        let first = SearchItem::Video(first_summary);
+        let mut removed = subscription_video_summary();
+        removed.video_id = "M7lc1UVf-VE".to_owned();
+        removed.title = "Removed fixture video".to_owned();
+        {
+            let store = StateStore::open(&config).expect("initial disk state");
+            store
+                .put_cached_subscription_items(&CachedSubscriptionItems {
+                    source: SourceKind::YouTube,
+                    source_id: "UCfixture".to_owned(),
+                    items: vec![first.clone(), SearchItem::Video(removed)],
+                    fetched_at: 1,
+                })
+                .expect("seed subscription snapshot");
+        }
+
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_no_channel_request(&captured_requests, "the source root must remain quota-free");
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Removed fixture video"],
+            "the restart snapshot must render before the provider responds"
+        );
+        assert!(matches!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.items.first()),
+            Some(SearchItem::Video(video)) if video.stream_url.is_none()
+        ));
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(
+            request.page, 1,
+            "opening must refresh the cached first page"
+        );
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![first],
+                next_page: None,
+            }),
+        });
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video"],
+            "the refreshed page must remove provider-deleted rows"
+        );
+        let persisted = controller
+            .store
+            .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+            .expect("read refreshed snapshot")
+            .expect("refreshed snapshot");
+        assert_eq!(persisted.items.len(), 1);
+        assert!(matches!(
+            persisted.items.first(),
+            Some(SearchItem::Video(video))
+                if video.video_id == "dQw4w9WgXcQ" && video.stream_url.is_none()
+        ));
+    }
+
+    #[test]
+    fn subscription_initial_empty_page_persists_first_later_playable_page() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open(&config).expect("initial disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let mut scheduled = subscription_video_summary();
+        scheduled.video_id = "scheduled00".to_owned();
+        scheduled.duration_seconds = Some(0);
+        scheduled.live = false;
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(scheduled)],
+                next_page: Some(2),
+            }),
+        });
+
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        let playable = subscription_video_summary();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 2,
+                items: vec![SearchItem::Video(playable)],
+                next_page: None,
+            }),
+        });
+        let persisted = controller
+            .store
+            .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+            .expect("load first playable snapshot")
+            .expect("first playable snapshot");
+        assert!(matches!(
+            persisted.items.as_slice(),
+            [SearchItem::Video(video)] if video.video_id == "dQw4w9WgXcQ"
+        ));
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let mut restarted = AppController::new(config, store, None, None);
+        restarted.youtube_provider_available = true;
+        let (requests, _captured_requests) = unbounded();
+        restarted.provider_requests = Some(requests);
+        restarted.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        restarted.dispatch(UiAction::ActivateSelection);
+        assert_eq!(
+            restarted
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video"]
+        );
+    }
+
+    #[test]
+    fn subscription_disk_snapshot_survives_failure_and_clears_after_empty_success() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        {
+            let store = StateStore::open(&config).expect("initial disk state");
+            store
+                .put_cached_subscription_items(&CachedSubscriptionItems {
+                    source: SourceKind::YouTube,
+                    source_id: "UCfixture".to_owned(),
+                    items: vec![SearchItem::Video(subscription_video_summary())],
+                    fetched_at: 1,
+                })
+                .expect("seed subscription snapshot");
+        }
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Err("temporary provider failure".to_owned()),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller
+                .store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("read preserved snapshot")
+                .expect("preserved snapshot")
+                .items
+                .len(),
+            1
+        );
+
+        controller.view.error_popup = None;
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: Vec::new(),
+                next_page: None,
+            }),
+        });
+        assert!(controller.view.subscriptions.items.is_empty());
+        assert!(
+            controller
+                .store
+                .cached_subscription_items(&SourceKind::YouTube, "UCfixture")
+                .expect("read cleared snapshot")
+                .expect("authoritative empty snapshot")
+                .items
+                .is_empty()
+        );
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("second restart disk state");
+        let mut restarted = AppController::new(config, store, None, None);
+        restarted.youtube_provider_available = true;
+        let (requests, _captured_requests) = unbounded();
+        restarted.provider_requests = Some(requests);
+        restarted.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        restarted.dispatch(UiAction::ActivateSelection);
+        assert!(restarted.view.subscriptions.items.is_empty());
+        assert!(
+            restarted
+                .subscription_video_cache
+                .get("UCfixture")
+                .is_some_and(|cached| cached.items.is_empty())
         );
     }
 
@@ -13920,14 +14463,20 @@ mod tests {
                     WikidataStatementValue {
                         display: "Soviet Union".to_owned(),
                         item_id: Some("Q15180".to_owned()),
+                        external_url: None,
+                        preview_url: None,
                     },
                     WikidataStatementValue {
                         display: "Q212".to_owned(),
                         item_id: Some("Q212".to_owned()),
+                        external_url: None,
+                        preview_url: None,
                     },
                 ],
             }],
             truncated: false,
+            hard_bounds_reached: false,
+            unsupported_values_omitted: false,
         };
 
         let formatted = format_wikidata_entity(&entity);
@@ -13945,11 +14494,17 @@ mod tests {
                 .map(|link| {
                     (
                         &formatted.text[link.start_byte..link.end_byte],
-                        link.item_id.as_str(),
+                        link.url.as_str(),
                     )
                 })
                 .collect::<Vec<_>>(),
-            [("Soviet Union (Q15180)", "Q15180"), ("Q212", "Q212"),]
+            [
+                (
+                    "Soviet Union (Q15180)",
+                    "https://www.wikidata.org/wiki/Q15180"
+                ),
+                ("Q212", "https://www.wikidata.org/wiki/Q212"),
+            ]
         );
         assert_eq!(
             canonical_wikidata_item_url("Q212").as_deref(),
@@ -13971,11 +14526,70 @@ mod tests {
         assert_eq!(details.links[0].label, "Q212");
 
         entity.truncated = true;
+        entity.hard_bounds_reached = true;
         assert!(
             format_wikidata_entity(&entity)
                 .text
-                .contains("properties, values, or labels"),
-            "the safety footer must describe label-only truncation accurately"
+                .contains("256 properties"),
+            "the hard-bound footer must name the exact limits"
+        );
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn wikidata_formatter_links_external_ids_and_exposes_p18_preview() {
+        use crate::providers::wikidata::{
+            WikidataEntityStatements, WikidataStatement, WikidataStatementValue,
+        };
+
+        let x_url = url::Url::parse("https://x.com/douglasadams").expect("X fixture URL");
+        let image_page_url = url::Url::parse(
+            "https://commons.wikimedia.org/wiki/File:Douglas%20adams%20portrait%20cropped.jpg",
+        )
+        .expect("Commons file-page fixture URL");
+        let image_preview_url = url::Url::parse(
+            "https://commons.wikimedia.org/wiki/Special:Redirect/file/Douglas%20adams%20portrait%20cropped.jpg?width=512",
+        )
+        .expect("Commons preview fixture URL");
+        let entity = WikidataEntityStatements {
+            item_id: "Q42".to_owned(),
+            statements: vec![
+                WikidataStatement {
+                    property_id: "P2002".to_owned(),
+                    property_label: "X (Twitter) username".to_owned(),
+                    values: vec![WikidataStatementValue {
+                        display: "douglasadams".to_owned(),
+                        item_id: None,
+                        external_url: Some(x_url.clone()),
+                        preview_url: None,
+                    }],
+                },
+                WikidataStatement {
+                    property_id: "P18".to_owned(),
+                    property_label: "image".to_owned(),
+                    values: vec![WikidataStatementValue {
+                        display: "Douglas adams portrait cropped.jpg".to_owned(),
+                        item_id: None,
+                        external_url: Some(image_page_url.clone()),
+                        preview_url: Some(image_preview_url.clone()),
+                    }],
+                },
+            ],
+            truncated: false,
+            hard_bounds_reached: false,
+            unsupported_values_omitted: false,
+        };
+
+        let formatted = format_wikidata_entity(&entity);
+        assert!(!formatted.text.contains("Wikidata properties for Q42"));
+        assert_eq!(formatted.image_url.as_ref(), Some(&image_preview_url));
+        assert_eq!(
+            formatted
+                .value_links
+                .iter()
+                .map(|link| link.url.as_str())
+                .collect::<Vec<_>>(),
+            [x_url.as_str(), image_page_url.as_str()]
         );
     }
 
