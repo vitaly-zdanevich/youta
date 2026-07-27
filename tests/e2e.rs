@@ -6,6 +6,109 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// Maximum time a hosted runner may take to expose one expected TUI effect.
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(
+        feature = "youtube-official",
+        feature = "invidious",
+        feature = "backend-mpv"
+    )
+))]
+const TUI_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Poll interval for transcript and helper-output readiness checks.
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(
+        feature = "youtube-official",
+        feature = "invidious",
+        feature = "backend-mpv"
+    )
+))]
+const TUI_READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Waits for a flushed pseudo-terminal transcript to contain `expected`.
+///
+/// The bounded poll replaces startup and rendering timing guesses. It tolerates
+/// the transcript not existing yet and reports a bounded tail on timeout.
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(
+        feature = "youtube-official",
+        feature = "invidious",
+        feature = "backend-mpv"
+    )
+))]
+fn wait_for_transcript_text(path: &std::path::Path, expected: &str) {
+    wait_for_text_file(path, expected, "terminal transcript");
+}
+
+/// Waits for an asynchronous test helper's output file to contain `expected`.
+///
+/// This readiness boundary proves that an external action ran before the test
+/// sends another hotkey. The wait is capped by [`TUI_READINESS_TIMEOUT`].
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(
+        feature = "youtube-official",
+        feature = "invidious",
+        feature = "backend-mpv"
+    )
+))]
+fn wait_for_helper_output(path: &std::path::Path, expected: &str) {
+    wait_for_text_file(path, expected, "helper output");
+}
+
+/// Polls one UTF-8-ish text file until it contains a readiness marker.
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(
+        feature = "youtube-official",
+        feature = "invidious",
+        feature = "backend-mpv"
+    )
+))]
+fn wait_for_text_file(path: &std::path::Path, expected: &str, label: &str) {
+    use std::io::ErrorKind;
+    use std::time::Instant;
+
+    let deadline = Instant::now()
+        .checked_add(TUI_READINESS_TIMEOUT)
+        .expect("readiness deadline");
+    let mut observed = String::new();
+    loop {
+        match fs::read(path) {
+            Ok(bytes) => observed = String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot read {label} {}: {error}", path.display()),
+        }
+        if observed.contains(expected) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let tail = observed
+                .chars()
+                .rev()
+                .take(4_096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            panic!(
+                "timed out waiting for `{expected}` in {label} {};\nlast output tail:\n{tail}",
+                path.display()
+            );
+        }
+        std::thread::sleep(TUI_READINESS_POLL);
+    }
+}
+
 /// Runs one deterministic key sequence against Youta in a pseudo-terminal.
 #[cfg(all(target_os = "linux", feature = "tui"))]
 fn run_tui_session(
@@ -142,13 +245,16 @@ fn fatal_configuration_error_prints_a_redacted_diagnostic_report() {
         .stderr(predicate::str::contains("fatal-secret-canary").not());
 }
 
-#[cfg(all(target_os = "linux", feature = "tui"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "tui",
+    any(feature = "youtube-official", feature = "invidious")
+))]
 #[test]
 fn tui_missing_provider_opens_setup_with_storage_location() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
-    use std::thread;
     use std::time::Duration;
 
     let temporary = tempdir().expect("temporary directory");
@@ -206,21 +312,30 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
+    wait_for_transcript_text(&transcript, "YouTube video search");
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
-    thread::sleep(Duration::from_millis(500));
     input.write_all(b"/ambient focus\r").expect("submit search");
     input.flush().expect("flush search");
-    thread::sleep(Duration::from_millis(500));
-    for function_key in [b"\x1bOP".as_slice(), b"\x1bOQ", b"\x1bOR"] {
+    wait_for_transcript_text(&transcript, "Configure YouTube metadata");
+    for (function_key, expected_url) in [
+        (b"\x1bOP".as_slice(), youta::tui::YOUTUBE_API_KEY_GUIDE_URL),
+        (
+            b"\x1bOQ".as_slice(),
+            youta::tui::GOOGLE_CLOUD_CREDENTIALS_URL,
+        ),
+        (b"\x1bOR".as_slice(), youta::tui::INVIDIOUS_INSTANCES_URL),
+    ] {
         input
             .write_all(function_key)
             .expect("open provider setup link");
         input.flush().expect("flush provider setup link");
-        thread::sleep(Duration::from_millis(150));
+        wait_for_helper_output(&opened_links, expected_url);
     }
     input.write_all(b"\x1b").expect("cancel setup");
     input.flush().expect("flush setup cancellation");
-    thread::sleep(Duration::from_millis(300));
+    // Keep a short standalone-Escape gap so the terminal decoder cannot
+    // interpret the following quit key as an Alt chord.
+    std::thread::sleep(Duration::from_millis(100));
     input.write_all(b"q").expect("quit");
     input.flush().expect("flush quit");
     child.stdin.take();
@@ -431,7 +546,6 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
-    use std::thread;
     use std::time::Duration;
 
     let temporary = tempdir().expect("temporary directory");
@@ -511,24 +625,38 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
+    wait_for_transcript_text(&transcript, "YouTube video search");
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
-    thread::sleep(Duration::from_millis(500));
     input
         .write_all(b"/https://media.example.test/fixture.opus\r")
         .expect("submit direct media fixture");
     input.flush().expect("flush search input");
-    thread::sleep(Duration::from_millis(300));
+    wait_for_transcript_text(
+        &transcript,
+        "Direct link recognized for media.example.test.",
+    );
     input.write_all(b"\r").expect("activate selected video");
     input.flush().expect("flush activation");
-    thread::sleep(Duration::from_secs(1));
-    for action in *b"cig" {
+    wait_for_transcript_text(&transcript, "Youta diagnostic report");
+    wait_for_transcript_text(&transcript, "[g]");
+    for (action, output_path, expected) in [
+        (b'c', &copy_log, "- No bounded input reached its limit."),
+        (
+            b'i',
+            &open_log,
+            "github.com/vitaly-zdanevich/youta/issues/new",
+        ),
+        (b'g', &gh_body_log, "- No bounded input reached its limit."),
+    ] {
         input.write_all(&[action]).expect("send popup action");
         input.flush().expect("flush popup action");
-        thread::sleep(Duration::from_millis(250));
+        wait_for_helper_output(output_path, expected);
     }
     input.write_all(b"\x1b").expect("close diagnostic popup");
     input.flush().expect("flush popup close");
-    thread::sleep(Duration::from_millis(300));
+    // Keep a short standalone-Escape gap so the terminal decoder cannot
+    // interpret the following quit key as an Alt chord.
+    std::thread::sleep(Duration::from_millis(100));
     input.write_all(b"q").expect("quit Youta");
     input.flush().expect("flush quit");
     child.stdin.take();

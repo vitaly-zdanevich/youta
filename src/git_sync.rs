@@ -47,12 +47,14 @@ pub enum GitSyncOutcome {
 /// non-interactive and shares one bounded wall-clock deadline. The caller
 /// should report an error only after the terminal has been restored; a
 /// synchronization failure must not turn an otherwise graceful TUI shutdown
-/// into an application failure.
+/// into an application failure. If the Git executable is absent and neither
+/// `config_root` nor one of its ancestors has a `.git` control path, the
+/// directory is treated as outside a worktree and no error is reported.
 ///
 /// # Errors
 ///
-/// Returns an error when Git cannot be started or times out, or a stage,
-/// commit, or push command fails.
+/// Returns an error when Git cannot be started for a discoverable worktree or
+/// times out, or a stage, commit, or push command fails.
 pub fn sync_config_root(config_root: &Path) -> Result<GitSyncOutcome, GitSyncError> {
     sync_config_root_with(config_root, Path::new("git"), DEFAULT_SYNC_TIMEOUT)
 }
@@ -86,7 +88,12 @@ fn sync_config_root_with_prefix(
         deadline,
     };
 
-    if !is_git_worktree(&mut git, &config_root)? {
+    let is_worktree = match is_git_worktree(&mut git, &config_root) {
+        Ok(is_worktree) => is_worktree,
+        Err(error) if git_is_missing(&error) && !has_git_control_path(&config_root) => false,
+        Err(error) => return Err(error),
+    };
+    if !is_worktree {
         return Ok(GitSyncOutcome::NotRepository);
     }
 
@@ -188,6 +195,54 @@ fn is_git_worktree(git: &mut GitRunner<'_>, config_root: &Path) -> Result<bool, 
             operation: "discover the Git worktree",
             output: printable_output(output),
         }),
+    }
+}
+
+/// Returns whether worktree discovery failed because Git is not installed.
+fn git_is_missing(error: &GitSyncError) -> bool {
+    matches!(
+        error,
+        GitSyncError::StartGit {
+            operation: "discover the Git worktree",
+            source,
+        } if source.kind() == io::ErrorKind::NotFound
+    )
+}
+
+/// Conservatively detects a normal or linked Git worktree control path.
+///
+/// An unreadable candidate is treated as present so a missing Git executable
+/// remains visible instead of silently skipping a potentially configured
+/// repository.
+fn has_git_control_path(config_root: &Path) -> bool {
+    config_root
+        .ancestors()
+        .any(|directory| is_git_control_path(&directory.join(".git")))
+}
+
+/// Recognizes a normal `.git` directory or a linked-worktree control file.
+fn is_git_control_path(control_path: &Path) -> bool {
+    let metadata = match control_path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if metadata.is_dir() {
+        return match control_path.join("HEAD").try_exists() {
+            Ok(exists) => exists,
+            Err(_) => true,
+        };
+    }
+    if !metadata.is_file() {
+        return false;
+    }
+
+    let mut prefix = [0_u8; b"gitdir:".len()];
+    match std::fs::File::open(control_path).and_then(|mut file| file.read_exact(&mut prefix)) {
+        Ok(()) => prefix.eq_ignore_ascii_case(b"gitdir:"),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
     }
 }
 
@@ -547,6 +602,79 @@ mod tests {
         assert!(!log.contains("\tadd\t"));
         assert!(!log.contains("\tcommit\t"));
         assert!(!log.contains("\tpush"));
+    }
+
+    #[test]
+    fn missing_git_is_a_no_op_outside_a_discoverable_worktree() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = temporary.path().join("config").join("youta");
+        fs::create_dir_all(&config).expect("config directory");
+        let missing_git = temporary.path().join("missing-git");
+
+        assert_eq!(
+            sync_config_root_with(&config, &missing_git, Duration::from_secs(2))
+                .expect("non-repository no-op"),
+            GitSyncOutcome::NotRepository
+        );
+    }
+
+    #[test]
+    fn missing_git_is_reported_inside_a_discoverable_worktree() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repository = temporary.path().join("repository");
+        let config = repository.join("config").join("youta");
+        fs::create_dir_all(repository.join(".git")).expect("Git control directory");
+        fs::write(
+            repository.join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("Git HEAD");
+        fs::create_dir_all(&config).expect("config directory");
+        let missing_git = temporary.path().join("missing-git");
+
+        let error = sync_config_root_with(&config, &missing_git, Duration::from_secs(2))
+            .expect_err("missing Git in a worktree must be reported");
+
+        assert!(matches!(
+            error,
+            GitSyncError::StartGit {
+                operation: "discover the Git worktree",
+                ref source,
+            } if source.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn missing_git_is_reported_inside_a_linked_worktree() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repository = temporary.path().join("linked-worktree");
+        let config = repository.join("config").join("youta");
+        let control_directory = temporary
+            .path()
+            .join("git")
+            .join("worktrees")
+            .join("linked");
+        fs::create_dir_all(&control_directory).expect("linked-worktree control directory");
+        fs::write(control_directory.join("HEAD"), "ref: refs/heads/linked\n")
+            .expect("linked-worktree HEAD");
+        fs::create_dir_all(&config).expect("config directory");
+        fs::write(
+            repository.join(".git"),
+            format!("gitdir: {}\n", control_directory.display()),
+        )
+        .expect("linked-worktree control file");
+        let missing_git = temporary.path().join("missing-git");
+
+        let error = sync_config_root_with(&config, &missing_git, Duration::from_secs(2))
+            .expect_err("missing Git in a linked worktree must be reported");
+
+        assert!(matches!(
+            error,
+            GitSyncError::StartGit {
+                operation: "discover the Git worktree",
+                ref source,
+            } if source.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
