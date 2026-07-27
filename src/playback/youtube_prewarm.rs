@@ -893,6 +893,37 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Waits for Linux to publish a killed fixture process as gone or zombie.
+    ///
+    /// A successful process-group signal can precede the target's final
+    /// `/proc` state transition, especially on a loaded CI host. Keeping this
+    /// wait bounded still detects a descendant that escaped termination.
+    #[cfg(target_os = "linux")]
+    fn assert_process_terminated(pid: &str) {
+        let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match std::fs::read_to_string(&stat_path) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit_once(") ")
+                        .and_then(|(_, fields)| fields.chars().next())
+                        .expect("Linux process stat must contain a state");
+                    if state == 'Z' {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "a surviving descendant must be terminated; observed /proc state {state}"
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error) => panic!("read descendant process state: {error}"),
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn watch_url() -> Url {
         Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").expect("fixture URL")
     }
@@ -1230,17 +1261,7 @@ exit 7"#,
         ));
         let descendant = std::fs::read_to_string(&marker)
             .expect("the mock helper should start its descendant before timeout");
-        let stat_path = PathBuf::from(format!("/proc/{}/stat", descendant.trim()));
-        if let Ok(stat) = std::fs::read_to_string(&stat_path) {
-            let state = stat
-                .rsplit_once(") ")
-                .and_then(|(_, fields)| fields.chars().next());
-            assert_eq!(
-                state,
-                Some('Z'),
-                "a surviving descendant must be terminated, even if init has not reaped it yet"
-            );
-        }
+        assert_process_terminated(descendant.trim());
     }
 
     #[cfg(unix)]
