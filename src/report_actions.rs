@@ -1098,16 +1098,23 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary command directory");
         let helper = temporary.path().join("slow-helper");
         let pid_file = temporary.path().join("pid");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
         let sleep = find_test_executable(&["/usr/bin/sleep", "/bin/sleep"]);
-        make_executable(&helper);
         fs::write(
             &helper,
             "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\n\"$2\" 0.2\n",
         )
         .expect("slow helper fixture");
+        // Execute the fixture through a stable interpreter. Overwriting an
+        // executable fixture and launching it immediately can race with CI
+        // filesystem or security tooling and transiently return ETXTBSY.
         let plan = CommandPlan {
-            executable: helper,
-            arguments: vec![pid_file.as_os_str().to_owned(), sleep.into_os_string()],
+            executable: shell,
+            arguments: vec![
+                helper.into_os_string(),
+                pid_file.as_os_str().to_owned(),
+                sleep.into_os_string(),
+            ],
             standard_input: None,
             observation_time: Duration::from_millis(20),
         };
@@ -1121,10 +1128,7 @@ mod tests {
             foreground_elapsed < Duration::from_millis(500),
             "foreground observation took {foreground_elapsed:?}"
         );
-        let pid = fs::read_to_string(&pid_file)
-            .expect("helper PID")
-            .parse::<u32>()
-            .expect("numeric helper PID");
+        let pid = wait_for_test_pid(&pid_file, Duration::from_secs(1));
         let process_path = PathBuf::from(format!("/proc/{pid}"));
         let reaping_deadline = Instant::now() + Duration::from_secs(2);
         while process_path.exists() && Instant::now() < reaping_deadline {
@@ -1217,6 +1221,28 @@ mod tests {
             .map(PathBuf::from)
             .find(|candidate| is_executable(candidate))
             .expect("standard test executable should exist")
+    }
+
+    /// Waits for the reaper fixture to publish its process ID.
+    ///
+    /// A short observation window can return control before the operating
+    /// system has scheduled the helper far enough to create its PID file.
+    #[cfg(target_os = "linux")]
+    fn wait_for_test_pid(path: &Path, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper did not publish a numeric PID within {timeout:?}: {:?}",
+                fs::read_to_string(path)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
