@@ -1,9 +1,10 @@
 //! Bounded `YouTube Music` search through the external `yt-dlp` executable.
 //!
 //! `YouTube Music` does not require a `Google API` key for this adapter. `yt-dlp`
-//! opens the public `YouTube Music` search page and recursively resolves its
-//! browse containers. A JSON-safe print template emits only video-stage leaf
-//! entries, so callers receive playable identifiers rather than albums.
+//! opens the public `YouTube Music` search page's songs section in flat-playlist
+//! mode. That preserves its ranked playable entries without recursively
+//! expanding album, artist, or playlist containers. A JSON-safe print template
+//! emits both entry kinds, and the parser keeps only playable video identifiers.
 //!
 //! Search is deliberately synchronous, matching Youta's provider interfaces.
 //! Call it from the provider worker rather than the terminal event loop. The
@@ -22,10 +23,9 @@ use thiserror::Error;
 use url::Url;
 
 const SEARCH_URL: &str = "https://music.youtube.com/search";
+const SEARCH_SECTION: &str = "songs";
 const MAX_QUERY_BYTES: usize = 512;
 const MAX_RESULTS: usize = 100;
-const SCAN_MULTIPLIER: usize = 4;
-const MAX_SCAN_ENTRIES: usize = MAX_RESULTS * SCAN_MULTIPLIER;
 const MAX_TITLE_BYTES: usize = 1_024;
 const MAX_ARTIST_BYTES: usize = 512;
 const MAX_STDERR_BYTES: usize = 8 * 1_024;
@@ -129,11 +129,11 @@ impl YouTubeMusicSearch {
 
     /// Searches `YouTube Music` and returns at most `max_results` playable tracks.
     ///
-    /// `YouTube Music` frequently returns album and artist browse containers
-    /// before individual tracks. `yt-dlp` resolves those containers, while a
-    /// video-stage print template emits only playable leaf entries. The child
-    /// stops after `max_results` videos and also has independent time and output
-    /// byte bounds.
+    /// `YouTube Music` interleaves playable tracks with album, artist, and
+    /// playlist browse containers. Flat extraction keeps the ranked top-level
+    /// entries and avoids recursively walking those containers; the parser then
+    /// retains only playable tracks. The child also has independent time and
+    /// output byte bounds.
     ///
     /// This method blocks its calling thread while the supervised child runs.
     /// Youta's provider worker should call it so the TUI remains responsive.
@@ -148,10 +148,7 @@ impl YouTubeMusicSearch {
         max_results: usize,
     ) -> Result<Vec<YouTubeMusicTrack>, YouTubeMusicSearchError> {
         let query = validate_search_request(query, max_results, &self.config)?;
-        let scan_entries = max_results
-            .saturating_mul(SCAN_MULTIPLIER)
-            .min(MAX_SCAN_ENTRIES);
-        let mut command = build_search_command(&self.config, query, max_results, scan_entries)?;
+        let mut command = build_search_command(&self.config, query, max_results)?;
         let output = run_bounded_command(
             &mut command,
             self.config.timeout,
@@ -193,10 +190,10 @@ impl Default for YouTubeMusicSearch {
 /// Parses bounded line-oriented JSON fields printed by the adapter's `yt-dlp`
 /// template.
 ///
-/// Non-flat extraction recursively opens `YoutubeTab` album and artist browse
-/// containers. The default `video` print stage emits only resolved leaf videos,
-/// and this parser accepts only the `Youtube` extractor with valid video IDs.
-/// Unknown diagnostic or future container lines are ignored.
+/// Flat extraction emits ranked `Youtube` video entries alongside `YoutubeTab`
+/// album, artist, and playlist containers. This parser accepts only the former
+/// with valid video IDs. Unknown diagnostic or future container lines are
+/// ignored.
 ///
 /// # Errors
 ///
@@ -347,11 +344,13 @@ fn build_search_command(
     config: &YouTubeMusicSearchConfig,
     query: &str,
     max_results: usize,
-    scan_entries: usize,
 ) -> Result<Command, YouTubeMusicSearchError> {
     let mut search_url = Url::parse(SEARCH_URL)
         .map_err(|error| YouTubeMusicSearchError::InvalidOutput(error.to_string()))?;
     search_url.query_pairs_mut().append_pair("q", query);
+    // yt-dlp's `YoutubeMusicSearchURL` extractor maps this fragment to the
+    // service's songs filter without requiring a Google API key.
+    search_url.set_fragment(Some(SEARCH_SECTION));
 
     let socket_timeout = config.timeout.as_secs().max(1);
     let mut command = Command::new(&config.executable);
@@ -360,7 +359,7 @@ fn build_search_command(
         command.arg("--no-plugin-dirs");
     }
     command
-        .arg("--no-flat-playlist")
+        .arg("--flat-playlist")
         .arg("--skip-download")
         .arg("--no-warnings")
         .arg("--output-na-placeholder")
@@ -368,8 +367,6 @@ fn build_search_command(
         .arg("--print")
         .arg(PRINT_TEMPLATE)
         .arg("--playlist-end")
-        .arg(scan_entries.to_string())
-        .arg("--max-downloads")
         .arg(max_results.to_string())
         .arg("--socket-timeout")
         .arg(socket_timeout.to_string())
@@ -614,14 +611,15 @@ fn sanitized_process_detail(stderr: &[u8]) -> String {
 mod tests {
     use std::ffi::OsString;
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
     fn fixture() -> &'static [u8] {
         concat!(
-            // A broad flat search may contain only these browse containers.
-            // Non-flat extraction resolves them before the following video
-            // print-stage lines are emitted.
+            // A flat search interleaves browse containers with directly
+            // playable, ranked video entries.
             r#"{"_type":"url","ie_key":"YoutubeTab","id":"MPREb_album","url":"https://music.youtube.com/browse/MPREb_album"}"#,
             "\n",
             "youta-music\t\"Tb0MC0jFv6M\"\t\"Teardrop (feat. Elizabeth Fraser)\"",
@@ -638,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_output_after_browse_containers_returns_unique_playable_tracks() {
+    fn flat_output_with_browse_containers_returns_unique_playable_tracks() {
         let tracks = parse_ytdlp_music_search(fixture(), 10).expect("parse fixture");
 
         assert_eq!(tracks.len(), 2);
@@ -669,8 +667,7 @@ mod tests {
     #[test]
     fn command_is_headless_bounded_and_uses_music_search_without_an_api_key() {
         let config = YouTubeMusicSearchConfig::default();
-        let command =
-            build_search_command(&config, "Björk & strings", 3, 12).expect("search command");
+        let command = build_search_command(&config, "Björk & strings", 3).expect("search command");
         let arguments = command
             .get_args()
             .map(std::ffi::OsStr::to_os_string)
@@ -687,8 +684,9 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "--no-plugin-dirs")
         );
+        assert!(visible.iter().any(|argument| argument == "--flat-playlist"));
         assert!(
-            visible
+            !visible
                 .iter()
                 .any(|argument| argument == "--no-flat-playlist")
         );
@@ -700,12 +698,7 @@ mod tests {
         assert!(
             visible
                 .windows(2)
-                .any(|pair| pair[0] == "--playlist-end" && pair[1] == "12")
-        );
-        assert!(
-            visible
-                .windows(2)
-                .any(|pair| pair[0] == "--max-downloads" && pair[1] == "3")
+                .any(|pair| pair[0] == "--playlist-end" && pair[1] == "3")
         );
         assert_eq!(
             visible
@@ -723,11 +716,68 @@ mod tests {
         assert!(visible.iter().any(|argument| {
             argument.starts_with("https://music.youtube.com/search?")
                 && argument.contains("q=Bj%C3%B6rk+%26+strings")
+                && argument.ends_with("#songs")
         }));
         assert!(
             !visible
                 .iter()
                 .any(|argument| matches!(argument.as_ref(), "--api-key" | "--youtube-api-key"))
+        );
+    }
+
+    #[cfg(unix)]
+    struct MockExecutable {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl MockExecutable {
+        fn new(body: &str) -> Self {
+            let directory = tempfile::tempdir().expect("temporary mock executable directory");
+            let path = directory.path().join("mock yt-dlp; no shell");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write mock executable");
+            let mut permissions = std::fs::metadata(&path)
+                .expect("mock executable metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).expect("make mock executable runnable");
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_recursively_expand_slow_browse_containers() {
+        let executable = MockExecutable::new(
+            r#"flat=false
+for argument in "$@"; do
+    case "$argument" in
+        --flat-playlist) flat=true ;;
+        --no-flat-playlist) exec sleep 10 ;;
+    esac
+done
+[ "$flat" = true ] || exit 64
+printf '%s\n' 'youta-music	"Tb0MC0jFv6M"	"Teardrop"	null	null	null	null	"youtube"	"Youtube"	null'"#,
+        );
+        let search = YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
+            executable: executable.path.clone(),
+            timeout: Duration::from_secs(2),
+            ..YouTubeMusicSearchConfig::default()
+        });
+
+        let tracks = search
+            .search("Massive Attack", 30)
+            .expect("flat search should finish without expanding containers");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].video_id, "Tb0MC0jFv6M");
+        assert_eq!(
+            tracks[0].thumbnail_url.as_str(),
+            "https://i.ytimg.com/vi/Tb0MC0jFv6M/hqdefault.jpg"
         );
     }
 

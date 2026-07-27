@@ -121,6 +121,13 @@ youtube_backend = 'auto'
 # other plain-HTTP provider URL. Youta never sends credentials to Mirsoft.
 allow_insecure_http = true
 
+# Preferred Bandcamp audio encoding. `best-available` is the default.
+# One of: `best-available`, `flac`, `alac`, `wav`, `aiff`, `mp3-320`, `mp3-v0`,
+# `aac`, `ogg-vorbis`, or `public-stream-mp3-128`.
+# The in-app [p] Preferences popup cycles this closed set with [b].
+# YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT has higher precedence.
+bandcamp_audio_format = 'best-available'
+
 # Prefer environment overrides for secrets, for example:
 #
 #   YOUTA_PROVIDERS__YOUTUBE_API_KEY='...'

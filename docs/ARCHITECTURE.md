@@ -56,10 +56,48 @@ Youta has three state classes:
 | durable library | SQLite | subscriptions, history, positions, notes, queue |
 | interoperable subscriptions | OPML | podcast/RSS feed outlines |
 
-The default persistent root is `~/.config/youta/`. Source media directories are
-read-only. SQLite uses migrations and foreign-key checks; each user action is a
-small transaction. Configuration writes use a temporary file, an `fsync`, and
-an atomic rename. Private files are created with user-only permissions on Unix.
+The default persistent root is `~/.config/youta/`. Browsing source media
+directories is read-only; only explicit Local Rename, Move to Trash, and Move
+actions mutate selected entries. SQLite uses migrations and foreign-key
+checks; each user action is a small transaction. Configuration writes use a
+temporary file, an `fsync`, and an atomic rename. Private files are created
+with user-only permissions on Unix.
+
+Before a Local Move request reaches the filesystem worker, Youta validates the
+complete bounded tree, rejects symbolic links, collisions, and paths that
+cannot be represented durably, and records the exact source-to-target mappings
+in SQLite. Completion remaps Local history, progress, queue, comments,
+bookmarks, subscription snapshots, and session paths in the same durable
+transaction that clears the move journal. Startup reconciles moves that
+finished or never began. If both endpoints exist or both are missing, Youta
+does not guess: it blocks new moves and orderly quit until the user repairs the
+ambiguous filesystem state and retries.
+
+Apple Podcasts discovery is isolated from the YouTube routes. The tab uses a
+bounded, storefront-specific public catalogue search and persists only compact
+show summaries. Selecting a show does not resolve every result in advance;
+Enter requests the documented bounded episode lookup for that one show, which
+keeps startup and idle network use predictable. Apple search, lookup, and
+direct-link resolution share a capacity-one latest-only lane: one call may be
+in flight, one newer request replaces queued stale work, and shutdown discards
+that pending request before waiting for the active call's bounded timeout.
+Apple API redirects are followed manually only within the exact original
+scheme, host, and port, with a three-hop ceiling.
+Provider-returned feed, artwork, and enclosure URLs reject non-public IP
+literals plus `localhost`, `.local`, `.internal`, and single-label names.
+Youta does not fetch the returned Apple feed: show episodes come from the
+bounded Apple lookup. If terminal artwork is enabled, Youta's thumbnail worker
+pins DNS to public addresses and rejects redirects. Episode enclosures are
+handed to the external playback backend; later media DNS and redirects belong
+to that backend and are not presented as Youta-side SSRF containment.
+
+Bandcamp discovery has its own restart snapshot containing the trimmed query,
+current page, advertised next page, compact canonical track/album summaries,
+and selected row. Search never stores or resolves direct stream URLs. Those
+short-lived URLs and required headers exist only in RAM after an explicit
+playback action. Public-page search uses a capacity-one latest-only worker
+separate from the general YouTube provider lane.
+
 The YouTube provider setup popup displays the exact `config.toml` destination
 before it saves; that path's parent directory is mode `0700` and the file is
 mode `0600` on Unix.
@@ -111,14 +149,15 @@ short explanation; they do not fail after collecting input.
 
 Stable domain identifiers use `(provider, kind, provider_id)`. URLs are
 attributes, because provider URLs and host instances can change. A local file
-also stores a stable filesystem identity when available, but Youta never moves
-the file.
+also stores a stable filesystem identity when available. Youta never moves it
+automatically; an explicit Local Move remaps every retained path after the
+filesystem operation succeeds.
 
 ### Provider tiers
 
 - Tier 0 adapters are expected to be dependable without an account: local
   media, RSS/OPML, radio, Invidious, configurable PeerTube/Funkwhale
-  instances, direct URLs, and `yt-dlp`.
+  instances, Apple Podcasts catalogue search, direct URLs, and `yt-dlp`.
 - Tier 1 uses public/open data: SponsorBlock, DeArrow, Wikidata, Commons,
   Internet Archive, LibriVox, Podcast Index, gpodder.net, Jamendo with a
   user-provided application client ID, and official YouTube public metadata
@@ -128,6 +167,11 @@ the file.
   storage, and remote subscription sync.
 - Experimental adapters rely on unofficial or frequently changing APIs and
   live behind individual build flags.
+
+The implemented Bandcamp tab is a credential-free public-page adapter rather
+than an API integration. Its bounded HTML search is best-effort and may need
+maintenance when Bandcamp changes markup, but it remains isolated behind the
+`bandcamp` feature and cannot turn a search result into authenticated access.
 
 Retries are bounded and use jittered backoff. Each adapter has explicit
 timeouts, a user agent, pagination limits, and a concurrency budget. Search
@@ -154,10 +198,11 @@ shared by the TUI and CLI search paths. It does not select playback:
 
 YouTube Music discovery is a separate provider route and persistent result
 snapshot. It invokes the configured `yt-dlp` executable on the public
-`music.youtube.com` search page from the blocking provider worker, recursively
-resolves browse containers, and accepts only playable YouTube video leaves.
-The child process, retained output, metadata fields, timeout, and result count
-are bounded. This route needs no Data API key and never overwrites the normal
+`music.youtube.com` search page from a capacity-one latest-only worker,
+recursively resolves browse containers, and accepts only playable YouTube video
+leaves. Its process cannot hold the general YouTube provider lane. The child
+process, retained output, metadata fields, timeout, and result count are
+bounded. This route needs no Data API key and never overwrites the normal
 YouTube or MOD/tracker query, rows, or selection.
 
 Jamendo uses its fixed HTTPS v3 tracks endpoint rather than a configurable
@@ -217,6 +262,19 @@ detail fields independently:
 Each request carries the selected media ID and generation number. A late result
 for an old selection is cached but not painted over the new selection.
 
+Apple Podcasts and Bandcamp keep independent query, result, and selection
+state. Apple show search returns one bounded, storefront-specific ranked set
+because the documented Search API has no episode-search entity or pagination;
+Enter performs one documented lookup for the selected collection and renders
+Apple's returned order of at most 200 associated episodes. Bandcamp search
+accepts bounded pages of canonical track and album URLs from the fixed public
+HTTPS endpoint and follows only the sequential next page advertised in its
+HTML. Neither tab performs per-row stream resolution while the user navigates.
+Official Apple show/episode URLs and strict canonical Bandcamp release URLs
+enter these same first-class state machines instead of falling through to a
+generic extractor; direct pages retain Back navigation and canonical restart
+identity.
+
 Description links, hashtags, timecodes, and YouTube IDs are parsed into typed
 spans. Following an internal media link pushes the current detail state onto a
 bounded navigation stack. Back restores the exact selection and scroll offset.
@@ -239,11 +297,12 @@ not asserted links.
 
 A matching entity is represented by one collapsed External links row rather
 than duplicated in the channel/video metadata body. Activating its `[W] 🧾`
-control starts a separate bounded EntityData and label request, then replaces
-the Details description body with a scrollable property spoiler. Only
-human-facing statements are formatted; closing the spoiler restores the
-ordinary Details body. Entity statements therefore remain lazy even after the
-lighter exact-ID match has completed.
+control starts a bounded `wbgetentities` claims-plus-sitelinks request and
+bounded label requests, then replaces the Details description body with a
+scrollable property spoiler. Only human-facing statements and canonical,
+validated Wikipedia article sitelinks are formatted; closing the spoiler
+restores the ordinary Details body. Entity details therefore remain lazy even
+after the lighter exact-ID match has completed.
 
 ### Subscription navigation and channel videos
 
@@ -414,6 +473,28 @@ postprocessor commands, and user-supplied output templates are outside the safe
 default. The command is for media a user is allowed to access; it is not a
 rights or policy bypass.
 
+### Bandcamp on-demand resolution
+
+Pressing Enter on a Bandcamp result sends its canonical page and the configured
+audio preference to one bounded resolver worker. The worker ignores external
+`yt-dlp` configuration and plugins, supplies no cookies, validates that the
+Bandcamp extractor and public CDN produced the response, and discards stale
+completions when the selected release changes. Album entries are bounded; the
+queue and persisted state retain canonical release identity rather than
+resolved URLs or headers.
+
+`providers.bandcamp_audio_format` defaults to `best-available`. The complete
+closed set is `best-available`, `flac`, `alac`, `wav`, `aiff`, `mp3-320`,
+`mp3-v0`, `aac`, `ogg-vorbis`, and `public-stream-mp3-128`;
+`YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT` has higher precedence. The `[b]`
+control in Preferences cycles this exact order. Every value maps to a static
+Youta-owned selector, so configuration cannot inject a raw `yt-dlp` format
+expression. `best-available` prioritizes lossless encodings before lossy
+downloads and the public stream. Each named encoding falls back to the public
+MP3-128 stream and then the extractor's best audio, so the setting is a
+preference rather than a guarantee. Resolving a free-download format may
+consume an artist-configured download allocation.
+
 ### Selected YouTube audio prewarm
 
 With `playback.youtube_prewarm = true`, the reducer waits for a YouTube video
@@ -448,6 +529,9 @@ is no universal reliable query for terminal background color.
 Thumbnail support is a separate feature and runtime capability:
 
 - supported graphics protocol detected: fetch a size-bounded thumbnail lazily;
+- remote artwork rejects non-public literal, DNS-resolved, `.local`,
+  `.internal`, and single-label destinations, and HTTP redirects are not
+  followed;
 - Linux virtual console, serial/real TTY, `TERM=dumb`, or unknown protocol:
   show text details only;
 - selected artwork has priority; one bounded worker may then prefetch the

@@ -13,6 +13,8 @@ use url::Url;
 
 #[cfg(feature = "apple-podcasts")]
 pub mod apple_podcasts;
+#[cfg(feature = "bandcamp")]
+pub mod bandcamp;
 #[cfg(feature = "bbc-radio")]
 pub mod bbc;
 #[cfg(feature = "dearrow")]
@@ -915,7 +917,6 @@ pub fn validate_youtube_video_id(video_id: &str) -> Result<(), ProviderError> {
 }
 
 #[cfg(any(
-    feature = "apple-podcasts",
     feature = "dearrow",
     feature = "funkwhale",
     feature = "invidious",
@@ -942,7 +943,6 @@ pub(crate) fn provider_agent(timeout: Duration) -> ureq::Agent {
 }
 
 #[cfg(any(
-    feature = "apple-podcasts",
     feature = "dearrow",
     feature = "funkwhale",
     feature = "invidious",
@@ -994,7 +994,6 @@ pub(crate) fn get_bounded_json<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(any(
-    feature = "apple-podcasts",
     feature = "dearrow",
     feature = "funkwhale",
     feature = "invidious",

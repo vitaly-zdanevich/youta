@@ -31,6 +31,7 @@ default = [
     "soundcloud",
     "soundstream",
     "youtube-music",
+    "bandcamp",
     "apple-podcasts",
     "litres",
     "sponsorblock",
@@ -64,6 +65,7 @@ thumbnails = [
     "tui",
     "network",
     "dep:image",
+    "dep:jpeg-decoder",
     "dep:ratatui-image",
     "dep:sha2",
 ]
@@ -71,7 +73,7 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
-local = ["dep:lofty", "dep:trash"]
+local = ["dep:lofty", "dep:rustix", "dep:trash"]
 rss = ["network", "dep:feed-rs"]
 invidious = ["network"]
 peertube = ["network"]
@@ -115,7 +117,7 @@ webdav = ["network"]
 ssh = []
 evernote = []
 telegram = []
-bandcamp = ["network"]
+bandcamp = ["network", "yt-dlp"]
 odysee = ["network"]
 rumble = ["network"]
 bilibili = ["network"]
@@ -140,7 +142,7 @@ directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 opml = "1.1.6"
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"] }
-rustix = { version = "1.1.4", features = ["process"], optional = true }
+rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
@@ -156,6 +158,7 @@ lofty = { version = "0.24.0", optional = true }
 mio = { version = "1.2.0", features = ["net", "os-ext", "os-poll"], optional = true }
 trash = { version = "5.2.5", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+jpeg-decoder = { version = "0.3.2", default-features = false, optional = true }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros"], optional = true }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"], optional = true }
 quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }

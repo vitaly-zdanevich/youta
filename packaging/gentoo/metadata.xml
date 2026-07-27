@@ -34,7 +34,7 @@
 		<flag name="lastfm">Enable optional Last.fm scrobbling</flag>
 		<flag name="librivox">Enable the LibriVox audiobook adapter</flag>
 		<flag name="litres">Enable LitRes podcast catalog metadata and bounded public-page resolution</flag>
-		<flag name="local">Index local audio and video files without moving them</flag>
+		<flag name="local">Browse local audio, video, and images in place, with explicit rename, system-trash, and move actions</flag>
 		<flag name="mpv">Build the invisible mpv JSON-IPC playback backend</flag>
 		<flag name="native">Build the experimental native playback backend</flag>
 		<flag name="odysee">Enable the experimental Odysee adapter</flag>

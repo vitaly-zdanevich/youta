@@ -5,9 +5,80 @@
 //! and the `SQLite` store independently testable.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
-use url::Url;
+use url::{Host, Url};
+
+/// Returns whether a remote URL names an explicitly non-public network host.
+///
+/// This rejects literal loopback, private, link-local, unspecified, broadcast,
+/// and multicast addresses, including IPv4-mapped IPv6 forms. It also rejects
+/// `localhost`, `.local`, `.internal`, and single-label hostnames. Callers still
+/// need a redirect policy and must not treat this syntactic check as DNS-
+/// rebinding protection.
+#[must_use]
+pub(crate) fn remote_url_has_non_public_host(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => ip_address_is_non_public(IpAddr::V4(address)),
+        Some(Host::Ipv6(address)) => ip_address_is_non_public(IpAddr::V6(address)),
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            !host.contains('.')
+                || host == "localhost"
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+                || host.ends_with(".internal")
+        }
+        None => true,
+    }
+}
+
+/// Returns whether one resolved address is unsafe for a public-network fetch.
+///
+/// This is shared by URL-literal validation and HTTP resolvers so a public-
+/// looking hostname cannot bypass the same address policy after DNS lookup.
+#[must_use]
+pub(crate) fn ip_address_is_non_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => ipv4_is_non_public(address),
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_multicast()
+                || address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || segments[0] & 0xffc0 == 0xfec0
+                || (segments[0] == 0x0100
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && segments[3] == 0)
+                || (segments[0] == 0x2001 && segments[1] & 0xfe00 == 0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || segments[0] == 0x2002
+                || address.to_ipv4_mapped().is_some_and(ipv4_is_non_public)
+        }
+    }
+}
+
+fn ipv4_is_non_public(address: std::net::Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    first == 0
+        || first == 10
+        || (first == 100 && (64..=127).contains(&second))
+        || first == 127
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 0 && third == 0)
+        || (first == 192 && second == 0 && third == 2)
+        || (first == 192 && second == 88 && third == 99)
+        || (first == 192 && second == 168)
+        || (first == 198 && (second == 18 || second == 19))
+        || (first == 198 && second == 51 && third == 100)
+        || (first == 203 && second == 0 && third == 113)
+        || first >= 224
+}
 
 /// The watched fraction at which an item is considered played.
 pub const PLAYED_THRESHOLD: f64 = 0.90;
@@ -435,6 +506,65 @@ pub struct MediaItem {
     pub captions: Vec<CaptionTrack>,
 }
 
+/// Compact provider-neutral metadata for a podcast show search result.
+///
+/// Episode descriptions and enclosure URLs deliberately remain outside this
+/// type so restart snapshots can stay small and resolve current feed data
+/// lazily after selection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PodcastShowSummary {
+    /// Provider-qualified show identifier.
+    pub id: MediaId,
+    /// Podcast show title.
+    pub title: String,
+    /// Creator, publisher, or network name, when supplied.
+    pub author: Option<String>,
+    /// Public RSS or Atom feed URL, when advertised by the catalogue.
+    pub feed_url: Option<Url>,
+    /// Canonical provider page suitable for opening in a browser.
+    pub webpage_url: Option<Url>,
+    /// Artwork suitable for a terminal preview.
+    pub artwork_url: Option<Url>,
+    /// Number of published episodes reported by the catalogue.
+    pub episode_count: Option<u64>,
+    /// Provider-supplied genre labels.
+    pub genres: Vec<String>,
+    /// Whether the catalogue marks the show explicit.
+    pub explicit: Option<bool>,
+}
+
+/// Bandcamp release kinds retained in provider-neutral search snapshots.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BandcampReleaseKind {
+    /// One public Bandcamp track page.
+    Track,
+    /// One public Bandcamp album page.
+    Album,
+}
+
+/// Compact provider-neutral metadata for a Bandcamp search result.
+///
+/// The provider-qualified [`MediaId`] retains the stable Bandcamp identity,
+/// while `webpage_url` retains the canonical track or album page needed for a
+/// later explicit playback, download, or autoplay action. Resolved and signed
+/// media URLs deliberately remain outside restart state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BandcampSearchSummary {
+    /// Provider-qualified stable release identity.
+    pub id: MediaId,
+    /// Whether the result is a track or an album.
+    pub kind: BandcampReleaseKind,
+    /// Public release title.
+    pub title: String,
+    /// Artist or label display name, when supplied by public search.
+    pub artist: Option<String>,
+    /// Canonical credential-free Bandcamp track or album page.
+    pub webpage_url: Url,
+    /// Public Bandcamp CDN artwork, when supplied by public search.
+    pub artwork_url: Option<Url>,
+}
+
 /// A Wikidata item linked to an external media identifier.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WikidataLink {
@@ -657,6 +787,12 @@ pub struct HistoryEntry {
     pub media_id: MediaId,
     /// Title captured at playback time for offline history display.
     pub title: String,
+    /// Stable credential-free local path or provider page used for replay.
+    ///
+    /// Resolved media streams, signed URLs, and other transient playback
+    /// locations must not be stored here.
+    #[serde(default)]
+    pub replay_locator: Option<String>,
     /// First playback time for this entry, as Unix seconds.
     pub started_at: i64,
     /// Most recent playback time for this entry, as Unix seconds.
@@ -920,6 +1056,10 @@ pub enum Screen {
     Search,
     /// Music-focused `YouTube Music` search results and details.
     YouTubeMusic,
+    /// Bandcamp track and album search results.
+    Bandcamp,
+    /// `Apple Podcasts` show search results and details.
+    ApplePodcasts,
     /// Local folders and supported media files.
     Local,
     /// Local subscription tree.
@@ -976,6 +1116,12 @@ pub struct SessionState {
     /// Last selected row in the independent `YouTube Music` result list.
     #[serde(default)]
     pub youtube_music_selected_row: Option<usize>,
+    /// Last selected row in the independent Bandcamp result list.
+    #[serde(default)]
+    pub bandcamp_selected_row: Option<usize>,
+    /// Last selected row in the independent `Apple Podcasts` result list.
+    #[serde(default)]
+    pub apple_podcasts_selected_row: Option<usize>,
     /// Vertical scroll offset in the details panel.
     pub details_scroll: u64,
     /// Last search text.
@@ -983,6 +1129,12 @@ pub struct SessionState {
     /// Last search text entered on the independent `YouTube Music` tab.
     #[serde(default)]
     pub youtube_music_search_text: String,
+    /// Last search text entered on the independent Bandcamp tab.
+    #[serde(default)]
+    pub bandcamp_search_text: String,
+    /// Last search text entered on the independent `Apple Podcasts` tab.
+    #[serde(default)]
+    pub apple_podcasts_search_text: String,
     /// Last canonical folder shown by the Local screen.
     #[serde(default)]
     pub local_path: Option<String>,
@@ -1210,6 +1362,94 @@ mod tests {
             serde_json::from_value(encoded).expect("decode pre-toggle session");
 
         assert!(!restored.chapter_timestamps_hidden);
+    }
+
+    #[test]
+    fn older_sessions_default_independent_bandcamp_state() {
+        let mut encoded =
+            serde_json::to_value(SessionState::default()).expect("encode session fixture");
+        let object = encoded
+            .as_object_mut()
+            .expect("session must encode as an object");
+        object.remove("bandcamp_selected_row");
+        object.remove("bandcamp_search_text");
+
+        let restored: SessionState =
+            serde_json::from_value(encoded).expect("decode pre-Bandcamp session");
+
+        assert_eq!(restored.bandcamp_selected_row, None);
+        assert!(restored.bandcamp_search_text.is_empty());
+    }
+
+    #[test]
+    fn bandcamp_screen_has_a_stable_restart_name() {
+        let encoded = serde_json::to_string(&Screen::Bandcamp).expect("encode Bandcamp screen");
+        let restored: Screen = serde_json::from_str(&encoded).expect("decode screen");
+
+        assert!(encoded.contains("bandcamp"));
+        assert_eq!(restored, Screen::Bandcamp);
+    }
+
+    #[test]
+    fn older_sessions_default_independent_apple_podcasts_state() {
+        let mut encoded =
+            serde_json::to_value(SessionState::default()).expect("encode session fixture");
+        let object = encoded
+            .as_object_mut()
+            .expect("session must encode as an object");
+        object.remove("apple_podcasts_selected_row");
+        object.remove("apple_podcasts_search_text");
+
+        let restored: SessionState =
+            serde_json::from_value(encoded).expect("decode pre-Apple session");
+
+        assert_eq!(restored.apple_podcasts_selected_row, None);
+        assert!(restored.apple_podcasts_search_text.is_empty());
+    }
+
+    #[test]
+    fn apple_podcasts_screen_has_a_stable_restart_name() {
+        let encoded =
+            serde_json::to_string(&Screen::ApplePodcasts).expect("encode Apple Podcasts screen");
+        let restored: Screen = serde_json::from_str(&encoded).expect("decode screen");
+
+        assert!(encoded.contains("apple-podcasts"));
+        assert_eq!(restored, Screen::ApplePodcasts);
+    }
+
+    #[test]
+    fn remote_literal_host_check_rejects_non_public_network_destinations() {
+        for raw in [
+            "http://127.0.0.1/audio",
+            "https://10.0.0.1/artwork",
+            "https://169.254.169.254/metadata",
+            "https://0.0.0.0/feed",
+            "https://[::1]/episode",
+            "https://[fc00::1]/episode",
+            "https://[fe80::1]/episode",
+            "https://localhost/image",
+            "https://player.localhost/image",
+            "https://printer.local/image",
+            "https://metadata.service.internal/image",
+            "https://intranet/image",
+        ] {
+            let url = Url::parse(raw).expect("non-public URL fixture");
+            assert!(
+                remote_url_has_non_public_host(&url),
+                "non-public host was accepted: {raw}"
+            );
+        }
+        for raw in [
+            "https://podcasts.apple.com/us/podcast/show/id1",
+            "https://8.8.8.8/public-fixture",
+            "https://[2606:4700:4700::1111]/public-fixture",
+        ] {
+            let url = Url::parse(raw).expect("public URL fixture");
+            assert!(
+                !remote_url_has_non_public_host(&url),
+                "public host was rejected: {raw}"
+            );
+        }
     }
 
     #[test]

@@ -32,9 +32,10 @@ use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
-    DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
+    BandcampAudioFormat, DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout,
+    ThumbnailMode,
 };
-use crate::domain::{Chapter, MediaId};
+use crate::domain::{Chapter, MediaId, MediaKind};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
@@ -49,6 +50,18 @@ pub const YOUTUBE_API_KEY_GUIDE_URL: &str =
 
 /// Google Cloud page where the user creates and restricts API credentials.
 pub const GOOGLE_CLOUD_CREDENTIALS_URL: &str = "https://console.cloud.google.com/apis/credentials";
+
+/// Fixed-width placeholder rendered before playable Wikidata media values.
+pub const WIKIDATA_MEDIA_PLAY_SYMBOL: &str = "▶";
+
+/// Fixed-width marker rendered for the same actively playing Commons value.
+const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "⏸";
+
+/// Bottom seek-status control shown when playback can be resumed.
+const PLAYBACK_RESUME_SYMBOL: &str = "▶";
+
+/// Bottom seek-status control shown when playback can be paused.
+const PLAYBACK_PAUSE_SYMBOL: &str = "⏸";
 
 /// Official Invidious documentation listing public instances.
 pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
@@ -67,10 +80,16 @@ pub enum Screen {
     Search,
     /// Music-focused search through `music.youtube.com`.
     YouTubeMusic,
-    /// Local folders and supported media files.
-    Local,
+    /// Artist, album, and track discovery through `Bandcamp`.
+    Bandcamp,
+    /// Podcast-show discovery through Apple's public catalogue.
+    ApplePodcasts,
+    /// Aggregated tracker-module search across dedicated archives.
+    TrackerMusic,
     /// Locally subscribed channels and feeds.
     Subscriptions,
+    /// Local folders and supported media files.
+    Local,
     /// Media available without a network connection.
     Downloaded,
     /// Played and partially played media.
@@ -79,15 +98,14 @@ pub enum Screen {
     Playlists,
     /// Listening totals grouped by source.
     Statistics,
-    /// Aggregated tracker-module search across dedicated archives.
-    TrackerMusic,
 }
 
 impl Screen {
-    #[cfg(feature = "youtube-music")]
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::Search,
         Self::YouTubeMusic,
+        Self::Bandcamp,
+        Self::ApplePodcasts,
         Self::TrackerMusic,
         Self::Subscriptions,
         Self::Local,
@@ -97,22 +115,22 @@ impl Screen {
         Self::Statistics,
     ];
 
-    #[cfg(not(feature = "youtube-music"))]
-    const ALL: [Self; 8] = [
-        Self::Search,
-        Self::TrackerMusic,
-        Self::Subscriptions,
-        Self::Local,
-        Self::Playlists,
-        Self::Downloaded,
-        Self::History,
-        Self::Statistics,
-    ];
+    /// Whether the active build exposes this provider-backed tab.
+    const fn enabled(self) -> bool {
+        match self {
+            Self::YouTubeMusic => cfg!(feature = "youtube-music"),
+            Self::Bandcamp => cfg!(feature = "bandcamp"),
+            Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
+            _ => true,
+        }
+    }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Search => "YouTube",
             Self::YouTubeMusic => "YouTube Music",
+            Self::Bandcamp => "Bandcamp",
+            Self::ApplePodcasts => "Apple Podcasts",
             Self::TrackerMusic => "MOD/tracker",
             Self::Local => "Local",
             Self::Subscriptions => "Subscriptions",
@@ -127,6 +145,8 @@ impl Screen {
         match self {
             Self::Search => "YouTube",
             Self::YouTubeMusic => "YT Music",
+            Self::Bandcamp => "Bandcamp",
+            Self::ApplePodcasts => "Apple",
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
             Self::Subscriptions => "Subs",
@@ -142,7 +162,10 @@ impl Screen {
         let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
             return Self::ALL[0];
         };
-        Self::ALL[(index + 1) % Self::ALL.len()]
+        (1..=Self::ALL.len())
+            .map(|offset| Self::ALL[(index + offset) % Self::ALL.len()])
+            .find(|candidate| candidate.enabled())
+            .unwrap_or(Self::Search)
     }
 
     /// Returns the previous enabled top-level tab, wrapping at the beginning.
@@ -150,7 +173,10 @@ impl Screen {
         let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
             return Self::ALL[Self::ALL.len() - 1];
         };
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        (1..=Self::ALL.len())
+            .map(|offset| Self::ALL[(index + Self::ALL.len() - offset) % Self::ALL.len()])
+            .find(|candidate| candidate.enabled())
+            .unwrap_or(Self::Search)
     }
 }
 
@@ -237,6 +263,10 @@ pub enum SearchActivity {
     YouTube,
     /// A music-focused search through `yt-dlp` and `music.youtube.com`.
     YouTubeMusic,
+    /// A public track and album search through `Bandcamp`.
+    Bandcamp,
+    /// A show search through Apple's public podcast catalogue.
+    ApplePodcasts,
     /// An aggregate search through the enabled MOD/tracker archives.
     TrackerArchives,
 }
@@ -247,6 +277,8 @@ impl SearchActivity {
         match self {
             Self::YouTube => Screen::Search,
             Self::YouTubeMusic => Screen::YouTubeMusic,
+            Self::Bandcamp => Screen::Bandcamp,
+            Self::ApplePodcasts => Screen::ApplePodcasts,
             Self::TrackerArchives => Screen::TrackerMusic,
         }
     }
@@ -319,6 +351,8 @@ pub struct RowView {
     pub vertical: bool,
     /// Omit generic source and marker padding on a source-specific screen.
     pub compact: bool,
+    /// Whether this Local row belongs to the current explicit move batch.
+    pub local_marked: bool,
 }
 
 /// Details for the selected media item.
@@ -381,6 +415,12 @@ pub struct DetailView {
     /// The URL is never rendered as text. Unsupported terminals omit the
     /// image without fetching it.
     pub thumbnail_url: Option<url::Url>,
+    /// Whether artwork occupies all remaining rows in the Details panel.
+    ///
+    /// This interaction-only state is never persisted. Selecting another item
+    /// constructs a fresh [`DetailView`] and restores the configured artwork
+    /// height.
+    pub thumbnail_expanded: bool,
     /// Whether the selected local entry can be renamed in place.
     pub local_renamable: bool,
     /// Whether the selected local entry can be moved to recoverable Trash.
@@ -492,6 +532,8 @@ pub struct PreferencesPopupView {
     pub youtube_prewarm: bool,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
     pub show_local_folder_sizes: bool,
+    /// Draft preferred Bandcamp playback encoding.
+    pub bandcamp_audio_format: BandcampAudioFormat,
     /// Exact private TOML file updated by the save action.
     pub config_path: String,
     /// Environment variable shadowing the TOML value, when present.
@@ -521,6 +563,30 @@ pub enum LocalFilePopupView {
         /// Filesystem failure retained in the popup.
         error: Option<String>,
     },
+    /// Destination browser for one or more explicitly selected Local entries.
+    Move {
+        /// Lossy display names of the source entries, bounded by the controller.
+        source_names: Vec<String>,
+        /// Canonical directory that would receive the selected sources.
+        destination: String,
+        /// Parent and real child directories available for navigation.
+        directories: Vec<LocalMoveDestinationView>,
+        /// Selected destination-browser row.
+        selected: usize,
+        /// Whether a background directory listing is in flight.
+        pending: bool,
+        /// Validation or filesystem failure retained in the popup.
+        error: Option<String>,
+    },
+}
+
+/// One exact destination-browser row inside the Local Move popup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalMoveDestinationView {
+    /// Human-readable basename, or `..` for the canonical parent.
+    pub name: String,
+    /// Canonical directory selected when this row is activated.
+    pub path: String,
 }
 
 /// One selectable timecode span inside the original Details description.
@@ -569,11 +635,38 @@ pub struct DetailWikidataEntityView {
     pub text: String,
     /// Item-valued statement spans that open canonical Wikidata pages.
     pub value_links: Vec<DetailWikidataValueLinkView>,
-    /// Commons P18 media shown while this property spoiler is expanded.
+    /// Play/pause controls for supported Commons audio and video values.
+    pub media_controls: Vec<DetailWikidataMediaView>,
+    /// First Commons P18 preview retained for the expanded property spoiler.
+    ///
+    /// Keeping one preview bounds rendering and memory work. It is used only as
+    /// a fallback when no primary provider artwork exists and never replaces
+    /// YouTube or other source artwork. Every P18 value remains readable and
+    /// clickable in [`Self::text`].
     pub image_url: Option<url::Url>,
 }
 
-/// One clickable item or external identifier inside Wikidata properties.
+/// One playable Commons value embedded in expanded Wikidata text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailWikidataMediaView {
+    /// Inclusive byte offset of the fixed-width play/pause marker.
+    pub marker_start_byte: usize,
+    /// Exclusive byte offset of the fixed-width play/pause marker.
+    pub marker_end_byte: usize,
+    /// Stable Commons identity used to match current playback.
+    pub media_id: MediaId,
+    /// Audio or video classification supplied by the Wikidata provider.
+    pub kind: MediaKind,
+    /// Human-facing Commons filename used as the player title.
+    pub title: String,
+    /// Canonical Commons file page retained for navigation and history.
+    pub webpage_url: url::Url,
+    /// Stable credential-free Commons file redirect passed to playback.
+    pub playback_url: url::Url,
+}
+
+/// One clickable item, identifier, Commons page, or Wikipedia article inside
+/// expanded Wikidata details.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetailWikidataValueLinkView {
     /// Inclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
@@ -745,6 +838,8 @@ pub struct ViewModel {
     pub details_scroll: usize,
     /// Selected external-link index, or `None` before link navigation begins.
     pub selected_detail_link: Option<usize>,
+    /// Selected Commons media control inside the expanded Wikidata spoiler.
+    pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
     pub right_panel_mode: RightPanelMode,
     /// Waveform peaks chosen for the current terminal width.
@@ -811,6 +906,7 @@ impl Default for ViewModel {
             details_focused: false,
             details_scroll: 0,
             selected_detail_link: None,
+            selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
             waveform: Vec::new(),
             playback: PlaybackStatus::default(),
@@ -901,10 +997,17 @@ pub enum UiAction {
     ActivateDetailLink(usize),
     /// Expand or collapse lazy Wikidata properties for an external-link row.
     ToggleWikidataStatements(usize),
-    /// Open one validated Wikidata item, external identifier, or Commons file.
+    /// Open one validated Wikidata item, identifier, Commons page, or
+    /// Wikipedia article.
     OpenWikidataValue(String),
+    /// Move the selected Commons media control inside expanded Wikidata.
+    MoveWikidataMedia(i32),
+    /// Start or pause one indexed Commons media value in expanded Wikidata.
+    ActivateWikidataMedia(usize),
     /// Give or remove explicit keyboard focus from the Details panel.
     SetDetailsFocus(bool),
+    /// Toggle artwork between its configured size and the remaining Details area.
+    ToggleThumbnailExpansion,
     /// Scroll the focused or pointer-targeted Details panel.
     ScrollDetails(DetailsScroll),
     /// Set the Details panel to an exact renderer-clamped wrapped-line offset.
@@ -1028,6 +1131,8 @@ pub enum UiAction {
     ToggleYouTubePrewarm,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
     ToggleLocalFolderSizes,
+    /// Cycle the preferred Bandcamp playback encoding in the draft.
+    CycleBandcampAudioFormat,
     /// Persist the draft preference and close the editor.
     SubmitPreferences,
     /// Close the preferences editor without saving.
@@ -1046,6 +1151,18 @@ pub enum UiAction {
     RequestLocalTrash,
     /// Move the selected local entry to recoverable system Trash.
     ConfirmLocalTrash,
+    /// Open the destination chooser for marked entries or the current row.
+    BeginLocalMove,
+    /// Extend the Local move batch and selection by one signed row.
+    ExtendLocalMoveSelection(i32),
+    /// Select one exact row inside the Local Move destination browser.
+    SelectLocalMoveDestination(usize),
+    /// Move destination-browser selection by a signed row count.
+    MoveLocalMoveDestination(i32),
+    /// Open the selected parent or child directory in the Move popup.
+    ActivateLocalMoveDestination,
+    /// Move the validated source batch into the displayed destination.
+    ConfirmLocalMoveHere,
     /// Close the local-entry popup without changing the filesystem.
     DismissLocalFilePopup,
     /// Select an exact subscription source row.
@@ -1077,6 +1194,13 @@ trait ThumbnailRenderer {
         false
     }
     fn needs_immediate_redraw(&self) -> bool {
+        false
+    }
+    /// Reports whether the current frame can render actual artwork pixels.
+    ///
+    /// Loading and error placeholders deliberately return `false` so the TUI
+    /// never exposes an image-expansion hit target where no image is visible.
+    fn has_rendered_artwork(&self) -> bool {
         false
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
@@ -1134,6 +1258,12 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
 
     fn needs_immediate_redraw(&self) -> bool {
         self.followup_frame_pending
+    }
+
+    fn has_rendered_artwork(&self) -> bool {
+        self.manager.state() == &ThumbnailState::Ready
+            && !self.clear_before_ready
+            && self.manager.protocol().is_some()
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -1261,11 +1391,13 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                     &mut hit_map,
                     Some(renderer.as_mut()),
                 );
+                render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 virtual_cursor.render(frame);
             })?;
         } else {
             session.terminal.draw(|frame| {
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
+                render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 virtual_cursor.render(frame);
             })?;
         }
@@ -1656,6 +1788,8 @@ struct HitMap {
     subscription_item_first_index: usize,
     subscription_source_buttons: Vec<(UiAction, Rect)>,
     details_panel: Rect,
+    /// Cells occupied by actual, ready artwork in the Details panel.
+    thumbnail_area: Option<Rect>,
     /// Actual wrapped-line offset rendered in the Details description.
     details_scroll_offset: usize,
     /// Largest wrapped-line offset that can change the visible description.
@@ -1676,6 +1810,10 @@ struct HitMap {
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
     local_file_buttons: Vec<(UiAction, Rect)>,
+    /// Visible destination rows inside the Local Move popup.
+    local_move_rows: Rect,
+    /// First destination model row represented by [`Self::local_move_rows`].
+    local_move_first_index: usize,
 }
 
 /// Exact terminal cells belonging to one visible, selectable Details row.
@@ -1689,6 +1827,7 @@ struct SelectableDetailsRow {
 #[cfg(test)]
 fn render(frame: &mut Frame<'_>, view: &ViewModel, settings: &UiSettings, hit_map: &mut HitMap) {
     render_frame(frame, view, settings, hit_map, None);
+    render_local_rename_cursor(frame, view, true);
 }
 
 /// Chooses a bounded chapter-label height without taking space from the
@@ -2040,6 +2179,8 @@ fn render_frame(
         render_preferences_popup(frame, preferences, &theme, hit_map);
     }
     hit_map.local_file_buttons.clear();
+    hit_map.local_move_rows = Rect::default();
+    hit_map.local_move_first_index = 0;
     if let Some(popup) = view.local_file_popup.as_ref() {
         render_local_file_popup(frame, popup, &theme, hit_map);
     }
@@ -2115,25 +2256,45 @@ fn render_tabs(
     if area.is_empty() {
         return;
     }
-    const DIVIDER: &str = " │ ";
-    let full_width = Screen::ALL
+    const FULL_DIVIDER: &str = " │ ";
+    const COMPACT_DIVIDER: &str = "│";
+    let enabled = Screen::ALL
+        .into_iter()
+        .filter(|screen| screen.enabled())
+        .collect::<Vec<_>>();
+    let full_width = enabled
         .iter()
         .map(|screen| usize::from(terminal_text_width(screen.label())))
         .sum::<usize>()
         .saturating_add(
-            usize::from(terminal_text_width(DIVIDER))
-                .saturating_mul(Screen::ALL.len().saturating_sub(1)),
+            usize::from(terminal_text_width(FULL_DIVIDER))
+                .saturating_mul(enabled.len().saturating_sub(1)),
         );
     let compact = full_width > usize::from(area.width);
-    let mut spans = Vec::with_capacity(Screen::ALL.len().saturating_mul(2));
+    let divider = if compact {
+        COMPACT_DIVIDER
+    } else {
+        FULL_DIVIDER
+    };
+    let divider_width = terminal_text_width(divider);
+    let compact_width = enabled
+        .iter()
+        .map(|screen| usize::from(terminal_text_width(screen.compact_label())))
+        .sum::<usize>()
+        .saturating_add(usize::from(divider_width).saturating_mul(enabled.len().saturating_sub(1)));
+    let visible = if compact && compact_width > usize::from(area.width) {
+        active_tab_window(&enabled, view.screen, area.width, divider_width)
+    } else {
+        0..enabled.len()
+    };
+    let mut spans = Vec::with_capacity(visible.len().saturating_mul(2));
     let mut x = area.x;
-    for (index, screen) in Screen::ALL.into_iter().enumerate() {
+    for (index, screen) in enabled[visible].iter().copied().enumerate() {
         if index > 0 {
-            let divider_width = terminal_text_width(DIVIDER);
             if x >= area.right() {
                 break;
             }
-            spans.push(Span::styled(DIVIDER, theme.muted));
+            spans.push(Span::styled(divider, theme.muted));
             x = x.saturating_add(divider_width);
         }
         if x >= area.right() {
@@ -2162,6 +2323,56 @@ fn render_tabs(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Chooses a contiguous compact-tab window that always contains the active tab.
+fn active_tab_window(
+    screens: &[Screen],
+    active: Screen,
+    available_width: u16,
+    divider_width: u16,
+) -> std::ops::Range<usize> {
+    let Some(active_index) = screens.iter().position(|screen| *screen == active) else {
+        return 0..screens.len();
+    };
+    let widths = screens
+        .iter()
+        .map(|screen| terminal_text_width(screen.compact_label()))
+        .collect::<Vec<_>>();
+    let mut start = active_index;
+    let mut end = active_index.saturating_add(1);
+    let mut used = widths[active_index].min(available_width);
+
+    while start > 0 || end < screens.len() {
+        let left_cost = (start > 0).then(|| divider_width.saturating_add(widths[start - 1]));
+        let right_cost = (end < screens.len()).then(|| divider_width.saturating_add(widths[end]));
+        let prefer_left =
+            active_index.saturating_sub(start) <= end.saturating_sub(active_index + 1);
+        let added = if prefer_left {
+            if left_cost.is_some_and(|cost| used.saturating_add(cost) <= available_width) {
+                start -= 1;
+                left_cost
+            } else if right_cost.is_some_and(|cost| used.saturating_add(cost) <= available_width) {
+                end += 1;
+                right_cost
+            } else {
+                None
+            }
+        } else if right_cost.is_some_and(|cost| used.saturating_add(cost) <= available_width) {
+            end += 1;
+            right_cost
+        } else if left_cost.is_some_and(|cost| used.saturating_add(cost) <= available_width) {
+            start -= 1;
+            left_cost
+        } else {
+            None
+        };
+        let Some(added) = added else {
+            break;
+        };
+        used = used.saturating_add(added);
+    }
+    start..end
+}
+
 /// Builds the result-panel title, including a route-matched ASCII search frame.
 fn search_panel_title(view: &ViewModel) -> String {
     let search_title = if view.search_editing {
@@ -2176,6 +2387,8 @@ fn search_panel_title(view: &ViewModel) -> String {
                 }
             ),
             Screen::YouTubeMusic => " YouTube Music search ".to_owned(),
+            Screen::Bandcamp => " Bandcamp search ".to_owned(),
+            Screen::ApplePodcasts => " Apple Podcasts search ".to_owned(),
             Screen::TrackerMusic => " MOD/tracker archive search ".to_owned(),
             Screen::Local if !view.local_path.is_empty() => {
                 format!(" Local — {} ", view.local_path)
@@ -2231,6 +2444,7 @@ fn render_body(
     hit_map.detail_buttons.clear();
     hit_map.detail_text_rows.clear();
     hit_map.details_panel = Rect::default();
+    hit_map.thumbnail_area = None;
     hit_map.details_scroll_offset = 0;
     hit_map.details_scroll_maximum = 0;
     hit_map.rows = Rect::default();
@@ -2387,33 +2601,52 @@ fn render_row_list(
             } else {
                 theme.accent
             };
+            let marked_style = if selected || playing {
+                row_style
+            } else {
+                theme.accent
+            };
             let watched_marker = if has_playback_progress {
                 watched_marker(row.watched_percent)
             } else {
                 " "
             };
             let mut title_spans = if row.compact {
-                let mut spans = Vec::with_capacity(2);
+                let mut spans = Vec::with_capacity(3);
                 if playing {
                     spans.push(Span::styled("▶ ", row_style));
+                }
+                if row.local_marked {
+                    spans.push(Span::styled("✓ ", marked_style));
                 }
                 if has_playback_progress {
                     spans.push(Span::styled(format!("{watched_marker} "), watched_style));
                 }
                 spans
             } else if show_source {
-                vec![
+                let mut spans = vec![
                     Span::styled(format!("{} ", if playing { "▶" } else { " " }), row_style),
                     Span::styled(format!("{marker} "), source_style),
-                    Span::styled(format!("{watched_marker} "), watched_style),
-                ]
+                ];
+                if row.local_marked {
+                    spans.push(Span::styled("✓ ", marked_style));
+                }
+                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                spans
             } else if playing {
-                vec![
-                    Span::styled("▶ ", row_style),
-                    Span::styled(format!("{watched_marker} "), watched_style),
-                ]
+                let mut spans = vec![Span::styled("▶ ", row_style)];
+                if row.local_marked {
+                    spans.push(Span::styled("✓ ", marked_style));
+                }
+                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                spans
             } else {
-                vec![Span::styled(format!("{watched_marker} "), watched_style)]
+                let mut spans = Vec::with_capacity(2);
+                if row.local_marked {
+                    spans.push(Span::styled("✓ ", marked_style));
+                }
+                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                spans
             };
             title_spans.push(Span::styled(&row.title, title_style));
             title_spans.push(Span::styled(progress, secondary_style));
@@ -2779,7 +3012,8 @@ fn render_details(
         "Select an item to load details lazily.",
         match view.screen {
             Screen::Local => InformationPanelKind::Local,
-            Screen::History => InformationPanelKind::Generic,
+            Screen::ApplePodcasts => InformationPanelKind::Podcast,
+            Screen::Bandcamp | Screen::History => InformationPanelKind::Generic,
             _ => InformationPanelKind::Video,
         },
         true,
@@ -2793,6 +3027,8 @@ fn render_details(
 enum InformationPanelKind {
     /// Media details with duration, likes, and views.
     Video,
+    /// Podcast show or episode details without video-only statistics.
+    Podcast,
     /// Channel details with subscriber metadata.
     Channel,
     /// Local folder, media, or image metadata without remote statistics.
@@ -2888,8 +3124,21 @@ fn render_information_panel(
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::ToggleSubscription)
     });
-    let open_button = (show_text_selection && kind == InformationPanelKind::Video).then(|| {
-        let label = button("o", "xdg-open video", show_hotkeys);
+    let open_button = (show_text_selection
+        && matches!(
+            kind,
+            InformationPanelKind::Video | InformationPanelKind::Podcast
+        ))
+    .then(|| {
+        let label = button(
+            "o",
+            if kind == InformationPanelKind::Podcast {
+                "xdg-open podcast"
+            } else {
+                "xdg-open video"
+            },
+            show_hotkeys,
+        );
         let line_index = lines.len();
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenInBrowser)
@@ -2927,6 +3176,14 @@ fn render_information_panel(
                 Span::raw(&details.views),
             ]),
         ]),
+        InformationPanelKind::Podcast => {
+            if !details.length.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Length: ", theme.muted),
+                    Span::raw(&details.length),
+                ]));
+            }
+        }
         InformationPanelKind::Channel => {
             if let Some(count) = details.channel_subscriber_count {
                 lines.push(Line::from(vec![
@@ -3061,22 +3318,31 @@ fn render_information_panel(
                 .iter()
                 .find(|entity| entity.item_id == item_id)
         });
-    let visible_thumbnail_url = expanded_wikidata_entity
-        .and_then(|entity| entity.image_url.as_ref())
-        .or(details.thumbnail_url.as_ref());
+    let visible_thumbnail_url = details
+        .thumbnail_url
+        .as_ref()
+        .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
     let mut cursor_y = metadata_area.bottom();
     let mut remaining_height = inner.bottom().saturating_sub(cursor_y);
     if let Some(renderer) = thumbnail_renderer.as_mut() {
-        let text_reserve = u16::from(!details.description.is_empty())
-            + u16::from(!details.links.is_empty()).saturating_mul(2);
+        let text_reserve = if details.thumbnail_expanded {
+            0
+        } else {
+            u16::from(!details.description.is_empty())
+                + u16::from(!details.links.is_empty()).saturating_mul(2)
+        };
         let preferred_thumbnail_height = if details.source == "Local image" {
             thumbnail_height.saturating_mul(2)
         } else {
             thumbnail_height
         };
-        let rendered_thumbnail_height = remaining_height
-            .saturating_sub(text_reserve)
-            .min(preferred_thumbnail_height);
+        let rendered_thumbnail_height = if details.thumbnail_expanded {
+            remaining_height
+        } else {
+            remaining_height
+                .saturating_sub(text_reserve)
+                .min(preferred_thumbnail_height)
+        };
         if renderer.is_enabled()
             && visible_thumbnail_url.is_some()
             && rendered_thumbnail_height >= MIN_THUMBNAIL_HEIGHT
@@ -3084,7 +3350,11 @@ fn render_information_panel(
             let thumbnail_area =
                 Rect::new(inner.x, cursor_y, inner.width, rendered_thumbnail_height);
             renderer.synchronize(visible_thumbnail_url, thumbnail_area);
+            let artwork_rendered = renderer.has_rendered_artwork();
             renderer.render(frame, thumbnail_area, theme);
+            if artwork_rendered {
+                hit_map.thumbnail_area = Some(thumbnail_area);
+            }
             cursor_y = cursor_y.saturating_add(rendered_thumbnail_height);
             remaining_height = inner.bottom().saturating_sub(cursor_y);
         } else {
@@ -3197,6 +3467,9 @@ fn render_information_panel(
     let wikidata_value_links = expanded_wikidata_entity
         .map(|entity| entity.value_links.as_slice())
         .unwrap_or_default();
+    let wikidata_media_controls = expanded_wikidata_entity
+        .map(|entity| entity.media_controls.as_slice())
+        .unwrap_or_default();
     if remaining_height > 0 && !body_source.is_empty() {
         let description_area = Rect::new(inner.x, cursor_y, inner.width, remaining_height);
         let (description_text_area, scrollbar_area) = if description_area.width > 1 {
@@ -3254,10 +3527,14 @@ fn render_information_panel(
                             append_wikidata_source_spans(
                                 body_source,
                                 wikidata_value_links,
+                                wikidata_media_controls,
                                 start_byte,
                                 end_byte,
                                 description_text_area,
                                 row,
+                                view.playing_media_id.as_ref(),
+                                &view.playback,
+                                view.selected_wikidata_media,
                                 theme,
                                 hit_map,
                                 &mut spans,
@@ -3350,50 +3627,114 @@ fn render_information_panel(
 fn append_wikidata_source_spans<'a>(
     source: &'a str,
     value_links: &[DetailWikidataValueLinkView],
+    media_controls: &[DetailWikidataMediaView],
     start_byte: usize,
     end_byte: usize,
     description_area: Rect,
     row: u16,
+    playing_media_id: Option<&MediaId>,
+    playback: &PlaybackStatus,
+    selected_media: Option<usize>,
     theme: &Theme,
     hit_map: &mut HitMap,
     spans: &mut Vec<Span<'a>>,
     cell_cursor: &mut u16,
 ) {
     let mut source_cursor = start_byte;
-    for link in value_links
+    let mut links = value_links
         .iter()
         .filter(|link| link.start_byte < end_byte && link.end_byte > start_byte)
-    {
-        let start = link.start_byte.max(start_byte);
-        let end = link.end_byte.min(end_byte);
-        if source_cursor < start {
-            let plain = &source[source_cursor..start];
-            *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
-            spans.push(Span::raw(plain));
-        }
-        let linked = &source[start..end];
-        let linked_width = terminal_text_width(linked);
-        spans.push(Span::styled(
-            linked,
-            theme
-                .accent
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        ));
-        let available = description_area.width.saturating_sub(*cell_cursor);
-        let target_width = linked_width.min(available);
-        if target_width > 0 {
-            hit_map.detail_buttons.push((
-                UiAction::OpenWikidataValue(link.url.clone()),
-                Rect::new(
-                    description_area.x.saturating_add(*cell_cursor),
-                    row,
-                    target_width,
-                    1,
-                ),
+        .peekable();
+    let mut controls = media_controls
+        .iter()
+        .enumerate()
+        .filter(|(_, control)| {
+            control.marker_start_byte < end_byte && control.marker_end_byte > start_byte
+        })
+        .peekable();
+    loop {
+        let control_first = match (controls.peek(), links.peek()) {
+            (Some((_, control)), Some(link)) => control.marker_start_byte <= link.start_byte,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if control_first {
+            let (index, control) = controls.next().expect("peeked control must remain");
+            let start = control.marker_start_byte.max(start_byte);
+            let end = control.marker_end_byte.min(end_byte);
+            if source_cursor < start {
+                let plain = &source[source_cursor..start];
+                *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
+                spans.push(Span::raw(plain));
+            }
+            let actively_playing =
+                playing_media_id == Some(&control.media_id) && !playback.idle && !playback.paused;
+            let marker = if actively_playing {
+                WIKIDATA_MEDIA_PAUSE_SYMBOL
+            } else {
+                WIKIDATA_MEDIA_PLAY_SYMBOL
+            };
+            let marker_width = terminal_text_width(marker);
+            let selected = selected_media == Some(index);
+            spans.push(Span::styled(
+                marker,
+                if selected {
+                    theme
+                        .accent
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    theme.accent.add_modifier(Modifier::BOLD)
+                },
             ));
+            let available = description_area.width.saturating_sub(*cell_cursor);
+            let target_width = marker_width.min(available);
+            if target_width > 0 {
+                hit_map.detail_buttons.push((
+                    UiAction::ActivateWikidataMedia(index),
+                    Rect::new(
+                        description_area.x.saturating_add(*cell_cursor),
+                        row,
+                        target_width,
+                        1,
+                    ),
+                ));
+            }
+            *cell_cursor = cell_cursor.saturating_add(marker_width);
+            source_cursor = end;
+        } else {
+            let link = links.next().expect("peeked link must remain");
+            let start = link.start_byte.max(start_byte);
+            let end = link.end_byte.min(end_byte);
+            if source_cursor < start {
+                let plain = &source[source_cursor..start];
+                *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
+                spans.push(Span::raw(plain));
+            }
+            let linked = &source[start..end];
+            let linked_width = terminal_text_width(linked);
+            spans.push(Span::styled(
+                linked,
+                theme
+                    .accent
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+            let available = description_area.width.saturating_sub(*cell_cursor);
+            let target_width = linked_width.min(available);
+            if target_width > 0 {
+                hit_map.detail_buttons.push((
+                    UiAction::OpenWikidataValue(link.url.clone()),
+                    Rect::new(
+                        description_area.x.saturating_add(*cell_cursor),
+                        row,
+                        target_width,
+                        1,
+                    ),
+                ));
+            }
+            *cell_cursor = cell_cursor.saturating_add(linked_width);
+            source_cursor = end;
         }
-        *cell_cursor = cell_cursor.saturating_add(linked_width);
-        source_cursor = end;
     }
     if source_cursor < end_byte {
         let plain = &source[source_cursor..end_byte];
@@ -3772,9 +4113,9 @@ fn render_seek_bar(
     let state = if view.playback.buffering {
         "buffering"
     } else if view.playback.paused {
-        "paused"
+        PLAYBACK_RESUME_SYMBOL
     } else {
-        "playing"
+        PLAYBACK_PAUSE_SYMBOL
     };
     let marker = match settings.seek_bar_style {
         SeekBarStyle::Line => "",
@@ -4271,6 +4612,12 @@ fn render_buttons(
             UiAction::ToggleLocalSizeSort,
         ));
     }
+    if screen == Screen::Local {
+        primary_buttons.push((
+            button("x", "Move", settings.show_hotkeys),
+            UiAction::BeginLocalMove,
+        ));
+    }
     primary_buttons.push((
         button(
             "Tab",
@@ -4551,7 +4898,8 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  F4 playlists     F5 stats     M/F6 MOD/tracker music     p preferences",
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
-        "  Local: Z size order     r rename     Delete move to Trash",
+        "  ↪ internal video: click the marker after a YouTube URL",
+        "  Local: Z size order     r rename     x move     Shift+J/K extend move selection     Delete move to Trash",
         "  Subscriptions channel: R refresh videos     i description",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: GPM mouse input is detected automatically.",
@@ -4568,7 +4916,6 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  y copy link     c channel info     s local subscribe/unsubscribe",
         "  m private note     e equalizer     t Details-only text selection",
         "  Alt+j/k select external link     Alt+Enter open selected link",
-        "  ↪ internal video: click after a YouTube URL to open it in Details",
         "",
         "Mouse",
         "  Click Details; wheel/PageUp/PageDown scroll.",
@@ -5088,7 +5435,7 @@ fn render_preferences_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(76, 64, frame.area());
+    let area = centered_rect(76, 76, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -5103,6 +5450,7 @@ fn render_preferences_popup(
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -5235,8 +5583,38 @@ fn render_preferences_popup(
         ),
     ));
 
+    let bandcamp_format_label = if cfg!(feature = "bandcamp") {
+        format!(
+            "[b] Bandcamp audio: {}",
+            preferences.bandcamp_audio_format.label()
+        )
+    } else {
+        "Bandcamp audio: unavailable in this build".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(bandcamp_format_label.clone())
+            .style(if cfg!(feature = "bandcamp") {
+                theme.selected
+            } else {
+                theme.muted
+            })
+            .alignment(Alignment::Center),
+        sections[5],
+    );
+    if cfg!(feature = "bandcamp") {
+        hit_map.preferences_buttons.push((
+            UiAction::CycleBandcampAudioFormat,
+            Rect::new(
+                centered_line_x(sections[5], terminal_text_width(&bandcamp_format_label)),
+                sections[5].y,
+                terminal_text_width(&bandcamp_format_label).min(sections[5].width),
+                1,
+            ),
+        ));
+    }
+
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -5259,7 +5637,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[5],
+        sections[6],
     );
 
     let buttons = [
@@ -5275,15 +5653,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[6],
+        sections[7],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[6], total_width);
+    let mut x = centered_line_x(sections[7], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[6].y, width, 1)));
+            .push((action, Rect::new(x, sections[7].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -5294,27 +5672,42 @@ fn render_local_file_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
+    if let LocalFilePopupView::Move {
+        source_names,
+        destination,
+        directories,
+        selected,
+        pending,
+        error,
+    } = popup
+    {
+        render_local_move_popup(
+            frame,
+            source_names,
+            destination,
+            directories,
+            *selected,
+            *pending,
+            error.as_deref(),
+            theme,
+            hit_map,
+        );
+        return;
+    }
     let (message, error, confirm_label, confirm_action) = match popup {
-        LocalFilePopupView::Rename {
-            value,
-            cursor_byte,
-            error,
-        } => {
-            let cursor_byte = rename_cursor_boundary(value, *cursor_byte);
-            let (before, after) = value.split_at(cursor_byte);
-            (
-                format!("New basename:\n{before}▏{after}"),
-                error.as_deref(),
-                "[Enter] Rename",
-                UiAction::SubmitLocalRename,
-            )
-        }
+        LocalFilePopupView::Rename { error, .. } => (
+            "New basename:".to_owned(),
+            error.as_deref(),
+            "[Enter] Rename",
+            UiAction::SubmitLocalRename,
+        ),
         LocalFilePopupView::Trash { name, path, error } => (
             format!("Move “{name}” to recoverable system Trash?\nFrom: {path}"),
             error.as_deref(),
             "[Enter] Move to Trash",
             UiAction::ConfirmLocalTrash,
         ),
+        LocalFilePopupView::Move { .. } => unreachable!("handled above"),
     };
     let (title, area, message) = match popup {
         LocalFilePopupView::Rename { .. } => (
@@ -5336,6 +5729,7 @@ fn render_local_file_popup(
                 wrapped_message.join("\n"),
             )
         }
+        LocalFilePopupView::Move { .. } => unreachable!("handled above"),
     };
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(title, theme), area);
@@ -5358,6 +5752,13 @@ fn render_local_file_popup(
             .wrap(Wrap { trim: false }),
         sections[0],
     );
+    if let LocalFilePopupView::Rename {
+        value, cursor_byte, ..
+    } = popup
+        && let Some(field_area) = rename_field_area(area)
+    {
+        render_local_rename_field(frame, field_area, value, *cursor_byte, theme);
+    }
     if let Some(error) = error {
         frame.render_widget(
             Paragraph::new(error).style(Style::default().fg(Color::Red)),
@@ -5388,6 +5789,240 @@ fn render_local_file_popup(
             terminal_text_width(cancel_label),
             1,
         ),
+    ));
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Move popup keeps controller-owned destination state explicit"
+)]
+fn render_local_move_popup(
+    frame: &mut Frame<'_>,
+    source_names: &[String],
+    destination: &str,
+    directories: &[LocalMoveDestinationView],
+    selected: usize,
+    pending: bool,
+    error: Option<&str>,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.saturating_sub(4).clamp(1, 112);
+    let height = frame.area().height.saturating_sub(4).clamp(1, 34);
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Move ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+
+    let source_summary = if source_names.is_empty() {
+        "Nothing selected".to_owned()
+    } else {
+        format!(
+            "Moving {} entr{}: {}",
+            source_names.len(),
+            if source_names.len() == 1 { "y" } else { "ies" },
+            source_names.join(", ")
+        )
+    };
+    let source_rows = u16::try_from(wrap_text_lines(&source_summary, inner.width).len())
+        .unwrap_or(u16::MAX)
+        .clamp(1, 3);
+    let sections = Layout::vertical([
+        Constraint::Length(source_rows),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(u16::from(error.is_some())),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(source_summary)
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("Destination:\n{destination}"))
+            .style(theme.muted)
+            .wrap(Wrap { trim: false }),
+        sections[1],
+    );
+
+    let selected = selected.min(directories.len().saturating_sub(1));
+    let visible_rows = usize::from(sections[2].height).max(usize::from(!sections[2].is_empty()));
+    let first_index = selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(directories.len().saturating_sub(visible_rows));
+    let rows = directories
+        .iter()
+        .enumerate()
+        .skip(first_index)
+        .take(visible_rows)
+        .map(|(index, directory)| {
+            let style = if index == selected {
+                theme.selected.fg(Color::Black)
+            } else {
+                theme.base
+            };
+            ListItem::new(format!("  {}/", directory.name)).style(style)
+        })
+        .collect::<Vec<_>>();
+    if pending && directories.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Reading destination folders…").style(theme.muted),
+            sections[2],
+        );
+    } else if directories.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No child folders; move into the displayed destination or go back.")
+                .style(theme.muted)
+                .wrap(Wrap { trim: false }),
+            sections[2],
+        );
+    } else {
+        frame.render_widget(List::new(rows), sections[2]);
+        hit_map.local_move_rows = sections[2];
+        hit_map.local_move_first_index = first_index;
+    }
+
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red)),
+            sections[3],
+        );
+    }
+    let controls = "[Enter] Open folder   [M] Move here   [Esc] Cancel";
+    frame.render_widget(
+        Paragraph::new(controls)
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[4],
+    );
+    let start = centered_line_x(sections[4], terminal_text_width(controls));
+    let open_label = "[Enter] Open folder";
+    let move_label = "[M] Move here";
+    let cancel_label = "[Esc] Cancel";
+    let open_width = terminal_text_width(open_label);
+    let move_width = terminal_text_width(move_label);
+    hit_map.local_file_buttons.push((
+        UiAction::ActivateLocalMoveDestination,
+        Rect::new(start, sections[4].y, open_width, 1),
+    ));
+    hit_map.local_file_buttons.push((
+        UiAction::ConfirmLocalMoveHere,
+        Rect::new(
+            start.saturating_add(open_width).saturating_add(3),
+            sections[4].y,
+            move_width,
+            1,
+        ),
+    ));
+    hit_map.local_file_buttons.push((
+        UiAction::DismissLocalFilePopup,
+        Rect::new(
+            start
+                .saturating_add(open_width)
+                .saturating_add(move_width)
+                .saturating_add(6),
+            sections[4].y,
+            terminal_text_width(cancel_label),
+            1,
+        ),
+    ));
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RenameFieldViewport {
+    /// First byte rendered in the horizontally scrolled field.
+    start_byte: usize,
+    /// Display-cell width hidden to the left of the field.
+    scroll_width: u16,
+    /// Visible display-cell column of the insertion point.
+    cursor_column: u16,
+}
+
+/// Returns the one-line basename field inside a rename popup.
+fn rename_field_area(popup_area: Rect) -> Option<Rect> {
+    let inner = popup_area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    (inner.width > 0 && inner.height >= 2)
+        .then(|| Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1))
+}
+
+/// Chooses a grapheme-aligned horizontal viewport that keeps the cursor visible.
+fn rename_field_viewport(value: &str, cursor_byte: usize, field_width: u16) -> RenameFieldViewport {
+    if field_width == 0 {
+        return RenameFieldViewport::default();
+    }
+    let cursor_byte = rename_cursor_boundary(value, cursor_byte);
+    let cursor_width = terminal_text_width(&value[..cursor_byte]);
+    let desired_scroll = cursor_width.saturating_sub(field_width.saturating_sub(1));
+    let mut viewport = RenameFieldViewport {
+        cursor_column: cursor_width,
+        ..RenameFieldViewport::default()
+    };
+    if desired_scroll == 0 {
+        return viewport;
+    }
+    for (start_byte, grapheme) in value[..cursor_byte].grapheme_indices(true) {
+        viewport.start_byte = start_byte.saturating_add(grapheme.len());
+        viewport.scroll_width = viewport
+            .scroll_width
+            .saturating_add(terminal_text_width(grapheme));
+        if viewport.scroll_width >= desired_scroll {
+            break;
+        }
+    }
+    viewport.cursor_column = cursor_width.saturating_sub(viewport.scroll_width);
+    viewport
+}
+
+/// Renders the basename unchanged in a one-line, cursor-following viewport.
+fn render_local_rename_field(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    value: &str,
+    cursor_byte: usize,
+    theme: &Theme,
+) {
+    let viewport = rename_field_viewport(value, cursor_byte, area.width);
+    frame.render_widget(
+        Paragraph::new(&value[viewport.start_byte..]).style(theme.base),
+        area,
+    );
+}
+
+/// Places the native terminal cursor over the visible rename insertion point.
+///
+/// A higher-priority error popup or the keyboard-controlled virtual pointer
+/// suppresses this layer. Omitting it from the next frame makes Ratatui hide
+/// the terminal cursor automatically.
+fn render_local_rename_cursor(frame: &mut Frame<'_>, view: &ViewModel, enabled: bool) {
+    if !enabled || view.error_popup.is_some() {
+        return;
+    }
+    let Some(LocalFilePopupView::Rename {
+        value, cursor_byte, ..
+    }) = view.local_file_popup.as_ref()
+    else {
+        return;
+    };
+    let popup_area = centered_rect(66, 28, frame.area());
+    let Some(field_area) = rename_field_area(popup_area) else {
+        return;
+    };
+    let viewport = rename_field_viewport(value, *cursor_byte, field_area.width);
+    frame.set_cursor_position((
+        field_area.x.saturating_add(viewport.cursor_column),
+        field_area.y,
     ));
 }
 
@@ -5670,6 +6305,18 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
                 Some(UiAction::AppendLocalRenameCharacter(character))
             }
             (LocalFilePopupView::Trash { .. }, KeyCode::Enter) => Some(UiAction::ConfirmLocalTrash),
+            (LocalFilePopupView::Move { .. }, KeyCode::Enter) => {
+                Some(UiAction::ActivateLocalMoveDestination)
+            }
+            (LocalFilePopupView::Move { .. }, KeyCode::Char('m' | 'M')) => {
+                Some(UiAction::ConfirmLocalMoveHere)
+            }
+            (LocalFilePopupView::Move { .. }, KeyCode::Up | KeyCode::Char('k')) => {
+                Some(UiAction::MoveLocalMoveDestination(-1))
+            }
+            (LocalFilePopupView::Move { .. }, KeyCode::Down | KeyCode::Char('j')) => {
+                Some(UiAction::MoveLocalMoveDestination(1))
+            }
             _ => None,
         };
     }
@@ -5697,6 +6344,9 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
             KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
+            KeyCode::Char('b') if cfg!(feature = "bandcamp") => {
+                Some(UiAction::CycleBandcampAudioFormat)
+            }
             KeyCode::Char('d') => Some(UiAction::SetSubscriptionsLayout(
                 SubscriptionsLayout::DrillDown,
             )),
@@ -5780,6 +6430,17 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         .details
         .as_ref()
         .map_or(0, |details| details.links.len());
+    let wikidata_media_count = view
+        .details
+        .as_ref()
+        .and_then(|details| {
+            let item_id = details.expanded_wikidata_item.as_deref()?;
+            details
+                .wikidata_entities
+                .iter()
+                .find(|entity| entity.item_id == item_id)
+        })
+        .map_or(0, |entity| entity.media_controls.len());
     match key.code {
         KeyCode::Char('q') => Some(UiAction::Quit),
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
@@ -5805,6 +6466,27 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         }
         KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
+        KeyCode::Char('x') if view.screen == Screen::Local => Some(UiAction::BeginLocalMove),
+        KeyCode::Char('J')
+            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Some(UiAction::ExtendLocalMoveSelection(1))
+        }
+        KeyCode::Char('K')
+            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Some(UiAction::ExtendLocalMoveSelection(-1))
+        }
+        KeyCode::Char('j')
+            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Some(UiAction::ExtendLocalMoveSelection(1))
+        }
+        KeyCode::Char('k')
+            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Some(UiAction::ExtendLocalMoveSelection(-1))
+        }
         KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
         KeyCode::Char('i')
             if view.screen == Screen::Subscriptions
@@ -5849,6 +6531,12 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         {
             Some(UiAction::ToggleTextSelectionMode)
         }
+        KeyCode::Char('j') if alt && view.details_focused && wikidata_media_count > 0 => {
+            Some(UiAction::MoveWikidataMedia(1))
+        }
+        KeyCode::Char('k') if alt && view.details_focused && wikidata_media_count > 0 => {
+            Some(UiAction::MoveWikidataMedia(-1))
+        }
         KeyCode::Char('j') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(1)),
         KeyCode::Char('k') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(-1)),
         KeyCode::Home if alt && detail_link_count > 0 => Some(UiAction::SelectDetailLink(0)),
@@ -5879,6 +6567,13 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
                 .unwrap_or_default()
                 .min(detail_link_count - 1);
             Some(UiAction::ActivateDetailLink(selected))
+        }
+        KeyCode::Enter if view.details_focused && wikidata_media_count > 0 => {
+            Some(UiAction::ActivateWikidataMedia(
+                view.selected_wikidata_media
+                    .unwrap_or_default()
+                    .min(wikidata_media_count - 1),
+            ))
         }
         KeyCode::Enter => Some(UiAction::ActivateSelection),
         KeyCode::Char(' ') => Some(UiAction::TogglePause),
@@ -5938,11 +6633,40 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
     }
     if view.local_file_popup.is_some() {
         return match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => hit_map
-                .local_file_buttons
-                .iter()
-                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
-                .map(|(action, _)| action.clone()),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if matches!(
+                    view.local_file_popup.as_ref(),
+                    Some(LocalFilePopupView::Move { .. })
+                ) && contains(hit_map.local_move_rows, mouse.column, mouse.row)
+                {
+                    let index = hit_map.local_move_first_index.saturating_add(usize::from(
+                        mouse.row.saturating_sub(hit_map.local_move_rows.y),
+                    ));
+                    Some(UiAction::SelectLocalMoveDestination(index))
+                } else {
+                    hit_map
+                        .local_file_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            MouseEventKind::ScrollDown
+                if matches!(
+                    view.local_file_popup.as_ref(),
+                    Some(LocalFilePopupView::Move { .. })
+                ) =>
+            {
+                Some(UiAction::MoveLocalMoveDestination(1))
+            }
+            MouseEventKind::ScrollUp
+                if matches!(
+                    view.local_file_popup.as_ref(),
+                    Some(LocalFilePopupView::Move { .. })
+                ) =>
+            {
+                Some(UiAction::MoveLocalMoveDestination(-1))
+            }
             _ => None,
         };
     }
@@ -6060,6 +6784,12 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
                 if contains(*area, mouse.column, mouse.row) {
                     return Some(action.clone());
                 }
+            }
+            if hit_map
+                .thumbnail_area
+                .is_some_and(|area| contains(area, mouse.column, mouse.row))
+            {
+                return Some(UiAction::ToggleThumbnailExpansion);
             }
             for (action, area) in &hit_map.subscription_source_buttons {
                 if contains(*area, mouse.column, mouse.row) {
@@ -6402,6 +7132,7 @@ mod tests {
         clear_count: usize,
         pending: bool,
         immediate_redraw: bool,
+        rendered_artwork: bool,
         poll_results: VecDeque<bool>,
         poll_count: usize,
     }
@@ -6426,6 +7157,10 @@ mod tests {
 
         fn needs_immediate_redraw(&self) -> bool {
             self.immediate_redraw
+        }
+
+        fn has_rendered_artwork(&self) -> bool {
+            self.rendered_artwork
         }
 
         fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -6756,6 +7491,12 @@ mod tests {
         assert_eq!(search_panel_title(&view), " | MOD/tracker — ambient ");
         view.search_activity = None;
         assert_eq!(search_panel_title(&view), " MOD/tracker — ambient ");
+        view.screen = Screen::Bandcamp;
+        view.search_activity = Some(SearchActivity::Bandcamp);
+        assert_eq!(search_panel_title(&view), " | Bandcamp — ambient ");
+        view.screen = Screen::ApplePodcasts;
+        view.search_activity = Some(SearchActivity::ApplePodcasts);
+        assert_eq!(search_panel_title(&view), " | Apple Podcasts — ambient ");
     }
 
     #[test]
@@ -7414,24 +8155,127 @@ mod tests {
     }
 
     #[test]
-    fn rename_popup_renders_the_caret_at_its_utf8_cursor() {
+    fn rename_popup_keeps_ascii_filename_contiguous_at_each_cursor_offset() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let view = ViewModel {
+        let mut view = ViewModel {
             local_file_popup: Some(LocalFilePopupView::Rename {
-                value: "трек.flac".to_owned(),
-                cursor_byte: "трек".len(),
+                value: "5.jpg".to_owned(),
+                cursor_byte: 0,
                 error: None,
             }),
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
+        let popup_area = centered_rect(66, 28, Rect::new(0, 0, 100, 30));
+        let field_area = rename_field_area(popup_area).expect("rename field");
 
+        for cursor_byte in 0..="5.jpg".len() {
+            let Some(LocalFilePopupView::Rename {
+                cursor_byte: current,
+                ..
+            }) = view.local_file_popup.as_mut()
+            else {
+                panic!("rename popup");
+            };
+            *current = cursor_byte;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw rename popup");
+
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("5.jpg"));
+            assert!(!rendered.contains('▏'));
+            assert!(terminal.backend().cursor_visible());
+            let cursor = terminal.backend().cursor_position();
+            assert_eq!(cursor.x, field_area.x.saturating_add(cursor_byte as u16));
+            assert_eq!(cursor.y, field_area.y);
+        }
+    }
+
+    #[test]
+    fn rename_popup_cursor_uses_wide_grapheme_display_cells_and_scrolls_whole_graphemes() {
+        let value = "界👩‍💻.jpg";
+        let after_wide_graphemes = "界👩‍💻".len();
+        let viewport = rename_field_viewport(value, value.len(), 5);
+        assert_eq!(&value[viewport.start_byte..], ".jpg");
+        assert_eq!(viewport.scroll_width, 4);
+        assert_eq!(viewport.cursor_column, 4);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            local_file_popup: Some(LocalFilePopupView::Rename {
+                value: value.to_owned(),
+                cursor_byte: after_wide_graphemes,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw rename popup");
 
-        assert!(rendered_text(&terminal).contains("трек▏.flac"));
+        let popup_area = centered_rect(66, 28, Rect::new(0, 0, 100, 30));
+        let field_area = rename_field_area(popup_area).expect("rename field");
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(cursor.x, field_area.x.saturating_add(4));
+        assert_eq!(cursor.y, field_area.y);
+    }
+
+    #[test]
+    fn rename_cursor_hides_on_the_next_non_rename_frame() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            local_file_popup: Some(LocalFilePopupView::Rename {
+                value: "5.jpg".to_owned(),
+                cursor_byte: 1,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw rename popup");
+        assert!(terminal.backend().cursor_visible());
+
+        view.local_file_popup = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw non-rename frame");
+        assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn virtual_pointer_suppresses_the_native_rename_cursor() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            local_file_popup: Some(LocalFilePopupView::Rename {
+                value: "5.jpg".to_owned(),
+                cursor_byte: 1,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut virtual_cursor = VirtualCursor {
+            active: true,
+            ..VirtualCursor::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None);
+                render_local_rename_cursor(frame, &view, !virtual_cursor.active);
+                virtual_cursor.render(frame);
+            })
+            .expect("draw rename popup with virtual pointer");
+
+        assert!(!terminal.backend().cursor_visible());
     }
 
     #[test]
@@ -7564,9 +8408,13 @@ mod tests {
         assert_eq!(Screen::Subscriptions.next(), Screen::Local);
         assert_eq!(Screen::Local.previous(), Screen::Subscriptions);
 
-        for (index, screen) in Screen::ALL.into_iter().enumerate() {
-            let next = Screen::ALL[(index + 1) % Screen::ALL.len()];
-            let previous = Screen::ALL[(index + Screen::ALL.len() - 1) % Screen::ALL.len()];
+        let enabled = Screen::ALL
+            .into_iter()
+            .filter(|screen| screen.enabled())
+            .collect::<Vec<_>>();
+        for (index, screen) in enabled.iter().copied().enumerate() {
+            let next = enabled[(index + 1) % enabled.len()];
+            let previous = enabled[(index + enabled.len() - 1) % enabled.len()];
             let mut view = ViewModel {
                 screen,
                 ..ViewModel::default()
@@ -8231,6 +9079,7 @@ mod tests {
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
                 show_local_folder_sizes: true,
+                bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
                 validation_error: None,
@@ -8247,6 +9096,8 @@ mod tests {
         assert!(rendered.contains("[s] Split"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[f] Show Local folder sizes: on"));
+        #[cfg(feature = "bandcamp")]
+        assert!(rendered.contains("[b] Bandcamp audio: Best available"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
@@ -8263,6 +9114,11 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleLocalFolderSizes)
+        );
+        #[cfg(feature = "bandcamp")]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &view),
+            Some(UiAction::CycleBandcampAudioFormat)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &view),
@@ -8325,6 +9181,27 @@ mod tests {
             ),
             Some(UiAction::ToggleLocalFolderSizes)
         );
+        #[cfg(feature = "bandcamp")]
+        {
+            let (_, bandcamp_format_target) = hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(action, _)| action == &UiAction::CycleBandcampAudioFormat)
+                .expect("Bandcamp format target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: bandcamp_format_target.x,
+                        row: bandcamp_format_target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::CycleBandcampAudioFormat)
+            );
+        }
     }
 
     #[test]
@@ -8336,6 +9213,7 @@ mod tests {
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
                 show_local_folder_sizes: true,
+                bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
                 validation_error: Some("save failed".to_owned()),
@@ -9122,6 +10000,66 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_podcast_details_use_podcast_controls_without_video_statistics() {
+        let backend = TestBackend::new(100, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            screen: Screen::ApplePodcasts,
+            rows: vec![RowView {
+                title: "Fixture episode".to_owned(),
+                subtitle: "2026 July 27 · 42:05".to_owned(),
+                source: "Apple Podcasts".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                title: "Fixture episode".to_owned(),
+                source: "Apple Podcasts".to_owned(),
+                description: "Episode notes".to_owned(),
+                length: "42:05".to_owned(),
+                likes: "must not render".to_owned(),
+                views: "must not render".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Apple episode details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("[o] xdg-open podcast"));
+        assert!(rendered.contains("Length: 42:05"));
+        assert!(!rendered.contains("xdg-open video"));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenInBrowser)
+        );
+
+        view.rows[0].title = "Fixture show".to_owned();
+        view.details = Some(DetailView {
+            title: "Fixture show".to_owned(),
+            source: "Apple Podcasts".to_owned(),
+            description: "Show notes".to_owned(),
+            ..DetailView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Apple show details");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[o] xdg-open podcast"));
+        assert!(!rendered.contains("Length:"));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+    }
+
     #[test]
     fn details_render_confined_text_selection_control_and_highlight() {
         let backend = TestBackend::new(120, 32);
@@ -9505,24 +10443,51 @@ mod tests {
     }
 
     #[test]
-    fn expanded_wikidata_p18_replaces_the_source_thumbnail() {
+    fn expanded_wikidata_keeps_source_artwork_and_links_every_p18_value() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let source_thumbnail =
             url::Url::parse("https://images.example/source.jpg").expect("source thumbnail URL");
-        let p18 = url::Url::parse(
+        let first_p18_preview = url::Url::parse(
             "https://commons.wikimedia.org/wiki/Special:Redirect/file/Douglas%20Adams.jpg",
         )
-        .expect("P18 fixture URL");
-        let view = ViewModel {
+        .expect("first P18 preview URL");
+        let second_p18_preview = url::Url::parse(
+            "https://commons.wikimedia.org/wiki/Special:Redirect/file/Douglas%20Adams%202008.jpg",
+        )
+        .expect("second P18 preview URL");
+        let first_p18_page =
+            "https://commons.wikimedia.org/wiki/File:Douglas%20Adams.jpg".to_owned();
+        let second_p18_page =
+            "https://commons.wikimedia.org/wiki/File:Douglas%20Adams%202008.jpg".to_owned();
+        let wikidata_text = "image (P18): Douglas Adams.jpg; Douglas Adams 2008.jpg".to_owned();
+        let first_start = wikidata_text
+            .find("Douglas Adams.jpg")
+            .expect("first P18 display");
+        let second_start = wikidata_text
+            .find("Douglas Adams 2008.jpg")
+            .expect("second P18 display");
+        let mut view = ViewModel {
             details: Some(DetailView {
-                thumbnail_url: Some(source_thumbnail),
+                thumbnail_url: Some(source_thumbnail.clone()),
                 expanded_wikidata_item: Some("Q42".to_owned()),
                 wikidata_entities: vec![DetailWikidataEntityView {
                     item_id: "Q42".to_owned(),
-                    text: "image (P18): Douglas Adams.jpg".to_owned(),
-                    value_links: Vec::new(),
-                    image_url: Some(p18.clone()),
+                    text: wikidata_text,
+                    value_links: vec![
+                        DetailWikidataValueLinkView {
+                            start_byte: first_start,
+                            end_byte: first_start + "Douglas Adams.jpg".len(),
+                            url: first_p18_page.clone(),
+                        },
+                        DetailWikidataValueLinkView {
+                            start_byte: second_start,
+                            end_byte: second_start + "Douglas Adams 2008.jpg".len(),
+                            url: second_p18_page.clone(),
+                        },
+                    ],
+                    media_controls: Vec::new(),
+                    image_url: Some(first_p18_preview.clone()),
                 }],
                 ..DetailView::default()
             }),
@@ -9544,10 +10509,222 @@ mod tests {
                     Some(&mut thumbnails),
                 );
             })
-            .expect("draw expanded P18 image");
+            .expect("draw expanded Wikidata with source artwork");
 
         assert_eq!(thumbnails.synchronized.len(), 1);
-        assert_eq!(thumbnails.synchronized[0].0.as_ref(), Some(&p18));
+        assert_eq!(
+            thumbnails.synchronized[0].0.as_ref(),
+            Some(&source_thumbnail),
+            "P18 must not replace primary provider artwork"
+        );
+        for page_url in [&first_p18_page, &second_p18_page] {
+            assert!(
+                hit_map.detail_buttons.iter().any(|(action, _)| {
+                    action == &UiAction::OpenWikidataValue(page_url.clone())
+                }),
+                "each P18 value must remain clickable"
+            );
+        }
+
+        view.details
+            .as_mut()
+            .expect("fixture details")
+            .thumbnail_url = None;
+        let mut fallback_thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut fallback_thumbnails),
+                );
+            })
+            .expect("draw bounded P18 fallback");
+        assert_eq!(fallback_thumbnails.synchronized.len(), 1);
+        assert_eq!(
+            fallback_thumbnails.synchronized[0].0.as_ref(),
+            Some(&first_p18_preview),
+            "without primary artwork only the first ordered P18 preview is rendered"
+        );
+        assert!(
+            fallback_thumbnails
+                .synchronized
+                .iter()
+                .all(|(url, _)| url.as_ref() != Some(&second_p18_preview))
+        );
+    }
+
+    #[test]
+    fn wikidata_media_controls_are_distinct_clickable_and_follow_playback_state() {
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let text = "image (P18): Portrait.jpg\n\
+                    audio (P51): ▶ Spoken fixture.opus\n\
+                    video (P10): ▶ Video fixture.webm"
+            .to_owned();
+        let marker_offsets = text
+            .match_indices(WIKIDATA_MEDIA_PLAY_SYMBOL)
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        assert_eq!(marker_offsets.len(), 2);
+        let audio_page =
+            url::Url::parse("https://commons.wikimedia.org/wiki/File:Spoken%20fixture.opus")
+                .expect("audio page URL");
+        let video_page =
+            url::Url::parse("https://commons.wikimedia.org/wiki/File:Video%20fixture.webm")
+                .expect("video page URL");
+        let audio_id = MediaId::new(SourceKind::WikimediaCommons, audio_page.to_string());
+        let media_control =
+            |marker_start_byte, media_id, kind, title: &str, webpage_url| DetailWikidataMediaView {
+                marker_start_byte,
+                marker_end_byte: marker_start_byte + WIKIDATA_MEDIA_PLAY_SYMBOL.len(),
+                media_id,
+                kind,
+                title: title.to_owned(),
+                webpage_url,
+                playback_url: url::Url::parse(&format!(
+                    "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}",
+                    title.replace(' ', "%20")
+                ))
+                .expect("playback URL"),
+            };
+        let audio = media_control(
+            marker_offsets[0],
+            audio_id.clone(),
+            MediaKind::Audio,
+            "Spoken fixture.opus",
+            audio_page.clone(),
+        );
+        let video = media_control(
+            marker_offsets[1],
+            MediaId::new(SourceKind::WikimediaCommons, video_page.to_string()),
+            MediaKind::Video,
+            "Video fixture.webm",
+            video_page.clone(),
+        );
+        let links = [
+            (
+                "Portrait.jpg",
+                "https://commons.wikimedia.org/wiki/File:Portrait.jpg",
+            ),
+            ("Spoken fixture.opus", audio_page.as_str()),
+            ("Video fixture.webm", video_page.as_str()),
+        ]
+        .into_iter()
+        .map(|(display, url)| {
+            let start_byte = text.find(display).expect("linked value");
+            DetailWikidataValueLinkView {
+                start_byte,
+                end_byte: start_byte + display.len(),
+                url: url.to_owned(),
+            }
+        })
+        .collect();
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/provider.jpg")
+                        .expect("provider artwork URL"),
+                ),
+                expanded_wikidata_item: Some("Q42".to_owned()),
+                wikidata_entities: vec![DetailWikidataEntityView {
+                    item_id: "Q42".to_owned(),
+                    text,
+                    value_links: links,
+                    media_controls: vec![audio, video],
+                    image_url: Some(
+                        url::Url::parse(
+                            "https://commons.wikimedia.org/wiki/Special:Redirect/file/Portrait.jpg?width=512",
+                        )
+                        .expect("P18 preview URL"),
+                    ),
+                }],
+                ..DetailView::default()
+            }),
+            details_focused: true,
+            selected_wikidata_media: Some(0),
+            playing_media_id: Some(audio_id),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw active Wikidata media");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("⏸ Spoken fixture.opus"));
+        assert!(rendered.contains("▶ Video fixture.webm"));
+
+        let control_areas = [0, 1].map(|index| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(action, area)| {
+                    (action == &UiAction::ActivateWikidataMedia(index)).then_some(*area)
+                })
+                .expect("media control hit target")
+        });
+        assert_ne!(control_areas[0], control_areas[1]);
+        for (index, area) in control_areas.into_iter().enumerate() {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ActivateWikidataMedia(index))
+            );
+        }
+        for page in [audio_page.as_str(), video_page.as_str()] {
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| { action == &UiAction::OpenWikidataValue(page.to_owned()) }),
+                "the filename must retain its Commons page action"
+            );
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ActivateWikidataMedia(0))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), &view),
+            Some(UiAction::MoveWikidataMedia(1))
+        );
+        view.selected_wikidata_media = Some(1);
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ActivateWikidataMedia(1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), &view),
+            Some(UiAction::MoveWikidataMedia(-1))
+        );
+
+        view.playback.paused = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw paused Wikidata media");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains(WIKIDATA_MEDIA_PAUSE_SYMBOL));
+        assert!(rendered.contains("▶ Spoken fixture.opus"));
+        assert!(rendered.contains("▶ Video fixture.webm"));
     }
 
     #[test]
@@ -9661,6 +10838,204 @@ mod tests {
         assert_eq!(thumbnails.synchronized.len(), 1);
         assert_eq!(thumbnails.synchronized[0].1.height, 7);
         assert!(rendered_text(&terminal).contains("Description remains below"));
+    }
+
+    #[test]
+    fn ready_artwork_click_toggles_expansion_even_during_details_text_selection() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            text_selection_mode: true,
+            details: Some(DetailView {
+                title: "Clickable artwork fixture".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "Selectable text below the image.".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/clickable.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw ready artwork");
+
+        let thumbnail_area = hit_map.thumbnail_area.expect("ready artwork hitbox");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: thumbnail_area.x,
+            row: thumbnail_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(click, &hit_map, &view),
+            Some(UiAction::ToggleThumbnailExpansion),
+            "the image action must take precedence over Details focus without disabling text selection"
+        );
+    }
+
+    #[test]
+    fn expanded_artwork_uses_all_remaining_right_panel_rows_in_wide_and_narrow_layouts() {
+        for (width, height) in [(120, 40), (70, 50)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut view = ViewModel {
+                rows: vec![RowView {
+                    title: "Left-panel fixture".to_owned(),
+                    ..RowView::default()
+                }],
+                details: Some(DetailView {
+                    title: "Expanded artwork fixture".to_owned(),
+                    source: "Local image".to_owned(),
+                    description: "Hidden while artwork is expanded.".to_owned(),
+                    thumbnail_url: Some(
+                        url::Url::parse("file:///tmp/youta-expanded-artwork.jpg")
+                            .expect("fixture thumbnail URL"),
+                    ),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            let mut normal = MockThumbnailRenderer {
+                enabled: true,
+                rendered_artwork: true,
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_frame(
+                        frame,
+                        &view,
+                        &UiSettings::default(),
+                        &mut hit_map,
+                        Some(&mut normal),
+                    );
+                })
+                .expect("draw configured artwork");
+            let normal_area = normal.synchronized[0].1;
+
+            view.details
+                .as_mut()
+                .expect("fixture details")
+                .thumbnail_expanded = true;
+            let mut expanded = MockThumbnailRenderer {
+                enabled: true,
+                rendered_artwork: true,
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_frame(
+                        frame,
+                        &view,
+                        &UiSettings::default(),
+                        &mut hit_map,
+                        Some(&mut expanded),
+                    );
+                })
+                .expect("draw expanded artwork");
+            let expanded_area = expanded.synchronized[0].1;
+
+            assert!(expanded_area.height > normal_area.height);
+            assert_eq!(expanded_area.x, hit_map.details_panel.x);
+            assert_eq!(expanded_area.width, hit_map.details_panel.width);
+            assert_eq!(expanded_area.bottom(), hit_map.details_panel.bottom());
+            assert_eq!(hit_map.thumbnail_area, Some(expanded_area));
+            if width < 80 {
+                assert!(
+                    hit_map.rows.bottom() <= hit_map.details_panel.y,
+                    "narrow layout must retain the list above the expanded right/details panel"
+                );
+            } else {
+                assert_eq!(
+                    hit_map.rows.right(),
+                    hit_map.details_panel.x,
+                    "wide layout must retain the left panel beside expanded artwork"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_loading_and_failed_artwork_never_create_an_expansion_hitbox() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "No artwork fixture".to_owned(),
+                description: "Details remain focusable.".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw absent artwork");
+        assert!(hit_map.thumbnail_area.is_none());
+        assert!(thumbnails.synchronized.is_empty());
+
+        view.details
+            .as_mut()
+            .expect("fixture details")
+            .thumbnail_url = Some(
+            url::Url::parse("https://images.example/loading.jpg")
+                .expect("loading fixture thumbnail URL"),
+        );
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw loading or failed placeholder");
+        assert!(hit_map.thumbnail_area.is_none());
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: thumbnails.synchronized[0].1.x,
+            row: thumbnails.synchronized[0].1.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(click, &hit_map, &view),
+            Some(UiAction::SetDetailsFocus(true)),
+            "a placeholder must retain ordinary Details focus behavior"
+        );
     }
 
     #[test]
@@ -10860,9 +12235,62 @@ prose 07:25 remains clickable but is not a chapter";
         let status_row = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
-        let expected = "18:28 / 1:33:06  1×  vol 80% paused";
+        let expected = "18:28 / 1:33:06  1×  vol 80% ▶";
         assert!(!track_row.contains(expected));
         assert!(status_row.contains(expected));
+    }
+
+    #[test]
+    fn seek_status_uses_play_and_pause_action_symbols() {
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                paused: true,
+                position: Duration::from_secs(10),
+                duration: Some(Duration::from_secs(100)),
+                volume: 80,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw paused seek status");
+        let paused = rendered_text(&terminal);
+        assert!(paused.contains("vol 80% ▶"));
+        assert!(!paused.contains("paused"));
+        assert!(!paused.contains("playing"));
+
+        view.playback.paused = false;
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw playing seek status");
+        let playing = rendered_text(&terminal);
+        assert!(playing.contains("vol 80% ⏸"));
+        assert!(!playing.contains("paused"));
+        assert!(!playing.contains("playing"));
     }
 
     #[test]
@@ -11634,6 +13062,7 @@ prose 07:25 remains clickable but is not a chapter";
                 end_byte: start_byte + "human (Q5)".len(),
                 url: "https://www.wikidata.org/wiki/Q5".to_owned(),
             }],
+            media_controls: Vec::new(),
             image_url: None,
         });
         terminal
@@ -11667,13 +13096,14 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn wrapped_unicode_wikidata_value_keeps_every_fragment_clickable() {
+    fn wrapped_unicode_wikipedia_article_keeps_every_fragment_clickable() {
         let backend = TestBackend::new(56, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let value = "Україна з довгою тестовою назвою (Q212)";
-        let text = format!("country of citizenship (P27): {value}");
+        let value = "be-tarask.wikipedia.org — Дуглас Адамз з доўгай назвай";
+        let text = format!("Wikipedia articles:\n  {value}");
         let start_byte = text.find(value).expect("linked Unicode value");
-        let view = ViewModel {
+        let article_url = "https://be-tarask.wikipedia.org/wiki/%D0%94%D1%83%D0%B3%D0%BB%D0%B0%D1%81_%D0%90%D0%B4%D0%B0%D0%BC%D0%B7";
+        let mut view = ViewModel {
             details: Some(DetailView {
                 links: vec![DetailLinkView {
                     label: "Fixture creator (Q61113)".to_owned(),
@@ -11687,8 +13117,9 @@ prose 07:25 remains clickable but is not a chapter";
                     value_links: vec![DetailWikidataValueLinkView {
                         start_byte,
                         end_byte: start_byte + value.len(),
-                        url: "https://www.wikidata.org/wiki/Q212".to_owned(),
+                        url: article_url.to_owned(),
                     }],
+                    media_controls: Vec::new(),
                     image_url: None,
                 }],
                 ..DetailView::default()
@@ -11705,11 +13136,7 @@ prose 07:25 remains clickable but is not a chapter";
             .detail_buttons
             .iter()
             .filter_map(|(action, area)| {
-                (action
-                    == &UiAction::OpenWikidataValue(
-                        "https://www.wikidata.org/wiki/Q212".to_owned(),
-                    ))
-                    .then_some(*area)
+                (action == &UiAction::OpenWikidataValue(article_url.to_owned())).then_some(*area)
             })
             .collect::<Vec<_>>();
         assert!(
@@ -11720,7 +13147,7 @@ prose 07:25 remains clickable but is not a chapter";
             value_areas.windows(2).any(|areas| areas[0].y != areas[1].y),
             "wrapped fragments must occupy distinct terminal rows"
         );
-        for area in value_areas {
+        for area in &value_areas {
             assert_eq!(
                 mouse_action(
                     MouseEvent {
@@ -11732,11 +13159,34 @@ prose 07:25 remains clickable but is not a chapter";
                     &hit_map,
                     &view,
                 ),
-                Some(UiAction::OpenWikidataValue(
-                    "https://www.wikidata.org/wiki/Q212".to_owned()
-                ))
+                Some(UiAction::OpenWikidataValue(article_url.to_owned()))
             );
         }
+
+        view.text_selection_mode = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Wikipedia article in Details text-selection mode");
+        let article_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::OpenWikidataValue(article_url.to_owned())).then_some(*area)
+            })
+            .expect("visible Wikipedia article target");
+        assert!(matches!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: article_area.x,
+                    row: article_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::BeginDetailsTextSelection(_))
+        ));
     }
 
     #[test]
@@ -11805,6 +13255,146 @@ prose 07:25 remains clickable but is not a chapter";
                 .local_file_buttons
                 .iter()
                 .any(|(action, _)| action == &UiAction::ConfirmLocalTrash)
+        );
+    }
+
+    #[test]
+    fn local_move_shortcuts_are_scoped_to_the_local_screen() {
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                UiAction::BeginLocalMove,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+                UiAction::ExtendLocalMoveSelection(1),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+                UiAction::ExtendLocalMoveSelection(-1),
+            ),
+        ] {
+            assert_eq!(key_action(key, &local), Some(expected));
+        }
+
+        let search = ViewModel::default();
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+                &search,
+            ),
+            Some(UiAction::ExtendLocalMoveSelection(1))
+        );
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+                &search,
+            ),
+            Some(UiAction::ExtendLocalMoveSelection(-1))
+        );
+    }
+
+    #[test]
+    fn local_move_popup_renders_and_exposes_keyboard_and_mouse_controls() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Local,
+            local_file_popup: Some(LocalFilePopupView::Move {
+                source_names: vec!["first.flac".to_owned(), "Album".to_owned()],
+                destination: "/home/listener/Music".to_owned(),
+                directories: vec![
+                    LocalMoveDestinationView {
+                        name: "..".to_owned(),
+                        path: "/home/listener".to_owned(),
+                    },
+                    LocalMoveDestinationView {
+                        name: "Archive".to_owned(),
+                        path: "/home/listener/Music/Archive".to_owned(),
+                    },
+                ],
+                selected: 1,
+                pending: false,
+                error: Some("destination already contains first.flac".to_owned()),
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Move destination popup");
+        let rendered = rendered_text(&terminal);
+        for expected in [
+            "Move",
+            "Moving 2 entries: first.flac, Album",
+            "Destination:",
+            "/home/listener/Music",
+            "Archive",
+            "destination already contains first.flac",
+            "[Enter] Open folder",
+            "[M] Move here",
+            "[Esc] Cancel",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "Move popup omitted {expected:?}:\n{rendered}"
+            );
+        }
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ActivateLocalMoveDestination)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+                &view,
+            ),
+            Some(UiAction::ConfirmLocalMoveHere)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveLocalMoveDestination(1))
+        );
+
+        let selected_row = Rect::new(
+            hit_map.local_move_rows.x,
+            hit_map.local_move_rows.y.saturating_add(1),
+            1,
+            1,
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: selected_row.x,
+                    row: selected_row.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SelectLocalMoveDestination(
+                hit_map.local_move_first_index.saturating_add(1)
+            ))
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: selected_row.x,
+                    row: selected_row.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::MoveLocalMoveDestination(-1))
         );
     }
 
@@ -12044,6 +13634,10 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Search,
                 #[cfg(feature = "youtube-music")]
                 Screen::YouTubeMusic,
+                #[cfg(feature = "bandcamp")]
+                Screen::Bandcamp,
+                #[cfg(feature = "apple-podcasts")]
+                Screen::ApplePodcasts,
                 Screen::TrackerMusic,
                 Screen::Subscriptions,
                 Screen::Local,
@@ -12099,7 +13693,13 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw compact tabs");
         #[cfg(feature = "youtube-music")]
         assert!(rendered_text(&terminal).contains("YT Music"));
-        assert_eq!(compact_hit_map.tabs.len(), Screen::ALL.len());
+        assert_eq!(
+            compact_hit_map.tabs.len(),
+            Screen::ALL
+                .into_iter()
+                .filter(|screen| screen.enabled())
+                .count()
+        );
         for (screen, area) in &compact_hit_map.tabs {
             for column in [area.x, area.right().saturating_sub(1)] {
                 let click = MouseEvent {
@@ -12124,6 +13724,54 @@ prose 07:25 remains clickable but is not a chapter";
                 };
                 assert_eq!(mouse_action(divider_click, &compact_hit_map, &view), None);
             }
+        }
+    }
+
+    #[test]
+    fn narrow_tab_strip_keeps_the_active_tab_visible_and_clickable() {
+        let active_screens = [
+            #[cfg(feature = "apple-podcasts")]
+            Screen::ApplePodcasts,
+            Screen::Statistics,
+        ];
+        for active in active_screens {
+            let backend = TestBackend::new(40, 1);
+            let mut terminal = Terminal::new(backend).expect("narrow terminal");
+            let view = ViewModel {
+                screen: active,
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| {
+                    render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("draw narrow tabs");
+
+            let (_, active_area) = hit_map
+                .tabs
+                .iter()
+                .find(|(screen, _)| *screen == active)
+                .expect("active tab hit target");
+            assert!(active_area.right() <= 40);
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: active_area.x,
+                        row: active_area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ShowScreen(active))
+            );
+            assert!(
+                rendered_text(&terminal).contains(active.compact_label()),
+                "the active compact label must stay on-screen"
+            );
         }
     }
 

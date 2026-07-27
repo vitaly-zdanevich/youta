@@ -17,7 +17,6 @@ use super::{
 use crate::domain::WikidataLink;
 
 const ENDPOINT: &str = "https://query.wikidata.org/sparql";
-const ENTITY_DATA_BASE: &str = "https://www.wikidata.org/wiki/Special:EntityData/";
 const ENTITY_API_ENDPOINT: &str = "https://www.wikidata.org/w/api.php";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RESULTS: usize = 20;
@@ -27,9 +26,13 @@ const MAX_FORMATTER_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_STATEMENT_PROPERTIES: usize = 256;
 const MAX_VALUES_PER_PROPERTY: usize = 128;
 const MAX_STATEMENT_VALUES: usize = 1_024;
+const MAX_WIKIPEDIA_SITELINKS: usize = 512;
 const MAX_LABEL_IDS: usize = 50;
 const MAX_LABEL_ENTITY_IDS: usize = MAX_STATEMENT_PROPERTIES + MAX_STATEMENT_VALUES;
+/// Maximum qualifier snaks inspected for one P8687 follower observation.
+const MAX_FOLLOWER_QUALIFIER_SNAKS: usize = 16;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
+const COMMONS_CATEGORY_PAGE_BASE: &str = "https://commons.wikimedia.org/wiki/Category:";
 const COMMONS_FILE_PAGE_BASE: &str = "https://commons.wikimedia.org/wiki/File:";
 const COMMONS_FILE_PREVIEW_BASE: &str = "https://commons.wikimedia.org/wiki/Special:Redirect/file/";
 const COMMONS_PREVIEW_WIDTH: &str = "512";
@@ -78,15 +81,26 @@ pub struct WikidataExternalLookup {
 /// Human-facing statements loaded for one exact Wikidata item.
 ///
 /// Claims are grouped by property while preserving the order of values within
-/// each property. Qualifiers, references, statement IDs, ranks, numeric entity
-/// IDs, hashes, and other Wikibase implementation metadata are deliberately
-/// omitted.
+/// each property. P8687 service/date qualifiers and deprecated rank are
+/// consumed to produce readable follower-history rows. Raw qualifier values,
+/// references, statement IDs, numeric entity IDs, hashes, and other Wikibase
+/// implementation metadata are deliberately omitted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WikidataEntityStatements {
     /// Validated Wikidata item identifier.
     pub item_id: String,
     /// Bounded property groups in stable property-ID order.
     pub statements: Vec<WikidataStatement>,
+    /// Canonical Wikipedia articles supplied by Wikidata for this item.
+    ///
+    /// Only validated HTTPS `*.wikipedia.org/wiki/…` targets are retained.
+    /// The collection has an independent bound so a broadly translated item
+    /// cannot consume the statement-value budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wikipedia_sitelinks: Vec<WikidataWikipediaSitelink>,
+    /// Whether otherwise valid Wikipedia sitelinks exceeded their own bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wikipedia_sitelinks_omitted: bool,
     /// Whether a property, value, label, or overlong display value was omitted.
     ///
     /// An oversized HTTP response remains an error because it cannot be safely
@@ -98,6 +112,19 @@ pub struct WikidataEntityStatements {
     /// Whether an empty or unsupported structured value was omitted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsupported_values_omitted: bool,
+}
+
+/// One canonical Wikipedia article linked from an exact Wikidata item.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WikidataWikipediaSitelink {
+    /// Stable Wikibase site identifier, such as `enwiki`.
+    pub site_id: String,
+    /// Readable canonical Wikipedia hostname.
+    pub project_label: String,
+    /// Human-facing article title supplied by Wikidata.
+    pub title: String,
+    /// Validated canonical HTTPS article URL supplied by Wikidata.
+    pub url: Url,
 }
 
 /// One Wikidata property and all bounded, human-facing main values.
@@ -136,12 +163,51 @@ pub struct WikidataStatementValue {
     pub preview_url: Option<Url>,
 }
 
+impl WikidataStatementValue {
+    /// Derives a stable, credential-free Commons playback target when this is
+    /// a supported P51 audio or P10 video value.
+    ///
+    /// The URL is derived on demand instead of serialized, so caches never
+    /// retain a resolved CDN location. The human-facing Commons file page in
+    /// [`Self::external_url`] remains the navigation target.
+    #[must_use]
+    pub fn commons_playback(&self, property_id: &str) -> Option<WikidataPlayableMedia> {
+        let expected_page = commons_file_page_url(&self.display)?;
+        if self.external_url.as_ref() != Some(&expected_page) {
+            return None;
+        }
+        let kind = commons_playable_media_kind(property_id, &self.display)?;
+        Some(WikidataPlayableMedia {
+            kind,
+            playback_url: commons_file_redirect_url(&self.display)?,
+        })
+    }
+}
+
+/// Playable Commons media class derived from a Wikidata property.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WikidataPlayableMediaKind {
+    /// Audio represented by Wikidata property P51.
+    Audio,
+    /// Video represented by Wikidata property P10; Youta still plays audio only.
+    Video,
+}
+
+/// Stable direct Commons input derived for one supported statement value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WikidataPlayableMedia {
+    /// Whether the Wikidata property represents audio or video.
+    pub kind: WikidataPlayableMediaKind,
+    /// Canonical Commons redirect without credentials or transient query data.
+    pub playback_url: Url,
+}
+
 /// Bounded client for the public Wikidata Query Service.
 #[derive(Clone)]
 pub struct WikidataProvider {
     agent: ureq::Agent,
     max_response_bytes: usize,
-    entity_data_base: Url,
     entity_api_endpoint: Url,
     formatter_query_endpoint: Url,
     max_entity_response_bytes: usize,
@@ -162,8 +228,6 @@ impl WikidataProvider {
         Self {
             agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
             max_response_bytes: MAX_RESPONSE_BYTES,
-            entity_data_base: Url::parse(ENTITY_DATA_BASE)
-                .expect("the compile-time Wikidata EntityData base URL is valid"),
             entity_api_endpoint: Url::parse(ENTITY_API_ENDPOINT)
                 .expect("the compile-time Wikidata entity API URL is valid"),
             formatter_query_endpoint: Url::parse(ENDPOINT)
@@ -195,8 +259,8 @@ impl WikidataProvider {
 
     /// Lazily loads bounded, human-facing statements for one Wikidata item.
     ///
-    /// The first request uses Wikidata's HTTPS `Special:EntityData` JSON
-    /// representation. Additional bounded `wbgetentities` requests resolve
+    /// The first bounded `wbgetentities` request retrieves claims plus
+    /// canonical Wikipedia sitelink URLs. Additional bounded requests resolve
     /// labels in anonymous-API-sized batches and retrieve P1630 formatter URLs
     /// for external-ID properties. Direct item-valued claims are requested
     /// before supporting entities and property labels. Unresolved IDs remain
@@ -211,8 +275,12 @@ impl WikidataProvider {
         item_id: &str,
     ) -> Result<WikidataEntityStatements, ProviderError> {
         validate_item_id(item_id)?;
-        let entity_url = build_entity_data_url(&self.entity_data_base, item_id)?;
-        let response: EntityDataResponse =
+        let entity_url = build_entity_api_url(
+            &self.entity_api_endpoint,
+            &[item_id.to_owned()],
+            "claims|sitelinks/urls",
+        )?;
+        let response: EntityStatementsResponse =
             get_bounded_json(&self.agent, &entity_url, self.max_entity_response_bytes)?;
         let mut pending = normalize_entity_claims(item_id, response)?;
 
@@ -249,7 +317,6 @@ impl WikidataProvider {
 
     #[cfg(test)]
     fn with_statement_endpoints(
-        entity_data_base: Url,
         entity_api_endpoint: Url,
         max_entity_response_bytes: usize,
         max_label_response_bytes: usize,
@@ -260,7 +327,6 @@ impl WikidataProvider {
         Self {
             agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
             max_response_bytes: MAX_RESPONSE_BYTES,
-            entity_data_base,
             entity_api_endpoint,
             formatter_query_endpoint,
             max_entity_response_bytes,
@@ -434,12 +500,6 @@ LIMIT {MAX_RESULTS}"#,
     Ok(url)
 }
 
-fn build_entity_data_url(base: &Url, item_id: &str) -> Result<Url, ProviderError> {
-    validate_item_id(item_id)?;
-    base.join(&format!("{item_id}.json"))
-        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
-}
-
 fn build_label_url(endpoint: &Url, entity_ids: &[String]) -> Result<Url, ProviderError> {
     build_entity_api_url(endpoint, entity_ids, "labels")
 }
@@ -552,6 +612,8 @@ fn valid_prefixed_decimal_id(value: &str, prefix: char) -> bool {
 struct PendingEntityStatements {
     item_id: String,
     statements: Vec<PendingStatement>,
+    wikipedia_sitelinks: Vec<WikidataWikipediaSitelink>,
+    wikipedia_sitelinks_omitted: bool,
     omissions: OmissionState,
 }
 
@@ -582,6 +644,7 @@ struct PendingStatement {
 enum PendingStatementValue {
     Plain(String),
     ExternalId(String),
+    CommonsCategory(String),
     CommonsMedia(String),
     Entity(String),
     Quantity {
@@ -600,6 +663,26 @@ enum PendingStatementValue {
         altitude: Option<String>,
         globe_id: Option<String>,
     },
+    /// One P8687 observation stripped of account identifiers and raw metadata.
+    SocialFollowers {
+        amount: Option<String>,
+        service_property_ids: Vec<String>,
+        dates: Vec<PendingFollowerDate>,
+        rank: RawStatementRank,
+    },
+}
+
+/// One bounded P585 qualifier used to explain a follower observation.
+#[derive(Debug)]
+enum PendingFollowerDate {
+    /// A precise enough date with its calendar retained for label resolution.
+    Known {
+        display: String,
+        sort_key: String,
+        calendar_id: Option<String>,
+    },
+    /// A `somevalue` or `novalue` P585 qualifier.
+    Unknown,
 }
 
 impl PendingStatementValue {
@@ -610,10 +693,12 @@ impl PendingStatementValue {
             Self::Entity(entity_id) => Some(entity_id),
             Self::Plain(_)
             | Self::ExternalId(_)
+            | Self::CommonsCategory(_)
             | Self::CommonsMedia(_)
             | Self::Quantity { .. }
             | Self::Time { .. }
-            | Self::Coordinate { .. } => None,
+            | Self::Coordinate { .. }
+            | Self::SocialFollowers { .. } => None,
         }
     }
 
@@ -623,7 +708,12 @@ impl PendingStatementValue {
             Self::Quantity { unit_id, .. } => unit_id.as_deref(),
             Self::Time { calendar_id, .. } => calendar_id.as_deref(),
             Self::Coordinate { globe_id, .. } => globe_id.as_deref(),
-            Self::Plain(_) | Self::ExternalId(_) | Self::CommonsMedia(_) | Self::Entity(_) => None,
+            Self::Plain(_)
+            | Self::ExternalId(_)
+            | Self::CommonsCategory(_)
+            | Self::CommonsMedia(_)
+            | Self::Entity(_)
+            | Self::SocialFollowers { .. } => None,
         }
     }
 
@@ -646,6 +736,12 @@ impl PendingStatementValue {
                 external_url: formatter_urls
                     .get(property_id)
                     .and_then(|formatter| formatted_external_url(formatter, display)),
+                preview_url: None,
+            },
+            Self::CommonsCategory(display) => WikidataStatementValue {
+                display: display.clone(),
+                item_id: None,
+                external_url: commons_category_page_url(display),
                 preview_url: None,
             },
             Self::CommonsMedia(display) => WikidataStatementValue {
@@ -729,24 +825,50 @@ impl PendingStatementValue {
                     preview_url: None,
                 }
             }
+            Self::SocialFollowers {
+                amount,
+                service_property_ids,
+                dates,
+                rank,
+            } => {
+                let service = follower_service_display(service_property_ids, labels);
+                let date = follower_date_display(dates, labels);
+                let count = amount.as_deref().map_or_else(
+                    || "follower count unknown".to_owned(),
+                    |amount| format!("{} followers", grouped_quantity(amount)),
+                );
+                let rank = if *rank == RawStatementRank::Deprecated {
+                    " · deprecated"
+                } else {
+                    ""
+                };
+                WikidataStatementValue {
+                    display: format!("{service} · {date} · {count}{rank}"),
+                    item_id: None,
+                    external_url: None,
+                    preview_url: None,
+                }
+            }
         }
     }
 }
 
 fn normalize_entity_claims(
     item_id: &str,
-    mut response: EntityDataResponse,
+    mut response: EntityStatementsResponse,
 ) -> Result<PendingEntityStatements, ProviderError> {
     if response.entities.len() != 1 {
         return Err(ProviderError::InvalidResponse(
-            "Wikidata EntityData response must contain exactly one entity".to_owned(),
+            "Wikidata entity response must contain exactly one entity".to_owned(),
         ));
     }
     let entity = response.entities.remove(item_id).ok_or_else(|| {
         ProviderError::InvalidResponse(
-            "Wikidata EntityData response does not match the requested item".to_owned(),
+            "Wikidata entity response does not match the requested item".to_owned(),
         )
     })?;
+    let (wikipedia_sitelinks, wikipedia_sitelinks_omitted) =
+        normalize_wikipedia_sitelinks(entity.sitelinks);
     let property_count = entity.claims.len();
     let mut statements = Vec::with_capacity(property_count.min(MAX_STATEMENT_PROPERTIES));
     let mut total_values = 0usize;
@@ -772,7 +894,11 @@ fn normalize_entity_claims(
                     "Wikidata claim property does not match its containing group".to_owned(),
                 ));
             }
-            let (value, value_omissions) = normalize_snak(claim.mainsnak)?;
+            let (value, value_omissions) = if property_id == "P8687" {
+                normalize_social_followers(claim)?
+            } else {
+                normalize_snak(claim.mainsnak)?
+            };
             omissions.merge(value_omissions);
             if let Some(value) = value {
                 values.push(value);
@@ -794,8 +920,434 @@ fn normalize_entity_claims(
     Ok(PendingEntityStatements {
         item_id: item_id.to_owned(),
         statements,
+        wikipedia_sitelinks,
+        wikipedia_sitelinks_omitted,
         omissions,
     })
+}
+
+/// Retains canonical Wikipedia sitelinks without consuming statement limits.
+fn normalize_wikipedia_sitelinks(
+    sitelinks: BTreeMap<String, RawSitelink>,
+) -> (Vec<WikidataWikipediaSitelink>, bool) {
+    let mut normalized = Vec::new();
+    let mut omitted = false;
+
+    for (map_site_id, sitelink) in sitelinks {
+        let candidate_is_wikipedia = sitelink
+            .url
+            .as_deref()
+            .and_then(|raw| Url::parse(raw).ok())
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| wikipedia_project_host(&host));
+        let Some(value) = normalize_wikipedia_sitelink(&map_site_id, sitelink) else {
+            omitted |= candidate_is_wikipedia;
+            continue;
+        };
+        normalized.push(value);
+    }
+
+    normalized.sort_by(|left, right| {
+        (left.site_id != "enwiki")
+            .cmp(&(right.site_id != "enwiki"))
+            .then_with(|| left.project_label.cmp(&right.project_label))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.url.as_str().cmp(right.url.as_str()))
+    });
+    let mut seen_urls = BTreeSet::new();
+    normalized.retain(|value| seen_urls.insert(value.url.as_str().to_owned()));
+    if normalized.len() > MAX_WIKIPEDIA_SITELINKS {
+        normalized.truncate(MAX_WIKIPEDIA_SITELINKS);
+        omitted = true;
+    }
+    (normalized, omitted)
+}
+
+/// Validates one API-supplied Wikipedia sitelink as a display and click target.
+fn normalize_wikipedia_sitelink(
+    map_site_id: &str,
+    sitelink: RawSitelink,
+) -> Option<WikidataWikipediaSitelink> {
+    if map_site_id != sitelink.site
+        || map_site_id.is_empty()
+        || map_site_id.len() > 128
+        || !map_site_id.ends_with("wiki")
+        || !map_site_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    let raw_url = sitelink.url?;
+    if raw_url.len() > MAX_VALUE_BYTES {
+        return None;
+    }
+    let url = Url::parse(&raw_url).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    if !wikipedia_project_host(host) {
+        return None;
+    }
+    let raw_authority = raw_url
+        .strip_prefix("https://")?
+        .split_once('/')
+        .map(|(authority, _)| authority)?;
+    if raw_authority != host {
+        return None;
+    }
+    let article_path = url.path().strip_prefix("/wiki/")?;
+    if article_path.is_empty() {
+        return None;
+    }
+    let (title, title_omissions) = bounded_display(&sitelink.title).ok()?;
+    if title_omissions.hard_bounds_reached || title_omissions.unsupported_values_omitted {
+        return None;
+    }
+    Some(WikidataWikipediaSitelink {
+        site_id: map_site_id.to_owned(),
+        project_label: host.to_owned(),
+        title: title?,
+        url,
+    })
+}
+
+/// Accepts exactly one canonical Wikipedia project subdomain.
+fn wikipedia_project_host(host: &str) -> bool {
+    let Some(project) = host.strip_suffix(".wikipedia.org") else {
+        return false;
+    };
+    !project.is_empty()
+        && !project.contains('.')
+        && project
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Normalizes one P8687 observation without retaining account identifiers.
+fn normalize_social_followers(
+    claim: RawClaim,
+) -> Result<(Option<PendingStatementValue>, OmissionState), ProviderError> {
+    let amount = match claim.mainsnak.snak_type.as_str() {
+        "novalue" | "somevalue" => None,
+        "value" => {
+            let data_value = claim.mainsnak.data_value.ok_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "Wikidata follower claim is missing its data value".to_owned(),
+                )
+            })?;
+            if data_value.value_type != "quantity" {
+                return Err(ProviderError::InvalidResponse(
+                    "Wikidata follower claim must contain a quantity".to_owned(),
+                ));
+            }
+            let raw: RawQuantity = serde_json::from_value(data_value.value)
+                .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+            if raw.unit != "1" {
+                return Err(ProviderError::InvalidResponse(
+                    "Wikidata follower count must be dimensionless".to_owned(),
+                ));
+            }
+            Some(required_bounded_text(&raw.amount, "follower count")?)
+        }
+        _ => {
+            return Err(ProviderError::InvalidResponse(
+                "Wikidata follower claim contains an unknown snak type".to_owned(),
+            ));
+        }
+    };
+    let (amount, mut omissions) = amount.map_or((None, OmissionState::default()), |value| {
+        (Some(value.0), value.1)
+    });
+    let mut service_property_ids = Vec::new();
+    let mut dates = Vec::new();
+    let mut inspected = 0usize;
+
+    for (property_id, qualifier_snaks) in claim.qualifiers {
+        validate_property_id(&property_id)?;
+        for qualifier_value in qualifier_snaks {
+            if inspected >= MAX_FOLLOWER_QUALIFIER_SNAKS {
+                omissions.hard_bounds_reached = true;
+                continue;
+            }
+            inspected = inspected.saturating_add(1);
+            let qualifier: RawMainSnak = serde_json::from_value(qualifier_value)
+                .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+            if qualifier.property != property_id {
+                return Err(ProviderError::InvalidResponse(
+                    "Wikidata qualifier property does not match its containing group".to_owned(),
+                ));
+            }
+            if property_id == "P585" {
+                let (date, date_omissions) = normalize_follower_date(qualifier)?;
+                omissions.merge(date_omissions);
+                dates.push(date);
+            } else if qualifier.data_type.as_deref() == Some("external-id") {
+                if !matches!(
+                    qualifier.snak_type.as_str(),
+                    "value" | "somevalue" | "novalue"
+                ) {
+                    return Err(ProviderError::InvalidResponse(
+                        "Wikidata service qualifier contains an unknown snak type".to_owned(),
+                    ));
+                }
+                // Retain only the property that names the service. The account
+                // ID itself must never reach caches, diagnostics, or the UI.
+                service_property_ids.push(property_id.clone());
+            }
+        }
+    }
+    service_property_ids.sort();
+    dates.sort_by(|left, right| follower_date_sort_key(right).cmp(follower_date_sort_key(left)));
+
+    Ok((
+        Some(PendingStatementValue::SocialFollowers {
+            amount,
+            service_property_ids,
+            dates,
+            rank: claim.rank,
+        }),
+        omissions,
+    ))
+}
+
+/// Normalizes one P585 qualifier while preserving precision and calendar.
+fn normalize_follower_date(
+    snak: RawMainSnak,
+) -> Result<(PendingFollowerDate, OmissionState), ProviderError> {
+    match snak.snak_type.as_str() {
+        "novalue" | "somevalue" => Ok((PendingFollowerDate::Unknown, OmissionState::default())),
+        "value" => {
+            let data_value = snak.data_value.ok_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "Wikidata point-in-time qualifier is missing its data value".to_owned(),
+                )
+            })?;
+            if data_value.value_type != "time" {
+                return Err(ProviderError::InvalidResponse(
+                    "Wikidata point-in-time qualifier must contain a time value".to_owned(),
+                ));
+            }
+            let raw: RawTime = serde_json::from_value(data_value.value)
+                .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+            let calendar_id = unit_entity_id(&raw.calendar_model)?;
+            let display = follower_human_time(&raw.time, raw.precision)?;
+            let (display, omissions) =
+                required_bounded_text(&display, "follower observation date")?;
+            Ok((
+                PendingFollowerDate::Known {
+                    display,
+                    sort_key: raw.time,
+                    calendar_id,
+                },
+                omissions,
+            ))
+        }
+        _ => Err(ProviderError::InvalidResponse(
+            "Wikidata point-in-time qualifier contains an unknown snak type".to_owned(),
+        )),
+    }
+}
+
+/// Produces a year-first, precision-aware date for a P585 qualifier.
+fn follower_human_time(time: &str, precision: u8) -> Result<String, ProviderError> {
+    let normalized = human_time(time, precision)?;
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    if precision >= 11 {
+        let (year_month, day) = normalized.rsplit_once('-').ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Wikidata follower date is missing a day component".to_owned(),
+            )
+        })?;
+        let (year, month) = year_month.rsplit_once('-').ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Wikidata follower date is missing a month component".to_owned(),
+            )
+        })?;
+        let month_index = month
+            .parse::<usize>()
+            .ok()
+            .and_then(|month| month.checked_sub(1).filter(|index| *index < MONTHS.len()));
+        let month = month_index.map(|index| MONTHS[index]).ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Wikidata follower date contains an invalid month".to_owned(),
+            )
+        })?;
+        return Ok(format!("{year} {month} {}", day.trim_start_matches('0')));
+    }
+    if precision == 10 {
+        let (year, month) = normalized.rsplit_once('-').ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Wikidata follower date is missing a month component".to_owned(),
+            )
+        })?;
+        let month_index = month
+            .parse::<usize>()
+            .ok()
+            .and_then(|month| month.checked_sub(1).filter(|index| *index < MONTHS.len()));
+        let month = month_index.map(|index| MONTHS[index]).ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Wikidata follower date contains an invalid month".to_owned(),
+            )
+        })?;
+        return Ok(format!("{year} {month}"));
+    }
+    if precision == 9 {
+        Ok(normalized)
+    } else {
+        Ok(format!("{normalized} (precision {precision})"))
+    }
+}
+
+fn follower_date_sort_key(date: &PendingFollowerDate) -> &str {
+    match date {
+        PendingFollowerDate::Known { sort_key, .. } => sort_key,
+        PendingFollowerDate::Unknown => "",
+    }
+}
+
+/// Resolves one or more service-identifier qualifier properties.
+fn follower_service_display(
+    service_property_ids: &[String],
+    labels: &BTreeMap<String, String>,
+) -> String {
+    if service_property_ids.is_empty() {
+        return "Unknown service".to_owned();
+    }
+    let unique_ids = service_property_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let services = unique_ids
+        .iter()
+        .map(|property_id| follower_service_label(property_id, labels))
+        .collect::<Vec<_>>();
+    if services.len() > 1 {
+        format!("Multiple services: {}", services.join(", "))
+    } else if service_property_ids.len() > 1 {
+        format!("Multiple service accounts: {}", services[0])
+    } else {
+        services[0].clone()
+    }
+}
+
+/// Converts an identifier-property label into a concise service name.
+fn follower_service_label(property_id: &str, labels: &BTreeMap<String, String>) -> String {
+    match property_id {
+        "P2397" => return "YouTube".to_owned(),
+        "P4033" => return "Mastodon".to_owned(),
+        "P6552" => return "X (Twitter)".to_owned(),
+        _ => {}
+    }
+    let label = labels
+        .get(property_id)
+        .map(String::as_str)
+        .unwrap_or(property_id);
+    const SUFFIXES: [&str; 8] = [
+        " numeric user ID",
+        " channel ID",
+        " username",
+        " address",
+        " artist ID",
+        " user ID",
+        " profile ID",
+        " ID",
+    ];
+    SUFFIXES
+        .iter()
+        .find_map(|suffix| label.strip_suffix(suffix))
+        .filter(|service| !service.is_empty())
+        .unwrap_or(label)
+        .to_owned()
+}
+
+/// Renders one or more P585 qualifier dates without hiding ambiguity.
+fn follower_date_display(
+    dates: &[PendingFollowerDate],
+    labels: &BTreeMap<String, String>,
+) -> String {
+    if dates.is_empty() {
+        return "date unknown".to_owned();
+    }
+    let rendered = dates
+        .iter()
+        .map(|date| match date {
+            PendingFollowerDate::Unknown => "date unknown".to_owned(),
+            PendingFollowerDate::Known {
+                display,
+                calendar_id,
+                ..
+            } => {
+                let calendar = calendar_id
+                    .as_ref()
+                    .map_or_else(String::new, |calendar_id| {
+                        if calendar_id == "Q1985727" {
+                            String::new()
+                        } else {
+                            format!(
+                                " ({})",
+                                labels
+                                    .get(calendar_id)
+                                    .map_or(calendar_id.as_str(), String::as_str)
+                            )
+                        }
+                    });
+                format!("{display}{calendar}")
+            }
+        })
+        .collect::<Vec<_>>();
+    if rendered.len() == 1 {
+        rendered[0].clone()
+    } else {
+        format!("multiple dates: {}", rendered.join(", "))
+    }
+}
+
+/// Groups integral follower counts without carrying Wikibase uncertainty bounds.
+fn grouped_quantity(amount: &str) -> String {
+    let (sign, digits) = if let Some(digits) = amount.strip_prefix('+') {
+        ("", digits)
+    } else if let Some(digits) = amount.strip_prefix('-') {
+        ("-", digits)
+    } else {
+        ("", amount)
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return amount.strip_prefix('+').unwrap_or(amount).to_owned();
+    }
+    let mut grouped = String::with_capacity(amount.len().saturating_add(amount.len() / 3));
+    grouped.push_str(sign);
+    let first_group = digits.len() % 3;
+    if first_group > 0 {
+        grouped.push_str(&digits[..first_group]);
+    }
+    for chunk in digits.as_bytes()[first_group..].chunks(3) {
+        if grouped.len() > sign.len() {
+            grouped.push(',');
+        }
+        grouped.push_str(std::str::from_utf8(chunk).expect("ASCII digits are valid UTF-8"));
+    }
+    grouped
 }
 
 fn normalize_snak(
@@ -817,14 +1369,17 @@ fn normalize_snak(
                 )
             })?;
             let (value, omissions) = normalize_data_value(data_value)?;
-            let value = match (snak.data_type.as_deref(), value) {
-                (Some("external-id"), Some(PendingStatementValue::Plain(display))) => {
+            let value = match (snak.property.as_str(), snak.data_type.as_deref(), value) {
+                ("P373", _, Some(PendingStatementValue::Plain(display))) => {
+                    Some(PendingStatementValue::CommonsCategory(display))
+                }
+                (_, Some("external-id"), Some(PendingStatementValue::Plain(display))) => {
                     Some(PendingStatementValue::ExternalId(display))
                 }
-                (Some("commonsMedia"), Some(PendingStatementValue::Plain(display))) => {
+                (_, Some("commonsMedia"), Some(PendingStatementValue::Plain(display))) => {
                     Some(PendingStatementValue::CommonsMedia(display))
                 }
-                (_, value) => value,
+                (_, _, value) => value,
             };
             Ok((value, omissions))
         }
@@ -844,6 +1399,15 @@ fn formatted_external_url(formatter: &str, external_id: &str) -> Option<Url> {
     safe_external_url(&rendered)
 }
 
+/// Builds Wikimedia Commons' human-facing category page for a P373 value.
+fn commons_category_page_url(category: &str) -> Option<Url> {
+    Url::parse(&format!(
+        "{COMMONS_CATEGORY_PAGE_BASE}{}",
+        percent_encode_component(category)
+    ))
+    .ok()
+}
+
 /// Builds Wikimedia Commons' human-facing file page for a P18 value.
 fn commons_file_page_url(filename: &str) -> Option<Url> {
     Url::parse(&format!(
@@ -853,16 +1417,43 @@ fn commons_file_page_url(filename: &str) -> Option<Url> {
     .ok()
 }
 
-/// Builds a bounded-width Commons raster redirect suitable for TUI previews.
-fn commons_file_preview_url(filename: &str) -> Option<Url> {
-    let mut url = Url::parse(&format!(
+/// Builds Commons' stable file redirect without resolving a CDN location.
+fn commons_file_redirect_url(filename: &str) -> Option<Url> {
+    Url::parse(&format!(
         "{COMMONS_FILE_PREVIEW_BASE}{}",
         percent_encode_component(filename)
     ))
-    .ok()?;
+    .ok()
+}
+
+/// Builds a bounded-width Commons raster redirect suitable for TUI previews.
+fn commons_file_preview_url(filename: &str) -> Option<Url> {
+    let mut url = commons_file_redirect_url(filename)?;
     url.query_pairs_mut()
         .append_pair("width", COMMONS_PREVIEW_WIDTH);
     Some(url)
+}
+
+/// Classifies only open-format P51/P10 Commons media extensions.
+fn commons_playable_media_kind(
+    property_id: &str,
+    filename: &str,
+) -> Option<WikidataPlayableMediaKind> {
+    let extension = filename.rsplit_once('.')?.1.to_ascii_lowercase();
+    match property_id {
+        "P51"
+            if matches!(
+                extension.as_str(),
+                "flac" | "oga" | "ogg" | "opus" | "wav" | "webm"
+            ) =>
+        {
+            Some(WikidataPlayableMediaKind::Audio)
+        }
+        "P10" if matches!(extension.as_str(), "ogg" | "ogv" | "webm") => {
+            Some(WikidataPlayableMediaKind::Video)
+        }
+        _ => None,
+    }
 }
 
 /// Accepts only credential-free HTTP(S) links with a network host.
@@ -1168,35 +1759,59 @@ fn collect_label_ids(pending: &PendingEntityStatements) -> (Vec<String>, bool) {
     let mut identifiers = Vec::with_capacity(MAX_LABEL_ENTITY_IDS);
     let mut seen = BTreeSet::new();
     let mut truncated = false;
-    let candidates = pending
+    let mut push_identifier = |entity_id: &str| {
+        if !is_label_entity_id(entity_id) || !seen.insert(entity_id.to_owned()) {
+            return;
+        }
+        if identifiers.len() >= MAX_LABEL_ENTITY_IDS {
+            truncated = true;
+            return;
+        }
+        identifiers.push(entity_id.to_owned());
+    };
+    for entity_id in pending
         .statements
         .iter()
         .flat_map(|statement| statement.values.iter())
         .filter_map(PendingStatementValue::direct_entity_id)
-        .filter(|entity_id| is_label_entity_id(entity_id))
-        .chain(
-            pending
-                .statements
-                .iter()
-                .flat_map(|statement| statement.values.iter())
-                .filter_map(PendingStatementValue::supporting_entity_id)
-                .filter(|entity_id| is_label_entity_id(entity_id)),
-        );
-    let candidates = candidates.chain(
-        pending
-            .statements
-            .iter()
-            .map(|statement| statement.property_id.as_str()),
-    );
-    for entity_id in candidates {
-        if !seen.insert(entity_id.to_owned()) {
-            continue;
+    {
+        push_identifier(entity_id);
+    }
+    for entity_id in pending
+        .statements
+        .iter()
+        .flat_map(|statement| statement.values.iter())
+        .filter_map(PendingStatementValue::supporting_entity_id)
+    {
+        push_identifier(entity_id);
+    }
+    for value in pending
+        .statements
+        .iter()
+        .flat_map(|statement| statement.values.iter())
+    {
+        if let PendingStatementValue::SocialFollowers {
+            service_property_ids,
+            dates,
+            ..
+        } = value
+        {
+            for property_id in service_property_ids {
+                push_identifier(property_id);
+            }
+            for date in dates {
+                if let PendingFollowerDate::Known {
+                    calendar_id: Some(calendar_id),
+                    ..
+                } = date
+                {
+                    push_identifier(calendar_id);
+                }
+            }
         }
-        if identifiers.len() >= MAX_LABEL_ENTITY_IDS {
-            truncated = true;
-            continue;
-        }
-        identifiers.push(entity_id.to_owned());
+    }
+    for statement in &pending.statements {
+        push_identifier(&statement.property_id);
     }
     (identifiers, truncated)
 }
@@ -1285,6 +1900,47 @@ fn normalize_formatter_urls(
     Ok((formatters, omissions))
 }
 
+/// Gives follower observations a stable service/rank/date ordering.
+fn compare_follower_values(
+    left: &PendingStatementValue,
+    right: &PendingStatementValue,
+) -> std::cmp::Ordering {
+    let (
+        PendingStatementValue::SocialFollowers {
+            amount: left_amount,
+            service_property_ids: left_services,
+            dates: left_dates,
+            rank: left_rank,
+        },
+        PendingStatementValue::SocialFollowers {
+            amount: right_amount,
+            service_property_ids: right_services,
+            dates: right_dates,
+            rank: right_rank,
+        },
+    ) = (left, right)
+    else {
+        return std::cmp::Ordering::Equal;
+    };
+    left_services
+        .cmp(right_services)
+        .then_with(|| follower_rank_order(*left_rank).cmp(&follower_rank_order(*right_rank)))
+        .then_with(|| {
+            let left_date = left_dates.first().map_or("", follower_date_sort_key);
+            let right_date = right_dates.first().map_or("", follower_date_sort_key);
+            right_date.cmp(left_date)
+        })
+        .then_with(|| left_amount.cmp(right_amount))
+}
+
+const fn follower_rank_order(rank: RawStatementRank) -> u8 {
+    match rank {
+        RawStatementRank::Preferred => 0,
+        RawStatementRank::Normal => 1,
+        RawStatementRank::Deprecated => 2,
+    }
+}
+
 fn render_entity_statements(
     pending: PendingEntityStatements,
     labels: &BTreeMap<String, String>,
@@ -1298,8 +1954,11 @@ fn render_entity_statements(
             .into_iter()
             .map(|statement| {
                 let property_id = statement.property_id;
-                let values = statement
-                    .values
+                let mut pending_values = statement.values;
+                if property_id == "P8687" {
+                    pending_values.sort_by(compare_follower_values);
+                }
+                let values = pending_values
                     .iter()
                     .map(|value| value.render(&property_id, labels, formatter_urls))
                     .collect();
@@ -1313,6 +1972,8 @@ fn render_entity_statements(
                 }
             })
             .collect(),
+        wikipedia_sitelinks: pending.wikipedia_sitelinks,
+        wikipedia_sitelinks_omitted: pending.wikipedia_sitelinks_omitted,
         truncated: omissions.is_truncated(),
         hard_bounds_reached: omissions.hard_bounds_reached,
         unsupported_values_omitted: omissions.unsupported_values_omitted,
@@ -1403,19 +2064,43 @@ fn wikidata_entity_id(
 }
 
 #[derive(Debug, Deserialize)]
-struct EntityDataResponse {
-    entities: BTreeMap<String, RawEntityData>,
+struct EntityStatementsResponse {
+    entities: BTreeMap<String, RawStatementEntity>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawEntityData {
+struct RawStatementEntity {
     #[serde(default)]
     claims: BTreeMap<String, Vec<RawClaim>>,
+    #[serde(default)]
+    sitelinks: BTreeMap<String, RawSitelink>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSitelink {
+    site: String,
+    title: String,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawClaim {
     mainsnak: RawMainSnak,
+    #[serde(default)]
+    qualifiers: BTreeMap<String, Vec<Value>>,
+    #[serde(default)]
+    rank: RawStatementRank,
+}
+
+/// Wikibase statement rank retained only where it changes follower history.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum RawStatementRank {
+    Preferred,
+    #[default]
+    Normal,
+    Deprecated,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1782,10 +2467,6 @@ mod tests {
             json_response("200 OK", ENTITY_LABELS_FIXTURE),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("label API URL"),
             MAX_ENTITY_RESPONSE_BYTES,
             MAX_LABEL_RESPONSE_BYTES,
@@ -1799,7 +2480,18 @@ mod tests {
         assert_eq!(result.item_id, "Q42");
         assert!(!result.truncated);
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0], "/wiki/Special:EntityData/Q42.json");
+        let entity_url = server_url(&requests[0]);
+        let entity_pairs = entity_url.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(entity_url.path(), "/w/api.php");
+        assert_eq!(
+            entity_pairs.get("action").map(AsRef::as_ref),
+            Some("wbgetentities")
+        );
+        assert_eq!(entity_pairs.get("ids").map(AsRef::as_ref), Some("Q42"));
+        assert_eq!(
+            entity_pairs.get("props").map(AsRef::as_ref),
+            Some("claims|sitelinks/urls")
+        );
         let label_url = server_url(&requests[1]);
         let label_pairs = label_url.query_pairs().collect::<BTreeMap<_, _>>();
         assert_eq!(
@@ -1870,22 +2562,301 @@ mod tests {
     }
 
     #[test]
-    fn external_ids_and_commons_media_expose_safe_provider_links() {
+    fn follower_history_uses_service_and_date_qualifiers_without_leaking_accounts() {
+        let response: EntityStatementsResponse = serde_json::from_value(serde_json::json!({
+            "entities": {
+                "Q42": {
+                    "claims": {
+                        "P8687": [
+                            follower_claim_fixture(
+                                "+490181",
+                                "P6552",
+                                "account-secret-x",
+                                "+00000002023-02-06T00:00:00Z",
+                                "normal",
+                            ),
+                            follower_claim_fixture(
+                                "+1880000",
+                                "P2397",
+                                "account-secret-youtube",
+                                "+00000002025-03-01T00:00:00Z",
+                                "preferred",
+                            ),
+                            follower_claim_fixture(
+                                "+136000",
+                                "P2397",
+                                "deprecated-account-secret",
+                                "+00000002020-01-01T00:00:00Z",
+                                "deprecated",
+                            ),
+                            follower_claim_fixture(
+                                "+604",
+                                "P4033",
+                                "account-secret-mastodon",
+                                "+00000002024-04-11T00:00:00Z",
+                                "normal",
+                            ),
+                        ]
+                    }
+                }
+            }
+        }))
+        .expect("follower fixture JSON");
+        let pending =
+            normalize_entity_claims("Q42", response).expect("follower claims should normalize");
+        let (label_ids, truncated) = collect_label_ids(&pending);
+        assert!(!truncated);
+        for expected in ["P8687", "P2397", "P4033", "P6552", "Q1985727"] {
+            assert!(label_ids.iter().any(|label_id| label_id == expected));
+        }
+        let labels = BTreeMap::from([
+            ("P8687".to_owned(), "social media followers".to_owned()),
+            ("P2397".to_owned(), "YouTube channel ID".to_owned()),
+            ("P4033".to_owned(), "Mastodon address".to_owned()),
+            ("P6552".to_owned(), "X numeric user ID".to_owned()),
+            (
+                "Q1985727".to_owned(),
+                "proleptic Gregorian calendar".to_owned(),
+            ),
+        ]);
+
+        let result = render_entity_statements(pending, &labels, &BTreeMap::new());
+        let followers = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P8687")
+            .expect("follower statement");
+        assert_eq!(
+            followers
+                .values
+                .iter()
+                .map(|value| value.display.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "YouTube · 2025 March 1 · 1,880,000 followers",
+                "YouTube · 2020 January 1 · 136,000 followers · deprecated",
+                "Mastodon · 2024 April 11 · 604 followers",
+                "X (Twitter) · 2023 February 6 · 490,181 followers",
+            ]
+        );
+        let diagnostic = format!("{result:?}");
+        for secret in [
+            "account-secret-x",
+            "account-secret-youtube",
+            "deprecated-account-secret",
+            "account-secret-mastodon",
+            "qualifier-secret-hash",
+            "reference-secret-hash",
+        ] {
+            assert!(!diagnostic.contains(secret));
+        }
+        assert!(
+            !followers.values[0].display.contains('–'),
+            "quantity uncertainty bounds are not part of follower history"
+        );
+    }
+
+    #[test]
+    fn follower_qualifiers_are_bounded_and_ambiguity_is_explicit() {
+        let account_qualifiers = (0..=MAX_FOLLOWER_QUALIFIER_SNAKS)
+            .map(|index| {
+                serde_json::json!({
+                    "snaktype": "value",
+                    "property": "P2397",
+                    "datatype": "external-id",
+                    "datavalue": {
+                        "value": format!("private-account-{index}"),
+                        "type": "string"
+                    }
+                })
+            })
+            .collect();
+        let claim = RawClaim {
+            mainsnak: RawMainSnak {
+                snak_type: "value".to_owned(),
+                property: "P8687".to_owned(),
+                data_type: Some("quantity".to_owned()),
+                data_value: Some(RawDataValue {
+                    value_type: "quantity".to_owned(),
+                    value: serde_json::json!({
+                        "amount": "+1000",
+                        "unit": "1",
+                        "lowerBound": "+999",
+                        "upperBound": "+1001"
+                    }),
+                }),
+            },
+            qualifiers: BTreeMap::from([("P2397".to_owned(), account_qualifiers)]),
+            rank: RawStatementRank::Normal,
+        };
+
+        let (value, omissions) =
+            normalize_social_followers(claim).expect("bounded qualifiers should normalize");
+        assert!(omissions.hard_bounds_reached);
+        let rendered =
+            value
+                .expect("follower value")
+                .render("P8687", &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(
+            rendered.display,
+            "Multiple service accounts: YouTube · date unknown · 1,000 followers"
+        );
+        assert!(!format!("{rendered:?}").contains("private-account"));
+    }
+
+    /// Builds a realistic P8687 claim with private qualifier metadata.
+    fn follower_claim_fixture(
+        amount: &str,
+        service_property: &str,
+        account_id: &str,
+        point_in_time: &str,
+        rank: &str,
+    ) -> Value {
+        serde_json::json!({
+            "mainsnak": {
+                "snaktype": "value",
+                "property": "P8687",
+                "datatype": "quantity",
+                "datavalue": {
+                    "value": {
+                        "amount": amount,
+                        "unit": "1",
+                        "lowerBound": format!("{amount}0"),
+                        "upperBound": format!("{amount}9")
+                    },
+                    "type": "quantity"
+                }
+            },
+            "rank": rank,
+            "qualifiers": {
+                (service_property): [{
+                    "snaktype": "value",
+                    "property": service_property,
+                    "datatype": "external-id",
+                    "datavalue": {"value": account_id, "type": "string"},
+                    "hash": "qualifier-secret-hash"
+                }],
+                "P585": [{
+                    "snaktype": "value",
+                    "property": "P585",
+                    "datatype": "time",
+                    "datavalue": {
+                        "value": {
+                            "time": point_in_time,
+                            "timezone": 0,
+                            "before": 0,
+                            "after": 0,
+                            "precision": 11,
+                            "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+                        },
+                        "type": "time"
+                    }
+                }]
+            },
+            "references": [{"hash": "reference-secret-hash"}]
+        })
+    }
+
+    #[test]
+    fn external_ids_and_multiple_p18_values_expose_safe_provider_links() {
         let entity_fixture = serde_json::json!({
             "entities": {
                 "Q42": {
                     "claims": {
-                        "P18": [{
-                            "mainsnak": {
-                                "snaktype": "value",
-                                "property": "P18",
-                                "datatype": "commonsMedia",
-                                "datavalue": {
-                                    "value": "Portrait with a space.jpg",
-                                    "type": "string"
+                        "P18": [
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P18",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Portrait with a space.jpg",
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P18",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Second portrait.jpg",
+                                        "type": "string"
+                                    }
                                 }
                             }
-                        }],
+                        ],
+                        "P51": [
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P51",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "First recording.opus",
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P51",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Second recording.FLAC",
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P51",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Unsupported recording.mp3",
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        ],
+                        "P10": [
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P10",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "First video.webm",
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P10",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Second video.ogv",
+                                        "type": "string"
+                                    }
+                                }
+                            },
+                            {
+                                "mainsnak": {
+                                    "snaktype": "value",
+                                    "property": "P10",
+                                    "datatype": "commonsMedia",
+                                    "datavalue": {
+                                        "value": "Unsupported video.mp4",
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        ],
                         "P2002": [{
                             "mainsnak": {
                                 "snaktype": "value",
@@ -1893,6 +2864,17 @@ mod tests {
                                 "datatype": "external-id",
                                 "datavalue": {
                                     "value": "name/with space",
+                                    "type": "string"
+                                }
+                            }
+                        }],
+                        "P373": [{
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "property": "P373",
+                                "datatype": "string",
+                                "datavalue": {
+                                    "value": "Douglas Adams / portraits",
                                     "type": "string"
                                 }
                             }
@@ -1907,8 +2889,17 @@ mod tests {
                 "P18": {
                     "labels": {"en": {"value": "image"}}
                 },
+                "P51": {
+                    "labels": {"en": {"value": "audio"}}
+                },
+                "P10": {
+                    "labels": {"en": {"value": "video"}}
+                },
                 "P2002": {
                     "labels": {"en": {"value": "X username"}}
+                },
+                "P373": {
+                    "labels": {"en": {"value": "Commons category"}}
                 }
             }
         })
@@ -1934,10 +2925,6 @@ mod tests {
             json_response("200 OK", &formatter_fixture),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("entity API URL"),
             MAX_ENTITY_RESPONSE_BYTES,
             MAX_LABEL_RESPONSE_BYTES,
@@ -1953,23 +2940,105 @@ mod tests {
         let formatter_pairs = formatter_url.query_pairs().collect::<BTreeMap<_, _>>();
         let formatter_query = formatter_pairs.get("query").expect("formatter query");
         assert!(formatter_query.contains("VALUES ?property { wd:P2002 }"));
+        assert!(!formatter_query.contains("wd:P373"));
         assert!(formatter_query.contains("?property wdt:P1630 ?formatterUrl"));
-        let image = result
+        let images = result
             .statements
             .iter()
             .find(|statement| statement.property_id == "P18")
-            .and_then(|statement| statement.values.first())
-            .expect("image statement value");
+            .map(|statement| statement.values.as_slice())
+            .expect("image statement values");
         assert_eq!(
-            image.external_url.as_ref().map(Url::as_str),
-            Some("https://commons.wikimedia.org/wiki/File:Portrait%20with%20a%20space.jpg")
+            images
+                .iter()
+                .map(|image| image.external_url.as_ref().map(Url::as_str))
+                .collect::<Vec<_>>(),
+            [
+                Some("https://commons.wikimedia.org/wiki/File:Portrait%20with%20a%20space.jpg"),
+                Some("https://commons.wikimedia.org/wiki/File:Second%20portrait.jpg"),
+            ]
+        );
+        assert!(
+            images
+                .iter()
+                .all(|image| image.commons_playback("P18").is_none()),
+            "P18 must remain image-only even though it is Commons media"
+        );
+        let audio = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P51")
+            .map(|statement| statement.values.as_slice())
+            .expect("audio statement values");
+        assert_eq!(
+            audio
+                .iter()
+                .map(|value| {
+                    value
+                        .commons_playback("P51")
+                        .map(|media| (media.kind, media.playback_url))
+                })
+                .collect::<Vec<_>>(),
+            [
+                Some((
+                    WikidataPlayableMediaKind::Audio,
+                    Url::parse(
+                        "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
+                         First%20recording.opus"
+                    )
+                    .expect("first audio playback URL"),
+                )),
+                Some((
+                    WikidataPlayableMediaKind::Audio,
+                    Url::parse(
+                        "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
+                         Second%20recording.FLAC"
+                    )
+                    .expect("second audio playback URL"),
+                )),
+                None,
+            ]
+        );
+        assert!(
+            audio.iter().all(|value| value.external_url.is_some()),
+            "unsupported audio must remain a clickable Commons file page"
+        );
+        let video = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P10")
+            .map(|statement| statement.values.as_slice())
+            .expect("video statement values");
+        assert_eq!(
+            video
+                .iter()
+                .map(|value| value.commons_playback("P10").map(|media| media.kind))
+                .collect::<Vec<_>>(),
+            [
+                Some(WikidataPlayableMediaKind::Video),
+                Some(WikidataPlayableMediaKind::Video),
+                None,
+            ]
+        );
+        assert!(
+            video.iter().all(|value| value.external_url.is_some()),
+            "unsupported video must remain a clickable Commons file page"
         );
         assert_eq!(
-            image.preview_url.as_ref().map(Url::as_str),
-            Some(
-                "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
-                 Portrait%20with%20a%20space.jpg?width=512"
-            )
+            images
+                .iter()
+                .map(|image| image.preview_url.as_ref().map(Url::as_str))
+                .collect::<Vec<_>>(),
+            [
+                Some(
+                    "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
+                     Portrait%20with%20a%20space.jpg?width=512"
+                ),
+                Some(
+                    "https://commons.wikimedia.org/wiki/Special:Redirect/file/\
+                     Second%20portrait.jpg?width=512"
+                ),
+            ]
         );
         let username = result
             .statements
@@ -1981,6 +3050,21 @@ mod tests {
             username.external_url.as_ref().map(Url::as_str),
             Some("https://x.com/name%2Fwith%20space")
         );
+        let commons_category = result
+            .statements
+            .iter()
+            .find(|statement| statement.property_id == "P373")
+            .and_then(|statement| statement.values.first())
+            .expect("Commons-category statement value");
+        assert_eq!(commons_category.display, "Douglas Adams / portraits");
+        assert_eq!(
+            commons_category.external_url.as_ref().map(Url::as_str),
+            Some(
+                "https://commons.wikimedia.org/wiki/Category:\
+                 Douglas%20Adams%20%2F%20portraits"
+            )
+        );
+        assert!(commons_category.preview_url.is_none());
         assert!(!result.truncated);
     }
 
@@ -2032,10 +3116,6 @@ mod tests {
             json_response("200 OK", &formatter_fixture),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("entity API URL"),
             MAX_ENTITY_RESPONSE_BYTES,
             MAX_LABEL_RESPONSE_BYTES,
@@ -2092,6 +3172,194 @@ mod tests {
         .expect("older cached entity should deserialize");
         assert!(!entity.hard_bounds_reached);
         assert!(!entity.unsupported_values_omitted);
+        assert!(entity.wikipedia_sitelinks.is_empty());
+        assert!(!entity.wikipedia_sitelinks_omitted);
+
+        let linked = WikidataWikipediaSitelink {
+            site_id: "be_x_oldwiki".to_owned(),
+            project_label: "be-tarask.wikipedia.org".to_owned(),
+            title: "Дуглас Адамз".to_owned(),
+            url: Url::parse("https://be-tarask.wikipedia.org/wiki/Дуглас_Адамз")
+                .expect("Wikipedia fixture URL"),
+        };
+        let mut linked_entity = entity;
+        linked_entity.wikipedia_sitelinks.push(linked.clone());
+        assert_eq!(
+            serde_json::from_value::<WikidataEntityStatements>(
+                serde_json::to_value(&linked_entity).expect("linked entity should serialize")
+            )
+            .expect("linked entity should deserialize")
+            .wikipedia_sitelinks,
+            vec![linked]
+        );
+    }
+
+    #[test]
+    fn canonical_wikipedia_sitelinks_are_bounded_sorted_and_strictly_validated() {
+        let mut sitelinks = BTreeMap::from([
+            (
+                "simplewiki".to_owned(),
+                raw_sitelink(
+                    "simplewiki",
+                    "Douglas Adams",
+                    "https://simple.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "enwiki".to_owned(),
+                raw_sitelink(
+                    "enwiki",
+                    "Douglas Adams",
+                    "https://en.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "be_x_oldwiki".to_owned(),
+                raw_sitelink(
+                    "be_x_oldwiki",
+                    "Дуглас Адамз",
+                    "https://be-tarask.wikipedia.org/wiki/%D0%94%D1%83%D0%B3%D0%BB%D0%B0%D1%81_%D0%90%D0%B4%D0%B0%D0%BC%D0%B7",
+                ),
+            ),
+            (
+                "zh_classicalwiki".to_owned(),
+                raw_sitelink(
+                    "zh_classicalwiki",
+                    "道格拉斯·亞當斯",
+                    "https://zh-classical.wikipedia.org/wiki/%E9%81%93%E6%A0%BC%E6%8B%89%E6%96%AF%C2%B7%E4%BA%9E%E7%95%B6%E6%96%AF",
+                ),
+            ),
+            (
+                "duplicatewiki".to_owned(),
+                raw_sitelink(
+                    "duplicatewiki",
+                    "Duplicate",
+                    "https://en.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "commonswiki".to_owned(),
+                raw_sitelink(
+                    "commonswiki",
+                    "Douglas Adams",
+                    "https://commons.wikimedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "evilwiki".to_owned(),
+                raw_sitelink(
+                    "evilwiki",
+                    "Foreign",
+                    "https://en.wikipedia.org.evil.test/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "httpwiki".to_owned(),
+                raw_sitelink(
+                    "httpwiki",
+                    "HTTP",
+                    "http://en.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "credentialwiki".to_owned(),
+                raw_sitelink(
+                    "credentialwiki",
+                    "Credentials",
+                    "https://user@en.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "portwiki".to_owned(),
+                raw_sitelink(
+                    "portwiki",
+                    "Port",
+                    "https://en.wikipedia.org:443/wiki/Douglas_Adams",
+                ),
+            ),
+            (
+                "querywiki".to_owned(),
+                raw_sitelink(
+                    "querywiki",
+                    "Query",
+                    "https://en.wikipedia.org/wiki/Douglas_Adams?oldid=1",
+                ),
+            ),
+            (
+                "fragmentwiki".to_owned(),
+                raw_sitelink(
+                    "fragmentwiki",
+                    "Fragment",
+                    "https://en.wikipedia.org/wiki/Douglas_Adams#Life",
+                ),
+            ),
+            (
+                "emptywiki".to_owned(),
+                raw_sitelink("emptywiki", "Empty", "https://en.wikipedia.org/wiki/"),
+            ),
+            (
+                "mismatchwiki".to_owned(),
+                raw_sitelink(
+                    "anotherwiki",
+                    "Mismatch",
+                    "https://en.wikipedia.org/wiki/Douglas_Adams",
+                ),
+            ),
+        ]);
+        sitelinks.insert(
+            "blankwiki".to_owned(),
+            raw_sitelink("blankwiki", "\n\t ", "https://en.wikipedia.org/wiki/Blank"),
+        );
+
+        let (normalized, omitted) = normalize_wikipedia_sitelinks(sitelinks);
+
+        assert!(omitted, "unsafe Wikipedia candidates must be reported");
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|link| {
+                    (
+                        link.site_id.as_str(),
+                        link.project_label.as_str(),
+                        link.title.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("enwiki", "en.wikipedia.org", "Douglas Adams"),
+                ("be_x_oldwiki", "be-tarask.wikipedia.org", "Дуглас Адамз"),
+                ("simplewiki", "simple.wikipedia.org", "Douglas Adams"),
+                (
+                    "zh_classicalwiki",
+                    "zh-classical.wikipedia.org",
+                    "道格拉斯·亞當斯"
+                ),
+            ]
+        );
+        assert!(normalized.iter().all(|link| link.url.scheme() == "https"
+            && link.url.host_str().is_some_and(wikipedia_project_host)));
+    }
+
+    #[test]
+    fn wikipedia_sitelink_bound_is_independent_from_statement_limits() {
+        let sitelinks = (0..=MAX_WIKIPEDIA_SITELINKS)
+            .map(|index| {
+                let site_id = format!("x{index:03}wiki");
+                (
+                    site_id.clone(),
+                    raw_sitelink(
+                        &site_id,
+                        &format!("Fixture {index}"),
+                        &format!("https://x{index:03}.wikipedia.org/wiki/Fixture_{index}"),
+                    ),
+                )
+            })
+            .collect();
+
+        let (normalized, omitted) = normalize_wikipedia_sitelinks(sitelinks);
+
+        assert_eq!(normalized.len(), MAX_WIKIPEDIA_SITELINKS);
+        assert!(omitted);
     }
 
     #[test]
@@ -2132,10 +3400,6 @@ mod tests {
             json_response("200 OK", &label_fixture),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("label API URL"),
             MAX_ENTITY_RESPONSE_BYTES,
             MAX_LABEL_RESPONSE_BYTES,
@@ -2263,10 +3527,6 @@ mod tests {
             ),
         ]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("label API URL"),
             MAX_ENTITY_RESPONSE_BYTES,
             MAX_LABEL_RESPONSE_BYTES,
@@ -2345,13 +3605,16 @@ mod tests {
                         value: Value::String(format!("value {index}")),
                     }),
                 },
+                qualifiers: BTreeMap::new(),
+                rank: RawStatementRank::Normal,
             })
             .collect();
-        let response = EntityDataResponse {
+        let response = EntityStatementsResponse {
             entities: BTreeMap::from([(
                 "Q42".to_owned(),
-                RawEntityData {
+                RawStatementEntity {
                     claims: BTreeMap::from([("P1".to_owned(), claims)]),
+                    sitelinks: BTreeMap::new(),
                 },
             )]),
         };
@@ -2366,10 +3629,10 @@ mod tests {
 
     #[test]
     fn unsupported_values_are_distinct_from_hard_bounds() {
-        let response = EntityDataResponse {
+        let response = EntityStatementsResponse {
             entities: BTreeMap::from([(
                 "Q42".to_owned(),
-                RawEntityData {
+                RawStatementEntity {
                     claims: BTreeMap::from([(
                         "P1".to_owned(),
                         vec![RawClaim {
@@ -2382,8 +3645,11 @@ mod tests {
                                     value: serde_json::json!({"future": "shape"}),
                                 }),
                             },
+                            qualifiers: BTreeMap::new(),
+                            rank: RawStatementRank::Normal,
                         }],
                     )]),
+                    sitelinks: BTreeMap::new(),
                 },
             )]),
         };
@@ -2407,6 +3673,8 @@ mod tests {
                     values: vec![PendingStatementValue::Plain("value".to_owned())],
                 })
                 .collect(),
+            wikipedia_sitelinks: Vec::new(),
+            wikipedia_sitelinks_omitted: false,
             omissions: OmissionState::default(),
         };
 
@@ -2435,10 +3703,6 @@ mod tests {
     fn oversized_entity_response_is_rejected_before_label_lookup() {
         let server = MockServer::spawn(vec![json_response("200 OK", ENTITY_STATEMENTS_FIXTURE)]);
         let provider = WikidataProvider::with_statement_endpoints(
-            server
-                .base_url
-                .join("wiki/Special:EntityData/")
-                .expect("entity-data URL"),
             server.base_url.join("w/api.php").expect("label API URL"),
             64,
             MAX_LABEL_RESPONSE_BYTES,
@@ -2451,7 +3715,15 @@ mod tests {
             error,
             ProviderError::ResponseTooLarge { limit: 64 }
         ));
-        assert_eq!(server.finish(), vec!["/wiki/Special:EntityData/Q42.json"]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        let request = server_url(&requests[0]);
+        let pairs = request.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(request.path(), "/w/api.php");
+        assert_eq!(
+            pairs.get("props").map(AsRef::as_ref),
+            Some("claims|sitelinks/urls")
+        );
     }
 
     fn statement_value<'a>(result: &'a WikidataEntityStatements, property_id: &str) -> &'a str {
@@ -2462,6 +3734,14 @@ mod tests {
             .and_then(|statement| statement.values.first())
             .map(|value| value.display.as_str())
             .expect("fixture statement value")
+    }
+
+    fn raw_sitelink(site: &str, title: &str, url: &str) -> RawSitelink {
+        RawSitelink {
+            site: site.to_owned(),
+            title: title.to_owned(),
+            url: Some(url.to_owned()),
+        }
     }
 
     fn server_url(target: &str) -> Url {

@@ -16,6 +16,9 @@ pub mod report_actions;
 pub mod subscriptions;
 pub mod waveform;
 
+#[cfg(feature = "local")]
+pub mod local_move;
+
 #[cfg(feature = "network")]
 pub mod audio_identification;
 

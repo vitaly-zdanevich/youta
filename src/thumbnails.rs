@@ -24,15 +24,22 @@ use std::fs::File;
 use std::io::{BufReader, SeekFrom};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
-use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+use image::{
+    DynamicImage, GrayAlphaImage, GrayImage, ImageFormat, ImageReader, Limits, RgbImage, RgbaImage,
+};
+use jpeg_decoder::{CodingProcess, Decoder as JpegDecoder, PixelFormat};
 use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, ResizeEncodeRender};
 use sha2::{Digest, Sha256};
+use ureq::ResponseExt;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
 use crate::config::ThumbnailMode;
+use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4_096;
@@ -48,6 +55,9 @@ const CACHE_MAX_ENTRIES: usize = 512;
 const CACHE_FILE_EXTENSION: &str = "image";
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
+const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
+const LOCAL_PREVIEW_MAGIC: &[u8; 8] = b"YTPRV001";
+const LOCAL_PREVIEW_HEADER_BYTES: usize = LOCAL_PREVIEW_MAGIC.len() + 4 + 4 + 1;
 #[cfg(feature = "local")]
 const MAX_LOCAL_ARTWORK_READ_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "local")]
@@ -57,6 +67,9 @@ const MAX_LOCAL_ARTWORK_PICTURES: usize = 64;
 #[cfg(feature = "local")]
 const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static LOCAL_SOURCE_DECODE_COUNTS: std::sync::Mutex<Vec<(PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Graphics protocol selected for terminal artwork.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,12 +283,67 @@ struct WorkerResult {
     result: Result<StatefulProtocol, ThumbnailFailure>,
 }
 
+/// One terminal protocol plus an optional local derivative to persist after
+/// the ready result has been published.
+struct LoadedThumbnail {
+    protocol: StatefulProtocol,
+    deferred_local_preview: Option<DeferredLocalPreview>,
+}
+
+/// Bounded local preview bytes whose disk write must not delay first display.
+struct DeferredLocalPreview {
+    cache_key: [u8; 32],
+    record: Vec<u8>,
+    fingerprint: LocalThumbnailFingerprint,
+}
+
+/// Exact pixel box requested by one terminal-cell thumbnail area.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalPreviewTarget {
+    width: u32,
+    height: u32,
+}
+
 trait ThumbnailTransport: Send + 'static {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
 }
 
 struct HttpThumbnailTransport {
     agent: ureq::Agent,
+}
+
+/// DNS resolver that pins thumbnail connections to public addresses only.
+#[derive(Debug, Default)]
+struct PublicThumbnailResolver {
+    resolver: DefaultResolver,
+    #[cfg(test)]
+    allow_non_public: bool,
+}
+
+impl Resolver for PublicThumbnailResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.resolver.resolve(uri, config, timeout)?;
+        #[cfg(test)]
+        if self.allow_non_public {
+            return Ok(resolved);
+        }
+        let mut public = self.empty();
+        for address in &resolved {
+            if !ip_address_is_non_public(address.ip()) {
+                public.push(*address);
+            }
+        }
+        if public.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(public)
+        }
+    }
 }
 
 impl ThumbnailTransport for HttpThumbnailTransport {
@@ -572,6 +640,231 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+/// Stable identity for one regular local image at a point in time.
+///
+/// The canonical path and change metadata keep derivatives private, invalidate
+/// them after replacement or mutation, and reject symlinks before any decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalThumbnailFingerprint {
+    canonical_path: PathBuf,
+    length: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+}
+
+impl LocalThumbnailFingerprint {
+    fn capture(path: &Path) -> Result<Self, ThumbnailFailure> {
+        let supplied_metadata =
+            fs::symlink_metadata(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+        if !supplied_metadata.file_type().is_file() {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        let canonical_path =
+            fs::canonicalize(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+        let canonical_metadata =
+            fs::symlink_metadata(&canonical_path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+        if !canonical_metadata.file_type().is_file() {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        let supplied = Self::from_metadata(canonical_path.clone(), &supplied_metadata);
+        let canonical = Self::from_metadata(canonical_path, &canonical_metadata);
+        if supplied != canonical {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        Ok(canonical)
+    }
+
+    fn from_metadata(canonical_path: PathBuf, metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            canonical_path,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            change_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            change_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        Self::capture(&self.canonical_path).is_ok_and(|current| current == *self)
+    }
+
+    fn preview_cache_key(&self, target: LocalPreviewTarget) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(LOCAL_PREVIEW_CACHE_KEY_VERSION);
+        hash_local_thumbnail_path(&mut digest, &self.canonical_path);
+        digest.update(self.length.to_le_bytes());
+        hash_local_thumbnail_system_time(&mut digest, self.modified);
+        hash_local_thumbnail_system_time(&mut digest, self.created);
+        #[cfg(unix)]
+        {
+            digest.update(self.device.to_le_bytes());
+            digest.update(self.inode.to_le_bytes());
+            digest.update(self.change_seconds.to_le_bytes());
+            digest.update(self.change_nanoseconds.to_le_bytes());
+            digest.update(self.modified_seconds.to_le_bytes());
+            digest.update(self.modified_nanoseconds.to_le_bytes());
+        }
+        digest.update(target.width.to_le_bytes());
+        digest.update(target.height.to_le_bytes());
+        digest.finalize().into()
+    }
+}
+
+#[cfg(unix)]
+fn hash_local_thumbnail_path(digest: &mut Sha256, path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(windows)]
+fn hash_local_thumbnail_path(digest: &mut Sha256, path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let length = path.as_os_str().encode_wide().count();
+    digest.update(u64::try_from(length).unwrap_or(u64::MAX).to_le_bytes());
+    for word in path.as_os_str().encode_wide() {
+        digest.update(word.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hash_local_thumbnail_path(digest: &mut Sha256, path: &Path) {
+    let path = path.as_os_str().to_string_lossy();
+    digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(path.as_bytes());
+}
+
+fn hash_local_thumbnail_system_time(digest: &mut Sha256, time: Option<SystemTime>) {
+    let Some(time) = time else {
+        digest.update([0]);
+        return;
+    };
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => {
+            digest.update([1]);
+            digest.update(duration.as_secs().to_le_bytes());
+            digest.update(duration.subsec_nanos().to_le_bytes());
+        }
+        Err(error) => {
+            let duration = error.duration();
+            digest.update([2]);
+            digest.update(duration.as_secs().to_le_bytes());
+            digest.update(duration.subsec_nanos().to_le_bytes());
+        }
+    }
+}
+
+/// Serializes a pre-fitted image into one strictly bounded private cache
+/// record. Unsupported high-bit-depth variants are normalized to RGBA8.
+fn encode_local_preview_record(image: &DynamicImage) -> Option<Vec<u8>> {
+    let converted;
+    let (color, pixels): (u8, &[u8]) = match image {
+        DynamicImage::ImageLuma8(image) => (1, image.as_raw()),
+        DynamicImage::ImageLumaA8(image) => (2, image.as_raw()),
+        DynamicImage::ImageRgb8(image) => (3, image.as_raw()),
+        DynamicImage::ImageRgba8(image) => (4, image.as_raw()),
+        _ => {
+            converted = image.to_rgba8();
+            (4, converted.as_raw())
+        }
+    };
+    let total = LOCAL_PREVIEW_HEADER_BYTES.checked_add(pixels.len())?;
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > MAX_IMAGE_DIMENSION
+        || image.height() > MAX_IMAGE_DIMENSION
+        || total > MAX_DOWNLOAD_BYTES
+    {
+        return None;
+    }
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(LOCAL_PREVIEW_MAGIC);
+    record.extend_from_slice(&image.width().to_le_bytes());
+    record.extend_from_slice(&image.height().to_le_bytes());
+    record.push(color);
+    record.extend_from_slice(pixels);
+    Some(record)
+}
+
+/// Parses one private preview record after validating dimensions and its exact
+/// payload length before allocating an image buffer.
+fn decode_local_preview_record(bytes: &[u8]) -> Option<DynamicImage> {
+    if bytes.len() < LOCAL_PREVIEW_HEADER_BYTES
+        || bytes.len() > MAX_DOWNLOAD_BYTES
+        || bytes.get(..LOCAL_PREVIEW_MAGIC.len())? != LOCAL_PREVIEW_MAGIC
+    {
+        return None;
+    }
+    let width = u32::from_le_bytes(
+        bytes
+            .get(8..12)?
+            .try_into()
+            .expect("fixed-width preview width"),
+    );
+    let height = u32::from_le_bytes(
+        bytes
+            .get(12..16)?
+            .try_into()
+            .expect("fixed-width preview height"),
+    );
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return None;
+    }
+    let color = *bytes.get(16)?;
+    let channels = match color {
+        1 => 1_usize,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        _ => return None,
+    };
+    let expected = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(channels)?
+        .checked_add(LOCAL_PREVIEW_HEADER_BYTES)?;
+    if expected != bytes.len() {
+        return None;
+    }
+    let pixels = bytes.get(LOCAL_PREVIEW_HEADER_BYTES..)?.to_vec();
+    match color {
+        1 => GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8),
+        2 => GrayAlphaImage::from_raw(width, height, pixels).map(DynamicImage::ImageLumaA8),
+        3 => RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8),
+        4 => RgbaImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgba8),
+        _ => None,
+    }
 }
 
 /// Failure while extracting and persisting optional artwork from local media.
@@ -1536,7 +1829,9 @@ fn render_worker_request<T: ThumbnailTransport>(
     debounce: Duration,
 ) -> bool {
     let mut cache = cache;
-    if let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, &request.target) {
+    if matches!(request.target.source.scheme(), "http" | "https")
+        && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, &request.target)
+    {
         return results
             .send(WorkerResult {
                 generation: request.generation,
@@ -1553,13 +1848,30 @@ fn render_worker_request<T: ThumbnailTransport>(
     for newer in requests.try_iter() {
         request = newer;
     }
-    let result = load_thumbnail(transport, cache, picker, &request.target);
-    results
+    let loaded = load_thumbnail(transport, cache.as_deref_mut(), picker, &request.target);
+    let (result, deferred_local_preview) = match loaded {
+        Ok(LoadedThumbnail {
+            protocol,
+            deferred_local_preview,
+        }) => (Ok(protocol), deferred_local_preview),
+        Err(error) => (Err(error), None),
+    };
+    if results
         .send(WorkerResult {
             generation: request.generation,
             result,
         })
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+
+    // A cold local thumbnail becomes visible before the atomic cache write,
+    // directory sync, and eviction scan can add latency.
+    if let (Some(cache), Some(preview)) = (cache, deferred_local_preview) {
+        persist_local_preview(cache, &preview);
+    }
+    true
 }
 
 /// Fetches one background source into the persistent byte cache.
@@ -1593,8 +1905,10 @@ fn prefetch_thumbnail(
 }
 
 fn thumbnail_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .max_redirects(0)
+        .http_status_as_error(false)
         .user_agent(concat!(
             "youta/",
             env!("CARGO_PKG_VERSION"),
@@ -1602,8 +1916,29 @@ fn thumbnail_agent() -> ureq::Agent {
             env!("CARGO_PKG_REPOSITORY"),
             ")"
         ))
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::default(),
+        PublicThumbnailResolver::default(),
+    )
+}
+
+#[cfg(test)]
+fn mock_thumbnail_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::default(),
+        PublicThumbnailResolver {
+            resolver: DefaultResolver::default(),
+            allow_non_public: true,
+        },
+    )
 }
 
 fn load_thumbnail(
@@ -1611,17 +1946,19 @@ fn load_thumbnail(
     mut cache: Option<&mut ThumbnailCache>,
     picker: &Picker,
     target: &ThumbnailTarget,
-) -> Result<StatefulProtocol, ThumbnailFailure> {
+) -> Result<LoadedThumbnail, ThumbnailFailure> {
     if target.source.scheme() == "file" {
-        let image = decode_local_thumbnail(&target.source)?;
-        return encode_thumbnail(picker, target.area, image);
+        return load_local_thumbnail(cache, picker, target);
     }
 
     let persistent_cache_allowed = matches!(target.source.scheme(), "http" | "https");
     if persistent_cache_allowed
         && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, target)
     {
-        return result;
+        return result.map(|protocol| LoadedThumbnail {
+            protocol,
+            deferred_local_preview: None,
+        });
     }
 
     let bytes = transport.fetch(&target.source)?;
@@ -1629,7 +1966,77 @@ fn load_thumbnail(
     if persistent_cache_allowed && let Some(cache) = cache {
         let _ = cache.store(&target.source, &bytes);
     }
-    encode_thumbnail(picker, target.area, image)
+    encode_thumbnail(picker, target.area, image).map(|protocol| LoadedThumbnail {
+        protocol,
+        deferred_local_preview: None,
+    })
+}
+
+/// Loads one local derivative or builds a new bounded preview for this exact
+/// terminal pixel box.
+fn load_local_thumbnail(
+    mut cache: Option<&mut ThumbnailCache>,
+    picker: &Picker,
+    target: &ThumbnailTarget,
+) -> Result<LoadedThumbnail, ThumbnailFailure> {
+    let path = target
+        .source
+        .to_file_path()
+        .map_err(|()| ThumbnailFailure::InvalidSource)?;
+    let fingerprint = LocalThumbnailFingerprint::capture(&path)?;
+    let preview_target = local_preview_target(picker, target.area);
+    let cache_key = fingerprint.preview_cache_key(preview_target);
+
+    if let Some(cache) = cache.as_deref_mut()
+        && let Some(bytes) = cache.read_key(&cache_key).ok().flatten()
+    {
+        if let Some(image) = decode_local_preview_record(&bytes)
+            && fingerprint.is_current()
+        {
+            let protocol = encode_thumbnail(picker, target.area, image)?;
+            return Ok(LoadedThumbnail {
+                protocol,
+                deferred_local_preview: None,
+            });
+        }
+        cache.remove_key(&cache_key);
+    }
+
+    let image = decode_local_thumbnail_path(&fingerprint.canonical_path, preview_target)?;
+    let image = prefit_thumbnail(image, preview_target);
+    if !fingerprint.is_current() {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+    let record = cache
+        .is_some()
+        .then(|| encode_local_preview_record(&image))
+        .flatten();
+    let protocol = encode_thumbnail(picker, target.area, image)?;
+    Ok(LoadedThumbnail {
+        protocol,
+        deferred_local_preview: record.map(|record| DeferredLocalPreview {
+            cache_key,
+            record,
+            fingerprint,
+        }),
+    })
+}
+
+/// Persists one already-rendered local derivative only while its source still
+/// matches the key fingerprint.
+fn persist_local_preview(cache: &ThumbnailCache, preview: &DeferredLocalPreview) {
+    if !preview.fingerprint.is_current() {
+        return;
+    }
+    if cache
+        .store_key(&preview.cache_key, &preview.record)
+        .is_err()
+    {
+        return;
+    }
+    if !preview.fingerprint.is_current() {
+        cache.remove_key(&preview.cache_key);
+    }
 }
 
 /// Loads and encodes one validated persistent-cache entry without network I/O.
@@ -1668,6 +2075,15 @@ fn encode_thumbnail(
 }
 
 fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
+    fetch_thumbnail_with_policy(agent, source, false)
+}
+
+/// Fetches one thumbnail, optionally allowing a loopback test fixture.
+fn fetch_thumbnail_with_policy(
+    agent: &ureq::Agent,
+    source: &Url,
+    allow_non_public_test_source: bool,
+) -> Result<Vec<u8>, ThumbnailFailure> {
     if source.scheme() == "file" {
         let path = source
             .to_file_path()
@@ -1681,7 +2097,7 @@ fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, Thumbna
         }
         return fs::read(path).map_err(|_| ThumbnailFailure::DownloadFailed);
     }
-    if !is_safe_thumbnail_source(source) {
+    if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
         return Err(ThumbnailFailure::InvalidSource);
     }
     let mut response = agent
@@ -1689,6 +2105,14 @@ fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, Thumbna
         .header("Accept", "image/jpeg, image/png, image/webp")
         .call()
         .map_err(|_| ThumbnailFailure::DownloadFailed)?;
+    if !(200..300).contains(&response.status().as_u16()) {
+        return Err(ThumbnailFailure::DownloadFailed);
+    }
+    let final_url =
+        Url::parse(&response.get_uri().to_string()).map_err(|_| ThumbnailFailure::InvalidSource)?;
+    if !is_safe_remote_thumbnail_source(&final_url, allow_non_public_test_source) {
+        return Err(ThumbnailFailure::InvalidSource);
+    }
     if response
         .body()
         .content_length()
@@ -1713,28 +2137,191 @@ fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, Thumbna
 }
 
 fn is_safe_thumbnail_source(source: &Url) -> bool {
-    (matches!(source.scheme(), "http" | "https")
-        && source.username().is_empty()
-        && source.password().is_none())
+    is_safe_remote_thumbnail_source(source, false)
         || (source.scheme() == "file" && source.to_file_path().is_ok())
 }
 
-/// Decodes a regular local image without first copying the encoded file into
-/// one bounded in-memory download buffer.
-///
-/// Local encoded files have no network-download limit. Pixel dimensions and
-/// decoder allocations remain bounded by [`decode_thumbnail_reader`] so an
-/// oversized or malformed local image cannot exhaust application memory.
-fn decode_local_thumbnail(source: &Url) -> Result<DynamicImage, ThumbnailFailure> {
-    let path = source
-        .to_file_path()
-        .map_err(|()| ThumbnailFailure::InvalidSource)?;
-    let metadata = fs::symlink_metadata(&path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
-    if !metadata.file_type().is_file() {
-        return Err(ThumbnailFailure::InvalidSource);
+fn is_safe_remote_thumbnail_source(source: &Url, allow_non_public_test_source: bool) -> bool {
+    matches!(source.scheme(), "http" | "https")
+        && source.username().is_empty()
+        && source.password().is_none()
+        && source.host_str().is_some()
+        && (allow_non_public_test_source || !remote_url_has_non_public_host(source))
+}
+
+/// Converts one terminal-cell rectangle into the exact corresponding pixel
+/// box, using the terminal's detected font dimensions.
+fn local_preview_target(picker: &Picker, area: Rect) -> LocalPreviewTarget {
+    let font = picker.font_size();
+    LocalPreviewTarget {
+        width: u32::from(area.width)
+            .saturating_mul(u32::from(font.width))
+            .max(1),
+        height: u32::from(area.height)
+            .saturating_mul(u32::from(font.height))
+            .max(1),
     }
+}
+
+/// Decodes a regular local image without first copying its encoded file into
+/// a bounded network-download buffer.
+///
+/// JPEG uses decoder-side DCT scaling toward the requested terminal pixels.
+/// PNG and WebP retain [`decode_thumbnail_reader`]'s original dimension and
+/// allocation policy.
+fn decode_local_thumbnail_path(
+    path: &Path,
+    target: LocalPreviewTarget,
+) -> Result<DynamicImage, ThumbnailFailure> {
+    #[cfg(test)]
+    record_local_source_decode(path);
     let reader = ImageReader::open(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
-    decode_thumbnail_reader(reader)
+    let reader = reader
+        .with_guessed_format()
+        .map_err(|_| ThumbnailFailure::InvalidImage)?;
+    match reader.format() {
+        Some(ImageFormat::Jpeg) => decode_scaled_local_jpeg(reader.into_inner(), target),
+        Some(ImageFormat::Png | ImageFormat::WebP) => decode_thumbnail_reader(reader),
+        Some(_) => Err(ThumbnailFailure::UnsupportedFormat),
+        None => Err(ThumbnailFailure::InvalidImage),
+    }
+}
+
+#[cfg(test)]
+fn record_local_source_decode(path: &Path) {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut counts = LOCAL_SOURCE_DECODE_COUNTS
+        .lock()
+        .expect("local thumbnail decode counter");
+    if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| candidate == &path) {
+        *count = count.saturating_add(1);
+    } else {
+        counts.push((path, 1));
+    }
+}
+
+/// Uses the JPEG decoder's bounded 1/8, 1/4, or 1/2 IDCT path before the
+/// ordinary exact fit. Oversized source dimensions are accepted only when the
+/// scaled output itself remains inside Youta's existing decode budget.
+fn decode_scaled_local_jpeg<R: Read>(
+    reader: R,
+    target: LocalPreviewTarget,
+) -> Result<DynamicImage, ThumbnailFailure> {
+    let mut decoder = JpegDecoder::new(reader);
+    decoder.set_max_decoding_buffer_size(
+        usize::try_from(MAX_DECODE_ALLOC_BYTES).unwrap_or(usize::MAX),
+    );
+    decoder
+        .read_info()
+        .map_err(|_| ThumbnailFailure::InvalidImage)?;
+    let original = decoder.info().ok_or(ThumbnailFailure::InvalidImage)?;
+
+    let output = if original.coding_process == CodingProcess::Lossless {
+        original
+    } else {
+        let mut requested_width =
+            u16::try_from(target.width.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+        let mut requested_height =
+            u16::try_from(target.height.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+        loop {
+            decoder
+                .scale(requested_width.max(1), requested_height.max(1))
+                .map_err(|_| ThumbnailFailure::InvalidImage)?;
+            let scaled = decoder.info().ok_or(ThumbnailFailure::InvalidImage)?;
+            if jpeg_output_is_bounded(scaled) {
+                break scaled;
+            }
+            if requested_width == 1 && requested_height == 1 {
+                return Err(ThumbnailFailure::InvalidImage);
+            }
+            requested_width = (requested_width / 2).max(1);
+            requested_height = (requested_height / 2).max(1);
+        }
+    };
+    if !jpeg_output_is_bounded(output) {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+
+    let pixels = decoder
+        .decode()
+        .map_err(|_| ThumbnailFailure::InvalidImage)?;
+    let output = decoder.info().ok_or(ThumbnailFailure::InvalidImage)?;
+    jpeg_pixels_to_image(output, pixels)
+}
+
+/// Checks both retained output and temporary conversion bytes against the
+/// decoded-allocation budget.
+fn jpeg_output_is_bounded(info: jpeg_decoder::ImageInfo) -> bool {
+    let working_bytes_per_pixel = match info.pixel_format {
+        PixelFormat::L8 => 1_u64,
+        PixelFormat::L16 => 4,
+        PixelFormat::RGB24 => 3,
+        PixelFormat::CMYK32 => 7,
+    };
+    u32::from(info.width) <= MAX_IMAGE_DIMENSION
+        && u32::from(info.height) <= MAX_IMAGE_DIMENSION
+        && u64::from(info.width)
+            .checked_mul(u64::from(info.height))
+            .and_then(|pixels| pixels.checked_mul(working_bytes_per_pixel))
+            .is_some_and(|bytes| bytes <= MAX_DECODE_ALLOC_BYTES)
+}
+
+/// Converts one validated JPEG decoder output without another copy for the
+/// common grayscale and RGB paths.
+fn jpeg_pixels_to_image(
+    info: jpeg_decoder::ImageInfo,
+    pixels: Vec<u8>,
+) -> Result<DynamicImage, ThumbnailFailure> {
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    match info.pixel_format {
+        PixelFormat::L8 => GrayImage::from_raw(width, height, pixels)
+            .map(DynamicImage::ImageLuma8)
+            .ok_or(ThumbnailFailure::InvalidImage),
+        PixelFormat::RGB24 => RgbImage::from_raw(width, height, pixels)
+            .map(DynamicImage::ImageRgb8)
+            .ok_or(ThumbnailFailure::InvalidImage),
+        PixelFormat::L16 => {
+            let samples = pixels
+                .chunks_exact(2)
+                .map(|sample| u16::from_ne_bytes([sample[0], sample[1]]))
+                .collect::<Vec<_>>();
+            if !pixels.len().is_multiple_of(2) {
+                return Err(ThumbnailFailure::InvalidImage);
+            }
+            image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(width, height, samples)
+                .map(DynamicImage::ImageLuma16)
+                .ok_or(ThumbnailFailure::InvalidImage)
+        }
+        PixelFormat::CMYK32 => {
+            if !pixels.len().is_multiple_of(4) {
+                return Err(ThumbnailFailure::InvalidImage);
+            }
+            let mut rgb = Vec::with_capacity(pixels.len().saturating_sub(pixels.len() / 4));
+            for pixel in pixels.chunks_exact(4) {
+                let black = u16::from(255_u8.saturating_sub(pixel[3]));
+                for component in &pixel[..3] {
+                    let inverted = u16::from(255_u8.saturating_sub(*component));
+                    rgb.push(u8::try_from(inverted * black / 255).unwrap_or(u8::MAX));
+                }
+            }
+            RgbImage::from_raw(width, height, rgb)
+                .map(DynamicImage::ImageRgb8)
+                .ok_or(ThumbnailFailure::InvalidImage)
+        }
+    }
+}
+
+/// Fits a decoded image before constructing `StatefulProtocol`, preventing the
+/// protocol from retaining a full-resolution source that it will never show.
+fn prefit_thumbnail(image: DynamicImage, target: LocalPreviewTarget) -> DynamicImage {
+    let width = target.width.min(image.width()).max(1);
+    let height = target.height.min(image.height()).max(1);
+    if image.width() <= width && image.height() <= height {
+        image
+    } else {
+        image.resize(width, height, image::imageops::FilterType::Nearest)
+    }
 }
 
 fn decode_thumbnail(bytes: &[u8]) -> Result<DynamicImage, ThumbnailFailure> {
@@ -2007,8 +2594,8 @@ pub(crate) mod tests {
             .write_to(&mut png, ImageFormat::Png)
             .expect("encode fixture PNG");
         let (source, server) = serve_once("200 OK", Vec::new(), png.into_inner());
-        let bytes =
-            fetch_thumbnail(&thumbnail_agent(), &source).expect("fetch bounded fixture image");
+        let bytes = fetch_thumbnail_with_policy(&mock_thumbnail_agent(), &source, true)
+            .expect("fetch bounded fixture image");
         server.join().expect("fixture image server");
         let decoded = decode_thumbnail(&bytes).expect("decode fetched fixture");
         assert_eq!((decoded.width(), decoded.height()), (3, 2));
@@ -2022,7 +2609,7 @@ pub(crate) mod tests {
             Vec::new(),
         );
         assert_eq!(
-            fetch_thumbnail(&thumbnail_agent(), &oversized)
+            fetch_thumbnail_with_policy(&mock_thumbnail_agent(), &oversized, true)
                 .expect_err("oversized response must be rejected"),
             ThumbnailFailure::ResponseTooLarge
         );
@@ -2046,6 +2633,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn thumbnail_fetch_rejects_non_public_hosts_and_does_not_follow_redirects() {
+        for raw in [
+            "http://127.0.0.1/private.png",
+            "https://10.0.0.1/private.png",
+            "https://169.254.169.254/private.png",
+            "https://[::1]/private.png",
+            "https://artwork.local/private.png",
+            "https://artwork.service.internal/private.png",
+            "https://intranet/private.png",
+        ] {
+            let source = Url::parse(raw).expect("non-public thumbnail URL");
+            assert_eq!(
+                fetch_thumbnail(&thumbnail_agent(), &source)
+                    .expect_err("non-public thumbnail host must be rejected"),
+                ThumbnailFailure::InvalidSource,
+                "unsafe thumbnail source was accepted: {raw}"
+            );
+        }
+
+        let (redirect, server) = serve_once(
+            "302 Found",
+            vec![(
+                "Location".to_owned(),
+                "http://169.254.169.254/private.png".to_owned(),
+            )],
+            Vec::new(),
+        );
+        assert_eq!(
+            fetch_thumbnail_with_policy(&mock_thumbnail_agent(), &redirect, true)
+                .expect_err("thumbnail redirects must not be followed"),
+            ThumbnailFailure::DownloadFailed
+        );
+        server.join().expect("redirect fixture server");
+    }
+
+    #[test]
     fn local_thumbnail_streams_encoded_files_larger_than_the_remote_limit() {
         let directory = tempfile::tempdir().expect("local thumbnail directory");
         let local_path = directory.path().join("large-cover.png");
@@ -2062,10 +2685,14 @@ pub(crate) mod tests {
                 u64::try_from(MAX_DOWNLOAD_BYTES.saturating_add(1)).expect("remote limit fits u64"),
             )
             .expect("pad local image beyond remote download limit");
-        let source = Url::from_file_path(&local_path).expect("fixture file URL");
-
-        let decoded =
-            decode_local_thumbnail(&source).expect("stream local image without encoded-size limit");
+        let decoded = decode_local_thumbnail_path(
+            &local_path,
+            LocalPreviewTarget {
+                width: 100,
+                height: 100,
+            },
+        )
+        .expect("stream local image without encoded-size limit");
 
         assert_eq!((decoded.width(), decoded.height()), (3, 2));
         assert!(
@@ -2073,6 +2700,190 @@ pub(crate) mod tests {
                 .expect("local thumbnail metadata")
                 .len()
                 > MAX_DOWNLOAD_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn oversized_local_jpeg_scales_within_the_existing_decode_budget() {
+        let directory = tempfile::tempdir().expect("large local JPEG directory");
+        let local_path = directory.path().join("5663x2753.jpg");
+        write_jpeg_fixture(&local_path, 5_663, 2_753);
+        let target = LocalPreviewTarget {
+            width: 1_200,
+            height: 800,
+        };
+
+        assert_eq!(
+            decode_thumbnail_reader(
+                ImageReader::open(&local_path).expect("open oversized JPEG through image crate")
+            )
+            .expect_err("the generic decoder must retain its original dimension limit"),
+            ThumbnailFailure::InvalidImage
+        );
+
+        let scaled = decode_local_thumbnail_path(&local_path, target)
+            .expect("decoder-side scaling must accept the oversized local JPEG");
+        assert!(scaled.width() <= MAX_IMAGE_DIMENSION);
+        assert!(scaled.height() <= MAX_IMAGE_DIMENSION);
+        assert!(
+            u64::from(scaled.width())
+                .checked_mul(u64::from(scaled.height()))
+                .and_then(|pixels| pixels.checked_mul(u64::from(scaled.color().bytes_per_pixel())))
+                .is_some_and(|bytes| bytes <= MAX_DECODE_ALLOC_BYTES)
+        );
+
+        let fitted = prefit_thumbnail(scaled, target);
+        assert!(fitted.width() <= target.width);
+        assert!(fitted.height() <= target.height);
+    }
+
+    #[test]
+    fn local_preview_cache_survives_restart_without_decoding_source_again() {
+        let directory = tempfile::tempdir().expect("local preview cache directory");
+        let local_path = directory.path().join("cover.jpg");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        write_jpeg_fixture(&local_path, 1_600, 900);
+        let source = Url::from_file_path(&local_path).expect("local JPEG URL");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let mut first = local_thumbnail_manager(cache_directory.clone());
+        assert!(first.synchronize(Some(&source), area));
+        assert_eq!(wait_for_terminal_state(&mut first), ThumbnailState::Ready);
+        let cache_key = local_preview_cache_key(&local_path, area);
+        wait_for_local_preview(&cache_directory, &cache_key);
+        assert_eq!(local_source_decode_count(&local_path), 1);
+        drop(first);
+
+        let mut restarted = local_thumbnail_manager(cache_directory);
+        assert!(restarted.synchronize(Some(&source), area));
+        assert_eq!(
+            wait_for_terminal_state(&mut restarted),
+            ThumbnailState::Ready
+        );
+        assert_eq!(
+            local_source_decode_count(&local_path),
+            1,
+            "the restarted manager must decode the persisted derivative, not the source"
+        );
+    }
+
+    #[test]
+    fn local_preview_cache_invalidates_after_source_mutation() {
+        let directory = tempfile::tempdir().expect("local preview mutation directory");
+        let local_path = directory.path().join("cover.jpg");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let area = Rect::new(0, 0, 64, 20);
+        write_jpeg_fixture(&local_path, 1_200, 675);
+        render_and_wait_for_local_preview(&local_path, &cache_directory, area);
+        let old_key = local_preview_cache_key(&local_path, area);
+        assert_eq!(local_source_decode_count(&local_path), 1);
+
+        write_jpeg_fixture(&local_path, 1_280, 720);
+        let new_key = local_preview_cache_key(&local_path, area);
+        assert_ne!(old_key, new_key);
+        render_and_wait_for_local_preview(&local_path, &cache_directory, area);
+        assert_eq!(
+            local_source_decode_count(&local_path),
+            2,
+            "changed source metadata must select a new derivative key"
+        );
+    }
+
+    #[test]
+    fn corrupt_local_preview_is_removed_and_regenerated() {
+        let directory = tempfile::tempdir().expect("corrupt local preview directory");
+        let local_path = directory.path().join("cover.jpg");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let area = Rect::new(0, 0, 64, 20);
+        write_jpeg_fixture(&local_path, 1_200, 675);
+        render_and_wait_for_local_preview(&local_path, &cache_directory, area);
+        let cache_key = local_preview_cache_key(&local_path, area);
+        let cache = ThumbnailCache::new(cache_directory.clone());
+        fs::write(cache.entry_path_for_key(&cache_key), b"corrupt preview")
+            .expect("corrupt persisted local preview");
+
+        render_and_wait_for_local_preview(&local_path, &cache_directory, area);
+        assert_eq!(
+            local_source_decode_count(&local_path),
+            2,
+            "a corrupt derivative must fall back to the original local image"
+        );
+        let repaired = cache
+            .read_key(&cache_key)
+            .expect("read repaired derivative")
+            .expect("repaired derivative exists");
+        assert!(decode_local_preview_record(&repaired).is_some());
+    }
+
+    #[test]
+    fn oversized_local_png_and_webp_keep_the_generic_decode_limits() {
+        let directory = tempfile::tempdir().expect("oversized local raster directory");
+        let target = LocalPreviewTarget {
+            width: 100,
+            height: 100,
+        };
+        for (name, format) in [
+            ("oversized.png", ImageFormat::Png),
+            ("oversized.webp", ImageFormat::WebP),
+        ] {
+            let path = directory.path().join(name);
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::new_rgba8(MAX_IMAGE_DIMENSION + 1, 1)
+                .write_to(&mut bytes, format)
+                .expect("encode oversized local raster");
+            fs::write(&path, bytes.into_inner()).expect("write oversized local raster");
+            assert_eq!(
+                decode_local_thumbnail_path(&path, target)
+                    .expect_err("PNG and WebP must retain the generic dimension limit"),
+                ThumbnailFailure::InvalidImage
+            );
+        }
+    }
+
+    /// Compares source decode with the persisted derivative on a developer
+    /// supplied large image without imposing a wall-clock threshold on CI.
+    #[test]
+    #[ignore = "set YOUTA_LARGE_LOCAL_IMAGE to a large JPEG and run explicitly"]
+    fn local_preview_cache_relative_benchmark() {
+        let path = PathBuf::from(
+            std::env::var_os("YOUTA_LARGE_LOCAL_IMAGE")
+                .expect("set YOUTA_LARGE_LOCAL_IMAGE to a local JPEG path"),
+        );
+        let directory = tempfile::tempdir().expect("benchmark cache directory");
+        let cache = ThumbnailCache::new(directory.path().join("thumbnail-cache"));
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let target = ThumbnailTarget {
+            source: Url::from_file_path(&path).expect("benchmark file URL"),
+            area: Rect::new(0, 0, 120, 40),
+        };
+
+        let cold_started = Instant::now();
+        let cold = load_local_thumbnail(
+            Some(&mut ThumbnailCache::new(cache.directory.clone())),
+            &picker,
+            &target,
+        )
+        .expect("cold local preview");
+        let cold_elapsed = cold_started.elapsed();
+        let deferred = cold
+            .deferred_local_preview
+            .expect("benchmark preview fits the persistent cache");
+        persist_local_preview(&cache, &deferred);
+        drop(cold.protocol);
+
+        let warm_started = Instant::now();
+        let warm = load_local_thumbnail(
+            Some(&mut ThumbnailCache::new(cache.directory.clone())),
+            &picker,
+            &target,
+        )
+        .expect("warm local preview");
+        let warm_elapsed = warm_started.elapsed();
+        assert!(warm.deferred_local_preview.is_none());
+        eprintln!("cold={cold_elapsed:?}, warm={warm_elapsed:?}");
+        assert!(
+            warm_elapsed < cold_elapsed,
+            "the persisted derivative should avoid the source JPEG decode"
         );
     }
 
@@ -3261,6 +4072,80 @@ pub(crate) mod tests {
             );
             thread::yield_now();
         }
+    }
+
+    fn local_thumbnail_manager(cache_directory: PathBuf) -> ThumbnailManager {
+        ThumbnailManager::from_terminal_info_with_cache(
+            ThumbnailMode::Auto,
+            &graphical_terminal(),
+            Some(cache_directory),
+        )
+    }
+
+    fn local_preview_cache_key(path: &Path, area: Rect) -> [u8; 32] {
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, (9, 18));
+        LocalThumbnailFingerprint::capture(path)
+            .expect("capture local preview fixture")
+            .preview_cache_key(local_preview_target(&picker, area))
+    }
+
+    fn wait_for_local_preview(cache_directory: &Path, cache_key: &[u8]) {
+        let cache = ThumbnailCache::new(cache_directory.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if cache
+                .read_key(cache_key)
+                .expect("read local preview cache")
+                .is_some_and(|bytes| decode_local_preview_record(&bytes).is_some())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local preview was not persisted before its test deadline"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn render_and_wait_for_local_preview(path: &Path, cache_directory: &Path, area: Rect) {
+        let source = Url::from_file_path(path).expect("local preview URL");
+        let mut manager = local_thumbnail_manager(cache_directory.to_path_buf());
+        assert!(manager.synchronize(Some(&source), area));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        let cache_key = local_preview_cache_key(path, area);
+        wait_for_local_preview(cache_directory, &cache_key);
+    }
+
+    fn local_source_decode_count(path: &Path) -> usize {
+        let path = fs::canonicalize(path).expect("canonical local thumbnail fixture");
+        LOCAL_SOURCE_DECODE_COUNTS
+            .lock()
+            .expect("local thumbnail decode counts")
+            .iter()
+            .find_map(|(candidate, count)| (candidate == &path).then_some(*count))
+            .unwrap_or(0)
+    }
+
+    fn write_jpeg_fixture(path: &Path, width: u32, height: u32) {
+        let image = RgbImage::from_fn(width, height, |x, y| {
+            let mut value = x
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add(y.wrapping_mul(0x85EB_CA6B));
+            value ^= value >> 16;
+            value = value.wrapping_mul(0x7FEB_352D);
+            value ^= value >> 15;
+            image::Rgb([
+                value as u8,
+                value.rotate_left(11) as u8,
+                value.rotate_left(23) as u8,
+            ])
+        });
+        let mut jpeg = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut jpeg, ImageFormat::Jpeg)
+            .expect("encode deterministic JPEG fixture");
+        fs::write(path, jpeg.into_inner()).expect("write deterministic JPEG fixture");
     }
 
     /// Encodes a small PNG fixture for thumbnail worker tests.

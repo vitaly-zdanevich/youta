@@ -586,6 +586,93 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn tui_history_enter_reports_a_removed_local_file_without_deleting_history() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use youta::config::Config;
+    use youta::domain::{HistoryEntry, MediaId, Screen, SessionState, SourceKind};
+    use youta::persistence::StateStore;
+
+    let temporary = tempdir().expect("temporary directory");
+    let config_directory = temporary.path().join("configuration");
+    let helpers = temporary.path().join("helpers");
+    let transcript = temporary.path().join("typescript.txt");
+    let opened_links = temporary.path().join("opened-links.txt");
+    let launcher = temporary.path().join("launch-youta");
+    let removed = temporary.path().join("removed-history.opus");
+    fs::create_dir(&helpers).expect("helper directory");
+    for helper in ["mpv", "yt-dlp"] {
+        let path = helpers.join(helper);
+        fs::write(&path, "#!/bin/sh\nprintf 'mock-helper 1.0\\n'\n").expect("diagnostic helper");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("diagnostic helper permissions");
+    }
+    fs::write(
+        &launcher,
+        "#!/bin/sh\n/bin/stty cols 120 rows 40\n\
+         exec \"$YOUTA_TEST_BINARY\" --config-dir \"$YOUTA_TEST_CONFIG_DIR\" tui\n",
+    )
+    .expect("launcher fixture");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))
+        .expect("launcher permissions");
+
+    let config = Config::for_dir(&config_directory);
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .insert_history(&HistoryEntry {
+            id: 0,
+            media_id: MediaId::new(SourceKind::Local, removed.display().to_string()),
+            title: "Removed History fixture".to_owned(),
+            replay_locator: Some(removed.display().to_string()),
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 0,
+            duration_seconds: None,
+            finished: false,
+        })
+        .expect("history fixture");
+    store
+        .save_session(
+            &SessionState {
+                screen: Screen::History,
+                ..SessionState::default()
+            },
+            2,
+        )
+        .expect("History session");
+    drop(store);
+
+    let output = run_tui_session(
+        &launcher,
+        assert_cmd::cargo::cargo_bin!("youta"),
+        &config_directory,
+        &helpers,
+        &transcript,
+        &opened_links,
+        None,
+        &[(b"\r", 700), (b"\x1b", 200), (b"q", 200)],
+    );
+
+    assert!(
+        output.status.success(),
+        "TUI process failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal_output = fs::read_to_string(&transcript).expect("terminal transcript");
+    assert!(terminal_output.contains("Removed History fixture"));
+    assert!(terminal_output.contains("Removed"));
+    assert!(terminal_output.contains("History item is unavailable"));
+
+    let store = StateStore::open(&config).expect("reopen state store");
+    assert_eq!(
+        store.history(false, 10).expect("retained History").len(),
+        1,
+        "failed replay must retain the History record"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_uses_configured_helpers_only_when_features_need_them() {

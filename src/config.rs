@@ -48,6 +48,9 @@ pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
 /// Environment variable that overrides lazy Local-folder size measurement.
 pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 
+/// Environment variable that overrides the preferred Bandcamp audio format.
+pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
+
 /// Default maximum thumbnail height in terminal rows.
 pub const DEFAULT_THUMBNAIL_HEIGHT: u16 = 20;
 
@@ -466,6 +469,46 @@ impl Config {
         self.playback.autoplay = autoplay;
         Ok(())
     }
+
+    /// Persists the selected Bandcamp audio format in `config.toml`.
+    ///
+    /// Existing unrelated settings and comments are preserved.
+    /// [`BANDCAMP_AUDIO_FORMAT_ENV`] retains precedence and therefore prevents
+    /// this writer from storing a value that would immediately be shadowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the environment override is active, the existing
+    /// file is too large or malformed, or the private atomic update fails.
+    #[cfg(feature = "tui")]
+    pub fn save_bandcamp_audio_format(
+        &mut self,
+        format: BandcampAudioFormat,
+    ) -> Result<(), ConfigError> {
+        if std::env::var_os(BANDCAMP_AUDIO_FORMAT_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{BANDCAMP_AUDIO_FORMAT_ENV} overrides config.toml; change or remove it before saving this preference"
+            )));
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let providers = document
+            .as_table_mut()
+            .entry("providers")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`providers` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        providers["bandcamp_audio_format"] = value(format.as_config_value());
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.providers.bandcamp_audio_format = format;
+        Ok(())
+    }
 }
 
 /// Player and audio-output settings.
@@ -738,6 +781,8 @@ pub struct ProviderConfig {
     ///
     /// Youta does not bundle Jamendo's public documentation/testing client ID.
     pub jamendo_client_id: Option<String>,
+    /// Preferred Bandcamp stream or free-download encoding.
+    pub bandcamp_audio_format: BandcampAudioFormat,
     /// `yt-dlp` executable name or path.
     pub yt_dlp_executable: PathBuf,
     /// `mpv` executable name or path.
@@ -765,6 +810,7 @@ impl fmt::Debug for ProviderConfig {
                 "jamendo_client_id",
                 &self.jamendo_client_id.as_ref().map(|_| "[CONFIGURED]"),
             )
+            .field("bandcamp_audio_format", &self.bandcamp_audio_format)
             .field("yt_dlp_executable", &self.yt_dlp_executable)
             .field("mpv_executable", &self.mpv_executable)
             .finish()
@@ -782,9 +828,130 @@ impl Default for ProviderConfig {
             youtube_api_key: None,
             mod_archive_api_key: None,
             jamendo_client_id: None,
+            bandcamp_audio_format: BandcampAudioFormat::default(),
             yt_dlp_executable: PathBuf::from("yt-dlp"),
             mpv_executable: PathBuf::from("mpv"),
         }
+    }
+}
+
+/// Closed set of Bandcamp encodings exposed by configuration and Preferences.
+///
+/// Each variant maps to a Youta-owned static `yt-dlp` selector. Configuration
+/// deserialization therefore cannot introduce arbitrary format expressions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BandcampAudioFormat {
+    /// Prefer FLAC, then other lossless encodings, lossy download encodings,
+    /// and finally the public MP3-128 stream or extractor-selected best audio.
+    #[default]
+    #[serde(rename = "best-available")]
+    BestAvailable,
+    /// Prefer Bandcamp's FLAC download.
+    #[serde(rename = "flac")]
+    Flac,
+    /// Prefer Bandcamp's Apple Lossless download.
+    #[serde(rename = "alac")]
+    Alac,
+    /// Prefer Bandcamp's uncompressed WAV download.
+    #[serde(rename = "wav")]
+    Wav,
+    /// Prefer Bandcamp's uncompressed AIFF download.
+    #[serde(rename = "aiff")]
+    Aiff,
+    /// Prefer Bandcamp's 320 kbps MP3 download.
+    #[serde(rename = "mp3-320")]
+    Mp3Kbps320,
+    /// Prefer Bandcamp's V0 variable-bitrate MP3 download.
+    #[serde(rename = "mp3-v0")]
+    Mp3V0,
+    /// Prefer Bandcamp's high-quality AAC download.
+    #[serde(rename = "aac")]
+    Aac,
+    /// Prefer Bandcamp's Ogg Vorbis download.
+    #[serde(rename = "ogg-vorbis")]
+    OggVorbis,
+    /// Use the public MP3-128 stream, with `bestaudio` as a compatibility
+    /// fallback for extractor naming changes.
+    #[serde(rename = "public-stream-mp3-128")]
+    PublicStreamMp3Kbps128,
+}
+
+impl BandcampAudioFormat {
+    /// Formats in the stable order shown by the Preferences selector.
+    pub const ALL: [Self; 10] = [
+        Self::BestAvailable,
+        Self::Flac,
+        Self::Alac,
+        Self::Wav,
+        Self::Aiff,
+        Self::Mp3Kbps320,
+        Self::Mp3V0,
+        Self::Aac,
+        Self::OggVorbis,
+        Self::PublicStreamMp3Kbps128,
+    ];
+
+    /// Returns the human-readable Preferences label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BestAvailable => "Best available",
+            Self::Flac => "FLAC",
+            Self::Alac => "ALAC",
+            Self::Wav => "WAV",
+            Self::Aiff => "AIFF",
+            Self::Mp3Kbps320 => "MP3 320",
+            Self::Mp3V0 => "MP3 V0",
+            Self::Aac => "AAC",
+            Self::OggVorbis => "Ogg Vorbis",
+            Self::PublicStreamMp3Kbps128 => "Public stream/MP3 128",
+        }
+    }
+
+    /// Returns the stable TOML and environment representation.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::BestAvailable => "best-available",
+            Self::Flac => "flac",
+            Self::Alac => "alac",
+            Self::Wav => "wav",
+            Self::Aiff => "aiff",
+            Self::Mp3Kbps320 => "mp3-320",
+            Self::Mp3V0 => "mp3-v0",
+            Self::Aac => "aac",
+            Self::OggVorbis => "ogg-vorbis",
+            Self::PublicStreamMp3Kbps128 => "public-stream-mp3-128",
+        }
+    }
+
+    /// Returns Youta's static `yt-dlp` selector for this preference.
+    ///
+    /// Every named download encoding falls back to Bandcamp's public MP3-128
+    /// stream and then `bestaudio`. `Best available` orders FLAC first,
+    /// followed by the other lossless choices before lossy encodings.
+    #[must_use]
+    pub const fn yt_dlp_selector(self) -> &'static str {
+        match self {
+            Self::BestAvailable => {
+                "flac/wav/aiff-lossless/falac/[acodec^=alac]/mp3-320/mp3-v0/aac-hi/vorbis/mp3-128/bestaudio"
+            }
+            Self::Flac => "flac/mp3-128/bestaudio",
+            Self::Alac => "falac/[acodec^=alac]/mp3-128/bestaudio",
+            Self::Wav => "wav/mp3-128/bestaudio",
+            Self::Aiff => "aiff-lossless/mp3-128/bestaudio",
+            Self::Mp3Kbps320 => "mp3-320/mp3-128/bestaudio",
+            Self::Mp3V0 => "mp3-v0/mp3-128/bestaudio",
+            Self::Aac => "aac-hi/mp3-128/bestaudio",
+            Self::OggVorbis => "vorbis/mp3-128/bestaudio",
+            Self::PublicStreamMp3Kbps128 => "mp3-128/bestaudio",
+        }
+    }
+}
+
+impl fmt::Display for BandcampAudioFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -1002,6 +1169,10 @@ mod tests {
         assert!(config.providers.allow_insecure_http);
         assert_eq!(config.providers.youtube_backend, YouTubeBackend::Auto);
         assert!(config.providers.jamendo_client_id.is_none());
+        assert_eq!(
+            config.providers.bandcamp_audio_format,
+            BandcampAudioFormat::BestAvailable
+        );
         assert_eq!(config.database_file(), root.join("state.sqlite3"));
         assert_eq!(config.downloads_dir(), root.join("downloads"));
         assert_eq!(config.thumbnail_cache_dir(), root.join("thumbnail-cache"));
@@ -1031,6 +1202,9 @@ thumbnail_height = 14
 prefetch_search_thumbnails = false
 show_local_folder_sizes = false
 subscriptions_layout = "split"
+
+[providers]
+bandcamp_audio_format = "alac"
 "#,
         )
         .expect("write test TOML");
@@ -1048,6 +1222,10 @@ subscriptions_layout = "split"
         assert!(!config.ui.prefetch_search_thumbnails);
         assert!(!config.ui.show_local_folder_sizes);
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
+        assert_eq!(
+            config.providers.bandcamp_audio_format,
+            BandcampAudioFormat::Alac
+        );
         assert_eq!(config.config_dir(), directory.path());
     }
 
@@ -1065,6 +1243,10 @@ subscriptions_layout = "split"
             assert!(!config.ui.prefetch_search_thumbnails);
             assert!(!config.ui.show_local_folder_sizes);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
+            assert_eq!(
+                config.providers.bandcamp_audio_format,
+                BandcampAudioFormat::OggVorbis
+            );
             return;
         }
 
@@ -1091,6 +1273,7 @@ subscriptions_layout = "split"
             .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
+            .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
             .output()
             .expect("run environment test child");
         assert!(
@@ -1213,6 +1396,33 @@ youtube_api_key = "keep-this-existing-secret"
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
         assert!(reloaded.playback.autoplay);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn bandcamp_audio_format_save_preserves_unrelated_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep this comment\n[providers]\nyoutube_api_key = \"keep-this-secret\"\n",
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_bandcamp_audio_format(BandcampAudioFormat::Flac)
+            .expect("save Bandcamp format");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("youtube_api_key = \"keep-this-secret\""));
+        assert!(contents.contains("bandcamp_audio_format = \"flac\""));
+        assert_eq!(
+            config.providers.bandcamp_audio_format,
+            BandcampAudioFormat::Flac
+        );
     }
 
     #[cfg(feature = "tui")]
@@ -1349,6 +1559,54 @@ youtube_api_key = "keep-this-existing-secret"
         let mut config = Config::default();
         config.playback.speed_percent = 40;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn bandcamp_audio_format_serde_is_closed_and_stable() {
+        let expected = [
+            (BandcampAudioFormat::BestAvailable, "best-available"),
+            (BandcampAudioFormat::Flac, "flac"),
+            (BandcampAudioFormat::Alac, "alac"),
+            (BandcampAudioFormat::Wav, "wav"),
+            (BandcampAudioFormat::Aiff, "aiff"),
+            (BandcampAudioFormat::Mp3Kbps320, "mp3-320"),
+            (BandcampAudioFormat::Mp3V0, "mp3-v0"),
+            (BandcampAudioFormat::Aac, "aac"),
+            (BandcampAudioFormat::OggVorbis, "ogg-vorbis"),
+            (
+                BandcampAudioFormat::PublicStreamMp3Kbps128,
+                "public-stream-mp3-128",
+            ),
+        ];
+        for (format, value) in expected {
+            let encoded = serde_json::to_string(&format).expect("serialize format");
+            assert_eq!(encoded, format!("\"{value}\""));
+            assert_eq!(
+                serde_json::from_str::<BandcampAudioFormat>(&encoded)
+                    .expect("deserialize known format"),
+                format
+            );
+            assert_eq!(format.as_config_value(), value);
+        }
+        assert!(
+            serde_json::from_str::<BandcampAudioFormat>("\"flac/bestaudio[protocol=https]\"")
+                .is_err(),
+            "arbitrary yt-dlp expressions must not deserialize"
+        );
+    }
+
+    #[test]
+    fn invalid_bandcamp_audio_format_is_rejected_from_toml() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[providers]\nbandcamp_audio_format = \"flac/bestaudio\"\n",
+        )
+        .expect("write invalid configuration");
+
+        assert!(
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).is_err()
+        );
     }
 
     #[test]

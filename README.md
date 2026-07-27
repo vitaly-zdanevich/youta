@@ -37,11 +37,13 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   queue, history, notes, bookmarks, and playback positions beneath
   `~/.config/youta/`.
 - The Local tab browses supported media and images in place. Youta never
-  reorganizes folders automatically; only explicit Rename and Move to Trash
-  actions change a selected entry. Recursive folder sizes are enabled by
-  default, calculated asynchronously one folder at a time, and never follow
-  symbolic links. `[Z]` cycles size sorting off, ascending, and descending;
-  unknown folders remain after known sizes.
+  reorganizes folders automatically; only explicit Rename, Move to Trash, and
+  Move actions change selected entries. A durable move journal lets startup
+  finish or reconcile interrupted moves without guessing which copy is
+  authoritative. Recursive folder sizes are enabled by default, calculated
+  asynchronously one folder at a time, and never follow symbolic links. `[Z]`
+  cycles size sorting off, ascending, and descending; unknown folders remain
+  after known sizes.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. Youta does not attempt thumbnail
@@ -102,7 +104,7 @@ implement the same playback interface without changing screens or history.
 
 ## Current foundation
 
-The initial `0.1.0` work establishes:
+The current pre-alpha foundation includes:
 
 - configuration-file plus `YOUTA_` environment overrides;
 - a source-neutral domain model for media, channels, queues, positions, notes,
@@ -114,6 +116,10 @@ The initial `0.1.0` work establishes:
   details, with description-link extraction;
 - an independent YouTube Music tab that searches playable tracks through
   `yt-dlp` without requiring a YouTube Data API key;
+- an independent Bandcamp tab that searches public track and album pages and
+  resolves only the selected release for explicit playback through `yt-dlp`;
+- an independent Apple Podcasts tab that searches the public, unauthenticated
+  Apple catalogue by storefront and lazily loads playable episode metadata;
 - lazy Wikidata enrichment for exact YouTube, SoundCloud, and Bilibili
   external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
@@ -208,9 +214,10 @@ hours. Network and response errors are not negative-cache entries.
 
 Each matched entity appears once under External links as a collapsed
 `[W] 🧾▸` row. Activating that row lazily requests the entity's bounded,
-human-readable statements and expands them in the scrollable Details pane;
-activating `[W] 🧾▾` collapses the spoiler again. Property data is not fetched
-for entities the user never expands.
+human-readable statements plus canonical Wikipedia article sitelinks and
+expands them in the scrollable Details pane. Statement values and Wikipedia
+rows retain validated clickable targets. Activating `[W] 🧾▾` collapses the
+spoiler again. Entity data is not fetched for items the user never expands.
 
 This is exact-ID enrichment, not title, name, or arbitrary-URL matching.
 YouTube video IDs come from validated links, bare IDs, or search results;
@@ -224,7 +231,7 @@ not resolve `b23.tv` or other redirect hosts before Wikidata lookup.
 
 ## Build and run
 
-Youta requires Rust 1.90 or newer.
+Youta requires Rust 1.95 or newer.
 
 Build an optimized binary and start Youta with one command:
 
@@ -325,7 +332,7 @@ it will save the key and applies user-only Unix permissions, but environment
 injection avoids storing it in `config.toml`. A system-keyring adapter and
 explicit secret references are roadmap work.
 
-## YouTube, the official API, Invidious, and `yt-dlp`
+## Online discovery and `yt-dlp`
 
 These are distinct integration modes:
 
@@ -357,9 +364,40 @@ These are distinct integration modes:
   containers but retains only playable track-level video IDs, with strict
   process, output, timeout, and result limits. Its query, results, and selected
   row are saved independently from the normal YouTube and MOD/tracker tabs.
+  Search runs on a capacity-one latest-only worker, so a slow `yt-dlp` search
+  cannot delay general YouTube provider requests.
   When an official or Invidious metadata provider is configured, it may enrich
   the selected track with full public video details; basic music search and
   playback remain keyless.
+- The separate **Apple Podcasts** tab uses Apple's documented,
+  unauthenticated [iTunes Search
+  API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html)
+  to discover podcast shows. Apple documents podcast-show search, but not
+  episode search or result pagination, so Youta keeps one bounded ranked
+  result set and, only after Enter, loads the bounded associated episodes Apple
+  returns from its documented lookup. Youta preserves Apple's returned order
+  without claiming that this is a complete or newest-first episode list. The
+  same tab accepts official Apple Podcasts show and episode URLs; direct
+  episodes play from their public RSS enclosure, while direct shows open the
+  same bounded episode view and preserve Back navigation. The storefront,
+  query, show results, and selected row are cached independently across
+  restarts. No Apple account, API key, or played-status synchronization is
+  implied. Apple API redirects stay on the exact original origin. Returned
+  feed, artwork, and enclosure URLs reject non-public literals and obvious
+  local-only names; Youta does not fetch the returned feed. Thumbnail fetches
+  also require public DNS results and reject redirects. Enclosures are handed
+  to the external playback backend, which owns later media DNS and redirects.
+- The separate **Bandcamp** tab performs bounded, best-effort searches of
+  Bandcamp's public HTTPS search page and accepts only canonical track and
+  album pages on artist or label subdomains. Search persists the query, current
+  page, advertised next page, compact public metadata, and selected row, but
+  never a resolved stream. Pressing Enter resolves only the selected release
+  through a bounded `yt-dlp` worker. It passes no cookies and does not provide
+  access to authenticated purchases; resolved media URLs and headers remain in
+  RAM. A canonical `https://artist.bandcamp.com/track/...` or `/album/...`
+  input opens directly in this first-class tab without issuing a text search.
+  Public-page search has its own capacity-one latest-only worker and cannot
+  hold the general YouTube provider lane.
 - `[N] Sort: relevance/newest` changes the order and reloads the current
   YouTube search. The official adapter sends `order=date` for newest-first
   searches. Invidious currently
@@ -378,9 +416,9 @@ These are distinct integration modes:
   licence terms, and instance behavior can depend on its deployed version, so
   Youta still loads and displays the selected video's licence metadata before
   offering a Commons workflow. The toggle applies to videos, not channels.
-- Both adapters provide discovery and metadata only. Online playback remains
-  the independent `yt-dlp` resolver plus the invisible `mpv` backend; the
-  YouTube API key is not a playback credential.
+- The official YouTube and Invidious adapters provide discovery and metadata
+  only. Online playback remains the independent `yt-dlp` resolver plus the
+  invisible `mpv` backend; the YouTube API key is not a playback credential.
 - The official [YouTube API developer
   policies](https://developers.google.com/youtube/terms/developer-policies)
   prohibit API clients from downloading or offering offline playback of
@@ -393,6 +431,15 @@ These are distinct integration modes:
   configurable tools. Their availability and site compatibility can change.
   Users are responsible for the terms, copyright, and laws that apply to media
   they access.
+
+Bandcamp audio defaults to **Best available** (`best-available`). The `[b]`
+control in the `[p]` Preferences popup cycles the same closed set accepted by
+`providers.bandcamp_audio_format` and
+`YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT`: `best-available`, `flac`, `alac`,
+`wav`, `aiff`, `mp3-320`, `mp3-v0`, `aac`, `ogg-vorbis`, and
+`public-stream-mp3-128`. These are Youta-owned selectors, not arbitrary
+`yt-dlp` format expressions. A requested encoding remains a preference:
+availability depends on the public release and the installed extractor.
 
 Youta passes validated URLs and an allowlisted argument set directly to
 `yt-dlp`; it does not construct a shell command. It does not import browser
@@ -439,8 +486,11 @@ On a Linux virtual console, serial terminal, `TERM=dumb`, or a terminal without
 one of those image protocols, Youta neither fetches nor renders artwork. The
 detail panel remains text-only. Accepted remote images are limited to bounded
 JPEG, PNG, and WebP input before decoding, which prevents unbounded downloads
-and image allocations. These gates avoid stray escape sequences and reduce
-network traffic, decoding work, memory use, heat, and battery consumption.
+and image allocations. Remote image fetches reject non-public literal and
+DNS-resolved addresses, `.local`, `.internal`, and single-label hosts;
+redirects are not followed. These gates avoid stray escape sequences and
+reduce network traffic, decoding work, memory use, heat, and battery
+consumption.
 
 Configure the runtime policy in `~/.config/youta/config.toml`:
 
@@ -613,9 +663,11 @@ snapshot, so playback resolves a fresh stream from the canonical video page.
 The detailed disk bounds are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
 
-Persistent writes stay under `~/.config/youta/`; transient IPC sockets may use
-the operating system's runtime directory. Downloads also default to a
-Youta-owned subdirectory rather than a media source folder.
+Application-owned persistent state stays under `~/.config/youta/`; transient
+IPC sockets may use the operating system's runtime directory. The Local tab's
+explicit Rename, Move to Trash, and Move actions are the only operations that
+mutate selected source entries. Downloads default to a Youta-owned subdirectory
+rather than a media source folder.
 
 Automatic Git commits and pushes are a roadmap feature and will be opt-in.
 The safer design batches an atomic state change, excludes secrets and media,
@@ -629,20 +681,23 @@ The roadmap is intentionally tiered:
 
 1. **Core:** local audio/video, RSS and OPML, radio/BBC feeds, official
    YouTube metadata, Invidious, PeerTube, Funkwhale, direct
-   Vimeo/RuTube/SoundCloud URLs, tracker modules, generic `yt-dlp`, `mpv`, and
-   search/history/queue/download state.
+   Vimeo/RuTube/SoundCloud URLs, Apple Podcasts catalogue search, Bandcamp
+   public track/album discovery and playback, tracker modules, generic
+   `yt-dlp`, `mpv`, and search/history/queue/download state.
 2. **Open-data integrations:** SponsorBlock, DeArrow, broader Wikidata
    discovery, Wikimedia Commons, Internet Archive, LibriVox, Podcast Index,
    and gpodder.net.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
    bidirectional local/YouTube subscription sync, Last.fm, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
-4. **Experimental adapters:** Apple Podcasts catalog search, Bandcamp, Odysee,
-   Rumble, Bilibili, Telegram, Yandex services, VK, cloud.mail.ru, 4duk,
-   knizhnyvoz, archive files, and torrent-backed sources.
+4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex
+   services, VK, cloud.mail.ru, 4duk, knizhnyvoz, archive files, and
+   torrent-backed sources.
 
-Proprietary or scraper-dependent providers are not promised until an adapter
-has tests, documented authentication, rate limiting, and a maintenance owner.
+Additional proprietary or scraper-dependent providers are not promised until
+an adapter has tests, documented authentication, rate limiting, and a
+maintenance owner. The implemented Bandcamp public-page adapter remains
+best-effort and makes no stability or authenticated-access claim.
 RuTracker/torrent support is a separate build feature and must remain stopped
 when Youta exits. Youta will not bypass access controls or digital-rights
 management.
@@ -732,15 +787,17 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
-required live Apple Podcasts and Wikidata jobs; a newer push does not cancel
-the older revision's suite. Clippy blocks compiler hygiene plus its correctness,
-suspicious-code, and performance groups; style, complexity, and pedantic
-findings remain visible as advisory output while that backlog is reduced in
-focused changes. Apple Podcasts is checked from public Apple metadata through
-its RSS enclosure and silent audio decode. Wikidata is checked through a live
-exact P1651 lookup. Each enabled live job retries once for a transient network
-failure; a second failure fails CI. Tagged releases build on native amd64 and
-arm64 runners and publish:
+required live Apple Podcasts, keyless YouTube Music, and Wikidata jobs; a newer
+push does not cancel the older revision's suite. Clippy blocks compiler hygiene
+plus its correctness, suspicious-code, and performance groups; style,
+complexity, and pedantic findings remain visible as advisory output while that
+backlog is reduced in focused changes. Apple Podcasts is checked from public
+Apple metadata through its RSS enclosure and silent audio decode. YouTube Music
+is checked through yt-dlp's public songs search with a 15-second process bound
+and no Google API key. Wikidata is checked through a live exact P1651 lookup.
+Each enabled live job retries once for a transient network failure; a second
+failure fails CI. Tagged releases build on native amd64 and arm64 runners and
+publish:
 
 - a binary archive for each architecture; and
 - a Cargo vendor archive for offline/external build systems.
@@ -763,6 +820,12 @@ opt-in live check:
 
 ```sh
 YOUTA_RUN_LIVE_YOUTUBE_CHANNEL_TEST=1 cargo test --locked --test live_services --all-features -- --ignored --exact youtube_channel_about_profile_is_usable --nocapture
+```
+
+Run the same keyless YouTube Music search check locally with:
+
+```sh
+YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
 ```
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and
