@@ -31,6 +31,8 @@ pub mod litres;
 pub mod modarchive;
 #[cfg(feature = "peertube")]
 pub mod peertube;
+#[cfg(feature = "radio")]
+pub mod radio;
 #[cfg(feature = "rss")]
 pub mod rss;
 #[cfg(feature = "soundstream")]
@@ -923,6 +925,7 @@ pub fn validate_youtube_video_id(video_id: &str) -> Result<(), ProviderError> {
     feature = "jamendo",
     feature = "litres",
     feature = "peertube",
+    feature = "radio",
     feature = "sponsorblock",
     feature = "tracker-music",
     feature = "wikidata",
@@ -948,6 +951,7 @@ pub(crate) fn provider_agent(timeout: Duration) -> ureq::Agent {
     feature = "invidious",
     feature = "jamendo",
     feature = "peertube",
+    feature = "radio",
     feature = "soundstream",
     feature = "sponsorblock",
     feature = "wikidata"
@@ -999,6 +1003,7 @@ pub(crate) fn get_bounded_json<T: serde::de::DeserializeOwned>(
     feature = "invidious",
     feature = "jamendo",
     feature = "peertube",
+    feature = "radio",
     feature = "soundstream",
     feature = "sponsorblock",
     feature = "wikidata"

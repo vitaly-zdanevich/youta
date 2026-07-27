@@ -15,9 +15,13 @@ current binary supports it.
 2. **Keep external `mpv` first.** JSON IPC provides playback events and
    commands while Youta owns the screen and seek bar. This gives mature codec
    and ALSA support without embedding a second UI.
-3. **Use OPML as interchange, SQLite as truth.** OPML migrates feeds and folder
-   outlines; it cannot safely represent private notes, history, bookmarks, and
-   playback positions.
+3. **Use OPML for subscriptions and human-readable TOML for default state.**
+   OPML migrates feeds and folder outlines but has no standard representation
+   for private notes, history, bookmarks, or playback positions. Deterministic
+   TOML split across `state/progress.toml`, `history.toml`, `notes.toml`,
+   `bookmarks.toml`, `statistics.toml`, and `playlists.toml` is the default
+   source of truth; SQLite is an optional alternative selected with
+   `sqlite-state`.
 4. **Do not render thumbnails on an unsupported TTY.** Terminal graphics are
    optional runtime capabilities, not an assumption.
 5. **Stage providers.** Shipping dozens of brittle adapters together would
@@ -27,6 +31,20 @@ current binary supports it.
    selection and visible signal-path controls belong in Youta; CPU governor,
    scheduler, and kernel tuning remain documented, external, reversible user
    choices.
+
+The file backend also has an implemented single-writer rule: Youta holds an
+exclusive `state/.lock` while it is open. Users should close Youta before
+editing human-readable state so in-memory data cannot overwrite a manual edit.
+
+Private notes are implemented as one 16 KiB UTF-8 note per exact
+provider-qualified media or source target. The `m` action opens a multiline
+Add/Edit/Delete popup for videos, tracks, podcast episodes, direct-source media,
+local files, channels, Bandcamp releases, subscriptions, and podcast shows.
+Downloaded, History, and playlist selections reuse the underlying media target
+instead of creating screen-specific notes. The existing-note action is visibly
+highlighted, and both TOML and optional SQLite persistence survive restart.
+General multi-note notebooks, rich text, and remote note synchronization remain
+roadmap work.
 
 ## YouTube capability matrix
 
@@ -57,9 +75,10 @@ adapter is compiled, then falls back to Invidious. The TUI and CLI search paths
 share this selection.
 
 Attempting a TUI search with neither provider configured opens a setup popup
-for either value. It displays the exact `config.toml` destination before
-saving. On Unix, the save uses mode `0700` for its directory and `0600` for the
-file; an API key stored there is plaintext.
+for either value. It displays both exact destinations before saving:
+`secrets/credentials.toml` for a YouTube API key and `config.toml` for an
+Invidious instance URL. On Unix, the save uses mode `0700` for private
+directories and `0600` for files; a stored API key is plaintext.
 `YOUTA_PROVIDERS__YOUTUBE_API_KEY` overrides the saved value. This API path is
 metadata-only: `yt-dlp` still resolves media and the invisible `mpv` process
 still performs playback.
@@ -112,9 +131,9 @@ statements in the public [Wikidata Query Service
 The request is lazy: selecting a YouTube video/channel result, or opening a
 recognized SoundCloud/Bilibili direct link, triggers it. Startup does not.
 Queries run outside the render loop and responses are bounded to 512 KiB and
-20 bindings. SQLite caches a successful positive result for seven days and a
-successful empty result for 24 hours; transport and malformed-response failures
-are not cached as “not found.”
+20 bindings. The selected persistence backend caches a successful positive
+result for seven days and a successful empty result for 24 hours; transport
+and malformed-response failures are not cached as “not found.”
 
 URL extraction is intentionally strict. SoundCloud recognizes canonical
 `soundcloud.com`, `www.soundcloud.com`, or `m.soundcloud.com` links with one
@@ -172,19 +191,29 @@ YouTube does not guarantee Internet Archive scope or ownership.
 | --- | --- | --- |
 | RSS/Atom | Core | Feed URL is canonical; enclosure media and Podcasting 2.0 chapters can be optional enhancements. |
 | Apple Podcasts | Catalog search then RSS | Search is feasible; Apple playback-position/subscription sync has no suitable public cross-platform API. |
-| gpodder.net | Tier 1 | Device/subscription and episode-action APIs fit optional sync; local state remains authoritative. |
+| gpodder.net | Tier 1 | Device/subscription APIs plus JSON episode actions (`started`, `position`, `total`, and `timestamp`) fit optional import/export/sync; TOML state remains authoritative. |
 | Podcast Index | Tier 1 | Broad search with API credentials and attribution requirements. |
 | Wikidata | Enrichment | Useful linked-data search, not complete enough as the only catalog. |
 | LibriVox | Tier 1 | Open catalog and public-domain recordings; retain author/reader/license metadata. |
 | Wikimedia Commons | Tier 1 | Category/API search plus structured-data enrichment. |
 | Internet Archive | Tier 1 | Advanced search and metadata APIs; stream formats vary. |
-| Online radio | Core/Tier 1 | Direct streams and playlist files first; Radio Browser is a useful open catalog. |
+| Online radio | Implemented core | The account-free `radio` feature uses a static, zero-startup-network catalogue of reviewed direct streams and M3U entry points. A dynamic Radio Browser adapter remains optional future discovery work. |
 | BBC Radio | Core adapter | Official podcast/RSS feeds use the RSS path; BBC Sounds landing URLs can resolve through `yt-dlp`. Do not assume a stable public Sounds catalog API. |
 | Funkwhale | Core adapter | Configurable pods expose a stable REST API and an administrator-controlled subset of Subsonic. Keep pod identity and rate limits explicit. |
 | [Jamendo](https://developer.jamendo.com/v3.0/tracks) | Core music adapter | Official v3 track search and lookup require a user-provided application client ID. Keep requests and pagination bounded, use only HTTPS media links, preserve the exact `license_ccurl`, and expose `audiodownload` only when `audiodownload_allowed` is true. CC-NC and CC-ND metadata is not a Wikimedia Commons eligibility decision. |
 | [LitRes podcasts](https://docs.litres.ru/public/39063068.html) | Opt-in catalog adapter | Documented CataLit search/details/episode calls require a LitRes-issued application ID and secret and use only the documented anonymous session. Pace calls to one per second. Parse exact public pages only for bounded schema.org metadata and explicit unsigned media; never synthesize podcast download URLs from file IDs or access login-, payment-, DRM-, or signature-gated files. |
 | Local folders | Core | Read metadata and artwork without moving files; watch/rescan is configurable. |
 | ZIP/RAR | Experimental | Index safely, cap expansion, reject traversal/symlinks, and stream/extract only beneath Youta staging. RAR may need an external tool. |
+
+OPML remains the portable subscription-list format, not a progress format.
+gPodder's episode-actions protocol is the closest interoperable model for
+podcast progress: a `play` JSON action identifies the feed and enclosure and
+can carry `started`, `position`, `total`, and `timestamp`. Youta can map local
+current position, known duration, and update time to the latter three fields
+and capture the per-play start offset for `started`, without forcing
+non-podcast media into a podcast protocol. See the
+[gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
+and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
 
 Additional good targets are Audiobookshelf, OpenSubsonic, ListenBrainz,
 MusicBrainz, and public-library OPDS catalogs. Every catalog result still needs
@@ -212,7 +241,7 @@ metadata worker.
 | Yandex Music/podcasts | Token-based unofficial ecosystem | Experimental; user-supplied token, no bundled credentials. |
 | VK audio/video | Restricted and account-sensitive APIs | Defer until a documented lawful API route and scopes are verified. |
 | knizhnyvoz.com | Site-specific scraping | Defer; author navigation is feasible but brittle and needs permission/robots review. |
-| 4duk.ru | Site-specific files/live stream | Defer until endpoints, rights, and stability are documented. |
+| 4duk.ru | Public MP3 live stream plus bounded current-track JSON | Implemented in the static Radio catalogue. Keep its published HTTP stream/metadata warning visible, send no credentials, retry passive metadata with capped backoff, and do not infer an open-content licence. |
 | cloud.mail.ru | Proprietary storage API | Experimental only after OAuth/auth flow review. |
 | Telegram channel audio | Telegram client protocol | Use a local user-authorized client such as TDLib, not an AWS Lambda proxy holding user sessions. Bots cannot read arbitrary channel history. |
 | RuTracker/torrents | Sequential torrent streaming | Technically feasible but legally and operationally high-risk. Separate disabled-by-default feature; enforce shutdown and configurable seeding. |
@@ -286,7 +315,7 @@ References:
 
 | Target | Feasibility | First safe scope |
 | --- | --- | --- |
-| Git repository | Feasible | One-way export/commit/push of allowlisted portable state; never tokens, WAL files, caches, or media by default. |
+| Git repository | Implemented locally | On successful graceful shutdown, path-scoped `git add .`, commit `Automatic state update`, and push; never pull. Existing `.gitignore` rules decide what is included. |
 | Google Drive | Feasible with OAuth | Separate one-way state backup and optional media backup. Remote-folder playback uses a cache. |
 | WebDAV | Feasible | One-way upload with ETag/precondition checks. |
 | SSH/SFTP | Feasible | Host-key verification required; no automatic trust-on-first-use in unattended mode. |
@@ -294,10 +323,12 @@ References:
 | Evernote | Feasible with API limits | Saving a rich item is separate from configuration sync. A single-note append model needs size/conflict handling. |
 
 “Sync only to Evernote and never fetch” is backup, not sync, and should be named
-accordingly. Likewise, a git push after every small position write would create
-commit storms. The proposed default is an append-only local change journal plus
-debounced, atomic exports; strict per-change commits can remain an advanced
-option.
+accordingly. Youta avoids commit storms by attempting Git synchronization only
+after a successful graceful shutdown, rather than after every position write.
+It creates a default `.gitignore` for credentials and generated data only when
+the root has none. Users remain in control: edited or removed ignore rules are
+honored, and Youta does not refuse a commit merely because it would include an
+API key.
 
 Remote media locations are read-only sources unless the user explicitly selects
 backup/upload. Encrypted keyring references are portable only as names; a new
@@ -334,9 +365,10 @@ packet boundaries and must say so.
 - Leaving a YouTube comment is feasible with OAuth and explicit confirmation.
 - YouTube and Apple Podcasts played-position synchronization is not available
   through suitable public APIs; keep it local.
-- Caption text can be indexed in SQLite FTS after language/source attribution.
-  An external transcription model is an optional local/remote effect when no
-  caption is available.
+- Caption text can use a backend-specific text index after language/source
+  attribution; SQLite FTS is one optional implementation. An external
+  transcription model is an optional local/remote effect when no caption is
+  available.
 - Hashtags and media links are internal typed actions; external links require a
   browser/open confirmation appropriate to the terminal environment.
 
@@ -362,9 +394,9 @@ SQL fragment, shell string, or URL without normalization for that sink.
 
 ### Phase 0 — foundation
 
-Configuration, domain model, SQLite/OPML, TUI state, official YouTube Data API
-and Invidious discovery, description links, external `mpv` IPC, `yt-dlp`
-supervision, and diagnostics.
+Configuration, domain model, default TOML state, optional SQLite, OPML
+subscriptions, TUI state, official YouTube Data API and Invidious discovery,
+description links, external `mpv` IPC, `yt-dlp` supervision, and diagnostics.
 
 ### Phase 1 — useful local player
 

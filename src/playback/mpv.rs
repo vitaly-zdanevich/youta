@@ -25,14 +25,18 @@ mod unix {
     const MAX_PENDING_EVENTS: usize = 32;
     const MAX_WARNING_LINES: usize = 12;
     const MAX_DIAGNOSTIC_CHARS: usize = 512;
+    const MAX_STREAM_TITLE_BYTES: usize = 512;
     const MAX_RESOLVED_HTTP_HEADERS: usize = 32;
     const MAX_RESOLVED_HTTP_HEADER_BYTES: usize = 16 * 1024;
+    const ICY_TITLE_OBSERVER_ID: u64 = 1;
+    const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
 
     struct MpvIpc {
         reader: BufReader<UnixStream>,
         request_id: u64,
         events: VecDeque<PlaybackEvent>,
         warnings: VecDeque<String>,
+        stream_title: Option<String>,
     }
 
     /// Headless mpv playback backend.
@@ -83,12 +87,7 @@ mod unix {
                 profile: config.profile,
                 process_exit_reported: false,
             };
-            // mpv's JSON IPC log stream contains the authoritative extractor,
-            // decoder, and audio-output failure text that otherwise occurs
-            // after `loadfile` has already been acknowledged.
-            backend
-                .ipc
-                .send(&[json!("request_log_messages"), json!("warn")])?;
+            configure_ipc(&mut backend.ipc)?;
             Ok(backend)
         }
 
@@ -146,6 +145,7 @@ mod unix {
                 request_id: 0,
                 events: VecDeque::new(),
                 warnings: VecDeque::new(),
+                stream_title: None,
             }
         }
 
@@ -188,6 +188,11 @@ mod unix {
 
         fn handle_event(&mut self, message: &Value) {
             match message.get("event").and_then(Value::as_str) {
+                Some("start-file") => {
+                    // mpv may retain the previous file's metadata until the
+                    // replacement stream publishes its first property event.
+                    self.stream_title = None;
+                }
                 Some("file-loaded") => self.push_event(PlaybackEvent::MediaLoaded),
                 Some("playback-restart") => self.push_event(PlaybackEvent::PlaybackStarted),
                 Some("end-file") => {
@@ -206,12 +211,23 @@ mod unix {
                         .or_else(|| event_text(message, "file-error"));
                     let diagnostic = self.diagnostic();
                     self.warnings.clear();
+                    self.stream_title = None;
                     self.push_event(PlaybackEvent::Ended(PlaybackEnd {
                         reason,
                         error,
                         file_error,
                         diagnostic,
                     }));
+                }
+                Some("property-change")
+                    if message.get("id").and_then(Value::as_u64) == Some(ICY_TITLE_OBSERVER_ID)
+                        && message.get("name").and_then(Value::as_str)
+                            == Some(ICY_TITLE_PROPERTY) =>
+                {
+                    self.stream_title = message
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_stream_title);
                 }
                 Some("log-message") => self.capture_warning(message),
                 _ => {}
@@ -267,6 +283,32 @@ mod unix {
         }
     }
 
+    /// Enables the bounded mpv event streams consumed by Youta.
+    fn configure_ipc(ipc: &mut MpvIpc) -> Result<()> {
+        for command in ipc_configuration_commands() {
+            ipc.send(&command)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the deterministic subscriptions installed on every mpv process.
+    fn ipc_configuration_commands() -> [Vec<Value>; 2] {
+        // mpv's JSON IPC log stream contains the authoritative extractor,
+        // decoder, and audio-output failure text that otherwise occurs after
+        // `loadfile` has already been acknowledged.
+        // ICY title changes arrive on the existing audio connection.
+        // Observing the property avoids another stream or HTTP poll and keeps
+        // status reads cheap on low-power systems.
+        [
+            vec![json!("request_log_messages"), json!("warn")],
+            vec![
+                json!("observe_property"),
+                json!(ICY_TITLE_OBSERVER_ID),
+                json!(ICY_TITLE_PROPERTY),
+            ],
+        ]
+    }
+
     fn event_text(message: &Value, field: &str) -> Option<String> {
         message
             .get(field)
@@ -295,6 +337,7 @@ mod unix {
                         | "stop"
                         | "quit"
                         | "request_log_messages"
+                        | "observe_property"
                 )
             })
             .unwrap_or("unknown");
@@ -360,6 +403,44 @@ mod unix {
             .collect::<String>();
         bounded.push('…');
         bounded
+    }
+
+    /// Normalizes untrusted ICY text for one terminal line.
+    fn normalize_stream_title(message: &str) -> Option<String> {
+        let mut normalized = String::new();
+        let mut pending_space = false;
+        let mut truncated = false;
+        for character in message.chars() {
+            if character.is_control() || character.is_whitespace() {
+                pending_space = !normalized.is_empty();
+                continue;
+            }
+            let separator_bytes = usize::from(pending_space && !normalized.is_empty());
+            if normalized
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(character.len_utf8())
+                > MAX_STREAM_TITLE_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            if separator_bytes == 1 {
+                normalized.push(' ');
+            }
+            normalized.push(character);
+            pending_space = false;
+        }
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("(error)") {
+            return None;
+        }
+        if truncated {
+            while normalized.len().saturating_add('…'.len_utf8()) > MAX_STREAM_TITLE_BYTES {
+                normalized.pop();
+            }
+            normalized.push('…');
+        }
+        Some(normalized)
     }
 
     fn parse_buffered_ranges(cache_state: &Value) -> Vec<BufferedRange> {
@@ -594,6 +675,9 @@ mod unix {
                     "media location cannot be empty".to_owned(),
                 ));
             }
+            // Do not show metadata retained from the previous stream while
+            // mpv is loading a replacement.
+            self.ipc.stream_title = None;
             self.send(&loadfile_command(input)?)?;
             Ok(())
         }
@@ -701,6 +785,7 @@ mod unix {
             let title = self
                 .property("media-title")?
                 .and_then(|value| value.as_str().map(ToOwned::to_owned));
+            let stream_title = self.ipc.stream_title.clone();
 
             Ok(PlaybackStatus {
                 idle,
@@ -713,6 +798,7 @@ mod unix {
                 buffering,
                 buffered_ranges,
                 title,
+                stream_title,
             })
         }
 
@@ -877,6 +963,21 @@ mod unix {
                 .expect("mock IPC request");
             server_thread.join().expect("mock IPC server");
             ipc
+        }
+
+        #[test]
+        fn ipc_configuration_includes_the_icy_title_subscription() {
+            assert_eq!(
+                ipc_configuration_commands(),
+                [
+                    vec![json!("request_log_messages"), json!("warn")],
+                    vec![
+                        json!("observe_property"),
+                        json!(ICY_TITLE_OBSERVER_ID),
+                        json!(ICY_TITLE_PROPERTY),
+                    ],
+                ]
+            );
         }
 
         fn backend_with_properties(
@@ -1316,6 +1417,7 @@ mod unix {
                     ],
                 }),
             )]);
+            backend.ipc.stream_title = Some("Artist — Work".to_owned());
 
             let status = backend.status().expect("mock mpv status");
 
@@ -1332,8 +1434,83 @@ mod unix {
                     },
                 ]
             );
+            assert_eq!(status.stream_title.as_deref(), Some("Artist — Work"));
             backend.shutdown().expect("shut down mock backend");
             server_thread.join().expect("mock status server");
+        }
+
+        #[test]
+        fn icy_property_changes_are_normalized_bounded_and_clearable() {
+            let (client, _server) = UnixStream::pair().expect("mock IPC pair");
+            let mut ipc = MpvIpc::new(client);
+            ipc.handle_event(&json!({
+                "event": "property-change",
+                "id": ICY_TITLE_OBSERVER_ID,
+                "name": ICY_TITLE_PROPERTY,
+                "data": "  Artist\u{0}\n  Work  ",
+            }));
+            assert_eq!(ipc.stream_title.as_deref(), Some("Artist Work"));
+
+            let oversized = "é".repeat(MAX_STREAM_TITLE_BYTES);
+            ipc.handle_event(&json!({
+                "event": "property-change",
+                "id": ICY_TITLE_OBSERVER_ID,
+                "name": ICY_TITLE_PROPERTY,
+                "data": oversized,
+            }));
+            let bounded = ipc
+                .stream_title
+                .as_deref()
+                .expect("oversized title remains available in bounded form");
+            assert!(bounded.len() <= MAX_STREAM_TITLE_BYTES);
+            assert!(bounded.ends_with('…'));
+
+            ipc.handle_event(&json!({
+                "event": "property-change",
+                "id": ICY_TITLE_OBSERVER_ID,
+                "name": ICY_TITLE_PROPERTY,
+                "data": null,
+            }));
+            assert_eq!(ipc.stream_title, None);
+
+            ipc.handle_event(&json!({
+                "event": "property-change",
+                "id": ICY_TITLE_OBSERVER_ID,
+                "name": ICY_TITLE_PROPERTY,
+                "data": "(error)",
+            }));
+            assert_eq!(
+                ipc.stream_title, None,
+                "mpv's missing-property marker is not station metadata"
+            );
+        }
+
+        #[test]
+        fn unrelated_property_events_cannot_replace_the_icy_title() {
+            let (client, _server) = UnixStream::pair().expect("mock IPC pair");
+            let mut ipc = MpvIpc::new(client);
+            ipc.stream_title = Some("retained".to_owned());
+
+            for message in [
+                json!({
+                    "event": "property-change",
+                    "id": ICY_TITLE_OBSERVER_ID + 1,
+                    "name": ICY_TITLE_PROPERTY,
+                    "data": "wrong observer",
+                }),
+                json!({
+                    "event": "property-change",
+                    "id": ICY_TITLE_OBSERVER_ID,
+                    "name": "media-title",
+                    "data": "wrong property",
+                }),
+            ] {
+                ipc.handle_event(&message);
+            }
+
+            assert_eq!(ipc.stream_title.as_deref(), Some("retained"));
+            ipc.handle_event(&json!({"event": "start-file"}));
+            assert_eq!(ipc.stream_title, None);
         }
 
         #[test]

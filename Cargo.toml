@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -42,6 +42,9 @@ default = [
     "backend-mpv",
     "yt-dlp",
 ]
+
+# Optional SQLite persistence for users who prefer one transactional database.
+sqlite-state = ["dep:rusqlite"]
 
 # User interface and playback backends.
 tui = [
@@ -93,7 +96,7 @@ litres = ["network", "dep:sha2"]
 podcast-index = ["rss"]
 gpodder = ["rss"]
 radio = ["network"]
-bbc-radio = ["radio", "yt-dlp"]
+bbc-radio = ["yt-dlp"]
 funkwhale = ["network"]
 jamendo = ["network"]
 soundcloud = ["network", "yt-dlp"]
@@ -131,7 +134,7 @@ torrent = []
 
 # Portable release builds can opt into a bundled SQLite library. Distribution
 # packages should prefer their system SQLite.
-bundled-sqlite = ["rusqlite/bundled"]
+bundled-sqlite = ["sqlite-state", "rusqlite/bundled"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -141,11 +144,12 @@ crossbeam-channel = "0.5.16"
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 opml = "1.1.6"
-rusqlite = { version = "0.40.1", default-features = false, features = ["cache"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
+toml = "0.8.23"
 toml_edit = { version = "0.22.27", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
 url = { version = "2.5.8", features = ["serde"] }

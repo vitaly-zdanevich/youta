@@ -84,6 +84,8 @@ pub enum Screen {
     Bandcamp,
     /// Podcast-show discovery through Apple's public catalogue.
     ApplePodcasts,
+    /// Curated public live-radio stations.
+    Radio,
     /// Aggregated tracker-module search across dedicated archives.
     TrackerMusic,
     /// Locally subscribed channels and feeds.
@@ -101,11 +103,12 @@ pub enum Screen {
 }
 
 impl Screen {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
+        Self::Radio,
         Self::TrackerMusic,
         Self::Subscriptions,
         Self::Local,
@@ -121,6 +124,7 @@ impl Screen {
             Self::YouTubeMusic => cfg!(feature = "youtube-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
+            Self::Radio => cfg!(feature = "radio"),
             _ => true,
         }
     }
@@ -131,6 +135,7 @@ impl Screen {
             Self::YouTubeMusic => "YouTube Music",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple Podcasts",
+            Self::Radio => "Radio",
             Self::TrackerMusic => "MOD/tracker",
             Self::Local => "Local",
             Self::Subscriptions => "Subscriptions",
@@ -147,6 +152,7 @@ impl Screen {
             Self::YouTubeMusic => "YT Music",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple",
+            Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
             Self::Subscriptions => "Subs",
@@ -349,6 +355,8 @@ pub struct RowView {
     pub thumbnail_url: Option<url::Url>,
     /// Whether provider metadata identifies this as a vertical video.
     pub vertical: bool,
+    /// Hide played-state markers while retaining identity for playing-row emphasis.
+    pub hide_watched_marker: bool,
     /// Omit generic source and marker padding on a source-specific screen.
     pub compact: bool,
     /// Whether this Local row belongs to the current explicit move batch.
@@ -400,6 +408,16 @@ pub struct DetailView {
     pub published: String,
     /// Provider-reported license.
     pub license: String,
+    /// Local playlists that currently contain this media item.
+    ///
+    /// The controller supplies display names in stable presentation order.
+    /// An empty list keeps the playlist metadata line out of Details.
+    pub playlist_names: Vec<String>,
+    /// Whether an exact private local note exists for this media or source.
+    ///
+    /// The note body deliberately remains outside `DetailView` so diagnostics
+    /// and debug snapshots cannot expose user-authored private text.
+    pub has_private_note: bool,
     /// Lazy Wikidata lookup state or item link.
     pub wikidata: String,
     /// Selectable external links associated with this media item or channel.
@@ -540,6 +558,157 @@ pub struct PreferencesPopupView {
     pub environment_override: Option<String>,
     /// Save or validation failure kept inside the popup.
     pub validation_error: Option<String>,
+}
+
+/// Playable selected item for which playlist actions are available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistItemView {
+    /// Stable identity used to verify that Details actions target displayed media.
+    pub media_id: MediaId,
+    /// Human-readable item title shown in the playlist chooser.
+    pub title: String,
+    /// Whether the reserved `todo` playlist currently contains the item.
+    pub in_todo: bool,
+}
+
+/// Focused multiline editor for one private local note.
+///
+/// The body has a custom redacted [`std::fmt::Debug`] representation because
+/// `ViewModel` is routinely included in test failures and may later be sampled
+/// while producing diagnostics.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PrivateNotePopupView {
+    /// Human-readable media, channel, or podcast-show label.
+    pub target_label: String,
+    /// User-authored multiline plain text.
+    pub body: String,
+    /// UTF-8 byte offset at a grapheme boundary where edits are applied.
+    pub cursor_byte: usize,
+    /// Whether a note existed when this editor opened.
+    pub existing: bool,
+    /// Whether Delete now awaits one explicit confirmation.
+    pub confirming_delete: bool,
+    /// Exact local state path used by the selected persistence backend.
+    pub storage_path: String,
+    /// Validation or persistence failure retained inside the editor.
+    pub validation_error: Option<String>,
+}
+
+impl std::fmt::Debug for PrivateNotePopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivateNotePopupView")
+            .field("target_label", &self.target_label)
+            .field("body", &"[REDACTED]")
+            .field("cursor_byte", &self.cursor_byte)
+            .field("existing", &self.existing)
+            .field("confirming_delete", &self.confirming_delete)
+            .field("storage_path", &self.storage_path)
+            .field(
+                "validation_error",
+                &self.validation_error.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Cursor movement inside the multiline private-note editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateNoteCursorMotion {
+    /// Move to the preceding grapheme cluster.
+    Left,
+    /// Move to the following grapheme cluster.
+    Right,
+    /// Keep the visual column while moving to the preceding line.
+    Up,
+    /// Keep the visual column while moving to the following line.
+    Down,
+    /// Move to the start of the current line.
+    Home,
+    /// Move to the end of the current line.
+    End,
+}
+
+/// One local playlist shown in the membership chooser.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaylistChoiceView {
+    /// Stable controller-owned playlist identity.
+    pub playlist_id: String,
+    /// User-visible playlist name.
+    pub name: String,
+    /// Whether the selected playable item belongs to this playlist.
+    pub contains_item: bool,
+}
+
+/// Active route inside the playlist chooser/editor popup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaylistPopupMode {
+    /// Browse playlists and toggle the selected item's membership.
+    #[default]
+    Choose,
+    /// Create a playlist and add the selected item to it.
+    Create,
+    /// Rename or describe an existing playlist without changing its identity.
+    Edit,
+}
+
+/// Focused field inside the playlist create/edit form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaylistEditorField {
+    /// Required playlist display name.
+    #[default]
+    Name,
+    /// Optional playlist description.
+    Description,
+}
+
+/// Controller-owned local-playlist chooser and create/edit form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistPopupView {
+    /// Selected playable item whose membership is being edited.
+    pub item_title: String,
+    /// Stable playlist rows with current membership exposed immediately.
+    pub playlists: Vec<PlaylistChoiceView>,
+    /// Selected playlist row in [`Self::playlists`].
+    pub selected: usize,
+    /// Chooser, creation, or editing route.
+    pub mode: PlaylistPopupMode,
+    /// Stable identity retained while editing an existing playlist.
+    ///
+    /// This remains `None` for the chooser and new-playlist form. In
+    /// particular, editing the reserved `todo` playlist changes only its
+    /// display fields, never the identity used by the quick action.
+    pub editing_playlist_id: Option<String>,
+    /// Editor field currently receiving printable characters.
+    pub editor_field: PlaylistEditorField,
+    /// Draft required display name.
+    pub editor_name: String,
+    /// Draft optional description; an empty value represents `None`.
+    pub editor_description: String,
+    /// Maximum UTF-8 bytes accepted in the name.
+    pub name_limit: usize,
+    /// Maximum user-visible characters accepted in the description.
+    pub description_limit: usize,
+    /// Validation or persistence failure retained inside the popup.
+    pub validation_error: Option<String>,
+}
+
+impl Default for PlaylistPopupView {
+    fn default() -> Self {
+        Self {
+            item_title: String::new(),
+            playlists: Vec::new(),
+            selected: 0,
+            mode: PlaylistPopupMode::Choose,
+            editing_playlist_id: None,
+            editor_field: PlaylistEditorField::Name,
+            editor_name: String::new(),
+            editor_description: String::new(),
+            name_limit: 256,
+            description_limit: 1_000,
+            validation_error: None,
+        }
+    }
 }
 
 /// Explicit local-file mutation awaiting text input or confirmation.
@@ -732,8 +901,10 @@ pub struct YouTubeSetupPopupView {
     pub api_key: String,
     /// Base URL of a user-selected Invidious instance.
     pub invidious_url: String,
-    /// Exact configuration path where a submitted value will be stored.
-    pub config_path: String,
+    /// Exact private credentials path where an official API key is stored.
+    pub api_key_path: String,
+    /// Exact general configuration path where an Invidious URL is stored.
+    pub invidious_path: String,
     /// Actionable validation or provider-construction failure, when present.
     pub validation_error: Option<String>,
 }
@@ -745,7 +916,8 @@ impl std::fmt::Debug for YouTubeSetupPopupView {
             .field("selected_field", &self.selected_field)
             .field("api_key", &"[REDACTED]")
             .field("invidious_url", &self.invidious_url)
-            .field("config_path", &self.config_path)
+            .field("api_key_path", &self.api_key_path)
+            .field("invidious_path", &self.invidious_path)
             .field("validation_error", &self.validation_error)
             .finish()
     }
@@ -846,6 +1018,11 @@ pub struct ViewModel {
     pub waveform: Vec<Peak>,
     /// Current player state.
     pub playback: PlaybackStatus,
+    /// Best-effort current programme or track for the playing radio station.
+    ///
+    /// Fresh provider metadata is preferred; the player may supply ICY
+    /// metadata as a fallback without replacing the stable station title.
+    pub radio_now_playing: Option<String>,
     /// Chapters inferred for the authoritative playing media.
     pub playback_chapters: Vec<Chapter>,
     /// Whether chapter labels include their timestamps.
@@ -856,6 +1033,12 @@ pub struct ViewModel {
     pub local_size_sort: LocalSizeSort,
     /// Whether recursive Local-folder sizes and size ordering are available.
     pub local_folder_sizes_enabled: bool,
+    /// Selected playable item for which quick and general playlist actions apply.
+    pub playlist_item: Option<PlaylistItemView>,
+    /// Whether the selected Playlists-screen row can open the shared editor.
+    pub playlist_edit_available: bool,
+    /// Whether the Playlists screen is showing entries that can return to its index.
+    pub playlist_back_available: bool,
     /// Whether EOF continues with the next playable same-source list entry.
     pub autoplay: bool,
     /// Repeat-current-item state.
@@ -872,6 +1055,12 @@ pub struct ViewModel {
     pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
     /// Focused runtime preferences editor.
     pub preferences_popup: Option<PreferencesPopupView>,
+    /// Focused local-playlist chooser or create/edit form.
+    pub playlist_popup: Option<PlaylistPopupView>,
+    /// Focused private-note editor.
+    pub private_note_popup: Option<PrivateNotePopupView>,
+    /// Whether the current selection resolves to a note-capable exact target.
+    pub private_note_available: bool,
     /// Explicit rename or move-to-Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
     /// Active or most recently completed supervised download.
@@ -910,11 +1099,15 @@ impl Default for ViewModel {
             right_panel_mode: RightPanelMode::Details,
             waveform: Vec::new(),
             playback: PlaybackStatus::default(),
+            radio_now_playing: None,
             playback_chapters: Vec::new(),
             show_chapter_timestamps: true,
             skip_advertisement_chapters: true,
             local_size_sort: LocalSizeSort::Off,
             local_folder_sizes_enabled: true,
+            playlist_item: None,
+            playlist_edit_available: false,
+            playlist_back_available: false,
             autoplay: false,
             repeating: false,
             status_line: "Press / to search or ? for help".to_owned(),
@@ -923,6 +1116,9 @@ impl Default for ViewModel {
             youtube_setup_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
+            playlist_popup: None,
+            private_note_popup: None,
+            private_note_available: false,
             local_file_popup: None,
             download: None,
             quitting: false,
@@ -1073,6 +1269,32 @@ pub enum UiAction {
     PlayNext,
     /// Add the selected item to the current queue.
     AddToQueue,
+    /// Toggle the selected playable item in the reserved `todo` playlist.
+    ToggleTodoPlaylist,
+    /// Open the general playlist-membership chooser for the selected item.
+    OpenPlaylistPopup,
+    /// Move the playlist chooser selection by a signed row count.
+    MovePlaylistPopupSelection(i32),
+    /// Select one exact playlist-membership row.
+    SelectPlaylistPopupRow(usize),
+    /// Toggle membership in the selected chooser row without closing it.
+    ToggleSelectedPlaylistMembership,
+    /// Replace the chooser with an empty new-playlist editor.
+    BeginNewPlaylist,
+    /// Open the shared editor for the selected Playlists-screen row.
+    EditSelectedPlaylist,
+    /// Give one create/edit field keyboard focus.
+    SelectPlaylistEditorField(PlaylistEditorField),
+    /// Append one printable character to the focused playlist editor field.
+    AppendPlaylistEditorCharacter(char),
+    /// Remove the final character from the focused playlist editor field.
+    DeletePlaylistEditorCharacter,
+    /// Create a playlist and add the selected playable item to it.
+    CreatePlaylistAndAdd,
+    /// Save display-name and optional-description changes to one stable playlist.
+    UpdatePlaylist,
+    /// Return from the editor to its chooser, or close the playlist popup.
+    DismissPlaylistPopup,
     /// Download the selected item.
     Download,
     /// Open the canonical item link in a browser.
@@ -1083,6 +1305,20 @@ pub enum UiAction {
     CopyLink,
     /// Edit a private local note.
     EditPrivateNote,
+    /// Insert one printable character into the private-note editor.
+    AppendPrivateNoteCharacter(char),
+    /// Insert a line break into the private-note editor.
+    InsertPrivateNoteNewline,
+    /// Remove the grapheme immediately before the private-note cursor.
+    DeletePrivateNoteCharacter,
+    /// Move the private-note cursor without modifying its body.
+    MovePrivateNoteCursor(PrivateNoteCursorMotion),
+    /// Persist the private-note draft for its exact target.
+    SavePrivateNote,
+    /// Enter or complete private-note deletion confirmation.
+    RequestPrivateNoteDelete,
+    /// Close the private-note editor without saving.
+    DismissPrivateNotePopup,
     /// Open equalizer controls.
     OpenEqualizer,
     /// Close the diagnostic error popup without changing the underlying screen.
@@ -1809,6 +2045,13 @@ struct HitMap {
     rss_subscription_field: Option<Rect>,
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
+    /// Visible playlist membership rows inside the chooser popup.
+    playlist_popup_rows: Rect,
+    /// First playlist model row represented by [`Self::playlist_popup_rows`].
+    playlist_popup_first_index: usize,
+    playlist_popup_fields: Vec<(PlaylistEditorField, Rect)>,
+    playlist_popup_buttons: Vec<(UiAction, Rect)>,
+    private_note_buttons: Vec<(UiAction, Rect)>,
     local_file_buttons: Vec<(UiAction, Rect)>,
     /// Visible destination rows inside the Local Move popup.
     local_move_rows: Rect,
@@ -2112,6 +2355,8 @@ fn render_frame(
         || view.youtube_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
         || view.preferences_popup.is_some()
+        || view.playlist_popup.is_some()
+        || view.private_note_popup.is_some()
         || view.local_file_popup.is_some()
         || view.error_popup.is_some();
     if thumbnail_is_obscured {
@@ -2155,6 +2400,9 @@ fn render_frame(
         view.youtube_creative_commons_only,
         view.show_chapter_timestamps,
         view.autoplay,
+        view.playlist_item.as_ref(),
+        view.playlist_edit_available,
+        view.playlist_back_available,
         view.local_folder_sizes_enabled
             .then_some(view.local_size_sort),
         &status_line,
@@ -2183,6 +2431,17 @@ fn render_frame(
     hit_map.local_move_first_index = 0;
     if let Some(popup) = view.local_file_popup.as_ref() {
         render_local_file_popup(frame, popup, &theme, hit_map);
+    }
+    hit_map.playlist_popup_rows = Rect::default();
+    hit_map.playlist_popup_first_index = 0;
+    hit_map.playlist_popup_fields.clear();
+    hit_map.playlist_popup_buttons.clear();
+    if let Some(popup) = view.playlist_popup.as_ref() {
+        render_playlist_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+    }
+    hit_map.private_note_buttons.clear();
+    if let Some(popup) = view.private_note_popup.as_ref() {
+        render_private_note_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.error_buttons.clear();
     if let Some(error) = view.error_popup.as_ref() {
@@ -2578,7 +2837,7 @@ fn render_row_list(
                 row_style
             };
             let marker = if row.subscribed { "◆" } else { " " };
-            let has_playback_progress = row.media_id.is_some();
+            let has_playback_progress = row.media_id.is_some() && !row.hide_watched_marker;
             let progress = if !has_playback_progress || row.watched_percent == 0 {
                 String::new()
             } else {
@@ -3013,7 +3272,8 @@ fn render_details(
         match view.screen {
             Screen::Local => InformationPanelKind::Local,
             Screen::ApplePodcasts => InformationPanelKind::Podcast,
-            Screen::Bandcamp | Screen::History => InformationPanelKind::Generic,
+            Screen::Radio => InformationPanelKind::Radio,
+            Screen::Bandcamp | Screen::Playlists | Screen::History => InformationPanelKind::Generic,
             _ => InformationPanelKind::Video,
         },
         true,
@@ -3031,6 +3291,8 @@ enum InformationPanelKind {
     Podcast,
     /// Channel details with subscriber metadata.
     Channel,
+    /// Public live-radio metadata without finite-media statistics.
+    Radio,
     /// Local folder, media, or image metadata without remote statistics.
     Local,
     /// Persisted or aggregate rows without source-specific remote statistics.
@@ -3110,6 +3372,65 @@ fn render_information_panel(
         ));
         (line_index, label, UiAction::ToggleTextSelectionMode)
     });
+    let details_playlist_item = view
+        .playlist_item
+        .as_ref()
+        .filter(|item| details.media_id.as_ref() == Some(&item.media_id));
+    let todo_button = details_playlist_item.map(|item| {
+        let label = button(
+            "l",
+            if item.in_todo {
+                "Remove from todo"
+            } else {
+                "Add to todo"
+            },
+            show_hotkeys,
+        );
+        let line_index = lines.len();
+        lines.push(Line::styled(
+            label.clone(),
+            if item.in_todo {
+                theme.selected
+            } else {
+                theme.accent
+            },
+        ));
+        (line_index, label, UiAction::ToggleTodoPlaylist)
+    });
+    let playlist_button = details_playlist_item.map(|_| {
+        let label = button("P", "Playlist…", show_hotkeys);
+        let line_index = lines.len();
+        lines.push(Line::styled(label.clone(), theme.accent));
+        (line_index, label, UiAction::OpenPlaylistPopup)
+    });
+    let edit_playlist_button = (view.screen == Screen::Playlists && view.playlist_edit_available)
+        .then(|| {
+            let label = button("e", "Edit playlist", show_hotkeys);
+            let line_index = lines.len();
+            lines.push(Line::styled(label.clone(), theme.accent));
+            (line_index, label, UiAction::EditSelectedPlaylist)
+        });
+    let private_note_button = view.private_note_available.then(|| {
+        let label = button(
+            "m",
+            if details.has_private_note {
+                "Edit private note"
+            } else {
+                "Add private note"
+            },
+            show_hotkeys,
+        );
+        let line_index = lines.len();
+        lines.push(Line::styled(
+            label.clone(),
+            if details.has_private_note {
+                theme.selected
+            } else {
+                theme.accent
+            },
+        ));
+        (line_index, label, UiAction::EditPrivateNote)
+    });
     let subscription_button = (!details.channel_id.is_empty()).then(|| {
         let label = button(
             "s",
@@ -3127,28 +3448,41 @@ fn render_information_panel(
     let open_button = (show_text_selection
         && matches!(
             kind,
-            InformationPanelKind::Video | InformationPanelKind::Podcast
+            InformationPanelKind::Video
+                | InformationPanelKind::Podcast
+                | InformationPanelKind::Radio
         ))
     .then(|| {
+        let action_text = match kind {
+            InformationPanelKind::Podcast => "xdg-open podcast".to_owned(),
+            InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
+                || "xdg-open station website".to_owned(),
+                |url| format!("xdg-open · {url}"),
+            ),
+            _ => "xdg-open video".to_owned(),
+        };
         let label = button(
-            "o",
-            if kind == InformationPanelKind::Podcast {
-                "xdg-open podcast"
+            if kind == InformationPanelKind::Radio {
+                "O"
             } else {
-                "xdg-open video"
+                "o"
             },
+            &action_text,
             show_hotkeys,
         );
         let line_index = lines.len();
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenInBrowser)
     });
-    let open_channel_button = details.channel_webpage_url.as_ref().map(|url| {
-        let label = button("O", &format!("xdg-open channel · {url}"), show_hotkeys);
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::OpenChannelInBrowser)
-    });
+    let open_channel_button = (kind != InformationPanelKind::Radio)
+        .then_some(details.channel_webpage_url.as_ref())
+        .flatten()
+        .map(|url| {
+            let label = button("O", &format!("xdg-open channel · {url}"), show_hotkeys);
+            let line_index = lines.len();
+            lines.push(Line::styled(label.clone(), theme.accent));
+            (line_index, label, UiAction::OpenChannelInBrowser)
+        });
     let rename_button =
         (kind == InformationPanelKind::Local && details.local_renamable).then(|| {
             let label = button("r", "Rename", show_hotkeys);
@@ -3222,6 +3556,7 @@ fn render_information_panel(
                 ));
             }
         }
+        InformationPanelKind::Radio => {}
         InformationPanelKind::Local => {
             if !details.length.is_empty() && details.length != "unknown" {
                 lines.push(Line::from(vec![
@@ -3231,6 +3566,14 @@ fn render_information_panel(
             }
         }
         InformationPanelKind::Generic => {}
+    }
+    if show_text_selection && !details.playlist_names.is_empty() {
+        let summary = format!("Playlists: {}", details.playlist_names.join(", "));
+        lines.extend(
+            wrap_text_lines(&summary, inner.width)
+                .into_iter()
+                .map(Line::raw),
+        );
     }
     if is_creative_commons_license(&details.license) {
         lines.push(Line::from(vec![
@@ -3252,6 +3595,16 @@ fn render_information_panel(
         let subscription_button_row = subscription_button
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
+        let todo_button_row = todo_button.as_ref().map(|(line_index, _, _)| *line_index);
+        let playlist_button_row = playlist_button
+            .as_ref()
+            .map(|(line_index, _, _)| *line_index);
+        let edit_playlist_button_row = edit_playlist_button
+            .as_ref()
+            .map(|(line_index, _, _)| *line_index);
+        let private_note_button_row = private_note_button
+            .as_ref()
+            .map(|(line_index, _, _)| *line_index);
         let open_button_row = open_button.as_ref().map(|(line_index, _, _)| *line_index);
         let open_channel_button_row = open_channel_button
             .as_ref()
@@ -3261,6 +3614,10 @@ fn render_information_panel(
         for line_index in 0..usize::from(metadata_height) {
             if selection_button_row == Some(line_index)
                 || subscription_button_row == Some(line_index)
+                || todo_button_row == Some(line_index)
+                || playlist_button_row == Some(line_index)
+                || edit_playlist_button_row == Some(line_index)
+                || private_note_button_row == Some(line_index)
                 || open_button_row == Some(line_index)
                 || open_channel_button_row == Some(line_index)
                 || rename_button_row == Some(line_index)
@@ -3284,6 +3641,10 @@ fn render_information_panel(
     }
     for (line_index, label, action) in text_selection_button
         .into_iter()
+        .chain(todo_button)
+        .chain(playlist_button)
+        .chain(edit_playlist_button)
+        .chain(private_note_button)
         .chain(subscription_button)
         .chain(open_button)
         .chain(open_channel_button)
@@ -4140,10 +4501,22 @@ fn render_seek_bar(
     );
     let title = (!view.playback.idle)
         .then_some(view.playback.title.as_deref())
-        .flatten();
-    let title_offset = title.map(|_| terminal_text_width(&status_prefix));
-    let title_width = title.map(terminal_text_width).unwrap_or_default();
-    let label = format!("{status_prefix}{}{marker}", title.unwrap_or_default());
+        .flatten()
+        .map(|title| {
+            view.radio_now_playing.as_ref().map_or_else(
+                || title.to_owned(),
+                |metadata| format!("{title} · {metadata}"),
+            )
+        });
+    let title_offset = title.as_ref().map(|_| terminal_text_width(&status_prefix));
+    let title_width = title
+        .as_deref()
+        .map(terminal_text_width)
+        .unwrap_or_default();
+    let label = format!(
+        "{status_prefix}{}{marker}",
+        title.as_deref().unwrap_or_default()
+    );
     if !view.playback_chapters.is_empty() && area.height >= 3 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -4569,6 +4942,9 @@ fn render_buttons(
     youtube_creative_commons_only: bool,
     show_chapter_timestamps: bool,
     autoplay: bool,
+    playlist_item: Option<&PlaylistItemView>,
+    playlist_edit_available: bool,
+    playlist_back_available: bool,
     local_size_sort: Option<LocalSizeSort>,
     status: &str,
     playback_active: bool,
@@ -4616,6 +4992,18 @@ fn render_buttons(
         primary_buttons.push((
             button("x", "Move", settings.show_hotkeys),
             UiAction::BeginLocalMove,
+        ));
+    }
+    if screen == Screen::Playlists && playlist_back_available {
+        primary_buttons.push((
+            button("Backspace", "Back to playlists", settings.show_hotkeys),
+            UiAction::GoBack,
+        ));
+    }
+    if screen == Screen::Playlists && playlist_edit_available {
+        primary_buttons.push((
+            button("e", "Edit playlist", settings.show_hotkeys),
+            UiAction::EditSelectedPlaylist,
         ));
     }
     primary_buttons.push((
@@ -4697,7 +5085,7 @@ fn render_buttons(
         button("w", "Waveform", settings.show_hotkeys),
         UiAction::ToggleWaveform,
     ));
-    let full_navigation_buttons = [
+    let mut full_navigation_buttons = vec![
         (
             button("k", "Move up", settings.show_hotkeys),
             UiAction::MoveSelection(-1),
@@ -4718,19 +5106,39 @@ fn render_buttons(
             button("Enter", "Start", settings.show_hotkeys),
             UiAction::ActivateSelection,
         ),
-        (
-            button(
-                "T",
-                if show_chapter_timestamps {
-                    "Chapter times: on"
-                } else {
-                    "Chapter times: off"
-                },
-                settings.show_hotkeys,
-            ),
-            UiAction::ToggleChapterTimestamps,
-        ),
     ];
+    if let Some(playlist_item) = playlist_item {
+        full_navigation_buttons.extend([
+            (
+                button(
+                    "l",
+                    if playlist_item.in_todo {
+                        "Remove from todo"
+                    } else {
+                        "Add to todo"
+                    },
+                    settings.show_hotkeys,
+                ),
+                UiAction::ToggleTodoPlaylist,
+            ),
+            (
+                button("P", "Playlist…", settings.show_hotkeys),
+                UiAction::OpenPlaylistPopup,
+            ),
+        ]);
+    }
+    full_navigation_buttons.push((
+        button(
+            "T",
+            if show_chapter_timestamps {
+                "Chapter times: on"
+            } else {
+                "Chapter times: off"
+            },
+            settings.show_hotkeys,
+        ),
+        UiAction::ToggleChapterTimestamps,
+    ));
     let full_navigation_width = full_navigation_buttons
         .iter()
         .map(|(label, _)| usize::from(terminal_text_width(label)))
@@ -4739,40 +5147,97 @@ fn render_buttons(
     let navigation_buttons = if full_navigation_width <= usize::from(area.width) {
         full_navigation_buttons
     } else {
-        [
+        let mut compact = vec![
             (
-                button("k", "Up", settings.show_hotkeys),
+                button(
+                    "k",
+                    if playlist_item.is_some() { "↑" } else { "Up" },
+                    settings.show_hotkeys,
+                ),
                 UiAction::MoveSelection(-1),
             ),
             (
-                button("j", "Down", settings.show_hotkeys),
-                UiAction::MoveSelection(1),
-            ),
-            (
-                button("↑", "Vol+", settings.show_hotkeys),
-                UiAction::ChangeVolume(5),
-            ),
-            (
-                button("↓", "Vol-", settings.show_hotkeys),
-                UiAction::ChangeVolume(-5),
-            ),
-            (
-                button("Enter", "Start", settings.show_hotkeys),
-                UiAction::ActivateSelection,
-            ),
-            (
                 button(
-                    "T",
-                    if show_chapter_timestamps {
-                        "Time:on"
+                    "j",
+                    if playlist_item.is_some() {
+                        "↓"
                     } else {
-                        "Time:off"
+                        "Down"
                     },
                     settings.show_hotkeys,
                 ),
-                UiAction::ToggleChapterTimestamps,
+                UiAction::MoveSelection(1),
             ),
-        ]
+            (
+                button(
+                    "↑",
+                    if playlist_item.is_some() { "+" } else { "Vol+" },
+                    settings.show_hotkeys,
+                ),
+                UiAction::ChangeVolume(5),
+            ),
+            (
+                button(
+                    "↓",
+                    if playlist_item.is_some() { "-" } else { "Vol-" },
+                    settings.show_hotkeys,
+                ),
+                UiAction::ChangeVolume(-5),
+            ),
+            (
+                button(
+                    "Enter",
+                    if playlist_item.is_some() {
+                        "▶"
+                    } else {
+                        "Start"
+                    },
+                    settings.show_hotkeys,
+                ),
+                UiAction::ActivateSelection,
+            ),
+        ];
+        if let Some(playlist_item) = playlist_item {
+            compact.extend([
+                (
+                    button(
+                        "l",
+                        if playlist_item.in_todo {
+                            "Remove from todo"
+                        } else {
+                            "Add to todo"
+                        },
+                        settings.show_hotkeys,
+                    ),
+                    UiAction::ToggleTodoPlaylist,
+                ),
+                (
+                    button("P", "Playlist…", settings.show_hotkeys),
+                    UiAction::OpenPlaylistPopup,
+                ),
+            ]);
+        }
+        compact.push((
+            button(
+                "T",
+                if show_chapter_timestamps {
+                    if playlist_item.is_some() {
+                        "Time"
+                    } else {
+                        "Time:on"
+                    }
+                } else {
+                    if playlist_item.is_some() {
+                        "Time"
+                    } else {
+                        "Time:off"
+                    }
+                },
+                settings.show_hotkeys,
+            ),
+            UiAction::ToggleChapterTimestamps,
+        ));
+        compact
     };
     let primary_controls = primary_buttons
         .iter()
@@ -4901,6 +5366,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  ↪ internal video: click the marker after a YouTube URL",
         "  Local: Z size order     r rename     x move     Shift+J/K extend move selection     Delete move to Trash",
         "  Subscriptions channel: R refresh videos     i description",
+        "  Playlists: e edit selected playlist",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: GPM mouse input is detected automatically.",
         "",
@@ -4912,6 +5378,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "",
         "Actions",
         "  n play next     a add to queue     d download     o video page",
+        "  l toggle todo     P choose playlist",
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
         "  m private note     e equalizer     t Details-only text selection",
@@ -5261,8 +5728,9 @@ fn render_youtube_setup_popup(
         .push((UiAction::OpenInvidiousInstances, guide_sections[4]));
 
     let storage = format!(
-        "Will save to: {}\nAPI keys are plaintext; Unix permissions: directory 0700, file 0600.\nEnvironment variables override saved values.{}",
-        setup.config_path,
+        "API key saves to: {}\nInvidious URL saves to: {}\nAPI keys are plaintext; Unix permissions: directories 0700, files 0600. Environment variables override saved values.{}",
+        setup.api_key_path,
+        setup.invidious_path,
         setup
             .validation_error
             .as_ref()
@@ -5426,6 +5894,445 @@ fn render_rss_subscription_popup(
             Rect::new(button_x, sections[4].y, width, sections[4].height),
         ));
         button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+}
+
+fn render_playlist_popup(
+    frame: &mut Frame<'_>,
+    popup: &PlaylistPopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(82, 20, frame.area());
+    frame.render_widget(Clear, area);
+    let title = match popup.mode {
+        PlaylistPopupMode::Choose => " Add to playlist ",
+        PlaylistPopupMode::Create => " New playlist ",
+        PlaylistPopupMode::Edit => " Edit playlist ",
+    };
+    frame.render_widget(panel_block(title, theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    match popup.mode {
+        PlaylistPopupMode::Choose => {
+            render_playlist_chooser(frame, inner, popup, show_hotkeys, theme, hit_map);
+        }
+        PlaylistPopupMode::Create | PlaylistPopupMode::Edit => {
+            render_playlist_editor(frame, inner, popup, show_hotkeys, theme, hit_map);
+        }
+    }
+}
+
+fn render_playlist_chooser(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    popup: &PlaylistPopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(if popup.validation_error.is_some() {
+                2
+            } else {
+                0
+            }),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Item: {}\nEnter toggles membership and keeps this chooser open.",
+            popup.item_title
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    hit_map.playlist_popup_rows = sections[1];
+    if popup.playlists.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No playlists yet. Press n to create one.")
+                .style(theme.muted)
+                .alignment(Alignment::Center),
+            sections[1],
+        );
+    } else {
+        let selected = popup.selected.min(popup.playlists.len().saturating_sub(1));
+        let visible_rows = usize::from(sections[1].height).max(1);
+        let first = selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+            .min(popup.playlists.len().saturating_sub(visible_rows));
+        hit_map.playlist_popup_first_index = first;
+        let items = popup
+            .playlists
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(visible_rows)
+            .map(|(index, playlist)| {
+                let selected = index == selected;
+                let marker = if selected { "▶" } else { " " };
+                let membership = if playlist.contains_item {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                };
+                ListItem::new(format!("{marker} {membership} {}", playlist.name)).style(
+                    if selected {
+                        theme.selected
+                    } else if playlist.contains_item {
+                        theme.accent
+                    } else {
+                        theme.base
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(List::new(items), sections[1]);
+    }
+    if let Some(error) = popup.validation_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {error}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            sections[2],
+        );
+    }
+    render_playlist_popup_buttons(
+        frame,
+        sections[3],
+        [
+            (
+                button("Enter", "Add/remove", show_hotkeys),
+                UiAction::ToggleSelectedPlaylistMembership,
+            ),
+            (
+                button("n", "New playlist", show_hotkeys),
+                UiAction::BeginNewPlaylist,
+            ),
+            (
+                button("Esc", "Close", show_hotkeys),
+                UiAction::DismissPlaylistPopup,
+            ),
+        ],
+        theme,
+        hit_map,
+    );
+}
+
+fn render_playlist_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    popup: &PlaylistPopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(2),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let explanation = match popup.mode {
+        PlaylistPopupMode::Create => "Create a playlist and add the selected item.",
+        PlaylistPopupMode::Edit => "Edit display fields; stable playlist identity is unchanged.",
+        PlaylistPopupMode::Choose => unreachable!("chooser uses its dedicated renderer"),
+    };
+    frame.render_widget(Paragraph::new(explanation).style(theme.base), sections[0]);
+
+    let name_count = popup.editor_name.len();
+    let name_focused = popup.editor_field == PlaylistEditorField::Name;
+    frame.render_widget(
+        Paragraph::new(if popup.editor_name.is_empty() {
+            "Required"
+        } else {
+            popup.editor_name.as_str()
+        })
+        .style(if popup.editor_name.is_empty() {
+            theme.muted
+        } else {
+            theme.base
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if name_focused {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .title(format!(
+                    " {}Name bytes ({name_count}/{}) ",
+                    if name_focused { "▶ " } else { "" },
+                    popup.name_limit
+                )),
+        ),
+        sections[1],
+    );
+    hit_map
+        .playlist_popup_fields
+        .push((PlaylistEditorField::Name, sections[1]));
+
+    let description_count = popup.editor_description.chars().count();
+    let description_focused = popup.editor_field == PlaylistEditorField::Description;
+    frame.render_widget(
+        Paragraph::new(if popup.editor_description.is_empty() {
+            "Optional"
+        } else {
+            popup.editor_description.as_str()
+        })
+        .style(if popup.editor_description.is_empty() {
+            theme.muted
+        } else {
+            theme.base
+        })
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if description_focused {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .title(format!(
+                    " {}Description ({description_count}/{}) ",
+                    if description_focused { "▶ " } else { "" },
+                    popup.description_limit
+                )),
+        ),
+        sections[2],
+    );
+    hit_map
+        .playlist_popup_fields
+        .push((PlaylistEditorField::Description, sections[2]));
+
+    let mut note = "Tab or ↑/↓ switches fields.".to_owned();
+    if let Some(error) = popup.validation_error.as_deref() {
+        note.push_str(&format!("\nError: {error}"));
+    }
+    frame.render_widget(
+        Paragraph::new(note)
+            .style(if popup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[3],
+    );
+
+    let submit = match popup.mode {
+        PlaylistPopupMode::Create => (
+            button("Enter", "Create and add", show_hotkeys),
+            UiAction::CreatePlaylistAndAdd,
+        ),
+        PlaylistPopupMode::Edit => (
+            button("Enter", "Save changes", show_hotkeys),
+            UiAction::UpdatePlaylist,
+        ),
+        PlaylistPopupMode::Choose => unreachable!("chooser uses its dedicated renderer"),
+    };
+    render_playlist_popup_buttons(
+        frame,
+        sections[4],
+        [
+            submit,
+            (
+                button("Esc", "Back/close", show_hotkeys),
+                UiAction::DismissPlaylistPopup,
+            ),
+        ],
+        theme,
+        hit_map,
+    );
+}
+
+fn render_playlist_popup_buttons<const N: usize>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: [(String, UiAction); N],
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let mut x = centered_line_x(area, terminal_text_width(&controls));
+    for (label, action) in buttons {
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
+        if width > 0 {
+            hit_map
+                .playlist_popup_buttons
+                .push((action, Rect::new(x, area.y, width, area.height.min(1))));
+        }
+        x = x
+            .saturating_add(terminal_text_width(&label))
+            .saturating_add(3);
+    }
+}
+
+fn render_private_note_popup(
+    frame: &mut Frame<'_>,
+    popup: &PrivateNotePopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(88, 24, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Private note ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(if popup.validation_error.is_some() {
+                2
+            } else {
+                0
+            }),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} note for: {}",
+            if popup.existing { "Editing" } else { "New" },
+            popup.target_label
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let mut cursor = popup.cursor_byte.min(popup.body.len());
+    while cursor > 0 && !popup.body.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let mut body = popup.body.clone();
+    body.insert_str(cursor, "▏");
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(theme.base)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.accent)
+                    .title(format!(" Text · {} / 16384 bytes ", popup.body.len())),
+            ),
+        sections[1],
+    );
+
+    let notice = if popup.confirming_delete {
+        "Delete this note permanently? Press Delete or Enter again to confirm."
+    } else {
+        "Enter inserts a new line. Ctrl+S saves. Esc closes without saving."
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{notice}\nStored in: {}", popup.storage_path))
+            .style(if popup.confirming_delete {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+    if let Some(error) = popup.validation_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {error}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            sections[3],
+        );
+    }
+
+    let buttons = if popup.confirming_delete {
+        vec![
+            (
+                button("Delete/Enter", "Confirm delete", show_hotkeys),
+                UiAction::RequestPrivateNoteDelete,
+            ),
+            (
+                button("Esc", "Cancel", show_hotkeys),
+                UiAction::DismissPrivateNotePopup,
+            ),
+        ]
+    } else {
+        let mut buttons = vec![(
+            button("Ctrl+S", "Save", show_hotkeys),
+            UiAction::SavePrivateNote,
+        )];
+        if popup.existing {
+            buttons.push((
+                button("Delete", "Delete note", show_hotkeys),
+                UiAction::RequestPrivateNoteDelete,
+            ));
+        }
+        buttons.push((
+            button("Esc", "Cancel", show_hotkeys),
+            UiAction::DismissPrivateNotePopup,
+        ));
+        buttons
+    };
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[4],
+    );
+    let mut x = centered_line_x(sections[4], terminal_text_width(&controls));
+    for (label, action) in buttons {
+        let width = terminal_text_width(&label).min(sections[4].right().saturating_sub(x));
+        if width > 0 {
+            hit_map
+                .private_note_buttons
+                .push((action, Rect::new(x, sections[4].y, width, 1)));
+        }
+        x = x
+            .saturating_add(terminal_text_width(&label))
+            .saturating_add(3);
     }
 }
 
@@ -6281,6 +7188,89 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             _ => None,
         };
     }
+    if let Some(popup) = view.private_note_popup.as_ref() {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        return match key.code {
+            KeyCode::Esc => Some(UiAction::DismissPrivateNotePopup),
+            KeyCode::Char('s' | 'S') if control => Some(UiAction::SavePrivateNote),
+            KeyCode::Delete => Some(UiAction::RequestPrivateNoteDelete),
+            KeyCode::Enter if popup.confirming_delete => Some(UiAction::RequestPrivateNoteDelete),
+            KeyCode::Enter => Some(UiAction::InsertPrivateNoteNewline),
+            KeyCode::Backspace => Some(UiAction::DeletePrivateNoteCharacter),
+            KeyCode::Left => Some(UiAction::MovePrivateNoteCursor(
+                PrivateNoteCursorMotion::Left,
+            )),
+            KeyCode::Right => Some(UiAction::MovePrivateNoteCursor(
+                PrivateNoteCursorMotion::Right,
+            )),
+            KeyCode::Up => Some(UiAction::MovePrivateNoteCursor(PrivateNoteCursorMotion::Up)),
+            KeyCode::Down => Some(UiAction::MovePrivateNoteCursor(
+                PrivateNoteCursorMotion::Down,
+            )),
+            KeyCode::Home => Some(UiAction::MovePrivateNoteCursor(
+                PrivateNoteCursorMotion::Home,
+            )),
+            KeyCode::End => Some(UiAction::MovePrivateNoteCursor(
+                PrivateNoteCursorMotion::End,
+            )),
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(UiAction::AppendPrivateNoteCharacter(character))
+            }
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.playlist_popup.as_ref() {
+        return match popup.mode {
+            PlaylistPopupMode::Choose => match key.code {
+                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
+                KeyCode::Enter => Some(UiAction::ToggleSelectedPlaylistMembership),
+                KeyCode::Up | KeyCode::Char('k') => Some(UiAction::MovePlaylistPopupSelection(-1)),
+                KeyCode::Down | KeyCode::Char('j') => Some(UiAction::MovePlaylistPopupSelection(1)),
+                KeyCode::Char('n')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Some(UiAction::BeginNewPlaylist)
+                }
+                _ => None,
+            },
+            PlaylistPopupMode::Create | PlaylistPopupMode::Edit => match key.code {
+                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
+                KeyCode::Enter if popup.mode == PlaylistPopupMode::Create => {
+                    Some(UiAction::CreatePlaylistAndAdd)
+                }
+                KeyCode::Enter => Some(UiAction::UpdatePlaylist),
+                KeyCode::Tab | KeyCode::BackTab => Some(UiAction::SelectPlaylistEditorField(
+                    match popup.editor_field {
+                        PlaylistEditorField::Name => PlaylistEditorField::Description,
+                        PlaylistEditorField::Description => PlaylistEditorField::Name,
+                    },
+                )),
+                KeyCode::Up => Some(UiAction::SelectPlaylistEditorField(
+                    PlaylistEditorField::Name,
+                )),
+                KeyCode::Down => Some(UiAction::SelectPlaylistEditorField(
+                    PlaylistEditorField::Description,
+                )),
+                KeyCode::Backspace => Some(UiAction::DeletePlaylistEditorCharacter),
+                KeyCode::Char(character)
+                    if !character.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Some(UiAction::AppendPlaylistEditorCharacter(character))
+                }
+                _ => None,
+            },
+        };
+    }
     if let Some(popup) = view.local_file_popup.as_ref() {
         return match (popup, key.code) {
             (_, KeyCode::Esc) => Some(UiAction::DismissLocalFilePopup),
@@ -6461,6 +7451,25 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         KeyCode::Char('C') => Some(UiAction::ToggleYouTubeCreativeCommons),
         KeyCode::Char('A') => Some(UiAction::ToggleAutoplay),
+        KeyCode::Char('l')
+            if view.playlist_item.is_some()
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ) =>
+        {
+            Some(UiAction::ToggleTodoPlaylist)
+        }
+        KeyCode::Char('P')
+            if view.playlist_item.is_some()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(UiAction::OpenPlaylistPopup)
+        }
+        KeyCode::Char('e') if view.screen == Screen::Playlists && view.playlist_edit_available => {
+            Some(UiAction::EditSelectedPlaylist)
+        }
         KeyCode::Char('Z') if view.screen == Screen::Local && view.local_folder_sizes_enabled => {
             Some(UiAction::ToggleLocalSizeSort)
         }
@@ -6596,6 +7605,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('a') => Some(UiAction::AddToQueue),
         KeyCode::Char('d') => Some(UiAction::Download),
         KeyCode::Char('o') => Some(UiAction::OpenInBrowser),
+        KeyCode::Char('O') if view.screen == Screen::Radio => Some(UiAction::OpenInBrowser),
         KeyCode::Char('O') => Some(UiAction::OpenChannelInBrowser),
         KeyCode::Char('y') => Some(UiAction::CopyLink),
         KeyCode::Char('m') => Some(UiAction::EditPrivateNote),
@@ -6627,6 +7637,50 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
             }
             MouseEventKind::ScrollUp => {
                 Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
+            }
+            _ => None,
+        };
+    }
+    if view.private_note_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .private_note_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.playlist_popup.as_ref() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((field, _)) = hit_map
+                    .playlist_popup_fields
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::SelectPlaylistEditorField(*field))
+                } else if contains(hit_map.playlist_popup_rows, mouse.column, mouse.row) {
+                    let index = hit_map
+                        .playlist_popup_first_index
+                        .saturating_add(usize::from(
+                            mouse.row.saturating_sub(hit_map.playlist_popup_rows.y),
+                        ));
+                    (index < popup.playlists.len())
+                        .then_some(UiAction::SelectPlaylistPopupRow(index))
+                } else {
+                    hit_map
+                        .playlist_popup_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            MouseEventKind::ScrollDown if popup.mode == PlaylistPopupMode::Choose => {
+                Some(UiAction::MovePlaylistPopupSelection(1))
+            }
+            MouseEventKind::ScrollUp if popup.mode == PlaylistPopupMode::Choose => {
+                Some(UiAction::MovePlaylistPopupSelection(-1))
             }
             _ => None,
         };
@@ -7910,6 +8964,9 @@ mod tests {
         assert!(rendered.contains("Alt+←/→ Details back/forward"));
         assert!(rendered.contains("Backspace Details back"));
         assert!(rendered.contains("Local: Z size order"));
+        assert!(rendered.contains("Playlists: e edit selected playlist"));
+        assert!(rendered.contains("l toggle todo"));
+        assert!(rendered.contains("P choose playlist"));
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
         assert!(rendered.contains("GPM mouse input is detected automatically"));
@@ -8344,6 +9401,150 @@ mod tests {
     }
 
     #[test]
+    fn private_note_popup_is_modal_multiline_and_redacted_from_debug() {
+        let secret = "a private line\nanother private line";
+        let mut view = ViewModel {
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Fixture episode".to_owned(),
+                body: secret.to_owned(),
+                cursor_byte: secret.len(),
+                existing: true,
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &view
+            ),
+            Some(UiAction::SavePrivateNote)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::InsertPrivateNoteNewline)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &view),
+            Some(UiAction::MovePrivateNoteCursor(PrivateNoteCursorMotion::Up))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &view),
+            Some(UiAction::RequestPrivateNoteDelete)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &view),
+            Some(UiAction::AppendPrivateNoteCharacter('q')),
+            "normal Quit must not leak through the focused note editor"
+        );
+        let debug = format!("{view:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+
+        view.private_note_popup
+            .as_mut()
+            .expect("note popup")
+            .confirming_delete = true;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::RequestPrivateNoteDelete)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissPrivateNotePopup)
+        );
+    }
+
+    #[test]
+    fn private_note_popup_renders_storage_and_mouse_buttons() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 32)).expect("private-note test terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture")),
+                title: "Fixture episode".to_owned(),
+                has_private_note: true,
+                ..DetailView::default()
+            }),
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Fixture episode".to_owned(),
+                body: "Line one\nLine two".to_owned(),
+                cursor_byte: 8,
+                existing: true,
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            private_note_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render note popup");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Private note"));
+        assert!(rendered.contains("Line one"));
+        assert!(rendered.contains("/tmp/youta/state/notes.toml"));
+        let save_area = hit_map
+            .private_note_buttons
+            .iter()
+            .find_map(|(action, area)| (*action == UiAction::SavePrivateNote).then_some(*area))
+            .expect("Save mouse target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: save_area.x,
+                    row: save_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SavePrivateNote)
+        );
+    }
+
+    #[test]
+    fn details_private_note_button_changes_between_add_and_edit() {
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).expect("Details test terminal");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture")),
+                title: "Fixture episode".to_owned(),
+                ..DetailView::default()
+            }),
+            rows: vec![RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture")),
+                title: "Fixture episode".to_owned(),
+                ..RowView::default()
+            }],
+            private_note_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render add note");
+        assert!(rendered_text(&terminal).contains("[m] Add private note"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::EditPrivateNote)
+        );
+
+        view.details.as_mut().expect("Details").has_private_note = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render edit note");
+        assert!(rendered_text(&terminal).contains("[m] Edit private note"));
+    }
+
+    #[test]
     fn keyboard_moves_selects_and_activates_detail_links_without_replacing_list_controls() {
         let view = ViewModel {
             details: Some(DetailView {
@@ -8453,6 +9654,18 @@ mod tests {
     }
 
     #[test]
+    fn radio_tab_follows_its_compile_feature() {
+        assert_eq!(Screen::Radio.enabled(), cfg!(feature = "radio"));
+        assert_eq!(
+            Screen::ALL
+                .into_iter()
+                .filter(|screen| screen.enabled())
+                .any(|screen| screen == Screen::Radio),
+            cfg!(feature = "radio")
+        );
+    }
+
+    #[test]
     fn preferences_and_channel_page_have_distinct_global_shortcuts() {
         let view = ViewModel::default();
         assert_eq!(
@@ -8535,6 +9748,236 @@ mod tests {
             ),
             None,
             "the focused URL editor must capture unrelated modified keys"
+        );
+    }
+
+    #[test]
+    fn playlist_shortcuts_require_a_playable_item_and_preserve_modifier_meanings() {
+        for screen in [
+            Screen::Search,
+            Screen::YouTubeMusic,
+            Screen::Bandcamp,
+            Screen::ApplePodcasts,
+            Screen::Local,
+        ] {
+            let view = ViewModel {
+                screen,
+                playlist_item: Some(PlaylistItemView {
+                    media_id: MediaId::new(SourceKind::YouTube, "playable"),
+                    title: "Playable item".to_owned(),
+                    in_todo: false,
+                }),
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &view),
+                Some(UiAction::ToggleTodoPlaylist),
+                "plain l must toggle todo on {screen:?}"
+            );
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                    &view
+                ),
+                Some(UiAction::OpenPlaylistPopup),
+                "uppercase P must open the chooser on {screen:?}"
+            );
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::SHIFT,
+            ] {
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('l'), modifiers), &view),
+                    None,
+                    "modified l must retain terminal/application semantics"
+                );
+            }
+        }
+
+        let unavailable = ViewModel::default();
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                &unavailable
+            ),
+            None
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                &unavailable
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn playlist_popup_keys_are_modal_and_route_create_edit_fields() {
+        let browse = ViewModel {
+            playlist_item: Some(PlaylistItemView {
+                media_id: MediaId::new(SourceKind::YouTube, "episode"),
+                title: "Episode".to_owned(),
+                in_todo: false,
+            }),
+            playlist_popup: Some(PlaylistPopupView {
+                item_title: "Episode".to_owned(),
+                playlists: vec![PlaylistChoiceView {
+                    playlist_id: "todo".to_owned(),
+                    name: "todo".to_owned(),
+                    contains_item: false,
+                }],
+                ..PlaylistPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                UiAction::MovePlaylistPopupSelection(-1),
+            ),
+            (
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                UiAction::MovePlaylistPopupSelection(1),
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                UiAction::ToggleSelectedPlaylistMembership,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                UiAction::BeginNewPlaylist,
+            ),
+            (
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                UiAction::DismissPlaylistPopup,
+            ),
+        ] {
+            assert_eq!(key_action(key, &browse), Some(expected));
+        }
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                &browse
+            ),
+            None,
+            "the chooser must suppress the global todo shortcut"
+        );
+
+        let mut create = browse.clone();
+        create.playlist_popup.as_mut().expect("popup").mode = PlaylistPopupMode::Create;
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                &create
+            ),
+            Some(UiAction::AppendPlaylistEditorCharacter('l'))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &create),
+            Some(UiAction::SelectPlaylistEditorField(
+                PlaylistEditorField::Description
+            ))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &create),
+            Some(UiAction::SelectPlaylistEditorField(
+                PlaylistEditorField::Description
+            ))
+        );
+        create.playlist_popup.as_mut().expect("popup").editor_field =
+            PlaylistEditorField::Description;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &create),
+            Some(UiAction::SelectPlaylistEditorField(
+                PlaylistEditorField::Name
+            ))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &create),
+            Some(UiAction::CreatePlaylistAndAdd)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                &create
+            ),
+            Some(UiAction::DeletePlaylistEditorCharacter)
+        );
+
+        let mut edit = create;
+        edit.playlist_popup.as_mut().expect("popup").mode = PlaylistPopupMode::Edit;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &edit),
+            Some(UiAction::UpdatePlaylist)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &edit),
+            Some(UiAction::DismissPlaylistPopup)
+        );
+    }
+
+    #[test]
+    fn playlist_popup_sits_above_local_mutations_but_below_diagnostics() {
+        let mut view = ViewModel {
+            playlist_popup: Some(PlaylistPopupView::default()),
+            local_file_popup: Some(LocalFilePopupView::Trash {
+                name: "fixture.flac".to_owned(),
+                path: "/music/fixture.flac".to_owned(),
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissPlaylistPopup),
+            "the visibly topmost playlist popup must receive modal input"
+        );
+
+        view.error_popup = Some(ErrorPopupView {
+            report: "diagnostic fixture".to_owned(),
+            ..ErrorPopupView::default()
+        });
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissErrorPopup),
+            "diagnostics remain the highest-priority modal"
+        );
+    }
+
+    #[test]
+    fn playlists_screen_edit_shortcut_overrides_equalizer_only_on_that_screen() {
+        let playlists = ViewModel {
+            screen: Screen::Playlists,
+            playlist_edit_available: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &playlists
+            ),
+            Some(UiAction::EditSelectedPlaylist)
+        );
+        let playlist_entries = ViewModel {
+            screen: Screen::Playlists,
+            playlist_edit_available: false,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &playlist_entries
+            ),
+            Some(UiAction::OpenEqualizer),
+            "playlist entries without an editable playlist row retain the equalizer shortcut"
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &ViewModel::default()
+            ),
+            Some(UiAction::OpenEqualizer)
         );
     }
 
@@ -9411,6 +10854,204 @@ mod tests {
     }
 
     #[test]
+    fn playable_details_show_playlist_actions_and_wrapped_selectable_membership() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-episode");
+        let view = ViewModel {
+            rows: vec![RowView {
+                title: "Fixture episode".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(media_id.clone()),
+                title: "Fixture episode".to_owned(),
+                playlist_names: vec![
+                    "todo".to_owned(),
+                    "A playlist name long enough to wrap".to_owned(),
+                ],
+                ..DetailView::default()
+            }),
+            playlist_item: Some(PlaylistItemView {
+                media_id,
+                title: "Fixture episode".to_owned(),
+                in_todo: true,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw playlist membership");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[l] Remove from todo"));
+        assert!(rendered.contains("[P] Playlist…"));
+        assert!(rendered.contains("Playlists: todo"));
+        assert!(rendered.contains("A playlist name"));
+
+        let selectable = hit_map
+            .detail_text_rows
+            .iter()
+            .map(|row| row.cells.concat())
+            .collect::<Vec<_>>();
+        assert!(
+            selectable
+                .iter()
+                .any(|line| line.contains("Playlists: todo"))
+        );
+        assert!(
+            selectable
+                .iter()
+                .any(|line| line.contains("A playlist name")),
+            "wrapped continuation must remain selectable: {selectable:?}"
+        );
+        for expected in [UiAction::ToggleTodoPlaylist, UiAction::OpenPlaylistPopup] {
+            let (_, target) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .expect("playlist Details button");
+            if expected == UiAction::ToggleTodoPlaylist {
+                assert_eq!(
+                    target.width,
+                    terminal_text_width("[l] Remove from todo"),
+                    "the Details hit region must cover the full explicit action label"
+                );
+            }
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn details_hide_playlist_actions_when_the_visible_item_has_a_different_identity() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "linked-video")),
+                title: "Linked video".to_owned(),
+                ..DetailView::default()
+            }),
+            playlist_item: Some(PlaylistItemView {
+                media_id: MediaId::new(SourceKind::YouTube, "selected-video"),
+                title: "Selected video".to_owned(),
+                in_todo: false,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw linked-video Details");
+
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("[l] Add to todo"));
+        assert!(!rendered.contains("[l] Remove from todo"));
+        assert!(!rendered.contains("[P] Playlist…"));
+        assert!(hit_map.detail_buttons.iter().all(|(action, _)| !matches!(
+            action,
+            UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
+        )));
+    }
+
+    #[test]
+    fn details_omit_playlist_membership_line_when_the_item_has_none() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::YouTube, "unsorted-episode");
+        let view = ViewModel {
+            rows: vec![RowView {
+                title: "Unsorted episode".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(media_id.clone()),
+                title: "Unsorted episode".to_owned(),
+                playlist_names: Vec::new(),
+                ..DetailView::default()
+            }),
+            playlist_item: Some(PlaylistItemView {
+                media_id,
+                title: "Unsorted episode".to_owned(),
+                in_todo: false,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw item without playlist memberships");
+
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("Playlists:"));
+        assert!(
+            hit_map
+                .detail_text_rows
+                .iter()
+                .flat_map(|row| row.cells.iter())
+                .all(|line| !line.contains("Playlists:"))
+        );
+    }
+
+    #[test]
+    fn playlist_metadata_omits_video_only_statistics() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Playlists,
+            rows: vec![RowView {
+                title: "Research".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                title: "Research".to_owned(),
+                description: "Items to study later\n3 items".to_owned(),
+                ..DetailView::default()
+            }),
+            playlist_edit_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw playlist metadata");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[e] Edit playlist"));
+        assert!(rendered.contains("Items to study later"));
+        assert!(!rendered.contains("Length:"));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+    }
+
+    #[test]
     fn focused_details_render_scrolled_description_and_visible_scrollbar() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -9997,6 +11638,69 @@ mod tests {
                 .detail_buttons
                 .iter()
                 .all(|(action, _)| action != &UiAction::OpenInBrowser)
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_rows_and_details_render_as_live_station_controls() {
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::Radio, "sector-radio-progressive-flac");
+        let view = ViewModel {
+            screen: Screen::Radio,
+            rows: vec![RowView {
+                media_id: Some(media_id.clone()),
+                title: "Sector Radio — Progressive".to_owned(),
+                subtitle: "FLAC · 44.1 kHz · stereo".to_owned(),
+                source: "Radio".to_owned(),
+                watched_percent: 42,
+                hide_watched_marker: true,
+                compact: true,
+                ..RowView::default()
+            }],
+            playing_media_id: Some(media_id),
+            details: Some(DetailView {
+                title: "Sector Radio — Progressive".to_owned(),
+                source: "Radio".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://sectorradio.com/").expect("station URL"),
+                ),
+                description: "Lossless progressive electronic music.\n\nQuality: FLAC · bitrate unknown · 44.1 kHz · stereo\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
+                length: "must not render".to_owned(),
+                likes: "must not render".to_owned(),
+                views: "must not render".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Radio details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("▶ Sector Radio — Progressive"));
+        assert!(!rendered.contains("▶ ● Sector Radio"));
+        assert!(!rendered.contains("42%"));
+        assert!(rendered.contains("FLAC · 44.1 kHz · stereo"));
+        assert!(rendered.contains("[O] xdg-open · https://sectorradio.com/"));
+        assert!(!rendered.contains("Length:"));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenInBrowser)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenInBrowser)
         );
     }
 
@@ -11285,6 +12989,9 @@ mod tests {
                     false,
                     true,
                     false,
+                    None,
+                    false,
+                    false,
                     Some(LocalSizeSort::Off),
                     "",
                     false,
@@ -11334,6 +13041,9 @@ mod tests {
                     false,
                     true,
                     false,
+                    None,
+                    false,
+                    false,
                     Some(LocalSizeSort::Off),
                     "",
                     false,
@@ -11363,6 +13073,192 @@ mod tests {
     }
 
     #[test]
+    fn playlist_entries_footer_exposes_a_clickable_back_action() {
+        let backend = TestBackend::new(320, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let view = ViewModel {
+            screen: Screen::Playlists,
+            playlist_back_available: true,
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    Screen::Playlists,
+                    YouTubeSearchSort::Relevance,
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
+                    true,
+                    None,
+                    "",
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("draw playlist-entry controls");
+
+        assert!(rendered_text(&terminal).contains("[Backspace] Back to playlists"));
+        let (_, target) = hit_map
+            .buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::GoBack)
+            .expect("playlist back click target");
+        assert_eq!(
+            target.width,
+            terminal_text_width("[Backspace] Back to playlists")
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::GoBack)
+        );
+    }
+
+    #[test]
+    fn playable_footer_keeps_todo_and_playlist_mouse_actions_at_eighty_columns() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let playlist_item = PlaylistItemView {
+            media_id: MediaId::new(SourceKind::YouTube, "playable"),
+            title: "Playable".to_owned(),
+            in_todo: false,
+        };
+        let view = ViewModel {
+            playlist_item: Some(playlist_item.clone()),
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    Screen::Search,
+                    YouTubeSearchSort::Relevance,
+                    false,
+                    true,
+                    false,
+                    Some(&playlist_item),
+                    false,
+                    false,
+                    None,
+                    "",
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("draw playable controls");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[l] Add to todo"));
+        assert!(rendered.contains("[P] Playlist…"));
+        for expected in [UiAction::ToggleTodoPlaylist, UiAction::OpenPlaylistPopup] {
+            let (_, target) = hit_map
+                .buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .expect("playlist footer click target");
+            if expected == UiAction::ToggleTodoPlaylist {
+                assert_eq!(
+                    target.width,
+                    terminal_text_width("[l] Add to todo"),
+                    "the footer hit region must cover the full explicit action label"
+                );
+            }
+            assert!(target.right() <= terminal.backend().buffer().area.right());
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_hotkeys_keep_playlist_labels_and_click_targets() {
+        let backend = TestBackend::new(240, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let playlist_item = PlaylistItemView {
+            media_id: MediaId::new(SourceKind::YouTube, "playable"),
+            title: "Playable".to_owned(),
+            in_todo: true,
+        };
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings {
+                        show_hotkeys: false,
+                        ..UiSettings::default()
+                    },
+                    &Theme::new(false),
+                    Screen::Search,
+                    YouTubeSearchSort::Relevance,
+                    false,
+                    true,
+                    false,
+                    Some(&playlist_item),
+                    false,
+                    false,
+                    None,
+                    "",
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("draw controls without hotkey values");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Remove from todo"));
+        assert!(rendered.contains("Playlist…"));
+        assert!(!rendered.contains("[l]"));
+        assert!(!rendered.contains("[P]"));
+        assert!(
+            hit_map
+                .buttons
+                .iter()
+                .any(|(action, target)| action == &UiAction::ToggleTodoPlaylist
+                    && target.width == terminal_text_width("Remove from todo"))
+        );
+        assert!(
+            hit_map
+                .buttons
+                .iter()
+                .any(|(action, target)| action == &UiAction::OpenPlaylistPopup && target.width > 0)
+        );
+    }
+
+    #[test]
     fn eighty_column_search_footer_keeps_autoplay_visible_and_clickable() {
         let backend = TestBackend::new(80, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -11380,6 +13276,9 @@ mod tests {
                     YouTubeSearchSort::Relevance,
                     false,
                     true,
+                    false,
+                    None,
+                    false,
                     false,
                     None,
                     "",
@@ -11552,6 +13451,9 @@ mod tests {
                     YouTubeSearchSort::Newest,
                     true,
                     true,
+                    false,
+                    None,
+                    false,
                     false,
                     Some(LocalSizeSort::Off),
                     "",
@@ -12516,6 +14418,46 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn radio_metadata_extends_the_clickable_stable_station_title() {
+        let backend = TestBackend::new(220, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let active = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                title: Some("France Musique".to_owned()),
+                volume: 80,
+                speed: 1.0,
+                ..PlaybackStatus::default()
+            },
+            radio_now_playing: Some("On air: Le Concert — Current segment".to_owned()),
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &active,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw Radio status");
+
+        let expected = "France Musique · On air: Le Concert — Current segment";
+        let target = hit_map.now_playing.expect("Radio now-playing target");
+        assert_eq!(target.width, terminal_text_width(expected));
+        let rendered_status = (target.x..target.right())
+            .map(|x| terminal.backend().buffer()[(x, target.y)].symbol())
+            .collect::<String>();
+        assert_eq!(rendered_status, expected);
+        assert!(!rendered_status.contains("http"));
+    }
+
+    #[test]
     fn render_shows_known_and_unknown_download_progress_without_hiding_seekbar() {
         let backend = TestBackend::new(160, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -12769,7 +14711,8 @@ prose 07:25 remains clickable but is not a chapter";
                 selected_field: YouTubeSetupField::ApiKey,
                 api_key: secret.to_owned(),
                 invidious_url: "https://invidious.example".to_owned(),
-                config_path: "/home/listener/.config/youta/config.toml".to_owned(),
+                api_key_path: "/home/listener/.config/youta/secrets/credentials.toml".to_owned(),
+                invidious_path: "/home/listener/.config/youta/config.toml".to_owned(),
                 validation_error: Some("API key was rejected".to_owned()),
             }),
             ..ViewModel::default()
@@ -12818,10 +14761,12 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(normalized.contains("choose a public instance from the official list"));
         assert!(normalized.contains("[F3] Instance list"));
         assert!(normalized.contains(INVIDIOUS_INSTANCES_URL.trim_start_matches("https://")));
+        assert!(normalized.contains("/home/listener/.config/youta/secrets/credentials.toml"));
         assert!(normalized.contains("/home/listener/.config/youta/config.toml"));
-        assert!(normalized.contains("Will save to:"));
+        assert!(normalized.contains("API key saves to:"));
+        assert!(normalized.contains("Invidious URL saves to:"));
         assert!(normalized.contains("API keys are plaintext"));
-        assert!(normalized.contains("directory 0700, file 0600"));
+        assert!(normalized.contains("directories 0700, files 0600"));
         assert!(normalized.contains("Environment variables override"));
         assert!(normalized.contains("Error: API key was rejected"));
         assert!(normalized.contains("[Enter] Save and retry"));
@@ -12910,6 +14855,233 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn playlist_chooser_exposes_membership_and_keyboard_equivalent_mouse_targets() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            playlist_popup: Some(PlaylistPopupView {
+                item_title: "Fixture episode".to_owned(),
+                playlists: vec![
+                    PlaylistChoiceView {
+                        playlist_id: "todo".to_owned(),
+                        name: "todo".to_owned(),
+                        contains_item: true,
+                    },
+                    PlaylistChoiceView {
+                        playlist_id: "research".to_owned(),
+                        name: "Research".to_owned(),
+                        contains_item: false,
+                    },
+                ],
+                selected: 0,
+                ..PlaylistPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw playlist chooser");
+        let normalized = rendered_text(&terminal)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "Add to playlist",
+            "Item: Fixture episode",
+            "[✓] todo",
+            "[ ] Research",
+            "[Enter] Add/remove",
+            "[n] New playlist",
+            "[Esc] Close",
+        ] {
+            assert!(
+                normalized.contains(expected),
+                "playlist chooser omitted `{expected}`:\n{normalized}"
+            );
+        }
+
+        assert_eq!(hit_map.playlist_popup_first_index, 0);
+        assert!(hit_map.playlist_popup_rows.height >= 2);
+        let second_row_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit_map.playlist_popup_rows.x,
+            row: hit_map.playlist_popup_rows.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(second_row_click, &hit_map, &view),
+            Some(UiAction::SelectPlaylistPopupRow(1))
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit_map.playlist_popup_rows.x,
+                    row: hit_map.playlist_popup_rows.y.saturating_add(3),
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            None,
+            "blank chooser rows must not manufacture model indices"
+        );
+        for expected in [
+            UiAction::ToggleSelectedPlaylistMembership,
+            UiAction::BeginNewPlaylist,
+            UiAction::DismissPlaylistPopup,
+        ] {
+            let target = hit_map
+                .playlist_popup_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .map(|(_, area)| *area)
+                .expect("playlist chooser button");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: hit_map.playlist_popup_rows.x,
+                    row: hit_map.playlist_popup_rows.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::MovePlaylistPopupSelection(1))
+        );
+    }
+
+    #[test]
+    fn playlist_editor_shows_bounded_fields_errors_and_hidden_hotkey_mouse_actions() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            playlist_popup: Some(PlaylistPopupView {
+                mode: PlaylistPopupMode::Create,
+                editor_field: PlaylistEditorField::Description,
+                editor_name: "Road trip".to_owned(),
+                editor_description: "Episodes for the train".to_owned(),
+                name_limit: 80,
+                description_limit: 500,
+                validation_error: Some("playlist name already exists".to_owned()),
+                ..PlaylistPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw playlist editor");
+        let normalized = rendered_text(&terminal)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "New playlist",
+            "Name bytes (9/80)",
+            "Description (22/500)",
+            "Error: playlist name already exists",
+            "[Enter] Create and add",
+            "[Esc] Back/close",
+        ] {
+            assert!(
+                normalized.contains(expected),
+                "playlist editor omitted `{expected}`:\n{normalized}"
+            );
+        }
+        assert_eq!(hit_map.playlist_popup_fields.len(), 2);
+        let name_target = hit_map
+            .playlist_popup_fields
+            .iter()
+            .find(|(field, _)| *field == PlaylistEditorField::Name)
+            .map(|(_, area)| *area)
+            .expect("name field target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: name_target.x,
+                    row: name_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SelectPlaylistEditorField(
+                PlaylistEditorField::Name
+            ))
+        );
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &view,
+                    &UiSettings {
+                        show_hotkeys: false,
+                        ..UiSettings::default()
+                    },
+                    &mut hit_map,
+                );
+            })
+            .expect("draw playlist editor without hotkey values");
+        let hidden = rendered_text(&terminal);
+        assert!(hidden.contains("Create and add"));
+        assert!(!hidden.contains("[Enter]"));
+        assert!(!hidden.contains("[Esc]"));
+        let submit = hit_map
+            .playlist_popup_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::CreatePlaylistAndAdd)
+            .map(|(_, area)| *area)
+            .expect("hidden-hotkey submit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: submit.x,
+                    row: submit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CreatePlaylistAndAdd)
+        );
+
+        view.playlist_popup.as_mut().expect("popup").mode = PlaylistPopupMode::Edit;
+        view.playlist_popup
+            .as_mut()
+            .expect("popup")
+            .editing_playlist_id = Some("reserved:todo".to_owned());
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw playlist editor");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Edit playlist"));
+        assert!(rendered.contains("[Enter] Save changes"));
+        assert!(!rendered.contains("reserved:todo"));
+    }
+
+    #[test]
     fn rss_subscription_popup_redacts_private_url_from_debug_output() {
         let private_url =
             "https://listener:secret@podcasts.example/private.xml?token=unprintable-secret";
@@ -12936,7 +15108,8 @@ prose 07:25 remains clickable but is not a chapter";
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             youtube_setup_popup: Some(YouTubeSetupPopupView {
-                config_path: "/home/listener/.config/youta/config.toml".to_owned(),
+                api_key_path: "/home/listener/.config/youta/secrets/credentials.toml".to_owned(),
+                invidious_path: "/home/listener/.config/youta/config.toml".to_owned(),
                 ..YouTubeSetupPopupView::default()
             }),
             ..ViewModel::default()
@@ -12978,7 +15151,8 @@ prose 07:25 remains clickable but is not a chapter";
             "choose a public instance from the official list",
             "[F3] Instance list",
             "docs.invidious.io/instances/",
-            "Will save to: /home/listener/.config/youta/config.toml",
+            "API key saves to: /home/listener/.config/youta/secrets/credentials.toml",
+            "Invidious URL saves to: /home/listener/.config/youta/config.toml",
             "API keys are plaintext",
             "[Enter] Save and retry",
             "[Esc] Cancel",
@@ -13638,6 +15812,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Bandcamp,
                 #[cfg(feature = "apple-podcasts")]
                 Screen::ApplePodcasts,
+                #[cfg(feature = "radio")]
+                Screen::Radio,
                 Screen::TrackerMusic,
                 Screen::Subscriptions,
                 Screen::Local,

@@ -41,12 +41,13 @@
 		<flag name="peertube">Enable configurable PeerTube instances</flag>
 		<flag name="pipewire">Enable mpv playback through PipeWire</flag>
 		<flag name="podcast-index">Enable Podcast Index catalog search</flag>
-		<flag name="radio">Enable direct online radio streams</flag>
+		<flag name="radio">Enable the account-free static online-radio catalogue and direct live streams</flag>
 		<flag name="rumble">Enable the experimental Rumble adapter</flag>
 		<flag name="rutube">Enable direct RuTube URLs through yt-dlp</flag>
 		<flag name="soundcloud">Enable SoundCloud URLs and optional official-API discovery</flag>
 		<flag name="soundstream">Enable bounded, read-only metadata resolution for public SoundStream playlist and clip links</flag>
 		<flag name="sponsorblock">Enable read-only SponsorBlock segment retrieval</flag>
+		<flag name="sqlite">Build the optional SQLite state backend; human-readable TOML state remains the runtime default</flag>
 		<flag name="ssh">Enable read-only SSH/SFTP media sources and optional backups</flag>
 		<flag name="telegram">Enable the experimental local Telegram client adapter</flag>
 		<flag name="thumbnails">Build optional terminal-image-protocol support</flag>

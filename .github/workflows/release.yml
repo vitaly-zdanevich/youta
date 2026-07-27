@@ -74,11 +74,34 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
 
-      - name: Run deterministic all-feature tests
-        run: cargo test --locked --all-targets --all-features
+      - name: Run the complete deterministic feature matrix
+        run: |
+          cargo test --locked --all-targets
+          cargo test --locked --all-targets --no-default-features
+          cargo test --locked --all-targets --no-default-features --features sqlite-state
+          cargo test --locked --all-targets --no-default-features --features tui
+          cargo test --locked --all-targets --no-default-features --features tui,local
+          cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts
+          cargo test --locked --all-targets --no-default-features --features tui,bandcamp
+          cargo test --locked --all-targets --no-default-features --features tui,radio
+          cargo test --locked --all-targets --all-features
 
-      - name: Run all-feature Rustdoc tests
-        run: cargo test --locked --doc --all-features
+      - name: Run the explicit end-to-end terminal test
+        env:
+          TERM: xterm-256color
+        run: cargo test --locked --test e2e --all-features
+
+      - name: Run the complete Rustdoc test matrix
+        run: |
+          cargo test --locked --doc
+          cargo test --locked --doc --no-default-features
+          cargo test --locked --doc --no-default-features --features sqlite-state
+          cargo test --locked --doc --no-default-features --features tui
+          cargo test --locked --doc --no-default-features --features tui,local
+          cargo test --locked --doc --no-default-features --features tui,apple-podcasts
+          cargo test --locked --doc --no-default-features --features tui,bandcamp
+          cargo test --locked --doc --no-default-features --features tui,radio
+          cargo test --locked --doc --all-features
 
   binaries:
     name: Linux ${{ matrix.architecture }}

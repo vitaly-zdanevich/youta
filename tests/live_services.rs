@@ -41,6 +41,9 @@ const YOUTUBE_MUSIC_TEST_QUERY: &str = "YOUTA_LIVE_YOUTUBE_MUSIC_QUERY";
 #[cfg(feature = "youtube-music")]
 const DEFAULT_YOUTUBE_MUSIC_QUERY: &str = "Massive Attack Teardrop";
 
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+const RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_RADIO_TEST";
+
 /// Resolves a real Apple Podcasts show, parses its RSS feed, and decodes audio.
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
 #[test]
@@ -375,6 +378,100 @@ fn youtube_music_keyless_search_returns_playable_tracks_before_timeout() {
                 .query_pairs()
                 .any(|(key, value)| key == "v" && value.as_ref() == track.video_id.as_str())
     }));
+}
+
+/// Decodes a public HTTPS radio stream and parses optional station metadata.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires public radio streams, 4duk metadata, and mpv"]
+fn radio_stream_and_passive_metadata_are_usable() {
+    use std::time::{Duration, Instant};
+
+    use youta::playback::mpv::MpvBackend;
+    use youta::playback::{
+        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackInput,
+        PlaybackProfile, ProcessPlaybackConfig,
+    };
+    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
+
+    assert_eq!(
+        std::env::var(RADIO_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {RADIO_TEST_OPT_IN}=1 when invoking this live test"
+    );
+
+    let station = station_by_id("radio-swiss-classic").expect("HTTPS live-radio fixture");
+    let temporary = tempfile::tempdir().expect("temporary Radio playback directory");
+    let config = ProcessPlaybackConfig {
+        mpv_executable: std::env::var_os("YOUTA_TEST_MPV").map_or_else(|| "mpv".into(), Into::into),
+        yt_dlp_executable: std::env::var_os("YOUTA_TEST_YT_DLP")
+            .map_or_else(|| "yt-dlp".into(), Into::into),
+        runtime_dir: temporary.path().join("runtime"),
+        audio_output: AudioOutputDriver::Null,
+        audio_device: None,
+        profile: PlaybackProfile::Balanced,
+        audiophile: AudiophilePlaybackOptions::default(),
+    };
+    let mut backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    backend
+        .play(&PlaybackInput::new(station.stream))
+        .expect("open the public HTTPS radio stream through Youta");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut active = false;
+    let mut position = Duration::ZERO;
+    let mut stream_title = None;
+    let mut backend_diagnostic = None;
+    while Instant::now() < deadline {
+        match backend.status() {
+            Ok(status) => {
+                active |= !status.idle;
+                position = position.max(status.position);
+                if status
+                    .stream_title
+                    .as_deref()
+                    .is_some_and(|title| !title.trim().is_empty())
+                {
+                    stream_title = status.stream_title;
+                }
+            }
+            Err(error) => {
+                backend_diagnostic = Some(error.to_string());
+                break;
+            }
+        }
+        match backend.poll_event() {
+            Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
+            | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
+                backend_diagnostic = Some(format!("{event:?}"));
+            }
+            Ok(_) => {}
+            Err(error) => backend_diagnostic = Some(error.to_string()),
+        }
+        if active && position >= Duration::from_secs(2) && stream_title.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    backend.shutdown().expect("stop Radio playback cleanly");
+    assert!(
+        active && position >= Duration::from_secs(2) && stream_title.is_some(),
+        "public Radio audio or ICY metadata did not become active; last position: {position:?}; \
+         stream title: {stream_title:?}; backend diagnostic: {}",
+        backend_diagnostic.as_deref().unwrap_or("none")
+    );
+
+    let four_duk = station_by_id("4duk-radio").expect("4duk metadata fixture");
+    let endpoint = four_duk
+        .now_playing
+        .expect("4duk retains its optional metadata endpoint");
+    let metadata = RadioNowPlayingClient::with_options(Duration::from_secs(20), 16 * 1024)
+        .expect("bounded Radio metadata client")
+        .fetch(endpoint)
+        .expect("fetch and parse 4duk's public now-playing JSON");
+    assert!(
+        metadata.title.is_some() || metadata.artist.is_some(),
+        "4duk returned no current title or artist"
+    );
 }
 
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]

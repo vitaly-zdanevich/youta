@@ -153,6 +153,10 @@ fn run_tui(config: Config) -> Result<()> {
         thumbnail_cache_dir: Some(config.thumbnail_cache_dir()),
         ..UiSettings::default()
     };
+    let shutdown_git_sync = config
+        .persistence
+        .git_commit_on_change
+        .then(|| config.config_dir().to_path_buf());
     let mut controller = AppController::new(config, store, provider, playback_factory);
     if let Some(error) = provider_startup_error {
         let report = DiagnosticReport::capture_error(
@@ -178,7 +182,25 @@ fn run_tui(config: Config) -> Result<()> {
     std::panic::set_hook(previous_hook);
 
     match run_result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            let synchronization =
+                finalize_before_sync(controller, AppController::shutdown_for_exit, || {
+                    shutdown_git_sync
+                        .as_deref()
+                        .map(youta::git_sync::sync_config_root)
+                        .transpose()
+                });
+            match synchronization {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("Youta Git synchronization failed: {error}"),
+                Err(error) => {
+                    eprintln!(
+                        "Youta state persistence failed; automatic Git synchronization was skipped: {error}"
+                    );
+                }
+            }
+            Ok(())
+        }
         Ok(Err(error)) => {
             let helpers =
                 probe_diagnostic_helpers(diagnostic_mpv.clone(), diagnostic_yt_dlp.clone());
@@ -209,6 +231,26 @@ fn run_tui(config: Config) -> Result<()> {
             bail!("terminal UI panicked; Youta displayed a diagnostic report")
         }
     }
+}
+
+/// Durably shuts down and drops an owner before invoking a synchronization callback.
+///
+/// Dropping the owner before `synchronize` releases resources such as the
+/// human-readable state lock. A shutdown error drops the owner but returns
+/// without invoking `synchronize`.
+#[cfg(feature = "tui")]
+fn finalize_before_sync<T, Shutdown, Synchronize, Output, Error>(
+    mut owner: T,
+    shutdown: Shutdown,
+    synchronize: Synchronize,
+) -> Result<Output, Error>
+where
+    Shutdown: FnOnce(&mut T) -> Result<(), Error>,
+    Synchronize: FnOnce() -> Output,
+{
+    shutdown(&mut owner)?;
+    drop(owner);
+    Ok(synchronize())
 }
 
 #[cfg(feature = "tui")]
@@ -373,7 +415,12 @@ fn run_doctor(config: &Config) -> Result<()> {
         .ensure_directories()
         .context("cannot prepare private Youta directories")?;
     println!("config directory: {}", config.config_dir().display());
-    println!("state database: {}", config.database_file().display());
+    println!("state backend: {}", config.persistence.backend);
+    println!("state directory: {}", config.state_dir().display());
+    if config.persistence.backend == youta::config::PersistenceBackend::Sqlite {
+        println!("SQLite database: {}", config.database_file().display());
+    }
+    println!("credentials file: {}", config.credentials_file().display());
     println!(
         "Invidious: {}",
         config
@@ -474,7 +521,14 @@ fn helper_version(executable: &Path, arguments: &[&str]) -> Result<String> {
 fn print_config(config: &Config) {
     println!("config_dir = {}", config.config_dir().display());
     println!("config_file = {}", config.config_file().display());
-    println!("database_file = {}", config.database_file().display());
+    println!("credentials_file = {}", config.credentials_file().display());
+    println!("persistence_backend = {}", config.persistence.backend);
+    println!("state_dir = {}", config.state_dir().display());
+    println!("runtime_dir = {}", config.runtime_dir().display());
+    println!("cache_dir = {}", config.cache_dir().display());
+    if config.persistence.backend == youta::config::PersistenceBackend::Sqlite {
+        println!("database_file = {}", config.database_file().display());
+    }
     println!(
         "subscriptions_file = {}",
         config.subscriptions_file().display()
@@ -592,6 +646,107 @@ mod tests {
             super::panic_payload_message(&opaque),
             "non-string panic payload (contents omitted)"
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn graceful_exit_flushes_then_drops_lock_before_sync() {
+        use std::cell::Cell;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct LockedOwner {
+            events: Rc<RefCell<Vec<&'static str>>>,
+            lock_held: Rc<Cell<bool>>,
+        }
+
+        impl Drop for LockedOwner {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push("drop");
+                self.lock_held.set(false);
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let lock_held = Rc::new(Cell::new(true));
+        let owner = LockedOwner {
+            events: Rc::clone(&events),
+            lock_held: Rc::clone(&lock_held),
+        };
+
+        let outcome = super::finalize_before_sync(
+            owner,
+            |owner| {
+                assert!(owner.lock_held.get(), "state lock disappeared before flush");
+                owner.events.borrow_mut().push("flush");
+                Ok::<_, &'static str>(())
+            },
+            || {
+                assert!(!lock_held.get(), "Git ran while the state lock was held");
+                events.borrow_mut().push("sync");
+                youta::git_sync::GitSyncOutcome::NotRepository
+            },
+        )
+        .expect("durable shutdown");
+
+        assert_eq!(outcome, youta::git_sync::GitSyncOutcome::NotRepository);
+        assert_eq!(*events.borrow(), ["flush", "drop", "sync"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn graceful_exit_skips_sync_when_persistence_fails() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct DropProbe(Rc<Cell<bool>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let synchronized = Rc::new(Cell::new(false));
+        let synchronized_by_callback = Rc::clone(&synchronized);
+        let error = super::finalize_before_sync(
+            DropProbe(Rc::clone(&dropped)),
+            |_| Err::<(), _>("fixture persistence failure"),
+            move || synchronized_by_callback.set(true),
+        )
+        .expect_err("persistence failure");
+
+        assert_eq!(error, "fixture persistence failure");
+        assert!(
+            dropped.get(),
+            "failed owner must still release its state lock"
+        );
+        assert!(
+            !synchronized.get(),
+            "Git callback must not run after persistence failure"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn graceful_exit_releases_real_state_lock_before_callback() {
+        use youta::app::AppController;
+        use youta::persistence::StateStore;
+
+        let temporary = tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("initial state lock");
+        let controller = AppController::new(config.clone(), store, None, None);
+
+        let reopened =
+            super::finalize_before_sync(controller, AppController::shutdown_for_exit, || {
+                StateStore::open(&config)
+            })
+            .expect("durable controller shutdown")
+            .expect("state lock released before callback");
+
+        drop(reopened);
     }
 
     #[cfg(all(feature = "tui", feature = "backend-mpv"))]

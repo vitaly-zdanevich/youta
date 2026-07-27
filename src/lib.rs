@@ -16,6 +16,9 @@ pub mod report_actions;
 pub mod subscriptions;
 pub mod waveform;
 
+#[cfg(feature = "tui")]
+pub mod git_sync;
+
 #[cfg(feature = "local")]
 pub mod local_move;
 

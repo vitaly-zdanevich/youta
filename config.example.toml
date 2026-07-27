@@ -96,21 +96,37 @@ nyan_cat_seekbar = false
 dos_rpg_mode = false
 
 [persistence]
+# `files` is the core default and stores deterministic, human-readable TOML
+# below ~/.config/youta/state/. `sqlite` requires the `sqlite-state` Cargo
+# feature (or `bundled-sqlite`, which includes it). Both can coexist;
+# switching this value selects the active state without migrating either one.
+# The files backend holds an exclusive state/.lock while Youta is running.
+# Close Youta before editing state/*.toml by hand.
+backend = 'files'
 position_save_interval_seconds = 30
 played_threshold_percent = 90
 
-# Experimental and off by default. Secrets, caches, database side files, and
-# media must never be included in automatic commits.
-git_commit_on_change = false
+# On a successful graceful shutdown, detect whether the configured Youta root
+# is in a Git worktree. If so, run a path-scoped `git add .`, commit changed
+# Youta files as `Automatic state update`, and push. Youta never pulls.
+# Pending state is flushed and its lock released first; a flush failure skips
+# Git synchronization.
+# Existing .gitignore rules are authoritative. Set this to false to opt out.
+git_commit_on_change = true
 
 [providers]
+# The built-in Radio tab needs no API key or instance URL. It is a static
+# catalogue compiled by the `radio` feature; selecting a station is the first
+# operation that opens its stream or optional passive metadata endpoint.
+#
 # Metadata backend for YouTube search and public details. One of: `auto`,
-# `official`, or `invidious`. `auto` prefers `youtube_api_key` when the
-# official adapter is compiled in, then falls back to `invidious_base_url`.
+# `official`, or `invidious`. `auto` prefers a YouTube API key from
+# secrets/credentials.toml or the environment when the official adapter is
+# compiled in, then falls back to `invidious_base_url`.
 # Playback remains on the separate yt-dlp/mpv path.
 youtube_backend = 'auto'
 
-# Base URLs and credentials are unset until the user chooses a provider.
+# Provider base URLs are unset until the user chooses one.
 # invidious_base_url = 'https://inv.example.org/'
 # peertube_instance_url = 'https://video.example.org/'
 # funkwhale_instance_url = 'https://audio.example.org/'
@@ -128,25 +144,32 @@ allow_insecure_http = true
 # YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT has higher precedence.
 bandcamp_audio_format = 'best-available'
 
-# Prefer environment overrides for secrets, for example:
+# Plaintext credentials belong in ~/.config/youta/secrets/credentials.toml,
+# not in this general configuration file:
+#
+#   [providers]
+#   youtube_api_key = '...'
+#   mod_archive_api_key = '...'
+#   # Register at https://devportal.jamendo.com/; Youta never ships the
+#   # documentation/testing client ID.
+#   jamendo_client_id = '...'
+#
+# Environment overrides have the highest precedence, for example:
 #
 #   YOUTA_PROVIDERS__YOUTUBE_API_KEY='...'
 #   YOUTA_PROVIDERS__MOD_ARCHIVE_API_KEY='...'
 #   YOUTA_PROVIDERS__JAMENDO_CLIENT_ID='...'
 #
 # If YouTube search has no provider, its TUI setup popup accepts either the API
-# key below or the Invidious URL above. It shows the exact config.toml path and,
-# on Unix, saves the directory with mode 0700 and the file with mode 0600.
+# key or the Invidious URL above. It shows both exact destinations:
+# secrets/credentials.toml for the key and config.toml for the instance URL.
+# On Unix, Youta saves private directories with mode 0700 and files with mode
+# 0600.
 # The popup includes API-key creation/restriction steps plus selectable links
 # to Google's official credential guide, Google Cloud Credentials, and the
 # official Invidious public-instance list.
-# The YouTube API key is plaintext in this file; its environment override takes
-# precedence. The planned keyring adapter is not part of the current foundation.
-# youtube_api_key = '...'
-# mod_archive_api_key = '...'
-# Register your own application at https://devportal.jamendo.com/; Youta never
-# ships Jamendo's documentation/testing client ID.
-# jamendo_client_id = '...'
+# Credentials remain plaintext at rest. The planned keyring adapter is not part
+# of the current foundation.
 
 # Helper names may instead be absolute paths.
 yt_dlp_executable = 'yt-dlp'

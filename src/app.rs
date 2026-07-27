@@ -35,16 +35,17 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
-    SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout,
-    YOUTUBE_PREWARM_ENV, YouTubeBackend, YouTubeProviderSetting,
+    PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
+    SubscriptionsLayout, YOUTUBE_PREWARM_ENV, YouTubeBackend, YouTubeProviderSetting,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 #[cfg(feature = "bandcamp")]
 use crate::domain::{BandcampReleaseKind, BandcampSearchSummary};
 use crate::domain::{
-    Chapter, HistoryEntry, MediaId, MediaItem, MediaKind, MediaLicense, MediaStatistics,
-    PanelFocus, PlaybackProgress, PlaybackQueue, PodcastShowSummary, QueueItem,
-    Screen as StoredScreen, SessionState, SourceKind,
+    Chapter, CommentTarget, HistoryEntry, MediaId, MediaItem, MediaKind, MediaLicense,
+    MediaStatistics, PanelFocus, PlaybackProgress, PlaybackQueue, Playlist, PlaylistEntry,
+    PlaylistMediaSnapshot, PlaylistSummary, PodcastShowSummary, QueueItem, Screen as StoredScreen,
+    SessionState, SourceKind, TODO_PLAYLIST_ID,
 };
 use crate::links::{
     LinkTarget, is_advertisement_chapter_title, normalize_description_chapter_lines,
@@ -63,7 +64,8 @@ use crate::persistence::SavedApplePodcastsSearch;
 #[cfg(feature = "youtube-music")]
 use crate::persistence::SavedYouTubeMusicSearch;
 use crate::persistence::{
-    CachedSubscriptionItems, MAX_SAVED_SUBSCRIPTION_ITEMS, MAX_SAVED_YOUTUBE_SEARCH_RESULTS,
+    CachedSubscriptionItems, MAX_PLAYLIST_NAME_BYTES, MAX_SAVED_SUBSCRIPTION_ITEMS,
+    MAX_SAVED_YOUTUBE_SEARCH_RESULTS, PlaylistCreateOutcome, PlaylistToggleOutcome,
     SavedYouTubeSearch, StateStore,
 };
 #[cfg(feature = "bandcamp")]
@@ -93,6 +95,11 @@ use crate::providers::bandcamp::{
     BandcampMediaKind, BandcampMediaUrl, BandcampResolution, BandcampResolvePurpose,
     BandcampResolver, BandcampSearchClient, BandcampSearchPage,
 };
+#[cfg(feature = "radio")]
+use crate::providers::radio::{
+    MIN_NOW_PLAYING_REFRESH, RadioCodec, RadioNowPlaying, RadioNowPlayingEndpoint,
+    RadioNowPlayingKind, RadioStationPreset, STATIONS as RADIO_STATIONS, station_by_id,
+};
 #[cfg(feature = "youtube-music")]
 use crate::providers::youtube_music::{
     YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
@@ -117,10 +124,11 @@ use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
     DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
     INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, MAX_DETAILS_SELECTION_BYTES,
-    PreferencesPopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
-    SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
-    ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
+    PlaylistChoiceView, PlaylistEditorField, PlaylistItemView, PlaylistPopupMode,
+    PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView,
+    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
+    SubscriptionPane, SubscriptionRoute, UiAction, UiController, ViewModel,
+    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::tui::{
@@ -139,6 +147,29 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
     value.truncate(boundary);
 }
 
+/// Maximum UTF-8 payload stored for one private local note.
+pub const MAX_PRIVATE_NOTE_BYTES: usize = 16 * 1024;
+
+/// Normalizes an optional editor field without retaining surrounding spacing.
+fn optional_trimmed_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Produces one whitespace-normalized, character-bounded list excerpt.
+fn one_line_excerpt(value: &str, maximum_characters: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut excerpt = characters
+        .by_ref()
+        .take(maximum_characters)
+        .collect::<String>();
+    if characters.next().is_some() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 /// Clamps an editable basename cursor to a preceding grapheme boundary.
 fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
     let requested = requested.min(value.len());
@@ -151,6 +182,80 @@ fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
         .take_while(|index| *index <= requested)
         .last()
         .unwrap_or_default()
+}
+
+/// Clamps a private-note cursor to the preceding grapheme boundary.
+fn private_note_cursor_boundary(value: &str, requested: usize) -> usize {
+    rename_cursor_boundary(value, requested)
+}
+
+/// Moves one multiline note cursor while retaining its grapheme column.
+fn moved_private_note_cursor(
+    value: &str,
+    requested: usize,
+    motion: PrivateNoteCursorMotion,
+) -> usize {
+    let cursor = private_note_cursor_boundary(value, requested);
+    match motion {
+        PrivateNoteCursorMotion::Left => value[..cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(cursor, |(index, _)| index),
+        PrivateNoteCursorMotion::Right => value[cursor..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map_or(value.len(), |(index, _)| cursor.saturating_add(index)),
+        PrivateNoteCursorMotion::Home => value[..cursor]
+            .rfind('\n')
+            .map_or(0, |index| index.saturating_add(1)),
+        PrivateNoteCursorMotion::End => value[cursor..]
+            .find('\n')
+            .map_or(value.len(), |index| cursor.saturating_add(index)),
+        PrivateNoteCursorMotion::Up | PrivateNoteCursorMotion::Down => {
+            moved_private_note_cursor_vertically(value, cursor, motion)
+        }
+    }
+}
+
+fn moved_private_note_cursor_vertically(
+    value: &str,
+    cursor: usize,
+    motion: PrivateNoteCursorMotion,
+) -> usize {
+    let current_start = value[..cursor]
+        .rfind('\n')
+        .map_or(0, |index| index.saturating_add(1));
+    let current_column = value[current_start..cursor].graphemes(true).count();
+    let (target_start, target_end) = match motion {
+        PrivateNoteCursorMotion::Up => {
+            if current_start == 0 {
+                return cursor;
+            }
+            let previous_end = current_start.saturating_sub(1);
+            let previous_start = value[..previous_end]
+                .rfind('\n')
+                .map_or(0, |index| index.saturating_add(1));
+            (previous_start, previous_end)
+        }
+        PrivateNoteCursorMotion::Down => {
+            let current_end = value[cursor..]
+                .find('\n')
+                .map_or(value.len(), |index| cursor.saturating_add(index));
+            if current_end == value.len() {
+                return cursor;
+            }
+            let next_start = current_end.saturating_add(1);
+            let next_end = value[next_start..]
+                .find('\n')
+                .map_or(value.len(), |index| next_start.saturating_add(index));
+            (next_start, next_end)
+        }
+        _ => return cursor,
+    };
+    value[target_start..target_end]
+        .grapheme_indices(true)
+        .nth(current_column)
+        .map_or(target_end, |(index, _)| target_start.saturating_add(index))
 }
 
 /// Factory used to start a playback engine only when the user presses Play.
@@ -233,6 +338,19 @@ enum ApplePodcastsRoute {
     Direct,
 }
 
+/// Current level inside the persistent local Playlists screen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum PlaylistsRoute {
+    /// Named playlists in case-insensitive display order.
+    #[default]
+    Index,
+    /// Ordered media entries belonging to one stable playlist identity.
+    Entries {
+        /// Stable playlist identifier, independent of later renames.
+        playlist_id: String,
+    },
+}
+
 /// Apple Podcasts screen that should be restored after leaving episode rows.
 #[cfg_attr(not(feature = "apple-podcasts"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +425,11 @@ pub enum LocalInputError {
         source: std::io::Error,
     },
 }
+
+/// Error returned when graceful shutdown cannot durably save restart-safe state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("one or more restart-safe state documents could not be saved")]
+pub struct ShutdownPersistenceError;
 
 /// Expands and validates an explicit local path from the unified input box.
 ///
@@ -706,7 +829,8 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
-        Screen::Subscriptions
+        Screen::Radio
+        | Screen::Subscriptions
         | Screen::Local
         | Screen::Downloaded
         | Screen::History
@@ -806,6 +930,12 @@ enum ProviderRequest {
     #[cfg(feature = "wikidata")]
     WikidataStatements {
         item_id: String,
+    },
+    #[cfg(feature = "radio")]
+    RadioNowPlaying {
+        generation: u64,
+        station_id: String,
+        endpoint: RadioNowPlayingEndpoint,
     },
     Shutdown,
 }
@@ -1056,6 +1186,12 @@ enum ProviderResponse {
     WikidataStatements {
         item_id: String,
         result: Result<crate::providers::wikidata::WikidataEntityStatements, String>,
+    },
+    #[cfg(feature = "radio")]
+    RadioNowPlaying {
+        generation: u64,
+        station_id: String,
+        result: Result<RadioNowPlaying, String>,
     },
 }
 
@@ -1476,11 +1612,36 @@ struct HistoryListEntry {
     local_removed: bool,
 }
 
+/// One exact note-capable selection resolved from the active screen route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrivateNoteSelection {
+    /// Provider-qualified media or source identity used by persistence.
+    target: CommentTarget,
+    /// Human-facing label retained only while opening the editor.
+    label: String,
+}
+
+/// Persistence identity retained while a private-note popup is open.
+///
+/// The body remains solely in the popup's redacted view model.
+struct PrivateNoteEditor {
+    target: CommentTarget,
+}
+
 /// A History replay waiting for a stable provider page to resolve again.
 #[derive(Clone, Debug)]
 struct PendingHistoryReplay {
     generation: u64,
     entry: HistoryEntry,
+}
+
+/// One stable playlist entry waiting for a first-class provider re-resolution.
+#[derive(Clone, Debug)]
+struct PendingPlaylistReplay {
+    /// Provider generation that owns the response.
+    generation: u64,
+    /// Exact persisted entry selected when replay was requested.
+    entry: PlaylistEntry,
 }
 
 /// Exact, non-lossy paths owned by the open Local Move destination chooser.
@@ -1569,6 +1730,17 @@ struct BandcampResolveCompletion {
 struct PendingBandcampResolution {
     generation: u64,
     summary: BandcampSearchSummary,
+    owner: BandcampResolutionOwner,
+}
+
+/// UI origin allowed to consume one Bandcamp resolver completion.
+#[cfg(feature = "bandcamp")]
+enum BandcampResolutionOwner {
+    /// The still-selected row on the Bandcamp search screen.
+    SearchSelection,
+    /// A still-selected persistent playlist entry, boxed to keep this
+    /// short-lived ownership discriminator compact.
+    Playlist(Box<PlaylistEntry>),
 }
 
 /// Maximum channel collections retained by the process-local LRU cache.
@@ -1786,6 +1958,38 @@ struct DetailNavigationSnapshot {
     active_description_video: Option<ActiveDescriptionVideo>,
 }
 
+/// Successful passive radio metadata retained until its next bounded refresh.
+#[cfg(feature = "radio")]
+#[derive(Clone, Debug)]
+struct CachedRadioNowPlaying {
+    value: RadioNowPlaying,
+    refresh_at: Instant,
+}
+
+/// Sole passive radio request allowed to be active or queued.
+#[cfg(feature = "radio")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingRadioNowPlaying {
+    generation: u64,
+    station_id: String,
+}
+
+/// Station-scoped passive-metadata retry state.
+#[cfg(feature = "radio")]
+#[derive(Clone, Copy, Debug)]
+struct RadioNowPlayingRetry {
+    retry_at: Instant,
+    consecutive_failures: u8,
+}
+
+#[cfg(feature = "radio")]
+const RADIO_NOW_PLAYING_FAILURE_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(10 * 60),
+];
+
 /// Default application state used by the interactive terminal.
 pub struct AppController {
     config: Config,
@@ -1828,6 +2032,20 @@ pub struct AppController {
     apple_podcasts_storefront: String,
     /// Selected `Apple Podcasts` show retained while another tab is visible.
     apple_podcasts_selected: usize,
+    /// Selected public radio station retained while another tab is visible.
+    radio_selected: usize,
+    /// Successful selected/playing radio metadata, bounded by the static catalogue.
+    #[cfg(feature = "radio")]
+    radio_now_playing_cache: HashMap<String, CachedRadioNowPlaying>,
+    /// Retry deadlines for passive failures, bounded by the static catalogue.
+    #[cfg(feature = "radio")]
+    radio_now_playing_retry_at: HashMap<String, RadioNowPlayingRetry>,
+    /// Sole passive radio request, preventing selection churn from queueing work.
+    #[cfg(feature = "radio")]
+    pending_radio_now_playing: Option<PendingRadioNowPlaying>,
+    /// Request owner rejecting completions after route changes.
+    #[cfg(feature = "radio")]
+    radio_now_playing_generation: u64,
     /// Storefront-specific show summaries returned by Apple's public catalogue.
     apple_podcasts_results: Vec<PodcastShowSummary>,
     /// Current navigation level inside the Apple Podcasts tab.
@@ -1852,6 +2070,22 @@ pub struct AppController {
     history_entries: Vec<HistoryListEntry>,
     /// Selected first-class History item awaiting fresh public media metadata.
     pending_history_replay: Option<PendingHistoryReplay>,
+    /// Current navigation level inside the persistent Playlists screen.
+    playlists_route: PlaylistsRoute,
+    /// Compact playlist rows aligned with the Playlists index.
+    playlist_summaries: Vec<PlaylistSummary>,
+    /// Selected playlist retained while its entry list is open.
+    playlist_selected: usize,
+    /// Loaded playlist owning the current entry list.
+    active_playlist: Option<Playlist>,
+    /// Selected entry retained while returning from another top-level screen.
+    playlist_entry_selected: usize,
+    /// Exact selected snapshot retained while the membership popup is open.
+    playlist_popup_item: Option<PlaylistMediaSnapshot>,
+    /// Exact target and stable timestamps owned by the private-note editor.
+    private_note_editor: Option<PrivateNoteEditor>,
+    /// First-class playlist replay awaiting a fresh public media resolution.
+    pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
     /// Watched percentages hydrated once for the current Local listing.
@@ -2045,6 +2279,9 @@ pub struct AppController {
     /// Advertisement chapter most recently skipped while backend status catches up.
     skipped_advertisement_chapter: Option<(MediaId, u64)>,
     current_media: Option<MediaId>,
+    /// Playback progress loaded once per item and updated without rescanning
+    /// the complete human-readable progress document every checkpoint.
+    current_playback_progress: Option<PlaybackProgress>,
     /// Same-source position owning the active queue item.
     current_autoplay_origin: Option<AutoplayOrigin>,
     /// Same-source position resumed after explicit queued items finish.
@@ -2069,6 +2306,8 @@ pub struct AppController {
     unflushed_listen_time: Duration,
     diagnostic_only: bool,
     quit_on_error_dismiss: bool,
+    /// Cached result making explicit shutdown and [`std::ops::Drop`] idempotent.
+    shutdown_persistence_succeeded: Option<bool>,
 }
 
 impl AppController {
@@ -2344,6 +2583,25 @@ impl AppController {
         if view.screen == Screen::ApplePodcasts {
             view.selected = apple_podcasts_selected;
         }
+        let radio_selected = saved.radio_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::Radio {
+                view.selected
+            } else {
+                0
+            }
+        });
+        if view.screen == Screen::Radio {
+            #[cfg(feature = "radio")]
+            {
+                view.selected = radio_selected.min(RADIO_STATIONS.len().saturating_sub(1));
+            }
+            #[cfg(not(feature = "radio"))]
+            {
+                view.selected = 0;
+            }
+        }
+        let (playlists_route, playlist_selected, playlist_entry_selected) =
+            restored_playlists_route(&saved.screen, saved.selected_row);
         let tracker_selected = if view.screen == Screen::TrackerMusic {
             view.selected
         } else {
@@ -2382,6 +2640,15 @@ impl AppController {
             #[cfg(feature = "apple-podcasts")]
             apple_podcasts_storefront,
             apple_podcasts_selected,
+            radio_selected,
+            #[cfg(feature = "radio")]
+            radio_now_playing_cache: HashMap::new(),
+            #[cfg(feature = "radio")]
+            radio_now_playing_retry_at: HashMap::new(),
+            #[cfg(feature = "radio")]
+            pending_radio_now_playing: None,
+            #[cfg(feature = "radio")]
+            radio_now_playing_generation: 0,
             apple_podcasts_results,
             apple_podcasts_route: ApplePodcastsRoute::Shows,
             #[cfg(feature = "apple-podcasts")]
@@ -2397,6 +2664,14 @@ impl AppController {
             local_results: Vec::new(),
             history_entries: Vec::new(),
             pending_history_replay: None,
+            playlists_route,
+            playlist_summaries: Vec::new(),
+            playlist_selected,
+            active_playlist: None,
+            playlist_entry_selected,
+            playlist_popup_item: None,
+            private_note_editor: None,
+            pending_playlist_replay: None,
             local_listing: None,
             local_progress_cache: HashMap::new(),
             local_generation: 0,
@@ -2528,6 +2803,7 @@ impl AppController {
             ignore_replaced_stop: false,
             skipped_advertisement_chapter: None,
             current_media: saved.selected_media,
+            current_playback_progress: None,
             current_autoplay_origin: None,
             queued_autoplay_resume_origin: None,
             #[cfg(feature = "tracker-music")]
@@ -2546,6 +2822,7 @@ impl AppController {
             unflushed_listen_time: Duration::ZERO,
             diagnostic_only: false,
             quit_on_error_dismiss: false,
+            shutdown_persistence_succeeded: None,
         };
         controller.populate_local_screen();
         if controller.view.screen == Screen::Search && !controller.youtube_results.is_empty() {
@@ -2666,6 +2943,7 @@ impl AppController {
                 controller.show_error_message("Could not reconcile interrupted Local moves", error);
             }
         }
+        controller.refresh_selected_playlist_state();
         controller
     }
 
@@ -2783,7 +3061,8 @@ impl AppController {
                 .invidious_base_url
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
-            config_path: self.config.config_file().display().to_string(),
+            api_key_path: self.config.credentials_file().display().to_string(),
+            invidious_path: self.config.config_file().display().to_string(),
             validation_error: None,
         });
         self.view.search_editing = false;
@@ -3005,6 +3284,7 @@ impl AppController {
         self.refresh_youtube_rows();
         self.view.selected = 0;
         self.request_selected_details();
+        self.refresh_selected_playlist_state();
         self.view.status_line = direct.start_seconds.map_or_else(
             || format!("Loading YouTube video {}…", direct.video_id),
             |seconds| format!("Loading YouTube video at {}…", format_seconds(seconds)),
@@ -3038,6 +3318,7 @@ impl AppController {
         self.view.selected = 0;
         self.youtube_music_selected = 0;
         self.request_selected_details();
+        self.refresh_selected_playlist_state();
         self.view.status_line = direct.start_seconds.map_or_else(
             || format!("Loaded YouTube Music track {}", direct.video_id),
             |seconds| {
@@ -3081,8 +3362,9 @@ impl AppController {
         self.local_results.clear();
         self.direct_item = Some(direct.clone());
         let host = direct.url.host_str().unwrap_or("remote source");
+        let media_id = MediaId::new(direct.source.clone(), direct.url.to_string());
         self.view.rows = vec![RowView {
-            media_id: Some(MediaId::new(direct.source.clone(), direct.url.to_string())),
+            media_id: Some(media_id.clone()),
             title: direct.url.to_string(),
             subtitle: "direct link".to_owned(),
             source: direct.source.to_string(),
@@ -3090,6 +3372,7 @@ impl AppController {
         }];
         self.view.selected = 0;
         self.view.details = Some(DetailView {
+            media_id: Some(media_id),
             title: direct.url.to_string(),
             source: direct.source.to_string(),
             description: format!(
@@ -3099,6 +3382,7 @@ impl AppController {
             wikidata: "not loaded".to_owned(),
             ..DetailView::default()
         });
+        self.refresh_selected_playlist_state();
         self.view.status_line = if direct.source == SourceKind::ApplePodcasts {
             if !self.send_provider_request(
                 ProviderRequest::ResolveApple {
@@ -3168,6 +3452,7 @@ impl AppController {
         self.direct_item = None;
         self.resolved_direct = None;
         self.local_results.clear();
+        self.view.rows.clear();
         self.view.selected = 0;
         self.view.details = Some(DetailView {
             title: local.path.display().to_string(),
@@ -3181,6 +3466,7 @@ impl AppController {
             wikidata: "not applicable".to_owned(),
             ..DetailView::default()
         });
+        self.refresh_selected_playlist_state();
         if local.directory {
             if !self.send_provider_request(
                 ProviderRequest::ScanLocal {
@@ -3202,6 +3488,7 @@ impl AppController {
             self.local_results.push(local_media_item(local.path));
             self.refresh_local_rows();
             self.view.status_line = "Local media file recognized; press Enter to play".to_owned();
+            self.refresh_selected_playlist_state();
         }
     }
 
@@ -3213,6 +3500,7 @@ impl AppController {
         self.view.details = None;
         self.view.selected = 0;
         self.tracker_selected = 0;
+        self.refresh_selected_playlist_state();
         if !self.send_provider_request(
             ProviderRequest::TrackerSearch {
                 generation: self.search_generation,
@@ -3240,6 +3528,7 @@ impl AppController {
         self.view.details = None;
         self.view.selected = 0;
         self.youtube_music_selected = 0;
+        self.refresh_selected_playlist_state();
         if !self.send_provider_request(
             ProviderRequest::YouTubeMusicSearch {
                 generation: self.search_generation,
@@ -3291,6 +3580,7 @@ impl AppController {
         self.view.selected = 0;
         self.refresh_bandcamp_rows();
         self.update_bandcamp_detail();
+        self.refresh_selected_playlist_state();
         if let Err(error) = self.store.save_bandcamp_search(
             &SavedBandcampSearch {
                 query,
@@ -3330,6 +3620,7 @@ impl AppController {
             self.view.rows.clear();
             self.view.details = None;
             self.view.selected = 0;
+            self.refresh_selected_playlist_state();
             if let Err(error) = self.store.clear_bandcamp_search() {
                 self.show_error("Could not clear the saved Bandcamp search", &error);
             }
@@ -3389,6 +3680,7 @@ impl AppController {
             .min(self.apple_podcasts_results.len().saturating_sub(1));
         self.refresh_apple_podcasts_rows();
         self.update_apple_podcasts_detail();
+        self.refresh_selected_playlist_state();
         let request =
             ApplePodcastsSearchRequest::new(query, self.apple_podcasts_storefront.clone());
         if !self.send_provider_request(
@@ -3438,6 +3730,7 @@ impl AppController {
             self.view.details = None;
             self.view.selected = 0;
             self.youtube_selected = 0;
+            self.refresh_selected_playlist_state();
         }
         let target = match self.view.search_kind {
             SearchKind::Videos => SearchTarget::Videos,
@@ -4416,6 +4709,7 @@ impl AppController {
                                 )
                             };
                             self.request_selected_details();
+                            self.refresh_selected_playlist_state();
                         }
                     }
                     Err(error) => {
@@ -4465,6 +4759,7 @@ impl AppController {
                                 }
                             );
                             self.request_selected_details();
+                            self.refresh_selected_playlist_state();
                         }
                     }
                     Err(error) => {
@@ -4539,6 +4834,7 @@ impl AppController {
                                     }
                                 )
                             };
+                            self.refresh_selected_playlist_state();
                         }
                     }
                     Err(error) => {
@@ -4589,6 +4885,7 @@ impl AppController {
                                     "s"
                                 }
                             );
+                            self.refresh_selected_playlist_state();
                         }
                     }
                     Err(error) => {
@@ -4651,6 +4948,7 @@ impl AppController {
                                     "s"
                                 }
                             );
+                            self.refresh_selected_playlist_state();
                         }
                     }
                     Err(error) => {
@@ -4824,6 +5122,7 @@ impl AppController {
                         {
                             self.request_selected_details();
                         }
+                        self.refresh_selected_playlist_state();
                     }
                     Err(error) => {
                         if self
@@ -5180,8 +5479,12 @@ impl AppController {
                         self.show_error_message("Video details failed", error);
                     }
                 }
+                self.refresh_selected_playlist_state();
             }
             ProviderResponse::Apple { generation, result } => {
+                if self.finish_playlist_replay(generation, &SourceKind::ApplePodcasts, &result) {
+                    return;
+                }
                 if self.finish_history_replay(generation, &SourceKind::ApplePodcasts, &result) {
                     return;
                 }
@@ -5202,12 +5505,16 @@ impl AppController {
                         self.show_error_message("Apple Podcasts link failed", error);
                     }
                 }
+                self.refresh_selected_playlist_state();
             }
             ProviderResponse::FirstClass {
                 generation,
                 source,
                 result,
             } => {
+                if self.finish_playlist_replay(generation, &source, &result) {
+                    return;
+                }
                 if self.finish_history_replay(generation, &source, &result) {
                     return;
                 }
@@ -5226,6 +5533,7 @@ impl AppController {
                         );
                     }
                 }
+                self.refresh_selected_playlist_state();
             }
             ProviderResponse::TrackerSource {
                 generation,
@@ -5328,9 +5636,11 @@ impl AppController {
                             self.local_results.len(),
                             root.display()
                         );
+                        self.refresh_selected_playlist_state();
                     }
                     Err(error) => {
                         self.view.rows.clear();
+                        self.refresh_selected_playlist_state();
                         self.show_error_message("Local folder scan failed", error);
                     }
                 }
@@ -5465,6 +5775,12 @@ impl AppController {
                     }
                 }
             }
+            #[cfg(feature = "radio")]
+            ProviderResponse::RadioNowPlaying {
+                generation,
+                station_id,
+                result,
+            } => self.handle_radio_now_playing(generation, station_id, result),
         }
     }
 
@@ -6042,6 +6358,7 @@ impl AppController {
                 } else {
                     format!("Local folder: {path}")
                 };
+                self.refresh_selected_playlist_state();
             }
             Err(error) => {
                 self.pending_local_reselection = None;
@@ -6838,6 +7155,10 @@ impl AppController {
                 self.update_history_detail();
                 return;
             }
+            Screen::Downloaded => {
+                self.update_downloaded_detail();
+                return;
+            }
             Screen::Bandcamp => {
                 #[cfg(feature = "bandcamp")]
                 self.update_bandcamp_detail();
@@ -6855,10 +7176,13 @@ impl AppController {
                 }
                 return;
             }
+            Screen::Radio => {
+                self.update_radio_detail();
+                return;
+            }
             Screen::Search | Screen::TrackerMusic => {}
             Screen::YouTubeMusic
             | Screen::Subscriptions
-            | Screen::Downloaded
             | Screen::Playlists
             | Screen::Statistics => {
                 self.view.details = None;
@@ -7008,12 +7332,24 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::Radio {
+            self.radio_selected = self.view.selected;
+            self.update_radio_detail();
+        } else if self.view.screen == Screen::Playlists {
+            match self.playlists_route {
+                PlaylistsRoute::Index => self.playlist_selected = self.view.selected,
+                PlaylistsRoute::Entries { .. } => {
+                    self.playlist_entry_selected = self.view.selected;
+                }
+            }
+            self.update_playlist_detail();
         } else if matches!(
             self.view.screen,
-            Screen::TrackerMusic | Screen::Local | Screen::History
+            Screen::TrackerMusic | Screen::Local | Screen::Downloaded | Screen::History
         ) {
             self.update_non_youtube_detail();
         }
+        self.refresh_selected_playlist_state();
     }
 
     fn select_row(&mut self, row: usize) {
@@ -7047,9 +7383,21 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::Radio {
+            self.radio_selected = self.view.selected;
+            self.update_radio_detail();
+        } else if self.view.screen == Screen::Playlists {
+            match self.playlists_route {
+                PlaylistsRoute::Index => self.playlist_selected = self.view.selected,
+                PlaylistsRoute::Entries { .. } => {
+                    self.playlist_entry_selected = self.view.selected;
+                }
+            }
+            self.update_playlist_detail();
         } else {
             self.update_non_youtube_detail();
         }
+        self.refresh_selected_playlist_state();
     }
 
     /// Builds a queue entry using full visible description chapters when ready.
@@ -7073,6 +7421,22 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen == Screen::Downloaded {
+            return queue_item_from_local(&local_media_item(self.selected_downloaded_path()?));
+        }
+        if self.view.screen == Screen::Radio {
+            #[cfg(feature = "radio")]
+            {
+                let station = RADIO_STATIONS
+                    .get(self.view.selected)
+                    .ok_or_else(|| "No radio station is selected".to_owned())?;
+                return queue_item_from_radio_station(station);
+            }
+            #[cfg(not(feature = "radio"))]
+            {
+                return Err("This build omits Radio support".to_owned());
+            }
+        }
         if self.view.screen == Screen::TrackerMusic {
             let item = self
                 .tracker_results
@@ -7137,6 +7501,1116 @@ impl AppController {
             Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
             None => Err("No playable item is selected".to_owned()),
         }
+    }
+
+    /// Captures the selected playable item without retaining transient media URLs.
+    ///
+    /// Provider pages and local paths remain canonical so the resulting
+    /// snapshot can be persisted and resolved again after a restart.
+    fn selected_playlist_snapshot(&self) -> Result<PlaylistMediaSnapshot, String> {
+        if self.view.screen == Screen::Playlists {
+            if !matches!(self.playlists_route, PlaylistsRoute::Entries { .. }) {
+                return Err("Open a playlist and select one of its items".to_owned());
+            }
+            let snapshot = self
+                .active_playlist
+                .as_ref()
+                .and_then(|playlist| playlist.entries.get(self.view.selected))
+                .map(|entry| entry.media.clone())
+                .ok_or_else(|| "No playlist item is selected".to_owned())?;
+            ensure_playlist_snapshot_available(&snapshot)?;
+            return Ok(snapshot);
+        }
+
+        if self.view.screen == Screen::Local {
+            let listing = self
+                .local_listing
+                .as_ref()
+                .ok_or_else(|| "No local folder is loaded".to_owned())?;
+            let index = self
+                .local_entry_index()
+                .ok_or_else(|| "Select a local audio, video, or tracker file".to_owned())?;
+            let entry = listing
+                .entries
+                .get(index)
+                .filter(|entry| entry.kind.is_playable() && entry.path.is_file())
+                .ok_or_else(|| {
+                    "Only available local audio, video, or tracker files can be added to a media playlist"
+                        .to_owned()
+                })?;
+            return playlist_snapshot_from_queue_item(&queue_item_from_local(&local_media_item(
+                entry.path.clone(),
+            ))?);
+        }
+
+        if self.view.screen == Screen::Bandcamp {
+            #[cfg(feature = "bandcamp")]
+            {
+                let release = self
+                    .bandcamp_results
+                    .get(self.view.selected)
+                    .ok_or_else(|| "No Bandcamp release is selected".to_owned())?;
+                if release.kind != BandcampReleaseKind::Track {
+                    return Err(
+                        "Select a Bandcamp track; albums are containers, not playlist items"
+                            .to_owned(),
+                    );
+                }
+                return Ok(PlaylistMediaSnapshot {
+                    id: release.id.clone(),
+                    kind: MediaKind::Audio,
+                    title: release.title.clone(),
+                    creator: release.artist.clone(),
+                    webpage_url: release.webpage_url.clone(),
+                    thumbnail_url: release.artwork_url.clone(),
+                    duration_seconds: None,
+                    replay_locator: release.webpage_url.to_string(),
+                });
+            }
+            #[cfg(not(feature = "bandcamp"))]
+            {
+                return Err("This build omits Bandcamp support".to_owned());
+            }
+        }
+
+        if self.view.screen == Screen::ApplePodcasts {
+            #[cfg(feature = "apple-podcasts")]
+            {
+                if self.apple_podcasts_route == ApplePodcastsRoute::Direct {
+                    let media = self
+                        .resolved_direct
+                        .as_ref()
+                        .filter(|media| {
+                            media.source == SourceKind::ApplePodcasts
+                                && media.playback_url.is_some()
+                        })
+                        .ok_or_else(|| {
+                            "Open an Apple Podcast episode before using playlists".to_owned()
+                        })?;
+                    return playlist_snapshot_from_queue_item(&queue_item_from_resolved(media)?);
+                }
+                if self.apple_podcasts_route != ApplePodcastsRoute::Episodes {
+                    return Err("Open an Apple Podcast episode before using playlists".to_owned());
+                }
+                let episode = self
+                    .apple_podcast_episodes
+                    .get(self.view.selected)
+                    .ok_or_else(|| "No Apple Podcast episode is selected".to_owned())?;
+                let item = queue_item_from_apple_episode(
+                    episode,
+                    self.active_apple_podcast_show.as_ref(),
+                )?;
+                return playlist_snapshot_from_queue_item(&item);
+            }
+            #[cfg(not(feature = "apple-podcasts"))]
+            {
+                return Err("This build omits Apple Podcasts support".to_owned());
+            }
+        }
+
+        if self.view.screen == Screen::History {
+            let history = self
+                .history_entries
+                .get(self.view.selected)
+                .ok_or_else(|| "No History item is selected".to_owned())?;
+            if history.local_removed {
+                return Err("The local History file was removed or moved".to_owned());
+            }
+            let entry = &history.entry;
+            let target = history_replay_target(entry)?;
+            return playlist_snapshot_from_queue_item(&queue_item_from_history(entry, &target)?);
+        }
+
+        playlist_snapshot_from_queue_item(&self.selected_queue_item()?)
+    }
+
+    /// Rejects Local playlist writes while an identity move is not durable.
+    ///
+    /// Remote entries have stable provider identities and remain safe to edit.
+    /// Local entries wait until both the in-memory remap queue and crash
+    /// recovery journal are empty, preventing a new membership from being
+    /// written under an identity that the pending move may replace.
+    fn ensure_playlist_mutation_ready(
+        &self,
+        snapshot: &PlaylistMediaSnapshot,
+    ) -> Result<(), String> {
+        ensure_playlist_snapshot_available(snapshot)?;
+        #[cfg(feature = "local")]
+        if snapshot.id.source == SourceKind::Local
+            && (!self.local_move_persistence_queue.is_empty()
+                || self.local_move_journal_pending
+                || self.local_move_execution_pending)
+        {
+            return Err(
+                "Finish or recover the pending Local move before changing playlists".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the selected supported downloaded file after revalidating it.
+    fn selected_downloaded_path(&self) -> Result<PathBuf, String> {
+        let row = self
+            .view
+            .rows
+            .get(self.view.selected)
+            .ok_or_else(|| "No downloaded item is selected".to_owned())?;
+        let media_id = row
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)
+            .ok_or_else(|| "The selected download has no local media identity".to_owned())?;
+        let path = PathBuf::from(&media_id.external_id);
+        if !path.is_absolute()
+            || !path.is_file()
+            || !is_supported_media_path(&path.to_string_lossy())
+        {
+            return Err("The selected downloaded media is unavailable or unsupported".to_owned());
+        }
+        Ok(path)
+    }
+
+    /// Returns the selected playable identity without opening media metadata.
+    ///
+    /// This cheap path is used while navigating so Details membership never
+    /// causes a second FLAC tag read or a provider request.
+    fn selected_playlist_identity(&self) -> Option<(MediaId, String)> {
+        if self.view.screen == Screen::Subscriptions {
+            let video_is_active = match self.view.subscriptions.layout {
+                SubscriptionsLayout::DrillDown => {
+                    self.view.subscriptions.route == SubscriptionRoute::Items
+                }
+                SubscriptionsLayout::Split => {
+                    self.view.subscriptions.focus == SubscriptionPane::Items
+                        || self.view.subscriptions.description_expanded
+                }
+            };
+            if !video_is_active {
+                return None;
+            }
+            return match self.selected_subscription_item()? {
+                SearchItem::Video(video) => Some((
+                    MediaId::new(SourceKind::YouTube, &video.video_id),
+                    video.title.clone(),
+                )),
+                SearchItem::Channel(_) => None,
+            };
+        }
+
+        if self.view.screen == Screen::Bandcamp {
+            #[cfg(feature = "bandcamp")]
+            {
+                let release = self.bandcamp_results.get(self.view.selected)?;
+                return (release.kind == BandcampReleaseKind::Track)
+                    .then(|| (release.id.clone(), release.title.clone()));
+            }
+            #[cfg(not(feature = "bandcamp"))]
+            {
+                return None;
+            }
+        }
+
+        if self.view.screen == Screen::ApplePodcasts {
+            #[cfg(feature = "apple-podcasts")]
+            {
+                if self.apple_podcasts_route == ApplePodcastsRoute::Direct {
+                    let media = self.resolved_direct.as_ref().filter(|media| {
+                        media.source == SourceKind::ApplePodcasts
+                            && media.playback_url.is_some()
+                            && media.webpage_url.as_ref().is_some_and(|url| {
+                                stable_history_remote_url(&SourceKind::ApplePodcasts, url).is_some()
+                            })
+                    })?;
+                    return Some((
+                        MediaId::new(SourceKind::ApplePodcasts, media.external_id.clone()),
+                        media.title.clone(),
+                    ));
+                }
+                if self.apple_podcasts_route != ApplePodcastsRoute::Episodes {
+                    return None;
+                }
+                let episode = self.apple_podcast_episodes.get(self.view.selected)?;
+                return queue_item_from_apple_episode(
+                    episode,
+                    self.active_apple_podcast_show.as_ref(),
+                )
+                .ok()
+                .map(|item| (item.media.id, item.media.title));
+            }
+            #[cfg(not(feature = "apple-podcasts"))]
+            {
+                return None;
+            }
+        }
+
+        if self.view.screen == Screen::Local {
+            let listing = self.local_listing.as_ref()?;
+            let entry = listing.entries.get(self.local_entry_index()?)?;
+            return (entry.kind.is_playable() && entry.path.is_file()).then(|| {
+                (
+                    MediaId::new(SourceKind::Local, entry.path.display().to_string()),
+                    entry.display_name().into_owned(),
+                )
+            });
+        }
+
+        if self.view.screen == Screen::History {
+            let history = self.history_entries.get(self.view.selected)?;
+            if history.local_removed || history_replay_target(&history.entry).is_err() {
+                return None;
+            }
+            return Some((history.entry.media_id.clone(), history.entry.title.clone()));
+        }
+
+        if self.view.screen == Screen::TrackerMusic {
+            // Prepared tracker payloads live in the process cache and cannot
+            // be reconstructed from a stable provider page after restart.
+            return None;
+        }
+
+        if self.view.screen == Screen::Playlists {
+            if !matches!(self.playlists_route, PlaylistsRoute::Entries { .. }) {
+                return None;
+            }
+            let entry = self
+                .active_playlist
+                .as_ref()?
+                .entries
+                .get(self.view.selected)?;
+            if ensure_playlist_snapshot_available(&entry.media).is_err() {
+                return None;
+            }
+            return Some((entry.media.id.clone(), entry.media.title.clone()));
+        }
+
+        if self.view.screen == Screen::Search
+            && self.direct_item.is_some()
+            && self.resolved_direct.is_none()
+        {
+            return self
+                .selected_playlist_snapshot()
+                .ok()
+                .map(|snapshot| (snapshot.id, snapshot.title));
+        }
+
+        let row = self.view.rows.get(self.view.selected)?;
+        row.media_id
+            .as_ref()
+            .cloned()
+            .map(|media_id| (media_id, row.title.clone()))
+    }
+
+    /// Rehydrates quick-action state and the right-panel playlist membership.
+    fn refresh_selected_playlist_state(&mut self) {
+        self.refresh_selected_private_note_state();
+        self.view.playlist_item = None;
+        self.view.playlist_edit_available = self.view.screen == Screen::Playlists
+            && matches!(self.playlists_route, PlaylistsRoute::Index)
+            && self.playlist_summaries.get(self.view.selected).is_some();
+        self.view.playlist_back_available = self.view.screen == Screen::Playlists
+            && matches!(self.playlists_route, PlaylistsRoute::Entries { .. });
+        if let Some(details) = self.view.details.as_mut() {
+            details.playlist_names.clear();
+        }
+        let Some((media_id, title)) = self.selected_playlist_identity() else {
+            return;
+        };
+        let memberships = match self.store.playlist_memberships_with_names(&media_id) {
+            Ok(memberships) => memberships,
+            Err(error) => {
+                self.show_error("Could not read playlist membership", &error);
+                return;
+            }
+        };
+        let names = memberships
+            .iter()
+            .map(|membership| membership.playlist_name.clone())
+            .collect::<Vec<_>>();
+        let in_todo = memberships
+            .iter()
+            .any(|membership| membership.playlist_id == TODO_PLAYLIST_ID);
+        self.view.playlist_item = Some(PlaylistItemView {
+            media_id: media_id.clone(),
+            title,
+            in_todo,
+        });
+        if let Some(details) = self
+            .view
+            .details
+            .as_mut()
+            .filter(|details| details.media_id.as_ref() == Some(&media_id))
+        {
+            details.playlist_names = names;
+        }
+    }
+
+    /// Resolves the active route to one exact media or source note target.
+    ///
+    /// Provider-qualified identities keep equal-looking titles from colliding,
+    /// while source targets let channels and podcast shows retain notes
+    /// independently from their individual uploads or episodes.
+    fn selected_private_note_target(&self) -> Option<PrivateNoteSelection> {
+        if self.view.right_panel_mode == RightPanelMode::Channel {
+            let details = self.view.details.as_ref()?;
+            if !details.channel_id.is_empty() {
+                return Some(PrivateNoteSelection {
+                    target: CommentTarget::Source {
+                        source_id: MediaId::new(SourceKind::YouTube, &details.channel_id),
+                    },
+                    label: if details.channel_name.is_empty() {
+                        details.title.clone()
+                    } else {
+                        details.channel_name.clone()
+                    },
+                });
+            }
+        }
+
+        match self.view.screen {
+            Screen::Subscriptions => {
+                let item_is_active = match self.view.subscriptions.layout {
+                    SubscriptionsLayout::DrillDown => {
+                        self.view.subscriptions.route == SubscriptionRoute::Items
+                    }
+                    SubscriptionsLayout::Split => {
+                        self.view.subscriptions.focus == SubscriptionPane::Items
+                            || self.view.subscriptions.description_expanded
+                    }
+                };
+                if item_is_active {
+                    return match self.selected_subscription_item()? {
+                        SearchItem::Video(video) => Some(PrivateNoteSelection {
+                            target: CommentTarget::Media {
+                                media_id: MediaId::new(SourceKind::YouTube, &video.video_id),
+                            },
+                            label: video.title.clone(),
+                        }),
+                        SearchItem::Channel(channel) => Some(PrivateNoteSelection {
+                            target: CommentTarget::Source {
+                                source_id: MediaId::new(SourceKind::YouTube, &channel.channel_id),
+                            },
+                            label: channel.name.clone(),
+                        }),
+                    };
+                }
+                let subscription = &self
+                    .subscription_entries
+                    .get(self.view.subscriptions.selected_source)?
+                    .subscription;
+                let source_id = if let Some(channel_id) = subscription.youtube_channel_id() {
+                    MediaId::new(SourceKind::YouTube, channel_id)
+                } else {
+                    let source = match subscription.kind {
+                        SubscriptionKind::Rss => SourceKind::Rss,
+                        SubscriptionKind::YouTube => SourceKind::YouTube,
+                        SubscriptionKind::Other => SourceKind::Other("subscription".to_owned()),
+                    };
+                    MediaId::new(source, subscription.url.to_string())
+                };
+                Some(PrivateNoteSelection {
+                    target: CommentTarget::Source { source_id },
+                    label: subscription.title.clone(),
+                })
+            }
+            Screen::ApplePodcasts => {
+                #[cfg(feature = "apple-podcasts")]
+                {
+                    match self.apple_podcasts_route {
+                        ApplePodcastsRoute::Shows => {
+                            let show = self.apple_podcasts_results.get(self.view.selected)?;
+                            Some(PrivateNoteSelection {
+                                target: CommentTarget::Source {
+                                    source_id: show.id.clone(),
+                                },
+                                label: show.title.clone(),
+                            })
+                        }
+                        ApplePodcastsRoute::Episodes => {
+                            let episode = self.apple_podcast_episodes.get(self.view.selected)?;
+                            Some(PrivateNoteSelection {
+                                target: CommentTarget::Media {
+                                    media_id: MediaId::new(
+                                        SourceKind::ApplePodcasts,
+                                        episode.episode_id.to_string(),
+                                    ),
+                                },
+                                label: episode.title.clone(),
+                            })
+                        }
+                        ApplePodcastsRoute::Direct => {
+                            let media = self.resolved_direct.as_ref()?;
+                            let id = MediaId::new(SourceKind::ApplePodcasts, &media.external_id);
+                            Some(PrivateNoteSelection {
+                                target: if media.playback_url.is_some() {
+                                    CommentTarget::Media { media_id: id }
+                                } else {
+                                    CommentTarget::Source { source_id: id }
+                                },
+                                label: media.title.clone(),
+                            })
+                        }
+                    }
+                }
+                #[cfg(not(feature = "apple-podcasts"))]
+                {
+                    None
+                }
+            }
+            Screen::Bandcamp => {
+                #[cfg(feature = "bandcamp")]
+                {
+                    let release = self.bandcamp_results.get(self.view.selected)?;
+                    Some(PrivateNoteSelection {
+                        target: if release.kind == BandcampReleaseKind::Track {
+                            CommentTarget::Media {
+                                media_id: release.id.clone(),
+                            }
+                        } else {
+                            CommentTarget::Source {
+                                source_id: release.id.clone(),
+                            }
+                        },
+                        label: release.title.clone(),
+                    })
+                }
+                #[cfg(not(feature = "bandcamp"))]
+                {
+                    None
+                }
+            }
+            Screen::TrackerMusic => {
+                let item = self.tracker_results.get(self.view.selected)?;
+                Some(PrivateNoteSelection {
+                    target: CommentTarget::Media {
+                        media_id: MediaId::new(
+                            SourceKind::ModArchive,
+                            item.webpage_url.to_string(),
+                        ),
+                    },
+                    label: item.title.clone(),
+                })
+            }
+            Screen::Radio => {
+                #[cfg(feature = "radio")]
+                {
+                    let station = RADIO_STATIONS.get(self.view.selected)?;
+                    Some(PrivateNoteSelection {
+                        target: CommentTarget::Source {
+                            source_id: MediaId::new(SourceKind::Radio, station.id),
+                        },
+                        label: station.name.to_owned(),
+                    })
+                }
+                #[cfg(not(feature = "radio"))]
+                {
+                    None
+                }
+            }
+            Screen::Playlists => {
+                if !matches!(self.playlists_route, PlaylistsRoute::Entries { .. }) {
+                    return None;
+                }
+                let entry = self
+                    .active_playlist
+                    .as_ref()?
+                    .entries
+                    .get(self.view.selected)?;
+                Some(PrivateNoteSelection {
+                    target: if entry.media.id.source == SourceKind::Radio {
+                        CommentTarget::Source {
+                            source_id: entry.media.id.clone(),
+                        }
+                    } else {
+                        CommentTarget::Media {
+                            media_id: entry.media.id.clone(),
+                        }
+                    },
+                    label: entry.media.title.clone(),
+                })
+            }
+            Screen::Local | Screen::Downloaded | Screen::History => {
+                let details = self.view.details.as_ref()?;
+                let media_id = details.media_id.clone()?;
+                Some(PrivateNoteSelection {
+                    target: if media_id.source == SourceKind::Radio {
+                        CommentTarget::Source {
+                            source_id: media_id,
+                        }
+                    } else {
+                        CommentTarget::Media { media_id }
+                    },
+                    label: details.title.clone(),
+                })
+            }
+            Screen::Search | Screen::YouTubeMusic => {
+                if let Some(item) = self.selected_youtube_item() {
+                    return match item {
+                        SearchItem::Video(video) => Some(PrivateNoteSelection {
+                            target: CommentTarget::Media {
+                                media_id: MediaId::new(SourceKind::YouTube, &video.video_id),
+                            },
+                            label: video.title.clone(),
+                        }),
+                        SearchItem::Channel(channel) => Some(PrivateNoteSelection {
+                            target: CommentTarget::Source {
+                                source_id: MediaId::new(SourceKind::YouTube, &channel.channel_id),
+                            },
+                            label: channel.name.clone(),
+                        }),
+                    };
+                }
+                let details = self.view.details.as_ref()?;
+                Some(PrivateNoteSelection {
+                    target: CommentTarget::Media {
+                        media_id: details.media_id.clone()?,
+                    },
+                    label: details.title.clone(),
+                })
+            }
+            Screen::Statistics => None,
+        }
+    }
+
+    /// Refreshes only the non-sensitive note indicator for the active Details.
+    fn refresh_selected_private_note_state(&mut self) {
+        self.view.private_note_available = false;
+        if let Some(details) = self.view.details.as_mut() {
+            details.has_private_note = false;
+        }
+        let Some(selection) = self.selected_private_note_target() else {
+            return;
+        };
+        self.view.private_note_available = true;
+        match self.store.private_note(&selection.target) {
+            Ok(note) => {
+                if let Some(details) = self.view.details.as_mut() {
+                    details.has_private_note = note.is_some();
+                }
+            }
+            Err(error) => self.show_error("Could not read private note", &error),
+        }
+    }
+
+    /// Opens the multiline private-note editor for the active exact target.
+    fn open_private_note_popup(&mut self) {
+        let Some(selection) = self.selected_private_note_target() else {
+            self.view.status_line =
+                "Select a media item, channel, or podcast show before adding a note".to_owned();
+            return;
+        };
+        let existing = match self.store.private_note(&selection.target) {
+            Ok(existing) => existing,
+            Err(error) => {
+                self.show_error("Could not read private note", &error);
+                return;
+            }
+        };
+        let is_existing = existing.is_some();
+        let body = existing.map_or_else(String::new, |comment| comment.body);
+        let storage_path = match self.config.persistence.backend {
+            PersistenceBackend::Files => self.config.state_dir().join("notes.toml"),
+            PersistenceBackend::Sqlite => self.config.database_file(),
+        };
+        self.private_note_editor = Some(PrivateNoteEditor {
+            target: selection.target,
+        });
+        self.view.private_note_popup = Some(PrivateNotePopupView {
+            target_label: selection.label,
+            cursor_byte: body.len(),
+            body,
+            existing: is_existing,
+            storage_path: storage_path.display().to_string(),
+            ..PrivateNotePopupView::default()
+        });
+    }
+
+    /// Inserts one character if it fits the documented UTF-8 byte limit.
+    fn append_private_note_character(&mut self, character: char) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        if popup.body.len().saturating_add(character.len_utf8()) > MAX_PRIVATE_NOTE_BYTES {
+            popup.validation_error = Some(format!(
+                "A private note is limited to {MAX_PRIVATE_NOTE_BYTES} UTF-8 bytes"
+            ));
+            return;
+        }
+        let cursor = private_note_cursor_boundary(&popup.body, popup.cursor_byte);
+        popup.body.insert(cursor, character);
+        popup.cursor_byte = cursor.saturating_add(character.len_utf8());
+        popup.confirming_delete = false;
+        popup.validation_error = None;
+    }
+
+    /// Inserts one line break into the private-note draft.
+    fn insert_private_note_newline(&mut self) {
+        self.append_private_note_character('\n');
+    }
+
+    /// Removes one complete grapheme cluster before the note cursor.
+    fn delete_private_note_character(&mut self) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        let cursor = private_note_cursor_boundary(&popup.body, popup.cursor_byte);
+        let Some(start) = popup.body[..cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        popup.body.replace_range(start..cursor, "");
+        popup.cursor_byte = start;
+        popup.confirming_delete = false;
+        popup.validation_error = None;
+    }
+
+    /// Moves the private-note insertion point without splitting a grapheme.
+    fn move_private_note_cursor(&mut self, motion: PrivateNoteCursorMotion) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        popup.cursor_byte = moved_private_note_cursor(&popup.body, popup.cursor_byte, motion);
+        popup.confirming_delete = false;
+    }
+
+    /// Creates or edits the sole user-facing note for an exact target.
+    fn save_private_note(&mut self) {
+        let Some(editor) = self.private_note_editor.as_ref() else {
+            return;
+        };
+        let Some(popup) = self.view.private_note_popup.as_ref() else {
+            return;
+        };
+        if popup.body.trim().is_empty() {
+            if let Some(popup) = self.view.private_note_popup.as_mut() {
+                popup.validation_error =
+                    Some("A note cannot be empty; use Delete to remove it".to_owned());
+            }
+            return;
+        }
+        if popup.body.len() > MAX_PRIVATE_NOTE_BYTES {
+            if let Some(popup) = self.view.private_note_popup.as_mut() {
+                popup.validation_error = Some(format!(
+                    "A private note is limited to {MAX_PRIVATE_NOTE_BYTES} UTF-8 bytes"
+                ));
+            }
+            return;
+        }
+        let target = editor.target.clone();
+        let body = popup.body.clone();
+        match self.store.upsert_private_note(&target, &body, unix_time()) {
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(popup) = self.view.private_note_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        }
+        let label = self
+            .view
+            .private_note_popup
+            .as_ref()
+            .map_or("item", |popup| popup.target_label.as_str())
+            .to_owned();
+        self.dismiss_private_note_popup();
+        self.refresh_selected_private_note_state();
+        self.view.status_line = format!("Saved private note for {label}");
+    }
+
+    /// Starts deletion confirmation, then removes every legacy row at target.
+    fn request_private_note_delete(&mut self) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        if !popup.existing {
+            popup.validation_error = Some("This target has no saved note to delete".to_owned());
+            return;
+        }
+        if !popup.confirming_delete {
+            popup.confirming_delete = true;
+            popup.validation_error = None;
+            return;
+        }
+        let Some(editor) = self.private_note_editor.as_ref() else {
+            return;
+        };
+        match self.store.delete_private_note(&editor.target) {
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(popup) = self.view.private_note_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        }
+        let label = popup.target_label.clone();
+        self.dismiss_private_note_popup();
+        self.refresh_selected_private_note_state();
+        self.view.status_line = format!("Deleted private note for {label}");
+    }
+
+    /// Closes the private-note editor and drops its unsaved body.
+    fn dismiss_private_note_popup(&mut self) {
+        self.view.private_note_popup = None;
+        self.private_note_editor = None;
+    }
+
+    /// Toggles the selected item in the fixed Watch Later-style playlist.
+    fn toggle_selected_todo(&mut self) {
+        let snapshot = match self.selected_playlist_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+        };
+        if let Err(error) = self.ensure_playlist_mutation_ready(&snapshot) {
+            self.view.status_line = error;
+            return;
+        }
+        match self.store.toggle_todo(&snapshot, unix_time()) {
+            Ok(PlaylistToggleOutcome::Added) => {
+                self.view.status_line = format!("Added {} to todo", snapshot.title);
+            }
+            Ok(PlaylistToggleOutcome::Removed) => {
+                self.view.status_line = format!("Removed {} from todo", snapshot.title);
+            }
+            Err(error) => {
+                self.show_error("Could not update todo", &error);
+                return;
+            }
+        }
+        self.refresh_playlists_after_mutation(Some(&snapshot.id));
+    }
+
+    /// Opens a bounded membership chooser for the selected playable item.
+    fn open_playlist_popup(&mut self) {
+        let snapshot = match self.selected_playlist_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+        };
+        if let Err(error) = self.ensure_playlist_mutation_ready(&snapshot) {
+            self.view.status_line = error;
+            return;
+        }
+        let summaries = match self.store.playlists() {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                self.show_error("Could not load playlists", &error);
+                return;
+            }
+        };
+        let memberships = match self.store.playlist_memberships(&snapshot.id) {
+            Ok(memberships) => memberships.into_iter().collect::<HashSet<_>>(),
+            Err(error) => {
+                self.show_error("Could not load playlist membership", &error);
+                return;
+            }
+        };
+        let playlists = summaries
+            .into_iter()
+            .map(|summary| PlaylistChoiceView {
+                contains_item: memberships.contains(&summary.id),
+                playlist_id: summary.id,
+                name: summary.name,
+            })
+            .collect();
+        self.playlist_popup_item = Some(snapshot.clone());
+        self.view.playlist_popup = Some(PlaylistPopupView {
+            item_title: snapshot.title,
+            playlists,
+            ..PlaylistPopupView::default()
+        });
+    }
+
+    /// Rebuilds chooser rows after a membership or metadata mutation.
+    fn refresh_open_playlist_popup(&mut self) {
+        let Some(snapshot) = self.playlist_popup_item.as_ref() else {
+            return;
+        };
+        let summaries = match self.store.playlists() {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                self.show_error("Could not reload playlists", &error);
+                return;
+            }
+        };
+        let memberships = match self.store.playlist_memberships(&snapshot.id) {
+            Ok(memberships) => memberships.into_iter().collect::<HashSet<_>>(),
+            Err(error) => {
+                self.show_error("Could not reload playlist membership", &error);
+                return;
+            }
+        };
+        let Some(popup) = self.view.playlist_popup.as_mut() else {
+            return;
+        };
+        let selected_id = popup
+            .playlists
+            .get(popup.selected)
+            .map(|playlist| playlist.playlist_id.clone());
+        popup.playlists = summaries
+            .into_iter()
+            .map(|summary| PlaylistChoiceView {
+                contains_item: memberships.contains(&summary.id),
+                playlist_id: summary.id,
+                name: summary.name,
+            })
+            .collect();
+        popup.selected = selected_id
+            .and_then(|selected_id| {
+                popup
+                    .playlists
+                    .iter()
+                    .position(|playlist| playlist.playlist_id == selected_id)
+            })
+            .unwrap_or_default()
+            .min(popup.playlists.len().saturating_sub(1));
+        popup.validation_error = None;
+    }
+
+    /// Toggles membership in the chooser's selected playlist in place.
+    fn toggle_selected_playlist_membership(&mut self) {
+        let Some(snapshot) = self.playlist_popup_item.as_ref().cloned() else {
+            self.view.playlist_popup = None;
+            self.view.status_line = "The selected playlist item is no longer available".to_owned();
+            return;
+        };
+        if let Err(error) = self.ensure_playlist_mutation_ready(&snapshot) {
+            if let Some(popup) = self.view.playlist_popup.as_mut() {
+                popup.validation_error = Some(error);
+            }
+            return;
+        }
+        let Some(playlist) = self
+            .view
+            .playlist_popup
+            .as_ref()
+            .and_then(|popup| popup.playlists.get(popup.selected))
+            .cloned()
+        else {
+            if let Some(popup) = self.view.playlist_popup.as_mut() {
+                popup.validation_error =
+                    Some("Create a playlist before changing membership".to_owned());
+            }
+            return;
+        };
+        match self
+            .store
+            .toggle_playlist_entry(&playlist.playlist_id, &snapshot, unix_time())
+        {
+            Ok(PlaylistToggleOutcome::Added) => {
+                self.view.status_line = format!("Added {} to {}", snapshot.title, playlist.name);
+            }
+            Ok(PlaylistToggleOutcome::Removed) => {
+                self.view.status_line =
+                    format!("Removed {} from {}", snapshot.title, playlist.name);
+            }
+            Err(error) => {
+                if let Some(popup) = self.view.playlist_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        }
+        self.refresh_open_playlist_popup();
+        self.refresh_playlists_after_mutation(Some(&snapshot.id));
+    }
+
+    /// Opens the two-field create route while retaining the selected item.
+    fn begin_new_playlist(&mut self) {
+        let Some(popup) = self.view.playlist_popup.as_mut() else {
+            return;
+        };
+        popup.mode = PlaylistPopupMode::Create;
+        popup.editing_playlist_id = None;
+        popup.editor_field = PlaylistEditorField::Name;
+        popup.editor_name.clear();
+        popup.editor_description.clear();
+        popup.validation_error = None;
+    }
+
+    /// Opens the shared metadata editor for the selected playlist index row.
+    fn edit_selected_playlist(&mut self) {
+        if self.view.screen != Screen::Playlists
+            || !matches!(self.playlists_route, PlaylistsRoute::Index)
+        {
+            self.view.status_line = "Select a playlist before editing it".to_owned();
+            return;
+        }
+        let Some(summary) = self.playlist_summaries.get(self.view.selected).cloned() else {
+            self.view.status_line = "No playlist is selected".to_owned();
+            return;
+        };
+        self.playlist_popup_item = None;
+        self.view.playlist_popup = Some(PlaylistPopupView {
+            item_title: summary.name.clone(),
+            mode: PlaylistPopupMode::Edit,
+            editing_playlist_id: Some(summary.id),
+            editor_name: summary.name,
+            editor_description: summary.description.unwrap_or_default(),
+            ..PlaylistPopupView::default()
+        });
+    }
+
+    /// Appends one character under both display-character and persistence bounds.
+    fn append_playlist_editor_character(&mut self, character: char) {
+        let Some(popup) = self.view.playlist_popup.as_mut() else {
+            return;
+        };
+        match popup.editor_field {
+            PlaylistEditorField::Name => {
+                let limit = popup.name_limit.min(MAX_PLAYLIST_NAME_BYTES);
+                if popup.editor_name.len().saturating_add(character.len_utf8()) <= limit {
+                    popup.editor_name.push(character);
+                    popup.validation_error = None;
+                }
+            }
+            PlaylistEditorField::Description => {
+                if popup.editor_description.chars().count() < popup.description_limit {
+                    popup.editor_description.push(character);
+                    popup.validation_error = None;
+                }
+            }
+        }
+    }
+
+    /// Removes the final Unicode scalar from the focused playlist editor field.
+    fn delete_playlist_editor_character(&mut self) {
+        let Some(popup) = self.view.playlist_popup.as_mut() else {
+            return;
+        };
+        match popup.editor_field {
+            PlaylistEditorField::Name => {
+                popup.editor_name.pop();
+            }
+            PlaylistEditorField::Description => {
+                popup.editor_description.pop();
+            }
+        }
+        popup.validation_error = None;
+    }
+
+    /// Creates a named playlist and adds the chooser item after validation.
+    fn create_playlist_and_add(&mut self) {
+        let Some(snapshot) = self.playlist_popup_item.as_ref().cloned() else {
+            if let Some(popup) = self.view.playlist_popup.as_mut() {
+                popup.validation_error =
+                    Some("The selected media item is no longer available".to_owned());
+            }
+            return;
+        };
+        if let Err(error) = self.ensure_playlist_mutation_ready(&snapshot) {
+            if let Some(popup) = self.view.playlist_popup.as_mut() {
+                popup.validation_error = Some(error);
+            }
+            return;
+        }
+        let Some((name, description)) = self.view.playlist_popup.as_ref().map(|popup| {
+            (
+                popup.editor_name.clone(),
+                optional_trimmed_text(&popup.editor_description),
+            )
+        }) else {
+            return;
+        };
+        let now = unix_time();
+        let summary = match self.store.create_playlist_with_entry(
+            &name,
+            description.as_deref(),
+            &snapshot,
+            now,
+        ) {
+            Ok(PlaylistCreateOutcome::Created(summary)) => summary,
+            Ok(PlaylistCreateOutcome::Existing(summary)) => {
+                if let Some(popup) = self.view.playlist_popup.as_mut() {
+                    popup.validation_error = Some(format!(
+                        "A playlist named `{}` already exists; return to the chooser to use it",
+                        summary.name
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                if let Some(popup) = self.view.playlist_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+                return;
+            }
+        };
+        self.view.status_line = format!("Created {} and added {}", summary.name, snapshot.title);
+        if let Some(popup) = self.view.playlist_popup.as_mut() {
+            popup.mode = PlaylistPopupMode::Choose;
+            popup.editing_playlist_id = None;
+            popup.editor_name.clear();
+            popup.editor_description.clear();
+            popup.validation_error = None;
+        }
+        self.refresh_open_playlist_popup();
+        self.refresh_playlists_after_mutation(Some(&snapshot.id));
+    }
+
+    /// Persists playlist display metadata without changing its stable identity.
+    fn update_selected_playlist(&mut self) {
+        let Some((playlist_id, name, description)) =
+            self.view.playlist_popup.as_ref().and_then(|popup| {
+                Some((
+                    popup.editing_playlist_id.clone()?,
+                    popup.editor_name.clone(),
+                    optional_trimmed_text(&popup.editor_description),
+                ))
+            })
+        else {
+            return;
+        };
+        match self
+            .store
+            .update_playlist(&playlist_id, &name, description.as_deref(), unix_time())
+        {
+            Ok(Some(summary)) => {
+                self.view.status_line = format!("Updated playlist {}", summary.name);
+                self.view.playlist_popup = None;
+                self.playlist_popup_item = None;
+                self.refresh_playlists_after_mutation(None);
+            }
+            Ok(None) => {
+                if let Some(popup) = self.view.playlist_popup.as_mut() {
+                    popup.validation_error =
+                        Some("That playlist was removed by another process".to_owned());
+                }
+            }
+            Err(error) => {
+                if let Some(popup) = self.view.playlist_popup.as_mut() {
+                    popup.validation_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    /// Returns from create to chooser, or closes the current playlist popup.
+    fn dismiss_playlist_popup(&mut self) {
+        let return_to_chooser = self.view.playlist_popup.as_ref().is_some_and(|popup| {
+            popup.mode == PlaylistPopupMode::Create && self.playlist_popup_item.is_some()
+        });
+        if return_to_chooser {
+            if let Some(popup) = self.view.playlist_popup.as_mut() {
+                popup.mode = PlaylistPopupMode::Choose;
+                popup.editing_playlist_id = None;
+                popup.editor_name.clear();
+                popup.editor_description.clear();
+                popup.validation_error = None;
+            }
+            self.refresh_open_playlist_popup();
+            return;
+        }
+        self.view.playlist_popup = None;
+        self.playlist_popup_item = None;
     }
 
     fn queue_selected(&mut self, play_next: bool) {
@@ -7349,6 +8823,7 @@ impl AppController {
         });
         if self.view.screen == Screen::Downloaded {
             self.populate_downloads();
+            self.refresh_selected_playlist_state();
         }
         self.view.status_line = format!("Downloaded {}", completed_path.display());
     }
@@ -7360,6 +8835,10 @@ impl AppController {
         }
         if self.view.screen == Screen::History {
             self.activate_history_selection();
+            return;
+        }
+        if self.view.screen == Screen::Playlists {
+            self.activate_playlist_selection();
             return;
         }
         if self.view.screen == Screen::Bandcamp {
@@ -7447,6 +8926,16 @@ impl AppController {
             self.view.status_line = "No Bandcamp release is selected".to_owned();
             return;
         };
+        self.request_bandcamp_resolution(summary, BandcampResolutionOwner::SearchSelection);
+    }
+
+    /// Submits one canonical Bandcamp page for action-owned media resolution.
+    #[cfg(feature = "bandcamp")]
+    fn request_bandcamp_resolution(
+        &mut self,
+        summary: BandcampSearchSummary,
+        owner: BandcampResolutionOwner,
+    ) {
         let media = match BandcampMediaUrl::parse(summary.webpage_url.clone()) {
             Ok(media) if media.stable_id() == summary.id.external_id => media,
             Ok(_) => {
@@ -7487,6 +8976,7 @@ impl AppController {
                 self.pending_bandcamp_resolution = Some(PendingBandcampResolution {
                     generation,
                     summary,
+                    owner,
                 });
                 self.begin_playback_start_activity();
                 self.view.status_line = format!(
@@ -7593,12 +9083,28 @@ impl AppController {
                 .take()
                 .expect("matching Bandcamp resolve ownership was checked above");
             self.clear_playback_start_activity();
-            if self.view.screen != Screen::Bandcamp
-                || self
-                    .bandcamp_results
-                    .get(self.view.selected)
-                    .is_none_or(|selected| selected.id != pending.summary.id)
-            {
+            let still_selected = match &pending.owner {
+                BandcampResolutionOwner::SearchSelection => {
+                    self.view.screen == Screen::Bandcamp
+                        && self
+                            .bandcamp_results
+                            .get(self.view.selected)
+                            .is_some_and(|selected| selected.id == pending.summary.id)
+                }
+                BandcampResolutionOwner::Playlist(entry) => {
+                    self.view.screen == Screen::Playlists
+                        && matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+                        && self
+                            .active_playlist
+                            .as_ref()
+                            .and_then(|playlist| playlist.entries.get(self.view.selected))
+                            .is_some_and(|selected| {
+                                selected.media.id == entry.media.id
+                                    && selected.added_at == entry.added_at
+                            })
+                }
+            };
+            if !still_selected {
                 continue;
             }
             match completion.result {
@@ -8035,6 +9541,23 @@ impl AppController {
         };
         let music_origin = item.media.webpage_url.host_str() == Some("music.youtube.com");
 
+        #[cfg(feature = "radio")]
+        if item.media.id.source == SourceKind::Radio
+            && let Some(index) = RADIO_STATIONS
+                .iter()
+                .position(|station| station.id == item.media.id.external_id)
+        {
+            self.view.screen = Screen::Radio;
+            self.radio_selected = index;
+            self.view.selected = index;
+            self.populate_radio();
+            self.view.right_panel_mode = RightPanelMode::Details;
+            self.view.details_focused = true;
+            self.view.status_line = format!("Selected playing station: {}", item.media.title);
+            self.refresh_selected_playlist_state();
+            return;
+        }
+
         if item.media.id.source == SourceKind::YouTube
             && (self.view.screen == Screen::YouTubeMusic || music_origin)
             && let Some(index) = self.youtube_music_results.iter().position(|candidate| {
@@ -8051,6 +9574,7 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
             self.request_selected_details();
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            self.refresh_selected_playlist_state();
             return;
         }
 
@@ -8069,6 +9593,7 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
             self.request_selected_details();
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            self.refresh_selected_playlist_state();
             return;
         }
 
@@ -8087,6 +9612,7 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
             self.request_selected_details();
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            self.refresh_selected_playlist_state();
             return;
         }
 
@@ -8132,6 +9658,7 @@ impl AppController {
                     self.view.right_panel_mode = RightPanelMode::Details;
                     self.request_selected_details();
                     self.view.status_line = format!("Selected playing item: {}", item.media.title);
+                    self.refresh_selected_playlist_state();
                     return;
                 }
             }
@@ -8149,6 +9676,7 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
             self.update_local_browser_detail();
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            self.refresh_selected_playlist_state();
             return;
         }
 
@@ -8163,6 +9691,7 @@ impl AppController {
             self.refresh_tracker_rows();
             self.view.right_panel_mode = RightPanelMode::Details;
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
+            self.refresh_selected_playlist_state();
             return;
         }
 
@@ -8175,6 +9704,7 @@ impl AppController {
             "Showing queued details for {}; it is not in the current list",
             item.media.title
         );
+        self.refresh_selected_playlist_state();
     }
 
     fn show_selected_channel(&mut self) {
@@ -8182,6 +9712,7 @@ impl AppController {
             && self.view.subscriptions.focus == SubscriptionPane::Sources
         {
             self.update_selected_subscription_source();
+            self.refresh_selected_playlist_state();
             self.view.details_focused = true;
             self.view.right_panel_mode = RightPanelMode::Channel;
             self.view.status_line =
@@ -8574,6 +10105,7 @@ impl AppController {
             Self::push_detail_navigation_snapshot(&mut self.detail_navigation_forward, current);
         }
         self.restore_detail_navigation_snapshot(destination);
+        self.refresh_selected_playlist_state();
         self.view.status_line = if forward {
             "Moved forward in Details".to_owned()
         } else {
@@ -8583,6 +10115,19 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        if self.view.screen == Screen::Playlists
+            && matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+        {
+            self.playlists_route = PlaylistsRoute::Index;
+            self.active_playlist = None;
+            self.view.selected = self
+                .playlist_selected
+                .min(self.playlist_summaries.len().saturating_sub(1));
+            self.populate_playlist_index();
+            self.refresh_selected_playlist_state();
+            self.view.status_line = "Returned to playlists".to_owned();
+            return;
+        }
         if self.move_detail_navigation(false) {
             return;
         }
@@ -8606,6 +10151,7 @@ impl AppController {
                     self.view.status_line = "Returned to the direct Apple Podcasts page".to_owned();
                 }
             }
+            self.refresh_selected_playlist_state();
             return;
         }
         if self.view.screen == Screen::ApplePodcasts
@@ -8619,6 +10165,7 @@ impl AppController {
             self.refresh_apple_podcasts_rows();
             self.update_apple_podcasts_detail();
             self.view.status_line = "Returned to Apple Podcasts shows".to_owned();
+            self.refresh_selected_playlist_state();
             return;
         }
         if self.view.screen == Screen::Subscriptions {
@@ -8627,6 +10174,7 @@ impl AppController {
                 self.view.subscriptions.focus = SubscriptionPane::Items;
                 self.view.details_focused = false;
                 self.view.status_line = "Returned to subscription videos".to_owned();
+                self.refresh_selected_playlist_state();
                 return;
             }
             if self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
@@ -8637,6 +10185,7 @@ impl AppController {
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
                 self.view.status_line = "Returned to subscription sources".to_owned();
+                self.refresh_selected_playlist_state();
                 return;
             }
             if self.view.subscriptions.layout == SubscriptionsLayout::Split
@@ -8646,6 +10195,7 @@ impl AppController {
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
                 self.view.status_line = "Subscription source list focused".to_owned();
+                self.refresh_selected_playlist_state();
                 return;
             }
         }
@@ -8680,6 +10230,9 @@ impl AppController {
     /// Seeks the active item, or starts the selected item, at a description timecode.
     fn activate_timecode(&mut self, media_id: MediaId, seconds: u64) {
         if self.current_media.as_ref() == Some(&media_id) && self.player.is_some() {
+            if self.seek_is_unavailable_for_live_radio() {
+                return;
+            }
             if self
                 .view
                 .playback
@@ -8722,6 +10275,9 @@ impl AppController {
 
     /// Navigates parsed description chapters without relying on backend metadata.
     fn change_chapter(&mut self, delta: i32) {
+        if self.seek_is_unavailable_for_live_radio() {
+            return;
+        }
         if self.view.playback_chapters.is_empty() {
             self.player_command(PlayerCommand::ChangeChapter(delta));
             return;
@@ -8764,6 +10320,19 @@ impl AppController {
             return;
         };
         self.activate_timecode(media_id, chapter.start_seconds);
+    }
+
+    /// Rejects finite-media navigation for an endless Radio stream.
+    fn seek_is_unavailable_for_live_radio(&mut self) -> bool {
+        let unavailable = self
+            .current_media
+            .as_ref()
+            .is_some_and(|media| media.source == SourceKind::Radio)
+            && self.view.playback.duration.is_none();
+        if unavailable {
+            self.view.status_line = "Seeking is unavailable for live radio".to_owned();
+        }
+        unavailable
     }
 
     /// Identifies the same-source cursor represented by a queue item.
@@ -9141,23 +10710,35 @@ impl AppController {
             }
         }
         let media_id = item.media.id.clone();
+        let live_stream = item.media.kind == MediaKind::LiveStream;
         let media_changed = self.current_media.as_ref() != Some(&media_id);
         if media_changed {
             self.skipped_advertisement_chapter = None;
+            if self.playback_phase == PlaybackPhase::Playing {
+                self.persist_position();
+                self.last_position_save = Instant::now();
+            }
         }
         let chapters = item.media.chapters.clone();
-        let start_at = if let Some(start_at) = item.start_at_seconds {
-            start_at
+        let stored_progress = if live_stream {
+            None
         } else {
             match self.store.progress(&media_id) {
-                Ok(progress) => progress.map_or(0, |progress| {
-                    progress.resume_position_with_rewind(self.config.playback.resume_rewind_seconds)
-                }),
+                Ok(progress) => progress,
                 Err(error) => {
                     self.show_error("Could not restore the playback position", &error);
-                    0
+                    None
                 }
             }
+        };
+        let start_at = if live_stream {
+            0
+        } else if let Some(start_at) = item.start_at_seconds {
+            start_at
+        } else {
+            stored_progress.as_ref().map_or(0, |progress| {
+                progress.resume_position_with_rewind(self.config.playback.resume_rewind_seconds)
+            })
         };
         let mut canonical_input = PlaybackInput::new(item.playback_location.clone());
         canonical_input.start_at = Duration::from_secs(start_at);
@@ -9211,13 +10792,34 @@ impl AppController {
                         .begin_now(item.clone(), had_active_media);
                 }
                 self.current_media = Some(media_id.clone());
+                if live_stream {
+                    self.view.repeating = false;
+                    self.playback_queue.repeat_one = false;
+                }
+                #[cfg(feature = "radio")]
+                self.refresh_playing_radio_metadata(None);
+                #[cfg(not(feature = "radio"))]
+                {
+                    self.view.radio_now_playing = None;
+                }
+                let now = unix_time();
+                self.current_playback_progress = (!live_stream).then(|| {
+                    let mut current_progress = stored_progress.unwrap_or_else(|| {
+                        PlaybackProgress::new(media_id.clone(), item.media.duration_seconds, now)
+                    });
+                    current_progress.duration_seconds = item
+                        .media
+                        .duration_seconds
+                        .or(current_progress.duration_seconds);
+                    current_progress.record_position(start_at, now);
+                    current_progress
+                });
                 self.current_autoplay_origin = origin;
                 self.playback_phase = PlaybackPhase::Loading;
                 self.playback_load_kind = load_kind;
                 self.begin_playback_start_activity();
                 self.ignore_replaced_stop = had_active_media;
                 self.last_tick = Instant::now();
-                let now = unix_time();
                 self.pending_history = Some(HistoryEntry {
                     id: 0,
                     media_id,
@@ -9242,7 +10844,8 @@ impl AppController {
                 };
                 self.view.playback_chapters = chapters;
                 self.view.status_line = format!("Loading {}…", item.media.title);
-                if self.playback_queue.repeat_one
+                if !live_stream
+                    && self.playback_queue.repeat_one
                     && let Some(player) = self.player.as_mut()
                     && let Err(error) = player.command(PlayerCommand::SetRepeat(true))
                 {
@@ -9305,19 +10908,25 @@ impl AppController {
                 // replace it with a long, expiring, potentially sensitive URL.
                 status.title = Some(self.current_playback_title());
                 self.view.playback = status;
+                #[cfg(feature = "radio")]
+                {
+                    let icy_title = self.view.playback.stream_title.clone();
+                    self.refresh_playing_radio_metadata(icy_title.as_deref());
+                }
                 if self.playback_phase == PlaybackPhase::Playing {
                     self.update_live_local_progress_view();
                     self.skip_current_advertisement_chapter();
                     self.account_listen_time(elapsed);
-                    if self.last_position_save.elapsed()
-                        >= Duration::from_secs(
-                            self.config
-                                .persistence
-                                .position_save_interval_seconds
-                                .max(1),
-                        )
+                    if self.unflushed_listen_time >= Duration::from_secs(30)
+                        || self.last_position_save.elapsed()
+                            >= Duration::from_secs(
+                                self.config
+                                    .persistence
+                                    .position_save_interval_seconds
+                                    .max(1),
+                            )
                     {
-                        self.persist_position();
+                        self.checkpoint_position();
                         self.last_position_save = Instant::now();
                     }
                 }
@@ -9635,7 +11244,6 @@ impl AppController {
         if self.playback_phase == PlaybackPhase::Playing {
             self.account_listen_time(elapsed);
             self.persist_position();
-            self.flush_listen_time();
         }
     }
 
@@ -9647,9 +11255,11 @@ impl AppController {
         self.pending_history = None;
         self.ignore_replaced_stop = false;
         self.current_media = None;
+        self.current_playback_progress = None;
         self.current_autoplay_origin = None;
         self.seek_back.clear();
         self.view.playback_chapters.clear();
+        self.view.radio_now_playing = None;
         self.view.playback = PlaybackStatus {
             volume: self.config.playback.volume_percent,
             speed: f64::from(self.config.playback.speed_percent) / 100.0,
@@ -9676,53 +11286,100 @@ impl AppController {
         {
             self.unflushed_listen_time += elapsed;
         }
-        if self.unflushed_listen_time >= Duration::from_secs(30) {
-            self.flush_listen_time();
-        }
     }
 
-    fn flush_listen_time(&mut self) {
-        let seconds = self.unflushed_listen_time.as_secs();
-        if seconds == 0 {
-            return;
-        }
-        if let Some(media) = &self.current_media {
-            if let Err(error) = self.store.add_listen_seconds(&media.source, seconds) {
-                self.show_error("Could not save listening statistics", &error);
-                return;
-            }
-        }
-        self.unflushed_listen_time -= Duration::from_secs(seconds);
-    }
-
-    fn persist_position(&mut self) {
+    /// Builds the next progress row from a per-item cache.
+    ///
+    /// Normal playback loads this cache once when an item starts. Periodic
+    /// checkpoints therefore do not scan a growing human-readable progress
+    /// document.
+    fn current_progress_at_player_position(&mut self) -> Option<PlaybackProgress> {
         #[cfg(feature = "local")]
         if !self.local_move_persistence_queue.is_empty() {
-            return;
+            return None;
         }
         let Some(media_id) = self.current_media.clone() else {
-            return;
+            return None;
         };
+        if media_id.source == SourceKind::Radio {
+            return None;
+        }
         let duration = self.view.playback.duration.map(|value| value.as_secs());
         let now = unix_time();
-        let progress = self.store.progress(&media_id);
-        let mut progress = match progress {
-            Ok(progress) => {
-                progress.unwrap_or_else(|| PlaybackProgress::new(media_id, duration, now))
-            }
-            Err(error) => {
-                self.show_error("Could not load the saved playback position", &error);
-                PlaybackProgress::new(media_id, duration, now)
-            }
-        };
+        let mut progress = self
+            .current_playback_progress
+            .take()
+            .filter(|progress| progress.media_id == media_id)
+            .unwrap_or_else(|| PlaybackProgress::new(media_id, duration, now));
         progress.duration_seconds = duration.or(progress.duration_seconds);
         progress.record_position(self.view.playback.position.as_secs(), now);
-        match self.store.upsert_progress(&progress) {
-            Ok(()) => {
-                self.update_local_progress_view(&progress.media_id, progress.watched_percent());
-            }
-            Err(error) => self.show_error("Could not save playback position", &error),
+        self.current_playback_progress = Some(progress.clone());
+        Some(progress)
+    }
+
+    /// Atomically replaces the small periodic playback recovery document.
+    fn checkpoint_position(&mut self) -> bool {
+        if self
+            .current_media
+            .as_ref()
+            .is_some_and(|media| media.source == SourceKind::Radio)
+        {
+            let listened_seconds = self.unflushed_listen_time.as_secs();
+            return match self
+                .store
+                .checkpoint_listening(&SourceKind::Radio, listened_seconds)
+            {
+                Ok(()) => {
+                    self.unflushed_listen_time -= Duration::from_secs(listened_seconds);
+                    true
+                }
+                Err(error) => {
+                    self.show_error("Could not checkpoint live-radio listening", &error);
+                    false
+                }
+            };
         }
+        let Some(progress) = self.current_progress_at_player_position() else {
+            return false;
+        };
+        let listened_seconds = self.unflushed_listen_time.as_secs();
+        match self
+            .store
+            .checkpoint_playback(&progress, &progress.media_id.source, listened_seconds)
+        {
+            Ok(()) => {
+                self.unflushed_listen_time -= Duration::from_secs(listened_seconds);
+                self.update_local_progress_view(&progress.media_id, progress.watched_percent());
+                true
+            }
+            Err(error) => {
+                self.show_error("Could not checkpoint playback", &error);
+                false
+            }
+        }
+    }
+
+    /// Saves the latest checkpoint and publishes it to canonical state.
+    ///
+    /// `true` means either no media needed a checkpoint or every applicable
+    /// write completed. Errors remain visible through the diagnostic popup.
+    fn persist_position(&mut self) -> bool {
+        if self.current_media.is_none() {
+            return true;
+        }
+        if !self.checkpoint_position() {
+            return false;
+        }
+        self.publish_playback_checkpoint()
+    }
+
+    /// Publishes any durable recovery checkpoint into canonical state.
+    fn publish_playback_checkpoint(&mut self) -> bool {
+        if let Err(error) = self.store.flush_playback_checkpoint() {
+            self.show_error("Could not publish playback checkpoint", &error);
+            return false;
+        }
+        true
     }
 
     fn show_screen(&mut self, screen: Screen) {
@@ -9763,11 +11420,20 @@ impl AppController {
                     ApplePodcastsRoute::Direct => {}
                 }
             }
+            Screen::Radio => {
+                self.radio_selected = self.view.selected;
+            }
             Screen::TrackerMusic => {
                 self.tracker_search_query
                     .clone_from(&self.view.search_query);
                 self.tracker_selected = self.view.selected;
             }
+            Screen::Playlists => match self.playlists_route {
+                PlaylistsRoute::Index => self.playlist_selected = self.view.selected,
+                PlaylistsRoute::Entries { .. } => {
+                    self.playlist_entry_selected = self.view.selected;
+                }
+            },
             _ => {}
         }
         self.details_generation = self.details_generation.wrapping_add(1);
@@ -9811,11 +11477,29 @@ impl AppController {
                     ApplePodcastsRoute::Direct => 0,
                 };
             }
+            Screen::Radio => {
+                #[cfg(feature = "radio")]
+                {
+                    self.view.selected = self
+                        .radio_selected
+                        .min(RADIO_STATIONS.len().saturating_sub(1));
+                }
+                #[cfg(not(feature = "radio"))]
+                {
+                    self.view.selected = 0;
+                }
+            }
             Screen::TrackerMusic => {
                 self.view
                     .search_query
                     .clone_from(&self.tracker_search_query);
                 self.view.selected = self.tracker_selected;
+            }
+            Screen::Playlists => {
+                self.view.selected = match self.playlists_route {
+                    PlaylistsRoute::Index => self.playlist_selected,
+                    PlaylistsRoute::Entries { .. } => self.playlist_entry_selected,
+                };
             }
             _ => self.view.selected = 0,
         }
@@ -9856,6 +11540,7 @@ impl AppController {
                 ApplePodcastsRoute::Shows => {}
             }
         }
+        self.refresh_selected_playlist_state();
     }
 
     fn populate_local_screen(&mut self) {
@@ -9956,6 +11641,7 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             },
+            Screen::Radio => self.populate_radio(),
             Screen::TrackerMusic => {
                 self.refresh_tracker_rows();
                 self.view.status_line =
@@ -9980,12 +11666,699 @@ impl AppController {
             Screen::Subscriptions => self.populate_subscriptions(),
             Screen::Downloaded => self.populate_downloads(),
             Screen::History => self.populate_history(),
-            Screen::Playlists => {
-                self.view.rows.clear();
-                self.view.status_line = "No local playlists have been created yet".to_owned();
-            }
+            Screen::Playlists => self.populate_playlists_screen(),
             Screen::Statistics => self.populate_statistics(),
         }
+    }
+
+    /// Rebuilds the zero-network Radio catalogue from compile-time presets.
+    #[cfg(feature = "radio")]
+    fn populate_radio(&mut self) {
+        self.view.rows = RADIO_STATIONS
+            .iter()
+            .map(|station| RowView {
+                media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
+                title: station.name.to_owned(),
+                subtitle: radio_station_row_summary(station),
+                source: "Radio".to_owned(),
+                hide_watched_marker: true,
+                compact: true,
+                ..RowView::default()
+            })
+            .collect();
+        self.view.selected = self
+            .radio_selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.radio_selected = self.view.selected;
+        self.update_radio_detail();
+        self.view.status_line = format!(
+            "{} public radio station{}; Enter plays the selected live stream",
+            RADIO_STATIONS.len(),
+            if RADIO_STATIONS.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Leaves a safe empty view when Radio was omitted at compile time.
+    #[cfg(not(feature = "radio"))]
+    fn populate_radio(&mut self) {
+        self.view.rows.clear();
+        self.view.details = None;
+        self.view.status_line = "This build omits the `radio` feature".to_owned();
+    }
+
+    /// Refreshes selected station details without contacting the stream.
+    #[cfg(feature = "radio")]
+    fn update_radio_detail(&mut self) {
+        let Some(station) = RADIO_STATIONS.get(self.view.selected) else {
+            self.view.details = None;
+            return;
+        };
+        self.radio_selected = self.view.selected;
+        let mut description = station.summary.to_owned();
+        description.push_str("\n\nQuality: ");
+        description.push_str(&radio_station_quality(station, true));
+        description.push_str("\nStream: ");
+        description.push_str(station.stream);
+        let selected_metadata = self
+            .radio_now_playing_cache
+            .get(station.id)
+            .and_then(|cached| {
+                if Instant::now() < cached.refresh_at {
+                    radio_now_playing_display(&cached.value)
+                } else {
+                    radio_stale_now_playing_display(&cached.value)
+                }
+            });
+        let playing_metadata = self.view.radio_now_playing.clone().filter(|_| {
+            self.current_media.as_ref().is_some_and(|media| {
+                media.source == SourceKind::Radio && media.external_id == station.id
+            })
+        });
+        if let Some(now_playing) = playing_metadata.as_ref().or(selected_metadata.as_ref()) {
+            description.push_str("\n\n");
+            description.push_str(now_playing);
+        }
+        if let Some(last_known) = selected_metadata
+            .as_ref()
+            .filter(|selected| playing_metadata.as_ref() != Some(selected))
+        {
+            description.push_str("\n");
+            description.push_str(last_known);
+        }
+        self.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
+            title: station.name.to_owned(),
+            source: "Radio".to_owned(),
+            channel_webpage_url: station.homepage_url().ok(),
+            description,
+            links: vec![DetailLinkView {
+                label: "Station website".to_owned(),
+                url: station.homepage.to_owned(),
+                wikidata_item_id: None,
+            }],
+            ..DetailView::default()
+        });
+    }
+
+    /// Selects at most one station whose passive metadata may be refreshed.
+    #[cfg(feature = "radio")]
+    fn radio_now_playing_target(&self) -> Option<RadioStationPreset> {
+        let playing = (|| {
+            let media = self
+                .current_media
+                .as_ref()
+                .filter(|media| media.source == SourceKind::Radio)?;
+            station_by_id(&media.external_id).filter(|station| station.now_playing.is_some())
+        })();
+        playing.or_else(|| {
+            (self.view.screen == Screen::Radio)
+                .then(|| RADIO_STATIONS.get(self.view.selected).copied())
+                .flatten()
+                .filter(|station| station.now_playing.is_some())
+        })
+    }
+
+    /// Schedules one selected/playing radio metadata request without UI errors.
+    #[cfg(feature = "radio")]
+    fn request_due_radio_now_playing(&mut self, now: Instant) {
+        if self.pending_radio_now_playing.is_some() {
+            return;
+        }
+        let Some(station) = self.radio_now_playing_target() else {
+            return;
+        };
+        if self
+            .radio_now_playing_cache
+            .get(station.id)
+            .is_some_and(|cached| now < cached.refresh_at)
+            || self
+                .radio_now_playing_retry_at
+                .get(station.id)
+                .is_some_and(|retry| now < retry.retry_at)
+        {
+            return;
+        }
+        let Some(endpoint) = station.now_playing else {
+            return;
+        };
+        let generation = self.radio_now_playing_generation.wrapping_add(1);
+        let request = ProviderRequest::RadioNowPlaying {
+            generation,
+            station_id: station.id.to_owned(),
+            endpoint,
+        };
+        let Some(sender) = self.provider_requests.as_ref() else {
+            return;
+        };
+        if sender.send(request).is_ok() {
+            self.radio_now_playing_generation = generation;
+            self.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+                generation,
+                station_id: station.id.to_owned(),
+            });
+        }
+    }
+
+    /// Accepts passive metadata while retaining the last success on failures.
+    #[cfg(feature = "radio")]
+    fn handle_radio_now_playing(
+        &mut self,
+        generation: u64,
+        station_id: String,
+        result: Result<RadioNowPlaying, String>,
+    ) {
+        let expected = self
+            .pending_radio_now_playing
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.generation == generation && pending.station_id == station_id
+            });
+        if !expected {
+            return;
+        }
+        self.pending_radio_now_playing = None;
+        let now = Instant::now();
+        match result {
+            Ok(value) => {
+                let refresh_at = now
+                    .checked_add(value.refresh_after)
+                    .unwrap_or(now + MIN_NOW_PLAYING_REFRESH);
+                self.radio_now_playing_cache.insert(
+                    station_id.clone(),
+                    CachedRadioNowPlaying { value, refresh_at },
+                );
+                self.radio_now_playing_retry_at.remove(&station_id);
+            }
+            Err(_) => {
+                let consecutive_failures = self
+                    .radio_now_playing_retry_at
+                    .get(&station_id)
+                    .map_or(1, |retry| retry.consecutive_failures.saturating_add(1));
+                let delay = radio_now_playing_failure_delay(consecutive_failures);
+                self.radio_now_playing_retry_at.insert(
+                    station_id.clone(),
+                    RadioNowPlayingRetry {
+                        retry_at: now.checked_add(delay).unwrap_or(now),
+                        consecutive_failures,
+                    },
+                );
+            }
+        }
+        if self.current_media.as_ref().is_some_and(|media| {
+            media.source == SourceKind::Radio && media.external_id == station_id
+        }) {
+            let icy_title = self.view.playback.stream_title.clone();
+            self.refresh_playing_radio_metadata(icy_title.as_deref());
+        }
+        if self.view.screen == Screen::Radio
+            && RADIO_STATIONS
+                .get(self.view.selected)
+                .is_some_and(|station| station.id == station_id)
+        {
+            self.update_radio_detail();
+            self.refresh_selected_playlist_state();
+        }
+    }
+
+    /// Clears stale details in builds where Radio is unavailable.
+    #[cfg(not(feature = "radio"))]
+    fn update_radio_detail(&mut self) {
+        self.view.details = None;
+    }
+
+    /// Applies provider metadata before ICY metadata for the playing station.
+    #[cfg(feature = "radio")]
+    fn refresh_playing_radio_metadata(&mut self, icy_title: Option<&str>) {
+        let cached = self
+            .current_media
+            .as_ref()
+            .filter(|media| media.source == SourceKind::Radio)
+            .and_then(|media| self.radio_now_playing_cache.get(&media.external_id));
+        let next = playing_radio_metadata_display(cached, icy_title, Instant::now());
+        if self.view.radio_now_playing == next {
+            return;
+        }
+        self.view.radio_now_playing = next;
+        if self.view.screen == Screen::Radio {
+            self.update_radio_detail();
+        }
+    }
+
+    /// Rebuilds the current persistent playlist route without network access.
+    fn populate_playlists_screen(&mut self) {
+        match self.playlists_route.clone() {
+            PlaylistsRoute::Index => self.populate_playlist_index(),
+            PlaylistsRoute::Entries { playlist_id } => match self.store.playlist(&playlist_id) {
+                Ok(Some(playlist)) => {
+                    self.active_playlist = Some(playlist);
+                    self.populate_playlist_entries();
+                }
+                Ok(None) => {
+                    self.playlists_route = PlaylistsRoute::Index;
+                    self.active_playlist = None;
+                    self.playlist_entry_selected = 0;
+                    self.populate_playlist_index();
+                    self.view.status_line =
+                        "That playlist no longer exists; returned to Playlists".to_owned();
+                }
+                Err(error) => {
+                    self.view.rows.clear();
+                    self.view.details = None;
+                    self.show_error("Cannot load playlist entries", &error);
+                }
+            },
+        }
+    }
+
+    /// Loads compact playlist rows and the selected playlist description.
+    fn populate_playlist_index(&mut self) {
+        self.active_playlist = None;
+        self.playlist_summaries = match self.store.playlists() {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                self.view.rows.clear();
+                self.view.details = None;
+                self.show_error("Cannot load playlists", &error);
+                return;
+            }
+        };
+        self.view.rows = self
+            .playlist_summaries
+            .iter()
+            .map(|playlist| {
+                let count = format!(
+                    "{} item{}",
+                    playlist.entry_count,
+                    if playlist.entry_count == 1 { "" } else { "s" }
+                );
+                RowView {
+                    title: playlist.name.clone(),
+                    subtitle: playlist
+                        .description
+                        .as_deref()
+                        .filter(|description| !description.is_empty())
+                        .map_or_else(
+                            || count.clone(),
+                            |description| {
+                                format!("{count} · {}", one_line_excerpt(description, 160))
+                            },
+                        ),
+                    source: "Local playlist".to_owned(),
+                    compact: true,
+                    ..RowView::default()
+                }
+            })
+            .collect();
+        self.view.selected = self
+            .playlist_selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.playlist_selected = self.view.selected;
+        self.update_playlist_detail();
+        self.view.status_line = if self.playlist_summaries.is_empty() {
+            "No playlists yet; select a playable item and press P to create one".to_owned()
+        } else {
+            format!(
+                "{} local playlist{}",
+                self.playlist_summaries.len(),
+                if self.playlist_summaries.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+    }
+
+    /// Rebuilds ordered media rows for the loaded playlist.
+    fn populate_playlist_entries(&mut self) {
+        let Some(playlist) = self.active_playlist.as_ref() else {
+            self.view.rows.clear();
+            self.view.details = None;
+            return;
+        };
+        let playlist_name = playlist.name.clone();
+        let playlist_entry_count = playlist.entries.len();
+        self.view.rows = playlist
+            .entries
+            .iter()
+            .map(|entry| {
+                let live_stream = entry.media.kind == MediaKind::LiveStream;
+                let watched_percent = if live_stream {
+                    0
+                } else {
+                    self.store
+                        .progress(&entry.media.id)
+                        .ok()
+                        .flatten()
+                        .map_or(0, |progress| progress.watched_percent())
+                };
+                let mut metadata = Vec::with_capacity(3);
+                if live_stream {
+                    metadata.push("live".to_owned());
+                } else {
+                    if let Some(creator) = entry
+                        .media
+                        .creator
+                        .as_deref()
+                        .filter(|creator| !creator.is_empty())
+                    {
+                        metadata.push(creator.to_owned());
+                    }
+                    if let Some(duration) = entry.media.duration_seconds {
+                        metadata.push(format_seconds(duration));
+                    }
+                    if entry.media.id.source == SourceKind::Local
+                        && !Path::new(&entry.media.replay_locator).is_file()
+                    {
+                        metadata.push("Removed".to_owned());
+                    }
+                }
+                RowView {
+                    media_id: Some(entry.media.id.clone()),
+                    title: entry.media.title.clone(),
+                    subtitle: metadata.join(" · "),
+                    source: if entry.media.id.source == SourceKind::Radio {
+                        "Radio".to_owned()
+                    } else {
+                        entry.media.id.source.to_string()
+                    },
+                    watched_percent,
+                    thumbnail_url: entry.media.thumbnail_url.clone(),
+                    hide_watched_marker: live_stream,
+                    compact: true,
+                    ..RowView::default()
+                }
+            })
+            .collect();
+        self.view.selected = self
+            .playlist_entry_selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.playlist_entry_selected = self.view.selected;
+        self.update_playlist_detail();
+        self.view.status_line = format!(
+            "{} item{} in {}",
+            playlist_entry_count,
+            if playlist_entry_count == 1 { "" } else { "s" },
+            playlist_name
+        );
+    }
+
+    /// Shows metadata for the selected playlist or its selected media entry.
+    fn update_playlist_detail(&mut self) {
+        match self.playlists_route {
+            PlaylistsRoute::Index => {
+                let Some(playlist) = self.playlist_summaries.get(self.view.selected) else {
+                    self.view.details = None;
+                    self.view.playlist_edit_available = false;
+                    return;
+                };
+                let mut description = playlist.description.clone().unwrap_or_default();
+                if !description.is_empty() {
+                    description.push('\n');
+                }
+                description.push_str(&format!(
+                    "{} item{}",
+                    playlist.entry_count,
+                    if playlist.entry_count == 1 { "" } else { "s" }
+                ));
+                self.view.details = Some(DetailView {
+                    title: playlist.name.clone(),
+                    source: "Local playlist".to_owned(),
+                    description,
+                    ..DetailView::default()
+                });
+                self.view.playlist_edit_available = true;
+            }
+            PlaylistsRoute::Entries { .. } => {
+                let Some((playlist, entry)) = self.active_playlist.as_ref().and_then(|playlist| {
+                    Some((playlist, playlist.entries.get(self.view.selected)?))
+                }) else {
+                    self.view.details = None;
+                    self.view.playlist_edit_available = false;
+                    return;
+                };
+                let mut description = entry
+                    .media
+                    .creator
+                    .as_deref()
+                    .filter(|creator| !creator.is_empty())
+                    .map_or_else(String::new, |creator| format!("Creator: {creator}"));
+                if !description.is_empty() {
+                    description.push('\n');
+                }
+                description.push_str(&format!("Playlist: {}", playlist.name));
+                let links = matches!(entry.media.webpage_url.scheme(), "http" | "https")
+                    .then(|| DetailLinkView {
+                        label: "Canonical media page".to_owned(),
+                        url: entry.media.webpage_url.to_string(),
+                        wikidata_item_id: None,
+                    })
+                    .into_iter()
+                    .collect();
+                self.view.details = Some(DetailView {
+                    media_id: Some(entry.media.id.clone()),
+                    title: entry.media.title.clone(),
+                    source: if entry.media.id.source == SourceKind::Radio {
+                        "Radio".to_owned()
+                    } else {
+                        entry.media.id.source.to_string()
+                    },
+                    length: entry
+                        .media
+                        .duration_seconds
+                        .map_or_else(String::new, format_seconds),
+                    description,
+                    thumbnail_url: entry.media.thumbnail_url.clone(),
+                    links,
+                    ..DetailView::default()
+                });
+                self.view.playlist_edit_available = false;
+            }
+        }
+    }
+
+    /// Opens the selected playlist or starts its selected persisted item.
+    fn activate_playlist_selection(&mut self) {
+        match self.playlists_route.clone() {
+            PlaylistsRoute::Index => {
+                let Some(summary) = self.playlist_summaries.get(self.view.selected).cloned() else {
+                    self.view.status_line = "No playlist is selected".to_owned();
+                    return;
+                };
+                let playlist = match self.store.playlist(&summary.id) {
+                    Ok(Some(playlist)) => playlist,
+                    Ok(None) => {
+                        self.view.status_line =
+                            "That playlist no longer exists; refreshing the list".to_owned();
+                        self.populate_playlist_index();
+                        return;
+                    }
+                    Err(error) => {
+                        self.show_error("Cannot open playlist", &error);
+                        return;
+                    }
+                };
+                self.playlist_selected = self.view.selected;
+                self.playlist_entry_selected = 0;
+                self.playlists_route = PlaylistsRoute::Entries {
+                    playlist_id: summary.id,
+                };
+                self.active_playlist = Some(playlist);
+                self.view.selected = 0;
+                self.populate_playlist_entries();
+                self.refresh_selected_playlist_state();
+            }
+            PlaylistsRoute::Entries { .. } => {
+                let Some(entry) = self
+                    .active_playlist
+                    .as_ref()
+                    .and_then(|playlist| playlist.entries.get(self.view.selected))
+                    .cloned()
+                else {
+                    self.view.status_line = "No playlist item is selected".to_owned();
+                    return;
+                };
+                self.play_playlist_entry(entry);
+            }
+        }
+    }
+
+    /// Replays one stable playlist entry through its source-specific resolver.
+    fn play_playlist_entry(&mut self, entry: PlaylistEntry) {
+        if entry.media.id.source == SourceKind::Local {
+            let path = PathBuf::from(&entry.media.replay_locator);
+            if !path.is_absolute() || !path.is_file() {
+                self.show_error_message(
+                    "Playlist item is unavailable",
+                    format!(
+                        "The local file was removed or is not a regular file: {}",
+                        path.display()
+                    ),
+                );
+                return;
+            }
+            let item = match queue_item_from_local(&local_media_item(path)) {
+                Ok(item) => item,
+                Err(error) => {
+                    self.show_error_message("Playlist item is unavailable", error);
+                    return;
+                }
+            };
+            self.play_queue_item(item, false);
+            return;
+        }
+
+        if entry.media.id.source == SourceKind::Bandcamp {
+            #[cfg(feature = "bandcamp")]
+            {
+                let summary = BandcampSearchSummary {
+                    id: entry.media.id.clone(),
+                    kind: BandcampReleaseKind::Track,
+                    title: entry.media.title.clone(),
+                    artist: entry.media.creator.clone(),
+                    webpage_url: entry.media.webpage_url.clone(),
+                    artwork_url: entry.media.thumbnail_url.clone(),
+                };
+                self.request_bandcamp_resolution(
+                    summary,
+                    BandcampResolutionOwner::Playlist(Box::new(entry)),
+                );
+                return;
+            }
+            #[cfg(not(feature = "bandcamp"))]
+            {
+                self.view.status_line =
+                    "This build omits Bandcamp; rebuild with that feature to play this item"
+                        .to_owned();
+                return;
+            }
+        }
+
+        if matches!(
+            entry.media.id.source,
+            SourceKind::ApplePodcasts
+                | SourceKind::SoundStream
+                | SourceKind::LitRes
+                | SourceKind::Jamendo
+        ) {
+            self.resolve_playlist_entry(entry);
+            return;
+        }
+
+        let item = match queue_item_from_playlist_entry(&entry) {
+            Ok(item) => item,
+            Err(error) => {
+                self.show_error_message("Playlist item is unavailable", error);
+                return;
+            }
+        };
+        self.play_queue_item(item, false);
+    }
+
+    /// Resolves one canonical first-class provider page before playlist replay.
+    fn resolve_playlist_entry(&mut self, entry: PlaylistEntry) {
+        let url = match url::Url::parse(&entry.media.replay_locator) {
+            Ok(url) => url,
+            Err(_) => {
+                self.show_error_message(
+                    "Playlist item is unavailable",
+                    "The saved provider page is not a valid URL",
+                );
+                return;
+            }
+        };
+        self.supersede_search_generation();
+        let generation = self.search_generation;
+        let source = entry.media.id.source.clone();
+        self.pending_playlist_replay = Some(PendingPlaylistReplay { generation, entry });
+        let request = if source == SourceKind::ApplePodcasts {
+            ProviderRequest::ResolveApple { generation, url }
+        } else {
+            ProviderRequest::ResolveFirstClass {
+                generation,
+                direct: DirectSourceInput {
+                    url,
+                    source: source.clone(),
+                },
+            }
+        };
+        if !self.send_provider_request(request, "Could not resolve the playlist item") {
+            self.pending_playlist_replay = None;
+            return;
+        }
+        self.begin_playback_start_activity();
+        self.view.status_line = format!(
+            "Resolving {} for playlist playback…",
+            direct_source_label(&source)
+        );
+    }
+
+    /// Consumes one source response only while its playlist entry remains selected.
+    fn finish_playlist_replay(
+        &mut self,
+        generation: u64,
+        source: &SourceKind,
+        result: &Result<ResolvedDirectMedia, String>,
+    ) -> bool {
+        let matches_pending = self
+            .pending_playlist_replay
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.generation == generation && &pending.entry.media.id.source == source
+            });
+        if !matches_pending {
+            return false;
+        }
+        let pending = self
+            .pending_playlist_replay
+            .take()
+            .expect("matching playlist replay was checked above");
+        self.clear_playback_start_activity();
+        let still_selected = generation == self.search_generation
+            && self.view.screen == Screen::Playlists
+            && matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+            && self
+                .active_playlist
+                .as_ref()
+                .and_then(|playlist| playlist.entries.get(self.view.selected))
+                .is_some_and(|selected| {
+                    selected.media.id == pending.entry.media.id
+                        && selected.added_at == pending.entry.added_at
+                });
+        if !still_selected {
+            return true;
+        }
+        let media = match result {
+            Ok(media) => media,
+            Err(error) => {
+                self.show_error_message("Playlist item could not be resolved", error);
+                return true;
+            }
+        };
+        let item = match queue_item_from_resolved(media) {
+            Ok(item) => item,
+            Err(error) => {
+                self.show_error_message("Playlist item is unavailable", error);
+                return true;
+            }
+        };
+        if item.media.id != pending.entry.media.id {
+            self.show_error_message(
+                "Playlist item could not be resolved",
+                "The provider page resolved to a different media identifier; the playlist entry was kept",
+            );
+            return true;
+        }
+        self.play_queue_item(item, false);
+        true
+    }
+
+    /// Reloads the active playlist route and selected-item membership.
+    fn refresh_playlists_after_mutation(&mut self, _media_id: Option<&MediaId>) {
+        if self.view.screen == Screen::Playlists {
+            self.populate_playlists_screen();
+        }
+        self.refresh_selected_playlist_state();
     }
 
     fn populate_subscriptions(&mut self) {
@@ -10031,6 +12404,7 @@ impl AppController {
         {
             self.show_cached_selected_subscription_videos();
         }
+        self.refresh_selected_playlist_state();
     }
 
     /// Restores known channel-artwork URLs for every subscription source.
@@ -10131,6 +12505,7 @@ impl AppController {
         if self.view.subscriptions.layout == SubscriptionsLayout::Split {
             self.show_cached_selected_subscription_videos();
         }
+        self.refresh_selected_playlist_state();
     }
 
     /// Shows cached split-view rows without spending quota while sources move.
@@ -10200,6 +12575,7 @@ impl AppController {
         self.view.right_panel_mode = RightPanelMode::Details;
         self.request_selected_details();
         self.load_next_subscription_page_if_needed();
+        self.refresh_selected_playlist_state();
     }
 
     fn load_selected_subscription_videos(&mut self) {
@@ -10236,9 +12612,11 @@ impl AppController {
                 self.request_selected_details();
             }
             self.refresh_selected_subscription_videos();
+            self.refresh_selected_playlist_state();
             return;
         }
         self.request_subscription_videos(channel_id, 1);
+        self.refresh_selected_playlist_state();
     }
 
     /// Hydrates one compact first-page channel snapshot before network refresh.
@@ -10575,6 +12953,7 @@ impl AppController {
 
     fn populate_downloads(&mut self) {
         self.view.rows.clear();
+        self.view.details = None;
         let path = self.config.downloads_dir();
         let entries = match std::fs::read_dir(&path) {
             Ok(entries) => entries,
@@ -10606,6 +12985,10 @@ impl AppController {
             if !file_type.is_file() {
                 continue;
             }
+            let entry_path = entry.path();
+            if !is_supported_media_path(&entry_path.to_string_lossy()) {
+                continue;
+            }
             let size = match entry.metadata() {
                 Ok(metadata) => metadata.len(),
                 Err(error) => {
@@ -10616,7 +12999,7 @@ impl AppController {
             self.view.rows.push(RowView {
                 media_id: Some(MediaId::new(
                     SourceKind::Local,
-                    entry.path().display().to_string(),
+                    entry_path.display().to_string(),
                 )),
                 title: entry.file_name().to_string_lossy().into_owned(),
                 subtitle: human_bytes(size),
@@ -10625,12 +13008,44 @@ impl AppController {
             });
         }
         self.view.status_line = format!("{} downloaded file(s)", self.view.rows.len());
+        self.view.selected = self
+            .view
+            .selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.update_downloaded_detail();
         if !read_failures.is_empty() {
             self.show_error_message(
                 "Some downloaded files could not be inspected",
                 read_failures.join("\n"),
             );
         }
+    }
+
+    /// Shows stable local metadata for the selected offline download.
+    fn update_downloaded_detail(&mut self) {
+        let Some(row) = self.view.rows.get(self.view.selected) else {
+            self.view.details = None;
+            return;
+        };
+        let Some(media_id) = row
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)
+            .cloned()
+        else {
+            self.view.details = None;
+            return;
+        };
+        let path = PathBuf::from(&media_id.external_id);
+        self.view.details = Some(DetailView {
+            media_id: Some(media_id),
+            title: row.title.clone(),
+            source: "Local download".to_owned(),
+            description: format!("Full path: {}", path.display()),
+            ..DetailView::default()
+        });
+        #[cfg(all(feature = "local", feature = "thumbnails"))]
+        self.request_selected_local_artwork();
     }
 
     fn populate_history(&mut self) {
@@ -10648,29 +13063,44 @@ impl AppController {
                 self.view.rows = self
                     .history_entries
                     .iter()
-                    .map(|history| RowView {
-                        media_id: Some(history.entry.media_id.clone()),
-                        title: history.entry.title.clone(),
-                        subtitle: if history.local_removed {
-                            "Removed".to_owned()
-                        } else if history.entry.finished {
-                            "played".to_owned()
-                        } else {
-                            format!(
-                                "stopped at {}",
-                                format_seconds(history.entry.position_seconds)
-                            )
-                        },
-                        source: history.entry.media_id.source.to_string(),
-                        watched_percent: history
-                            .entry
-                            .duration_seconds
-                            .filter(|duration| *duration > 0)
-                            .map_or(0, |duration| {
-                                ((history.entry.position_seconds.min(duration) * 100) / duration)
-                                    as u8
-                            }),
-                        ..RowView::default()
+                    .map(|history| {
+                        let live_radio = history.entry.media_id.source == SourceKind::Radio;
+                        RowView {
+                            media_id: Some(history.entry.media_id.clone()),
+                            title: history.entry.title.clone(),
+                            subtitle: if live_radio {
+                                "live".to_owned()
+                            } else if history.local_removed {
+                                "Removed".to_owned()
+                            } else if history.entry.finished {
+                                "played".to_owned()
+                            } else {
+                                format!(
+                                    "stopped at {}",
+                                    format_seconds(history.entry.position_seconds)
+                                )
+                            },
+                            source: if live_radio {
+                                "Radio".to_owned()
+                            } else {
+                                history.entry.media_id.source.to_string()
+                            },
+                            watched_percent: if live_radio {
+                                0
+                            } else {
+                                history
+                                    .entry
+                                    .duration_seconds
+                                    .filter(|duration| *duration > 0)
+                                    .map_or(0, |duration| {
+                                        ((history.entry.position_seconds.min(duration) * 100)
+                                            / duration)
+                                            as u8
+                                    })
+                            },
+                            hide_watched_marker: live_radio,
+                            ..RowView::default()
+                        }
                     })
                     .collect();
                 self.view.status_line = format!("{} history item(s)", self.view.rows.len());
@@ -10752,6 +13182,33 @@ impl AppController {
         }
         if self.view.screen == Screen::ApplePodcasts {
             return self.current_apple_podcasts_url();
+        }
+        if self.view.screen == Screen::Radio {
+            #[cfg(feature = "radio")]
+            {
+                return RADIO_STATIONS
+                    .get(self.view.selected)
+                    .map(|station| station.homepage.to_owned());
+            }
+            #[cfg(not(feature = "radio"))]
+            return None;
+        }
+        if self.view.screen == Screen::Playlists {
+            return matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+                .then(|| {
+                    self.active_playlist
+                        .as_ref()?
+                        .entries
+                        .get(self.view.selected)
+                        .map(|entry| {
+                            if entry.media.id.source == SourceKind::Local {
+                                entry.media.replay_locator.clone()
+                            } else {
+                                entry.media.webpage_url.to_string()
+                            }
+                        })
+                })
+                .flatten();
         }
         if self.view.screen != Screen::Search {
             return None;
@@ -11348,29 +13805,96 @@ impl AppController {
         let _ = (&value, &source);
         #[cfg(feature = "local")]
         {
-            let mut actions = crate::local_browser::SystemLocalFileActions;
-            match crate::local_browser::rename_local_file(
-                &mut actions,
+            let target = match crate::local_browser::validate_local_rename(
                 &source,
                 std::ffi::OsStr::new(&value),
             ) {
-                Ok(target) => {
-                    self.view.local_file_popup = None;
-                    self.view.status_line = format!("Renamed to {}", target.display());
-                    if let Some(directory) = self
-                        .local_listing
-                        .as_ref()
-                        .map(|listing| listing.path.clone())
-                    {
-                        self.browse_local_directory(directory);
-                    }
-                }
+                Ok(target) => target,
                 Err(error) => {
                     if let Some(LocalFilePopupView::Rename {
                         error: popup_error, ..
                     }) = self.view.local_file_popup.as_mut()
                     {
                         *popup_error = Some(error.to_string());
+                    }
+                    return;
+                }
+            };
+            let mapping = LocalMoveMapping {
+                source: source.clone(),
+                target: target.clone(),
+            };
+            if let Some(collision) =
+                self.local_progress_cache_collision(std::slice::from_ref(&mapping))
+            {
+                if let Some(LocalFilePopupView::Rename {
+                    error: popup_error, ..
+                }) = self.view.local_file_popup.as_mut()
+                {
+                    *popup_error = Some(format!(
+                        "Rename cancelled because watched progress already exists for destination `{}`",
+                        collision.external_id
+                    ));
+                }
+                return;
+            }
+            if let Err(error) = self
+                .store
+                .journal_local_move_intent(std::slice::from_ref(&mapping), unix_time())
+            {
+                self.show_error("Could not save the Local rename recovery intent", &error);
+                return;
+            }
+            self.local_move_journal_pending = true;
+            let mut actions = crate::local_browser::SystemLocalFileActions;
+            match crate::local_browser::rename_local_file(
+                &mut actions,
+                &source,
+                std::ffi::OsStr::new(&value),
+            ) {
+                Ok(_) => {
+                    let warnings =
+                        self.apply_completed_local_move_mappings(std::slice::from_ref(&mapping));
+                    self.local_move_marks.remove(&source);
+                    self.view.local_file_popup = None;
+                    self.view.status_line = format!("Renamed to {}", target.display());
+                    let _ = self.persist_pending_local_move_mappings(
+                        LocalMovePersistenceAttempt::Automatic,
+                    );
+                    if let Some(directory) = target.parent().map(Path::to_owned) {
+                        self.browse_local_directory_with_reselection(
+                            directory,
+                            Some(target.clone()),
+                        );
+                    }
+                    if !warnings.is_empty() {
+                        self.show_error_message(
+                            "Local rename completed with warnings",
+                            warnings.join("\n"),
+                        );
+                    }
+                }
+                Err(rename_error) => {
+                    let error = match self
+                        .store
+                        .discard_local_move_intents(std::slice::from_ref(&mapping))
+                    {
+                        Ok(()) => {
+                            self.local_move_journal_pending = false;
+                            rename_error.to_string()
+                        }
+                        Err(discard_error) => {
+                            self.local_move_journal_pending = true;
+                            format!(
+                                "{rename_error}; the durable recovery intent could not be cleared: {discard_error}"
+                            )
+                        }
+                    };
+                    if let Some(LocalFilePopupView::Rename {
+                        error: popup_error, ..
+                    }) = self.view.local_file_popup.as_mut()
+                    {
+                        *popup_error = Some(error);
                     }
                 }
             }
@@ -12716,13 +15240,15 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => {}
             }
+        } else if self.view.screen == Screen::Radio {
+            self.radio_selected = self.view.selected;
         } else if self.view.screen == Screen::TrackerMusic {
             self.tracker_search_query
                 .clone_from(&self.view.search_query);
             self.tracker_selected = self.view.selected;
         }
         let state = SessionState {
-            screen: stored_screen_from_tui(self.view.screen),
+            screen: stored_session_screen(self.view.screen, &self.playlists_route),
             focus: if self.view.details_focused {
                 PanelFocus::Right
             } else {
@@ -12735,6 +15261,7 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
+            radio_selected_row: Some(self.radio_selected),
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
@@ -12760,7 +15287,33 @@ impl AppController {
         }
     }
 
-    fn shutdown(&mut self) {
+    /// Flushes restart-safe state and stops all owned workers exactly once.
+    ///
+    /// Repeated calls return the cached persistence outcome without writing
+    /// state or shutting helpers down again. This lets the executable perform
+    /// an explicit durability barrier before releasing the state lock and
+    /// starting automatic Git synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownPersistenceError`] when Local move reconciliation,
+    /// playback checkpoint publication, or session persistence fails. Worker
+    /// and playback teardown still completes in that case.
+    pub fn shutdown_for_exit(&mut self) -> Result<(), ShutdownPersistenceError> {
+        if self.shutdown() {
+            Ok(())
+        } else {
+            Err(ShutdownPersistenceError)
+        }
+    }
+
+    fn shutdown(&mut self) -> bool {
+        if let Some(succeeded) = self.shutdown_persistence_succeeded {
+            return succeeded;
+        }
+        // Prevent Drop from repeating partial teardown if a destructor or
+        // worker join panics while this method is already running.
+        self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
         self.shutdown_local_browse_worker();
@@ -12778,15 +15331,23 @@ impl AppController {
             self.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Explicit);
         #[cfg(not(feature = "local"))]
         let local_move_state_ready = true;
+        let mut persistence_succeeded = true;
         if !self.diagnostic_only {
             self.session_dirty = true;
             if local_move_state_ready {
-                self.persist_position();
-                self.flush_listen_time();
-                let _ = self.save_session_with_local_move_attempt(
+                let position_saved = self.persist_position();
+                // With no active media, `persist_position` intentionally skips
+                // creating a new checkpoint. Live radio writes listening-only
+                // state. In both cases, publish any durable recovery checkpoint
+                // before Git sees the state tree.
+                let checkpoint_published = position_saved && self.publish_playback_checkpoint();
+                let session_saved = self.save_session_with_local_move_attempt(
                     #[cfg(feature = "local")]
                     LocalMovePersistenceAttempt::Explicit,
                 );
+                persistence_succeeded = position_saved && checkpoint_published && session_saved;
+            } else {
+                persistence_succeeded = false;
             }
         }
         if let Some(player) = self.player.as_mut() {
@@ -12799,6 +15360,8 @@ impl AppController {
         if let Some(handle) = self.provider_thread.take() {
             let _ = handle.join();
         }
+        self.shutdown_persistence_succeeded = Some(persistence_succeeded);
+        persistence_succeeded
     }
 }
 
@@ -13053,10 +15616,14 @@ impl UiController for AppController {
             } => self.activate_description_video(video_id, start_seconds),
             UiAction::TogglePause => self.player_command(PlayerCommand::TogglePause),
             UiAction::SeekRelative(seconds) => {
-                self.player_command(PlayerCommand::SeekRelative(seconds));
+                if !self.seek_is_unavailable_for_live_radio() {
+                    self.player_command(PlayerCommand::SeekRelative(seconds));
+                }
             }
             UiAction::SeekPercent(percent) => {
-                self.player_command(PlayerCommand::SeekPercent(percent));
+                if !self.seek_is_unavailable_for_live_radio() {
+                    self.player_command(PlayerCommand::SeekPercent(percent));
+                }
             }
             UiAction::ChangeVolume(delta) => {
                 let volume = i16::from(self.view.playback.volume)
@@ -13083,6 +15650,16 @@ impl UiController for AppController {
                 );
             }
             UiAction::ToggleRepeat => {
+                if self
+                    .current_media
+                    .as_ref()
+                    .is_some_and(|media| media.source == SourceKind::Radio)
+                {
+                    self.view.repeating = false;
+                    self.playback_queue.repeat_one = false;
+                    self.view.status_line = "Repeat is unavailable for live radio".to_owned();
+                    return;
+                }
                 self.view.repeating = !self.view.repeating;
                 self.playback_queue.repeat_one = self.view.repeating;
                 if self.player.is_some() {
@@ -13121,10 +15698,67 @@ impl UiController for AppController {
             }
             UiAction::PlayNext => self.queue_selected(true),
             UiAction::AddToQueue => self.queue_selected(false),
-            UiAction::Download => self.start_selected_download(),
-            UiAction::EditPrivateNote => {
-                self.view.status_line = "Private note editor is not open yet".to_owned();
+            UiAction::ToggleTodoPlaylist => self.toggle_selected_todo(),
+            UiAction::OpenPlaylistPopup => self.open_playlist_popup(),
+            UiAction::MovePlaylistPopupSelection(delta) => {
+                if let Some(popup) = self
+                    .view
+                    .playlist_popup
+                    .as_mut()
+                    .filter(|popup| popup.mode == PlaylistPopupMode::Choose)
+                    && let Some(selected) =
+                        moved_index(popup.selected, popup.playlists.len(), delta)
+                {
+                    popup.selected = selected;
+                }
             }
+            UiAction::SelectPlaylistPopupRow(row) => {
+                if let Some(popup) = self
+                    .view
+                    .playlist_popup
+                    .as_mut()
+                    .filter(|popup| popup.mode == PlaylistPopupMode::Choose)
+                    && row < popup.playlists.len()
+                {
+                    popup.selected = row;
+                }
+            }
+            UiAction::ToggleSelectedPlaylistMembership => {
+                self.toggle_selected_playlist_membership();
+            }
+            UiAction::BeginNewPlaylist => self.begin_new_playlist(),
+            UiAction::EditSelectedPlaylist => self.edit_selected_playlist(),
+            UiAction::SelectPlaylistEditorField(field) => {
+                if let Some(popup) = self
+                    .view
+                    .playlist_popup
+                    .as_mut()
+                    .filter(|popup| popup.mode != PlaylistPopupMode::Choose)
+                {
+                    popup.editor_field = field;
+                    popup.validation_error = None;
+                }
+            }
+            UiAction::AppendPlaylistEditorCharacter(character) => {
+                self.append_playlist_editor_character(character);
+            }
+            UiAction::DeletePlaylistEditorCharacter => {
+                self.delete_playlist_editor_character();
+            }
+            UiAction::CreatePlaylistAndAdd => self.create_playlist_and_add(),
+            UiAction::UpdatePlaylist => self.update_selected_playlist(),
+            UiAction::DismissPlaylistPopup => self.dismiss_playlist_popup(),
+            UiAction::Download => self.start_selected_download(),
+            UiAction::EditPrivateNote => self.open_private_note_popup(),
+            UiAction::AppendPrivateNoteCharacter(character) => {
+                self.append_private_note_character(character);
+            }
+            UiAction::InsertPrivateNoteNewline => self.insert_private_note_newline(),
+            UiAction::DeletePrivateNoteCharacter => self.delete_private_note_character(),
+            UiAction::MovePrivateNoteCursor(motion) => self.move_private_note_cursor(motion),
+            UiAction::SavePrivateNote => self.save_private_note(),
+            UiAction::RequestPrivateNoteDelete => self.request_private_note_delete(),
+            UiAction::DismissPrivateNotePopup => self.dismiss_private_note_popup(),
             UiAction::OpenEqualizer => {
                 self.view.status_line =
                     "Equalizer is disabled in direct audiophile mode".to_owned();
@@ -13300,6 +15934,8 @@ impl UiController for AppController {
         #[cfg(feature = "yt-dlp")]
         self.poll_download();
         self.update_player();
+        #[cfg(feature = "radio")]
+        self.request_due_radio_now_playing(now);
         if self.session_dirty && self.last_session_save.elapsed() >= Duration::from_secs(30) {
             self.save_session();
         }
@@ -13308,7 +15944,7 @@ impl UiController for AppController {
 
 impl Drop for AppController {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -13935,6 +16571,8 @@ fn provider_worker(
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
+    #[cfg(feature = "radio")]
+    let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
     #[cfg(feature = "network")]
     let youtube_channel_page =
         crate::providers::youtube_channel_page::YouTubeChannelPageClient::new();
@@ -14575,6 +17213,26 @@ fn provider_worker(
                     .map_err(|error| error.to_string());
                 if responses
                     .send(ProviderResponse::WikidataStatements { item_id, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "radio")]
+            ProviderRequest::RadioNowPlaying {
+                generation,
+                station_id,
+                endpoint,
+            } => {
+                let result = radio_now_playing
+                    .fetch(endpoint)
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::RadioNowPlaying {
+                        generation,
+                        station_id,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -15385,6 +18043,7 @@ fn row_from_search_item(
                     && subscriptions.contains_youtube_channel(&video.channel_id),
                 thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
                 vertical: video.orientation == VideoOrientation::Vertical,
+                hide_watched_marker: false,
                 compact: false,
                 local_marked: false,
             }
@@ -15963,6 +18622,10 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::ApplePodcasts => StoredScreen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         Screen::ApplePodcasts => StoredScreen::Search,
+        #[cfg(feature = "radio")]
+        Screen::Radio => StoredScreen::Radio,
+        #[cfg(not(feature = "radio"))]
+        Screen::Radio => StoredScreen::Search,
         Screen::Local => StoredScreen::Local,
         Screen::Subscriptions => StoredScreen::Subscriptions,
         Screen::Downloaded => StoredScreen::Downloaded,
@@ -15970,6 +18633,37 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::Playlists => StoredScreen::Playlists,
         Screen::Statistics => StoredScreen::Statistics,
         Screen::TrackerMusic => StoredScreen::TrackerMusic,
+    }
+}
+
+/// Preserves the exact persistent-playlist route in the existing screen field.
+///
+/// `StoredScreen::Playlist` predates the TUI playlist index, so retaining its
+/// stable identifier requires no session-schema change.
+fn stored_session_screen(screen: Screen, route: &PlaylistsRoute) -> StoredScreen {
+    if screen == Screen::Playlists
+        && let PlaylistsRoute::Entries { playlist_id } = route
+    {
+        return StoredScreen::Playlist(playlist_id.clone());
+    }
+    stored_screen_from_tui(screen)
+}
+
+/// Restores both the playlist navigation level and its route-specific row.
+fn restored_playlists_route(
+    screen: &StoredScreen,
+    selected_row: usize,
+) -> (PlaylistsRoute, usize, usize) {
+    match screen {
+        StoredScreen::Playlist(playlist_id) => (
+            PlaylistsRoute::Entries {
+                playlist_id: playlist_id.clone(),
+            },
+            0,
+            selected_row,
+        ),
+        StoredScreen::Playlists => (PlaylistsRoute::Index, selected_row, 0),
+        _ => (PlaylistsRoute::Index, 0, 0),
     }
 }
 
@@ -15988,6 +18682,10 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         StoredScreen::ApplePodcasts => Screen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         StoredScreen::ApplePodcasts => Screen::Search,
+        #[cfg(feature = "radio")]
+        StoredScreen::Radio => Screen::Radio,
+        #[cfg(not(feature = "radio"))]
+        StoredScreen::Radio => Screen::Search,
         StoredScreen::Local => Screen::Local,
         StoredScreen::Subscriptions => Screen::Subscriptions,
         StoredScreen::Downloaded => Screen::Downloaded,
@@ -16159,6 +18857,157 @@ fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) ->
     }
 }
 
+/// Builds a live queue item while keeping the station page separate from audio.
+#[cfg(feature = "radio")]
+fn queue_item_from_radio_station(station: &RadioStationPreset) -> Result<QueueItem, String> {
+    let webpage_url = station
+        .homepage_url()
+        .map_err(|error| format!("The built-in station homepage is invalid: {error}"))?;
+    station
+        .stream_url()
+        .map_err(|error| format!("The built-in station stream is invalid: {error}"))?;
+    Ok(QueueItem {
+        media: MediaItem {
+            id: MediaId::new(SourceKind::Radio, station.id),
+            kind: MediaKind::LiveStream,
+            title: station.name.to_owned(),
+            creator: None,
+            description: Some(station.summary.to_owned()),
+            webpage_url,
+            thumbnail_url: None,
+            duration_seconds: None,
+            published_at: None,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::Unknown,
+            chapters: Vec::new(),
+            captions: Vec::new(),
+        },
+        playback_location: station.stream.to_owned(),
+        start_at_seconds: None,
+        added_at: unix_time(),
+    })
+}
+
+#[cfg(feature = "radio")]
+fn radio_codec_label(codec: Option<RadioCodec>) -> &'static str {
+    match codec {
+        Some(RadioCodec::Aac) => "AAC",
+        Some(RadioCodec::Flac) => "FLAC",
+        Some(RadioCodec::Mp3) => "MP3",
+        Some(RadioCodec::Opus) => "Opus",
+        None => "not published",
+    }
+}
+
+#[cfg(feature = "radio")]
+fn radio_station_row_summary(station: &RadioStationPreset) -> String {
+    radio_station_quality(station, false)
+}
+
+/// Formats only trustworthy quality attributes supplied by the preset.
+#[cfg(feature = "radio")]
+fn radio_station_quality(station: &RadioStationPreset, include_unknown_bitrate: bool) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if let Some(codec) = station.codec {
+        parts.push(radio_codec_label(Some(codec)).to_owned());
+    }
+    if let Some(rate) = station.bitrate_kbps {
+        parts.push(format!("{rate} kbps"));
+    } else if include_unknown_bitrate {
+        parts.push("bitrate unknown".to_owned());
+    }
+    if let Some(rate) = station.sample_rate_hz {
+        let kilohertz = f64::from(rate) / 1_000.0;
+        parts.push(if rate % 1_000 == 0 {
+            format!("{kilohertz:.0} kHz")
+        } else {
+            format!("{kilohertz:.1} kHz")
+        });
+    }
+    if let Some(channels) = station.channels {
+        parts.push(match channels {
+            1 => "mono".to_owned(),
+            2 => "stereo".to_owned(),
+            channels => format!("{channels} channels"),
+        });
+    }
+    if parts.is_empty() {
+        "quality unknown".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Formats optional station metadata with its correct user-facing meaning.
+#[cfg(feature = "radio")]
+fn radio_now_playing_display(metadata: &RadioNowPlaying) -> Option<String> {
+    let body = match metadata.kind {
+        RadioNowPlayingKind::Track => match (
+            metadata.artist.as_deref().filter(|value| !value.is_empty()),
+            metadata.title.as_deref().filter(|value| !value.is_empty()),
+        ) {
+            (Some(artist), Some(title)) => Some(format!("{artist} — {title}")),
+            (Some(artist), None) => Some(artist.to_owned()),
+            (None, Some(title)) => Some(title.to_owned()),
+            (None, None) => None,
+        },
+        RadioNowPlayingKind::OnAir => match (
+            metadata
+                .programme
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            metadata.title.as_deref().filter(|value| !value.is_empty()),
+        ) {
+            (Some(programme), Some(segment)) => Some(format!("{programme} — {segment}")),
+            (Some(programme), None) => Some(programme.to_owned()),
+            (None, Some(segment)) => Some(segment.to_owned()),
+            (None, None) => None,
+        },
+    }?;
+    Some(format!(
+        "{}: {body}",
+        match metadata.kind {
+            RadioNowPlayingKind::Track => "Track",
+            RadioNowPlayingKind::OnAir => "On air",
+        }
+    ))
+}
+
+/// Returns a capped, station-scoped delay for passive metadata failures.
+#[cfg(feature = "radio")]
+fn radio_now_playing_failure_delay(consecutive_failures: u8) -> Duration {
+    let index = usize::from(consecutive_failures.saturating_sub(1))
+        .min(RADIO_NOW_PLAYING_FAILURE_BACKOFF.len() - 1);
+    RADIO_NOW_PLAYING_FAILURE_BACKOFF[index]
+}
+
+/// Labels an expired provider record without claiming that it is current.
+#[cfg(feature = "radio")]
+fn radio_stale_now_playing_display(metadata: &RadioNowPlaying) -> Option<String> {
+    let current = radio_now_playing_display(metadata)?;
+    Some(match metadata.kind {
+        RadioNowPlayingKind::Track => current.replacen("Track:", "Last known track:", 1),
+        RadioNowPlayingKind::OnAir => current.replacen("On air:", "Last known programme:", 1),
+    })
+}
+
+/// Resolves current playing metadata with clock-explicit freshness semantics.
+#[cfg(feature = "radio")]
+fn playing_radio_metadata_display(
+    cached: Option<&CachedRadioNowPlaying>,
+    icy_title: Option<&str>,
+    now: Instant,
+) -> Option<String> {
+    cached
+        .filter(|cached| now < cached.refresh_at)
+        .and_then(|cached| radio_now_playing_display(&cached.value))
+        .or_else(|| {
+            icy_title
+                .filter(|title| !title.trim().is_empty())
+                .map(|title| format!("Track: {}", title.trim()))
+        })
+}
+
 /// Largest stable replay locator retained in one History row.
 const MAX_HISTORY_REPLAY_LOCATOR_BYTES: usize = 16 * 1024;
 
@@ -16191,6 +19040,53 @@ fn history_replay_locator(item: &QueueItem) -> Option<String> {
         SourceKind::ModArchive => None,
         _ => stable_history_remote_url(&item.media.id.source, &item.media.webpage_url)
             .map(|url| url.to_string()),
+    }
+}
+
+/// Converts one queue entry into bounded, credential-free playlist metadata.
+///
+/// Playback locations are deliberately ignored because they can contain
+/// signed CDN URLs or request-specific provider state. The same canonical
+/// locator policy used by History supplies the restart-safe replay target.
+fn playlist_snapshot_from_queue_item(item: &QueueItem) -> Result<PlaylistMediaSnapshot, String> {
+    let replay_locator = history_replay_locator(item).ok_or_else(|| {
+        format!(
+            "{} cannot be saved because it has no credential-free stable replay location",
+            item.media.title
+        )
+    })?;
+    let webpage_url = if item.media.id.source == SourceKind::Local {
+        item.media.webpage_url.clone()
+    } else {
+        url::Url::parse(&replay_locator)
+            .map_err(|_| "The canonical playlist replay URL is invalid".to_owned())?
+    };
+    Ok(PlaylistMediaSnapshot {
+        id: item.media.id.clone(),
+        kind: item.media.kind,
+        title: item.media.title.clone(),
+        creator: item.media.creator.clone(),
+        webpage_url,
+        thumbnail_url: item.media.thumbnail_url.clone(),
+        duration_seconds: item.media.duration_seconds,
+        replay_locator,
+    })
+}
+
+/// Confirms that a persisted Local playlist item still names a regular file.
+///
+/// Remote snapshots are resolved lazily through their canonical provider
+/// pages. A missing Local path has no equivalent resolver and must not be
+/// copied into another playlist under a dead identity.
+fn ensure_playlist_snapshot_available(snapshot: &PlaylistMediaSnapshot) -> Result<(), String> {
+    if snapshot.id.source != SourceKind::Local {
+        return Ok(());
+    }
+    let path = Path::new(&snapshot.replay_locator);
+    if path.is_absolute() && path.is_file() {
+        Ok(())
+    } else {
+        Err("The local playlist file was removed or moved".to_owned())
     }
 }
 
@@ -16285,11 +19181,115 @@ fn history_replay_target(entry: &HistoryEntry) -> Result<HistoryReplayTarget, St
     Ok(HistoryReplayTarget::Remote(url))
 }
 
+/// Reconstructs one persisted playlist entry from its stable replay locator.
+///
+/// The stored canonical page or absolute local path is revalidated before it
+/// reaches the player. Transient signed media URLs are never reconstructed.
+fn queue_item_from_playlist_entry(entry: &PlaylistEntry) -> Result<QueueItem, String> {
+    if let Some(segment) = entry.segment.as_ref()
+        && segment.media_id != entry.media.id
+    {
+        return Err("The saved playlist segment belongs to different media".to_owned());
+    }
+
+    #[cfg(feature = "radio")]
+    if entry.media.id.source == SourceKind::Radio {
+        if entry.segment.is_some() {
+            return Err("Live radio stations cannot be saved as finite segments".to_owned());
+        }
+        let station = station_by_id(&entry.media.id.external_id)
+            .ok_or_else(|| "The saved radio station is not present in this build".to_owned())?;
+        let saved = url::Url::parse(&entry.media.replay_locator)
+            .map_err(|_| "The saved radio station page is invalid".to_owned())?;
+        let expected = station
+            .homepage_url()
+            .map_err(|error| format!("The built-in station homepage is invalid: {error}"))?;
+        if stable_history_remote_url(&SourceKind::Radio, &saved).as_ref() != Some(&expected) {
+            return Err("The saved radio station page does not match its station ID".to_owned());
+        }
+        return queue_item_from_radio_station(&station);
+    }
+
+    let (webpage_url, playback_location) = if entry.media.id.source == SourceKind::Local {
+        let path = PathBuf::from(&entry.media.replay_locator);
+        if !path.is_absolute() {
+            return Err("The saved local playlist path is not absolute".to_owned());
+        }
+        let webpage_url = url::Url::from_file_path(&path).map_err(|()| {
+            format!(
+                "The saved local playlist path cannot be represented as a file URL: {}",
+                path.display()
+            )
+        })?;
+        (webpage_url, path.to_string_lossy().into_owned())
+    } else if entry.media.id.source == SourceKind::YouTube {
+        validate_youtube_video_id(&entry.media.id.external_id)
+            .map_err(|_| "The saved YouTube playlist identifier is invalid".to_owned())?;
+        let expected = url::Url::parse(&youtube_video_url(&entry.media.id.external_id))
+            .map_err(|_| "The saved YouTube playlist URL is invalid".to_owned())?;
+        let saved = url::Url::parse(&entry.media.replay_locator)
+            .map_err(|_| "The saved YouTube playlist URL is invalid".to_owned())?;
+        let stable = stable_history_remote_url(&SourceKind::YouTube, &saved)
+            .ok_or_else(|| "The saved YouTube playlist URL is not canonical".to_owned())?;
+        if stable != expected {
+            return Err(
+                "The saved YouTube playlist URL does not match its video identifier".to_owned(),
+            );
+        }
+        (expected.clone(), expected.to_string())
+    } else {
+        let saved = url::Url::parse(&entry.media.replay_locator)
+            .map_err(|_| "The saved playlist replay URL is invalid".to_owned())?;
+        let stable =
+            stable_history_remote_url(&entry.media.id.source, &saved).ok_or_else(|| {
+                "The saved playlist has no credential-free stable replay URL".to_owned()
+            })?;
+        (stable.clone(), stable.to_string())
+    };
+
+    Ok(QueueItem {
+        media: MediaItem {
+            id: entry.media.id.clone(),
+            kind: entry.media.kind,
+            title: entry.media.title.clone(),
+            creator: entry.media.creator.clone(),
+            description: None,
+            webpage_url,
+            thumbnail_url: entry.media.thumbnail_url.clone(),
+            duration_seconds: entry.media.duration_seconds,
+            published_at: None,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::Unknown,
+            chapters: Vec::new(),
+            captions: Vec::new(),
+        },
+        playback_location,
+        start_at_seconds: entry.segment.as_ref().map(|segment| segment.start_seconds),
+        added_at: unix_time(),
+    })
+}
+
 /// Reconstructs minimal queue metadata while leaving resume to saved progress.
 fn queue_item_from_history(
     entry: &HistoryEntry,
     target: &HistoryReplayTarget,
 ) -> Result<QueueItem, String> {
+    #[cfg(feature = "radio")]
+    if entry.media_id.source == SourceKind::Radio {
+        let station = station_by_id(&entry.media_id.external_id)
+            .ok_or_else(|| "The saved radio station is not present in this build".to_owned())?;
+        let expected = station
+            .homepage_url()
+            .map_err(|error| format!("The built-in station homepage is invalid: {error}"))?;
+        let HistoryReplayTarget::Remote(saved) = target else {
+            return Err("The saved radio station page is not remote".to_owned());
+        };
+        if saved != &expected {
+            return Err("The saved radio station page does not match its station ID".to_owned());
+        }
+        return queue_item_from_radio_station(&station);
+    }
+
     let (webpage_url, playback_location, path_hint) = match target {
         HistoryReplayTarget::Local(path) => {
             let webpage_url = url::Url::from_file_path(path).map_err(|()| {
@@ -17264,6 +20264,1555 @@ mod tests {
         }
     }
 
+    /// Selects one deterministic playable YouTube row without starting a
+    /// provider worker or relying on live network metadata.
+    fn select_fixture_youtube_video(controller: &mut AppController, screen: Screen) -> MediaId {
+        let video = subscription_video_summary();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        controller.view.screen = screen;
+        controller.view.selected = 0;
+        controller.local_results.clear();
+        controller.direct_item = None;
+        controller.resolved_direct = None;
+        if screen == Screen::YouTubeMusic {
+            controller.youtube_music_results = vec![SearchItem::Video(video.clone())];
+            controller.refresh_youtube_music_rows();
+        } else {
+            controller.youtube_results = vec![SearchItem::Video(video.clone())];
+            controller.refresh_youtube_rows();
+        }
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+        controller.refresh_selected_playlist_state();
+        media_id
+    }
+
+    fn assert_private_note_target(
+        controller: &AppController,
+        expected: CommentTarget,
+        expected_label: &str,
+    ) {
+        let selected = controller
+            .selected_private_note_target()
+            .expect("note-capable selection");
+        assert_eq!(selected.target, expected);
+        assert_eq!(selected.label, expected_label);
+    }
+
+    #[test]
+    fn private_note_target_resolver_distinguishes_media_channels_and_shows() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let video_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media { media_id: video_id },
+            "Fixture video",
+        );
+        #[cfg(feature = "youtube-music")]
+        {
+            let music_id = select_fixture_youtube_video(&mut controller, Screen::YouTubeMusic);
+            assert_private_note_target(
+                &controller,
+                CommentTarget::Media { media_id: music_id },
+                "Fixture video",
+            );
+        }
+
+        let channel = ChannelSummary {
+            channel_id: "UCnaturalfixture".to_owned(),
+            name: "Fixture nature channel".to_owned(),
+            description: String::new(),
+            subscriber_count: None,
+            video_count: None,
+            created_at: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: None,
+        };
+        controller.youtube_results = vec![SearchItem::Channel(channel.clone())];
+        controller.view.screen = Screen::Search;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.details =
+            Some(detail_from_channel(&channel, &controller.subscription_tree));
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Source {
+                source_id: MediaId::new(SourceKind::YouTube, "UCnaturalfixture"),
+            },
+            "Fixture nature channel",
+        );
+
+        #[cfg(feature = "apple-podcasts")]
+        {
+            controller.apple_podcasts_results = vec![PodcastShowSummary {
+                id: MediaId::new(SourceKind::ApplePodcasts, "12345"),
+                title: "Fixture science podcast".to_owned(),
+                author: None,
+                feed_url: None,
+                webpage_url: None,
+                artwork_url: None,
+                episode_count: None,
+                genres: Vec::new(),
+                explicit: None,
+            }];
+            controller.apple_podcasts_route = ApplePodcastsRoute::Shows;
+            controller.view.screen = Screen::ApplePodcasts;
+            controller.view.selected = 0;
+            assert_private_note_target(
+                &controller,
+                CommentTarget::Source {
+                    source_id: MediaId::new(SourceKind::ApplePodcasts, "12345"),
+                },
+                "Fixture science podcast",
+            );
+
+            controller.apple_podcasts_route = ApplePodcastsRoute::Episodes;
+            controller.apple_podcast_episodes = vec![ApplePodcastEpisodeMetadata {
+                episode_id: 67890,
+                collection_id: 12345,
+                title: "Fixture science episode".to_owned(),
+                podcast_title: "Fixture science podcast".to_owned(),
+                author: None,
+                description: None,
+                published_at: None,
+                duration_seconds: Some(60),
+                media_url: None,
+                webpage_url: None,
+                artwork_url: None,
+                explicit: None,
+            }];
+            assert_private_note_target(
+                &controller,
+                CommentTarget::Media {
+                    media_id: MediaId::new(SourceKind::ApplePodcasts, "67890"),
+                },
+                "Fixture science episode",
+            );
+        }
+
+        let feed_url = url::Url::parse("https://podcasts.example.org/nature.xml").expect("RSS URL");
+        controller.subscription_entries = vec![FlattenedSubscription {
+            depth: 0,
+            subscription: crate::subscriptions::Subscription::new(
+                "Fixture nature feed",
+                feed_url.clone(),
+            ),
+        }];
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.layout = SubscriptionsLayout::DrillDown;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.selected_source = 0;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Source {
+                source_id: MediaId::new(SourceKind::Rss, feed_url.to_string()),
+            },
+            "Fixture nature feed",
+        );
+
+        let direct_id = MediaId::new(SourceKind::SoundCloud, "fixture-track");
+        controller.view.screen = Screen::Search;
+        controller.youtube_results.clear();
+        controller.direct_item = Some(DirectSourceInput {
+            url: url::Url::parse("https://soundcloud.com/example/fixture").expect("SoundCloud URL"),
+            source: SourceKind::SoundCloud,
+        });
+        controller.resolved_direct = Some(ResolvedDirectMedia {
+            source: SourceKind::SoundCloud,
+            external_id: "fixture-track".to_owned(),
+            title: "Fixture direct track".to_owned(),
+            row_subtitle: String::new(),
+            description: String::new(),
+            license: String::new(),
+            published: None,
+            artwork_url: None,
+            duration_seconds: None,
+            playback_url: None,
+            webpage_url: None,
+            status_line: String::new(),
+        });
+        controller.view.details = Some(DetailView {
+            media_id: Some(direct_id.clone()),
+            title: "Fixture direct track".to_owned(),
+            ..DetailView::default()
+        });
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media {
+                media_id: direct_id,
+            },
+            "Fixture direct track",
+        );
+    }
+
+    #[test]
+    fn private_note_target_resolver_covers_bandcamp_tracker_local_history_and_playlists() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+
+        #[cfg(feature = "bandcamp")]
+        {
+            let track_id = MediaId::new(SourceKind::Bandcamp, "track:fixture");
+            controller.bandcamp_results = vec![BandcampSearchSummary {
+                id: track_id.clone(),
+                kind: BandcampReleaseKind::Track,
+                title: "Fixture Bandcamp track".to_owned(),
+                artist: None,
+                webpage_url: url::Url::parse("https://example.bandcamp.com/track/fixture")
+                    .expect("Bandcamp URL"),
+                artwork_url: None,
+            }];
+            controller.view.screen = Screen::Bandcamp;
+            controller.view.selected = 0;
+            assert_private_note_target(
+                &controller,
+                CommentTarget::Media { media_id: track_id },
+                "Fixture Bandcamp track",
+            );
+        }
+
+        controller.tracker_results = vec![TrackerItem {
+            source: "The Mod Archive".to_owned(),
+            title: "Fixture module".to_owned(),
+            subtitle: String::new(),
+            webpage_url: url::Url::parse("https://modarchive.org/module.php?id=42")
+                .expect("tracker URL"),
+            download_url: None,
+            expected_format: None,
+            access: TrackerAccess::MetadataOnly,
+            prepared_path: None,
+            insecure_transport: false,
+        }];
+        controller.view.screen = Screen::TrackerMusic;
+        controller.view.selected = 0;
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media {
+                media_id: MediaId::new(
+                    SourceKind::ModArchive,
+                    "https://modarchive.org/module.php?id=42",
+                ),
+            },
+            "Fixture module",
+        );
+
+        let local_id = MediaId::new(SourceKind::Local, "/tmp/fixture.opus");
+        controller.view.screen = Screen::Local;
+        controller.view.details = Some(DetailView {
+            media_id: Some(local_id.clone()),
+            title: "fixture.opus".to_owned(),
+            ..DetailView::default()
+        });
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media {
+                media_id: local_id.clone(),
+            },
+            "fixture.opus",
+        );
+
+        controller.view.screen = Screen::History;
+        controller.view.details = Some(DetailView {
+            media_id: Some(local_id.clone()),
+            title: "Historical fixture".to_owned(),
+            ..DetailView::default()
+        });
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media {
+                media_id: local_id.clone(),
+            },
+            "Historical fixture",
+        );
+
+        controller.view.screen = Screen::Playlists;
+        controller.playlists_route = PlaylistsRoute::Entries {
+            playlist_id: "fixture".to_owned(),
+        };
+        controller.active_playlist = Some(Playlist {
+            id: "fixture".to_owned(),
+            name: "Fixture list".to_owned(),
+            description: None,
+            entries: vec![PlaylistEntry {
+                media: PlaylistMediaSnapshot {
+                    id: local_id.clone(),
+                    kind: MediaKind::Audio,
+                    title: "Playlist fixture".to_owned(),
+                    creator: None,
+                    webpage_url: url::Url::parse("file:///tmp/fixture.opus")
+                        .expect("local file URL"),
+                    thumbnail_url: None,
+                    duration_seconds: None,
+                    replay_locator: "/tmp/fixture.opus".to_owned(),
+                },
+                segment: None,
+                added_at: 1,
+            }],
+        });
+        controller.view.selected = 0;
+        assert_private_note_target(
+            &controller,
+            CommentTarget::Media { media_id: local_id },
+            "Playlist fixture",
+        );
+    }
+
+    #[test]
+    fn private_note_create_edit_delete_and_restart_preserve_one_exact_note() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            let mut controller = AppController::new(config.clone(), store, None, None);
+            select_fixture_youtube_video(&mut controller, Screen::Search);
+            controller.dispatch(UiAction::EditPrivateNote);
+            for character in "First line\nSecond line".chars() {
+                if character == '\n' {
+                    controller.dispatch(UiAction::InsertPrivateNoteNewline);
+                } else {
+                    controller.dispatch(UiAction::AppendPrivateNoteCharacter(character));
+                }
+            }
+            controller.dispatch(UiAction::SavePrivateNote);
+            assert!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.has_private_note)
+            );
+            controller
+                .shutdown_for_exit()
+                .expect("first note session shutdown");
+            drop(controller);
+        }
+
+        let created_at = {
+            let store = StateStore::open(&config).expect("reopened state");
+            let mut controller = AppController::new(config.clone(), store, None, None);
+            select_fixture_youtube_video(&mut controller, Screen::Search);
+            controller.dispatch(UiAction::EditPrivateNote);
+            let popup = controller
+                .view
+                .private_note_popup
+                .as_ref()
+                .expect("reopened note popup");
+            assert_eq!(popup.body, "First line\nSecond line");
+            assert!(popup.existing);
+            let created_at = controller
+                .store
+                .private_note(&CommentTarget::Media {
+                    media_id: media_id.clone(),
+                })
+                .expect("read saved note")
+                .expect("saved note")
+                .created_at;
+            controller.dispatch(UiAction::AppendPrivateNoteCharacter('!'));
+            controller.dispatch(UiAction::SavePrivateNote);
+            controller
+                .shutdown_for_exit()
+                .expect("edited note session shutdown");
+            drop(controller);
+            created_at
+        };
+
+        {
+            let store = StateStore::open(&config).expect("second reopened state");
+            let target = CommentTarget::Media {
+                media_id: media_id.clone(),
+            };
+            let comments = store.private_comments(&target).expect("saved note");
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].body, "First line\nSecond line!");
+            assert_eq!(comments[0].created_at, created_at);
+            let mut controller = AppController::new(config.clone(), store, None, None);
+            select_fixture_youtube_video(&mut controller, Screen::Search);
+            controller.dispatch(UiAction::EditPrivateNote);
+            controller.dispatch(UiAction::RequestPrivateNoteDelete);
+            assert!(
+                controller
+                    .view
+                    .private_note_popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.confirming_delete)
+            );
+            controller.dispatch(UiAction::RequestPrivateNoteDelete);
+            assert!(controller.view.private_note_popup.is_none());
+            assert!(
+                controller
+                    .store
+                    .private_comments(&target)
+                    .expect("deleted note")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn private_note_editor_enforces_utf8_byte_limit_without_splitting() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::EditPrivateNote);
+        let popup = controller
+            .view
+            .private_note_popup
+            .as_mut()
+            .expect("note popup");
+        popup.body = "a".repeat(MAX_PRIVATE_NOTE_BYTES - 2);
+        popup.cursor_byte = popup.body.len();
+
+        controller.dispatch(UiAction::AppendPrivateNoteCharacter('é'));
+        assert_eq!(
+            controller
+                .view
+                .private_note_popup
+                .as_ref()
+                .expect("note popup")
+                .body
+                .len(),
+            MAX_PRIVATE_NOTE_BYTES
+        );
+        controller.dispatch(UiAction::AppendPrivateNoteCharacter('界'));
+        let popup = controller
+            .view
+            .private_note_popup
+            .as_ref()
+            .expect("note popup");
+        assert_eq!(popup.body.len(), MAX_PRIVATE_NOTE_BYTES);
+        assert!(popup.validation_error.is_some());
+        assert!(popup.body.is_char_boundary(popup.cursor_byte));
+    }
+
+    #[test]
+    fn todo_toggle_persists_membership_and_survives_async_detail_replacement() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let media_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+
+        assert!(
+            controller
+                .store
+                .todo_contains(&media_id)
+                .expect("todo state")
+        );
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo)
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected Details")
+                .playlist_names,
+            ["todo"]
+        );
+        let todo = controller
+            .store
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("todo lookup")
+            .expect("todo playlist");
+        assert_eq!(todo.entries.len(), 1);
+        assert_eq!(
+            todo.entries[0].media.replay_locator,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+
+        controller.details_generation = 17;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: 17,
+            result: Ok(subscription_video_details("Detailed fixture video")),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("replaced Details")
+                .playlist_names,
+            ["todo"]
+        );
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            !controller
+                .store
+                .todo_contains(&media_id)
+                .expect("todo state")
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected Details")
+                .playlist_names
+                .is_empty()
+        );
+        assert_eq!(
+            controller
+                .store
+                .playlist(TODO_PLAYLIST_ID)
+                .expect("todo lookup")
+                .expect("todo remains a stable playlist")
+                .entries
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn asynchronous_youtube_search_restores_playlist_actions_for_the_first_result() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let video = subscription_video_summary();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        let webpage_url =
+            url::Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").expect("video URL");
+        controller
+            .store
+            .add_to_todo(
+                &PlaylistMediaSnapshot {
+                    id: media_id,
+                    kind: MediaKind::Video,
+                    title: video.title.clone(),
+                    creator: Some(video.channel_name.clone()),
+                    webpage_url: webpage_url.clone(),
+                    thumbnail_url: None,
+                    duration_seconds: video.duration_seconds,
+                    replay_locator: webpage_url.to_string(),
+                },
+                unix_time(),
+            )
+            .expect("seed todo membership");
+        controller.view.screen = Screen::Search;
+        let request = SearchRequest::new("fixture", SearchTarget::Videos);
+
+        controller.handle_provider_response(ProviderResponse::Search {
+            generation: controller.search_generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(video)],
+                next_page: None,
+            }),
+        });
+
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo),
+            "the first async YouTube result must expose l/P actions immediately"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("YouTube Details")
+                .playlist_names,
+            ["todo"]
+        );
+    }
+
+    #[test]
+    fn starting_a_new_youtube_search_clears_stale_playlist_actions_before_response() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo)
+        );
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.youtube_provider_available = true;
+        controller.view.search_query = "replacement query".to_owned();
+
+        controller.submit_youtube_search(1);
+
+        assert!(controller.view.rows.is_empty());
+        assert!(controller.view.details.is_none());
+        assert!(
+            controller.view.playlist_item.is_none(),
+            "l/P must disappear while no replacement item is selected"
+        );
+        assert!(matches!(
+            captured_requests
+                .try_recv()
+                .expect("replacement search request"),
+            ProviderRequest::Search { .. }
+        ));
+    }
+
+    #[test]
+    fn opening_a_direct_source_replaces_playlist_identity_in_rows_and_details() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        let url =
+            url::Url::parse("https://media.example.test/episode.webm").expect("direct media URL");
+        let media_id = MediaId::new(SourceKind::GenericYtDlp, url.to_string());
+
+        controller.open_direct_source(DirectSourceInput {
+            url,
+            source: SourceKind::GenericYtDlp,
+        });
+
+        assert_eq!(
+            controller.view.rows[0].media_id.as_ref(),
+            Some(&media_id),
+            "the new row must not retain the previous YouTube identity"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref()),
+            Some(&media_id),
+            "Details actions must identify the same direct item as the row"
+        );
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.media_id == media_id && !item.in_todo)
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("direct Details")
+                .playlist_names
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selection_refresh_uses_current_membership_names_and_fixed_todo_identity() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("selected playlist snapshot");
+        controller
+            .store
+            .add_to_todo(&snapshot, 1)
+            .expect("add selected item to todo");
+        controller
+            .store
+            .update_playlist(TODO_PLAYLIST_ID, "Listen later", None, 2)
+            .expect("rename todo")
+            .expect("todo playlist");
+        for (name, timestamp) in [("Zulu", 3), ("Alpha", 4)] {
+            let PlaylistCreateOutcome::Created(playlist) = controller
+                .store
+                .create_playlist(name, None, timestamp)
+                .expect("create playlist")
+            else {
+                panic!("expected a new playlist");
+            };
+            controller
+                .store
+                .add_playlist_entry(&playlist.id, &snapshot, timestamp + 10)
+                .expect("add selected item");
+        }
+
+        controller.refresh_selected_playlist_state();
+
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo),
+            "the fixed Todo identity must survive a display-name change"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected Details")
+                .playlist_names,
+            ["Alpha", "Listen later", "Zulu"]
+        );
+    }
+
+    #[test]
+    fn todo_toggle_removes_the_active_item_from_the_todo_screen_without_stale_rows() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let media_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        controller.show_screen(Screen::Playlists);
+        assert_eq!(controller.view.rows[0].title, "todo");
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_eq!(controller.view.rows[0].title, "Fixture video");
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+
+        assert!(
+            !controller
+                .store
+                .todo_contains(&media_id)
+                .expect("todo state")
+        );
+        assert!(controller.view.rows.is_empty());
+        assert!(controller.view.details.is_none());
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(controller.view.rows[0].title, "todo");
+        assert_eq!(controller.view.rows[0].subtitle, "0 items");
+    }
+
+    #[test]
+    fn cached_subscription_navigation_refreshes_playlist_state_without_provider_results() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let first = subscription_video_summary();
+        let mut second = subscription_video_summary();
+        second.video_id = "9bZkp7q19f0".to_owned();
+        second.title = "Second fixture video".to_owned();
+        let snapshot = playlist_snapshot_from_queue_item(&queue_item_from_video(&first, None))
+            .expect("subscription snapshot");
+        store
+            .add_to_todo(&snapshot, unix_time())
+            .expect("seed todo membership");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, _captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.layout = SubscriptionsLayout::DrillDown;
+        controller.populate_subscriptions();
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(first), SearchItem::Video(second)],
+                next_page: None,
+            },
+        );
+
+        controller.activate_selection();
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo),
+            "opening cached videos must expose the first item's membership immediately"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("first subscription Details")
+                .playlist_names,
+            ["todo"]
+        );
+
+        controller.select_subscription_item(1);
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| !item.in_todo),
+            "moving to a nonmember must not retain the previous Todo state"
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("second subscription Details")
+                .playlist_names
+                .is_empty()
+        );
+
+        controller.go_back();
+        assert!(
+            controller.view.playlist_item.is_none(),
+            "returning to the channel source must clear media playlist actions"
+        );
+    }
+
+    #[test]
+    fn downloaded_item_todo_membership_survives_restart_and_replays_locally() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        config.ensure_directories().expect("private Youta folders");
+        let path = config.downloads_dir().join("fixture.opus");
+        std::fs::write(&path, b"fixture media").expect("download fixture");
+        let media_id = MediaId::new(SourceKind::Local, path.to_string_lossy());
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+
+        controller.show_screen(Screen::Downloaded);
+        assert_eq!(controller.view.rows.len(), 1);
+        assert!(controller.view.playlist_item.is_some());
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("download Details")
+                .playlist_names
+                .contains(&"todo".to_owned())
+        );
+        drop(controller);
+
+        let reopened = StateStore::open(&config).expect("reopened disk state");
+        assert!(reopened.todo_contains(&media_id).expect("persisted todo"));
+        let (factory, playback, _, _) = mock_playback_factory([], []);
+        let mut controller = AppController::new(config, reopened, None, Some(factory));
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.dispatch(UiAction::ActivateSelection);
+
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(playback.played[0].location, path.to_string_lossy());
+    }
+
+    #[test]
+    fn playlist_popup_creates_with_description_and_index_editor_updates_it() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let media_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+
+        controller.dispatch(UiAction::OpenPlaylistPopup);
+        controller.dispatch(UiAction::BeginNewPlaylist);
+        {
+            let popup = controller
+                .view
+                .playlist_popup
+                .as_mut()
+                .expect("new-playlist popup");
+            popup.editor_name = "Research".to_owned();
+            popup.editor_description = "Items to study later".to_owned();
+        }
+        controller.dispatch(UiAction::CreatePlaylistAndAdd);
+
+        let summaries = controller.store.playlists().expect("playlists");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "Research");
+        assert_eq!(
+            summaries[0].description.as_deref(),
+            Some("Items to study later")
+        );
+        assert_eq!(
+            controller
+                .store
+                .playlist_memberships(&media_id)
+                .expect("membership"),
+            [summaries[0].id.clone()]
+        );
+        let popup = controller
+            .view
+            .playlist_popup
+            .as_ref()
+            .expect("chooser restored");
+        assert_eq!(popup.mode, PlaylistPopupMode::Choose);
+        assert!(popup.playlists[0].contains_item);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected Details")
+                .playlist_names,
+            ["Research"]
+        );
+
+        controller.dispatch(UiAction::ToggleSelectedPlaylistMembership);
+        assert!(
+            controller
+                .store
+                .playlist_memberships(&media_id)
+                .expect("removed membership")
+                .is_empty()
+        );
+        assert!(
+            !controller
+                .view
+                .playlist_popup
+                .as_ref()
+                .expect("chooser stays open")
+                .playlists[0]
+                .contains_item
+        );
+        controller.dispatch(UiAction::ToggleSelectedPlaylistMembership);
+        assert_eq!(
+            controller
+                .store
+                .playlist_memberships(&media_id)
+                .expect("restored membership"),
+            [summaries[0].id.clone()]
+        );
+
+        controller.dispatch(UiAction::DismissPlaylistPopup);
+        controller.show_screen(Screen::Playlists);
+        assert_eq!(controller.view.rows[0].title, "Research");
+        controller.dispatch(UiAction::EditSelectedPlaylist);
+        {
+            let popup = controller
+                .view
+                .playlist_popup
+                .as_mut()
+                .expect("playlist editor");
+            popup.editor_name = "Deep research".to_owned();
+            popup.editor_description = "Long-form study queue".to_owned();
+        }
+        controller.dispatch(UiAction::UpdatePlaylist);
+
+        let updated = controller
+            .store
+            .playlist(&summaries[0].id)
+            .expect("playlist lookup")
+            .expect("updated playlist");
+        assert_eq!(updated.name, "Deep research");
+        assert_eq!(
+            updated.description.as_deref(),
+            Some("Long-form study queue")
+        );
+        assert_eq!(updated.entries[0].media.id, media_id);
+        assert_eq!(controller.view.rows[0].title, "Deep research");
+    }
+
+    #[test]
+    fn playlist_editor_enforces_its_name_limit_in_utf8_bytes() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.view.playlist_popup = Some(PlaylistPopupView::default());
+
+        for _ in 0..64 {
+            controller.dispatch(UiAction::AppendPlaylistEditorCharacter('🦀'));
+        }
+        controller.dispatch(UiAction::AppendPlaylistEditorCharacter('x'));
+
+        let popup = controller
+            .view
+            .playlist_popup
+            .as_ref()
+            .expect("playlist editor");
+        assert_eq!(popup.editor_name.len(), MAX_PLAYLIST_NAME_BYTES);
+        assert_eq!(popup.editor_name.chars().count(), 64);
+        assert!(!popup.editor_name.ends_with('x'));
+    }
+
+    #[test]
+    fn playlists_screen_opens_replays_and_returns_to_the_index() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("YouTube playlist snapshot");
+        controller
+            .store
+            .create_playlist_with_entry("Queue", Some("Replay fixtures"), &snapshot, unix_time())
+            .expect("create playlist");
+
+        controller.show_screen(Screen::Playlists);
+        assert_eq!(controller.view.rows[0].title, "Queue");
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("playlist Details")
+                .description,
+            "Replay fixtures\n1 item"
+        );
+
+        controller.dispatch(UiAction::ActivateSelection);
+        assert!(matches!(
+            controller.playlists_route,
+            PlaylistsRoute::Entries { .. }
+        ));
+        assert_eq!(controller.view.rows[0].title, "Fixture video");
+        assert_eq!(
+            controller.current_url().as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+
+        controller.dispatch(UiAction::ActivateSelection);
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(
+            playback.played[0].location,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+        drop(playback);
+
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(controller.playlists_route, PlaylistsRoute::Index);
+        assert_eq!(controller.view.rows[0].title, "Queue");
+    }
+
+    #[test]
+    fn playlist_index_and_exact_entry_route_survive_restart() {
+        let fixture = tempfile::tempdir().expect("temporary playlist state");
+        let config = Config::for_dir(fixture.path().join("youta"));
+        config.ensure_directories().expect("private Youta folders");
+        let snapshot = |video_id: &str, title: &str| {
+            let webpage_url = url::Url::parse(&youtube_video_url(video_id))
+                .expect("canonical YouTube fixture URL");
+            PlaylistMediaSnapshot {
+                id: MediaId::new(SourceKind::YouTube, video_id),
+                kind: MediaKind::Video,
+                title: title.to_owned(),
+                creator: Some("Fixture channel".to_owned()),
+                webpage_url: webpage_url.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(42),
+                replay_locator: webpage_url.to_string(),
+            }
+        };
+        let first = snapshot("dQw4w9WgXcQ", "First entry");
+        let second = snapshot("9bZkp7q19f0", "Second entry");
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .create_playlist_with_entry("Alpha", None, &first, 1)
+            .expect("first playlist");
+        let PlaylistCreateOutcome::Created(selected_playlist) = store
+            .create_playlist_with_entry("Zulu", Some("Restored route"), &first, 2)
+            .expect("selected playlist")
+        else {
+            panic!("Zulu must be newly created");
+        };
+        store
+            .add_playlist_entry(&selected_playlist.id, &second, 3)
+            .expect("second playlist entry");
+
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::Playlists);
+        controller.view.selected = 1;
+        controller.update_playlist_detail();
+        assert!(controller.save_session());
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen index state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        assert_eq!(controller.view.screen, Screen::Playlists);
+        assert_eq!(controller.playlists_route, PlaylistsRoute::Index);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.view.rows[1].title, "Zulu");
+
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.view.selected = 1;
+        controller.update_playlist_detail();
+        assert!(controller.save_session());
+        assert_eq!(
+            controller
+                .store
+                .session()
+                .expect("saved entry route")
+                .expect("saved session")
+                .screen,
+            StoredScreen::Playlist(selected_playlist.id.clone())
+        );
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen exact playlist route");
+        let controller = AppController::new(config, store, None, None);
+        assert_eq!(controller.view.screen, Screen::Playlists);
+        assert_eq!(
+            controller.playlists_route,
+            PlaylistsRoute::Entries {
+                playlist_id: selected_playlist.id
+            }
+        );
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.view.rows[1].title, "Second entry");
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn removed_local_playlist_entry_hides_actions_and_cannot_be_copied() {
+        let fixture = tempfile::tempdir().expect("temporary Local playlist");
+        let config = Config::for_dir(fixture.path().join("youta"));
+        config.ensure_directories().expect("private Youta folders");
+        let media_path = fixture.path().join("removed.flac");
+        std::fs::write(&media_path, b"fixture audio").expect("Local media fixture");
+        let snapshot = playlist_snapshot_from_queue_item(
+            &queue_item_from_local(&local_media_item(media_path.clone()))
+                .expect("Local queue item"),
+        )
+        .expect("stable Local snapshot");
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .create_playlist_with_entry("Queue", None, &snapshot, 1)
+            .expect("Local playlist");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+
+        controller.dispatch(UiAction::OpenPlaylistPopup);
+        assert!(controller.view.playlist_popup.is_some());
+        std::fs::remove_file(&media_path).expect("remove Local fixture");
+        controller.dispatch(UiAction::BeginNewPlaylist);
+        {
+            let popup = controller
+                .view
+                .playlist_popup
+                .as_mut()
+                .expect("new-playlist editor");
+            popup.editor_name = "Dead copy".to_owned();
+        }
+        controller.dispatch(UiAction::CreatePlaylistAndAdd);
+        assert!(
+            controller
+                .view
+                .playlist_popup
+                .as_ref()
+                .and_then(|popup| popup.validation_error.as_deref())
+                .is_some_and(|error| error.contains("removed or moved"))
+        );
+        assert_eq!(
+            controller.store.playlists().expect("playlists").len(),
+            1,
+            "a stale popup must not copy a removed Local identity"
+        );
+
+        controller.view.playlist_popup = None;
+        controller.playlist_popup_item = None;
+        controller.populate_playlists_screen();
+        controller.refresh_selected_playlist_state();
+        assert!(controller.view.rows[0].subtitle.contains("Removed"));
+        assert!(
+            controller.view.playlist_item.is_none(),
+            "l/P actions must disappear for a removed Local playlist entry"
+        );
+        assert!(
+            controller
+                .selected_playlist_snapshot()
+                .expect_err("removed Local snapshot must be rejected")
+                .contains("removed or moved")
+        );
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            !controller
+                .store
+                .todo_contains(&snapshot.id)
+                .expect("todo membership")
+        );
+        controller.dispatch(UiAction::OpenPlaylistPopup);
+        assert!(controller.view.playlist_popup.is_none());
+    }
+
+    #[test]
+    fn youtube_music_playlist_snapshot_keeps_only_the_canonical_video_page() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        select_fixture_youtube_video(&mut controller, Screen::YouTubeMusic);
+        controller.youtube_music_results[0] = match &controller.youtube_music_results[0] {
+            SearchItem::Video(video) => {
+                let mut video = video.clone();
+                video.webpage_url = Some(
+                    url::Url::parse("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=discarded")
+                        .expect("music page"),
+                );
+                video.stream_url = Some(
+                    url::Url::parse("https://signed.example.test/audio?token=secret")
+                        .expect("transient stream"),
+                );
+                SearchItem::Video(video)
+            }
+            SearchItem::Channel(_) => unreachable!("fixture is a video"),
+        };
+
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("YouTube Music snapshot");
+        assert_eq!(snapshot.id.source, SourceKind::YouTube);
+        assert_eq!(
+            snapshot.replay_locator,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+        assert!(!format!("{snapshot:?}").contains("secret"));
+        controller
+            .store
+            .add_to_todo(&snapshot, unix_time())
+            .expect("seed YouTube Music membership");
+        controller.refresh_selected_playlist_state();
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("YouTube Music Details")
+                .playlist_names,
+            ["todo"]
+        );
+    }
+
+    #[test]
+    fn playlist_replay_rejects_mismatched_youtube_identity_and_honors_segments() {
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        let mut snapshot = PlaylistMediaSnapshot {
+            id: media_id.clone(),
+            kind: MediaKind::Video,
+            title: "Segment fixture".to_owned(),
+            creator: Some("Fixture channel".to_owned()),
+            webpage_url: url::Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                .expect("fixture page"),
+            thumbnail_url: None,
+            duration_seconds: Some(120),
+            replay_locator: "https://www.youtube.com/watch?v=9bZkp7q19f0".to_owned(),
+        };
+        let entry = PlaylistEntry {
+            media: snapshot.clone(),
+            segment: None,
+            added_at: 1,
+        };
+        assert!(
+            queue_item_from_playlist_entry(&entry)
+                .expect_err("identity mismatch")
+                .contains("does not match")
+        );
+
+        snapshot.replay_locator = snapshot.webpage_url.to_string();
+        let entry = PlaylistEntry {
+            media: snapshot,
+            segment: Some(crate::domain::Segment {
+                id: 7,
+                media_id,
+                start_seconds: 30,
+                end_seconds: 60,
+                label: Some("Excerpt".to_owned()),
+                created_at: 1,
+            }),
+            added_at: 1,
+        };
+        let queued = queue_item_from_playlist_entry(&entry).expect("segment replay");
+        assert_eq!(queued.start_at_seconds, Some(30));
+        assert_eq!(
+            queued.playback_location,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+    }
+
+    #[cfg(feature = "bandcamp")]
+    #[test]
+    fn bandcamp_playlists_accept_tracks_but_reject_album_containers() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Bandcamp;
+        controller.bandcamp_results = vec![bandcamp_summary_fixture(
+            "fixture-artist",
+            "fixture-track",
+            "Fixture track",
+            BandcampReleaseKind::Track,
+        )];
+        controller.refresh_bandcamp_rows();
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("Bandcamp track snapshot");
+        assert_eq!(snapshot.id.source, SourceKind::Bandcamp);
+        assert_eq!(snapshot.replay_locator, snapshot.webpage_url.as_str());
+        controller
+            .store
+            .add_to_todo(&snapshot, unix_time())
+            .expect("seed Bandcamp membership");
+        controller.update_bandcamp_detail();
+        controller.refresh_selected_playlist_state();
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("Bandcamp Details")
+                .playlist_names,
+            ["todo"]
+        );
+
+        controller.bandcamp_results = vec![bandcamp_summary_fixture(
+            "fixture-artist",
+            "fixture-album",
+            "Fixture album",
+            BandcampReleaseKind::Album,
+        )];
+        controller.refresh_bandcamp_rows();
+        controller.update_bandcamp_detail();
+        controller.refresh_selected_playlist_state();
+        assert!(
+            controller
+                .selected_playlist_snapshot()
+                .expect_err("album container must be rejected")
+                .contains("albums are containers")
+        );
+        assert!(
+            controller.view.playlist_item.is_none(),
+            "album containers must not expose playlist actions"
+        );
+    }
+
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_episode_playlist_snapshots_strip_enclosures_and_tracking_noise() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let show = apple_podcast_show_fixture(2_002, "Fixture show");
+        let episode = apple_podcast_episode_fixture(
+            2_002,
+            4_004,
+            "Fixture episode",
+            Some("https://media.example.test/apple/episode.m4a?token=secret"),
+        );
+        controller.view.screen = Screen::ApplePodcasts;
+        controller.apple_podcasts_route = ApplePodcastsRoute::Episodes;
+        controller.active_apple_podcast_show = Some(show);
+        controller.apple_podcast_episodes = vec![episode];
+        controller.view.selected = 0;
+
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("Apple episode snapshot");
+        assert_eq!(snapshot.id.external_id, "4004");
+        assert_eq!(
+            snapshot.replay_locator,
+            "https://podcasts.apple.com/us/podcast/fixture-show/id2002?i=4004"
+        );
+        assert!(!format!("{snapshot:?}").contains("secret"));
+        controller
+            .store
+            .add_to_todo(&snapshot, unix_time())
+            .expect("seed Apple episode membership");
+        controller.update_apple_podcast_episode_detail();
+        controller.refresh_selected_playlist_state();
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("Apple episode Details")
+                .playlist_names,
+            ["todo"]
+        );
+
+        controller.apple_podcasts_route = ApplePodcastsRoute::Direct;
+        controller.resolved_direct = Some(ResolvedDirectMedia {
+            source: SourceKind::ApplePodcasts,
+            external_id: "4005".to_owned(),
+            title: "Direct fixture episode".to_owned(),
+            row_subtitle: "episode".to_owned(),
+            description: String::new(),
+            license: "publisher terms".to_owned(),
+            published: None,
+            artwork_url: None,
+            duration_seconds: Some(60),
+            playback_url: Some(
+                url::Url::parse("https://media.example.test/apple/direct.m4a?token=secret")
+                    .expect("direct enclosure"),
+            ),
+            webpage_url: Some(
+                url::Url::parse(
+                    "https://podcasts.apple.com/us/podcast/fixture-show/id2002?ref=noise&i=4005",
+                )
+                .expect("direct public page"),
+            ),
+            status_line: "ready".to_owned(),
+        });
+        let direct = controller
+            .selected_playlist_snapshot()
+            .expect("direct Apple episode snapshot");
+        assert_eq!(
+            direct.replay_locator,
+            "https://podcasts.apple.com/us/podcast/fixture-show/id2002?i=4005"
+        );
+        assert!(!format!("{direct:?}").contains("secret"));
+    }
+
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_playlist_replay_resolves_the_canonical_page_before_playback() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        let webpage_url =
+            url::Url::parse("https://podcasts.apple.com/us/podcast/fixture-show/id2002?i=4004")
+                .expect("canonical Apple page");
+        let snapshot = PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::ApplePodcasts, "4004"),
+            kind: MediaKind::PodcastEpisode,
+            title: "Persisted Apple episode".to_owned(),
+            creator: Some("Fixture Public Radio".to_owned()),
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: None,
+            duration_seconds: Some(123),
+            replay_locator: webpage_url.to_string(),
+        };
+        controller
+            .store
+            .create_playlist_with_entry("Podcasts", None, &snapshot, unix_time())
+            .expect("create podcast playlist");
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.dispatch(UiAction::ActivateSelection);
+
+        let generation = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Apple playlist resolver request")
+        {
+            ProviderRequest::ResolveApple { generation, url } => {
+                assert_eq!(url, webpage_url);
+                generation
+            }
+            _ => panic!("expected Apple playlist resolution"),
+        };
+        controller.handle_provider_response(ProviderResponse::Apple {
+            generation,
+            result: Ok(ResolvedDirectMedia {
+                source: SourceKind::ApplePodcasts,
+                external_id: "4004".to_owned(),
+                title: "Resolved Apple episode".to_owned(),
+                row_subtitle: "episode".to_owned(),
+                description: "Resolved fixture".to_owned(),
+                license: "publisher terms".to_owned(),
+                published: None,
+                artwork_url: None,
+                duration_seconds: Some(123),
+                playback_url: Some(
+                    url::Url::parse(
+                        "https://media.example.test/apple/episode.m4a?token=short-lived",
+                    )
+                    .expect("resolved enclosure"),
+                ),
+                webpage_url: Some(webpage_url.clone()),
+                status_line: "ready".to_owned(),
+            }),
+        });
+
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(
+            playback.played[0].location,
+            "https://media.example.test/apple/episode.m4a?token=short-lived"
+        );
+        drop(playback);
+        assert_eq!(
+            controller
+                .pending_history
+                .as_ref()
+                .and_then(|history| history.replay_locator.as_deref()),
+            Some(webpage_url.as_str())
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn local_playlist_snapshot_uses_an_existing_absolute_file() {
+        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let path = temporary.path().join("fixture.opus");
+        std::fs::write(&path, b"not decoded during playlist capture").expect("fixture file");
+        let mut controller = controller_with_mock_statuses([]).0;
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+            path: temporary.path().to_owned(),
+            parent: None,
+            entries: vec![crate::local_browser::LocalEntry {
+                name: "fixture.opus".into(),
+                path: path.clone(),
+                kind: crate::local_browser::LocalEntryKind::Audio,
+                size_bytes: Some(36),
+                image_dimensions: None,
+                directory_identity: None,
+            }],
+            truncated: false,
+            inspected_entries: 1,
+        });
+        controller.view.selected = 0;
+
+        let snapshot = controller
+            .selected_playlist_snapshot()
+            .expect("local playlist snapshot");
+        assert_eq!(snapshot.id.source, SourceKind::Local);
+        assert_eq!(snapshot.replay_locator, path.to_string_lossy());
+        std::fs::remove_file(&path).expect("remove fixture");
+        assert!(
+            controller
+                .selected_playlist_snapshot()
+                .expect_err("removed file must not be captured")
+                .contains("Only available local")
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn asynchronous_local_listing_restores_playlist_actions_without_selection_movement() {
+        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let path = temporary.path().join("fixture.opus");
+        std::fs::write(&path, b"fixture media").expect("fixture file");
+        let webpage_url = url::Url::from_file_path(&path).expect("absolute local file URL");
+        let snapshot = PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::Local, path.to_string_lossy()),
+            kind: MediaKind::Audio,
+            title: "fixture.opus".to_owned(),
+            creator: None,
+            webpage_url,
+            thumbnail_url: None,
+            duration_seconds: None,
+            replay_locator: path.to_string_lossy().into_owned(),
+        };
+        let mut controller = controller_with_mock_statuses([]).0;
+        controller
+            .store
+            .add_to_todo(&snapshot, unix_time())
+            .expect("seed todo membership");
+        controller.view.screen = Screen::Local;
+
+        controller.handle_local_directory_response(
+            controller.local_generation,
+            Ok(crate::local_browser::LocalDirectoryListing {
+                path: temporary.path().to_owned(),
+                parent: None,
+                entries: vec![crate::local_browser::LocalEntry {
+                    name: "fixture.opus".into(),
+                    path,
+                    kind: crate::local_browser::LocalEntryKind::Audio,
+                    size_bytes: Some(13),
+                    image_dimensions: None,
+                    directory_identity: None,
+                }],
+                truncated: false,
+                inspected_entries: 1,
+            }),
+        );
+
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo),
+            "the first async Local result must expose l/P actions immediately"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("local Details")
+                .playlist_names,
+            ["todo"]
+        );
+    }
+
     fn linked_video_details(video_id: &str, title: &str, description: &str) -> VideoDetails {
         VideoDetails {
             video_id: video_id.to_owned(),
@@ -17574,6 +22123,232 @@ mod tests {
         controller.refresh_youtube_rows();
 
         assert_eq!(controller.view.rows[0].watched_percent, 95);
+    }
+
+    #[test]
+    fn periodic_checkpoint_stays_runtime_only_until_clean_persistence_boundary() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "periodic-runtime-only");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.current_media = Some(media_id.clone());
+        controller.current_playback_progress = Some(PlaybackProgress::new(
+            media_id.clone(),
+            Some(120),
+            unix_time(),
+        ));
+        controller.view.playback.position = Duration::from_secs(45);
+        controller.view.playback.duration = Some(Duration::from_secs(120));
+        controller.unflushed_listen_time = Duration::from_secs(30);
+        let progress_path = config.state_dir().join("progress.toml");
+        let statistics_path = config.state_dir().join("statistics.toml");
+        let checkpoint_path = config.runtime_dir().join("playback-checkpoint.toml");
+
+        assert!(controller.checkpoint_position());
+        assert_eq!(controller.unflushed_listen_time, Duration::ZERO);
+        assert!(
+            !std::fs::read_to_string(&progress_path)
+                .expect("canonical progress")
+                .contains("periodic-runtime-only")
+        );
+        assert!(
+            !std::fs::read_to_string(&statistics_path)
+                .expect("canonical statistics")
+                .contains("youtube")
+        );
+        let pending = std::fs::read_to_string(&checkpoint_path).expect("runtime checkpoint");
+        assert!(pending.contains("periodic-runtime-only"));
+        assert!(pending.contains("total_seconds = 30"));
+
+        controller.persist_position();
+
+        assert!(
+            std::fs::read_to_string(progress_path)
+                .expect("published progress")
+                .contains("periodic-runtime-only")
+        );
+        assert!(
+            std::fs::read_to_string(statistics_path)
+                .expect("published statistics")
+                .contains("total_seconds = 30")
+        );
+        let cleared = std::fs::read_to_string(checkpoint_path).expect("cleared checkpoint");
+        assert!(!cleared.contains("periodic-runtime-only"));
+        assert!(!cleared.contains("listen_total"));
+    }
+
+    #[test]
+    fn failed_periodic_checkpoint_keeps_unacknowledged_listening_time() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "failed-periodic-checkpoint");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        controller.current_media = Some(media_id.clone());
+        controller.current_playback_progress =
+            Some(PlaybackProgress::new(media_id, Some(120), unix_time()));
+        controller.view.playback.position = Duration::from_secs(30);
+        controller.view.playback.duration = Some(Duration::from_secs(120));
+        controller.unflushed_listen_time = Duration::from_secs(30);
+        let checkpoint_path = config.runtime_dir().join("playback-checkpoint.toml");
+        let external = "format_version = 1\n# edited outside Youta\n";
+        std::fs::write(&checkpoint_path, external).expect("external checkpoint edit");
+
+        assert!(!controller.checkpoint_position());
+        assert_eq!(
+            controller.unflushed_listen_time,
+            Duration::from_secs(30),
+            "only a successfully acknowledged checkpoint may consume RAM time"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkpoint_path).expect("preserved external edit"),
+            external
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_is_idempotent_across_explicit_call_and_drop() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let session_path = config.runtime_dir().join("session.toml");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller
+            .shutdown_for_exit()
+            .expect("first graceful shutdown");
+        let externally_edited = format!(
+            "{}\n# edit made after the durability barrier\n",
+            std::fs::read_to_string(&session_path).expect("saved session")
+        );
+        std::fs::write(&session_path, &externally_edited).expect("external session edit");
+
+        controller
+            .shutdown_for_exit()
+            .expect("cached graceful shutdown result");
+        drop(controller);
+
+        assert_eq!(
+            std::fs::read_to_string(session_path).expect("preserved external session edit"),
+            externally_edited,
+            "neither a repeated call nor Drop may write state after explicit shutdown"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_publishes_pending_checkpoint_without_active_media() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "shutdown-pending-checkpoint");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        let mut progress = PlaybackProgress::new(media_id.clone(), Some(120), unix_time());
+        progress.record_position(45, unix_time());
+        controller
+            .store
+            .checkpoint_playback(&progress, &SourceKind::YouTube, 30)
+            .expect("pending checkpoint");
+        controller.current_media = None;
+
+        controller
+            .shutdown_for_exit()
+            .expect("graceful checkpoint publication");
+
+        assert_eq!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("canonical progress")
+                .map(|progress| progress.position_seconds),
+            Some(45)
+        );
+        assert_eq!(
+            controller
+                .store
+                .listened_seconds(&SourceKind::YouTube)
+                .expect("canonical listening total"),
+            30
+        );
+        assert!(
+            !std::fs::read_to_string(config.runtime_dir().join("playback-checkpoint.toml"))
+                .expect("cleared checkpoint")
+                .contains("shutdown-pending-checkpoint")
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_reports_checkpoint_publication_failure() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "shutdown-checkpoint-failure");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        controller.current_media = Some(media_id.clone());
+        controller.current_playback_progress =
+            Some(PlaybackProgress::new(media_id, Some(120), unix_time()));
+        controller.view.playback.position = Duration::from_secs(30);
+        controller.view.playback.duration = Some(Duration::from_mins(2));
+        let checkpoint_path = config.runtime_dir().join("playback-checkpoint.toml");
+        let external = "format_version = 1\n# edited outside Youta\n";
+        std::fs::write(&checkpoint_path, external).expect("external checkpoint edit");
+
+        assert_eq!(
+            controller.shutdown_for_exit(),
+            Err(ShutdownPersistenceError)
+        );
+        assert_eq!(
+            controller.shutdown_for_exit(),
+            Err(ShutdownPersistenceError),
+            "a repeated call must return the cached failure without retrying writes"
+        );
+        drop(controller);
+        assert_eq!(
+            std::fs::read_to_string(checkpoint_path).expect("preserved external checkpoint"),
+            external
+        );
+    }
+
+    #[test]
+    fn switching_media_flushes_the_previous_checkpoint_to_canonical_state() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let (factory, _state, _statuses, _events) = mock_playback_factory([], []);
+        let mut controller = AppController::new(config.clone(), store, None, Some(factory));
+        let previous_id = MediaId::new(SourceKind::RemoteFiles, "previous-item");
+        controller.current_media = Some(previous_id.clone());
+        controller.current_playback_progress = Some(PlaybackProgress::new(
+            previous_id.clone(),
+            Some(100),
+            unix_time(),
+        ));
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback.position = Duration::from_secs(40);
+        controller.view.playback.duration = Some(Duration::from_secs(100));
+        controller.unflushed_listen_time = Duration::from_secs(12);
+
+        controller.play_queue_item(fixture_direct_item("next-item"), false);
+
+        let progress = std::fs::read_to_string(config.state_dir().join("progress.toml"))
+            .expect("canonical progress after switch");
+        let statistics = std::fs::read_to_string(config.state_dir().join("statistics.toml"))
+            .expect("canonical statistics after switch");
+        let checkpoint =
+            std::fs::read_to_string(config.runtime_dir().join("playback-checkpoint.toml"))
+                .expect("cleared checkpoint after switch");
+        assert!(progress.contains("previous-item"));
+        assert!(statistics.contains("total_seconds = 12"));
+        assert!(!checkpoint.contains("previous-item"));
+        assert_eq!(
+            controller.current_media,
+            Some(MediaId::new(
+                SourceKind::RemoteFiles,
+                "https://media.example/next-item.opus"
+            ))
+        );
     }
 
     #[test]
@@ -20874,6 +25649,148 @@ mod tests {
 
     #[cfg(feature = "local")]
     #[test]
+    fn local_rename_remaps_playlist_progress_and_history_across_restart() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let config = Config::for_dir(fixture.path().join("youta"));
+        config.ensure_directories().expect("private Youta folders");
+        let media_directory = fixture.path().join("media");
+        std::fs::create_dir(&media_directory).expect("media directory");
+        let source = media_directory.join("before.flac");
+        let target = media_directory.join("after.flac");
+        std::fs::write(&source, b"fixture audio").expect("source fixture");
+        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
+        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let snapshot = playlist_snapshot_from_queue_item(
+            &queue_item_from_local(&local_media_item(source.clone())).expect("local queue item"),
+        )
+        .expect("stable Local snapshot");
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .add_to_todo(&snapshot, 1)
+            .expect("seed todo membership");
+        let PlaylistCreateOutcome::Created(playlist) = store
+            .create_playlist("Album notes", Some("Rename fixture"), 2)
+            .expect("create playlist")
+        else {
+            panic!("expected a new playlist");
+        };
+        store
+            .add_playlist_entry(&playlist.id, &snapshot, 3)
+            .expect("seed custom playlist");
+        let mut progress = PlaybackProgress::new(source_id.clone(), Some(120), 4);
+        progress.record_position(42, 5);
+        store.upsert_progress(&progress).expect("seed progress");
+        store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: source_id.clone(),
+                title: "Rename fixture".to_owned(),
+                replay_locator: Some(source.to_string_lossy().into_owned()),
+                started_at: 4,
+                last_played_at: 5,
+                position_seconds: 42,
+                duration_seconds: Some(120),
+                finished: false,
+            })
+            .expect("seed history");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(
+            crate::local_browser::list_local_directory(
+                &media_directory,
+                crate::local_browser::LocalBrowseLimits::default(),
+            )
+            .expect("Local listing"),
+        );
+        controller.refresh_local_browser_rows();
+        controller.select_local_path(Some(&source));
+        controller.view.local_file_popup = Some(LocalFilePopupView::Rename {
+            value: "after.flac".to_owned(),
+            cursor_byte: "after.flac".len(),
+            error: None,
+        });
+
+        controller.dispatch(UiAction::SubmitLocalRename);
+
+        assert!(!source.exists());
+        assert!(target.exists());
+        assert!(
+            controller
+                .store
+                .local_move_intents()
+                .expect("completed rename journal")
+                .is_empty()
+        );
+        assert!(
+            !controller
+                .store
+                .todo_contains(&source_id)
+                .expect("old todo identity")
+        );
+        assert!(
+            controller
+                .store
+                .todo_contains(&target_id)
+                .expect("new todo identity")
+        );
+        assert!(
+            controller
+                .store
+                .progress(&source_id)
+                .expect("old progress")
+                .is_none()
+        );
+        assert_eq!(
+            controller
+                .store
+                .progress(&target_id)
+                .expect("new progress")
+                .expect("remapped progress")
+                .position_seconds,
+            42
+        );
+        let history = controller
+            .store
+            .history(false, 10)
+            .expect("remapped history");
+        assert_eq!(history[0].media_id, target_id);
+        assert_eq!(
+            history[0].replay_locator.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+        drop(controller);
+
+        let reopened = StateStore::open(&config).expect("reopened disk state");
+        let custom = reopened
+            .playlist(&playlist.id)
+            .expect("custom playlist lookup")
+            .expect("custom playlist");
+        assert_eq!(custom.entries[0].media.id, target_id);
+        let (factory, playback, _, _) = mock_playback_factory([], []);
+        let mut controller = AppController::new(config, reopened, None, Some(factory));
+        controller.show_screen(Screen::Playlists);
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "todo")
+            .expect("todo row");
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_eq!(
+            playback
+                .lock()
+                .expect("mock playback")
+                .played
+                .first()
+                .expect("playlist replay")
+                .location,
+            target.to_string_lossy()
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
     fn local_move_extension_marks_real_rows_and_never_marks_parent_navigation() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let first = fixture.path().join("a.flac");
@@ -21458,6 +26375,71 @@ mod tests {
                 .as_ref()
                 .map(|popup| popup.title.as_str()),
             Some("Could not save moved Local identities")
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn failed_local_move_persistence_blocks_local_playlist_mutations() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let source = fixture.path().join("source.flac");
+        let target = fixture.path().join("target.flac");
+        std::fs::write(&target, b"moved audio").expect("moved Local fixture");
+        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
+        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let mapping = LocalMoveMapping {
+            source,
+            target: target.clone(),
+        };
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        controller
+            .store
+            .upsert_progress(&PlaybackProgress::new(source_id, Some(120), 7))
+            .expect("seed source progress");
+        controller
+            .store
+            .upsert_progress(&PlaybackProgress::new(target_id.clone(), Some(120), 8))
+            .expect("inject conflicting target progress");
+        controller.apply_completed_local_move_mappings(std::slice::from_ref(&mapping));
+        assert!(
+            !controller.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Automatic)
+        );
+        assert_eq!(controller.local_move_persistence_queue, [mapping]);
+        controller.local_move_journal_pending = true;
+        controller.dispatch(UiAction::DismissErrorPopup);
+
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(
+            crate::local_browser::list_local_directory(
+                fixture.path(),
+                crate::local_browser::LocalBrowseLimits::default(),
+            )
+            .expect("Local listing"),
+        );
+        controller.refresh_local_browser_rows();
+        controller.select_local_path(Some(&target));
+        controller.refresh_selected_playlist_state();
+        assert!(controller.view.playlist_item.is_some());
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("recover the pending Local move")
+        );
+        assert!(
+            !controller
+                .store
+                .todo_contains(&target_id)
+                .expect("todo membership"),
+            "a failed identity remap must not admit a new Local membership"
+        );
+        controller.dispatch(UiAction::OpenPlaylistPopup);
+        assert!(
+            controller.view.playlist_popup.is_none(),
+            "P must not open a mutation route until Local identity recovery succeeds"
         );
     }
 
@@ -23667,6 +28649,28 @@ mod tests {
         assert_eq!(restored.view.status_line, "Chapter timestamps shown");
     }
 
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_screen_and_selected_station_survive_restart() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::Radio);
+        let selected = RADIO_STATIONS.len().saturating_sub(2);
+        controller.view.selected = selected;
+        controller.radio_selected = selected;
+        assert!(controller.save_session());
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let restored = AppController::new(config, store, None, None);
+
+        assert_eq!(restored.view.screen, Screen::Radio);
+        assert_eq!(restored.view.selected, selected);
+        assert_eq!(restored.radio_selected, selected);
+    }
+
     #[test]
     fn timecode_seek_and_back_use_absolute_backend_commands_and_bounded_chapters() {
         let (mut controller, state) = controller_with_mock_statuses([]);
@@ -24173,10 +29177,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_youtube_provider_opens_setup_popup_with_exact_storage_path() {
+    fn missing_youtube_provider_opens_setup_popup_with_exact_storage_paths() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
-        let expected_path = config.config_file().display().to_string();
+        let expected_api_key_path = config.credentials_file().display().to_string();
+        let expected_invidious_path = config.config_file().display().to_string();
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
         controller.view.search_query = "ambient focus".to_owned();
@@ -24188,7 +29193,8 @@ mod tests {
             .youtube_setup_popup
             .as_ref()
             .expect("provider setup popup");
-        assert_eq!(popup.config_path, expected_path);
+        assert_eq!(popup.api_key_path, expected_api_key_path);
+        assert_eq!(popup.invidious_path, expected_invidious_path);
         assert_eq!(popup.selected_field, YouTubeSetupField::ApiKey);
         assert!(popup.api_key.is_empty());
         assert!(controller.view.error_popup.is_none());
@@ -24268,6 +29274,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
+        let credentials_file = config.credentials_file();
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
         controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
@@ -24290,7 +29297,9 @@ mod tests {
         );
         let saved = std::fs::read_to_string(&config_file).expect("saved config");
         assert!(saved.contains("youtube_backend = \"official\""));
-        assert!(saved.contains("AIzaSyFixture_key_123456789012345678"));
+        assert!(!saved.contains("AIzaSyFixture_key_123456789012345678"));
+        let credentials = std::fs::read_to_string(&credentials_file).expect("saved credentials");
+        assert!(credentials.contains("AIzaSyFixture_key_123456789012345678"));
 
         for _ in 0..100 {
             controller.tick();
@@ -24362,6 +29371,12 @@ mod tests {
         let mut item = queue_item_from_direct(&direct);
         item.media.title = name.to_owned();
         item
+    }
+
+    #[cfg(feature = "radio")]
+    fn fixture_radio_item(id: &str) -> QueueItem {
+        let station = station_by_id(id).expect("fixture radio station");
+        queue_item_from_radio_station(&station).expect("valid built-in radio station")
     }
 
     fn fixture_youtube_item(name: &str) -> QueueItem {
@@ -25282,6 +30297,170 @@ mod tests {
     }
 
     #[test]
+    fn local_history_playlist_actions_persist_membership_and_replay_after_restart() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let track = temporary.path().join("playlist history fixture.opus");
+        std::fs::write(&track, b"mock audio").expect("local media fixture");
+        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: media_id.clone(),
+                title: "Playlist History fixture".to_owned(),
+                replay_locator: Some(track.display().to_string()),
+                started_at: 1,
+                last_played_at: 2,
+                position_seconds: 0,
+                duration_seconds: Some(180),
+                finished: false,
+            })
+            .expect("history fixture");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::History);
+
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| !item.in_todo),
+            "a replayable History row must expose l/P playlist actions"
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("History Details")
+                .playlist_names
+                .is_empty()
+        );
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(controller.store.todo_contains(&media_id).expect("todo add"));
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("History Details after l add")
+                .playlist_names,
+            ["todo"]
+        );
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+        assert!(
+            !controller
+                .store
+                .todo_contains(&media_id)
+                .expect("todo remove")
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("History Details after l remove")
+                .playlist_names
+                .is_empty()
+        );
+
+        controller.dispatch(UiAction::OpenPlaylistPopup);
+        let chooser = controller
+            .view
+            .playlist_popup
+            .as_ref()
+            .expect("History playlist chooser");
+        assert_eq!(chooser.playlists.len(), 1);
+        assert_eq!(chooser.playlists[0].playlist_id, TODO_PLAYLIST_ID);
+        assert!(!chooser.playlists[0].contains_item);
+
+        controller.dispatch(UiAction::ToggleSelectedPlaylistMembership);
+        assert!(controller.store.todo_contains(&media_id).expect("P add"));
+        assert!(
+            controller
+                .view
+                .playlist_popup
+                .as_ref()
+                .expect("chooser remains open after add")
+                .playlists[0]
+                .contains_item
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("History Details after P add")
+                .playlist_names,
+            ["todo"]
+        );
+        controller.dispatch(UiAction::ToggleSelectedPlaylistMembership);
+        assert!(!controller.store.todo_contains(&media_id).expect("P remove"));
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("History Details after P remove")
+                .playlist_names
+                .is_empty()
+        );
+        controller.dispatch(UiAction::ToggleSelectedPlaylistMembership);
+        assert!(
+            controller
+                .store
+                .todo_contains(&media_id)
+                .expect("final P add")
+        );
+        drop(controller);
+
+        let reopened = StateStore::open(&config).expect("reopened disk state");
+        assert!(
+            reopened
+                .todo_contains(&media_id)
+                .expect("persisted History membership")
+        );
+        assert_eq!(
+            reopened
+                .history(false, 10)
+                .expect("persisted History")
+                .len(),
+            1
+        );
+        let (factory, playback, _, _) = mock_playback_factory([], []);
+        let mut controller = AppController::new(config, reopened, None, Some(factory));
+        controller.show_screen(Screen::History);
+        assert!(
+            controller
+                .view
+                .playlist_item
+                .as_ref()
+                .is_some_and(|item| item.in_todo)
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("reopened History Details")
+                .playlist_names,
+            ["todo"]
+        );
+
+        controller.show_screen(Screen::Playlists);
+        assert_eq!(controller.view.rows[0].title, "todo");
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_eq!(controller.view.rows[0].title, "Playlist History fixture");
+        controller.dispatch(UiAction::ActivateSelection);
+
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(playback.played[0].location, track.display().to_string());
+    }
+
+    #[test]
     fn history_enter_replays_pre_v8_remote_url_from_saved_progress() {
         let media_url =
             url::Url::parse("https://media.example.test/history.opus").expect("media URL");
@@ -25373,6 +30552,82 @@ mod tests {
                 .expect("kept history")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn removed_and_unreplayable_history_rows_expose_no_playlist_actions() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let removed = temporary.path().join("removed playlist fixture.opus");
+        let unsafe_remote = "https://media.example.test/private.opus?token=fixture";
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        for entry in [
+            HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(SourceKind::Local, removed.display().to_string()),
+                title: "Removed playlist fixture".to_owned(),
+                replay_locator: Some(removed.display().to_string()),
+                started_at: 1,
+                last_played_at: 20,
+                position_seconds: 0,
+                duration_seconds: None,
+                finished: false,
+            },
+            HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(SourceKind::RemoteFiles, unsafe_remote),
+                title: "Unreplayable playlist fixture".to_owned(),
+                replay_locator: None,
+                started_at: 2,
+                last_played_at: 10,
+                position_seconds: 0,
+                duration_seconds: None,
+                finished: false,
+            },
+        ] {
+            controller
+                .store
+                .insert_history(&entry)
+                .expect("history fixture");
+        }
+        controller.show_screen(Screen::History);
+
+        for (row, expected_title) in [
+            (0, "Removed playlist fixture"),
+            (1, "Unreplayable playlist fixture"),
+        ] {
+            controller.dispatch(UiAction::SelectRow(row));
+            assert_eq!(controller.view.rows[row].title, expected_title);
+            assert!(
+                controller.view.playlist_item.is_none(),
+                "{expected_title} must not expose l/P playlist controls"
+            );
+            assert!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .expect("History Details")
+                    .playlist_names
+                    .is_empty()
+            );
+            assert!(
+                controller.selected_playlist_snapshot().is_err(),
+                "{expected_title} must not produce a persistable playlist snapshot"
+            );
+            controller.dispatch(UiAction::OpenPlaylistPopup);
+            assert!(
+                controller.view.playlist_popup.is_none(),
+                "an unavailable History row must not open the chooser"
+            );
+        }
+        assert!(
+            controller
+                .store
+                .playlists()
+                .expect("playlist index")
+                .is_empty(),
+            "probing unavailable History rows must not create playlist state"
         );
     }
 
@@ -26679,6 +31934,694 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_catalog_rows_are_compact_marker_free_and_show_quality() {
+        let config = Config::for_dir("/tmp/youta-radio-catalog-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.show_screen(Screen::Radio);
+
+        assert_eq!(controller.view.rows.len(), RADIO_STATIONS.len());
+        assert!(controller.view.rows.iter().all(|row| row.compact));
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| row.hide_watched_marker)
+        );
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| !row.subtitle.trim().is_empty())
+        );
+        let sector_index = RADIO_STATIONS
+            .iter()
+            .position(|station| station.id == "sector-radio-progressive-flac")
+            .expect("Sector station");
+        assert_eq!(
+            controller.view.rows[sector_index].subtitle,
+            "FLAC · 44.1 kHz · stereo"
+        );
+        controller.view.selected = sector_index;
+        controller.update_radio_detail();
+        let details = controller.view.details.as_ref().expect("radio details");
+        assert!(
+            details
+                .description
+                .contains("Quality: FLAC · bitrate unknown · 44.1 kHz · stereo")
+        );
+        assert!(
+            details
+                .description
+                .contains("http://89.223.45.5:8000/progressive-flac")
+        );
+        assert!(details.length.is_empty());
+        assert!(details.likes.is_empty());
+        assert!(details.views.is_empty());
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_queue_uses_stable_identity_and_never_restores_a_position() {
+        let station = station_by_id("4duk-radio").expect("4duk station");
+        let mut item = queue_item_from_radio_station(&station).expect("radio queue item");
+        item.start_at_seconds = Some(900);
+        let (factory, state, _, _) = mock_playback_factory([], []);
+        let config = Config::for_dir("/tmp/youta-radio-live-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut stale_progress =
+            PlaybackProgress::new(item.media.id.clone(), Some(1_800), unix_time());
+        stale_progress.record_position(600, unix_time());
+        store
+            .upsert_progress(&stale_progress)
+            .expect("seed obsolete radio progress");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        controller.view.repeating = true;
+        controller.playback_queue.repeat_one = true;
+
+        controller.play_queue_item(item.clone(), false);
+
+        assert_eq!(item.media.id, MediaId::new(SourceKind::Radio, station.id));
+        assert_eq!(item.media.kind, MediaKind::LiveStream);
+        assert_eq!(item.media.duration_seconds, None);
+        assert_eq!(item.media.webpage_url.as_str(), station.homepage);
+        assert_eq!(item.playback_location, station.stream);
+        assert_eq!(
+            history_replay_locator(&item).as_deref(),
+            Some(station.homepage)
+        );
+        let state = state.lock().expect("mock playback state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(state.played[0].location.as_str(), station.stream);
+        assert_eq!(state.played[0].start_at, Duration::ZERO);
+        assert!(!controller.view.repeating);
+        assert!(!controller.playback_queue.repeat_one);
+        assert!(controller.current_playback_progress.is_none());
+        drop(state);
+
+        controller.unflushed_listen_time = Duration::from_secs(30);
+        assert!(controller.checkpoint_position());
+        assert_eq!(controller.unflushed_listen_time, Duration::ZERO);
+        let retained_progress = controller
+            .store
+            .progress(&item.media.id)
+            .expect("read Radio progress")
+            .expect("seeded progress remains available for compatibility");
+        assert_eq!(retained_progress.position_seconds, 600);
+        let radio_total = controller
+            .store
+            .listen_totals()
+            .expect("Radio listen totals")
+            .into_iter()
+            .find(|total| total.source == SourceKind::Radio)
+            .expect("Radio total");
+        assert_eq!(radio_total.total_seconds, 30);
+
+        controller.unflushed_listen_time = Duration::from_secs(20);
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.play_queue_item(fixture_direct_item("after-radio"), false);
+        let radio_total = controller
+            .store
+            .listen_totals()
+            .expect("Radio totals after source switch")
+            .into_iter()
+            .find(|total| total.source == SourceKind::Radio)
+            .expect("Radio total after switch");
+        assert_eq!(radio_total.total_seconds, 50);
+        assert_eq!(
+            controller
+                .store
+                .progress(&item.media.id)
+                .expect("Radio progress after switch")
+                .expect("seeded progress")
+                .position_seconds,
+            600,
+            "Radio playback must neither restore nor update obsolete progress"
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_todo_round_trip_stays_live_marker_free_and_replays_the_builtin_stream() {
+        let station = station_by_id("radio-swiss-classic").expect("Radio station");
+        let station_index = RADIO_STATIONS
+            .iter()
+            .position(|candidate| candidate.id == station.id)
+            .expect("station index");
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.show_screen(Screen::Radio);
+        controller.view.selected = station_index;
+        controller.update_radio_detail();
+        let media_id = MediaId::new(SourceKind::Radio, station.id);
+        let mut obsolete_progress = PlaybackProgress::new(media_id.clone(), Some(600), 1);
+        obsolete_progress.record_position(300, 2);
+        controller
+            .store
+            .upsert_progress(&obsolete_progress)
+            .expect("obsolete Radio progress fixture");
+
+        controller.dispatch(UiAction::ToggleTodoPlaylist);
+
+        let todo = controller
+            .store
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("Todo lookup")
+            .expect("Todo playlist");
+        assert_eq!(todo.entries.len(), 1);
+        assert_eq!(todo.entries[0].media.id, media_id);
+        assert_eq!(todo.entries[0].media.kind, MediaKind::LiveStream);
+        assert_eq!(todo.entries[0].media.duration_seconds, None);
+        assert_eq!(todo.entries[0].media.replay_locator, station.homepage);
+        assert_eq!(todo.entries[0].media.webpage_url.as_str(), station.homepage);
+        assert!(
+            !todo.entries[0]
+                .media
+                .replay_locator
+                .contains(station.stream)
+        );
+
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].source, "Radio");
+        assert_eq!(controller.view.rows[0].subtitle, "live");
+        assert_eq!(controller.view.rows[0].watched_percent, 0);
+        assert!(controller.view.rows[0].hide_watched_marker);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("playlist Radio details")
+                .length,
+            ""
+        );
+
+        controller.dispatch(UiAction::ActivateSelection);
+
+        let state = state.lock().expect("mock playback state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(state.played[0].location, station.stream);
+        assert_eq!(state.played[0].start_at, Duration::ZERO);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_history_is_live_marker_free_and_replays_the_builtin_stream() {
+        let station = station_by_id("radio-swiss-classic").expect("Radio station");
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller
+            .store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(SourceKind::Radio, station.id),
+                title: station.name.to_owned(),
+                replay_locator: Some(station.homepage.to_owned()),
+                started_at: 1,
+                last_played_at: 2,
+                position_seconds: 900,
+                duration_seconds: Some(1_800),
+                finished: true,
+            })
+            .expect("Radio History fixture");
+
+        controller.show_screen(Screen::History);
+
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].source, "Radio");
+        assert_eq!(controller.view.rows[0].subtitle, "live");
+        assert_eq!(controller.view.rows[0].watched_percent, 0);
+        assert!(controller.view.rows[0].hide_watched_marker);
+
+        controller.dispatch(UiAction::ActivateSelection);
+
+        let state = state.lock().expect("mock playback state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(state.played[0].location, station.stream);
+        assert_eq!(state.played[0].start_at, Duration::ZERO);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_station_note_survives_restart_and_keeps_one_source_target_across_routes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let station = station_by_id("radio-swiss-classic").expect("Radio station");
+        let station_index = RADIO_STATIONS
+            .iter()
+            .position(|candidate| candidate.id == station.id)
+            .expect("station index");
+        let source_id = MediaId::new(SourceKind::Radio, station.id);
+        let target = CommentTarget::Source {
+            source_id: source_id.clone(),
+        };
+
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            let mut controller = AppController::new(config.clone(), store, None, None);
+            controller.show_screen(Screen::Radio);
+            controller.view.selected = station_index;
+            controller.update_radio_detail();
+            assert_private_note_target(&controller, target.clone(), station.name);
+            controller
+                .store
+                .upsert_private_note(&target, "Classical station note", 10)
+                .expect("save Radio source note");
+            controller.dispatch(UiAction::ToggleTodoPlaylist);
+            controller
+                .store
+                .insert_history(&HistoryEntry {
+                    id: 0,
+                    media_id: source_id.clone(),
+                    title: station.name.to_owned(),
+                    replay_locator: Some(station.homepage.to_owned()),
+                    started_at: 10,
+                    last_played_at: 11,
+                    position_seconds: 0,
+                    duration_seconds: None,
+                    finished: false,
+                })
+                .expect("Radio History fixture");
+        }
+
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        controller.view.selected = station_index;
+        controller.update_radio_detail();
+        controller.refresh_selected_playlist_state();
+        assert_private_note_target(&controller, target.clone(), station.name);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.has_private_note)
+        );
+
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+        assert_private_note_target(&controller, target.clone(), station.name);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.has_private_note)
+        );
+
+        controller.show_screen(Screen::History);
+        assert_private_note_target(&controller, target, station.name);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.has_private_note)
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn periodic_radio_checkpoint_saves_stats_once_without_hot_looping() {
+        let active = PlaybackStatus {
+            idle: false,
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, statuses, _events) =
+            controller_with_mock_lifecycle([active.clone()], []);
+        controller.play_queue_item(fixture_radio_item("radio-swiss-classic"), false);
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.unflushed_listen_time = Duration::from_secs(30);
+        controller.last_position_save = Instant::now() - Duration::from_secs(31);
+
+        controller.update_player();
+        assert!(controller.unflushed_listen_time < Duration::from_secs(1));
+        let first_total = controller
+            .store
+            .listen_totals()
+            .expect("periodic Radio total")[0]
+            .total_seconds;
+        assert_eq!(first_total, 30);
+
+        statuses.lock().expect("mock statuses").push_back(active);
+        controller.update_player();
+        let second_total = controller
+            .store
+            .listen_totals()
+            .expect("unchanged Radio total")[0]
+            .total_seconds;
+        assert_eq!(second_total, first_total);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn graceful_shutdown_flushes_radio_stats_without_progress() {
+        let config = Config::for_dir("/tmp/youta-radio-shutdown-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let media_id = MediaId::new(SourceKind::Radio, "radio-swiss-classic");
+        controller.current_media = Some(media_id.clone());
+        controller.unflushed_listen_time = Duration::from_secs(45);
+
+        controller
+            .shutdown_for_exit()
+            .expect("Radio shutdown persistence");
+
+        assert_eq!(controller.unflushed_listen_time, Duration::ZERO);
+        assert!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("Radio progress after shutdown")
+                .is_none()
+        );
+        let total = controller
+            .store
+            .listen_totals()
+            .expect("Radio shutdown total")
+            .into_iter()
+            .find(|row| row.source == SourceKind::Radio)
+            .expect("Radio total after shutdown");
+        assert_eq!(total.total_seconds, 45);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn live_radio_rejects_seek_and_repeat_commands_without_a_popup() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_radio_item("4duk-radio"), false);
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::SeekRelative(5));
+        controller.dispatch(UiAction::SeekPercent(50.0));
+        controller.dispatch(UiAction::ChangeChapter(1));
+        controller.dispatch(UiAction::ToggleRepeat);
+
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "live radio must not issue finite-media player commands"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "Repeat is unavailable for live radio"
+        );
+        assert!(controller.view.error_popup.is_none());
+        assert!(!controller.view.repeating);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn playing_radio_metadata_precedes_selection_and_provider_precedes_icy() {
+        let config = Config::for_dir("/tmp/youta-radio-metadata-priority-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Radio;
+        controller.view.selected = RADIO_STATIONS
+            .iter()
+            .position(|station| station.id == "4duk-radio")
+            .expect("selected 4duk station");
+        controller.current_media = Some(MediaId::new(SourceKind::Radio, "france-musique"));
+
+        assert_eq!(
+            controller
+                .radio_now_playing_target()
+                .expect("playing metadata target")
+                .id,
+            "france-musique"
+        );
+
+        let now = Instant::now();
+        controller.radio_now_playing_cache.insert(
+            "france-musique".to_owned(),
+            CachedRadioNowPlaying {
+                value: RadioNowPlaying {
+                    kind: RadioNowPlayingKind::OnAir,
+                    title: Some("Current segment".to_owned()),
+                    artist: None,
+                    programme: Some("Current programme".to_owned()),
+                    station_start_time: None,
+                    duration: None,
+                    refresh_after: Duration::from_secs(60),
+                },
+                refresh_at: now + Duration::from_secs(60),
+            },
+        );
+        controller.refresh_playing_radio_metadata(Some("ICY Artist — ICY Track"));
+
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("On air: Current programme — Current segment")
+        );
+
+        let cached = controller
+            .radio_now_playing_cache
+            .get("france-musique")
+            .expect("provider cache");
+        assert_eq!(
+            playing_radio_metadata_display(
+                Some(cached),
+                Some("ICY Artist — ICY Track"),
+                now + Duration::from_secs(30),
+            )
+            .as_deref(),
+            Some("On air: Current programme — Current segment")
+        );
+        assert_eq!(
+            playing_radio_metadata_display(
+                Some(cached),
+                Some("ICY Artist — ICY Track"),
+                now + Duration::from_secs(61),
+            )
+            .as_deref(),
+            Some("Track: ICY Artist — ICY Track")
+        );
+        assert_eq!(
+            playing_radio_metadata_display(Some(cached), None, now + Duration::from_secs(61),),
+            None
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn icy_radio_metadata_updates_deduplicates_and_clears_without_losing_station_title() {
+        let active = |stream_title: Option<&str>| PlaybackStatus {
+            idle: false,
+            paused: false,
+            stream_title: stream_title.map(ToOwned::to_owned),
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, statuses, events) = controller_with_mock_lifecycle(
+            [active(Some("Artist — Track"))],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.play_queue_item(fixture_radio_item("radio-swiss-classic"), false);
+
+        controller.update_player();
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("Track: Artist — Track")
+        );
+        assert_eq!(
+            controller.view.playback.title.as_deref(),
+            Some("Radio Swiss Classic")
+        );
+
+        statuses
+            .lock()
+            .expect("mock statuses")
+            .push_back(active(Some("Artist — Track")));
+        controller.update_player();
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("Track: Artist — Track")
+        );
+
+        statuses
+            .lock()
+            .expect("mock statuses")
+            .push_back(active(None));
+        controller.update_player();
+        assert_eq!(controller.view.radio_now_playing, None);
+        assert_eq!(
+            controller.view.playback.title.as_deref(),
+            Some("Radio Swiss Classic")
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Stop,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+        assert_eq!(controller.view.radio_now_playing, None);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn passive_metadata_failure_retains_last_success_without_an_error_popup() {
+        let config = Config::for_dir("/tmp/youta-radio-passive-failure-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.current_media = Some(MediaId::new(SourceKind::Radio, "4duk-radio"));
+        controller.view.screen = Screen::Radio;
+        controller.view.selected = RADIO_STATIONS
+            .iter()
+            .position(|station| station.id == "4duk-radio")
+            .expect("4duk row");
+        controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+            generation: 1,
+            station_id: "4duk-radio".to_owned(),
+        });
+        controller.handle_radio_now_playing(
+            1,
+            "4duk-radio".to_owned(),
+            Ok(RadioNowPlaying {
+                kind: RadioNowPlayingKind::Track,
+                title: Some("Known title".to_owned()),
+                artist: Some("Known artist".to_owned()),
+                programme: None,
+                station_start_time: None,
+                duration: Some(Duration::from_secs(180)),
+                refresh_after: Duration::from_secs(60),
+            }),
+        );
+        controller
+            .radio_now_playing_cache
+            .get_mut("4duk-radio")
+            .expect("successful cache")
+            .refresh_at = Instant::now() - Duration::from_secs(1);
+        controller.view.playback.stream_title = Some("Fresh ICY title".to_owned());
+        controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+            generation: 2,
+            station_id: "4duk-radio".to_owned(),
+        });
+
+        controller.handle_radio_now_playing(
+            2,
+            "4duk-radio".to_owned(),
+            Err("fixture network failure".to_owned()),
+        );
+
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("Track: Fresh ICY title")
+        );
+        assert!(
+            controller
+                .radio_now_playing_cache
+                .contains_key("4duk-radio")
+        );
+        assert!(controller.view.error_popup.is_none());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected stale details")
+                .description
+                .contains("Last known track: Known artist — Known title")
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_metadata_failures_use_capped_backoff_and_success_resets_it() {
+        assert_eq!(
+            (0..=6)
+                .map(radio_now_playing_failure_delay)
+                .collect::<Vec<_>>(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(2 * 60),
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(10 * 60),
+            ]
+        );
+
+        let config = Config::for_dir("/tmp/youta-radio-backoff-reset-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.radio_now_playing_retry_at.insert(
+            "4duk-radio".to_owned(),
+            RadioNowPlayingRetry {
+                retry_at: Instant::now() + Duration::from_secs(10 * 60),
+                consecutive_failures: 4,
+            },
+        );
+        controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+            generation: 1,
+            station_id: "4duk-radio".to_owned(),
+        });
+
+        controller.handle_radio_now_playing(
+            1,
+            "4duk-radio".to_owned(),
+            Ok(RadioNowPlaying {
+                kind: RadioNowPlayingKind::Track,
+                title: Some("Recovered title".to_owned()),
+                artist: None,
+                programme: None,
+                station_start_time: None,
+                duration: None,
+                refresh_after: Duration::from_secs(60),
+            }),
+        );
+
+        assert!(
+            !controller
+                .radio_now_playing_retry_at
+                .contains_key("4duk-radio"),
+            "one success must reset that station's failure history"
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn show_now_playing_aligns_the_radio_tab_row_and_keeps_metadata() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_radio_item("4duk-radio"), false);
+        controller.view.radio_now_playing = Some("Track: Artist — Title".to_owned());
+        controller.view.screen = Screen::History;
+        controller.view.selected = 0;
+
+        controller.show_now_playing();
+
+        let expected = RADIO_STATIONS
+            .iter()
+            .position(|station| station.id == "4duk-radio")
+            .expect("4duk row");
+        assert_eq!(controller.view.screen, Screen::Radio);
+        assert_eq!(controller.view.selected, expected);
+        assert_eq!(controller.radio_selected, expected);
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("Track: Artist — Title")
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected radio details")
+                .description
+                .contains("Track: Artist — Title")
+        );
+    }
+
     #[test]
     fn playback_start_is_required_before_playing_status_and_history() {
         let active = PlaybackStatus {
@@ -27606,6 +33549,80 @@ mod tests {
 
     #[cfg(feature = "bandcamp")]
     #[test]
+    fn bandcamp_playlist_replay_keeps_playlist_ownership_through_resolution() {
+        let (mut controller, playback, _, _) = controller_with_mock_lifecycle([], []);
+        let summary = bandcamp_summary_fixture(
+            "fixture-artist",
+            "playlist-track",
+            "Playlist Fixture Track",
+            BandcampReleaseKind::Track,
+        );
+        let source =
+            BandcampMediaUrl::parse(summary.webpage_url.clone()).expect("canonical fixture");
+        let signed_url = "https://t4.bcbits.com/stream/playlist.flac?token=short-lived";
+        controller.bandcamp_resolver = Some(Box::new(MockBandcampResolveClient {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            result: Mutex::new(Some(Ok(BandcampResolution {
+                source: source.clone(),
+                purpose: BandcampResolvePurpose::Playback,
+                format: BandcampAudioFormat::BestAvailable,
+                tracks: vec![resolved_bandcamp_track_fixture(&source, signed_url)],
+                possibly_truncated: false,
+            }))),
+        }));
+        let snapshot = PlaylistMediaSnapshot {
+            id: summary.id.clone(),
+            kind: MediaKind::Audio,
+            title: summary.title.clone(),
+            creator: summary.artist.clone(),
+            webpage_url: summary.webpage_url.clone(),
+            thumbnail_url: summary.artwork_url.clone(),
+            duration_seconds: None,
+            replay_locator: summary.webpage_url.to_string(),
+        };
+        controller
+            .store
+            .create_playlist_with_entry("Bandcamp queue", None, &snapshot, unix_time())
+            .expect("create Bandcamp playlist");
+        controller.show_screen(Screen::Playlists);
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.dispatch(UiAction::ActivateSelection);
+        assert!(matches!(
+            controller
+                .pending_bandcamp_resolution
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(BandcampResolutionOwner::Playlist(_))
+        ));
+
+        let completion = controller
+            .bandcamp_resolve_responses
+            .as_ref()
+            .expect("Bandcamp response receiver")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock Bandcamp playlist resolution");
+        let (response_sender, response_receiver) = bounded(1);
+        response_sender
+            .send(completion)
+            .expect("restore resolver completion");
+        controller.bandcamp_resolve_responses = Some(response_receiver);
+        controller.drain_bandcamp_resolver_responses();
+
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(playback.played[0].location, signed_url);
+        drop(playback);
+        let queued = controller
+            .playback_queue
+            .current()
+            .expect("canonical Bandcamp queue item");
+        assert_eq!(queued.media.id, snapshot.id);
+        assert_eq!(queued.playback_location, summary.webpage_url.as_str());
+        assert!(!format!("{queued:?}").contains("short-lived"));
+    }
+
+    #[cfg(feature = "bandcamp")]
+    #[test]
     fn stale_bandcamp_resolution_cannot_play_a_new_selection() {
         let (mut controller, playback) = controller_with_mock_statuses([]);
         let first = bandcamp_summary_fixture(
@@ -27627,6 +33644,7 @@ mod tests {
         controller.pending_bandcamp_resolution = Some(PendingBandcampResolution {
             generation: 42,
             summary: first,
+            owner: BandcampResolutionOwner::SearchSelection,
         });
         let (sender, receiver) = bounded(1);
         sender

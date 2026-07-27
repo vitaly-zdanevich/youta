@@ -238,8 +238,7 @@ impl SourceKind {
                 ..SourceCapabilities::default()
             },
             Self::Radio => SourceCapabilities {
-                search: true,
-                subscriptions: true,
+                playlists: true,
                 stream: true,
                 ..SourceCapabilities::default()
             },
@@ -902,6 +901,15 @@ impl PlaybackQueue {
 /// Stable identifier for a local playlist.
 pub type PlaylistId = String;
 
+/// Stable identity of Youta's built-in Watch Later-style playlist.
+///
+/// The display name is intentionally stored separately and may be edited
+/// without changing the target used by the quick-add action.
+pub const TODO_PLAYLIST_ID: &str = "builtin:todo";
+
+/// Initial display name of Youta's built-in Watch Later-style playlist.
+pub const TODO_PLAYLIST_NAME: &str = "todo";
+
 /// A user-selected lossless cut within an item.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Segment {
@@ -954,15 +962,66 @@ impl Segment {
     }
 }
 
+/// Bounded, restart-safe metadata retained for one playlist item.
+///
+/// The replay locator is a canonical provider page or absolute local path,
+/// never a resolved CDN URL, signed stream, or provider credential. The
+/// persistence boundary validates those invariants before storing this value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlaylistMediaSnapshot {
+    /// Provider-qualified stable media identity.
+    pub id: MediaId,
+    /// Media type used for list rendering and later replay dispatch.
+    pub kind: MediaKind,
+    /// Title captured when the item was added.
+    pub title: String,
+    /// Channel, artist, author, or podcast captured when available.
+    pub creator: Option<String>,
+    /// Canonical public provider page or local `file:` URL.
+    pub webpage_url: Url,
+    /// Canonical public artwork or local `file:` URL, when available.
+    pub thumbnail_url: Option<Url>,
+    /// Duration known when the item was added.
+    pub duration_seconds: Option<u64>,
+    /// Credential-free canonical provider page or absolute local path used to
+    /// resolve the item again.
+    pub replay_locator: String,
+}
+
 /// A playlist entry, optionally restricted to a saved segment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlaylistEntry {
-    /// Source media.
-    pub media_id: MediaId,
+    /// Compact restart-safe media metadata.
+    pub media: PlaylistMediaSnapshot,
     /// Saved cut to play instead of the complete item.
     pub segment: Option<Segment>,
     /// Time the entry was added, as Unix seconds.
     pub added_at: i64,
+}
+
+/// Compact metadata for listing playlists without loading every entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlaylistSummary {
+    /// Stable local identifier.
+    pub id: PlaylistId,
+    /// User-visible name.
+    pub name: String,
+    /// Optional user description.
+    pub description: Option<String>,
+    /// Number of ordered entries currently in the playlist.
+    pub entry_count: usize,
+}
+
+/// Display metadata for one playlist containing a selected complete media item.
+///
+/// The stable identifier, rather than the user-editable name, distinguishes
+/// special playlists such as the built-in todo playlist.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlaylistMembership {
+    /// Stable local playlist identifier.
+    pub playlist_id: PlaylistId,
+    /// Current user-visible playlist name.
+    pub playlist_name: String,
 }
 
 /// A named local playlist.
@@ -1013,6 +1072,11 @@ pub enum CommentTarget {
         /// Commented media.
         media_id: MediaId,
     },
+    /// A channel, podcast show, artist, station, or other non-playable source.
+    Source {
+        /// Provider-qualified stable identity for the annotated source.
+        source_id: MediaId,
+    },
     /// A position within a media item.
     Position {
         /// Commented media.
@@ -1060,6 +1124,8 @@ pub enum Screen {
     Bandcamp,
     /// `Apple Podcasts` show search results and details.
     ApplePodcasts,
+    /// Curated public live-radio stations.
+    Radio,
     /// Local folders and supported media files.
     Local,
     /// Local subscription tree.
@@ -1122,6 +1188,9 @@ pub struct SessionState {
     /// Last selected row in the independent `Apple Podcasts` result list.
     #[serde(default)]
     pub apple_podcasts_selected_row: Option<usize>,
+    /// Last selected row in the independent Radio station list.
+    #[serde(default)]
+    pub radio_selected_row: Option<usize>,
     /// Vertical scroll offset in the details panel.
     pub details_scroll: u64,
     /// Last search text.
@@ -1415,6 +1484,42 @@ mod tests {
 
         assert!(encoded.contains("apple-podcasts"));
         assert_eq!(restored, Screen::ApplePodcasts);
+    }
+
+    #[test]
+    fn older_sessions_default_independent_radio_selection() {
+        let mut encoded =
+            serde_json::to_value(SessionState::default()).expect("encode session fixture");
+        encoded
+            .as_object_mut()
+            .expect("session must encode as an object")
+            .remove("radio_selected_row");
+
+        let restored: SessionState =
+            serde_json::from_value(encoded).expect("decode pre-Radio session");
+
+        assert_eq!(restored.radio_selected_row, None);
+    }
+
+    #[test]
+    fn radio_screen_has_a_stable_restart_name() {
+        let encoded = serde_json::to_string(&Screen::Radio).expect("encode Radio screen");
+        let restored: Screen = serde_json::from_str(&encoded).expect("decode screen");
+
+        assert!(encoded.contains("radio"));
+        assert_eq!(restored, Screen::Radio);
+    }
+
+    #[test]
+    fn radio_capabilities_match_the_static_live_catalog() {
+        assert_eq!(
+            SourceKind::Radio.capabilities(),
+            SourceCapabilities {
+                playlists: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            }
+        );
     }
 
     #[test]

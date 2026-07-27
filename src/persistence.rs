@@ -1,31 +1,40 @@
-//! SQLite-backed restart-safe state.
+//! Backend-neutral restart-safe state.
 //!
-//! [`StateStore`] keeps frequently updated state in one database under Youta's
-//! application directory. Connections use WAL journaling on disk so periodic
-//! progress updates do not block UI reads. SQL statements used by normal CRUD
-//! operations are prepared through rusqlite's bounded statement cache.
+//! [`StateStore`] selects deterministic TOML documents by default. Builds with
+//! `sqlite-state` may instead select `SQLite` through
+//! [`crate::config::PersistenceConfig`].
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::path::Path;
+#[cfg(feature = "sqlite-state")]
 use std::time::Duration;
 
+#[cfg(feature = "sqlite-state")]
 use rusqlite::types::Type;
+#[cfg(feature = "sqlite-state")]
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, PersistenceBackend};
 use crate::domain::{
     BandcampReleaseKind, BandcampSearchSummary, Bookmark, CommentTarget, HistoryEntry, MediaId,
-    MediaItem, PlaybackProgress, PodcastShowSummary, PrivateComment, SessionState, SourceKind,
-    WikidataLink, remote_url_has_non_public_host,
+    MediaItem, MediaKind, PlaybackProgress, Playlist, PlaylistEntry, PlaylistId,
+    PlaylistMediaSnapshot, PlaylistMembership, PlaylistSummary, PodcastShowSummary, PrivateComment,
+    SessionState, SourceKind, TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink,
+    remote_url_has_non_public_host,
 };
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+use crate::local_move::LocalIdentityRemapError;
 #[cfg(feature = "local")]
 use crate::local_move::{
-    LocalIdentityRemapError, LocalMoveMapping, remap_local_media_id, remap_local_path_prefix,
-    remap_local_replay_locator,
+    LocalMoveMapping, remap_local_media_id, remap_local_path_prefix, remap_local_replay_locator,
 };
-use crate::providers::{ChannelSummary, SearchItem, SearchRequest, SearchTarget, VideoOrientation};
+use crate::providers::{
+    ChannelSummary, SearchItem, SearchRequest, SearchTarget, VideoOrientation,
+    validate_youtube_video_id,
+};
 
 const MAX_SAVED_SEARCH_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SAVED_SEARCH_RESULTS_BYTES: usize = 4 * 1024 * 1024;
@@ -48,6 +57,21 @@ const MAX_SAVED_SUBSCRIPTION_ITEMS_BYTES: usize = 512 * 1024;
 const MAX_SAVED_SUBSCRIPTION_SOURCE_BYTES: usize = 128;
 const MAX_SAVED_SUBSCRIPTION_SOURCE_ID_BYTES: usize = 2 * 1024;
 const MAX_HISTORY_REPLAY_LOCATOR_BYTES: usize = 16 * 1024;
+const MAX_PLAYLIST_ID_BYTES: usize = 128;
+const MAX_PLAYLIST_EXTERNAL_ID_BYTES: usize = 16 * 1024;
+const MAX_PLAYLIST_SNAPSHOT_BYTES: usize = 64 * 1024;
+const MAX_PLAYLIST_SEGMENT_BYTES: usize = 16 * 1024;
+const MAX_PLAYLIST_TITLE_BYTES: usize = 4 * 1024;
+const MAX_PLAYLIST_CREATOR_BYTES: usize = 4 * 1024;
+const MAX_PLAYLIST_URL_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 byte length of a local playlist name.
+pub const MAX_PLAYLIST_NAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of a local playlist description.
+pub const MAX_PLAYLIST_DESCRIPTION_BYTES: usize = 16 * 1024;
+/// Maximum number of local playlists accepted by the bounded list API.
+pub const MAX_PLAYLISTS: usize = 1_024;
+/// Maximum number of entries accepted in one local playlist.
+pub const MAX_PLAYLIST_ENTRIES: usize = 10_000;
 #[cfg(feature = "local")]
 const MAX_LOCAL_MOVE_MAPPINGS: usize = 10_000;
 
@@ -66,6 +90,21 @@ pub const MAX_SAVED_SUBSCRIPTION_ITEMS: usize = 50;
 /// Maximum number of recently refreshed subscribed sources retained on disk.
 pub const MAX_SAVED_SUBSCRIPTION_SOURCES: usize = 32;
 
+/// Indexed hot-path query for the playlists containing one complete media item.
+///
+/// Keeping this projection separate from playlist summaries avoids counting
+/// every entry merely to render selection-dependent membership names.
+#[cfg(feature = "sqlite-state")]
+const PLAYLIST_MEMBERSHIPS_WITH_NAMES_SQL: &str = r"
+	SELECT p.id, p.name
+	FROM playlist_entries AS e INDEXED BY playlist_entries_media
+	INNER JOIN playlists AS p ON p.id = e.playlist_id
+	WHERE e.source = ?1 AND e.external_id = ?2 AND e.segment_json IS NULL
+	ORDER BY p.name_key, p.id
+	LIMIT ?3
+	";
+
+#[cfg(feature = "sqlite-state")]
 const MIGRATIONS: &[&str] = &[
     r"
 	CREATE TABLE schema_migrations (
@@ -249,17 +288,62 @@ const MIGRATIONS: &[&str] = &[
 		created_at INTEGER NOT NULL
 	) WITHOUT ROWID;
 	",
+    r"
+	CREATE TABLE playlists (
+		id TEXT PRIMARY KEY CHECK (
+			length(CAST(id AS BLOB)) BETWEEN 1 AND 128
+		),
+		name TEXT NOT NULL CHECK (
+			length(CAST(name AS BLOB)) BETWEEN 1 AND 256
+		),
+		name_key TEXT NOT NULL UNIQUE CHECK (
+			length(CAST(name_key AS BLOB)) BETWEEN 1 AND 256
+		),
+		description TEXT CHECK (
+			description IS NULL
+			OR length(CAST(description AS BLOB)) <= 16384
+		),
+		created_at INTEGER NOT NULL CHECK (created_at >= 0),
+		updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+	) WITHOUT ROWID;
+
+	CREATE TABLE playlist_entries (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+		position INTEGER NOT NULL CHECK (position >= 0),
+		source TEXT NOT NULL CHECK (
+			length(CAST(source AS BLOB)) BETWEEN 1 AND 128
+		),
+		external_id TEXT NOT NULL CHECK (
+			length(CAST(external_id AS BLOB)) BETWEEN 1 AND 16384
+		),
+		snapshot_json TEXT NOT NULL CHECK (
+			length(CAST(snapshot_json AS BLOB)) BETWEEN 2 AND 65536
+		),
+		segment_json TEXT CHECK (
+			segment_json IS NULL
+			OR length(CAST(segment_json AS BLOB)) BETWEEN 2 AND 16384
+		),
+		added_at INTEGER NOT NULL CHECK (added_at >= 0),
+		UNIQUE (playlist_id, position)
+	);
+	CREATE UNIQUE INDEX playlist_whole_media_unique
+		ON playlist_entries(playlist_id, source, external_id)
+		WHERE segment_json IS NULL;
+	CREATE INDEX playlist_entries_media
+		ON playlist_entries(source, external_id, playlist_id);
+	",
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// One bounded `YouTube` search snapshot retained across application restarts.
 ///
 /// Search summaries intentionally exclude lazily fetched video details,
 /// subscriber enrichment, and Wikidata data. Those retain their independent
 /// cache and request policies after restoration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SavedYouTubeSearch {
     /// Exact request that produced the most recently accepted page.
     pub request: SearchRequest,
@@ -270,7 +354,7 @@ pub struct SavedYouTubeSearch {
 }
 
 /// One bounded `YouTube Music` search snapshot retained across restarts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SavedYouTubeMusicSearch {
     /// Exact trimmed query sent to the music-search adapter.
     pub query: String,
@@ -283,7 +367,7 @@ pub struct SavedYouTubeMusicSearch {
 /// Only canonical page identities and compact display metadata are stored.
 /// Resolved or signed media URLs are intentionally excluded so restoring this
 /// snapshot cannot consume a free-download allocation or replay stale media.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SavedBandcampSearch {
     /// Exact trimmed query sent to public Bandcamp search.
     pub query: String,
@@ -296,7 +380,7 @@ pub struct SavedBandcampSearch {
 }
 
 /// One bounded `Apple Podcasts` show-search snapshot retained across restarts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SavedApplePodcastsSearch {
     /// Exact trimmed query sent to Apple's public Search API.
     pub query: String,
@@ -311,7 +395,7 @@ pub struct SavedApplePodcastsSearch {
 /// Snapshots are intentionally stale-while-revalidate: callers may render
 /// [`Self::items`] immediately, then refresh the source in the background and
 /// replace the row. Only compact [`SearchItem`] summaries are stored.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CachedSubscriptionItems {
     /// Provider family that owns the subscription.
     pub source: SourceKind,
@@ -321,6 +405,33 @@ pub struct CachedSubscriptionItems {
     pub items: Vec<SearchItem>,
     /// Successful fetch completion time as seconds since the Unix epoch.
     pub fetched_at: i64,
+}
+
+/// Result of idempotently creating a case-insensitively named playlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlaylistCreateOutcome {
+    /// A new empty playlist was created.
+    Created(PlaylistSummary),
+    /// A playlist with the same case-insensitive name already existed.
+    Existing(PlaylistSummary),
+}
+
+/// Result of idempotently adding a complete media item to one playlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistAddOutcome {
+    /// The item was appended to the end of the playlist.
+    Added,
+    /// The same provider-qualified media identity was already present.
+    AlreadyPresent,
+}
+
+/// Result of toggling a complete media item's membership in one playlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistToggleOutcome {
+    /// The absent item was appended.
+    Added,
+    /// The existing item was removed.
+    Removed,
 }
 
 /// A provenance record attached to cached provider metadata.
@@ -404,7 +515,7 @@ impl CachedMetadata {
 }
 
 /// Listening time aggregated for one source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ListenTotal {
     /// Source whose playback time was counted.
     pub source: SourceKind,
@@ -435,6 +546,8 @@ pub struct LocalMoveStateRemap {
     pub metadata_cache: usize,
     /// Cached Local folder identities or embedded item paths changed.
     pub subscription_items_cache: usize,
+    /// Local playlist snapshots and their stable replay paths changed.
+    pub playlist_entries: usize,
 }
 
 #[cfg(feature = "local")]
@@ -449,15 +562,18 @@ impl LocalMoveStateRemap {
             + self.sessions
             + self.metadata_cache
             + self.subscription_items_cache
+            + self.playlist_entries
     }
 }
 
 /// A migrated `SQLite` connection for Youta state.
-pub struct StateStore {
+#[cfg(feature = "sqlite-state")]
+struct SqliteStateStore {
     connection: Connection,
 }
 
-impl StateStore {
+#[cfg(feature = "sqlite-state")]
+impl SqliteStateStore {
     /// Opens the database derived from `config`, creating private directories as
     /// needed and enabling WAL mode.
     ///
@@ -478,6 +594,7 @@ impl StateStore {
     /// # Errors
     ///
     /// Returns an error if the in-memory schema cannot be migrated.
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, PersistenceError> {
         Self::open_path(Path::new(":memory:"), false)
     }
@@ -508,6 +625,7 @@ impl StateStore {
     /// # Errors
     ///
     /// Returns an error if the journal-mode pragma cannot be queried.
+    #[cfg(test)]
     pub fn journal_mode(&self) -> Result<String, PersistenceError> {
         Ok(self
             .connection
@@ -523,6 +641,623 @@ impl StateStore {
         Ok(self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Idempotently creates an empty local playlist.
+    ///
+    /// Names are compared through a Unicode-lowercase key while their original
+    /// spelling is retained for display. Repeating the request with different
+    /// casing returns [`PlaylistCreateOutcome::Existing`] and does not replace
+    /// the stored description. The reserved `todo` name always addresses
+    /// [`TODO_PLAYLIST_ID`], even after that playlist has been renamed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name, description, timestamp, or playlist
+    /// count violates a fixed bound, or when the transaction fails.
+    pub fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError> {
+        let (name, name_key, description) =
+            validated_playlist_fields(name, description, created_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if name_key == TODO_PLAYLIST_NAME {
+            if let Some(summary) = playlist_summary_by_id(&transaction, TODO_PLAYLIST_ID)? {
+                transaction.commit()?;
+                return Ok(PlaylistCreateOutcome::Existing(summary));
+            }
+            if let Some(summary) = playlist_summary_by_name_key(&transaction, &name_key)? {
+                transaction.commit()?;
+                return Ok(PlaylistCreateOutcome::Existing(summary));
+            }
+            ensure_playlist_capacity(&transaction)?;
+            insert_playlist(
+                &transaction,
+                TODO_PLAYLIST_ID,
+                name,
+                &name_key,
+                description,
+                created_at,
+            )?;
+            let summary = playlist_summary_by_id(&transaction, TODO_PLAYLIST_ID)?
+                .ok_or_else(|| invalid_playlist("created todo playlist could not be read back"))?;
+            transaction.commit()?;
+            return Ok(PlaylistCreateOutcome::Created(summary));
+        }
+        if let Some(summary) = playlist_summary_by_name_key(&transaction, &name_key)? {
+            transaction.commit()?;
+            return Ok(PlaylistCreateOutcome::Existing(summary));
+        }
+        ensure_playlist_capacity(&transaction)?;
+        let id = next_playlist_id(&transaction)?;
+        transaction
+            .prepare_cached(
+                r"
+				INSERT INTO playlists (
+					id, name, name_key, description, created_at, updated_at
+				) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+				",
+            )?
+            .execute(params![id, name, name_key, description, created_at])?;
+        let summary = playlist_summary_by_id(&transaction, &id)?
+            .ok_or_else(|| invalid_playlist("created playlist could not be read back"))?;
+        transaction.commit()?;
+        Ok(PlaylistCreateOutcome::Created(summary))
+    }
+
+    /// Atomically creates a playlist and adds its first complete media item.
+    ///
+    /// An existing case-insensitive name returns
+    /// [`PlaylistCreateOutcome::Existing`] without changing that playlist.
+    /// Invalid snapshot data, capacity failures, and insertion errors roll back
+    /// the playlist row, so the popup workflow cannot leave an empty artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the combined validation and transaction
+    /// conditions of [`Self::create_playlist`] and
+    /// [`Self::add_playlist_entry`].
+    pub fn create_playlist_with_entry(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        media: &PlaylistMediaSnapshot,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError> {
+        let (name, name_key, description) =
+            validated_playlist_fields(name, description, created_at)?;
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if name_key == TODO_PLAYLIST_NAME {
+            if let Some(summary) = playlist_summary_by_id(&transaction, TODO_PLAYLIST_ID)? {
+                transaction.commit()?;
+                return Ok(PlaylistCreateOutcome::Existing(summary));
+            }
+            if let Some(summary) = playlist_summary_by_name_key(&transaction, &name_key)? {
+                transaction.commit()?;
+                return Ok(PlaylistCreateOutcome::Existing(summary));
+            }
+            ensure_playlist_capacity(&transaction)?;
+            insert_playlist(
+                &transaction,
+                TODO_PLAYLIST_ID,
+                name,
+                &name_key,
+                description,
+                created_at,
+            )?;
+            let outcome = add_playlist_entry_in_transaction(
+                &transaction,
+                TODO_PLAYLIST_ID,
+                media,
+                &snapshot_json,
+                created_at,
+            )?;
+            debug_assert_eq!(outcome, PlaylistAddOutcome::Added);
+            let summary = playlist_summary_by_id(&transaction, TODO_PLAYLIST_ID)?
+                .ok_or_else(|| invalid_playlist("created todo playlist could not be read back"))?;
+            transaction.commit()?;
+            return Ok(PlaylistCreateOutcome::Created(summary));
+        }
+        if let Some(summary) = playlist_summary_by_name_key(&transaction, &name_key)? {
+            transaction.commit()?;
+            return Ok(PlaylistCreateOutcome::Existing(summary));
+        }
+        ensure_playlist_capacity(&transaction)?;
+        let id = next_playlist_id(&transaction)?;
+        insert_playlist(&transaction, &id, name, &name_key, description, created_at)?;
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            &id,
+            media,
+            &snapshot_json,
+            created_at,
+        )?;
+        debug_assert_eq!(outcome, PlaylistAddOutcome::Added);
+        let summary = playlist_summary_by_id(&transaction, &id)?
+            .ok_or_else(|| invalid_playlist("created playlist could not be read back"))?;
+        transaction.commit()?;
+        Ok(PlaylistCreateOutcome::Created(summary))
+    }
+
+    /// Updates one playlist's display name and optional description.
+    ///
+    /// The stable playlist ID is never changed. In particular, renaming the
+    /// built-in todo playlist does not redirect the quick-add action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate fields, an unsafe identifier,
+    /// an invalid timestamp, or a failed transaction.
+    pub fn update_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        description: Option<&str>,
+        updated_at: i64,
+    ) -> Result<Option<PlaylistSummary>, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        let (name, name_key, description) =
+            validated_playlist_fields(name, description, updated_at)?;
+        if playlist_id != TODO_PLAYLIST_ID && name_key == TODO_PLAYLIST_NAME {
+            return Err(invalid_playlist(
+                "the case-insensitive `todo` name is reserved for the built-in todo playlist",
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(existing) = playlist_summary_by_id(&transaction, playlist_id)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if let Some(owner) = playlist_summary_by_name_key(&transaction, &name_key)?
+            && owner.id != playlist_id
+        {
+            return Err(invalid_playlist(format!(
+                "playlist name conflicts with existing playlist `{}`",
+                owner.name
+            )));
+        }
+        transaction
+            .prepare_cached(
+                r"
+				UPDATE playlists
+				SET name = ?1, name_key = ?2, description = ?3, updated_at = ?4
+				WHERE id = ?5
+				",
+            )?
+            .execute(params![
+                name,
+                name_key,
+                description,
+                updated_at,
+                existing.id
+            ])?;
+        let summary = playlist_summary_by_id(&transaction, playlist_id)?
+            .ok_or_else(|| invalid_playlist("updated playlist could not be read back"))?;
+        transaction.commit()?;
+        Ok(Some(summary))
+    }
+
+    /// Lists compact playlist metadata in case-insensitive name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored state exceeds [`MAX_PLAYLISTS`], contains
+    /// invalid fields, or cannot be queried.
+    pub fn playlists(&self) -> Result<Vec<PlaylistSummary>, PersistenceError> {
+        playlist_summaries(&self.connection)
+    }
+
+    /// Loads one playlist and its entries in their explicit stored order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe identifier, an oversized playlist,
+    /// invalid stored snapshots, or a database failure.
+    pub fn playlist(&self, playlist_id: &str) -> Result<Option<Playlist>, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        let Some(summary) = playlist_summary_by_id(&self.connection, playlist_id)? else {
+            return Ok(None);
+        };
+        let mut statement = self.connection.prepare_cached(
+            r"
+			SELECT source, external_id, snapshot_json, segment_json, added_at
+			FROM playlist_entries
+			WHERE playlist_id = ?1
+			ORDER BY position, id
+			LIMIT ?2
+			",
+        )?;
+        let limit = i64::try_from(MAX_PLAYLIST_ENTRIES.saturating_add(1)).map_err(|_| {
+            PersistenceError::IntegerOutOfRange {
+                field: "playlist entry limit",
+            }
+        })?;
+        let rows = statement
+            .query_map(params![playlist_id, limit], playlist_entry_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_PLAYLIST_ENTRIES {
+            return Err(invalid_playlist(format!(
+                "playlist `{playlist_id}` exceeds the {MAX_PLAYLIST_ENTRIES}-entry limit"
+            )));
+        }
+        if rows.len() != summary.entry_count {
+            return Err(invalid_playlist(format!(
+                "playlist `{playlist_id}` entry count changed while it was being read"
+            )));
+        }
+        Ok(Some(Playlist {
+            id: summary.id,
+            name: summary.name,
+            description: summary.description,
+            entries: rows,
+        }))
+    }
+
+    /// Returns whether an exact provider-qualified item belongs to a playlist.
+    ///
+    /// A missing playlist is treated as empty, making membership checks
+    /// idempotent during lazy todo creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identifiers or a failed query.
+    pub fn playlist_contains(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+    ) -> Result<bool, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        validate_playlist_media_id(media_id)?;
+        Ok(self
+            .connection
+            .prepare_cached(
+                r"
+				SELECT 1
+				FROM playlist_entries
+				WHERE playlist_id = ?1 AND source = ?2 AND external_id = ?3
+				      AND segment_json IS NULL
+				LIMIT 1
+				",
+            )?
+            .query_row(
+                params![playlist_id, media_id.source.as_str(), media_id.external_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Lists playlist IDs containing an exact complete media item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid media identity, excessive stored
+    /// playlist state, or a failed query.
+    pub fn playlist_memberships(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Vec<PlaylistId>, PersistenceError> {
+        validate_playlist_media_id(media_id)?;
+        let mut statement = self.connection.prepare_cached(
+            r"
+			SELECT playlist_id
+			FROM playlist_entries
+			WHERE source = ?1 AND external_id = ?2 AND segment_json IS NULL
+			ORDER BY playlist_id
+			LIMIT ?3
+			",
+        )?;
+        let limit = i64::try_from(MAX_PLAYLISTS.saturating_add(1)).map_err(|_| {
+            PersistenceError::IntegerOutOfRange {
+                field: "playlist membership limit",
+            }
+        })?;
+        let ids = statement
+            .query_map(
+                params![media_id.source.as_str(), media_id.external_id, limit],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > MAX_PLAYLISTS {
+            return Err(invalid_playlist(format!(
+                "media membership exceeds the {MAX_PLAYLISTS}-playlist limit"
+            )));
+        }
+        for id in &ids {
+            validate_playlist_id(id)?;
+        }
+        Ok(ids)
+    }
+
+    /// Lists the stable IDs and current display names of playlists containing
+    /// an exact complete media item.
+    ///
+    /// The query starts from the `playlist_entries_media` index and joins only matching
+    /// playlist rows. It deliberately does not load descriptions or aggregate
+    /// entry counts, making it suitable for selection-driven UI refreshes.
+    /// Callers determine todo membership by comparing `playlist_id` with
+    /// [`TODO_PLAYLIST_ID`], which remains correct after a user renames Todo.
+    ///
+    /// Saved segments do not make their parent media a complete-item member.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid media identity, excessive or invalid
+    /// stored playlist membership state, or a failed query.
+    pub fn playlist_memberships_with_names(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Vec<PlaylistMembership>, PersistenceError> {
+        validate_playlist_media_id(media_id)?;
+        let mut statement = self
+            .connection
+            .prepare_cached(PLAYLIST_MEMBERSHIPS_WITH_NAMES_SQL)?;
+        let limit = i64::try_from(MAX_PLAYLISTS.saturating_add(1)).map_err(|_| {
+            PersistenceError::IntegerOutOfRange {
+                field: "playlist membership limit",
+            }
+        })?;
+        let memberships = statement
+            .query_map(
+                params![media_id.source.as_str(), media_id.external_id, limit],
+                |row| {
+                    Ok(PlaylistMembership {
+                        playlist_id: row.get(0)?,
+                        playlist_name: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if memberships.len() > MAX_PLAYLISTS {
+            return Err(invalid_playlist(format!(
+                "media membership exceeds the {MAX_PLAYLISTS}-playlist limit"
+            )));
+        }
+        for membership in &memberships {
+            validate_playlist_id(&membership.playlist_id)?;
+            validated_playlist_fields(&membership.playlist_name, None, 0)?;
+        }
+        Ok(memberships)
+    }
+
+    /// Idempotently appends one complete item to an existing playlist.
+    ///
+    /// Duplicate provider-qualified media identities keep their original
+    /// position, timestamp, and captured metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing playlist, invalid or oversized snapshot,
+    /// full playlist, invalid timestamp, or failed transaction.
+    pub fn add_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        validate_playlist_timestamp(added_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            playlist_id,
+            media,
+            &snapshot_json,
+            added_at,
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Idempotently removes one complete item from a playlist.
+    ///
+    /// Remaining positions are intentionally not renumbered; their order is
+    /// stable and a later re-add appends after the greatest retained position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identifiers, an invalid timestamp, or a
+    /// failed transaction.
+    pub fn remove_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        validate_playlist_media_id(media_id)?;
+        validate_playlist_timestamp(updated_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let removed =
+            remove_playlist_entry_in_transaction(&transaction, playlist_id, media_id, updated_at)?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    /// Atomically toggles one complete item's membership in a playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`Self::add_playlist_entry`] or [`Self::remove_playlist_entry`].
+    pub fn toggle_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        validate_playlist_id(playlist_id)?;
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        validate_playlist_timestamp(updated_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if playlist_contains_connection(&transaction, playlist_id, &media.id)? {
+            remove_playlist_entry_in_transaction(&transaction, playlist_id, &media.id, updated_at)?;
+            transaction.commit()?;
+            return Ok(PlaylistToggleOutcome::Removed);
+        }
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            playlist_id,
+            media,
+            &snapshot_json,
+            updated_at,
+        )?;
+        debug_assert_eq!(outcome, PlaylistAddOutcome::Added);
+        transaction.commit()?;
+        Ok(PlaylistToggleOutcome::Added)
+    }
+
+    /// Lazily creates the fixed todo playlist and idempotently appends an item.
+    ///
+    /// Renaming the todo playlist does not change this method's target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid snapshot data, a full store or playlist,
+    /// invalid timestamp, or failed transaction.
+    pub fn add_to_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError> {
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        validate_playlist_timestamp(added_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_todo_playlist(&transaction, added_at)?;
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            TODO_PLAYLIST_ID,
+            media,
+            &snapshot_json,
+            added_at,
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Atomically toggles membership in the fixed todo playlist.
+    ///
+    /// The playlist is created only when the operation needs to add an item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::add_to_todo`].
+    pub fn toggle_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        validate_playlist_timestamp(updated_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if playlist_contains_connection(&transaction, TODO_PLAYLIST_ID, &media.id)? {
+            remove_playlist_entry_in_transaction(
+                &transaction,
+                TODO_PLAYLIST_ID,
+                &media.id,
+                updated_at,
+            )?;
+            transaction.commit()?;
+            return Ok(PlaylistToggleOutcome::Removed);
+        }
+        ensure_todo_playlist(&transaction, updated_at)?;
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            TODO_PLAYLIST_ID,
+            media,
+            &snapshot_json,
+            updated_at,
+        )?;
+        debug_assert_eq!(outcome, PlaylistAddOutcome::Added);
+        transaction.commit()?;
+        Ok(PlaylistToggleOutcome::Added)
+    }
+
+    /// Returns whether an item belongs to the fixed todo playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid media identity or failed query.
+    pub fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        self.playlist_contains(TODO_PLAYLIST_ID, media_id)
+    }
+
+    /// Saves one periodic playback checkpoint in a single transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on integer overflow or when either transactional row
+    /// update cannot be committed.
+    pub fn checkpoint_playback(
+        &self,
+        progress: &PlaybackProgress,
+        listen_source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        let position = to_sql_u64(progress.position_seconds, "position_seconds")?;
+        let duration = progress
+            .duration_seconds
+            .map(|value| to_sql_u64(value, "duration_seconds"))
+            .transpose()?;
+        let played_override = progress.played_override.map(i64::from);
+        let listened_seconds = to_sql_u64(listened_seconds, "listen seconds")?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction
+            .prepare_cached(
+                r"
+				INSERT INTO playback_progress (
+					source, external_id, position_seconds, duration_seconds,
+					played_override, updated_at
+				) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+				ON CONFLICT(source, external_id) DO UPDATE SET
+					position_seconds = excluded.position_seconds,
+					duration_seconds = excluded.duration_seconds,
+					played_override = excluded.played_override,
+					updated_at = excluded.updated_at
+				",
+            )?
+            .execute(params![
+                progress.media_id.source.as_str(),
+                progress.media_id.external_id,
+                position,
+                duration,
+                played_override,
+                progress.updated_at,
+            ])?;
+        if listened_seconds > 0 {
+            add_sqlite_listen_seconds(&transaction, listen_source, listened_seconds)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Saves listened time without creating playback progress.
+    ///
+    /// This is the periodic checkpoint for live or otherwise non-seekable
+    /// streams. A zero-second delta is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on integer overflow or when the statistics transaction
+    /// cannot be committed.
+    pub fn checkpoint_listening(
+        &self,
+        source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        let listened_seconds = to_sql_u64(listened_seconds, "listen seconds")?;
+        if listened_seconds == 0 {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        add_sqlite_listen_seconds(&transaction, source, listened_seconds)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Inserts or replaces the latest progress for an item.
@@ -862,6 +1597,121 @@ impl StateStore {
         Ok(comments)
     }
 
+    /// Loads the sole user-facing private note for an exact target.
+    ///
+    /// Legacy databases can contain multiple comment rows for one target. In
+    /// that case this returns the most recently updated row without exposing
+    /// duplicate implementation records to the editor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target cannot be encoded or the row cannot be
+    /// decoded.
+    pub fn private_note(
+        &self,
+        target: &CommentTarget,
+    ) -> Result<Option<PrivateComment>, PersistenceError> {
+        let target_json = serde_json::to_string(target)?;
+        self.connection
+            .query_row(
+                r"
+				SELECT id, target_json, body, created_at, updated_at
+				FROM private_comments
+				WHERE target_json = ?1
+				ORDER BY updated_at DESC, id DESC
+				LIMIT 1
+				",
+                [target_json],
+                private_comment_from_row,
+            )
+            .optional()
+            .map_err(PersistenceError::from)
+    }
+
+    /// Atomically creates or replaces the sole private note for a target.
+    ///
+    /// The first note's creation timestamp is retained across edits. Any
+    /// duplicate rows left by the older multi-comment API are collapsed in the
+    /// same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target cannot be encoded or the transaction
+    /// cannot be completed.
+    pub fn upsert_private_note(
+        &self,
+        target: &CommentTarget,
+        body: &str,
+        updated_at: i64,
+    ) -> Result<PrivateComment, PersistenceError> {
+        let target_json = serde_json::to_string(target)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                r"
+				SELECT id, target_json, body, created_at, updated_at
+				FROM private_comments
+				WHERE target_json = ?1
+				ORDER BY updated_at DESC, id DESC
+				LIMIT 1
+				",
+                [&target_json],
+                private_comment_from_row,
+            )
+            .optional()?;
+        let stored = if let Some(existing) = existing {
+            transaction.execute(
+                r"
+				UPDATE private_comments
+				SET body = ?2, updated_at = ?3
+				WHERE id = ?1
+				",
+                params![existing.id, body, updated_at],
+            )?;
+            transaction.execute(
+                "DELETE FROM private_comments WHERE target_json = ?1 AND id != ?2",
+                params![target_json, existing.id],
+            )?;
+            PrivateComment {
+                body: body.to_owned(),
+                updated_at,
+                ..existing
+            }
+        } else {
+            transaction.execute(
+                r"
+				INSERT INTO private_comments (target_json, body, created_at, updated_at)
+				VALUES (?1, ?2, ?3, ?3)
+				",
+                params![target_json, body, updated_at],
+            )?;
+            PrivateComment {
+                id: transaction.last_insert_rowid(),
+                target: target.clone(),
+                body: body.to_owned(),
+                created_at: updated_at,
+                updated_at,
+            }
+        };
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// Atomically removes the private note and any legacy duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target cannot be encoded or rows cannot be
+    /// removed.
+    pub fn delete_private_note(&self, target: &CommentTarget) -> Result<bool, PersistenceError> {
+        let target_json = serde_json::to_string(target)?;
+        Ok(self
+            .connection
+            .prepare_cached("DELETE FROM private_comments WHERE target_json = ?1")?
+            .execute([target_json])?
+            > 0)
+    }
+
     /// Removes a private comment and returns whether it existed.
     ///
     /// # Errors
@@ -1015,9 +1865,9 @@ impl StateStore {
     /// media/position comments, bookmarks, session selections/navigation, and
     /// cached Local metadata are changed together. Local subscription snapshots
     /// remap their folder key, descendant video and channel identities, and
-    /// embedded `file:` URLs in the same transaction. Playlist, queue, and saved
-    /// segment records are not currently stored by [`StateStore`], so there are
-    /// no such rows to remap in schema version [`SCHEMA_VERSION`].
+    /// embedded `file:` URLs in the same transaction. Playlist snapshots,
+    /// stable replay paths, artwork URLs, and saved-segment media identities
+    /// are also remapped atomically.
     ///
     /// A successful return means callers may consume the complete mapping
     /// slice. On error every database change is rolled back; callers must keep
@@ -1864,17 +2714,7 @@ impl StateStore {
         seconds: u64,
     ) -> Result<(), PersistenceError> {
         let seconds = to_sql_u64(seconds, "listen seconds")?;
-        self.connection
-            .prepare_cached(
-                r"
-				INSERT INTO listen_totals (source, total_seconds)
-				VALUES (?1, ?2)
-				ON CONFLICT(source) DO UPDATE SET
-					total_seconds = total_seconds + excluded.total_seconds
-				",
-            )?
-            .execute(params![source.as_str(), seconds])?;
-        Ok(())
+        add_sqlite_listen_seconds(&self.connection, source, seconds)
     }
 
     /// Returns exact listened seconds for a source.
@@ -2193,6 +3033,821 @@ impl StateStore {
     }
 }
 
+#[path = "persistence_files.rs"]
+mod files;
+
+use files::FileStateStore;
+
+/// Operations supplied by every restart-state backend.
+///
+/// The trait is public only so [`StateStore`] can expose normal method syntax
+/// through [`Deref`]. Applications should construct [`StateStore`] rather than
+/// depending on a concrete backend.
+pub trait StateBackend {
+    /// Returns the stable backend name used in diagnostics.
+    fn backend_name(&self) -> &'static str;
+    /// Returns the backend document or schema version.
+    fn format_version(&self) -> Result<u32, PersistenceError>;
+    /// Creates an empty playlist idempotently.
+    fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError>;
+    /// Creates a playlist and its first entry atomically.
+    fn create_playlist_with_entry(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        media: &PlaylistMediaSnapshot,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError>;
+    /// Updates playlist metadata.
+    fn update_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        description: Option<&str>,
+        updated_at: i64,
+    ) -> Result<Option<PlaylistSummary>, PersistenceError>;
+    /// Lists playlists.
+    fn playlists(&self) -> Result<Vec<PlaylistSummary>, PersistenceError>;
+    /// Loads one playlist.
+    fn playlist(&self, playlist_id: &str) -> Result<Option<Playlist>, PersistenceError>;
+    /// Tests membership in one playlist.
+    fn playlist_contains(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+    ) -> Result<bool, PersistenceError>;
+    /// Lists playlist IDs containing media.
+    fn playlist_memberships(&self, media_id: &MediaId)
+    -> Result<Vec<PlaylistId>, PersistenceError>;
+    /// Lists playlist membership names.
+    fn playlist_memberships_with_names(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Vec<PlaylistMembership>, PersistenceError>;
+    /// Adds one playlist entry.
+    fn add_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError>;
+    /// Removes one playlist entry.
+    fn remove_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError>;
+    /// Toggles one playlist entry.
+    fn toggle_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError>;
+    /// Adds media to the built-in todo playlist.
+    fn add_to_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError>;
+    /// Toggles media in the built-in todo playlist.
+    fn toggle_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError>;
+    /// Tests built-in todo membership.
+    fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError>;
+    /// Saves a bounded periodic playback checkpoint.
+    ///
+    /// File persistence atomically replaces only its small runtime checkpoint
+    /// and exposes the pending values through normal reads. `SQLite` applies the
+    /// progress row and `listened_seconds` delta in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot durably publish the checkpoint.
+    fn checkpoint_playback(
+        &self,
+        progress: &PlaybackProgress,
+        listen_source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError>;
+    /// Saves a bounded listening-only checkpoint for non-seekable media.
+    ///
+    /// This method never creates playback progress. File persistence atomically
+    /// replaces the small runtime checkpoint with an absolute listening target,
+    /// making startup replay idempotent. `SQLite` increments statistics in one
+    /// transaction. A zero-second delta is a no-op on every backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delta or cumulative total overflows the
+    /// persistent integer range, or when the backend cannot durably record it.
+    fn checkpoint_listening(
+        &self,
+        source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError>;
+    /// Publishes a pending playback checkpoint into canonical state.
+    ///
+    /// File persistence clears the recovery record only after both canonical
+    /// documents are durable, making retry and startup replay idempotent.
+    /// `SQLite` checkpoints are already canonical, so this is a no-op there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot merge or clear the checkpoint.
+    fn flush_playback_checkpoint(&self) -> Result<(), PersistenceError>;
+    /// Inserts or replaces playback progress.
+    fn upsert_progress(&self, progress: &PlaybackProgress) -> Result<(), PersistenceError>;
+    /// Loads one progress row.
+    fn progress(&self, media_id: &MediaId) -> Result<Option<PlaybackProgress>, PersistenceError>;
+    /// Loads progress for a bounded identity list.
+    fn progress_for_media_ids(
+        &self,
+        media_ids: &[MediaId],
+    ) -> Result<HashMap<MediaId, PlaybackProgress>, PersistenceError>;
+    /// Deletes one progress row.
+    fn delete_progress(&self, media_id: &MediaId) -> Result<bool, PersistenceError>;
+    /// Inserts one history row.
+    fn insert_history(&self, entry: &HistoryEntry) -> Result<i64, PersistenceError>;
+    /// Updates one history row.
+    fn update_history(&self, entry: &HistoryEntry) -> Result<bool, PersistenceError>;
+    /// Lists recent history.
+    fn history(
+        &self,
+        finished_only: bool,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, PersistenceError>;
+    /// Deletes one history row.
+    fn delete_history(&self, id: i64) -> Result<bool, PersistenceError>;
+    /// Inserts one private comment.
+    fn insert_private_comment(&self, comment: &PrivateComment) -> Result<i64, PersistenceError>;
+    /// Updates one private comment.
+    fn update_private_comment(&self, comment: &PrivateComment) -> Result<bool, PersistenceError>;
+    /// Lists private comments for a target.
+    fn private_comments(
+        &self,
+        target: &CommentTarget,
+    ) -> Result<Vec<PrivateComment>, PersistenceError>;
+    /// Loads the sole user-facing private note for an exact target.
+    fn private_note(
+        &self,
+        target: &CommentTarget,
+    ) -> Result<Option<PrivateComment>, PersistenceError>;
+    /// Creates or replaces the sole private note for an exact target.
+    fn upsert_private_note(
+        &self,
+        target: &CommentTarget,
+        body: &str,
+        updated_at: i64,
+    ) -> Result<PrivateComment, PersistenceError>;
+    /// Deletes the private note and any legacy duplicates at an exact target.
+    fn delete_private_note(&self, target: &CommentTarget) -> Result<bool, PersistenceError>;
+    /// Deletes one private comment.
+    fn delete_private_comment(&self, id: i64) -> Result<bool, PersistenceError>;
+    /// Inserts one bookmark.
+    fn insert_bookmark(&self, bookmark: &Bookmark) -> Result<i64, PersistenceError>;
+    /// Updates one bookmark.
+    fn update_bookmark(&self, bookmark: &Bookmark) -> Result<bool, PersistenceError>;
+    /// Lists bookmarks for media.
+    fn bookmarks(&self, media_id: &MediaId) -> Result<Vec<Bookmark>, PersistenceError>;
+    /// Deletes one bookmark.
+    fn delete_bookmark(&self, id: i64) -> Result<bool, PersistenceError>;
+    /// Saves the active session.
+    fn save_session(&self, state: &SessionState, updated_at: i64) -> Result<(), PersistenceError>;
+    /// Loads the active session.
+    fn session(&self) -> Result<Option<SessionState>, PersistenceError>;
+    /// Atomically remaps state after Local moves.
+    #[cfg(feature = "local")]
+    fn remap_local_move_state(
+        &self,
+        mappings: &[LocalMoveMapping],
+    ) -> Result<LocalMoveStateRemap, PersistenceError>;
+    /// Journals Local move intentions.
+    #[cfg(feature = "local")]
+    fn journal_local_move_intent(
+        &self,
+        mappings: &[LocalMoveMapping],
+        created_at: i64,
+    ) -> Result<(), PersistenceError>;
+    /// Loads Local move intentions.
+    #[cfg(feature = "local")]
+    fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError>;
+    /// Discards completed Local move intentions.
+    #[cfg(feature = "local")]
+    fn discard_local_move_intents(
+        &self,
+        mappings: &[LocalMoveMapping],
+    ) -> Result<(), PersistenceError>;
+    /// Saves the latest YouTube search.
+    fn save_youtube_search(
+        &self,
+        search: &SavedYouTubeSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError>;
+    /// Loads the latest YouTube search.
+    fn youtube_search(&self) -> Result<Option<SavedYouTubeSearch>, PersistenceError>;
+    /// Updates one saved YouTube orientation.
+    fn update_saved_youtube_video_orientation(
+        &self,
+        video_id: &str,
+        orientation: VideoOrientation,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError>;
+    /// Clears the latest YouTube search.
+    fn clear_youtube_search(&self) -> Result<bool, PersistenceError>;
+    /// Saves the latest YouTube Music search.
+    fn save_youtube_music_search(
+        &self,
+        search: &SavedYouTubeMusicSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError>;
+    /// Loads the latest YouTube Music search.
+    fn youtube_music_search(&self) -> Result<Option<SavedYouTubeMusicSearch>, PersistenceError>;
+    /// Clears the latest YouTube Music search.
+    fn clear_youtube_music_search(&self) -> Result<bool, PersistenceError>;
+    /// Saves the latest Bandcamp search.
+    fn save_bandcamp_search(
+        &self,
+        search: &SavedBandcampSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError>;
+    /// Loads the latest Bandcamp search.
+    fn bandcamp_search(&self) -> Result<Option<SavedBandcampSearch>, PersistenceError>;
+    /// Clears the latest Bandcamp search.
+    fn clear_bandcamp_search(&self) -> Result<bool, PersistenceError>;
+    /// Saves the latest Apple Podcasts search.
+    fn save_apple_podcasts_search(
+        &self,
+        search: &SavedApplePodcastsSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError>;
+    /// Loads the latest Apple Podcasts search.
+    fn apple_podcasts_search(&self) -> Result<Option<SavedApplePodcastsSearch>, PersistenceError>;
+    /// Clears the latest Apple Podcasts search.
+    fn clear_apple_podcasts_search(&self) -> Result<bool, PersistenceError>;
+    /// Saves one subscription item cache.
+    fn put_cached_subscription_items(
+        &self,
+        cached: &CachedSubscriptionItems,
+    ) -> Result<(), PersistenceError>;
+    /// Loads one subscription item cache.
+    fn cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<Option<CachedSubscriptionItems>, PersistenceError>;
+    /// Deletes one subscription item cache.
+    fn delete_cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<bool, PersistenceError>;
+    /// Adds listened seconds.
+    fn add_listen_seconds(&self, source: &SourceKind, seconds: u64)
+    -> Result<(), PersistenceError>;
+    /// Loads listened seconds for a source.
+    fn listened_seconds(&self, source: &SourceKind) -> Result<u64, PersistenceError>;
+    /// Lists all listening totals.
+    fn listen_totals(&self) -> Result<Vec<ListenTotal>, PersistenceError>;
+    /// Deletes one listening total.
+    fn reset_listen_seconds(&self, source: &SourceKind) -> Result<bool, PersistenceError>;
+    /// Saves provider metadata.
+    fn put_cached_metadata(&self, cached: &CachedMetadata) -> Result<(), PersistenceError>;
+    /// Loads provider metadata.
+    fn cached_metadata(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Option<CachedMetadata>, PersistenceError>;
+    /// Deletes expired provider metadata.
+    fn delete_expired_metadata(&self, now: i64) -> Result<usize, PersistenceError>;
+    /// Saves a channel summary.
+    fn put_cached_channel_summary(
+        &self,
+        cached: &CachedChannelSummary,
+    ) -> Result<(), PersistenceError>;
+    /// Loads a channel summary.
+    fn cached_channel_summary(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<CachedChannelSummary>, PersistenceError>;
+    /// Deletes expired channel summaries.
+    fn delete_expired_channel_summaries(&self, now: i64) -> Result<usize, PersistenceError>;
+    /// Saves a Wikidata lookup.
+    fn put_cached_wikidata(&self, cached: &CachedWikidataLookup) -> Result<(), PersistenceError>;
+    /// Loads a Wikidata lookup.
+    fn cached_wikidata(
+        &self,
+        property_id: &str,
+        external_id: &str,
+    ) -> Result<Option<CachedWikidataLookup>, PersistenceError>;
+    /// Deletes expired Wikidata lookups.
+    fn delete_expired_wikidata(&self, now: i64) -> Result<usize, PersistenceError>;
+}
+
+/// Backend-selected restart-safe application state.
+pub struct StateStore {
+    backend: Box<dyn StateBackend>,
+}
+
+impl StateStore {
+    /// Opens the backend selected by `persistence.backend`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected backend is unavailable or its state
+    /// cannot be opened. Selecting file persistence never modifies an existing
+    /// SQLite database.
+    pub fn open(config: &Config) -> Result<Self, PersistenceError> {
+        config.ensure_directories()?;
+        let backend: Box<dyn StateBackend> = match config.persistence.backend {
+            PersistenceBackend::Files => Box::new(FileStateStore::open(config)?),
+            PersistenceBackend::Sqlite => {
+                #[cfg(feature = "sqlite-state")]
+                {
+                    Box::new(SqliteStateStore::open(config)?)
+                }
+                #[cfg(not(feature = "sqlite-state"))]
+                {
+                    return Err(PersistenceError::BackendUnavailable {
+                        backend: "sqlite",
+                        required_feature: "sqlite-state",
+                    });
+                }
+            }
+        };
+        Ok(Self { backend })
+    }
+
+    /// Opens an ephemeral human-readable-backend store for tests and transient
+    /// application sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial documents cannot be validated.
+    pub fn open_in_memory() -> Result<Self, PersistenceError> {
+        Ok(Self {
+            backend: Box::new(FileStateStore::open_in_memory()?),
+        })
+    }
+}
+
+impl Deref for StateStore {
+    type Target = dyn StateBackend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend.as_ref()
+    }
+}
+
+#[cfg(feature = "sqlite-state")]
+impl StateBackend for SqliteStateStore {
+    fn backend_name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn format_version(&self) -> Result<u32, PersistenceError> {
+        self.schema_version()
+    }
+
+    fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError> {
+        SqliteStateStore::create_playlist(self, name, description, created_at)
+    }
+
+    fn create_playlist_with_entry(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        media: &PlaylistMediaSnapshot,
+        created_at: i64,
+    ) -> Result<PlaylistCreateOutcome, PersistenceError> {
+        SqliteStateStore::create_playlist_with_entry(self, name, description, media, created_at)
+    }
+
+    fn update_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        description: Option<&str>,
+        updated_at: i64,
+    ) -> Result<Option<PlaylistSummary>, PersistenceError> {
+        SqliteStateStore::update_playlist(self, playlist_id, name, description, updated_at)
+    }
+
+    fn playlists(&self) -> Result<Vec<PlaylistSummary>, PersistenceError> {
+        SqliteStateStore::playlists(self)
+    }
+
+    fn playlist(&self, playlist_id: &str) -> Result<Option<Playlist>, PersistenceError> {
+        SqliteStateStore::playlist(self, playlist_id)
+    }
+
+    fn playlist_contains(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+    ) -> Result<bool, PersistenceError> {
+        SqliteStateStore::playlist_contains(self, playlist_id, media_id)
+    }
+
+    fn playlist_memberships(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Vec<PlaylistId>, PersistenceError> {
+        SqliteStateStore::playlist_memberships(self, media_id)
+    }
+
+    fn playlist_memberships_with_names(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Vec<PlaylistMembership>, PersistenceError> {
+        SqliteStateStore::playlist_memberships_with_names(self, media_id)
+    }
+
+    fn add_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError> {
+        SqliteStateStore::add_playlist_entry(self, playlist_id, media, added_at)
+    }
+
+    fn remove_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media_id: &MediaId,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError> {
+        SqliteStateStore::remove_playlist_entry(self, playlist_id, media_id, updated_at)
+    }
+
+    fn toggle_playlist_entry(
+        &self,
+        playlist_id: &str,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        SqliteStateStore::toggle_playlist_entry(self, playlist_id, media, updated_at)
+    }
+
+    fn add_to_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        added_at: i64,
+    ) -> Result<PlaylistAddOutcome, PersistenceError> {
+        SqliteStateStore::add_to_todo(self, media, added_at)
+    }
+
+    fn toggle_todo(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        SqliteStateStore::toggle_todo(self, media, updated_at)
+    }
+
+    fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        SqliteStateStore::todo_contains(self, media_id)
+    }
+
+    fn checkpoint_playback(
+        &self,
+        progress: &PlaybackProgress,
+        listen_source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::checkpoint_playback(self, progress, listen_source, listened_seconds)
+    }
+
+    fn checkpoint_listening(
+        &self,
+        source: &SourceKind,
+        listened_seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::checkpoint_listening(self, source, listened_seconds)
+    }
+
+    fn flush_playback_checkpoint(&self) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
+    fn upsert_progress(&self, progress: &PlaybackProgress) -> Result<(), PersistenceError> {
+        SqliteStateStore::upsert_progress(self, progress)
+    }
+
+    fn progress(&self, media_id: &MediaId) -> Result<Option<PlaybackProgress>, PersistenceError> {
+        SqliteStateStore::progress(self, media_id)
+    }
+
+    fn progress_for_media_ids(
+        &self,
+        media_ids: &[MediaId],
+    ) -> Result<HashMap<MediaId, PlaybackProgress>, PersistenceError> {
+        SqliteStateStore::progress_for_media_ids(self, media_ids)
+    }
+
+    fn delete_progress(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_progress(self, media_id)
+    }
+
+    fn insert_history(&self, entry: &HistoryEntry) -> Result<i64, PersistenceError> {
+        SqliteStateStore::insert_history(self, entry)
+    }
+
+    fn update_history(&self, entry: &HistoryEntry) -> Result<bool, PersistenceError> {
+        SqliteStateStore::update_history(self, entry)
+    }
+
+    fn history(
+        &self,
+        finished_only: bool,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, PersistenceError> {
+        SqliteStateStore::history(self, finished_only, limit)
+    }
+
+    fn delete_history(&self, id: i64) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_history(self, id)
+    }
+
+    fn insert_private_comment(&self, comment: &PrivateComment) -> Result<i64, PersistenceError> {
+        SqliteStateStore::insert_private_comment(self, comment)
+    }
+
+    fn update_private_comment(&self, comment: &PrivateComment) -> Result<bool, PersistenceError> {
+        SqliteStateStore::update_private_comment(self, comment)
+    }
+
+    fn private_comments(
+        &self,
+        target: &CommentTarget,
+    ) -> Result<Vec<PrivateComment>, PersistenceError> {
+        SqliteStateStore::private_comments(self, target)
+    }
+
+    fn private_note(
+        &self,
+        target: &CommentTarget,
+    ) -> Result<Option<PrivateComment>, PersistenceError> {
+        SqliteStateStore::private_note(self, target)
+    }
+
+    fn upsert_private_note(
+        &self,
+        target: &CommentTarget,
+        body: &str,
+        updated_at: i64,
+    ) -> Result<PrivateComment, PersistenceError> {
+        SqliteStateStore::upsert_private_note(self, target, body, updated_at)
+    }
+
+    fn delete_private_note(&self, target: &CommentTarget) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_private_note(self, target)
+    }
+
+    fn delete_private_comment(&self, id: i64) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_private_comment(self, id)
+    }
+
+    fn insert_bookmark(&self, bookmark: &Bookmark) -> Result<i64, PersistenceError> {
+        SqliteStateStore::insert_bookmark(self, bookmark)
+    }
+
+    fn update_bookmark(&self, bookmark: &Bookmark) -> Result<bool, PersistenceError> {
+        SqliteStateStore::update_bookmark(self, bookmark)
+    }
+
+    fn bookmarks(&self, media_id: &MediaId) -> Result<Vec<Bookmark>, PersistenceError> {
+        SqliteStateStore::bookmarks(self, media_id)
+    }
+
+    fn delete_bookmark(&self, id: i64) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_bookmark(self, id)
+    }
+
+    fn save_session(&self, state: &SessionState, updated_at: i64) -> Result<(), PersistenceError> {
+        SqliteStateStore::save_session(self, state, updated_at)
+    }
+
+    fn session(&self) -> Result<Option<SessionState>, PersistenceError> {
+        SqliteStateStore::session(self)
+    }
+
+    #[cfg(feature = "local")]
+    fn remap_local_move_state(
+        &self,
+        mappings: &[LocalMoveMapping],
+    ) -> Result<LocalMoveStateRemap, PersistenceError> {
+        SqliteStateStore::remap_local_move_state(self, mappings)
+    }
+
+    #[cfg(feature = "local")]
+    fn journal_local_move_intent(
+        &self,
+        mappings: &[LocalMoveMapping],
+        created_at: i64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::journal_local_move_intent(self, mappings, created_at)
+    }
+
+    #[cfg(feature = "local")]
+    fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError> {
+        SqliteStateStore::local_move_intents(self)
+    }
+
+    #[cfg(feature = "local")]
+    fn discard_local_move_intents(
+        &self,
+        mappings: &[LocalMoveMapping],
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::discard_local_move_intents(self, mappings)
+    }
+
+    fn save_youtube_search(
+        &self,
+        search: &SavedYouTubeSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::save_youtube_search(self, search, updated_at)
+    }
+
+    fn youtube_search(&self) -> Result<Option<SavedYouTubeSearch>, PersistenceError> {
+        SqliteStateStore::youtube_search(self)
+    }
+
+    fn update_saved_youtube_video_orientation(
+        &self,
+        video_id: &str,
+        orientation: VideoOrientation,
+        updated_at: i64,
+    ) -> Result<bool, PersistenceError> {
+        SqliteStateStore::update_saved_youtube_video_orientation(
+            self,
+            video_id,
+            orientation,
+            updated_at,
+        )
+    }
+
+    fn clear_youtube_search(&self) -> Result<bool, PersistenceError> {
+        SqliteStateStore::clear_youtube_search(self)
+    }
+
+    fn save_youtube_music_search(
+        &self,
+        search: &SavedYouTubeMusicSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::save_youtube_music_search(self, search, updated_at)
+    }
+
+    fn youtube_music_search(&self) -> Result<Option<SavedYouTubeMusicSearch>, PersistenceError> {
+        SqliteStateStore::youtube_music_search(self)
+    }
+
+    fn clear_youtube_music_search(&self) -> Result<bool, PersistenceError> {
+        SqliteStateStore::clear_youtube_music_search(self)
+    }
+
+    fn save_bandcamp_search(
+        &self,
+        search: &SavedBandcampSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::save_bandcamp_search(self, search, updated_at)
+    }
+
+    fn bandcamp_search(&self) -> Result<Option<SavedBandcampSearch>, PersistenceError> {
+        SqliteStateStore::bandcamp_search(self)
+    }
+
+    fn clear_bandcamp_search(&self) -> Result<bool, PersistenceError> {
+        SqliteStateStore::clear_bandcamp_search(self)
+    }
+
+    fn save_apple_podcasts_search(
+        &self,
+        search: &SavedApplePodcastsSearch,
+        updated_at: i64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::save_apple_podcasts_search(self, search, updated_at)
+    }
+
+    fn apple_podcasts_search(&self) -> Result<Option<SavedApplePodcastsSearch>, PersistenceError> {
+        SqliteStateStore::apple_podcasts_search(self)
+    }
+
+    fn clear_apple_podcasts_search(&self) -> Result<bool, PersistenceError> {
+        SqliteStateStore::clear_apple_podcasts_search(self)
+    }
+
+    fn put_cached_subscription_items(
+        &self,
+        cached: &CachedSubscriptionItems,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::put_cached_subscription_items(self, cached)
+    }
+
+    fn cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<Option<CachedSubscriptionItems>, PersistenceError> {
+        SqliteStateStore::cached_subscription_items(self, source, source_id)
+    }
+
+    fn delete_cached_subscription_items(
+        &self,
+        source: &SourceKind,
+        source_id: &str,
+    ) -> Result<bool, PersistenceError> {
+        SqliteStateStore::delete_cached_subscription_items(self, source, source_id)
+    }
+
+    fn add_listen_seconds(
+        &self,
+        source: &SourceKind,
+        seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::add_listen_seconds(self, source, seconds)
+    }
+
+    fn listened_seconds(&self, source: &SourceKind) -> Result<u64, PersistenceError> {
+        SqliteStateStore::listened_seconds(self, source)
+    }
+
+    fn listen_totals(&self) -> Result<Vec<ListenTotal>, PersistenceError> {
+        SqliteStateStore::listen_totals(self)
+    }
+
+    fn reset_listen_seconds(&self, source: &SourceKind) -> Result<bool, PersistenceError> {
+        SqliteStateStore::reset_listen_seconds(self, source)
+    }
+
+    fn put_cached_metadata(&self, cached: &CachedMetadata) -> Result<(), PersistenceError> {
+        SqliteStateStore::put_cached_metadata(self, cached)
+    }
+
+    fn cached_metadata(
+        &self,
+        media_id: &MediaId,
+    ) -> Result<Option<CachedMetadata>, PersistenceError> {
+        SqliteStateStore::cached_metadata(self, media_id)
+    }
+
+    fn delete_expired_metadata(&self, now: i64) -> Result<usize, PersistenceError> {
+        SqliteStateStore::delete_expired_metadata(self, now)
+    }
+
+    fn put_cached_channel_summary(
+        &self,
+        cached: &CachedChannelSummary,
+    ) -> Result<(), PersistenceError> {
+        SqliteStateStore::put_cached_channel_summary(self, cached)
+    }
+
+    fn cached_channel_summary(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<CachedChannelSummary>, PersistenceError> {
+        SqliteStateStore::cached_channel_summary(self, channel_id)
+    }
+
+    fn delete_expired_channel_summaries(&self, now: i64) -> Result<usize, PersistenceError> {
+        SqliteStateStore::delete_expired_channel_summaries(self, now)
+    }
+
+    fn put_cached_wikidata(&self, cached: &CachedWikidataLookup) -> Result<(), PersistenceError> {
+        SqliteStateStore::put_cached_wikidata(self, cached)
+    }
+
+    fn cached_wikidata(
+        &self,
+        property_id: &str,
+        external_id: &str,
+    ) -> Result<Option<CachedWikidataLookup>, PersistenceError> {
+        SqliteStateStore::cached_wikidata(self, property_id, external_id)
+    }
+
+    fn delete_expired_wikidata(&self, now: i64) -> Result<usize, PersistenceError> {
+        SqliteStateStore::delete_expired_wikidata(self, now)
+    }
+}
+
 /// Alias emphasizing that [`StateStore`] is the persistence boundary.
 pub type Store = StateStore;
 
@@ -2206,8 +3861,57 @@ pub enum PersistenceError {
     #[error("database file operation failed: {0}")]
     Io(#[from] std::io::Error),
     /// A `SQLite` operation failed.
+    #[cfg(feature = "sqlite-state")]
     #[error("SQLite state operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A human-readable TOML document is malformed.
+    #[error("human-readable state document is invalid: {0}")]
+    TomlDecode(#[from] toml::de::Error),
+    /// A human-readable TOML document cannot be encoded.
+    #[error("human-readable state document cannot be encoded: {0}")]
+    TomlEncode(#[from] toml::ser::Error),
+    /// A human-readable document exceeds its fixed read/write budget.
+    #[error("{document} state document exceeds the {maximum_bytes}-byte limit")]
+    StateDocumentTooLarge {
+        /// Stable document label that does not expose a user path.
+        document: &'static str,
+        /// Maximum accepted UTF-8 size.
+        maximum_bytes: usize,
+    },
+    /// A human-readable document violates an identity, ordering, or row invariant.
+    #[error("{document} state document is invalid: {reason}")]
+    InvalidFileDocument {
+        /// Stable document label that does not expose a user path.
+        document: &'static str,
+        /// Rejected invariant.
+        reason: String,
+    },
+    /// A bounded human-readable document cannot accept another durable row.
+    #[error("{document} state document has reached its {maximum_rows}-row limit")]
+    StateRowLimitReached {
+        /// Stable document label that does not expose a user path.
+        document: &'static str,
+        /// Maximum number of retained rows.
+        maximum_rows: usize,
+    },
+    /// A state file changed after this process loaded it.
+    #[error(
+        "{document} state document changed outside Youta; restart before saving to avoid \
+         overwriting the external edit"
+    )]
+    StateDocumentChangedExternally {
+        /// Stable document label that does not expose a user path.
+        document: &'static str,
+    },
+    /// A multi-document publication stopped after at least one replacement.
+    #[error(
+        "a Local move state publication stopped after partially updating files; restart Youta \
+         to reconcile the retained move journal before saving more state"
+    )]
+    PartialFilePublicationRequiresRestart,
+    /// Another process already holds the human-readable state lock.
+    #[error("human-readable state is already open by another Youta process")]
+    FileStateAlreadyOpen,
     /// A JSON payload could not be encoded or decoded.
     #[error("stored JSON state is invalid: {0}")]
     Json(#[from] serde_json::Error),
@@ -2246,6 +3950,12 @@ pub enum PersistenceError {
         /// Invariant rejected before the locator reached `SQLite`.
         reason: String,
     },
+    /// Playlist metadata, identity, ordering, or snapshots violate a bound.
+    #[error("playlist state is invalid: {reason}")]
+    InvalidPlaylist {
+        /// Invariant rejected before use or while reading stored state.
+        reason: String,
+    },
     /// Completed Local move mappings or their durable destinations conflict.
     #[cfg(feature = "local")]
     #[error("local move state remap is invalid: {reason}")]
@@ -2253,16 +3963,40 @@ pub enum PersistenceError {
         /// Mapping, path, row, or destination invariant that was rejected.
         reason: String,
     },
-    /// An unsigned domain value is too large for `SQLite`'s signed integer.
-    #[error("{field} is too large for SQLite")]
+    /// The configured persistence backend was not compiled into this binary.
+    #[error(
+        "persistence backend {backend:?} is unavailable; rebuild Youta with feature \
+         {required_feature:?}"
+    )]
+    BackendUnavailable {
+        /// Configuration value that selected the unavailable backend.
+        backend: &'static str,
+        /// Cargo feature that enables it.
+        required_feature: &'static str,
+    },
+    /// A state document uses a format newer than this binary.
+    #[error("state document format {found} is newer than supported format {supported}")]
+    UnsupportedFileFormat {
+        /// Version read from TOML.
+        found: u32,
+        /// Newest supported TOML version.
+        supported: u32,
+    },
+    /// An in-process state lock was poisoned by a prior panic.
+    #[error("state lock is poisoned")]
+    StateLockPoisoned,
+    /// A domain value is outside the supported persistent integer range.
+    #[error("{field} is outside the supported persistent integer range")]
     IntegerOutOfRange {
         /// Name of the field that overflowed.
         field: &'static str,
     },
     /// An on-disk database was unable to enter WAL mode.
+    #[cfg(feature = "sqlite-state")]
     #[error("SQLite refused WAL journal mode and selected {0:?}")]
     WalUnavailable(String),
     /// The database was written by a newer Youta schema.
+    #[cfg(feature = "sqlite-state")]
     #[error("database schema {found} is newer than supported schema {supported}")]
     UnsupportedSchema {
         /// Version stored in `SQLite`.
@@ -2272,14 +4006,743 @@ pub enum PersistenceError {
     },
 }
 
-#[cfg(feature = "local")]
+fn invalid_playlist(reason: impl Into<String>) -> PersistenceError {
+    PersistenceError::InvalidPlaylist {
+        reason: reason.into(),
+    }
+}
+
+fn validate_playlist_timestamp(timestamp: i64) -> Result<(), PersistenceError> {
+    if timestamp < 0 {
+        return Err(invalid_playlist("playlist timestamps cannot be negative"));
+    }
+    Ok(())
+}
+
+fn validate_playlist_id(playlist_id: &str) -> Result<(), PersistenceError> {
+    if playlist_id.is_empty()
+        || playlist_id.len() > MAX_PLAYLIST_ID_BYTES
+        || playlist_id.trim() != playlist_id
+        || playlist_id.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist(format!(
+            "playlist ID must be trimmed, printable, and at most {MAX_PLAYLIST_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn playlist_name_key(name: &str) -> String {
+    name.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn validated_playlist_fields<'a>(
+    name: &'a str,
+    description: Option<&'a str>,
+    timestamp: i64,
+) -> Result<(&'a str, String, Option<&'a str>), PersistenceError> {
+    validate_playlist_timestamp(timestamp)?;
+    if name.is_empty()
+        || name.len() > MAX_PLAYLIST_NAME_BYTES
+        || name.trim() != name
+        || name.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist(format!(
+            "playlist name must be trimmed, printable, and at most \
+             {MAX_PLAYLIST_NAME_BYTES} bytes"
+        )));
+    }
+    let name_key = playlist_name_key(name);
+    if name_key.is_empty() || name_key.len() > MAX_PLAYLIST_NAME_BYTES {
+        return Err(invalid_playlist(format!(
+            "case-insensitive playlist name exceeds {MAX_PLAYLIST_NAME_BYTES} bytes"
+        )));
+    }
+    if let Some(description) = description {
+        if description.is_empty() {
+            return Err(invalid_playlist(
+                "an empty playlist description must be represented as None",
+            ));
+        }
+        if description.len() > MAX_PLAYLIST_DESCRIPTION_BYTES {
+            return Err(invalid_playlist(format!(
+                "playlist description exceeds {MAX_PLAYLIST_DESCRIPTION_BYTES} bytes"
+            )));
+        }
+        if description
+            .chars()
+            .any(|character| character == '\0' || character == '\r')
+        {
+            return Err(invalid_playlist(
+                "playlist description cannot contain NUL or carriage-return characters",
+            ));
+        }
+    }
+    Ok((name, name_key, description))
+}
+
+fn validate_playlist_media_id(media_id: &MediaId) -> Result<(), PersistenceError> {
+    let source = media_id.source.as_str();
+    if source.is_empty()
+        || source.len() > MAX_SAVED_SUBSCRIPTION_SOURCE_BYTES
+        || source.trim() != source
+        || source.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist("playlist media source is invalid"));
+    }
+    if media_id.external_id.is_empty()
+        || media_id.external_id.len() > MAX_PLAYLIST_EXTERNAL_ID_BYTES
+        || media_id.external_id.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist(format!(
+            "playlist media identity must be printable and at most \
+             {MAX_PLAYLIST_EXTERNAL_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_playlist_snapshot(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
+    validate_playlist_media_id(&media.id)?;
+    if !matches!(
+        media.kind,
+        MediaKind::Video | MediaKind::Audio | MediaKind::PodcastEpisode | MediaKind::LiveStream
+    ) {
+        return Err(invalid_playlist(
+            "playlist snapshots must represent playable media",
+        ));
+    }
+    if media.title.is_empty()
+        || media.title.len() > MAX_PLAYLIST_TITLE_BYTES
+        || media.title.trim() != media.title
+        || media.title.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist(format!(
+            "playlist item title must be trimmed, printable, and at most \
+             {MAX_PLAYLIST_TITLE_BYTES} bytes"
+        )));
+    }
+    if let Some(creator) = &media.creator
+        && (creator.is_empty()
+            || creator.len() > MAX_PLAYLIST_CREATOR_BYTES
+            || creator.trim() != creator
+            || creator.chars().any(char::is_control))
+    {
+        return Err(invalid_playlist(format!(
+            "playlist item creator must be trimmed, printable, and at most \
+             {MAX_PLAYLIST_CREATOR_BYTES} bytes"
+        )));
+    }
+    validate_playlist_webpage(media)?;
+    if let Some(thumbnail_url) = &media.thumbnail_url {
+        validate_playlist_thumbnail_url(&media.id.source, thumbnail_url)?;
+    }
+    validate_playlist_replay_locator(media)?;
+    Ok(())
+}
+
+fn validate_playlist_webpage(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
+    let url = &media.webpage_url;
+    if url.as_str().len() > MAX_PLAYLIST_URL_BYTES
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_playlist(
+            "playlist webpage must be bounded and contain no credentials or fragment",
+        ));
+    }
+    if media.id.source == SourceKind::Local {
+        if url.query().is_some() {
+            return Err(invalid_playlist(
+                "Local playlist webpage must not contain a query",
+            ));
+        }
+        let path = url.to_file_path().map_err(|()| {
+            invalid_playlist("Local playlist webpage must be an absolute file URL")
+        })?;
+        if path != Path::new(&media.id.external_id) || !path.is_absolute() {
+            return Err(invalid_playlist(
+                "Local playlist webpage does not match its media identity",
+            ));
+        }
+        return Ok(());
+    }
+    if url.scheme() != "https" || url.host_str().is_none() || remote_url_has_non_public_host(url) {
+        return Err(invalid_playlist(
+            "remote playlist webpages must use a public absolute HTTPS URL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_playlist_thumbnail_url(source: &SourceKind, url: &Url) -> Result<(), PersistenceError> {
+    if url.as_str().len() > MAX_PLAYLIST_URL_BYTES
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return Err(invalid_playlist(
+            "playlist artwork must be bounded and contain no credentials, query, or fragment",
+        ));
+    }
+    if source == &SourceKind::Local {
+        let path = url
+            .to_file_path()
+            .map_err(|()| invalid_playlist("Local playlist artwork must use a file URL"))?;
+        if !path.is_absolute() {
+            return Err(invalid_playlist(
+                "Local playlist artwork must use an absolute path",
+            ));
+        }
+        return Ok(());
+    }
+    if url.scheme() != "https" || url.host_str().is_none() || remote_url_has_non_public_host(url) {
+        return Err(invalid_playlist(
+            "remote playlist artwork must use a public absolute HTTPS URL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_playlist_replay_locator(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
+    if media.replay_locator.is_empty()
+        || media.replay_locator.len() > MAX_PLAYLIST_URL_BYTES
+        || media.replay_locator.chars().any(char::is_control)
+    {
+        return Err(invalid_playlist(format!(
+            "playlist replay locator must be printable and at most \
+             {MAX_PLAYLIST_URL_BYTES} bytes"
+        )));
+    }
+    match media.id.source {
+        SourceKind::Local => {
+            let path = Path::new(&media.replay_locator);
+            if !path.is_absolute()
+                || path.file_name().is_none()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+                || media.replay_locator != media.id.external_id
+            {
+                return Err(invalid_playlist(
+                    "Local playlist replay locator must equal its normalized absolute media path",
+                ));
+            }
+        }
+        SourceKind::YouTube => validate_youtube_playlist_snapshot(media)?,
+        SourceKind::ApplePodcasts => validate_apple_playlist_snapshot(media)?,
+        SourceKind::Bandcamp => validate_bandcamp_playlist_snapshot(media)?,
+        _ => {
+            if media.replay_locator != media.webpage_url.as_str()
+                || media.webpage_url.query().is_some()
+            {
+                return Err(invalid_playlist(
+                    "remote playlist replay must equal a canonical queryless webpage",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_youtube_playlist_snapshot(
+    media: &PlaylistMediaSnapshot,
+) -> Result<(), PersistenceError> {
+    validate_youtube_video_id(&media.id.external_id)
+        .map_err(|error| invalid_playlist(format!("invalid YouTube playlist item: {error}")))?;
+    let expected = format!("https://www.youtube.com/watch?v={}", media.id.external_id);
+    if media.webpage_url.as_str() != expected || media.replay_locator != expected {
+        return Err(invalid_playlist(
+            "YouTube playlist replay must use its canonical watch URL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_apple_playlist_snapshot(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
+    if media.id.external_id.starts_with('0')
+        || media.id.external_id.len() > 20
+        || !media
+            .id
+            .external_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_playlist(
+            "Apple Podcasts playlist identity must be a positive episode ID",
+        ));
+    }
+    if media.webpage_url.host_str() != Some("podcasts.apple.com")
+        || media.webpage_url.port().is_some()
+        || media.replay_locator != media.webpage_url.as_str()
+    {
+        return Err(invalid_playlist(
+            "Apple Podcasts replay must use its canonical public episode page",
+        ));
+    }
+    let query = media
+        .webpage_url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if query.as_slice() != [("i".to_owned(), media.id.external_id.clone())] {
+        return Err(invalid_playlist(
+            "Apple Podcasts episode page must contain only its matching `i` parameter",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bandcamp_playlist_snapshot(
+    media: &PlaylistMediaSnapshot,
+) -> Result<(), PersistenceError> {
+    let Some(host) = media
+        .webpage_url
+        .host_str()
+        .and_then(|host| host.strip_suffix(".bandcamp.com"))
+        .filter(|artist| !artist.is_empty() && !artist.contains('.'))
+    else {
+        return Err(invalid_playlist(
+            "Bandcamp playlist items must use an artist subdomain",
+        ));
+    };
+    let segments = match media.webpage_url.path_segments() {
+        Some(segments) => segments.collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    let [kind, slug] = segments.as_slice() else {
+        return Err(invalid_playlist(
+            "Bandcamp playlist items must use one canonical track page",
+        ));
+    };
+    let expected_id = format!("{host}/{kind}/{slug}");
+    if *kind != "track"
+        || slug.is_empty()
+        || media.webpage_url.query().is_some()
+        || media.webpage_url.port().is_some()
+        || media.id.external_id != expected_id
+        || media.replay_locator != media.webpage_url.as_str()
+    {
+        return Err(invalid_playlist(
+            "Bandcamp playlist identity and canonical track page do not match",
+        ));
+    }
+    Ok(())
+}
+
+fn encoded_playlist_snapshot(media: &PlaylistMediaSnapshot) -> Result<String, PersistenceError> {
+    validate_playlist_snapshot(media)?;
+    let encoded = serde_json::to_string(media)?;
+    if encoded.len() > MAX_PLAYLIST_SNAPSHOT_BYTES {
+        return Err(invalid_playlist(format!(
+            "playlist snapshot exceeds {MAX_PLAYLIST_SNAPSHOT_BYTES} encoded bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+fn validate_playlist_segment(
+    segment: &crate::domain::Segment,
+    media: &PlaylistMediaSnapshot,
+) -> Result<(), PersistenceError> {
+    if segment.media_id != media.id {
+        return Err(invalid_playlist(
+            "playlist segment identity does not match its media snapshot",
+        ));
+    }
+    if segment.id < 0
+        || segment.created_at < 0
+        || segment.end_seconds <= segment.start_seconds
+        || media
+            .duration_seconds
+            .is_some_and(|duration| segment.end_seconds > duration)
+    {
+        return Err(invalid_playlist(
+            "playlist segment has an invalid identity, timestamp, or range",
+        ));
+    }
+    if let Some(label) = &segment.label
+        && (label.is_empty()
+            || label.len() > MAX_PLAYLIST_TITLE_BYTES
+            || label.trim() != label
+            || label.chars().any(char::is_control))
+    {
+        return Err(invalid_playlist(format!(
+            "playlist segment label must be trimmed, printable, and at most \
+             {MAX_PLAYLIST_TITLE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state")]
+fn ensure_playlist_capacity(connection: &Connection) -> Result<(), PersistenceError> {
+    let count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM playlists", [], |row| row.get(0))?;
+    let count = usize::try_from(count)
+        .map_err(|_| invalid_playlist("playlist count is outside the supported range"))?;
+    if count >= MAX_PLAYLISTS {
+        return Err(invalid_playlist(format!(
+            "playlist count has reached the {MAX_PLAYLISTS}-playlist limit"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state")]
+fn next_playlist_id(connection: &Connection) -> Result<PlaylistId, PersistenceError> {
+    for _ in 0..4 {
+        let id: String =
+            connection.query_row("SELECT 'local:' || lower(hex(randomblob(16)))", [], |row| {
+                row.get(0)
+            })?;
+        validate_playlist_id(&id)?;
+        let exists = connection
+            .query_row("SELECT 1 FROM playlists WHERE id = ?1", [&id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(id);
+        }
+    }
+    Err(invalid_playlist(
+        "could not allocate a collision-free local playlist ID",
+    ))
+}
+
+#[cfg(feature = "sqlite-state")]
+fn insert_playlist(
+    connection: &Connection,
+    id: &str,
+    name: &str,
+    name_key: &str,
+    description: Option<&str>,
+    created_at: i64,
+) -> Result<(), PersistenceError> {
+    validate_playlist_id(id)?;
+    connection
+        .prepare_cached(
+            r"
+			INSERT INTO playlists (
+				id, name, name_key, description, created_at, updated_at
+			) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+			",
+        )?
+        .execute(params![id, name, name_key, description, created_at])?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state")]
+fn ensure_todo_playlist(
+    connection: &Connection,
+    created_at: i64,
+) -> Result<bool, PersistenceError> {
+    if playlist_summary_by_id(connection, TODO_PLAYLIST_ID)?.is_some() {
+        return Ok(false);
+    }
+    if let Some(owner) = playlist_summary_by_name_key(connection, TODO_PLAYLIST_NAME)? {
+        return Err(invalid_playlist(format!(
+            "reserved todo name is unexpectedly owned by `{}`",
+            owner.id
+        )));
+    }
+    ensure_playlist_capacity(connection)?;
+    insert_playlist(
+        connection,
+        TODO_PLAYLIST_ID,
+        TODO_PLAYLIST_NAME,
+        TODO_PLAYLIST_NAME,
+        None,
+        created_at,
+    )?;
+    Ok(true)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_summary_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistSummary> {
+    let count: i64 = row.get(3)?;
+    let entry_count = usize::try_from(count).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
+    })?;
+    Ok(PlaylistSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        entry_count,
+    })
+}
+
+#[cfg(feature = "sqlite-state")]
+fn validate_playlist_summary(summary: &PlaylistSummary) -> Result<(), PersistenceError> {
+    validate_playlist_id(&summary.id)?;
+    validated_playlist_fields(&summary.name, summary.description.as_deref(), 0)?;
+    if summary.entry_count > MAX_PLAYLIST_ENTRIES {
+        return Err(invalid_playlist(format!(
+            "playlist `{}` exceeds the {MAX_PLAYLIST_ENTRIES}-entry limit",
+            summary.id
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_summary_by_id(
+    connection: &Connection,
+    playlist_id: &str,
+) -> Result<Option<PlaylistSummary>, PersistenceError> {
+    let summary = connection
+        .prepare_cached(
+            r"
+			SELECT p.id, p.name, p.description, COUNT(e.id)
+			FROM playlists AS p
+			LEFT JOIN playlist_entries AS e ON e.playlist_id = p.id
+			WHERE p.id = ?1
+			GROUP BY p.id, p.name, p.description
+			",
+        )?
+        .query_row([playlist_id], playlist_summary_from_row)
+        .optional()?;
+    if let Some(summary) = &summary {
+        validate_playlist_summary(summary)?;
+    }
+    Ok(summary)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_summary_by_name_key(
+    connection: &Connection,
+    name_key: &str,
+) -> Result<Option<PlaylistSummary>, PersistenceError> {
+    let summary = connection
+        .prepare_cached(
+            r"
+			SELECT p.id, p.name, p.description, COUNT(e.id)
+			FROM playlists AS p
+			LEFT JOIN playlist_entries AS e ON e.playlist_id = p.id
+			WHERE p.name_key = ?1
+			GROUP BY p.id, p.name, p.description
+			",
+        )?
+        .query_row([name_key], playlist_summary_from_row)
+        .optional()?;
+    if let Some(summary) = &summary {
+        validate_playlist_summary(summary)?;
+    }
+    Ok(summary)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_summaries(connection: &Connection) -> Result<Vec<PlaylistSummary>, PersistenceError> {
+    let mut statement = connection.prepare_cached(
+        r"
+		SELECT p.id, p.name, p.description, COUNT(e.id)
+		FROM playlists AS p
+		LEFT JOIN playlist_entries AS e ON e.playlist_id = p.id
+		GROUP BY p.id, p.name, p.description, p.name_key
+		ORDER BY p.name_key, p.id
+		LIMIT ?1
+		",
+    )?;
+    let limit = i64::try_from(MAX_PLAYLISTS.saturating_add(1)).expect("playlist bound fits SQLite");
+    let summaries = statement
+        .query_map([limit], playlist_summary_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if summaries.len() > MAX_PLAYLISTS {
+        return Err(invalid_playlist(format!(
+            "playlist count exceeds the {MAX_PLAYLISTS}-playlist limit"
+        )));
+    }
+    for summary in &summaries {
+        validate_playlist_summary(summary)?;
+    }
+    Ok(summaries)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_contains_connection(
+    connection: &Connection,
+    playlist_id: &str,
+    media_id: &MediaId,
+) -> Result<bool, PersistenceError> {
+    Ok(connection
+        .prepare_cached(
+            r"
+			SELECT 1
+			FROM playlist_entries
+			WHERE playlist_id = ?1 AND source = ?2 AND external_id = ?3
+			      AND segment_json IS NULL
+			LIMIT 1
+			",
+        )?
+        .query_row(
+            params![playlist_id, media_id.source.as_str(), media_id.external_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+#[cfg(feature = "sqlite-state")]
+fn add_playlist_entry_in_transaction(
+    connection: &Connection,
+    playlist_id: &str,
+    media: &PlaylistMediaSnapshot,
+    snapshot_json: &str,
+    added_at: i64,
+) -> Result<PlaylistAddOutcome, PersistenceError> {
+    if playlist_summary_by_id(connection, playlist_id)?.is_none() {
+        return Err(invalid_playlist(format!(
+            "playlist `{playlist_id}` does not exist"
+        )));
+    }
+    if playlist_contains_connection(connection, playlist_id, &media.id)? {
+        return Ok(PlaylistAddOutcome::AlreadyPresent);
+    }
+    let (count, maximum_position): (i64, Option<i64>) = connection.query_row(
+        "SELECT COUNT(*), MAX(position) FROM playlist_entries WHERE playlist_id = ?1",
+        [playlist_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = usize::try_from(count)
+        .map_err(|_| invalid_playlist("playlist entry count is outside the supported range"))?;
+    if count >= MAX_PLAYLIST_ENTRIES {
+        return Err(invalid_playlist(format!(
+            "playlist `{playlist_id}` has reached the {MAX_PLAYLIST_ENTRIES}-entry limit"
+        )));
+    }
+    let position = maximum_position
+        .map_or(Some(0), |position| position.checked_add(1))
+        .ok_or_else(|| invalid_playlist("playlist position is too large"))?;
+    connection
+        .prepare_cached(
+            r"
+			INSERT INTO playlist_entries (
+				playlist_id, position, source, external_id,
+				snapshot_json, segment_json, added_at
+			) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+			",
+        )?
+        .execute(params![
+            playlist_id,
+            position,
+            media.id.source.as_str(),
+            media.id.external_id,
+            snapshot_json,
+            added_at,
+        ])?;
+    connection
+        .prepare_cached("UPDATE playlists SET updated_at = ?1 WHERE id = ?2")?
+        .execute(params![added_at, playlist_id])?;
+    Ok(PlaylistAddOutcome::Added)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn remove_playlist_entry_in_transaction(
+    connection: &Connection,
+    playlist_id: &str,
+    media_id: &MediaId,
+    updated_at: i64,
+) -> Result<bool, PersistenceError> {
+    let removed = connection
+        .prepare_cached(
+            r"
+			DELETE FROM playlist_entries
+			WHERE playlist_id = ?1 AND source = ?2 AND external_id = ?3
+			      AND segment_json IS NULL
+			",
+        )?
+        .execute(params![
+            playlist_id,
+            media_id.source.as_str(),
+            media_id.external_id
+        ])?
+        > 0;
+    if removed {
+        connection
+            .prepare_cached("UPDATE playlists SET updated_at = ?1 WHERE id = ?2")?
+            .execute(params![updated_at, playlist_id])?;
+    }
+    Ok(removed)
+}
+
+#[cfg(feature = "sqlite-state")]
+fn playlist_entry_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistEntry> {
+    let source = SourceKind::from(row.get::<_, String>(0)?.as_str());
+    let external_id = row.get::<_, String>(1)?;
+    let snapshot_json = row.get::<_, String>(2)?;
+    if snapshot_json.len() > MAX_PLAYLIST_SNAPSHOT_BYTES {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(invalid_playlist(format!(
+                "stored playlist snapshot exceeds {MAX_PLAYLIST_SNAPSHOT_BYTES} bytes"
+            ))),
+        ));
+    }
+    let media = serde_json::from_str::<PlaylistMediaSnapshot>(&snapshot_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+    })?;
+    validate_playlist_snapshot(&media).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+    })?;
+    if media.id != MediaId::new(source, external_id) {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(invalid_playlist(
+                "playlist row identity does not match its encoded snapshot",
+            )),
+        ));
+    }
+    let segment_json = row.get::<_, Option<String>>(3)?;
+    if segment_json
+        .as_ref()
+        .is_some_and(|json| json.len() > MAX_PLAYLIST_SEGMENT_BYTES)
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            Box::new(invalid_playlist(format!(
+                "stored playlist segment exceeds {MAX_PLAYLIST_SEGMENT_BYTES} bytes"
+            ))),
+        ));
+    }
+    let segment: Option<crate::domain::Segment> = segment_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+        })?;
+    if let Some(segment) = &segment {
+        validate_playlist_segment(segment, &media).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+        })?;
+    }
+    let added_at = row.get(4)?;
+    validate_playlist_timestamp(added_at).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+    })?;
+    Ok(PlaylistEntry {
+        media,
+        segment,
+        added_at,
+    })
+}
+
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalIdentityUpdate {
     old_external_id: String,
     new_external_id: String,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalHistoryUpdate {
     id: i64,
@@ -2287,21 +4750,21 @@ struct LocalHistoryUpdate {
     replay_locator: Option<String>,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalJsonUpdate {
     id: i64,
     json: String,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalSessionUpdate {
     slot: String,
     state_json: String,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalMetadataUpdate {
     old_external_id: String,
@@ -2310,11 +4773,44 @@ struct LocalMetadataUpdate {
     source_url: Option<String>,
 }
 
+/// One validated rewrite of a Local playlist row after a filesystem move.
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[derive(Debug)]
+struct LocalPlaylistEntryUpdate {
+    /// Surrogate row identity used for the guarded update.
+    id: i64,
+    /// Provider identity after remapping the path prefix.
+    external_id: String,
+    /// Bounded playlist snapshot with remapped identity and file URLs.
+    snapshot_json: String,
+    /// Optional bounded segment with its remapped media identity.
+    segment_json: Option<String>,
+}
+
+/// Raw bounded fields read for one Local playlist entry during move planning.
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[derive(Debug)]
+struct LocalPlaylistEntryRow {
+    id: i64,
+    playlist_id: String,
+    external_id: String,
+    snapshot_json: String,
+    segment_json: Option<String>,
+}
+
+/// Collision identity and optional rewrite produced for one Local playlist row.
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[derive(Debug)]
+struct PreparedLocalPlaylistEntry {
+    whole_media_owner: Option<((String, String), String)>,
+    update: Option<LocalPlaylistEntryUpdate>,
+}
+
 /// One validated rewrite of a Local subscription snapshot.
 ///
 /// The row key and its embedded summaries are applied together so readers can
 /// never observe a moved folder identity paired with stale descendant paths.
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug)]
 struct LocalSubscriptionItemsUpdate {
     /// Folder identity currently stored in the composite primary key.
@@ -2325,7 +4821,7 @@ struct LocalSubscriptionItemsUpdate {
     items_json: String,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 #[derive(Debug, Default)]
 struct LocalMoveStatePlan {
     playback_progress: Vec<LocalIdentityUpdate>,
@@ -2335,9 +4831,10 @@ struct LocalMoveStatePlan {
     sessions: Vec<LocalSessionUpdate>,
     metadata_cache: Vec<LocalMetadataUpdate>,
     subscription_items_cache: Vec<LocalSubscriptionItemsUpdate>,
+    playlist_entries: Vec<LocalPlaylistEntryUpdate>,
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 impl LocalMoveStatePlan {
     fn report(&self) -> LocalMoveStateRemap {
         LocalMoveStateRemap {
@@ -2348,6 +4845,7 @@ impl LocalMoveStatePlan {
             sessions: self.sessions.len(),
             metadata_cache: self.metadata_cache.len(),
             subscription_items_cache: self.subscription_items_cache.len(),
+            playlist_entries: self.playlist_entries.len(),
         }
     }
 }
@@ -2359,7 +4857,7 @@ fn invalid_local_move_state(reason: impl Into<String>) -> PersistenceError {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn local_move_path_text<'a>(
     path: &'a Path,
     field: &'static str,
@@ -2493,6 +4991,7 @@ fn local_paths_overlap(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_move_state_remap(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2509,10 +5008,206 @@ fn prepare_local_move_state_remap(
         sessions: prepare_local_session_updates(connection, mappings)?,
         metadata_cache: prepare_local_metadata_updates(connection, mappings)?,
         subscription_items_cache: prepare_local_subscription_items_updates(connection, mappings)?,
+        playlist_entries: prepare_local_playlist_entry_updates(connection, mappings)?,
     })
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
+fn prepare_local_playlist_entry_updates(
+    connection: &Connection,
+    mappings: &[LocalMoveMapping],
+) -> Result<Vec<LocalPlaylistEntryUpdate>, PersistenceError> {
+    let mut statement = connection.prepare(
+        r"
+        SELECT id, playlist_id, external_id, snapshot_json, segment_json
+        FROM playlist_entries
+        WHERE source = 'local'
+        ORDER BY playlist_id, position, id
+        ",
+    )?;
+    let rows = statement
+        .query_map([], local_playlist_entry_row_from_sql)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let maximum_rows = MAX_PLAYLISTS.saturating_mul(MAX_PLAYLIST_ENTRIES);
+    if rows.len() > maximum_rows {
+        return Err(invalid_local_move_state(format!(
+            "playlist_entries exceeds the {maximum_rows}-row Local remap bound"
+        )));
+    }
+
+    // Whole-media rows are unique within one playlist. Build the complete
+    // final-owner map, including unchanged target rows, before applying any
+    // update so a stale destination cannot be overwritten or merged.
+    let mut whole_media_owners = HashMap::<(String, String), String>::with_capacity(rows.len());
+    let mut updates = Vec::new();
+    for row in rows {
+        let prepared = prepare_one_local_playlist_entry(row, mappings)?;
+        if let Some((identity, external_id)) = prepared.whole_media_owner
+            && let Some(owner) = whole_media_owners.insert(identity.clone(), external_id.clone())
+            && owner != external_id
+        {
+            return Err(invalid_local_move_state(format!(
+                "playlist `{}` destination identity `{}` conflicts between \
+                 `{owner}` and `{external_id}`",
+                identity.0, identity.1
+            )));
+        }
+        if let Some(update) = prepared.update {
+            updates.push(update);
+        }
+    }
+    Ok(updates)
+}
+
+#[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
+fn local_playlist_entry_row_from_sql(row: &Row<'_>) -> rusqlite::Result<LocalPlaylistEntryRow> {
+    Ok(LocalPlaylistEntryRow {
+        id: row.get(0)?,
+        playlist_id: row.get(1)?,
+        external_id: row.get(2)?,
+        snapshot_json: row.get(3)?,
+        segment_json: row.get(4)?,
+    })
+}
+
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+fn decode_local_playlist_entry(
+    row: &LocalPlaylistEntryRow,
+) -> Result<(PlaylistMediaSnapshot, Option<crate::domain::Segment>), PersistenceError> {
+    validate_playlist_id(&row.playlist_id).map_err(|error| {
+        invalid_local_move_state(format!(
+            "playlist entry {} has invalid playlist identity: {error}",
+            row.id
+        ))
+    })?;
+    if row.snapshot_json.len() > MAX_PLAYLIST_SNAPSHOT_BYTES {
+        return Err(invalid_local_move_state(format!(
+            "playlist entry {} snapshot exceeds {MAX_PLAYLIST_SNAPSHOT_BYTES} bytes",
+            row.id
+        )));
+    }
+    if row
+        .segment_json
+        .as_ref()
+        .is_some_and(|json| json.len() > MAX_PLAYLIST_SEGMENT_BYTES)
+    {
+        return Err(invalid_local_move_state(format!(
+            "playlist entry {} segment exceeds {MAX_PLAYLIST_SEGMENT_BYTES} bytes",
+            row.id
+        )));
+    }
+
+    let media: PlaylistMediaSnapshot = serde_json::from_str(&row.snapshot_json)?;
+    validate_playlist_snapshot(&media).map_err(|error| {
+        invalid_local_move_state(format!(
+            "playlist entry {} contains an invalid snapshot: {error}",
+            row.id
+        ))
+    })?;
+    if media.id.source != SourceKind::Local || media.id.external_id != row.external_id {
+        return Err(invalid_local_move_state(format!(
+            "playlist entry {} Local row identity does not match its snapshot",
+            row.id
+        )));
+    }
+    let segment = row
+        .segment_json
+        .as_deref()
+        .map(serde_json::from_str::<crate::domain::Segment>)
+        .transpose()?;
+    if let Some(segment) = &segment {
+        validate_playlist_segment(segment, &media).map_err(|error| {
+            invalid_local_move_state(format!(
+                "playlist entry {} contains an invalid segment: {error}",
+                row.id
+            ))
+        })?;
+    }
+    Ok((media, segment))
+}
+
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
+fn prepare_one_local_playlist_entry(
+    row: LocalPlaylistEntryRow,
+    mappings: &[LocalMoveMapping],
+) -> Result<PreparedLocalPlaylistEntry, PersistenceError> {
+    let (mut media, mut segment) = decode_local_playlist_entry(&row)?;
+    let identity_changed =
+        remap_local_media_id(&mut media.id, mappings).map_err(local_identity_remap_error)?;
+    let replay_changed = remap_local_replay_locator(&mut media.replay_locator, mappings)
+        .map_err(local_identity_remap_error)?;
+    let webpage_changed = remap_local_file_url(&mut media.webpage_url, mappings)?;
+    let thumbnail_changed = media
+        .thumbnail_url
+        .as_mut()
+        .map(|url| remap_local_file_url(url, mappings))
+        .transpose()?
+        .unwrap_or(false);
+    let segment_changed = segment
+        .as_mut()
+        .map(|segment| {
+            remap_local_media_id(&mut segment.media_id, mappings)
+                .map_err(local_identity_remap_error)
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let new_external_id = media.id.external_id.clone();
+    let whole_media_owner = segment
+        .is_none()
+        .then(|| ((row.playlist_id, new_external_id.clone()), row.external_id));
+    let changed = identity_changed
+        || replay_changed
+        || webpage_changed
+        || thumbnail_changed
+        || segment_changed;
+    if !changed {
+        return Ok(PreparedLocalPlaylistEntry {
+            whole_media_owner,
+            update: None,
+        });
+    }
+
+    if let Some(segment) = &segment {
+        validate_playlist_segment(segment, &media).map_err(|error| {
+            invalid_local_move_state(format!(
+                "playlist entry {} remapped segment is invalid: {error}",
+                row.id
+            ))
+        })?;
+    }
+    let snapshot_json = encoded_playlist_snapshot(&media).map_err(|error| {
+        invalid_local_move_state(format!(
+            "playlist entry {} remapped snapshot is invalid: {error}",
+            row.id
+        ))
+    })?;
+    let segment_json = segment.as_ref().map(serde_json::to_string).transpose()?;
+    if segment_json
+        .as_ref()
+        .is_some_and(|json| json.len() > MAX_PLAYLIST_SEGMENT_BYTES)
+    {
+        return Err(invalid_local_move_state(format!(
+            "playlist entry {} remapped segment exceeds {MAX_PLAYLIST_SEGMENT_BYTES} bytes",
+            row.id
+        )));
+    }
+    Ok(PreparedLocalPlaylistEntry {
+        whole_media_owner,
+        update: Some(LocalPlaylistEntryUpdate {
+            id: row.id,
+            external_id: new_external_id,
+            snapshot_json,
+            segment_json,
+        }),
+    })
+}
+
+#[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_keyed_identity_updates(
     connection: &Connection,
     table: &'static str,
@@ -2555,6 +5250,7 @@ fn prepare_local_keyed_identity_updates(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_subscription_items_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2674,7 +5370,7 @@ fn prepare_local_subscription_items_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remap_local_subscription_items(
     source_id: &str,
     items: &mut [SearchItem],
@@ -2721,6 +5417,7 @@ fn remap_local_subscription_items(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_history_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2770,6 +5467,7 @@ fn prepare_local_history_updates(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_comment_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2787,7 +5485,11 @@ fn prepare_local_comment_updates(
     for (id, target_json) in rows {
         let mut target: CommentTarget = serde_json::from_str(&target_json)?;
         let changed = match &mut target {
-            CommentTarget::Media { media_id } | CommentTarget::Position { media_id, .. } => {
+            CommentTarget::Media { media_id }
+            | CommentTarget::Source {
+                source_id: media_id,
+            }
+            | CommentTarget::Position { media_id, .. } => {
                 remap_local_media_id(media_id, mappings).map_err(local_identity_remap_error)?
             }
             CommentTarget::Segment { .. } | CommentTarget::Subscription { .. } => false,
@@ -2803,6 +5505,7 @@ fn prepare_local_comment_updates(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_bookmark_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2829,6 +5532,7 @@ fn prepare_local_bookmark_updates(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_session_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2867,6 +5571,7 @@ fn prepare_local_session_updates(
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn prepare_local_metadata_updates(
     connection: &Connection,
     mappings: &[LocalMoveMapping],
@@ -2932,7 +5637,7 @@ fn prepare_local_metadata_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remapped_local_external_id(
     external_id: &str,
     mappings: &[LocalMoveMapping],
@@ -2945,7 +5650,7 @@ fn remapped_local_external_id(
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remap_local_string_path(
     path: &mut String,
     mappings: &[LocalMoveMapping],
@@ -2963,7 +5668,7 @@ fn remap_local_string_path(
     Ok(true)
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remap_local_screen(
     screen: &mut crate::domain::Screen,
     mappings: &[LocalMoveMapping],
@@ -2976,7 +5681,7 @@ fn remap_local_screen(
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remap_local_media_file_urls(
     media: &mut MediaItem,
     mappings: &[LocalMoveMapping],
@@ -2991,7 +5696,7 @@ fn remap_local_media_file_urls(
     Ok(changed)
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn remap_local_file_url(
     url: &mut Url,
     mappings: &[LocalMoveMapping],
@@ -3019,7 +5724,7 @@ fn remap_local_file_url(
     Ok(true)
 }
 
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn local_identity_remap_error(error: LocalIdentityRemapError) -> PersistenceError {
     match error {
         LocalIdentityRemapError::NonUtf8Destination(path) => invalid_local_move_state(format!(
@@ -3030,6 +5735,7 @@ fn local_identity_remap_error(error: LocalIdentityRemapError) -> PersistenceErro
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
 fn apply_local_move_state_remap(
     connection: &Connection,
     plan: &LocalMoveStatePlan,
@@ -3126,10 +5832,38 @@ fn apply_local_move_state_remap(
             "subscription_items_cache",
         )?;
     }
+    apply_local_playlist_entry_updates(connection, &plan.playlist_entries)?;
     Ok(())
 }
 
 #[cfg(feature = "local")]
+#[cfg(feature = "sqlite-state")]
+fn apply_local_playlist_entry_updates(
+    connection: &Connection,
+    updates: &[LocalPlaylistEntryUpdate],
+) -> Result<(), PersistenceError> {
+    for update in updates {
+        ensure_one_local_move_row(
+            connection.execute(
+                r"
+                UPDATE playlist_entries
+                SET external_id = ?1, snapshot_json = ?2, segment_json = ?3
+                WHERE id = ?4 AND source = 'local'
+                ",
+                params![
+                    update.external_id,
+                    update.snapshot_json,
+                    update.segment_json,
+                    update.id
+                ],
+            )?,
+            "playlist_entries",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "local", feature = "sqlite-state"))]
 fn ensure_one_local_move_row(changed: usize, table: &'static str) -> Result<(), PersistenceError> {
     if changed == 1 {
         Ok(())
@@ -3658,6 +6392,7 @@ fn validate_cached_subscription_items(
     Ok(())
 }
 
+#[cfg(feature = "sqlite-state")]
 fn run_migrations(connection: &Connection) -> Result<(), PersistenceError> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current > SCHEMA_VERSION {
@@ -3687,8 +6422,35 @@ fn run_migrations(connection: &Connection) -> Result<(), PersistenceError> {
     Ok(())
 }
 
+#[cfg(feature = "sqlite-state")]
 fn to_sql_u64(value: u64, field: &'static str) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| PersistenceError::IntegerOutOfRange { field })
+}
+
+#[cfg(feature = "sqlite-state")]
+fn add_sqlite_listen_seconds(
+    connection: &Connection,
+    source: &SourceKind,
+    seconds: i64,
+) -> Result<(), PersistenceError> {
+    let maximum_existing = i64::MAX - seconds;
+    let changed = connection
+        .prepare_cached(
+            r"
+			INSERT INTO listen_totals (source, total_seconds)
+			VALUES (?1, ?2)
+			ON CONFLICT(source) DO UPDATE SET
+				total_seconds = listen_totals.total_seconds + excluded.total_seconds
+			WHERE listen_totals.total_seconds <= ?3
+			",
+        )?
+        .execute(params![source.as_str(), seconds, maximum_existing])?;
+    if changed == 0 {
+        return Err(PersistenceError::IntegerOutOfRange {
+            field: "listen seconds",
+        });
+    }
+    Ok(())
 }
 
 /// Enforces the same replay-locator byte bound as the schema migration.
@@ -3800,22 +6562,26 @@ fn validate_history_replay_locator(
     Ok(())
 }
 
+#[cfg(feature = "sqlite-state")]
 fn from_sql_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
     from_sql_u64_value(row.get(index)?, index)
 }
 
+#[cfg(feature = "sqlite-state")]
 fn from_sql_optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(index)?
         .map(|value| from_sql_u64_value(value, index))
         .transpose()
 }
 
+#[cfg(feature = "sqlite-state")]
 fn from_sql_u64_value(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(index, Type::Integer, Box::new(error))
     })
 }
 
+#[cfg(feature = "sqlite-state")]
 fn playback_progress_from_row(row: &Row<'_>) -> rusqlite::Result<PlaybackProgress> {
     Ok(PlaybackProgress {
         media_id: MediaId::new(
@@ -3829,6 +6595,7 @@ fn playback_progress_from_row(row: &Row<'_>) -> rusqlite::Result<PlaybackProgres
     })
 }
 
+#[cfg(feature = "sqlite-state")]
 fn history_entry_from_row(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {
     Ok(HistoryEntry {
         id: row.get(0)?,
@@ -3846,6 +6613,7 @@ fn history_entry_from_row(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {
     })
 }
 
+#[cfg(feature = "sqlite-state")]
 fn private_comment_from_row(row: &Row<'_>) -> rusqlite::Result<PrivateComment> {
     let target_json: String = row.get(1)?;
     let target = serde_json::from_str(&target_json).map_err(|error| {
@@ -3860,6 +6628,7 @@ fn private_comment_from_row(row: &Row<'_>) -> rusqlite::Result<PrivateComment> {
     })
 }
 
+#[cfg(feature = "sqlite-state")]
 fn bookmark_from_row(row: &Row<'_>) -> rusqlite::Result<Bookmark> {
     Ok(Bookmark {
         id: row.get(0)?,
@@ -3874,6 +6643,7 @@ fn bookmark_from_row(row: &Row<'_>) -> rusqlite::Result<Bookmark> {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "sqlite-state")]
 fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3882,17 +6652,19 @@ fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[cfg(feature = "sqlite-state")]
 fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite-state"))]
 mod tests {
     #[cfg(feature = "local")]
     use std::path::PathBuf;
 
     use tempfile::tempdir;
 
+    use super::SqliteStateStore as StateStore;
     use super::*;
     #[cfg(feature = "local")]
     use crate::domain::CaptionTrack;
@@ -4097,6 +6869,81 @@ mod tests {
             episode_count: Some(42),
             genres: vec!["Technology".to_owned(), "Podcasts".to_owned()],
             explicit: Some(false),
+        }
+    }
+
+    fn youtube_playlist_media(video_id: &str, title: &str) -> PlaylistMediaSnapshot {
+        let webpage_url = Url::parse(&format!("https://www.youtube.com/watch?v={video_id}"))
+            .expect("valid YouTube playlist fixture URL");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::YouTube, video_id),
+            kind: MediaKind::Video,
+            title: title.to_owned(),
+            creator: Some("Fixture channel".to_owned()),
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: Some(
+                Url::parse(&format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"))
+                    .expect("valid YouTube artwork fixture URL"),
+            ),
+            duration_seconds: Some(180),
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
+    fn apple_playlist_media(episode_id: &str) -> PlaylistMediaSnapshot {
+        let webpage_url = Url::parse(&format!(
+            "https://podcasts.apple.com/us/podcast/fixture/id123456789?i={episode_id}"
+        ))
+        .expect("valid Apple episode fixture URL");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::ApplePodcasts, episode_id),
+            kind: MediaKind::PodcastEpisode,
+            title: format!("Fixture episode {episode_id}"),
+            creator: Some("Fixture podcast".to_owned()),
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: Some(
+                Url::parse("https://is1-ssl.mzstatic.com/image/thumb/fixture/600x600.jpg")
+                    .expect("valid Apple artwork fixture URL"),
+            ),
+            duration_seconds: Some(3_600),
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
+    fn bandcamp_playlist_media(slug: &str) -> PlaylistMediaSnapshot {
+        let webpage_url = Url::parse(&format!("https://fixture-artist.bandcamp.com/track/{slug}"))
+            .expect("valid Bandcamp track fixture URL");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::Bandcamp, format!("fixture-artist/track/{slug}")),
+            kind: MediaKind::Audio,
+            title: slug.replace('-', " "),
+            creator: Some("Fixture Artist".to_owned()),
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: Some(
+                Url::parse("https://f4.bcbits.com/img/a1234567890_16.jpg")
+                    .expect("valid Bandcamp artwork fixture URL"),
+            ),
+            duration_seconds: Some(240),
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
+    #[cfg(feature = "local")]
+    fn local_playlist_media(path: &Path, artwork: Option<&Path>) -> PlaylistMediaSnapshot {
+        PlaylistMediaSnapshot {
+            id: local_media_id(path),
+            kind: MediaKind::Audio,
+            title: path
+                .file_name()
+                .expect("fixture filename")
+                .to_string_lossy()
+                .into_owned(),
+            creator: Some("Fixture Artist".to_owned()),
+            webpage_url: Url::from_file_path(path).expect("fixture media file URL"),
+            thumbnail_url: artwork
+                .map(|artwork| Url::from_file_path(artwork).expect("fixture artwork file URL")),
+            duration_seconds: Some(180),
+            replay_locator: path.to_str().expect("UTF-8 fixture media path").to_owned(),
         }
     }
 
@@ -4481,6 +7328,574 @@ mod tests {
     }
 
     #[test]
+    fn migration_from_v11_preserves_state_and_adds_empty_playlist_tables() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=11_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        connection
+            .execute(
+                r"
+                INSERT INTO playback_progress (
+                    source, external_id, position_seconds, duration_seconds,
+                    played_override, updated_at
+                ) VALUES ('youtube', 'dQw4w9WgXcQ', 42, 180, NULL, 11)
+                ",
+                [],
+            )
+            .expect("seed version-eleven progress");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .progress(&id("dQw4w9WgXcQ"))
+                .expect("preserved progress")
+                .expect("version-eleven progress")
+                .position_seconds,
+            42
+        );
+        assert!(store.playlists().expect("new playlists table").is_empty());
+        assert!(
+            store
+                .playlist(TODO_PLAYLIST_ID)
+                .expect("new playlist entries table")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn todo_playlist_is_lazy_idempotent_and_survives_restart() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let original = youtube_playlist_media("dQw4w9WgXcQ", "First captured title");
+
+        {
+            let store = StateStore::open(&config).expect("open state store");
+            assert!(
+                store
+                    .playlist(TODO_PLAYLIST_ID)
+                    .expect("read absent todo")
+                    .is_none()
+            );
+            assert_eq!(
+                store.add_to_todo(&original, 10).expect("add to todo"),
+                PlaylistAddOutcome::Added
+            );
+            let mut youtube_music_view = original.clone();
+            youtube_music_view.kind = MediaKind::Audio;
+            youtube_music_view.title = "Later YouTube Music title".to_owned();
+            assert_eq!(
+                store
+                    .add_to_todo(&youtube_music_view, 20)
+                    .expect("repeat todo add"),
+                PlaylistAddOutcome::AlreadyPresent
+            );
+        }
+
+        let reopened = StateStore::open(&config).expect("reopen state store");
+        let playlist = reopened
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("read todo")
+            .expect("todo playlist");
+        assert_eq!(playlist.id, TODO_PLAYLIST_ID);
+        assert_eq!(playlist.name, TODO_PLAYLIST_NAME);
+        assert_eq!(playlist.description, None);
+        assert_eq!(playlist.entries.len(), 1);
+        assert_eq!(playlist.entries[0].media, original);
+        assert_eq!(playlist.entries[0].added_at, 10);
+        assert!(
+            reopened
+                .todo_contains(&id("dQw4w9WgXcQ"))
+                .expect("todo membership")
+        );
+    }
+
+    #[test]
+    fn playlist_crud_preserves_case_insensitive_names_order_and_memberships() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let created = store
+            .create_playlist("Планы", Some("Things to hear"), 1)
+            .expect("create playlist");
+        let PlaylistCreateOutcome::Created(summary) = created else {
+            panic!("expected a new playlist");
+        };
+        assert_eq!(summary.description.as_deref(), Some("Things to hear"));
+        assert_eq!(
+            store
+                .create_playlist("пЛаНы", Some("Must not replace"), 2)
+                .expect("repeat playlist"),
+            PlaylistCreateOutcome::Existing(summary.clone())
+        );
+
+        let first = youtube_playlist_media("abcdefghijk", "First");
+        let second = apple_playlist_media("9876543210");
+        let third = bandcamp_playlist_media("third-track");
+        for (timestamp, media) in [(10, &first), (11, &second), (12, &third)] {
+            assert_eq!(
+                store
+                    .add_playlist_entry(&summary.id, media, timestamp)
+                    .expect("append playlist item"),
+                PlaylistAddOutcome::Added
+            );
+        }
+        assert_eq!(
+            store
+                .add_playlist_entry(&summary.id, &first, 99)
+                .expect("repeat playlist item"),
+            PlaylistAddOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            store
+                .playlist_memberships(&second.id)
+                .expect("playlist memberships"),
+            vec![summary.id.clone()]
+        );
+        assert!(
+            store
+                .remove_playlist_entry(&summary.id, &second.id, 20)
+                .expect("remove playlist item")
+        );
+        assert!(
+            !store
+                .remove_playlist_entry(&summary.id, &second.id, 21)
+                .expect("repeat remove")
+        );
+        assert_eq!(
+            store
+                .toggle_playlist_entry(&summary.id, &second, 22)
+                .expect("toggle item on"),
+            PlaylistToggleOutcome::Added
+        );
+        assert_eq!(
+            store
+                .playlist(&summary.id)
+                .expect("read playlist")
+                .expect("playlist")
+                .entries
+                .iter()
+                .map(|entry| entry.media.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "third track", "Fixture episode 9876543210"]
+        );
+
+        let updated = store
+            .update_playlist(&summary.id, "Listening queue", None, 30)
+            .expect("update playlist")
+            .expect("updated playlist");
+        assert_eq!(updated.name, "Listening queue");
+        assert_eq!(updated.description, None);
+        assert!(matches!(
+            store
+                .update_playlist(&summary.id, "todo", None, 31)
+                .expect_err("reserved todo name"),
+            PersistenceError::InvalidPlaylist { .. }
+        ));
+        assert_eq!(
+            store
+                .toggle_playlist_entry(&summary.id, &second, 32)
+                .expect("toggle item off"),
+            PlaylistToggleOutcome::Removed
+        );
+        assert!(
+            store
+                .playlist_memberships(&second.id)
+                .expect("removed memberships")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn playlist_memberships_with_names_returns_current_names_and_fixed_todo_identity() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let target = youtube_playlist_media("dQw4w9WgXcQ", "Membership target");
+        store.add_to_todo(&target, 1).expect("add target to todo");
+        store
+            .update_playlist(TODO_PLAYLIST_ID, "Listen later", None, 2)
+            .expect("rename todo")
+            .expect("todo playlist");
+        let PlaylistCreateOutcome::Created(zulu) = store
+            .create_playlist("Zulu", None, 3)
+            .expect("create Zulu playlist")
+        else {
+            panic!("expected new Zulu playlist");
+        };
+        let PlaylistCreateOutcome::Created(alpha) = store
+            .create_playlist("Alpha", None, 4)
+            .expect("create Alpha playlist")
+        else {
+            panic!("expected new Alpha playlist");
+        };
+        let PlaylistCreateOutcome::Created(segment_only) = store
+            .create_playlist("Segment only", None, 5)
+            .expect("create segment-only playlist")
+        else {
+            panic!("expected new segment-only playlist");
+        };
+        store
+            .add_playlist_entry(&zulu.id, &target, 6)
+            .expect("add target to Zulu");
+        store
+            .add_playlist_entry(&alpha.id, &target, 7)
+            .expect("add target to Alpha");
+        let segment_json = serde_json::to_string(
+            &crate::domain::Segment::new(1, target.id.clone(), 10, 20, None, 8)
+                .expect("valid segment fixture"),
+        )
+        .expect("encode segment fixture");
+        store
+            .connection
+            .execute(
+                r"
+				INSERT INTO playlist_entries (
+					playlist_id, position, source, external_id, snapshot_json,
+					segment_json, added_at
+					) VALUES (?1, 0, ?2, ?3, ?4, ?5, 8)
+				",
+                params![
+                    segment_only.id,
+                    target.id.source.as_str(),
+                    target.id.external_id,
+                    encoded_playlist_snapshot(&target).expect("encode target snapshot"),
+                    segment_json
+                ],
+            )
+            .expect("insert segment-only fixture");
+
+        let memberships = store
+            .playlist_memberships_with_names(&target.id)
+            .expect("membership names");
+
+        assert_eq!(
+            memberships,
+            vec![
+                PlaylistMembership {
+                    playlist_id: alpha.id,
+                    playlist_name: "Alpha".to_owned(),
+                },
+                PlaylistMembership {
+                    playlist_id: TODO_PLAYLIST_ID.to_owned(),
+                    playlist_name: "Listen later".to_owned(),
+                },
+                PlaylistMembership {
+                    playlist_id: zulu.id,
+                    playlist_name: "Zulu".to_owned(),
+                },
+            ]
+        );
+        assert!(
+            memberships
+                .iter()
+                .any(|membership| membership.playlist_id == TODO_PLAYLIST_ID),
+            "Todo is identified by its stable ID after a rename"
+        );
+        assert!(
+            memberships
+                .iter()
+                .all(|membership| membership.playlist_id != segment_only.id),
+            "a saved segment alone is not complete-item membership"
+        );
+    }
+
+    #[test]
+    fn playlist_membership_name_query_uses_media_index_with_large_unrelated_library() {
+        const UNRELATED_PLAYLISTS: usize = 768;
+
+        let store = StateStore::open_in_memory().expect("open store");
+        let target = youtube_playlist_media("dQw4w9WgXcQ", "Indexed target");
+        let PlaylistCreateOutcome::Created(target_playlist) = store
+            .create_playlist_with_entry("Target", None, &target, 1)
+            .expect("create target playlist")
+        else {
+            panic!("expected target playlist");
+        };
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("start fixture transaction");
+        {
+            let mut playlist_statement = transaction
+                .prepare_cached(
+                    r"
+					INSERT INTO playlists (
+						id, name, name_key, description, created_at, updated_at
+					) VALUES (?1, ?2, ?3, NULL, 2, 2)
+					",
+                )
+                .expect("prepare playlist fixture insert");
+            let mut entry_statement = transaction
+                .prepare_cached(
+                    r"
+					INSERT INTO playlist_entries (
+						playlist_id, position, source, external_id, snapshot_json,
+						segment_json, added_at
+					) VALUES (?1, 0, ?2, ?3, ?4, NULL, 2)
+					",
+                )
+                .expect("prepare entry fixture insert");
+            for index in 0..UNRELATED_PLAYLISTS {
+                let playlist_id = format!("bulk:{index:04}");
+                let playlist_name = format!("Bulk {index:04}");
+                let playlist_name_key = format!("bulk {index:04}");
+                let unrelated =
+                    youtube_playlist_media(&format!("bulk{index:07}"), "Unrelated fixture");
+                let snapshot =
+                    encoded_playlist_snapshot(&unrelated).expect("encode unrelated snapshot");
+                playlist_statement
+                    .execute(params![playlist_id, playlist_name, playlist_name_key])
+                    .expect("insert unrelated playlist");
+                entry_statement
+                    .execute(params![
+                        playlist_id,
+                        unrelated.id.source.as_str(),
+                        unrelated.id.external_id,
+                        snapshot
+                    ])
+                    .expect("insert unrelated playlist entry");
+            }
+        }
+        transaction.commit().expect("commit large fixture");
+
+        assert_eq!(
+            store
+                .playlist_memberships_with_names(&target.id)
+                .expect("indexed membership lookup"),
+            vec![PlaylistMembership {
+                playlist_id: target_playlist.id,
+                playlist_name: target_playlist.name,
+            }]
+        );
+
+        let explain_sql = format!("EXPLAIN QUERY PLAN {PLAYLIST_MEMBERSHIPS_WITH_NAMES_SQL}");
+        let limit =
+            i64::try_from(MAX_PLAYLISTS.saturating_add(1)).expect("membership limit fits SQLite");
+        let mut statement = store
+            .connection
+            .prepare(&explain_sql)
+            .expect("prepare membership query plan");
+        let plan = statement
+            .query_map(
+                params![target.id.source.as_str(), target.id.external_id, limit],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("read membership query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect membership query plan");
+        assert!(
+            plan.first().is_some_and(|step| {
+                step.contains("SEARCH e") && step.contains("playlist_entries_media")
+            }),
+            "membership lookup must start from an indexed media search: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("SCAN e")),
+            "membership lookup must not scan playlist entries: {plan:?}"
+        );
+        let normalized_sql = PLAYLIST_MEMBERSHIPS_WITH_NAMES_SQL.to_ascii_uppercase();
+        assert!(!normalized_sql.contains("COUNT("));
+        assert!(!normalized_sql.contains("GROUP BY"));
+    }
+
+    #[test]
+    fn renamed_todo_keeps_fixed_quick_action_identity() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let first = youtube_playlist_media("abcdefghijk", "First");
+        let second = youtube_playlist_media("ZYXWVUTSRQP", "Second");
+        store.add_to_todo(&first, 1).expect("create todo");
+        let renamed = store
+            .update_playlist(TODO_PLAYLIST_ID, "Listen later", Some("Private queue"), 2)
+            .expect("rename todo")
+            .expect("todo playlist");
+        assert_eq!(renamed.id, TODO_PLAYLIST_ID);
+        assert_eq!(renamed.name, "Listen later");
+        store
+            .add_to_todo(&second, 3)
+            .expect("quick add after rename");
+
+        let PlaylistCreateOutcome::Existing(todo_by_reserved_name) = store
+            .create_playlist("TODO", None, 4)
+            .expect("reserved name lookup")
+        else {
+            panic!("fixed todo should already exist");
+        };
+        assert_eq!(todo_by_reserved_name.id, TODO_PLAYLIST_ID);
+        assert_eq!(todo_by_reserved_name.name, "Listen later");
+        assert_eq!(
+            store
+                .playlist(TODO_PLAYLIST_ID)
+                .expect("read todo")
+                .expect("todo")
+                .entries
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn create_playlist_with_entry_is_atomic_and_reports_name_conflicts() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let media = bandcamp_playlist_media("atomic-track");
+        let PlaylistCreateOutcome::Created(created) = store
+            .create_playlist_with_entry("Atomic", Some("One transaction"), &media, 1)
+            .expect("create playlist with entry")
+        else {
+            panic!("expected created playlist");
+        };
+        assert_eq!(created.entry_count, 1);
+        assert_eq!(
+            store
+                .create_playlist_with_entry(
+                    "ATOMIC",
+                    Some("Must not replace"),
+                    &youtube_playlist_media("abcdefghijk", "Other"),
+                    2,
+                )
+                .expect("existing-name result"),
+            PlaylistCreateOutcome::Existing(created)
+        );
+
+        let mut invalid = youtube_playlist_media("dQw4w9WgXcQ", "Invalid URL");
+        invalid.webpage_url =
+            Url::parse("https://www.youtube.com/watch?v=abcdefghijk").expect("fixture URL");
+        assert!(matches!(
+            store.create_playlist_with_entry("Invalid snapshot", None, &invalid, 3),
+            Err(PersistenceError::InvalidPlaylist { .. })
+        ));
+        assert!(
+            store
+                .playlists()
+                .expect("playlists after validation failure")
+                .iter()
+                .all(|playlist| playlist.name != "Invalid snapshot")
+        );
+
+        store
+            .connection
+            .execute_batch(
+                r"
+                CREATE TRIGGER reject_atomic_playlist_entry
+                BEFORE INSERT ON playlist_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected playlist-entry failure');
+                END;
+                ",
+            )
+            .expect("install failure trigger");
+        assert!(matches!(
+            store.create_playlist_with_entry("Rollback", None, &media, 4),
+            Err(PersistenceError::Sqlite(_))
+        ));
+        assert!(
+            store
+                .playlists()
+                .expect("playlists after insertion failure")
+                .iter()
+                .all(|playlist| playlist.name != "Rollback")
+        );
+    }
+
+    #[test]
+    fn playlist_snapshots_reject_noncanonical_or_oversized_state() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let PlaylistCreateOutcome::Created(playlist) = store
+            .create_playlist("Validation", None, 1)
+            .expect("create validation playlist")
+        else {
+            panic!("expected new validation playlist");
+        };
+
+        let mut youtube = youtube_playlist_media("dQw4w9WgXcQ", "YouTube");
+        youtube.replay_locator = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10".to_owned();
+        let mut apple = apple_playlist_media("9876543210");
+        apple.webpage_url = Url::parse("https://podcasts.apple.com/us/podcast/fixture/id123?i=111")
+            .expect("mismatched Apple fixture");
+        let mut bandcamp = bandcamp_playlist_media("fixture-track");
+        bandcamp.webpage_url =
+            Url::parse("https://fixture-artist.bandcamp.com/album/fixture-track")
+                .expect("Bandcamp album fixture");
+        bandcamp.replay_locator = bandcamp.webpage_url.to_string();
+        let mut remote = bandcamp_playlist_media("query-track");
+        remote.id = MediaId::new(SourceKind::Rss, "episode-one");
+        remote.webpage_url =
+            Url::parse("https://feeds.example.test/episode?token=signed").expect("signed URL");
+        remote.replay_locator = remote.webpage_url.to_string();
+        let mut oversized = youtube_playlist_media("abcdefghijk", "Oversized");
+        oversized.title = "x".repeat(MAX_PLAYLIST_TITLE_BYTES + 1);
+
+        for snapshot in [youtube, apple, bandcamp, remote, oversized] {
+            assert!(matches!(
+                store.add_playlist_entry(&playlist.id, &snapshot, 2),
+                Err(PersistenceError::InvalidPlaylist { .. })
+            ));
+        }
+        assert_eq!(
+            store
+                .playlist(&playlist.id)
+                .expect("validation playlist")
+                .expect("playlist")
+                .entries,
+            Vec::new()
+        );
+        assert!(matches!(
+            store.create_playlist(&"n".repeat(MAX_PLAYLIST_NAME_BYTES + 1), None, 3,),
+            Err(PersistenceError::InvalidPlaylist { .. })
+        ));
+        assert!(matches!(
+            store.create_playlist(
+                "Oversized description",
+                Some(&"d".repeat(MAX_PLAYLIST_DESCRIPTION_BYTES + 1)),
+                3,
+            ),
+            Err(PersistenceError::InvalidPlaylist { .. })
+        ));
+    }
+
+    #[test]
+    fn playlist_read_rejects_snapshot_identity_corruption() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let media = youtube_playlist_media("dQw4w9WgXcQ", "Original");
+        store.add_to_todo(&media, 1).expect("seed todo");
+        let mismatched = youtube_playlist_media("abcdefghijk", "Mismatched");
+        store
+            .connection
+            .execute(
+                r"
+                UPDATE playlist_entries
+                SET snapshot_json = ?1
+                WHERE playlist_id = ?2
+                ",
+                params![
+                    serde_json::to_string(&mismatched).expect("encode mismatch"),
+                    TODO_PLAYLIST_ID
+                ],
+            )
+            .expect("inject inconsistent snapshot");
+
+        assert!(matches!(
+            store.playlist(TODO_PLAYLIST_ID),
+            Err(PersistenceError::Sqlite(
+                rusqlite::Error::FromSqlConversionFailure(..)
+            ))
+        ));
+    }
+
+    #[test]
     fn progress_crud_preserves_completion_inputs() {
         let store = StateStore::open_in_memory().expect("open store");
         let mut progress = PlaybackProgress::new(id("progress"), Some(100), 1);
@@ -4689,6 +8104,91 @@ mod tests {
     }
 
     #[test]
+    fn private_note_upsert_is_exact_atomic_and_preserves_creation_time() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let media_target = CommentTarget::Media {
+            media_id: id("private-note"),
+        };
+        let source_target = CommentTarget::Source {
+            source_id: id("private-note"),
+        };
+        let first_id = store
+            .insert_private_comment(&PrivateComment {
+                id: 0,
+                target: media_target.clone(),
+                body: "Legacy first".to_owned(),
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("seed first legacy row");
+        let newest_id = store
+            .insert_private_comment(&PrivateComment {
+                id: 0,
+                target: media_target.clone(),
+                body: "Legacy newest".to_owned(),
+                created_at: 20,
+                updated_at: 30,
+            })
+            .expect("seed newest legacy row");
+        store
+            .upsert_private_note(&source_target, "Channel note", 40)
+            .expect("save independent source note");
+
+        assert_eq!(
+            store
+                .private_note(&media_target)
+                .expect("read media note")
+                .expect("media note")
+                .id,
+            newest_id
+        );
+        let updated = store
+            .upsert_private_note(&media_target, "Edited once", 50)
+            .expect("edit and collapse media note");
+        assert_eq!(updated.id, newest_id);
+        assert_eq!(updated.created_at, 20);
+        assert_eq!(updated.updated_at, 50);
+        assert_eq!(
+            store
+                .private_comments(&media_target)
+                .expect("collapsed legacy rows"),
+            vec![updated.clone()]
+        );
+        assert_ne!(updated.id, first_id);
+        assert_eq!(
+            store
+                .private_note(&source_target)
+                .expect("read source note")
+                .expect("source note")
+                .body,
+            "Channel note"
+        );
+
+        assert!(
+            store
+                .delete_private_note(&media_target)
+                .expect("delete exact note")
+        );
+        assert!(
+            store
+                .private_note(&media_target)
+                .expect("read deleted note")
+                .is_none()
+        );
+        assert!(
+            !store
+                .delete_private_note(&media_target)
+                .expect("repeat exact deletion")
+        );
+        assert!(
+            store
+                .private_note(&source_target)
+                .expect("preserve source note")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn bookmark_crud_is_ordered_by_position() {
         let store = StateStore::open_in_memory().expect("open store");
         let media_id = id("bookmarked");
@@ -4737,6 +8237,9 @@ mod tests {
             target: target.clone(),
         }];
         let store = StateStore::open_in_memory().expect("open store");
+        store
+            .add_to_todo(&local_playlist_media(&source, None), 1)
+            .expect("seed Local playlist entry");
 
         let mut local_progress = PlaybackProgress::new(old_id.clone(), Some(180), 1);
         local_progress.record_position(42, 2);
@@ -4856,9 +8359,10 @@ mod tests {
                 sessions: 1,
                 metadata_cache: 1,
                 subscription_items_cache: 1,
+                playlist_entries: 1,
             }
         );
-        assert_eq!(report.total(), 8);
+        assert_eq!(report.total(), 9);
 
         assert_eq!(store.progress(&old_id).expect("old progress"), None);
         assert_eq!(
@@ -4956,6 +8460,29 @@ mod tests {
                 .expect("old Local subscription cache")
                 .is_none()
         );
+        assert!(
+            !store
+                .todo_contains(&old_id)
+                .expect("old Local playlist membership")
+        );
+        assert!(
+            store
+                .todo_contains(&new_id)
+                .expect("remapped Local playlist membership")
+        );
+        let todo = store
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("todo playlist")
+            .expect("saved todo");
+        assert_eq!(todo.entries[0].media.id, new_id);
+        assert_eq!(
+            todo.entries[0].media.webpage_url,
+            Url::from_file_path(&target).expect("target playlist file URL")
+        );
+        assert_eq!(
+            todo.entries[0].media.replay_locator,
+            target.to_string_lossy()
+        );
     }
 
     #[cfg(feature = "local")]
@@ -4983,6 +8510,9 @@ mod tests {
             store
                 .upsert_progress(&PlaybackProgress::new(old_id.clone(), Some(180), 1))
                 .expect("seed progress");
+            store
+                .add_to_todo(&local_playlist_media(&source_track, Some(&source_cover)), 1)
+                .expect("seed Local playlist snapshot");
             let session = SessionState {
                 screen: Screen::Local,
                 selected_media: Some(old_id.clone()),
@@ -5038,6 +8568,15 @@ mod tests {
         assert_eq!(
             metadata.media.captions[0].url,
             Url::from_file_path(&target_caption).expect("target caption URL")
+        );
+        let todo = reopened
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("todo playlist")
+            .expect("saved todo");
+        assert_eq!(todo.entries[0].media.id, new_id);
+        assert_eq!(
+            todo.entries[0].media.thumbnail_url,
+            Some(Url::from_file_path(&target_cover).expect("target playlist cover URL"))
         );
         let subscription = reopened
             .cached_subscription_items(
@@ -5423,6 +8962,89 @@ mod tests {
 
     #[cfg(feature = "local")]
     #[test]
+    fn local_playlist_destination_collision_is_rejected_before_journaling() {
+        let paths = tempdir().expect("fixture paths");
+        let source = paths.path().join("source.flac");
+        let target = paths.path().join("target.flac");
+        let source_media = local_playlist_media(&source, None);
+        let target_media = local_playlist_media(&target, None);
+        let store = StateStore::open_in_memory().expect("open store");
+        let PlaylistCreateOutcome::Created(playlist) = store
+            .create_playlist_with_entry("Move collision", None, &source_media, 1)
+            .expect("create playlist")
+        else {
+            panic!("expected new playlist");
+        };
+        store
+            .add_playlist_entry(&playlist.id, &target_media, 2)
+            .expect("seed stale target entry");
+        let mapping = LocalMoveMapping {
+            source: source.clone(),
+            target: target.clone(),
+        };
+
+        assert!(matches!(
+            store.journal_local_move_intent(std::slice::from_ref(&mapping), 3),
+            Err(PersistenceError::InvalidLocalMoveStateRemap { .. })
+        ));
+        assert!(store.local_move_intents().expect("move journal").is_empty());
+        assert!(matches!(
+            store.remap_local_move_state(std::slice::from_ref(&mapping)),
+            Err(PersistenceError::InvalidLocalMoveStateRemap { .. })
+        ));
+        let retained = store
+            .playlist(&playlist.id)
+            .expect("playlist")
+            .expect("retained playlist");
+        assert_eq!(
+            retained
+                .entries
+                .iter()
+                .map(|entry| entry.media.id.clone())
+                .collect::<Vec<_>>(),
+            vec![source_media.id, target_media.id]
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn local_playlist_identity_is_scoped_per_playlist_during_move() {
+        let paths = tempdir().expect("fixture paths");
+        let source = paths.path().join("source.flac");
+        let target = paths.path().join("target.flac");
+        let source_media = local_playlist_media(&source, None);
+        let target_media = local_playlist_media(&target, None);
+        let store = StateStore::open_in_memory().expect("open store");
+        let PlaylistCreateOutcome::Created(first) = store
+            .create_playlist_with_entry("First", None, &source_media, 1)
+            .expect("create first playlist")
+        else {
+            panic!("expected first playlist");
+        };
+        let PlaylistCreateOutcome::Created(second) = store
+            .create_playlist_with_entry("Second", None, &target_media, 2)
+            .expect("create second playlist")
+        else {
+            panic!("expected second playlist");
+        };
+
+        let report = store
+            .remap_local_move_state(&[LocalMoveMapping {
+                source,
+                target: target.clone(),
+            }])
+            .expect("remap across separate playlists");
+        assert_eq!(report.playlist_entries, 1);
+        let memberships = store
+            .playlist_memberships(&local_media_id(&target))
+            .expect("target memberships");
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.contains(&first.id));
+        assert!(memberships.contains(&second.id));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
     fn local_move_destination_identity_collision_is_rejected_without_mutation() {
         let paths = tempdir().expect("fixture paths");
         let source = paths.path().join("source.flac");
@@ -5585,6 +9207,68 @@ mod tests {
             ]),
             Err(PersistenceError::InvalidLocalMoveStateRemap { .. })
         ));
+    }
+
+    #[test]
+    fn sqlite_playback_checkpoint_commits_progress_and_statistics_together() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let media_id = id("transactional-checkpoint");
+        let mut progress = PlaybackProgress::new(media_id.clone(), Some(180), 10);
+        progress.record_position(42, 11);
+
+        store
+            .checkpoint_playback(&progress, &SourceKind::YouTube, 30)
+            .expect("transactional checkpoint");
+        store
+            .flush_playback_checkpoint()
+            .expect("SQLite flush is a no-op");
+
+        assert_eq!(
+            store.progress(&media_id).expect("saved progress"),
+            Some(progress)
+        );
+        assert_eq!(
+            store
+                .listened_seconds(&SourceKind::YouTube)
+                .expect("saved statistics"),
+            30
+        );
+    }
+
+    #[test]
+    fn sqlite_playback_checkpoint_rolls_back_progress_when_statistics_fail() {
+        let store = StateStore::open_in_memory().expect("open store");
+        store
+            .connection
+            .execute_batch(
+                r"
+                CREATE TRIGGER reject_checkpoint_statistics
+                BEFORE INSERT ON listen_totals
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected checkpoint failure');
+                END;
+                ",
+            )
+            .expect("failure trigger");
+        let media_id = id("failed-checkpoint");
+        let progress = PlaybackProgress::new(media_id.clone(), Some(180), 10);
+
+        assert!(matches!(
+            store.checkpoint_playback(&progress, &SourceKind::YouTube, 30),
+            Err(PersistenceError::Sqlite(_))
+        ));
+        assert!(
+            store
+                .progress(&media_id)
+                .expect("rolled-back progress")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .listened_seconds(&SourceKind::YouTube)
+                .expect("rolled-back statistics"),
+            0
+        );
     }
 
     #[test]

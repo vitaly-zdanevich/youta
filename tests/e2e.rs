@@ -97,7 +97,7 @@ fn config_command_reports_paths_and_redacts_credentials() {
     let temporary = tempdir().expect("temporary directory");
     fs::write(
         temporary.path().join("config.toml"),
-        "[providers]\nyoutube_api_key = \"must-not-leak\"\n",
+        "[providers]\nyoutube_api_key = \"must-not-leak-credential\"\n",
     )
     .expect("configuration fixture");
 
@@ -115,7 +115,7 @@ fn config_command_reports_paths_and_redacts_credentials() {
         .stdout(predicate::str::contains(
             "youtube_api_key = configured (redacted)",
         ))
-        .stdout(predicate::str::contains("must-not-leak").not());
+        .stdout(predicate::str::contains("must-not-leak-credential").not());
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
         "Instance list",
         "docs.invidious.io/instances/",
         "API keys are plaintext",
-        "Unix permissions: directory 0700",
+        "Unix permissions: directories 0700",
         "0600.",
         config_path.as_str(),
     ] {

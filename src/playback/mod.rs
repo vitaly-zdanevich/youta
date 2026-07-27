@@ -270,6 +270,12 @@ pub struct PlaybackStatus {
     pub buffered_ranges: Vec<BufferedRange>,
     /// Backend-reported media title.
     pub title: Option<String>,
+    /// Bounded current-track text carried by a live stream.
+    ///
+    /// Process backends should keep this separate from [`Self::title`]:
+    /// Youta owns the stable station title, while ICY or equivalent metadata
+    /// may change for every song.
+    pub stream_title: Option<String>,
 }
 
 /// A half-open media-time interval available without another network fetch.
@@ -294,6 +300,7 @@ impl Default for PlaybackStatus {
             buffering: false,
             buffered_ranges: Vec::new(),
             title: None,
+            stream_title: None,
         }
     }
 }

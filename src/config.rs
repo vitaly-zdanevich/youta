@@ -4,7 +4,8 @@
 //!
 //! 1. low-resource defaults;
 //! 2. `<config-dir>/config.toml`, when it exists;
-//! 3. environment variables prefixed with `YOUTA_`.
+//! 3. `<config-dir>/secrets/credentials.toml`, when it exists;
+//! 4. environment variables prefixed with `YOUTA_`.
 //!
 //! Double underscores express nesting, so
 //! `YOUTA_PLAYBACK__VOLUME_PERCENT=40` overrides
@@ -14,9 +15,7 @@
 
 use std::fmt;
 use std::fs;
-#[cfg(feature = "tui")]
 use std::fs::OpenOptions;
-#[cfg(feature = "tui")]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,6 +50,15 @@ pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 /// Environment variable that overrides the preferred Bandcamp audio format.
 pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
 
+/// Environment variable that overrides the selected `YouTube` metadata backend.
+pub const YOUTUBE_BACKEND_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_BACKEND";
+
+/// Environment variable that overrides the official `YouTube` Data API key.
+pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
+
+/// Environment variable that overrides the configured Invidious base URL.
+pub const INVIDIOUS_BASE_URL_ENV: &str = "YOUTA_PROVIDERS__INVIDIOUS_BASE_URL";
+
 /// Default maximum thumbnail height in terminal rows.
 pub const DEFAULT_THUMBNAIL_HEIGHT: u16 = 20;
 
@@ -59,6 +67,39 @@ pub const MIN_THUMBNAIL_HEIGHT: u16 = 4;
 
 #[cfg(feature = "tui")]
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
+const YOUTA_GITIGNORE_BEGIN: &str = "# BEGIN YOUTA PRIVATE AND GENERATED FILES";
+const YOUTA_GITIGNORE_END: &str = "# END YOUTA PRIVATE AND GENERATED FILES";
+const YOUTA_GITIGNORE_RULES: &[&str] = &[
+    "/secrets/",
+    "/cache/",
+    "/runtime/",
+    "/thumbnail-cache/",
+    "/downloads/",
+    "/state.sqlite3*",
+    "/state/.lock",
+    "/state/**/*.tmp",
+];
+
+/// Plain-text credentials accepted from the private credentials file.
+///
+/// This mirrors only secret-bearing provider fields. Keeping the schema
+/// separate prevents `secrets/credentials.toml` from silently overriding
+/// ordinary Git-friendly preferences.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CredentialsFile {
+    providers: ProviderCredentials,
+}
+
+/// Provider credentials that may be loaded from the private credentials file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProviderCredentials {
+    youtube_api_key: Option<String>,
+    mod_archive_api_key: Option<String>,
+    jamendo_client_id: Option<String>,
+}
 
 /// The root application configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,7 +112,7 @@ pub struct Config {
     pub ui: UiConfig,
     /// State persistence behavior.
     pub persistence: PersistenceConfig,
-    /// Network provider endpoints, credentials, and helper executables.
+    /// Network provider endpoints, loaded credentials, and helper executables.
     pub providers: ProviderConfig,
     /// Root for every file and directory written by Youta.
     ///
@@ -135,9 +176,14 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let defaults = Self::for_dir(&config_dir);
         let config_path = config_dir.join("config.toml");
+        let credentials_path = config_dir.join("secrets").join("credentials.toml");
         let mut figment = Figment::from(Serialized::defaults(defaults));
         if config_path.is_file() {
             figment = figment.merge(Toml::file_exact(config_path));
+        }
+        if credentials_path.is_file() {
+            validate_credentials_file(&credentials_path)?;
+            figment = figment.merge(Toml::file_exact(credentials_path));
         }
         if include_environment {
             figment = figment.merge(Env::prefixed("YOUTA_").ignore(&["config_dir"]).split("__"));
@@ -152,8 +198,10 @@ impl Config {
     /// Creates the application and download directories with private Unix
     /// permissions.
     ///
-    /// Existing Unix directories are tightened to mode `0700`. The operation
-    /// does not create or modify the user's TOML file.
+    /// Existing Unix directories are tightened to mode `0700`. A conservative
+    /// default `.gitignore` is created only when none exists; an existing file
+    /// remains entirely under user control. The operation does not create or
+    /// modify the user's TOML configuration.
     ///
     /// # Errors
     ///
@@ -162,7 +210,9 @@ impl Config {
     pub fn ensure_directories(&self) -> Result<(), ConfigError> {
         self.validate()?;
         create_private_directory(self.config_dir())?;
+        create_private_directory(&self.secrets_dir())?;
         create_private_directory(&self.downloads_dir())?;
+        ensure_youta_gitignore(&self.gitignore_file())?;
         Ok(())
     }
 
@@ -202,6 +252,23 @@ impl Config {
                 "ui.thumbnail_height must be at least {MIN_THUMBNAIL_HEIGHT}"
             )));
         }
+        if let Some(api_key) = self.providers.youtube_api_key.as_deref() {
+            validate_youtube_api_key("providers.youtube_api_key", api_key)?;
+        }
+        for (field, credential) in [
+            (
+                "providers.mod_archive_api_key",
+                self.providers.mod_archive_api_key.as_deref(),
+            ),
+            (
+                "providers.jamendo_client_id",
+                self.providers.jamendo_client_id.as_deref(),
+            ),
+        ] {
+            if let Some(credential) = credential {
+                validate_generic_credential(field, credential)?;
+            }
+        }
         Ok(())
     }
 
@@ -217,10 +284,48 @@ impl Config {
         self.root_dir.join("config.toml")
     }
 
+    /// Returns the directory containing plaintext credentials excluded by
+    /// Youta's default Git ignore rules.
+    #[must_use]
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.root_dir.join("secrets")
+    }
+
+    /// Returns the private TOML credentials path.
+    #[must_use]
+    pub fn credentials_file(&self) -> PathBuf {
+        self.secrets_dir().join("credentials.toml")
+    }
+
+    /// Returns the Git ignore file protecting generated and secret state by
+    /// default.
+    #[must_use]
+    pub fn gitignore_file(&self) -> PathBuf {
+        self.root_dir.join(".gitignore")
+    }
+
     /// Returns the `SQLite` state path.
     #[must_use]
     pub fn database_file(&self) -> PathBuf {
         self.root_dir.join("state.sqlite3")
+    }
+
+    /// Returns the human-readable authoritative-state directory.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        self.root_dir.join("state")
+    }
+
+    /// Returns the restart-only runtime-state directory.
+    #[must_use]
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root_dir.join("runtime")
+    }
+
+    /// Returns the regenerable provider-cache directory.
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root_dir.join("cache")
     }
 
     /// Returns the portable OPML subscription path.
@@ -245,58 +350,78 @@ impl Config {
     ///
     /// Existing unrelated keys and comments are preserved. The alternative
     /// provider credential is retained so the user can switch back later.
-    /// Environment variables still take precedence when configuration is
-    /// loaded again.
+    /// Youta refuses to write the selection while [`YOUTUBE_BACKEND_ENV`] or
+    /// the selected provider's value-specific environment variable is present,
+    /// because that override would shadow the saved setting on the next start.
     ///
     /// # Errors
     ///
-    /// Returns an error when the value is invalid, the existing file is too
-    /// large or malformed, or an atomic private-file update fails.
+    /// Returns an error when a relevant environment override is active, the
+    /// value is invalid, the existing file is too large or malformed, or an
+    /// atomic private-file update fails.
     #[cfg(feature = "tui")]
     pub fn save_youtube_provider(
         &mut self,
         setting: YouTubeProviderSetting,
     ) -> Result<(), ConfigError> {
+        let value_override = match &setting {
+            YouTubeProviderSetting::OfficialApiKey(_) => YOUTUBE_API_KEY_ENV,
+            YouTubeProviderSetting::InvidiousUrl(_) => INVIDIOUS_BASE_URL_ENV,
+        };
+        for variable in [YOUTUBE_BACKEND_ENV, value_override] {
+            if std::env::var_os(variable).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{variable} overrides the saved YouTube provider setting; change or remove it before saving"
+                )));
+            }
+        }
+
         enum ValidatedSetting {
             OfficialApiKey(String),
             InvidiousUrl(Url),
         }
 
         let setting = match setting {
-            YouTubeProviderSetting::OfficialApiKey(api_key) => {
-                ValidatedSetting::OfficialApiKey(validate_youtube_api_key(&api_key)?)
-            }
+            YouTubeProviderSetting::OfficialApiKey(api_key) => ValidatedSetting::OfficialApiKey(
+                validate_youtube_api_key("providers.youtube_api_key", &api_key)?,
+            ),
             YouTubeProviderSetting::InvidiousUrl(url) => {
                 ValidatedSetting::InvidiousUrl(validate_provider_url(url)?)
             }
         };
-        let (backend, field, stored_value) = match &setting {
-            ValidatedSetting::OfficialApiKey(api_key) => {
-                (YouTubeBackend::Official, "youtube_api_key", api_key.clone())
-            }
-            ValidatedSetting::InvidiousUrl(url) => (
-                YouTubeBackend::Invidious,
-                "invidious_base_url",
-                url.to_string(),
-            ),
+        let backend = match &setting {
+            ValidatedSetting::OfficialApiKey(_) => YouTubeBackend::Official,
+            ValidatedSetting::InvidiousUrl(_) => YouTubeBackend::Invidious,
         };
 
         self.ensure_directories()?;
-        let path = self.config_file();
-        let mut document = read_editable_config(&path)?;
-        let providers = document
-            .as_table_mut()
-            .entry("providers")
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| {
-                ConfigError::Invalid(
-                    "`providers` must be a TOML table before Youta can update it".to_owned(),
-                )
-            })?;
-        providers["youtube_backend"] = value(backend.as_config_value());
-        providers[field] = value(&stored_value);
-        write_private_config(&path, document.to_string().as_bytes())?;
+        let config_path = self.config_file();
+        let credentials_path = self.credentials_file();
+        let mut config_document = read_editable_config(&config_path)?;
+        let mut credentials_document = read_editable_credentials(&credentials_path)?;
+
+        migrate_legacy_provider_credentials(&mut config_document, &mut credentials_document)?;
+
+        {
+            let providers = editable_table(&mut config_document, "providers")?;
+            providers["youtube_backend"] = value(backend.as_config_value());
+            if let ValidatedSetting::InvidiousUrl(url) = &setting {
+                providers["invidious_base_url"] = value(url.to_string());
+            }
+            providers.remove("youtube_api_key");
+        }
+        if let ValidatedSetting::OfficialApiKey(api_key) = &setting {
+            let providers = editable_table(&mut credentials_document, "providers")?;
+            providers["youtube_api_key"] = value(api_key);
+        }
+
+        if !credentials_document.as_table().is_empty() {
+            write_private_config(
+                &credentials_path,
+                credentials_document.to_string().as_bytes(),
+            )?;
+        }
+        write_private_config(&config_path, config_document.to_string().as_bytes())?;
 
         self.providers.youtube_backend = backend;
         match setting {
@@ -732,22 +857,45 @@ pub enum ThumbnailMode {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct PersistenceConfig {
-    /// Interval between durable position updates.
+    /// Storage backend used for state and caches.
+    pub backend: PersistenceBackend,
+    /// Interval between bounded crash-durable playback checkpoints.
     pub position_save_interval_seconds: u64,
     /// Completion threshold used by configurable UI and import code.
     pub played_threshold_percent: u8,
-    /// Automatically commit local state when the config directory is a Git
-    /// working tree. Push behavior is implemented outside the state store.
+    /// On graceful shutdown, commit and push the application directory when it
+    /// belongs to a Git worktree.
     pub git_commit_on_change: bool,
 }
 
 impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
+            backend: PersistenceBackend::Files,
             position_save_interval_seconds: 30,
             played_threshold_percent: PLAYED_THRESHOLD_PERCENT,
-            git_commit_on_change: false,
+            git_commit_on_change: true,
         }
+    }
+}
+
+/// State-storage implementation selected at runtime.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PersistenceBackend {
+    /// Deterministic TOML files intended for inspection and version control.
+    #[default]
+    Files,
+    /// One SQLite database, available when built with `sqlite-state`.
+    Sqlite,
+}
+
+impl fmt::Display for PersistenceBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Files => "files",
+            Self::Sqlite => "sqlite",
+        })
     }
 }
 
@@ -1033,19 +1181,121 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "tui")]
-fn validate_youtube_api_key(api_key: &str) -> Result<String, ConfigError> {
-    let api_key = api_key.trim();
+fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
+    let contents = read_limited_utf8_file(path, MAX_CREDENTIALS_BYTES, "credentials.toml")?;
+    let credentials: CredentialsFile = toml::from_str(&contents).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "{} is not a valid Youta credentials file; check its TOML syntax and supported fields",
+            path.display()
+        ))
+    })?;
+    if let Some(api_key) = credentials.providers.youtube_api_key.as_deref() {
+        validate_youtube_api_key("providers.youtube_api_key", api_key)
+            .map_err(|error| credential_file_error(path, error))?;
+    }
+    for (field, credential) in [
+        (
+            "providers.mod_archive_api_key",
+            credentials.providers.mod_archive_api_key.as_deref(),
+        ),
+        (
+            "providers.jamendo_client_id",
+            credentials.providers.jamendo_client_id.as_deref(),
+        ),
+    ] {
+        if let Some(credential) = credential {
+            validate_generic_credential(field, credential)
+                .map_err(|error| credential_file_error(path, error))?;
+        }
+    }
+    Ok(())
+}
+
+fn credential_file_error(path: &Path, error: ConfigError) -> ConfigError {
+    match error {
+        ConfigError::Invalid(message) => {
+            ConfigError::Invalid(format!("{}: {message}", path.display()))
+        }
+        other => other,
+    }
+}
+
+fn read_limited_utf8_file(path: &Path, limit: u64, label: &str) -> Result<String, ConfigError> {
+    let file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > limit {
+        return Err(ConfigError::Invalid(format!(
+            "{label} exceeds the {limit}-byte limit"
+        )));
+    }
+    let capacity = usize::try_from(length).unwrap_or_default();
+    let mut contents = String::with_capacity(capacity);
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
+        return Err(ConfigError::Invalid(format!(
+            "{label} exceeds the {limit}-byte limit"
+        )));
+    }
+    Ok(contents)
+}
+
+fn validate_generic_credential(field: &str, credential: &str) -> Result<(), ConfigError> {
+    let trimmed = credential.trim();
+    if credential != trimmed {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain surrounding whitespace"
+        )));
+    }
+    if trimmed.is_empty() || trimmed.len() > 4096 || trimmed.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must contain 1 to 4096 printable characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_youtube_api_key(field: &str, api_key: &str) -> Result<String, ConfigError> {
+    if api_key != api_key.trim() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain surrounding whitespace"
+        )));
+    }
     if !(16..=256).contains(&api_key.len())
         || !api_key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(ConfigError::Invalid(
-            "the YouTube API key must contain 16 to 256 URL-safe characters".to_owned(),
-        ));
+        return Err(ConfigError::Invalid(format!(
+            "{field} must contain 16 to 256 URL-safe characters"
+        )));
     }
     Ok(api_key.to_owned())
+}
+
+fn ensure_youta_gitignore(path: &Path) -> Result<(), ConfigError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(ConfigError::Invalid(format!(
+                "{} must be a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+
+    let mut contents = String::new();
+    contents.push_str(YOUTA_GITIGNORE_BEGIN);
+    contents.push('\n');
+    for rule in YOUTA_GITIGNORE_RULES {
+        contents.push_str(rule);
+        contents.push('\n');
+    }
+    contents.push_str(YOUTA_GITIGNORE_END);
+    contents.push('\n');
+    write_private_config(path, contents.as_bytes())
 }
 
 #[cfg(feature = "tui")]
@@ -1071,36 +1321,89 @@ fn validate_provider_url(mut url: Url) -> Result<Url, ConfigError> {
 
 #[cfg(feature = "tui")]
 fn read_editable_config(path: &Path) -> Result<DocumentMut, ConfigError> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    read_editable_toml(path, MAX_CONFIG_BYTES, "config.toml")
+}
+
+#[cfg(feature = "tui")]
+fn read_editable_credentials(path: &Path) -> Result<DocumentMut, ConfigError> {
+    if path.is_file() {
+        validate_credentials_file(path)?;
+    }
+    read_editable_toml(path, MAX_CREDENTIALS_BYTES, "credentials.toml")
+}
+
+#[cfg(feature = "tui")]
+fn read_editable_toml(path: &Path, limit: u64, label: &str) -> Result<DocumentMut, ConfigError> {
+    let contents = match fs::metadata(path) {
+        Ok(_) => read_limited_utf8_file(path, limit, label)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DocumentMut::new());
         }
         Err(error) => return Err(error.into()),
     };
-    let length = file.metadata()?.len();
-    if length > MAX_CONFIG_BYTES {
-        return Err(ConfigError::Invalid(format!(
-            "config.toml exceeds the {MAX_CONFIG_BYTES}-byte update limit"
-        )));
-    }
-    let capacity = usize::try_from(length).unwrap_or_default();
-    let mut contents = String::with_capacity(capacity);
-    file.take(MAX_CONFIG_BYTES.saturating_add(1))
-        .read_to_string(&mut contents)?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
-        return Err(ConfigError::Invalid(format!(
-            "config.toml exceeds the {MAX_CONFIG_BYTES}-byte update limit"
-        )));
-    }
     contents.parse().map_err(|_| {
-        ConfigError::Invalid(
-            "config.toml is not valid TOML; fix it before saving a provider from Youta".to_owned(),
-        )
+        ConfigError::Invalid(format!(
+            "{label} is not valid TOML; fix it before saving from Youta"
+        ))
     })
 }
 
 #[cfg(feature = "tui")]
+fn editable_table<'a>(
+    document: &'a mut DocumentMut,
+    name: &str,
+) -> Result<&'a mut Table, ConfigError> {
+    document
+        .as_table_mut()
+        .entry(name)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`{name}` must be a TOML table before Youta can update it"
+            ))
+        })
+}
+
+#[cfg(feature = "tui")]
+fn migrate_legacy_provider_credentials(
+    config: &mut DocumentMut,
+    credentials: &mut DocumentMut,
+) -> Result<(), ConfigError> {
+    let mut legacy_credentials = Vec::new();
+    if let Some(providers) = config
+        .as_table_mut()
+        .get_mut("providers")
+        .and_then(Item::as_table_mut)
+    {
+        for field in [
+            "youtube_api_key",
+            "mod_archive_api_key",
+            "jamendo_client_id",
+        ] {
+            if let Some(item) = providers.remove(field) {
+                let credential = item.as_str().ok_or_else(|| {
+                    ConfigError::Invalid(format!(
+                        "`providers.{field}` must be a string before Youta can migrate it"
+                    ))
+                })?;
+                legacy_credentials.push((field, credential.to_owned()));
+            }
+        }
+    }
+    if legacy_credentials.is_empty() {
+        return Ok(());
+    }
+
+    let providers = editable_table(credentials, "providers")?;
+    for (field, credential) in legacy_credentials {
+        if !providers.contains_key(field) {
+            providers[field] = value(credential);
+        }
+    }
+    Ok(())
+}
+
 fn write_private_config(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     let result = (|| -> Result<(), ConfigError> {
@@ -1129,7 +1432,6 @@ fn write_private_config(path: &Path, contents: &[u8]) -> Result<(), ConfigError>
     result
 }
 
-#[cfg(feature = "tui")]
 fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1158,7 +1460,9 @@ mod tests {
         assert!(!config.playback.autoplay);
         assert!(config.playback.youtube_prewarm);
         assert!(config.playback.skip_advertisement_chapters);
+        assert_eq!(config.persistence.backend, PersistenceBackend::Files);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
+        assert!(config.persistence.git_commit_on_change);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
         assert!(config.ui.prefetch_search_thumbnails);
         assert!(config.ui.show_local_folder_sizes);
@@ -1247,15 +1551,25 @@ bandcamp_audio_format = "alac"
                 config.providers.bandcamp_audio_format,
                 BandcampAudioFormat::OggVorbis
             );
+            assert_eq!(
+                config.providers.youtube_api_key.as_deref(),
+                Some("AIzaEnvironment_key_123456789012345")
+            );
             return;
         }
 
         let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join("secrets")).expect("secrets directory");
         fs::write(
             directory.path().join("config.toml"),
-            "[playback]\nvolume_percent = 20\n",
+            "[playback]\nvolume_percent = 20\n\n[providers]\nyoutube_api_key = \"AIzaConfig_key_123456789012345678\"\n",
         )
         .expect("write test TOML");
+        fs::write(
+            directory.path().join("secrets/credentials.toml"),
+            "[providers]\nyoutube_api_key = \"AIzaPrivate_key_12345678901234567\"\n",
+        )
+        .expect("write private credentials");
         let output = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -1274,6 +1588,10 @@ bandcamp_audio_format = "alac"
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
+            .env(
+                "YOUTA_PROVIDERS__YOUTUBE_API_KEY",
+                "AIzaEnvironment_key_123456789012345",
+            )
             .output()
             .expect("run environment test child");
         assert!(
@@ -1605,7 +1923,8 @@ youtube_api_key = "keep-this-existing-secret"
         .expect("write invalid configuration");
 
         assert!(
-            Config::load_from_dir_with_environment(directory.path().to_owned(), false).is_err()
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).is_err(),
+            "an arbitrary yt-dlp selector must not deserialize as a Bandcamp preference"
         );
     }
 
@@ -1653,6 +1972,11 @@ youtube_api_key = "keep-this-existing-secret"
             .ensure_directories()
             .expect("create application folders");
         assert!(config.downloads_dir().is_dir());
+        assert!(config.secrets_dir().is_dir());
+        let gitignore = fs::read_to_string(config.gitignore_file()).expect("default .gitignore");
+        assert!(gitignore.contains("/secrets/"));
+        assert!(gitignore.contains("/runtime/"));
+        assert!(gitignore.contains("/cache/"));
 
         #[cfg(unix)]
         {
@@ -1668,6 +1992,129 @@ youtube_api_key = "keep-this-existing-secret"
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o700);
+            let mode = fs::metadata(config.secrets_dir())
+                .expect("secrets metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn existing_gitignore_remains_under_user_control() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("youta");
+        fs::create_dir(&root).expect("config directory");
+        let custom = "# I intentionally track credentials in a private repository.\n";
+        fs::write(root.join(".gitignore"), custom).expect("custom .gitignore");
+
+        Config::for_dir(&root)
+            .ensure_directories()
+            .expect("prepare application directory");
+
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).expect("preserved .gitignore"),
+            custom
+        );
+    }
+
+    #[test]
+    fn private_credentials_override_legacy_config_values() {
+        let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join("secrets")).expect("secrets directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[providers]\nyoutube_api_key = \"AIzaLegacy_key_123456789012345678\"\n",
+        )
+        .expect("legacy config");
+        fs::write(
+            directory.path().join("secrets/credentials.toml"),
+            "[providers]\nyoutube_api_key = \"AIzaPrivate_key_12345678901234567\"\n",
+        )
+        .expect("private credentials");
+
+        let config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load layered credentials");
+
+        assert_eq!(
+            config.providers.youtube_api_key.as_deref(),
+            Some("AIzaPrivate_key_12345678901234567")
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_private_credentials_are_rejected() {
+        let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join("secrets")).expect("secrets directory");
+        let path = directory.path().join("secrets/credentials.toml");
+        fs::write(
+            &path,
+            "[providers]\nyoutube_api_key = \"AIzaValid_key_123456789012345678\"\nunknown = true\n",
+        )
+        .expect("invalid credentials");
+
+        let error = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect_err("unknown credential fields must fail");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("AIzaValid_key_123456789012345678"));
+        assert!(rendered.contains("credentials file"));
+    }
+
+    #[test]
+    fn credentials_reject_surrounding_whitespace_without_loading_trimmed_values() {
+        for (field, value) in [
+            ("youtube_api_key", " AIzaValid_key_123456789012345678"),
+            ("mod_archive_api_key", "mod-archive-key "),
+            ("jamendo_client_id", "\tjamendo-client-id"),
+        ] {
+            let directory = tempdir().expect("temporary directory");
+            let secrets = directory.path().join("secrets");
+            fs::create_dir(&secrets).expect("secrets directory");
+            fs::write(
+                secrets.join("credentials.toml"),
+                format!("[providers]\n{field} = {value:?}\n"),
+            )
+            .expect("credential fixture");
+
+            let error = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+                .expect_err("surrounding whitespace must be rejected");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&format!("providers.{field}")),
+                "missing field path in: {rendered}"
+            );
+            assert!(
+                rendered.contains("credentials.toml"),
+                "missing credentials-file path in: {rendered}"
+            );
+            assert!(
+                rendered.contains("surrounding whitespace"),
+                "missing whitespace guidance in: {rendered}"
+            );
+            assert!(
+                !rendered.contains(value),
+                "credential value leaked in: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_provider_credentials_use_the_same_exact_validation() {
+        for (field, value) in [
+            ("youtube_api_key", "AIzaValid_key_123456789012345678 "),
+            ("mod_archive_api_key", " mod-archive-key"),
+            ("jamendo_client_id", "jamendo-client-id\n"),
+        ] {
+            let directory = tempdir().expect("temporary directory");
+            fs::write(
+                directory.path().join("config.toml"),
+                format!("[providers]\n{field} = {value:?}\n"),
+            )
+            .expect("legacy provider fixture");
+
+            let error = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+                .expect_err("legacy credentials must not be normalized implicitly");
+            assert!(error.to_string().contains(&format!("providers.{field}")));
         }
     }
 
@@ -1693,7 +2140,9 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(after_key.contains("# keep this comment"));
         assert!(after_key.contains("volume_percent = 35"));
         assert!(after_key.contains("youtube_backend = \"official\""));
-        assert!(after_key.contains(api_key));
+        assert!(!after_key.contains(api_key));
+        let credentials = fs::read_to_string(config.credentials_file()).expect("saved credentials");
+        assert!(credentials.contains(api_key));
         assert_eq!(config.providers.youtube_backend, YouTubeBackend::Official);
         assert_eq!(config.providers.youtube_api_key.as_deref(), Some(api_key));
 
@@ -1704,7 +2153,13 @@ youtube_api_key = "keep-this-existing-secret"
         let after_url = fs::read_to_string(config.config_file()).expect("updated config");
         assert!(after_url.contains("# keep this comment"));
         assert!(
-            after_url.contains(api_key),
+            !after_url.contains(api_key),
+            "the Git-friendly configuration must not contain the API key"
+        );
+        assert!(
+            fs::read_to_string(config.credentials_file())
+                .expect("retained credentials")
+                .contains(api_key),
             "switching must retain the API key"
         );
         assert!(after_url.contains("youtube_backend = \"invidious\""));
@@ -1724,7 +2179,143 @@ youtube_api_key = "keep-this-existing-secret"
                 .as_str(),
             "https://inv.example.test/api/"
         );
+        assert_eq!(restored.providers.youtube_api_key.as_deref(), Some(api_key));
         assert_eq!(restored.playback.volume_percent, 35);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn youtube_provider_environment_overrides_prevent_file_and_memory_mutation() {
+        const CHILD_MARKER: &str = "YOUTA_PROVIDER_SAVE_TEST_CHILD";
+        const TEST_DIRECTORY: &str = "YOUTA_PROVIDER_SAVE_TEST_DIR";
+        const TEST_CASE: &str = "YOUTA_PROVIDER_SAVE_TEST_CASE";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory =
+                PathBuf::from(std::env::var(TEST_DIRECTORY).expect("child test directory"));
+            let test_case = std::env::var(TEST_CASE).expect("child test case");
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            let before = config.clone();
+            let (setting, expected_override) = match test_case.as_str() {
+                "backend-official" => (
+                    YouTubeProviderSetting::OfficialApiKey(
+                        "AIzaSave_key_12345678901234567890".to_owned(),
+                    ),
+                    YOUTUBE_BACKEND_ENV,
+                ),
+                "backend-invidious" => (
+                    YouTubeProviderSetting::InvidiousUrl(
+                        Url::parse("https://save.example.test/").expect("fixture URL"),
+                    ),
+                    YOUTUBE_BACKEND_ENV,
+                ),
+                "api-key" => (
+                    YouTubeProviderSetting::OfficialApiKey(
+                        "AIzaSave_key_12345678901234567890".to_owned(),
+                    ),
+                    YOUTUBE_API_KEY_ENV,
+                ),
+                "invidious" => (
+                    YouTubeProviderSetting::InvidiousUrl(
+                        Url::parse("https://save.example.test/").expect("fixture URL"),
+                    ),
+                    INVIDIOUS_BASE_URL_ENV,
+                ),
+                other => panic!("unknown child test case: {other}"),
+            };
+
+            let error = config
+                .save_youtube_provider(setting)
+                .expect_err("environment override must lock the provider writer");
+
+            assert!(error.to_string().contains(expected_override));
+            assert_eq!(config, before, "failed save mutated in-memory settings");
+            assert!(!config.config_file().exists());
+            assert!(!config.credentials_file().exists());
+            assert!(!config.gitignore_file().exists());
+            assert!(!config.downloads_dir().exists());
+            return;
+        }
+
+        for (test_case, override_name, override_value) in [
+            ("backend-official", YOUTUBE_BACKEND_ENV, "invidious"),
+            ("backend-invidious", YOUTUBE_BACKEND_ENV, "official"),
+            (
+                "api-key",
+                YOUTUBE_API_KEY_ENV,
+                "AIzaEnvironment_key_123456789012345",
+            ),
+            (
+                "invidious",
+                INVIDIOUS_BASE_URL_ENV,
+                "https://environment.example.test/",
+            ),
+        ] {
+            let directory = tempdir().expect("temporary directory");
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "config::tests::youtube_provider_environment_overrides_prevent_file_and_memory_mutation",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD_MARKER, "1")
+                .env(TEST_CASE, test_case)
+                .env(TEST_DIRECTORY, directory.path())
+                .env(CONFIG_DIR_ENV, directory.path())
+                .env(override_name, override_value)
+                .output()
+                .expect("run provider environment-lock child");
+            assert!(
+                output.status.success(),
+                "child test failed for {override_name}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn youtube_provider_save_migrates_legacy_provider_credentials() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("youta");
+        fs::create_dir(&root).expect("config directory");
+        fs::write(
+            root.join("config.toml"),
+            r#"[providers]
+youtube_api_key = "AIzaLegacy_key_123456789012345678"
+mod_archive_api_key = "legacy-mod-key"
+jamendo_client_id = "legacy-jamendo-id"
+"#,
+        )
+        .expect("legacy config");
+        let mut config =
+            Config::load_from_dir_with_environment(root, false).expect("load legacy config");
+
+        config
+            .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                Url::parse("https://inv.example.test/").expect("fixture URL"),
+            ))
+            .expect("save and migrate");
+
+        let config_contents = fs::read_to_string(config.config_file()).expect("migrated config");
+        for secret in [
+            "AIzaLegacy_key_123456789012345678",
+            "legacy-mod-key",
+            "legacy-jamendo-id",
+        ] {
+            assert!(!config_contents.contains(secret));
+        }
+        let credentials =
+            fs::read_to_string(config.credentials_file()).expect("migrated credentials");
+        for secret in [
+            "AIzaLegacy_key_123456789012345678",
+            "legacy-mod-key",
+            "legacy-jamendo-id",
+        ] {
+            assert!(credentials.contains(secret));
+        }
     }
 
     #[cfg(feature = "tui")]
@@ -1814,7 +2405,13 @@ youtube_api_key = "keep-this-existing-secret"
             .permissions()
             .mode()
             & 0o777;
+        let credentials_mode = fs::metadata(config.credentials_file())
+            .expect("credentials file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+        assert_eq!(credentials_mode, 0o600);
     }
 }

@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.6.0`. Items marked **roadmap** are design decisions, not support
+present in `0.7.0`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -22,7 +22,7 @@ terminal input ─┐
 mouse events ───┼─> application reducer ─> immutable UI snapshot ─> renderer
 timers ─────────┤            │
 provider events ┤            ├─> command queue ─> provider workers
-player events ──┘            ├─> persistence worker ─> SQLite / OPML
+player events ──┘            ├─> persistence worker ─> TOML / optional SQLite / OPML
                              ├─> playback worker ─> mpv JSON IPC
                              └─> prewarm worker ─> yt-dlp selected-audio URL
 ```
@@ -36,7 +36,8 @@ The library is divided by responsibility:
 
 - `config`: versioned TOML configuration and environment overrides;
 - `domain`: source-neutral identifiers and media/application state;
-- `persistence`: SQLite migrations, durable state, and short transactions;
+- `persistence`: a backend-neutral durable-state boundary, deterministic TOML
+  documents, and optional SQLite migrations/transactions;
 - `subscriptions`: local subscriptions and OPML interchange;
 - `providers`: discovery and metadata interfaces plus provider adapters;
 - `links`: safe extraction and classification of links and timecodes;
@@ -48,27 +49,88 @@ normalized into domain objects with the original source ID retained.
 
 ## State and persistence
 
-Youta has three state classes:
+Youta separates canonical user state from restart-only and regenerable data:
 
 | State | Storage | Examples |
 | --- | --- | --- |
 | configuration | TOML | colors, provider endpoints, player choice |
-| durable library | SQLite | subscriptions, history, positions, notes, queue |
-| interoperable subscriptions | OPML | podcast/RSS feed outlines |
+| durable library (default) | `state/*.toml` | history, positions, notes, bookmarks, statistics, playlists, Local move journal |
+| restart-only state | `runtime/*.toml` | screen/session state |
+| regenerable metadata | `cache/*.toml` | searches, provider summaries, Wikidata |
+| optional durable backend | `state.sqlite3` | the same boundary when `sqlite-state` is selected |
+| interoperable subscriptions | `subscriptions.opml` | podcast/RSS and compatible channel outlines |
 
 The default persistent root is `~/.config/youta/`. Browsing source media
 directories is read-only; only explicit Local Rename, Move to Trash, and Move
-actions mutate selected entries. SQLite uses migrations and foreign-key
-checks; each user action is a small transaction. Configuration writes use a
-temporary file, an `fsync`, and an atomic rename. Private files are created
-with user-only permissions on Unix.
+actions mutate selected entries. The default files backend is part of the core
+build and keeps its format/backend marker in `state/manifest.toml`. Canonical
+data is split by write cadence and purpose:
+
+| File | Contents |
+| --- | --- |
+| `state/progress.toml` | positions, durations, timestamps, and played overrides |
+| `state/history.toml` | playback history |
+| `state/notes.toml` | private notes |
+| `state/bookmarks.toml` | media and segment bookmarks |
+| `state/statistics.toml` | listening totals |
+| `state/local-moves.toml` | crash-recoverable Local move journal |
+| `state/playlists.toml` | playlist metadata and ordered entries |
+| `runtime/session.toml` | restart-only screen, queue, and session state |
+| `runtime/playback-checkpoint.toml` | bounded periodic position and absolute listening-total recovery target |
+| `cache/searches.toml` | regenerable search snapshots |
+| `cache/providers.toml` | regenerable provider summaries and Wikidata cache |
+
+Mutations rewrite only their relevant document. In particular, a periodic
+playback save atomically replaces only the 16 KiB-bounded runtime checkpoint;
+its work and bytes do not grow with playback history. A clean media boundary
+publishes that checkpoint to canonical progress and statistics. Startup replays
+an interrupted publish idempotently: progress uses the latest timestamp and
+listening time uses an absolute target, then the checkpoint is cleared last.
+For a non-seekable live stream, the same bounded checkpoint contains only the
+absolute listening target; it never invents a playback-progress row.
+Other documents use deterministic ordering and same-directory atomic
+replacement so Git diffs remain stable. Configuration and private-file writes
+follow the same atomic-write boundary. Private files are created with user-only
+permissions on Unix.
+
+Startup treats only `runtime/session.toml`,
+`runtime/playback-checkpoint.toml`, `cache/searches.toml`, and
+`cache/providers.toml` as disposable. If one of those documents is malformed,
+unsupported, or outside its fixed bounds, Youta preserves the exact file beside
+the canonical path as a private hidden `.corrupt` file (using a numeric suffix
+without overwriting an earlier quarantine), then atomically installs an empty
+canonical document. Operational failures such as denied access still stop
+startup. `state/*.toml` and `state/manifest.toml` are never quarantined,
+recreated, or reset after publication; missing or invalid authoritative state
+stops startup so user records remain available for manual recovery.
+
+The files backend obtains an exclusive non-blocking lock on `state/.lock`
+before loading documents and retains it for the store's lifetime. A second
+Youta process fails to open that state instead of admitting concurrent writers.
+Human edits to `state/*.toml` must likewise be made while Youta is closed;
+reopening validates and loads the edited documents.
+
+The runtime setting `persistence.backend = 'sqlite'` selects
+`~/.config/youta/state.sqlite3` only when the binary includes the
+`sqlite-state` Cargo feature. `bundled-sqlite` includes `sqlite-state` and a
+vendored SQLite library; it does not change the runtime selection. SQLite uses
+versioned migrations, foreign-key checks, and short transactions, but it is
+not the default or a simultaneous second source of truth. TOML state and an
+untouched SQLite database can coexist. `persistence.backend` selects which one
+is active; switching does not migrate, merge, or delete the inactive backend.
+
+TOML is text suitable for review in ordinary editors and Git diffs. Firefox
+can display it but does not generally write changes back to a local `file://`
+document. GitHub and GitLab provide browser-based display, diffs, and editing
+after the state directory is committed.
 
 Before a Local Move request reaches the filesystem worker, Youta validates the
 complete bounded tree, rejects symbolic links, collisions, and paths that
 cannot be represented durably, and records the exact source-to-target mappings
-in SQLite. Completion remaps Local history, progress, queue, comments,
-bookmarks, subscription snapshots, and session paths in the same durable
-transaction that clears the move journal. Startup reconciles moves that
+through the selected persistence backend. Completion remaps Local history,
+progress, queue, private notes, bookmarks, subscription snapshots, and session
+paths in the same durable operation that clears the move journal. Startup
+reconciles moves that
 finished or never began. If both endpoints exist or both are missing, Youta
 does not guess: it blocks new moves and orderly quit until the user repairs the
 ambiguous filesystem state and retries.
@@ -98,12 +160,14 @@ short-lived URLs and required headers exist only in RAM after an explicit
 playback action. Public-page search uses a capacity-one latest-only worker
 separate from the general YouTube provider lane.
 
-The YouTube provider setup popup displays the exact `config.toml` destination
-before it saves; that path's parent directory is mode `0700` and the file is
-mode `0600` on Unix.
+The YouTube provider setup popup displays the exact destination before it
+saves. An official API key goes to `secrets/credentials.toml`; an Invidious
+instance URL goes to `config.toml`. Their parent directories are mode `0700`
+and files mode `0600` on Unix.
 
 The player reports progress in memory more often than it is written. A dirty
-position is persisted every 30 seconds, on pause, on a media switch, and during
+position and accumulated listening time are checkpointed every 30 seconds by
+default, then merged into canonical state on a media switch, playback end, and
 orderly shutdown. Completion is `position / duration >= 0.90` when duration is
 known. Returning to a partially played item resumes at the stored position
 minus 30 seconds, clamped to zero. Manual played/unplayed status remains an
@@ -113,14 +177,53 @@ Screen identity, selection, scroll offsets, detail navigation history, queue,
 and active item are snapshotted so restart returns to the same useful context.
 Transient errors and open secret prompts are never restored.
 
-### OPML
+### Private notes
 
-OPML is an import/export boundary, not the database schema. RSS feeds use
+The current TUI exposes one private note for each exact `CommentTarget`.
+`CommentTarget::Media` covers source-qualified videos, tracks, podcast
+episodes, MOD/tracker items, resolved direct-source media, and local files.
+Selecting that media through Downloaded, History, or a playlist resolves the
+same target rather than creating a screen-specific duplicate.
+`CommentTarget::Source` covers YouTube channels, Bandcamp album/releases,
+RSS/podcast subscriptions, and Apple Podcasts shows. Stable provider IDs
+prevent identical display titles from colliding, and source notes remain
+independent from their child-media notes.
+
+Details exposes a selectable `[m] Add private note` or `[m] Edit private note`
+action; the existing-note form is highlighted without placing the private body
+in `DetailView`, diagnostic snapshots, or error reports. The focused multiline
+popup accepts `Enter` for a newline, grapheme-safe `Backspace`, cursor movement,
+`Ctrl+S` to add/edit, `Delete` followed by `Delete` or `Enter` to confirm
+removal, and `Esc` to discard the draft. One note is bounded to 16 KiB of UTF-8
+text and cannot be saved empty.
+
+The files backend persists notes in `state/notes.toml`; the optional SQLite
+backend persists the same logical boundary in `state.sqlite3`. Add, edit, and
+delete operations replace only the exact target's sole user-facing note and
+survive restart. Older duplicate SQLite comment rows, if present, are
+collapsed behind this one-note interface.
+
+### OPML and listening progress
+
+OPML is the subscription import/export boundary, not a state-backend schema.
+RSS feeds use
 standard `xmlUrl`, `htmlUrl`, `text`, and `title` attributes. YouTube channel
 feed URLs can also be represented. Nested outlines preserve portable folder
 structure where possible. Youta-specific private notes, playback positions,
-colors, and bookmarks remain in SQLite rather than being smuggled into
-non-standard OPML attributes.
+colors, and bookmarks remain in the selected state backend rather than being
+smuggled into non-standard OPML attributes.
+
+OPML has no standard listening-progress representation. The default TOML state
+stores a source-neutral media identity together with `position_seconds`,
+`duration_seconds`, `updated_at`, and a played override. For a podcast,
+`position_seconds`, `duration_seconds`, and `updated_at` map to a gPodder
+`play` action's `position`, `total`, and `timestamp`; a future adapter must
+also capture the per-play start offset for gPodder's `started`. Feed URL and
+enclosure URL provide the podcast and episode identities. That adapter can
+import/export JSON and synchronize it with a compatible service; the service
+protocol does not replace Youta's canonical state. See the
+[gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
+and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
 
 From the subscription-source root, `[a] Add RSS feed` accepts an absolute
 HTTP(S) RSS or Atom URL, rejects embedded username/password credentials, strips
@@ -172,6 +275,23 @@ The implemented Bandcamp tab is a credential-free public-page adapter rather
 than an API integration. Its bounded HTML search is best-effort and may need
 maintenance when Bandcamp changes markup, but it remains isolated behind the
 `bandcamp` feature and cannot turn a search result into authenticated access.
+
+The implemented Radio tab is a credential-free static-catalog adapter behind
+the independent `radio` feature. Presets keep a stable application ID, station
+homepage, direct stream or M3U entry point, and only quality fields supported
+by a reviewed source or probe. Merely enabling the feature performs no startup
+network request. Enter starts `MediaKind::LiveStream`; progress, seeking,
+chapters, completion, and repeat-one are disabled for that item, while
+listening-time checkpoints update source statistics without creating a
+position row. History and playlists persist the stable ID plus canonical
+homepage, then resolve the current built-in stream at replay time.
+
+At most one selected-or-playing Radio metadata request can be active.
+Provider metadata is preferred only while fresh, followed by player-observed
+ICY text. Failures retain the last success for stale Details display, never
+open a popup, and use station-scoped 1/2/5/10-minute capped backoff. Successful
+responses reset that station's failure history. The static catalogue and the
+separate BBC URL/RSS adapter have independent build features.
 
 Retries are bounded and use jittered backoff. Each adapter has explicit
 timeouts, a user agent, pagination limits, and a concurrency budget. Search
@@ -354,9 +474,9 @@ Full `ChannelDetails`, including country, aggregate views, and external links,
 uses the existing 64-entry process-local channel-details LRU and is discarded
 at shutdown. Compact `ChannelSummary` fields such as description, subscriber
 count, joined timestamp, video count, artwork, and canonical URL continue
-through the seven-day SQLite summary cache. This separation avoids repeating
-About-page work while moving between channels without persisting the richer
-external-link profile.
+through the selected backend's seven-day summary cache. This separation avoids
+repeating About-page work while moving between channels without persisting the
+richer external-link profile.
 
 Channel-video work is selected-source lazy. For the official API, the worker
 uses `channels.list` to find the uploads playlist,
@@ -379,11 +499,11 @@ private/unavailable-only pages. Every response carries a subscription
 generation; a response for an older selection is ignored and cannot replace
 the newly selected channel's rows.
 
-Successful YouTube page-one refreshes also replace a compact
-`subscription_items_cache` snapshot in SQLite. Each source retains at most 50
+Successful YouTube page-one refreshes also replace a compact subscription-item
+snapshot in the selected cache backend. Each source retains at most 50
 provider-ordered items and 512 KiB of encoded item data; when the byte limit is
-reached, the longest whole-item prefix that fits is stored. SQLite keeps the 32
-most recently refreshed sources. Later pages remain process-local.
+reached, the longest whole-item prefix that fits is stored. The cache keeps the
+32 most recently refreshed sources. Later pages remain process-local.
 
 On activation after a restart, Youta restores the first-page snapshot into RAM
 and renders it before issuing the background page-one refresh. The successful
@@ -593,19 +713,20 @@ to another.
 
 ## Authentication and secrets
 
-The current pre-alpha configuration layer accepts API keys as plain strings.
-The YouTube setup popup masks input, states the exact destination, and
-atomically stores the selected value in the user-only configuration file. The
+The current pre-alpha configuration layer accepts API keys as plain strings in
+`secrets/credentials.toml`. The YouTube setup popup masks input, states that
+exact destination, and atomically stores the selected key there; ordinary
+provider selection and an Invidious instance URL remain in `config.toml`. The
 key remains plaintext at rest. `YOUTA_PROVIDERS__YOUTUBE_API_KEY` and other
-environment overrides take precedence over TOML and avoid this persistent
+environment overrides have the highest precedence and avoid the persistent
 copy. System-keyring and explicit secret-reference backends remain roadmap
 work.
 
 Diagnostics redact tokens, cookies, authorization headers, signed URLs, and
-provider query secrets. API credentials never enter SQLite, OPML, git sync,
-crash-state snapshots, logs, LLM prompts, or child command lines when a safer
-file descriptor or environment channel exists. One explicit exception is a
-user-supplied private RSS query parameter: it is part of the subscribed feed
+provider query secrets. API credentials do not enter durable media state,
+OPML, crash-state snapshots, logs, LLM prompts, or child command lines when a
+safer file descriptor or environment channel exists. One explicit exception is
+a user-supplied private RSS query parameter: it is part of the subscribed feed
 URL and is stored in the private OPML file, while its popup debug
 representation remains redacted. RSS URLs with embedded usernames or passwords
 are rejected.
@@ -614,16 +735,28 @@ Future OAuth adapters should use a local callback with state and PKCE where the
 provider supports it. Refresh-token storage will be keyring-backed. Provider
 scopes must be minimized and documented next to the action that needs them.
 
-## Git and cloud sync (**roadmap**)
+## Git synchronization and cloud sync (**cloud roadmap**)
 
-Automatic git sync is off by default. When enabled, Youta commits only an
-allowlist of portable state exports after an atomic application transaction.
-Tokens, the SQLite write-ahead log, IPC sockets, caches, downloads, and media
-are excluded. Push failures remain queued and never roll back the local action.
+`persistence.git_commit_on_change = true` is the default. After a successful
+graceful TUI shutdown, Youta checks whether its configured root is inside a Git
+worktree. If so, it invokes Git directly without a shell, runs path-scoped
+`git add .`, creates a path-scoped commit named `Automatic state update` when
+there are changes, and pushes. It never pulls, merges, or commits already
+staged paths outside the Youta root. Each child command is non-interactive and
+the whole sequence has a bounded deadline. Git failure is reported after the
+terminal is restored and does not roll back local state. Set the option to
+`false` to disable shutdown synchronization. The controller first publishes
+its pending playback checkpoint and session exactly once, then is dropped to
+release the file-state lock. Git is not invoked when that durability barrier
+fails.
 
-Debounced commits are the default because commit-per-keystroke history wastes
-storage and power. A strict per-change option can exist for users who accept
-that cost. All generated commit messages are deterministic and shell-safe.
+On first initialization Youta creates a default `.gitignore`, if one does not
+already exist, for `secrets/`, `cache/`, `runtime/`, `thumbnail-cache/`,
+`downloads/`, SQLite files, state locks, and temporary files. Git's existing
+ignore rules are authoritative. There is no policy allowlist or secret check:
+a user may edit or remove those rules and intentionally version credentials
+or generated files, including in a private repository. Shutdown sync honors
+that choice and still runs the same scoped Git commands.
 
 Cloud sync is one-way backup in the first implementation. Remote restore is a
 separate, explicit workflow with conflict preview. Listening from a remote
@@ -653,7 +786,8 @@ The core is designed for deterministic tests:
 
 - reducers receive events and a clock, then return state plus effects;
 - provider tests use recorded, minimized mock JSON and a local mock server;
-- persistence tests use temporary databases and exercise every migration;
+- persistence conformance tests exercise both deterministic file documents and
+  optional SQLite migrations against temporary roots;
 - OPML tests cover nested folders, duplicate feeds, invalid XML, and round
   trips;
 - playback tests use a fake backend plus a fake JSON IPC server;
@@ -672,7 +806,9 @@ Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
 include both official YouTube metadata and Invidious adapters; runtime
 `providers.youtube_backend` chooses one. Distribution/minimal builds can use
-`--no-default-features`.
+`--no-default-features`. Human-readable file persistence is part of the core;
+`sqlite-state` adds optional system-SQLite persistence, while `bundled-sqlite`
+adds the same backend with vendored SQLite.
 
 Tagged releases are produced natively on amd64 and arm64. The release also
 contains a `cargo vendor` archive and matching Cargo source configuration so

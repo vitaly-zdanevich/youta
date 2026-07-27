@@ -22,19 +22,19 @@ enabled media resolver and downloader. The terminal UI remains the only visible
 interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
 
 > **Project status: pre-alpha foundation.** The repository contains the first
-> working TUI and core state model, local SQLite persistence, OPML
-> import/export, configuration loading, official YouTube Data API v3 and
-> Invidious discovery, and supervised `mpv`/`yt-dlp` integration. The larger
-> provider, upload, sync, scrobbling, waveform, and audiophile feature set
-> described in the roadmap is not implemented yet. Do not treat an existing
-> Cargo feature name as a support claim.
+> working TUI and core state model, human-readable TOML persistence, optional
+> SQLite persistence, OPML import/export, configuration loading, official
+> YouTube Data API v3 and Invidious discovery, and supervised `mpv`/`yt-dlp`
+> integration. The larger provider, upload, remote sync, scrobbling, waveform,
+> and audiophile feature set described in the roadmap is not implemented yet.
+> Do not treat an existing Cargo feature name as a support claim.
 
 ## Why this design
 
 - The UI stays responsive while network, metadata, and playback work happen
   outside the render loop.
 - Persistent state is local-first and restartable. Youta stores navigation,
-  queue, history, notes, bookmarks, and playback positions beneath
+  queue, playlists, history, notes, bookmarks, and playback positions beneath
   `~/.config/youta/`.
 - The Local tab browses supported media and images in place. Youta never
   reorganizes folders automatically; only explicit Rename, Move to Trash, and
@@ -109,8 +109,11 @@ The current pre-alpha foundation includes:
 - configuration-file plus `YOUTA_` environment overrides;
 - a source-neutral domain model for media, channels, queues, positions, notes,
   and provider capabilities;
-- SQLite persistence and versioned migrations;
+- deterministic, human-readable TOML state by default, with SQLite available
+  behind an optional Cargo feature;
 - local subscriptions with OPML import/export;
+- persistent local playlists with editable descriptions, cross-source replay,
+  and a built-in `todo` list;
 - a two-panel terminal UI and restartable screen state;
 - official YouTube Data API v3 or Invidious video/channel search and video
   details, with description-link extraction;
@@ -120,6 +123,8 @@ The current pre-alpha foundation includes:
   resolves only the selected release for explicit playback through `yt-dlp`;
 - an independent Apple Podcasts tab that searches the public, unauthenticated
   Apple catalogue by storefront and lazily loads playable episode metadata;
+- an account-free Radio tab backed by a static, zero-startup-network catalogue
+  of direct public streams;
 - lazy Wikidata enrichment for exact YouTube, SoundCloud, and Bilibili
   external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
@@ -157,7 +162,8 @@ resolver:
   catalog API.
 - **BBC Radio** accepts BBC Sounds landing URLs through `yt-dlp` and imports
   official BBC podcast/RSS feeds through the RSS provider. Youta does not claim
-  a stable public BBC Sounds catalog API.
+  a stable public BBC Sounds catalog API. Its `bbc-radio` build feature is
+  independent from the curated `radio` feature.
 - **SoundCloud** accepts direct URLs through `yt-dlp`. Rich search and
   subscriptions use the official API only when users provide their own
   application credentials; the API uses OAuth 2.1. See the [SoundCloud API
@@ -193,6 +199,53 @@ resolver:
   libopenmpt, and some exotic Amiga formats need a future UADE backend.
   Archive availability does not grant a free license or re-upload rights.
 
+### Public Radio tab
+
+The default build includes a separate **Radio** tab. Its catalogue is compiled
+into Youta, needs no account, and performs no directory request at startup.
+`Enter` sends the selected live stream directly to the normal invisible `mpv`
+backend. Live streams do not restore or save a playback position; seeking and
+repeat are disabled. They remain marker-free as
+`Radio · live` entries in
+History, `todo`, and other playlists. Listening time still contributes to the
+Radio total on the Stats screen.
+
+The current station set is:
+
+- [Sector Radio — Progressive](https://sectorradio.com/), [4duk Radio](https://4duk.ru/),
+  [SomaFM Groove Salad](https://somafm.com/groovesalad/), [KEXP](https://www.kexp.org/),
+  [NTS 1 and NTS 2](https://www.nts.live/), [WFMU](https://wfmu.org/), and
+  [Radio Paradise](https://radioparadise.com/);
+- [R/a/dio](https://r-a-d.io/), [AnimeRadio.de](https://www.animeradio.de/),
+  [Anison.FM](https://en.anison.fm/), and [LISTEN.moe](https://listen.moe/);
+- [FIP](https://www.radiofrance.fr/fip),
+  [Radio Swiss Classic](https://www.radioswissclassic.ch/en),
+  [France Musique](https://www.radiofrance.fr/francemusique),
+  [All Classical Radio](https://www.allclassical.org/),
+  [NPO Klassiek](https://www.npoklassiek.nl/), and
+  [Deutschlandfunk](https://www.deutschlandfunk.de/).
+
+Details shows only quality attributes known for that preset, the readable
+playback endpoint, a summary, and the station homepage. `[O] xdg-open` opens
+the homepage rather than the audio endpoint. The same stable station identity
+is used for playlists, History replay, private station notes, and the
+now-playing click target; transient redirects are never persisted.
+
+Station ICY metadata observed by `mpv` can appear beside the stable station
+title. France Musique and 4duk also have bounded passive metadata adapters:
+fresh provider data wins, ICY is the playing fallback, and a failed refresh
+retains the last successful value only as clearly stale selected-station
+details. Failures stay silent and retry with a station-scoped capped
+1/2/5/10-minute backoff, so an unavailable service does not create an idle
+polling loop.
+
+Sector Radio, 4duk, WFMU, and Radio Paradise currently publish the selected
+playback endpoint over plain HTTP. These streams are enabled by default as
+requested, but transport is unauthenticated and can be observed or modified
+on the network. Youta sends no credentials to them. Inclusion describes
+technical public reachability, not an assertion that the broadcast content is
+openly licensed or reusable.
+
 ### Lazy Wikidata enrichment
 
 Selecting a supported search result or opening a supported direct link can
@@ -209,8 +262,9 @@ No Wikidata request is made at startup. The current mappings are:
 | Bilibili channel/user | [Bilibili user ID (P6455)](https://www.wikidata.org/wiki/Property:P6455) |
 
 Each response is limited to 512 KiB and 20 matches. Successful lookups are
-cached in SQLite for seven days; successful empty lookups are cached for 24
-hours. Network and response errors are not negative-cache entries.
+cached in the selected persistence backend for seven days; successful empty
+lookups are cached for 24 hours. Network and response errors are not
+negative-cache entries.
 
 Each matched entity appears once under External links as a collapsed
 `[W] 🧾▸` row. Activating that row lazily requests the entity's bounded,
@@ -255,8 +309,9 @@ cargo run --locked -- --help
 
 The default build expects `mpv` and `yt-dlp` at runtime for online playback.
 They remain separate executables so they can be updated quickly when sites
-change. It also enables the `thumbnails` Cargo feature; runtime capability
-checks decide whether the TUI may fetch and render artwork.
+change. Human-readable persistence is part of the core build. The default
+feature set also enables `thumbnails`; runtime capability checks decide whether
+the TUI may fetch and render artwork.
 
 After installation, the current commands are:
 
@@ -273,13 +328,14 @@ youta extractors              # list extractors reported by installed yt-dlp
 The TUI starts without a network request. On the first YouTube search without a
 configured metadata provider, it opens a setup popup where the user can enter
 either a YouTube Data API key or an Invidious instance URL. The popup shows the
-exact `config.toml` path before saving. On Unix, this save creates the
-configuration directory with mode `0700` and the file with mode `0600`; the
-selected API key is stored there as plaintext. Environment values take
-precedence over saved values. The popup lists the steps to create a Google
-Cloud project, enable YouTube Data API v3, create an API key, and restrict it
-to that API so it cannot call unrelated Google APIs. Its `[F1]` link opens
-Google's official [credentials
+exact destination before saving: API keys go to
+`~/.config/youta/secrets/credentials.toml`, while an Invidious instance URL
+goes to `~/.config/youta/config.toml`. On Unix, Youta creates private
+directories with mode `0700` and files with mode `0600`; stored keys remain
+plaintext. Environment values take precedence over both files. The popup lists
+the steps to create a Google Cloud project, enable YouTube Data API v3, create
+an API key, and restrict it to that API so it cannot call unrelated Google
+APIs. Its `[F1]` link opens Google's official [credentials
 guide](https://developers.google.com/youtube/registering_an_application),
 `[F2]` opens [Google Cloud
 Credentials](https://console.cloud.google.com/apis/credentials), and `[F3]`
@@ -287,28 +343,45 @@ opens the official [Invidious instance
 list](https://docs.invidious.io/instances/). All three links also accept mouse
 clicks.
 
-The same choice can be configured manually:
+The provider selection and Invidious URL can be configured manually in
+`~/.config/youta/config.toml`:
 
 ```toml
 [providers]
 youtube_backend = 'auto' # auto, official, or invidious
-youtube_api_key = '...'
 # invidious_base_url = 'https://inv.example.org/'
 ```
 
-`auto` prefers `youtube_api_key` when the official adapter is compiled in,
-then falls back to `invidious_base_url`. `official` and `invidious` select only
-that backend. Both the TUI and `youta search` use this selection.
+Store the plaintext API key separately in
+`~/.config/youta/secrets/credentials.toml`:
+
+```toml
+[providers]
+youtube_api_key = '...'
+```
+
+`auto` prefers that key when the official adapter is compiled in, then falls
+back to `invidious_base_url`. `official` and `invidious` select only that
+backend. Both the TUI and `youta search` use this selection.
 
 For a small local-only build:
 
 ```sh
-cargo build --release --no-default-features --features tui,local,backend-mpv
+cargo build --release --no-default-features \
+	--features tui,local,backend-mpv
 ```
 
 This intentionally omits terminal thumbnails. A custom
 `--no-default-features` build must list `thumbnails` explicitly when artwork is
 wanted.
+
+For a small TUI build containing only the curated Radio catalogue and `mpv`
+playback:
+
+```sh
+cargo run --release --locked --no-default-features \
+	--features tui,radio,backend-mpv
+```
 
 For metadata through the official YouTube Data API instead of Invidious:
 
@@ -327,10 +400,113 @@ YOUTA_PROVIDERS__YOUTUBE_API_KEY='...' youta search 'query'
 ```
 
 Do not place tokens in shell history. The current pre-alpha configuration
-layer accepts token fields as plain strings. The TUI provider popup says where
-it will save the key and applies user-only Unix permissions, but environment
-injection avoids storing it in `config.toml`. A system-keyring adapter and
-explicit secret references are roadmap work.
+layer accepts token fields as plain strings in `secrets/credentials.toml`. The
+TUI provider popup says where it will save the key and applies user-only Unix
+permissions. Environment injection avoids storing it on disk. A system-keyring
+adapter and explicit secret references are roadmap work.
+
+## Human-readable state, OPML, and optional SQLite
+
+The default files backend is part of Youta's core and writes deterministic TOML
+beneath `~/.config/youta/`:
+
+```text
+state/manifest.toml      format and backend marker
+state/progress.toml      positions, durations, and played overrides
+state/history.toml       playback history
+state/notes.toml         private notes
+state/bookmarks.toml     media and segment bookmarks
+state/statistics.toml    listening totals
+state/local-moves.toml   crash-recoverable Local move journal
+state/playlists.toml     playlist metadata and ordered entries
+runtime/session.toml     restart-only UI and session state
+runtime/playback-checkpoint.toml
+                         bounded periodic playback crash recovery
+cache/searches.toml      regenerable search snapshots
+cache/providers.toml     regenerable provider metadata
+subscriptions.opml       portable RSS, podcast, and compatible channel feeds
+```
+
+The `state/` files are the canonical user-owned state for this backend.
+`runtime/` and `cache/` can be regenerated or replaced by later application
+activity. Writes use canonical ordering and same-directory atomic replacement
+so diffs remain readable and an interrupted write does not replace the last
+complete document. Each kind of state has its own document, so saving playback
+progress does not rewrite history, notes, bookmarks, statistics, or playlists.
+At startup, a corrupt `runtime/` or `cache/` document is preserved beside its
+canonical path under a private hidden `.corrupt` name and replaced with an
+empty valid document. Existing quarantine files are never overwritten.
+Canonical `state/*.toml` documents are not reset or quarantined automatically;
+Youta stops and leaves them untouched for manual recovery.
+
+Only one Youta process can open the files backend at a time. It holds an
+exclusive `state/.lock` for the lifetime of the store and reports an error
+instead of risking concurrent writers. Close Youta before editing `state/*.toml`
+by hand, then reopen it so the validated files are loaded from disk.
+
+TOML is ordinary text: Firefox can display it, although Firefox is not itself a
+general editor for local `file://` documents. Once the directory is committed,
+GitHub and GitLab can display diffs and edit TOML in their browser editors; a
+normal text editor remains the direct local editing route.
+
+SQLite is optional. Build with `sqlite-state` to make
+`persistence.backend = 'sqlite'` available, or use `bundled-sqlite` to compile
+that backend with vendored SQLite:
+
+```sh
+cargo build --release --features sqlite-state
+cargo build --release --features bundled-sqlite
+```
+
+SQLite uses `~/.config/youta/state.sqlite3`; it is not the default or a second
+simultaneous source of truth. The TOML files and an untouched SQLite database
+may coexist. `persistence.backend` alone selects which state is active, so
+switching back to `sqlite` reopens the database rather than migrating or
+deleting it.
+
+## Private notes
+
+Press `m`, or activate the **Add private note** / **Edit private note** row in
+Details, to open the focused multiline editor. The row is highlighted when the
+exact selection already has a note and remains a selectable mouse action.
+Youta keeps one private note per exact target:
+
+- media targets include a YouTube video, YouTube Music or Bandcamp track,
+  Apple Podcasts episode, MOD/tracker item, resolved direct-source item, or
+  local file; the same media target is reused when selected through
+  **Downloaded**, **History**, or a playlist;
+- source targets include a YouTube channel, Bandcamp album/release, an
+  RSS/podcast subscription, or an Apple Podcasts show.
+
+Provider-qualified IDs keep equal-looking titles from sharing a note, and a
+channel/show note remains independent from notes on its videos or episodes.
+The note is limited to 16 KiB of UTF-8 text.
+
+| Editor key | Action |
+| --- | --- |
+| `Enter` | Insert a new line. |
+| `Backspace` | Delete the previous complete character/grapheme. |
+| Arrow keys, `Home`, `End` | Move the insertion cursor. |
+| `Ctrl+S` | Add or save the sole note for the exact target. |
+| `Delete`, then `Delete` or `Enter` | Confirm deletion of an existing note. |
+| `Esc` | Close without saving the current draft. |
+
+Notes survive restarts in `state/notes.toml` with the default files backend, or
+in `state.sqlite3` when the optional SQLite backend is selected. The editor
+shows the active destination. Empty notes are rejected; use the explicit
+delete action to remove one.
+
+OPML deliberately remains the subscription interchange format. It carries
+feed URLs and outline folders, but it has no standard listening-progress
+fields. Youta stores source-neutral current position, total duration, update
+time, and played override so the model also covers YouTube, Bandcamp,
+MOD/tracker, and local media. For podcasts, a future `gpodder` adapter maps
+those values to `position`, `total`, and `timestamp`, and captures the
+per-play start offset required for `started`. It can import, export, or
+synchronize episode-action JSON without making that service protocol Youta's
+canonical file format. See the
+[gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
+and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
 
 ## Online discovery and `yt-dlp`
 
@@ -540,12 +716,54 @@ or not running. Minimal builds can omit the Linux-console client with
 [GPM protocol definitions](https://sources.debian.org/src/gpm/1.20.7-12/src/headers/gpm.h/)
 for the control-socket contract.
 
+## Local playlists and `todo`
+
+Youta stores playlists in `~/.config/youta/state/playlists.toml` with the
+default human-readable backend, or in `~/.config/youta/state.sqlite3` when the
+optional SQLite backend is selected. A playlist has a required name, an
+optional editable description, and ordered media entries. It stores stable
+replay information rather than copying a local file or persisting an expiring
+remote stream URL.
+
+Playlist actions appear only when the current selection can be replayed. This
+includes YouTube videos, YouTube Music and Bandcamp tracks, Apple Podcasts
+episodes, and supported local media:
+
+| Key | Action |
+| --- | --- |
+| `l` | Toggle the selected item in the persistent built-in `todo` playlist. |
+| `P` | Open the playlist chooser for the selected item. |
+| `j` / `k` or `↓` / `↑` | Move through the open chooser. |
+| `Enter` | Add to or remove from the selected playlist without closing the chooser. |
+| `n` | Open the new-playlist form from the chooser. |
+| `Esc` | Return from the form to the chooser, or close the chooser. |
+
+The new-playlist form requires a name and accepts an optional description.
+`Tab`, `Shift+Tab`, `↑`, and `↓` switch fields; `Enter` creates the playlist
+and adds the original item. Validation failures remain in the form so the
+draft can be corrected.
+
+Details shows `Playlists: name1, name2` only when the selected item belongs to
+one or more playlists. The line wraps with the Details panel and remains
+selectable in Details text-selection mode.
+
+Open the **Playlists** tab with `F4` or normal tab navigation. `Enter` opens the
+selected playlist; another `Enter` replays its selected item, and `Backspace`
+returns to the playlist index. Local entries replay their original file when
+it still exists. Remote entries resolve a fresh stream from their saved
+canonical public page.
+
+On the playlist index, `e` opens the same name-and-description editor. The
+built-in `todo` playlist can also be renamed or described, but its internal
+identity is fixed: `l` continues to target it after a rename.
+
 ## Subscriptions and local data
 
 OPML is the interchange format for RSS/podcast feeds and compatible channel
 feed URLs. It makes migration possible without a Youta-specific conversion.
-Private comments, folders, bookmarks, playback positions, and provider IDs do
-not fit OPML reliably, so they remain in SQLite and can be exported separately.
+Private notes, folders, bookmarks, playback positions, and provider IDs do
+not fit OPML reliably, so they remain in the selected state backend and can be
+exported separately.
 
 At the Subscriptions source root, `[a] Add RSS feed` accepts an absolute
 HTTP(S) RSS or Atom URL without an embedded username or password. Youta removes
@@ -653,14 +871,14 @@ does not immediately repeat the request. It retains at most 24 channels and
 250 videos per channel under a shared approximate 8 MiB heap budget; list
 descriptions and thumbnails are compacted before caching.
 
-A compact first-page snapshot also survives restarts in SQLite. Activating a
-channel renders that snapshot immediately, then refreshes page one
-in the background so new videos appear and provider-deleted videos disappear.
-Moving between sources with the Split layout's arrow navigation remains
-request-free; `Enter` activates the source and starts the initial load or
-refresh. Short-lived or signed direct stream URLs are never persisted in this
-snapshot, so playback resolves a fresh stream from the canonical video page.
-The detailed disk bounds are documented in
+A compact first-page snapshot also survives restarts in the selected cache
+backend. Activating a channel renders that snapshot immediately, then refreshes
+page one in the background so new videos appear and provider-deleted videos
+disappear. Moving between sources with the Split layout's arrow navigation
+remains request-free; `Enter` activates the source and starts the initial load
+or refresh. Short-lived or signed direct stream URLs are never persisted in
+this snapshot, so playback resolves a fresh stream from the canonical video
+page. The detailed disk bounds are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
 
 Application-owned persistent state stays under `~/.config/youta/`; transient
@@ -669,11 +887,22 @@ explicit Rename, Move to Trash, and Move actions are the only operations that
 mutate selected source entries. Downloads default to a Youta-owned subdirectory
 rather than a media source folder.
 
-Automatic Git commits and pushes are a roadmap feature and will be opt-in.
-The safer design batches an atomic state change, excludes secrets and media,
-then commits an allowlisted set of state files. A strict commit-per-change mode
-would create noisy history and consume more power, so it should not be the
-default.
+On a successful graceful shutdown, `persistence.git_commit_on_change = true`
+(the default) checks whether the configured Youta root is inside a Git
+worktree. If it is, Youta runs `git add .` from that root, creates a
+path-scoped commit named `Automatic state update` when Youta files changed,
+and runs `git push`. It never pulls or merges. Set the option to `false` to
+disable this behavior. Before invoking Git, Youta publishes its pending
+playback checkpoint and session, completes controller shutdown, and releases
+the state lock. A persistence failure skips Git synchronization.
+
+When Youta first creates its root, its default `.gitignore` excludes
+`secrets/`, caches, runtime snapshots, downloads, thumbnail data, SQLite files,
+locks, and temporary state files. Existing Git ignore rules remain
+authoritative during shutdown sync. Youta does not enforce a secret policy or
+refuse the commit: users may edit or remove those rules and intentionally
+version credentials, for example in a private repository. Git failures are
+reported after the terminal is restored and do not roll back local state.
 
 ## Service roadmap
 
@@ -787,9 +1016,9 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
-required live Apple Podcasts, keyless YouTube Music, and Wikidata jobs; a newer
-push does not cancel the older revision's suite. Clippy blocks compiler hygiene
-plus its correctness, suspicious-code, and performance groups; style,
+required live Apple Podcasts, keyless YouTube Music, Wikidata, and public Radio
+jobs; a newer push does not cancel the older revision's suite. Clippy blocks
+compiler hygiene plus its correctness, suspicious-code, and performance groups; style,
 complexity, and pedantic findings remain visible as advisory output while that
 backlog is reduced in focused changes. Apple Podcasts is checked from public
 Apple metadata through its RSS enclosure and silent audio decode. YouTube Music
@@ -826,6 +1055,14 @@ Run the same keyless YouTube Music search check locally with:
 
 ```sh
 YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
+```
+
+Run the Radio smoke locally to decode a real HTTPS stream through Youta's
+`mpv` backend, observe real ICY metadata, and parse 4duk's bounded public
+now-playing response:
+
+```sh
+YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact radio_stream_and_passive_metadata_are_usable --nocapture
 ```
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and

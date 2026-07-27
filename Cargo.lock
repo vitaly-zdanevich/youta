@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "youta"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3031,6 +3031,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+ "toml",
  "toml_edit",
  "trash",
  "unicode-segmentation",
