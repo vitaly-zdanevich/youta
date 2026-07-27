@@ -1853,7 +1853,7 @@ mod tests {
     fn progress_crud_preserves_completion_inputs() {
         let store = StateStore::open_in_memory().expect("open store");
         let mut progress = PlaybackProgress::new(id("progress"), Some(100), 1);
-        progress.record_position(90, 2);
+        progress.record_position(91, 2);
         assert!(progress.is_played());
         store.upsert_progress(&progress).expect("insert progress");
         assert_eq!(

@@ -42,6 +42,9 @@ pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTIS
 /// Environment variable that overrides automatic same-source queue continuation.
 pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
 
+/// Environment variable that overrides selected-video `YouTube` prewarming.
+pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
+
 /// Environment variable that overrides lazy Local-folder size measurement.
 pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 
@@ -347,12 +350,14 @@ impl Config {
 
     /// Persists the preferences currently exposed by the in-app editor.
     ///
-    /// The Subscriptions layout, advertisement-chapter behavior, and lazy
-    /// Local-folder size preference are written together so confirming the
-    /// popup cannot save only part of the draft.
+    /// The Subscriptions layout, advertisement-chapter behavior, selected
+    /// YouTube-video prewarming, and lazy Local-folder size preference are
+    /// written together so confirming the popup cannot save only part of the
+    /// draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
+    /// [`YOUTUBE_PREWARM_ENV`] and
     /// [`LOCAL_FOLDER_SIZES_ENV`] retain precedence and therefore prevent this
     /// writer from storing a shadowed draft.
     ///
@@ -369,11 +374,13 @@ impl Config {
         &mut self,
         layout: SubscriptionsLayout,
         skip_advertisement_chapters: bool,
+        youtube_prewarm: bool,
         show_local_folder_sizes: bool,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
         ] {
             if std::env::var_os(variable).is_some() {
@@ -412,12 +419,14 @@ impl Config {
                     )
                 })?;
             playback["skip_advertisement_chapters"] = value(skip_advertisement_chapters);
+            playback["youtube_prewarm"] = value(youtube_prewarm);
         }
         write_private_config(&path, document.to_string().as_bytes())?;
 
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
+        self.playback.youtube_prewarm = youtube_prewarm;
         Ok(())
     }
 
@@ -477,6 +486,8 @@ pub struct PlaybackConfig {
     pub resume_rewind_seconds: u64,
     /// Continue with the next playable entry from the active source list.
     pub autoplay: bool,
+    /// Resolve the stable selected `YouTube` video briefly in RAM before Play.
+    pub youtube_prewarm: bool,
     /// Hide and skip chapters whose normalized title is exactly `Реклама`.
     pub skip_advertisement_chapters: bool,
     /// Settings that favor stable direct-device playback.
@@ -493,6 +504,7 @@ impl Default for PlaybackConfig {
             speed_percent: 100,
             resume_rewind_seconds: DEFAULT_RESUME_REWIND_SECONDS,
             autoplay: false,
+            youtube_prewarm: true,
             skip_advertisement_chapters: true,
             audiophile: AudiophileConfig::default(),
         }
@@ -977,6 +989,7 @@ mod tests {
         assert_eq!(config.subscriptions.audio_format, "opus");
         assert_eq!(config.playback.resume_rewind_seconds, 30);
         assert!(!config.playback.autoplay);
+        assert!(config.playback.youtube_prewarm);
         assert!(config.playback.skip_advertisement_chapters);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
@@ -1006,6 +1019,7 @@ mod tests {
 volume_percent = 35
 speed_percent = 120
 autoplay = true
+youtube_prewarm = false
 skip_advertisement_chapters = false
 
 [subscriptions]
@@ -1026,6 +1040,7 @@ subscriptions_layout = "split"
         assert_eq!(config.playback.volume_percent, 35);
         assert_eq!(config.playback.speed_percent, 120);
         assert!(config.playback.autoplay);
+        assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
         assert!(!config.subscriptions.auto_download);
         assert_eq!(config.ui.theme, ThemeMode::Light);
@@ -1043,6 +1058,7 @@ subscriptions_layout = "split"
             let config = Config::load().expect("load child configuration");
             assert_eq!(config.playback.volume_percent, 62);
             assert!(config.playback.autoplay);
+            assert!(!config.playback.youtube_prewarm);
             assert!(!config.playback.skip_advertisement_chapters);
             assert!(config.ui.nyan_cat_seekbar);
             assert_eq!(config.ui.thumbnail_height, 16);
@@ -1068,6 +1084,7 @@ subscriptions_layout = "split"
             .env(CONFIG_DIR_ENV, directory.path())
             .env("YOUTA_PLAYBACK__VOLUME_PERCENT", "62")
             .env(AUTOPLAY_ENV, "true")
+            .env(YOUTUBE_PREWARM_ENV, "false")
             .env(SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false")
             .env("YOUTA_UI__NYAN_CAT_SEEKBAR", "true")
             .env("YOUTA_UI__THUMBNAIL_HEIGHT", "16")
@@ -1141,7 +1158,7 @@ youtube_api_key = "keep-this-existing-secret"
             .expect("load configuration");
 
         config
-            .save_tui_preferences(SubscriptionsLayout::Split, false, false)
+            .save_tui_preferences(SubscriptionsLayout::Split, false, false, false)
             .expect("save TUI preferences");
 
         let contents = fs::read_to_string(&path).expect("read updated configuration");
@@ -1151,15 +1168,18 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("skip_advertisement_chapters = false"));
+        assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!config.ui.show_local_folder_sizes);
+        assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
 
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
     }
 
@@ -1250,7 +1270,7 @@ youtube_api_key = "keep-this-existing-secret"
             let mut config =
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
             let error = config
-                .save_tui_preferences(SubscriptionsLayout::Split, false, true)
+                .save_tui_preferences(SubscriptionsLayout::Split, false, true, true)
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
@@ -1260,6 +1280,7 @@ youtube_api_key = "keep-this-existing-secret"
         for (override_name, override_value) in [
             (SUBSCRIPTIONS_LAYOUT_ENV, "split"),
             (SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false"),
+            (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
         ] {
             let directory = tempdir().expect("temporary directory");

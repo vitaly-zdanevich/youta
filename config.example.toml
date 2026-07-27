@@ -29,6 +29,12 @@ resume_rewind_seconds = 30
 # YOUTA_PLAYBACK__AUTOPLAY has higher precedence.
 autoplay = false
 
+# Resolve only the currently selected YouTube video's audio after a 200 ms
+# selection debounce. The bounded worker keeps signed media URLs and HTTP
+# headers in RAM only; normal canonical YouTube playback remains the fallback.
+# YOUTA_PLAYBACK__YOUTUBE_PREWARM has higher precedence.
+youtube_prewarm = true
+
 # Hide seek-bar entries and automatically skip only chapters whose normalized
 # Russian title is exactly `Реклама`. Set this to false to retain and play them.
 # YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS has higher precedence.

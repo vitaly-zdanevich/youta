@@ -612,7 +612,7 @@ impl PlaybackProgress {
         u8::try_from(rounded).unwrap_or(100)
     }
 
-    /// Whether the item is played, honoring a user override before the 90% rule.
+    /// Whether the item is played, honoring an override before the >90% rule.
     #[must_use]
     pub fn is_played(&self) -> bool {
         self.played_override.unwrap_or_else(|| {
@@ -620,7 +620,7 @@ impl PlaybackProgress {
                 .filter(|duration| *duration > 0)
                 .is_some_and(|duration| {
                     u128::from(self.position_seconds) * 100
-                        >= u128::from(duration) * u128::from(PLAYED_THRESHOLD_PERCENT)
+                        > u128::from(duration) * u128::from(PLAYED_THRESHOLD_PERCENT)
                 })
         })
     }
@@ -1036,11 +1036,13 @@ mod tests {
     }
 
     #[test]
-    fn played_threshold_is_inclusive_and_can_be_overridden() {
+    fn played_threshold_is_strict_and_can_be_overridden() {
         let mut progress = PlaybackProgress::new(id("video"), Some(100), 1);
         progress.record_position(89, 2);
         assert!(!progress.is_played());
         progress.record_position(90, 3);
+        assert!(!progress.is_played());
+        progress.record_position(91, 4);
         assert!(progress.is_played());
 
         progress.set_played(false);

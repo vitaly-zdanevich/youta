@@ -16,6 +16,9 @@ pub mod mpv;
 #[cfg(feature = "yt-dlp")]
 pub mod ytdlp;
 
+#[cfg(feature = "yt-dlp")]
+pub mod youtube_prewarm;
+
 /// Errors returned by a playback or extraction backend.
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -67,6 +70,7 @@ impl PlaybackHttpHeaders {
     }
 
     /// Iterates over header names and their sensitive values.
+    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
         self.0
             .iter()
@@ -86,7 +90,7 @@ impl fmt::Debug for PlaybackHttpHeaders {
 }
 
 /// A media item to load into a playback backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlaybackInput {
     /// Local path or remote URL accepted by the selected backend.
     pub location: String,
@@ -104,6 +108,27 @@ pub struct PlaybackInput {
     pub http_headers: PlaybackHttpHeaders,
     /// Skip mpv's yt-dlp hook because [`Self::location`] is already resolved.
     pub bypass_ytdl: bool,
+}
+
+impl fmt::Debug for PlaybackInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlaybackInput")
+            .field(
+                "location",
+                &if self.bypass_ytdl {
+                    "<redacted-resolved-media-url>"
+                } else {
+                    self.location.as_str()
+                },
+            )
+            .field("start_at", &self.start_at)
+            .field("title", &self.title)
+            .field("verify_remote_format", &self.verify_remote_format)
+            .field("http_headers", &self.http_headers)
+            .field("bypass_ytdl", &self.bypass_ytdl)
+            .finish()
+    }
 }
 
 impl PlaybackInput {

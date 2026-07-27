@@ -1,10 +1,11 @@
 //! Application controller connecting providers, persistence, playback, and TUI.
 //!
-//! Network requests run on one blocking worker thread. Local directory listing
-//! uses a separate worker so recursive size scans and remote requests cannot
-//! delay foreground folder navigation. The terminal event loop therefore never
-//! waits for either class of response, while the process avoids an asynchronous
-//! runtime and its additional idle bookkeeping.
+//! Provider requests run on one blocking worker thread. Local directory
+//! listings and selected-video `YouTube` prewarming use dedicated workers; the
+//! prewarm queue is latest-only and bounded. Recursive scans, remote metadata,
+//! and speculative extraction therefore cannot delay foreground navigation.
+//! The terminal event loop never waits for these responses, while the process
+//! avoids an asynchronous runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "yt-dlp")]
@@ -20,10 +21,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+#[cfg(feature = "yt-dlp")]
+use crossbeam_channel::{TrySendError, bounded};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     Config, LOCAL_FOLDER_SIZES_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
-    SubscriptionsLayout, YouTubeBackend, YouTubeProviderSetting,
+    SubscriptionsLayout, YOUTUBE_PREWARM_ENV, YouTubeBackend, YouTubeProviderSetting,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 use crate::domain::{
@@ -42,6 +46,11 @@ use crate::persistence::CachedWikidataLookup;
 use crate::persistence::SavedYouTubeMusicSearch;
 use crate::persistence::{MAX_SAVED_YOUTUBE_SEARCH_RESULTS, SavedYouTubeSearch, StateStore};
 #[cfg(feature = "yt-dlp")]
+use crate::playback::youtube_prewarm::{
+    PrewarmedYouTubeAudio, YouTubePrewarmCancellation, YouTubePrewarmConfig, YouTubePrewarmError,
+    YouTubePrewarmRequest, YouTubePrewarmResolver, YouTubePrewarmResult,
+};
+#[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
     DownloadFormat, DownloadProcess, DownloadRequest, YtDlp, YtDlpConfig, parse_download_event,
 };
@@ -54,16 +63,16 @@ use crate::providers::youtube_music::{
     YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
 };
 use crate::providers::{
-    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest, Provider,
-    SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary,
-    invidious_youtube_provider, official_youtube_provider, validate_youtube_video_id,
+    ChannelDetails, ChannelExternalLinkKind, ChannelStatisticsMode, ChannelSubscriberCount,
+    ChannelSummary, ChannelVideosRequest, Provider, SearchFeature, SearchItem, SearchPage,
+    SearchRequest, SearchSort as ProviderSearchSort, SearchTarget, Thumbnail, VideoDetails,
+    VideoOrientation, VideoSummary, invidious_youtube_provider, official_youtube_provider,
+    validate_youtube_video_id,
 };
 use crate::report_actions::SystemReportActions;
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
 use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
-#[cfg(any(feature = "wikidata", test))]
 use crate::tui::DetailLinkView;
 #[cfg(feature = "yt-dlp")]
 use crate::tui::DownloadView;
@@ -75,6 +84,8 @@ use crate::tui::{
     SubscriptionRoute, UiAction, UiController, ViewModel, YOUTUBE_API_KEY_GUIDE_URL,
     YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
+#[cfg(feature = "wikidata")]
+use crate::tui::{DetailWikidataEntityView, DetailWikidataValueLinkView};
 
 /// Truncates a clipboard payload without splitting a UTF-8 character.
 fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
@@ -86,6 +97,20 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
         boundary -= 1;
     }
     value.truncate(boundary);
+}
+
+/// Clamps an editable basename cursor to a preceding grapheme boundary.
+fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
+    let requested = requested.min(value.len());
+    if requested == value.len() {
+        return requested;
+    }
+    value
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= requested)
+        .last()
+        .unwrap_or_default()
 }
 
 /// Factory used to start a playback engine only when the user presses Play.
@@ -679,6 +704,10 @@ enum ProviderRequest {
         kind: crate::providers::wikidata::WikidataExternalKind,
         external_id: String,
     },
+    #[cfg(feature = "wikidata")]
+    WikidataStatements {
+        item_id: String,
+    },
     Shutdown,
 }
 
@@ -707,7 +736,14 @@ enum ProviderResponse {
         generation: u64,
         provider_generation: u64,
         channel_id: String,
-        result: Result<ChannelSummary, String>,
+        result: Result<ChannelDetails, String>,
+    },
+    #[cfg(feature = "network")]
+    ChannelPageMetadata {
+        generation: u64,
+        provider_generation: u64,
+        channel_id: String,
+        result: Result<crate::providers::youtube_channel_page::YouTubeChannelPageMetadata, String>,
     },
     ChannelSubscriberCounts {
         provider_generation: u64,
@@ -759,6 +795,11 @@ enum ProviderResponse {
         property_id: String,
         external_id: String,
         result: Result<Vec<crate::domain::WikidataLink>, String>,
+    },
+    #[cfg(feature = "wikidata")]
+    WikidataStatements {
+        item_id: String,
+        result: Result<crate::providers::wikidata::WikidataEntityStatements, String>,
     },
 }
 
@@ -1075,6 +1116,16 @@ enum PlaybackPhase {
     Playing,
 }
 
+/// Bounded fallback stage for the current backend load attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaybackLoadKind {
+    #[default]
+    Regular,
+    YouTubeDirect,
+    YouTubeCanonical,
+    YouTubeChecked,
+}
+
 /// Stable position in a same-source list used for automatic continuation.
 ///
 /// Keeping an index avoids confusing duplicate media identifiers, which are
@@ -1206,8 +1257,101 @@ struct ScheduledChannelDetails {
     due_at: Instant,
 }
 
+/// One Wikidata channel lookup scheduled after source navigation settles.
+#[cfg(feature = "wikidata")]
+#[derive(Clone, Debug)]
+struct ScheduledChannelWikidata {
+    /// Lookup generation that owns the eventual visible update.
+    generation: u64,
+    /// Exact `YouTube` channel identifier queried through `P2397`.
+    channel_id: String,
+    /// Earliest instant at which the background request may start.
+    due_at: Instant,
+}
+
+#[cfg(feature = "yt-dlp")]
+const YOUTUBE_PREWARM_DEBOUNCE: Duration = Duration::from_millis(200);
+#[cfg(feature = "yt-dlp")]
+const YOUTUBE_PREWARM_TTL: Duration = Duration::from_secs(90);
+#[cfg(feature = "yt-dlp")]
+const YOUTUBE_PREWARM_EXPIRY_MARGIN_SECONDS: u64 = 30;
+#[cfg(feature = "yt-dlp")]
+const YOUTUBE_PREWARM_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Selected video waiting for the short debounce before extractor work.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+struct ScheduledYouTubePrewarm {
+    generation: u64,
+    media_id: MediaId,
+    source_url: url::Url,
+    due_at: Instant,
+}
+
+/// One cancellable request owned by the dedicated resolver worker.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+struct YouTubePrewarmJob {
+    media_id: MediaId,
+    request: YouTubePrewarmRequest,
+    cancellation: YouTubePrewarmCancellation,
+}
+
+/// Bounded command accepted by the resolver worker.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+enum YouTubePrewarmCommand {
+    Resolve(YouTubePrewarmJob),
+    Shutdown,
+}
+
+/// Worker completion paired with the exact selected media identity.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+struct YouTubePrewarmCompletion {
+    media_id: MediaId,
+    completed_at: Instant,
+    result: YouTubePrewarmResult,
+}
+
+/// Request currently running or waiting in the one-element worker queue.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+struct ActiveYouTubePrewarm {
+    generation: u64,
+    media_id: MediaId,
+    cancellation: YouTubePrewarmCancellation,
+}
+
+/// Fresh RAM-only direct stream eligible for one playback attempt.
+#[cfg(feature = "yt-dlp")]
+#[derive(Debug)]
+struct ReadyYouTubePrewarm {
+    media_id: MediaId,
+    completed_at: Instant,
+    audio: PrewarmedYouTubeAudio,
+}
+
+/// Selection identity retained while page one refreshes in the background.
+#[derive(Debug)]
+struct PendingSubscriptionRefresh {
+    /// Channel whose page-one response may replace the visible cache.
+    channel_id: String,
+    /// Video reselected when it remains present after the refresh.
+    selected_video_id: Option<String>,
+    /// Previous index used when the selected video disappeared.
+    fallback_index: usize,
+    /// Replacement pages staged while filtered page one is temporarily empty.
+    staged_cache: Option<CachedSubscriptionVideos>,
+}
+
 /// Maximum number of internal Details pages retained in either direction.
 const MAX_DETAIL_NAVIGATION_HISTORY: usize = 16;
+/// Maximum expanded Wikidata entities retained in process memory.
+#[cfg(feature = "wikidata")]
+const MAX_CACHED_WIKIDATA_ENTITIES: usize = 8;
+/// Maximum detached system-opener tasks accepted before earlier ones finish.
+const MAX_URL_OPEN_TASKS: usize = 4;
 /// Stable marker for a linked video whose provider details are still pending.
 const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video…";
 /// Stable marker rendered below the pending linked-video title.
@@ -1218,6 +1362,18 @@ const LINKED_VIDEO_LOADING_DESCRIPTION: &str = "Loading video details…";
 struct ActiveDescriptionVideo {
     video_id: String,
     start_seconds: Option<u64>,
+}
+
+/// URL-free result returned by one asynchronous `xdg-open` task.
+///
+/// The selected target is intentionally absent so it cannot enter diagnostics,
+/// debug output, or long-lived controller state.
+#[derive(Debug, Eq, PartialEq)]
+enum UrlOpenCompletion {
+    /// The system opener exited successfully.
+    Succeeded,
+    /// Starting, waiting for, or running the opener failed.
+    Failed(String),
 }
 
 /// One bounded, move-only browser-style Details location.
@@ -1317,6 +1473,8 @@ pub struct AppController {
     active_subscription_channel_id: Option<String>,
     /// Generation rejecting responses queued for an older source selection.
     subscription_generation: u64,
+    /// Selection restored after an explicit page-one refresh completes.
+    pending_subscription_refresh: Option<PendingSubscriptionRefresh>,
     next_youtube_page: Option<u32>,
     youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
@@ -1339,6 +1497,8 @@ pub struct AppController {
     pending_channel_subscribers: HashSet<String>,
     /// Compact positive and negative channel metadata cached for this process.
     channel_details_cache: HashMap<String, Option<ChannelSummary>>,
+    /// Selected-only public profile fields and channel-advertised links.
+    channel_profile_cache: HashMap<String, ChannelDetails>,
     /// Expiration timestamps for positive RAM entries hydrated from SQLite.
     channel_details_fresh_until: HashMap<String, i64>,
     /// Least-recently-used order for compact channel metadata.
@@ -1349,10 +1509,49 @@ pub struct AppController {
     channel_details_generation: u64,
     /// Debounced metadata request for the stable subscription source.
     scheduled_channel_details: Option<ScheduledChannelDetails>,
+    /// Debounced Wikidata lookup for the stable subscription source.
+    #[cfg(feature = "wikidata")]
+    scheduled_channel_wikidata: Option<ScheduledChannelWikidata>,
     search_generation: u64,
     details_generation: u64,
     #[cfg(feature = "wikidata")]
     wikidata_generation: u64,
+    /// Bounded human-facing Wikidata entity statements retained in RAM.
+    #[cfg(feature = "wikidata")]
+    wikidata_entity_cache: HashMap<String, crate::providers::wikidata::WikidataEntityStatements>,
+    /// Least-recently-used order for expanded Wikidata entities.
+    #[cfg(feature = "wikidata")]
+    wikidata_entity_cache_order: VecDeque<String>,
+    /// Exact Wikidata Q-IDs currently owned by the provider worker.
+    #[cfg(feature = "wikidata")]
+    pending_wikidata_entities: HashSet<String>,
+    /// Commands for the isolated selected-video resolver worker.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_requests: Option<Sender<YouTubePrewarmCommand>>,
+    /// Receiver clone used to replace a queued, not-yet-started request.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_request_drain: Option<Receiver<YouTubePrewarmCommand>>,
+    /// Bounded completions drained by the terminal tick.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_responses: Option<Receiver<YouTubePrewarmCompletion>>,
+    /// Dedicated worker handle joined during shutdown.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_thread: Option<JoinHandle<()>>,
+    /// Latest selection generation accepted for speculative resolution.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_generation: u64,
+    /// Debounced request for the stable selected `YouTube` row.
+    #[cfg(feature = "yt-dlp")]
+    scheduled_youtube_prewarm: Option<ScheduledYouTubePrewarm>,
+    /// Sole active or one-element-queued resolver request.
+    #[cfg(feature = "yt-dlp")]
+    active_youtube_prewarm: Option<ActiveYouTubePrewarm>,
+    /// Sole fresh resolved stream, never persisted or logged.
+    #[cfg(feature = "yt-dlp")]
+    ready_youtube_prewarm: Option<ReadyYouTubePrewarm>,
+    /// One recent failure suppressing repeated extraction for the same row.
+    #[cfg(feature = "yt-dlp")]
+    youtube_prewarm_failure: Option<(MediaId, Instant)>,
     playback_factory: Option<PlaybackFactory>,
     player: Option<Box<dyn PlaybackBackend>>,
     #[cfg(feature = "yt-dlp")]
@@ -1361,11 +1560,17 @@ pub struct AppController {
     active_download: Option<ActiveDownload>,
     report_actions: Box<dyn DiagnosticActionHandler>,
     diagnostic_helpers_cache: Option<Vec<ExternalHelper>>,
+    /// URL-free completions from detached system-opener tasks.
+    url_open_results: Receiver<UrlOpenCompletion>,
+    /// Sender cloned into each detached system-opener task.
+    url_open_result_sender: Sender<UrlOpenCompletion>,
+    /// Number of system-opener tasks that have not reported completion.
+    url_open_pending: usize,
     playback_queue: PlaybackQueue,
     playback_phase: PlaybackPhase,
+    playback_load_kind: PlaybackLoadKind,
     pending_history: Option<HistoryEntry>,
     ignore_replaced_stop: bool,
-    checked_format_retry_for: Option<MediaId>,
     /// Advertisement chapter most recently skipped while backend status catches up.
     skipped_advertisement_chapter: Option<(MediaId, u64)>,
     current_media: Option<MediaId>,
@@ -1422,6 +1627,7 @@ impl AppController {
         let (request_sender, request_receiver) = unbounded();
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
+        let (url_open_result_sender, url_open_results) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
@@ -1625,6 +1831,7 @@ impl AppController {
             subscription_cache_order: VecDeque::new(),
             active_subscription_channel_id: None,
             subscription_generation: 0,
+            pending_subscription_refresh: None,
             // Official YouTube pagination uses opaque tokens retained only by
             // the live provider. Restored rows remain instant and safe, while
             // a new explicit search rebuilds the continuation chain.
@@ -1645,15 +1852,42 @@ impl AppController {
             channel_subscriber_cache: HashMap::new(),
             pending_channel_subscribers: HashSet::new(),
             channel_details_cache: HashMap::new(),
+            channel_profile_cache: HashMap::new(),
             channel_details_fresh_until: HashMap::new(),
             channel_details_cache_order: VecDeque::new(),
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
             scheduled_channel_details: None,
+            #[cfg(feature = "wikidata")]
+            scheduled_channel_wikidata: None,
             search_generation: 0,
             details_generation: 0,
             #[cfg(feature = "wikidata")]
             wikidata_generation: 0,
+            #[cfg(feature = "wikidata")]
+            wikidata_entity_cache: HashMap::new(),
+            #[cfg(feature = "wikidata")]
+            wikidata_entity_cache_order: VecDeque::new(),
+            #[cfg(feature = "wikidata")]
+            pending_wikidata_entities: HashSet::new(),
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_requests: None,
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_request_drain: None,
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_responses: None,
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_thread: None,
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_generation: 0,
+            #[cfg(feature = "yt-dlp")]
+            scheduled_youtube_prewarm: None,
+            #[cfg(feature = "yt-dlp")]
+            active_youtube_prewarm: None,
+            #[cfg(feature = "yt-dlp")]
+            ready_youtube_prewarm: None,
+            #[cfg(feature = "yt-dlp")]
+            youtube_prewarm_failure: None,
             playback_factory,
             player: None,
             #[cfg(feature = "yt-dlp")]
@@ -1662,11 +1896,14 @@ impl AppController {
             active_download: None,
             report_actions: Box::new(SystemReportActions::new()),
             diagnostic_helpers_cache: None,
+            url_open_results,
+            url_open_result_sender,
+            url_open_pending: 0,
             playback_queue: PlaybackQueue::default(),
             playback_phase: PlaybackPhase::Idle,
+            playback_load_kind: PlaybackLoadKind::Regular,
             pending_history: None,
             ignore_replaced_stop: false,
-            checked_format_retry_for: None,
             skipped_advertisement_chapter: None,
             current_media: saved.selected_media,
             current_autoplay_origin: None,
@@ -1971,6 +2208,7 @@ impl AppController {
         self.channel_subscriber_cache.clear();
         self.pending_channel_subscribers.clear();
         self.channel_details_cache.clear();
+        self.channel_profile_cache.clear();
         self.channel_details_cache_order.clear();
         self.pending_channel_details.clear();
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
@@ -2361,15 +2599,279 @@ impl AppController {
         }
     }
 
+    /// Starts the isolated resolver worker only when an eligible selection
+    /// actually reaches the end of its debounce.
+    #[cfg(feature = "yt-dlp")]
+    fn ensure_youtube_prewarm_worker(&mut self) -> bool {
+        if self.youtube_prewarm_requests.is_some() {
+            return true;
+        }
+        #[cfg(test)]
+        if self.config.providers.yt_dlp_executable == Path::new("yt-dlp") {
+            // Unit tests opt in with an explicit mock executable. Integration
+            // and production builds use the configured helper normally.
+            return false;
+        }
+        let resolver = YouTubePrewarmResolver::new(YouTubePrewarmConfig {
+            executable: self.config.providers.yt_dlp_executable.clone(),
+            ..YouTubePrewarmConfig::default()
+        });
+        let (request_sender, request_receiver) = bounded(1);
+        let request_drain = request_receiver.clone();
+        let (response_sender, response_receiver) = bounded(1);
+        let response_drain = response_receiver.clone();
+        let thread = thread::Builder::new()
+            .name("youta-youtube-prewarm".to_owned())
+            .spawn(move || {
+                youtube_prewarm_worker(request_receiver, response_sender, response_drain, resolver);
+            });
+        let Ok(thread) = thread else {
+            return false;
+        };
+        self.youtube_prewarm_requests = Some(request_sender);
+        self.youtube_prewarm_request_drain = Some(request_drain);
+        self.youtube_prewarm_responses = Some(response_receiver);
+        self.youtube_prewarm_thread = Some(thread);
+        true
+    }
+
+    /// Cancels and forgets every speculative result without touching playback.
+    #[cfg(feature = "yt-dlp")]
+    fn cancel_youtube_prewarm(&mut self) {
+        self.youtube_prewarm_generation = self.youtube_prewarm_generation.wrapping_add(1);
+        self.scheduled_youtube_prewarm = None;
+        self.ready_youtube_prewarm = None;
+        if let Some(active) = self.active_youtube_prewarm.take() {
+            active.cancellation.cancel();
+        }
+        if let Some(receiver) = self.youtube_prewarm_request_drain.as_ref() {
+            while let Ok(command) = receiver.try_recv() {
+                if let YouTubePrewarmCommand::Resolve(job) = command {
+                    job.cancellation.cancel();
+                }
+            }
+        }
+        if let Some(receiver) = self.youtube_prewarm_responses.as_ref() {
+            while receiver.try_recv().is_ok() {}
+        }
+    }
+
+    /// Cancels the extractor child, stops its worker, and reaps the thread.
+    #[cfg(feature = "yt-dlp")]
+    fn shutdown_youtube_prewarm(&mut self) {
+        self.cancel_youtube_prewarm();
+        if let Some(sender) = self.youtube_prewarm_requests.take() {
+            let _ = sender.send(YouTubePrewarmCommand::Shutdown);
+        }
+        if let Some(thread) = self.youtube_prewarm_thread.take() {
+            let _ = thread.join();
+        }
+        self.youtube_prewarm_request_drain = None;
+        self.youtube_prewarm_responses = None;
+    }
+
+    /// Returns whether a resolved direct stream remains safe to try now.
+    #[cfg(feature = "yt-dlp")]
+    fn youtube_prewarm_is_fresh(ready: &ReadyYouTubePrewarm, now: Instant) -> bool {
+        if now.saturating_duration_since(ready.completed_at) > YOUTUBE_PREWARM_TTL {
+            return false;
+        }
+        let now_unix = u64::try_from(unix_time()).unwrap_or_default();
+        ready.audio.expires_at_unix().is_none_or(|expires_at| {
+            expires_at > now_unix.saturating_add(YOUTUBE_PREWARM_EXPIRY_MARGIN_SECONDS)
+        })
+    }
+
+    /// Replaces speculative work with one debounced eligible `YouTube` video.
+    #[cfg(feature = "yt-dlp")]
+    fn update_youtube_prewarm_for_selection(&mut self, selected: Option<&SearchItem>) {
+        if !self.config.playback.youtube_prewarm
+            || (self.playback_factory.is_none() && self.player.is_none())
+        {
+            self.cancel_youtube_prewarm();
+            return;
+        }
+        let Some(SearchItem::Video(video)) = selected else {
+            self.cancel_youtube_prewarm();
+            return;
+        };
+        let media_id = MediaId::new(SourceKind::YouTube, video.video_id.clone());
+        if video.live
+            || video.duration_seconds == Some(0)
+            || (self.playback_phase != PlaybackPhase::Idle
+                && self.current_media.as_ref() == Some(&media_id))
+        {
+            self.cancel_youtube_prewarm();
+            return;
+        }
+        let now = Instant::now();
+        if self.ready_youtube_prewarm.as_ref().is_some_and(|ready| {
+            ready.media_id == media_id && Self::youtube_prewarm_is_fresh(ready, now)
+        }) || self
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .is_some_and(|scheduled| scheduled.media_id == media_id)
+            || self
+                .active_youtube_prewarm
+                .as_ref()
+                .is_some_and(|active| active.media_id == media_id)
+        {
+            return;
+        }
+        if self
+            .youtube_prewarm_failure
+            .as_ref()
+            .is_some_and(|(failed, retry_at)| failed == &media_id && now < *retry_at)
+        {
+            self.cancel_youtube_prewarm();
+            return;
+        }
+        self.cancel_youtube_prewarm();
+        let generation = self.youtube_prewarm_generation;
+        let source_url = url::Url::parse(&youtube_video_url(&video.video_id))
+            .expect("a validated YouTube video ID always forms a valid URL");
+        self.scheduled_youtube_prewarm = Some(ScheduledYouTubePrewarm {
+            generation,
+            media_id,
+            source_url,
+            due_at: now + YOUTUBE_PREWARM_DEBOUNCE,
+        });
+    }
+
+    /// Dispatches the stable selected video without blocking the terminal.
+    #[cfg(feature = "yt-dlp")]
+    fn request_due_youtube_prewarm(&mut self, now: Instant) {
+        let Some(scheduled) = self.scheduled_youtube_prewarm.as_ref() else {
+            return;
+        };
+        if now < scheduled.due_at {
+            return;
+        }
+        let scheduled = self
+            .scheduled_youtube_prewarm
+            .take()
+            .expect("a due speculative request was checked above");
+        if scheduled.generation != self.youtube_prewarm_generation
+            || !self.ensure_youtube_prewarm_worker()
+        {
+            return;
+        }
+        if let Some(receiver) = self.youtube_prewarm_request_drain.as_ref() {
+            while let Ok(command) = receiver.try_recv() {
+                if let YouTubePrewarmCommand::Resolve(job) = command {
+                    job.cancellation.cancel();
+                }
+            }
+        }
+        let cancellation = YouTubePrewarmCancellation::new();
+        let command = YouTubePrewarmCommand::Resolve(YouTubePrewarmJob {
+            media_id: scheduled.media_id.clone(),
+            request: YouTubePrewarmRequest::new(scheduled.generation, scheduled.source_url),
+            cancellation: cancellation.clone(),
+        });
+        let Some(sender) = self.youtube_prewarm_requests.as_ref() else {
+            return;
+        };
+        match sender.try_send(command) {
+            Ok(()) => {
+                self.active_youtube_prewarm = Some(ActiveYouTubePrewarm {
+                    generation: scheduled.generation,
+                    media_id: scheduled.media_id,
+                    cancellation,
+                });
+            }
+            Err(
+                TrySendError::Full(YouTubePrewarmCommand::Resolve(job))
+                | TrySendError::Disconnected(YouTubePrewarmCommand::Resolve(job)),
+            ) => {
+                job.cancellation.cancel();
+            }
+            Err(
+                TrySendError::Full(YouTubePrewarmCommand::Shutdown)
+                | TrySendError::Disconnected(YouTubePrewarmCommand::Shutdown),
+            ) => {}
+        }
+    }
+
+    /// Accepts only the latest exact completion and keeps failures silent.
+    #[cfg(feature = "yt-dlp")]
+    fn drain_youtube_prewarm_responses(&mut self) {
+        loop {
+            let completion = self
+                .youtube_prewarm_responses
+                .as_ref()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some(completion) = completion else {
+                break;
+            };
+            let generation = completion.result.generation();
+            if self
+                .active_youtube_prewarm
+                .as_ref()
+                .is_some_and(|active| active.generation == generation)
+            {
+                self.active_youtube_prewarm = None;
+            }
+            if !completion.result.is_latest(self.youtube_prewarm_generation) {
+                continue;
+            }
+            match completion.result.into_outcome() {
+                Ok(audio) => {
+                    let ready = ReadyYouTubePrewarm {
+                        media_id: completion.media_id,
+                        completed_at: completion.completed_at,
+                        audio,
+                    };
+                    if Self::youtube_prewarm_is_fresh(&ready, Instant::now()) {
+                        self.ready_youtube_prewarm = Some(ready);
+                        self.youtube_prewarm_failure = None;
+                    }
+                }
+                Err(YouTubePrewarmError::Cancelled) => {}
+                Err(_) => {
+                    self.youtube_prewarm_failure = Some((
+                        completion.media_id,
+                        Instant::now() + YOUTUBE_PREWARM_FAILURE_BACKOFF,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Consumes one exact fresh direct stream and cancels competing extraction.
+    #[cfg(feature = "yt-dlp")]
+    fn take_ready_youtube_prewarm(&mut self, media_id: &MediaId) -> Option<PrewarmedYouTubeAudio> {
+        self.drain_youtube_prewarm_responses();
+        let ready = self
+            .ready_youtube_prewarm
+            .take()
+            .filter(|ready| {
+                &ready.media_id == media_id && Self::youtube_prewarm_is_fresh(ready, Instant::now())
+            })
+            .map(|ready| ready.audio);
+        self.cancel_youtube_prewarm();
+        ready
+    }
+
     fn request_selected_details(&mut self) {
         self.clear_detail_navigation_history();
         self.previous_detail = None;
         self.view.details_scroll = 0;
-        self.details_generation = self.details_generation.wrapping_add(1);
         let Some(selected) = self.selected_youtube_item().cloned() else {
+            self.details_generation = self.details_generation.wrapping_add(1);
+            #[cfg(feature = "yt-dlp")]
+            self.update_youtube_prewarm_for_selection(None);
             self.view.details = None;
             return;
         };
+        #[cfg(feature = "yt-dlp")]
+        self.update_youtube_prewarm_for_selection(Some(&selected));
+        if matches!(selected, SearchItem::Channel(_)) {
+            self.request_selected_channel_subscriber_count(&selected);
+            self.show_selected_channel();
+            return;
+        }
+        self.details_generation = self.details_generation.wrapping_add(1);
         let mut detail = preliminary_detail(&selected, &self.subscription_tree);
         if self.view.screen == Screen::YouTubeMusic {
             detail.source = "YouTube Music".to_owned();
@@ -2497,15 +2999,45 @@ impl AppController {
             .subscription_entries
             .get(self.view.subscriptions.selected_source)
         else {
+            #[cfg(feature = "wikidata")]
+            self.invalidate_wikidata_lookup();
             return;
         };
         if entry.subscription.kind != SubscriptionKind::YouTube {
+            #[cfg(feature = "wikidata")]
+            self.invalidate_wikidata_lookup();
             return;
         }
         let Some(channel_id) = entry.subscription.youtube_channel_id() else {
+            #[cfg(feature = "wikidata")]
+            self.invalidate_wikidata_lookup();
             return;
         };
+        self.schedule_channel_details(channel_id.clone(), now);
+        #[cfg(feature = "wikidata")]
+        self.schedule_channel_wikidata(channel_id, now);
+    }
+
+    /// Schedules metadata for the channel already visible in the Details pane.
+    fn schedule_visible_channel_details(&mut self, now: Instant) {
+        self.scheduled_channel_details = None;
+        let Some(channel_id) = self.visible_channel_id().map(str::to_owned) else {
+            return;
+        };
+        self.schedule_channel_details(channel_id, now);
+    }
+
+    /// Applies fresh cached metadata or schedules one bounded provider lookup.
+    fn schedule_channel_details(&mut self, channel_id: String, now: Instant) {
         let now_unix = unix_time();
+        let profile_cached =
+            if let Some(profile) = self.channel_profile_cache.get(&channel_id).cloned() {
+                self.touch_channel_details_cache(&channel_id);
+                self.apply_channel_profile_to_view(&profile);
+                true
+            } else {
+                false
+            };
         if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
             self.touch_channel_details_cache(&channel_id);
             if let Some(channel) = cached {
@@ -2514,6 +3046,7 @@ impl AppController {
                     .channel_details_fresh_until
                     .get(&channel_id)
                     .is_some_and(|expires_at| *expires_at > now_unix)
+                    && profile_cached
                 {
                     return;
                 }
@@ -2525,7 +3058,7 @@ impl AppController {
                         .insert(channel_id.clone(), cached.expires_at);
                     self.cache_channel_details(channel_id.clone(), Some(cached.summary.clone()));
                     self.apply_channel_details_to_view(&cached.summary);
-                    if cached.is_fresh_at(now_unix) {
+                    if cached.is_fresh_at(now_unix) && profile_cached {
                         return;
                     }
                 }
@@ -2545,8 +3078,8 @@ impl AppController {
         });
     }
 
-    /// Starts the settled-source request without blocking the terminal thread.
-    fn request_due_subscription_channel_details(&mut self, now: Instant) {
+    /// Starts one settled visible-channel request without blocking the TUI.
+    fn request_due_channel_details(&mut self, now: Instant) {
         let Some(scheduled) = self.scheduled_channel_details.take() else {
             return;
         };
@@ -2554,26 +3087,16 @@ impl AppController {
             self.scheduled_channel_details = Some(scheduled);
             return;
         }
-        let source_is_visible = self.view.screen == Screen::Subscriptions
-            && self.view.subscriptions.route == SubscriptionRoute::Sources
-            && self.visible_channel_id() == Some(scheduled.channel_id.as_str());
-        if scheduled.generation != self.channel_details_generation || !source_is_visible {
+        if scheduled.generation != self.channel_details_generation
+            || self.visible_channel_id() != Some(scheduled.channel_id.as_str())
+        {
             return;
         }
-        self.request_channel_details(scheduled.channel_id, scheduled.generation, false);
-    }
-
-    /// Loads the currently visible channel immediately after explicit `c`.
-    fn request_visible_channel_details(&mut self) {
-        let Some(channel_id) = self.visible_channel_id().map(str::to_owned) else {
-            return;
-        };
-        self.scheduled_channel_details = None;
-        self.request_channel_details(channel_id, self.channel_details_generation, true);
+        self.request_channel_details(scheduled.channel_id, scheduled.generation);
     }
 
     /// Sends one exact channel-details request or applies the bounded RAM cache.
-    fn request_channel_details(&mut self, channel_id: String, generation: u64, interactive: bool) {
+    fn request_channel_details(&mut self, channel_id: String, generation: u64) {
         if let Some(cached) = self.channel_details_cache.get(&channel_id).cloned() {
             if let Some(channel) = cached.as_ref() {
                 self.touch_channel_details_cache(&channel_id);
@@ -2588,29 +3111,19 @@ impl AppController {
                     .channel_details_fresh_until
                     .get(&channel_id)
                     .is_some_and(|expires_at| *expires_at > unix_time())
+                    && self.channel_profile_cache.contains_key(&channel_id)
                 {
                     return;
                 }
             }
-            if cached.is_none() && !interactive {
-                return;
-            }
             if cached.is_none() {
-                self.channel_details_cache.remove(&channel_id);
-                self.channel_details_cache_order
-                    .retain(|cached| cached != &channel_id);
+                return;
             }
         }
         if self.pending_channel_details.contains(&channel_id) {
-            if interactive {
-                self.view.status_line = "Channel info is already loading…".to_owned();
-            }
             return;
         }
         if !self.youtube_provider_available {
-            if interactive {
-                self.open_youtube_setup();
-            }
             return;
         }
         let request = ProviderRequest::ChannelDetails {
@@ -2618,13 +3131,10 @@ impl AppController {
             provider_generation: self.youtube_provider_generation,
             channel_id: channel_id.clone(),
         };
-        let sent = if interactive {
-            self.send_provider_request(request, "Could not load channel info")
-        } else {
-            self.provider_requests
-                .as_ref()
-                .is_some_and(|sender| sender.send(request).is_ok())
-        };
+        let sent = self
+            .provider_requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(request).is_ok());
         if !sent {
             return;
         }
@@ -2644,6 +3154,7 @@ impl AppController {
                     break;
                 };
                 self.channel_details_cache.remove(&oldest);
+                self.channel_profile_cache.remove(&oldest);
                 self.channel_details_fresh_until.remove(&oldest);
             }
         }
@@ -2678,6 +3189,11 @@ impl AppController {
         }
         details.channel_name.clone_from(&channel.name);
         details.channel_subscriber_count = channel.subscriber_count;
+        details.channel_video_count = channel.video_count;
+        details.channel_created = channel
+            .created_at
+            .map(format_unix_utc_date)
+            .unwrap_or_default();
         details.description.clone_from(&channel.description);
         details.thumbnail_url = preferred_thumbnail_url(&channel.thumbnails);
         details.channel_webpage_url =
@@ -2695,6 +3211,49 @@ impl AppController {
         self.refresh_youtube_rows();
         if self.active_subscription_channel_id.is_some() {
             self.refresh_subscription_video_rows();
+        }
+    }
+
+    /// Applies selected-only counts, country, and channel-advertised links.
+    fn apply_channel_profile_to_view(&mut self, profile: &ChannelDetails) {
+        self.apply_channel_details_to_view(&profile.summary);
+        let Some(details) = self
+            .view
+            .details
+            .as_mut()
+            .filter(|details| details.channel_id == profile.summary.channel_id)
+        else {
+            return;
+        };
+        details.channel_total_view_count = profile.total_view_count;
+        details.channel_country = profile.country.clone().unwrap_or_default();
+        details.channel_links_truncated = profile.external_links_truncated;
+
+        let wikidata_links = details
+            .links
+            .iter()
+            .filter(|link| link.wikidata_item_id.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen_urls = HashSet::new();
+        details.links = profile
+            .external_links
+            .iter()
+            .filter(|link| seen_urls.insert(link.url.as_str().to_owned()))
+            .map(|link| DetailLinkView {
+                label: channel_external_link_label(link.kind, &link.label),
+                url: link.url.to_string(),
+                wikidata_item_id: None,
+            })
+            .collect();
+        details.links.extend(wikidata_links);
+        let link_count = details.links.len();
+        if self
+            .view
+            .selected_detail_link
+            .is_some_and(|selected| selected >= link_count)
+        {
+            self.view.selected_detail_link = (link_count > 0).then_some(0);
         }
     }
 
@@ -2723,6 +3282,7 @@ impl AppController {
                 self.request_wikidata(WikidataExternalKind::YouTubeChannel, &channel.channel_id);
             }
             SearchItem::Channel(_) => {
+                self.invalidate_wikidata_lookup();
                 if let Some(details) = self.view.details.as_mut() {
                     details.wikidata = "channel ID unavailable".to_owned();
                 }
@@ -2735,31 +3295,6 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = "disabled at build time".to_owned();
         }
-    }
-
-    /// Starts the exact YouTube-channel Wikidata lookup for source full-info.
-    fn request_selected_subscription_wikidata(&mut self) {
-        let Some(entry) = self
-            .subscription_entries
-            .get(self.view.subscriptions.selected_source)
-        else {
-            return;
-        };
-        let Some(channel_id) = entry.subscription.youtube_channel_id() else {
-            return;
-        };
-        let selected = SearchItem::Channel(ChannelSummary {
-            channel_id,
-            name: entry.subscription.title.clone(),
-            description: entry.subscription.description.clone().unwrap_or_default(),
-            subscriber_count: None,
-            video_count: None,
-            created_at: None,
-            auto_generated: false,
-            thumbnails: Vec::new(),
-            webpage_url: entry.subscription.website_url.clone(),
-        });
-        self.request_selected_wikidata(&selected);
     }
 
     #[cfg(feature = "wikidata")]
@@ -2782,10 +3317,11 @@ impl AppController {
         };
         if let Some((kind, external_id)) = lookup {
             self.request_wikidata(kind, &external_id);
-        } else if matches!(direct.source, SourceKind::SoundCloud | SourceKind::Bilibili)
-            && let Some(details) = self.view.details.as_mut()
-        {
-            details.wikidata = "no exact external ID in this link".to_owned();
+        } else if matches!(direct.source, SourceKind::SoundCloud | SourceKind::Bilibili) {
+            self.invalidate_wikidata_lookup();
+            if let Some(details) = self.view.details.as_mut() {
+                details.wikidata = "no exact external ID in this link".to_owned();
+            }
         }
     }
 
@@ -2804,6 +3340,28 @@ impl AppController {
         kind: crate::providers::wikidata::WikidataExternalKind,
         external_id: &str,
     ) {
+        self.invalidate_wikidata_lookup();
+        let generation = self.wikidata_generation;
+        if self.apply_fresh_cached_wikidata(kind, external_id) {
+            return;
+        }
+        self.send_wikidata_request(generation, kind, external_id);
+    }
+
+    /// Invalidates pending work before a different Details identity is shown.
+    #[cfg(feature = "wikidata")]
+    fn invalidate_wikidata_lookup(&mut self) {
+        self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
+        self.scheduled_channel_wikidata = None;
+    }
+
+    /// Reapplies a fresh positive or empty cache entry to the visible panel.
+    #[cfg(feature = "wikidata")]
+    fn apply_fresh_cached_wikidata(
+        &mut self,
+        kind: crate::providers::wikidata::WikidataExternalKind,
+        external_id: &str,
+    ) -> bool {
         let property_id = kind.property_id();
         let now = unix_time();
         match self.store.cached_wikidata(property_id, external_id) {
@@ -2812,21 +3370,31 @@ impl AppController {
                     apply_wikidata_links(details, &cached.items);
                 }
                 self.view.selected_detail_link = (!cached.items.is_empty()).then_some(0);
-                return;
+                true
             }
-            Ok(_) => {}
+            Ok(_) => false,
             Err(error) => {
                 self.show_error("Wikidata cache could not be read", &error);
+                false
             }
         }
+    }
 
-        self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
+    /// Sends one generation-owned Wikidata request without blocking the TUI.
+    #[cfg(feature = "wikidata")]
+    fn send_wikidata_request(
+        &mut self,
+        generation: u64,
+        kind: crate::providers::wikidata::WikidataExternalKind,
+        external_id: &str,
+    ) {
+        let property_id = kind.property_id();
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = format!("loading {property_id} lazily…");
         }
         if !self.send_provider_request(
             ProviderRequest::Wikidata {
-                generation: self.wikidata_generation,
+                generation,
                 kind,
                 external_id: external_id.to_owned(),
             },
@@ -2835,6 +3403,51 @@ impl AppController {
         {
             details.wikidata = "provider worker unavailable".to_owned();
         }
+    }
+
+    /// Restores a cached channel item immediately, otherwise deferring network
+    /// work until the subscription selection has remained stable.
+    #[cfg(feature = "wikidata")]
+    fn schedule_channel_wikidata(&mut self, channel_id: String, now: Instant) {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        self.invalidate_wikidata_lookup();
+        let generation = self.wikidata_generation;
+        if self.apply_fresh_cached_wikidata(WikidataExternalKind::YouTubeChannel, &channel_id) {
+            return;
+        }
+        if let Some(details) = self.view.details.as_mut() {
+            details.wikidata.clear();
+        }
+        self.scheduled_channel_wikidata = Some(ScheduledChannelWikidata {
+            generation,
+            channel_id,
+            due_at: now + CHANNEL_DETAILS_DEBOUNCE,
+        });
+    }
+
+    /// Starts a stable subscription channel's deferred Wikidata lookup.
+    #[cfg(feature = "wikidata")]
+    fn request_due_channel_wikidata(&mut self, now: Instant) {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let Some(scheduled) = self.scheduled_channel_wikidata.take() else {
+            return;
+        };
+        if now < scheduled.due_at {
+            self.scheduled_channel_wikidata = Some(scheduled);
+            return;
+        }
+        if scheduled.generation != self.wikidata_generation
+            || self.visible_channel_id() != Some(scheduled.channel_id.as_str())
+        {
+            return;
+        }
+        self.send_wikidata_request(
+            scheduled.generation,
+            WikidataExternalKind::YouTubeChannel,
+            &scheduled.channel_id,
+        );
     }
 
     fn handle_provider_response(&mut self, response: ProviderResponse) {
@@ -2974,9 +3587,13 @@ impl AppController {
                 request,
                 result,
             } => {
+                let background_initial_load = self.view.screen != Screen::Subscriptions
+                    && self.pending_subscription_refresh.is_none()
+                    && self.active_subscription_channel_id.is_none();
                 if generation != self.subscription_generation
-                    || self.active_subscription_channel_id.as_deref()
+                    || (self.active_subscription_channel_id.as_deref()
                         != Some(request.channel_id.as_str())
+                        && !background_initial_load)
                 {
                     return;
                 }
@@ -2992,10 +3609,19 @@ impl AppController {
                                 .iter()
                                 .any(|item| !matches!(item, SearchItem::Video(_)))
                         {
-                            self.show_error_message(
-                                "Subscription videos failed",
-                                "the provider returned inconsistent channel-video pagination",
-                            );
+                            if self
+                                .pending_subscription_refresh
+                                .as_ref()
+                                .is_some_and(|pending| pending.channel_id == request.channel_id)
+                            {
+                                self.pending_subscription_refresh = None;
+                            }
+                            if self.view.screen == Screen::Subscriptions {
+                                self.show_error_message(
+                                    "Subscription videos failed",
+                                    "the provider returned inconsistent channel-video pagination",
+                                );
+                            }
                             return;
                         }
                         page.items.retain(|item| {
@@ -3006,11 +3632,65 @@ impl AppController {
                             )
                         });
                         let received_page_empty = page.items.is_empty();
-                        self.cache_subscription_video_page(&request.channel_id, page);
+                        let stage_refresh =
+                            self.pending_subscription_refresh
+                                .as_ref()
+                                .is_some_and(|pending| {
+                                    pending.channel_id == request.channel_id
+                                        && (pending.staged_cache.is_some()
+                                            || (request.page == 1 && received_page_empty))
+                                });
+                        if stage_refresh {
+                            let pending = self
+                                .pending_subscription_refresh
+                                .as_mut()
+                                .expect("a matching staged refresh was checked above");
+                            let staged = pending
+                                .staged_cache
+                                .get_or_insert_with(CachedSubscriptionVideos::default);
+                            Self::apply_subscription_video_page(staged, page);
+                            let continue_empty_refresh = received_page_empty
+                                && u32::from(staged.consecutive_empty_pages)
+                                    < MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES
+                                && staged.next_page.is_some();
+                            if continue_empty_refresh {
+                                let next_page =
+                                    staged.next_page.expect("continuation was checked above");
+                                self.view.status_line = format!(
+                                    "Refreshing {} through page {}…",
+                                    self.view.subscriptions.source_title, request.page
+                                );
+                                self.request_subscription_videos(
+                                    request.channel_id.clone(),
+                                    next_page,
+                                );
+                                return;
+                            }
+                            let staged = pending
+                                .staged_cache
+                                .take()
+                                .expect("the refresh cache was initialized above");
+                            self.subscription_video_cache
+                                .insert(request.channel_id.clone(), staged);
+                            self.touch_subscription_cache(&request.channel_id);
+                            self.enforce_subscription_cache_byte_budget(&request.channel_id);
+                        } else {
+                            self.cache_subscription_video_page(&request.channel_id, page);
+                        }
                         if self.view.screen != Screen::Subscriptions {
                             return;
                         }
                         self.refresh_subscription_video_rows();
+                        if self
+                            .pending_subscription_refresh
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.channel_id == request.channel_id
+                                    && pending.staged_cache.is_none()
+                            })
+                        {
+                            self.restore_subscription_refresh_selection(&request.channel_id);
+                        }
                         let count = self.view.subscriptions.items.len();
                         self.view.status_line = format!(
                             "{count} video{} loaded for {}",
@@ -3054,7 +3734,16 @@ impl AppController {
                         }
                     }
                     Err(error) => {
-                        self.show_error_message("Subscription videos failed", error);
+                        if self
+                            .pending_subscription_refresh
+                            .as_ref()
+                            .is_some_and(|pending| pending.channel_id == request.channel_id)
+                        {
+                            self.pending_subscription_refresh = None;
+                        }
+                        if self.view.screen == Screen::Subscriptions {
+                            self.show_error_message("Subscription videos failed", error);
+                        }
                     }
                 }
             }
@@ -3116,8 +3805,8 @@ impl AppController {
                 }
                 self.pending_channel_details.remove(&channel_id);
                 match result {
-                    Ok(mut channel) => {
-                        if channel.channel_id != channel_id {
+                    Ok(mut profile) => {
+                        if profile.summary.channel_id != channel_id {
                             if generation == self.channel_details_generation {
                                 self.view.status_line =
                                     "Channel metadata returned a mismatched identifier".to_owned();
@@ -3125,7 +3814,8 @@ impl AppController {
                             self.cache_channel_details(channel_id, None);
                             return;
                         }
-                        compact_channel_summary(&mut channel);
+                        compact_channel_summary(&mut profile.summary);
+                        let channel = profile.summary.clone();
                         let fetched_at = unix_time();
                         let expires_at =
                             fetched_at.saturating_add(CHANNEL_DETAILS_CACHE_TTL_SECONDS);
@@ -3143,10 +3833,12 @@ impl AppController {
                         self.channel_subscriber_cache
                             .insert(channel_id.clone(), channel.subscriber_count);
                         self.cache_channel_details(channel_id.clone(), Some(channel.clone()));
+                        self.channel_profile_cache
+                            .insert(channel_id.clone(), profile.clone());
                         if generation == self.channel_details_generation
                             && self.visible_channel_id() == Some(channel_id.as_str())
                         {
-                            self.apply_channel_details_to_view(&channel);
+                            self.apply_channel_profile_to_view(&profile);
                             self.view.status_line =
                                 format!("Loaded channel info for {}", channel.name);
                         } else {
@@ -3163,10 +3855,57 @@ impl AppController {
                             }) {
                                 details.description.clear();
                             }
-                            self.view.status_line =
-                                "Channel info is unavailable; press c to retry".to_owned();
+                            self.view.status_line = "Channel info is unavailable".to_owned();
                         }
                     }
+                }
+            }
+            #[cfg(feature = "network")]
+            ProviderResponse::ChannelPageMetadata {
+                generation,
+                provider_generation,
+                channel_id,
+                result,
+            } => {
+                if provider_generation != self.youtube_provider_generation {
+                    return;
+                }
+                let Ok(page) = result else {
+                    // Channel-page enrichment is optional. API/Invidious
+                    // metadata was already delivered in the preceding response.
+                    return;
+                };
+                let Some(mut profile) = self.channel_profile_cache.remove(&channel_id) else {
+                    return;
+                };
+                page.merge_missing_into(&mut profile);
+                let summary = profile.summary.clone();
+                self.channel_profile_cache
+                    .insert(channel_id.clone(), profile.clone());
+                self.cache_channel_details(channel_id.clone(), Some(summary.clone()));
+                let fetched_at = unix_time();
+                let expires_at = self
+                    .channel_details_fresh_until
+                    .get(&channel_id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        fetched_at.saturating_add(CHANNEL_DETAILS_CACHE_TTL_SECONDS)
+                    });
+                if let Err(error) = self.store.put_cached_channel_summary(
+                    &crate::persistence::CachedChannelSummary {
+                        summary,
+                        fetched_at,
+                        expires_at,
+                    },
+                ) {
+                    self.show_error("Could not cache enriched channel info", &error);
+                }
+                if generation == self.channel_details_generation
+                    && self.visible_channel_id() == Some(channel_id.as_str())
+                {
+                    self.apply_channel_profile_to_view(&profile);
+                    self.view.status_line =
+                        format!("Loaded public channel links for {}", profile.summary.name);
                 }
             }
             ProviderResponse::Details { generation, result } => {
@@ -3337,6 +4076,11 @@ impl AppController {
                                         },
                                     );
                             }
+                        }
+                        #[cfg(feature = "yt-dlp")]
+                        {
+                            let selected = self.selected_youtube_item().cloned();
+                            self.update_youtube_prewarm_for_selection(selected.as_ref());
                         }
                     }
                     Err(error) => {
@@ -3584,6 +4328,34 @@ impl AppController {
                             "Wikidata lookup timed out; playback remains available".to_owned()
                         } else {
                             "Wikidata lookup unavailable; playback remains available".to_owned()
+                        };
+                    }
+                }
+            }
+            #[cfg(feature = "wikidata")]
+            ProviderResponse::WikidataStatements { item_id, result } => {
+                self.pending_wikidata_entities.remove(&item_id);
+                match result {
+                    Ok(entity) => {
+                        self.cache_wikidata_entity(entity.clone());
+                        if let Some(details) = self.view.details.as_mut()
+                            && details.expanded_wikidata_item.as_deref() == Some(item_id.as_str())
+                        {
+                            apply_wikidata_entity_to_details(details, &entity);
+                            self.view.status_line =
+                                format!("Expanded Wikidata properties for {item_id}");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(details) = self.view.details.as_mut()
+                            && details.loading_wikidata_item.as_deref() == Some(item_id.as_str())
+                        {
+                            details.loading_wikidata_item = None;
+                        }
+                        self.view.status_line = if error.to_ascii_lowercase().contains("timeout") {
+                            "Wikidata property lookup timed out".to_owned()
+                        } else {
+                            "Wikidata properties are unavailable".to_owned()
                         };
                     }
                 }
@@ -4202,6 +4974,8 @@ impl AppController {
             .filter(|entry| entry.kind.is_playable())
             .map(|entry| MediaId::new(SourceKind::Local, entry.path.display().to_string()))
             .collect::<Vec<_>>();
+        self.local_progress_cache
+            .extend(progress_ids.iter().cloned().map(|media_id| (media_id, 0)));
         let Ok(progress) = self.store.progress_for_media_ids(&progress_ids) else {
             return;
         };
@@ -4210,6 +4984,57 @@ impl AppController {
                 .into_iter()
                 .map(|(media_id, progress)| (media_id, progress.watched_percent())),
         );
+    }
+
+    /// Updates one visible Local marker without rebuilding the directory or
+    /// rereading media metadata.
+    fn update_local_progress_view(&mut self, media_id: &MediaId, watched_percent: u8) {
+        if media_id.source != SourceKind::Local {
+            return;
+        }
+        let visible = self
+            .view
+            .rows
+            .iter()
+            .any(|row| row.media_id.as_ref() == Some(media_id));
+        if self.local_progress_cache.contains_key(media_id) || visible {
+            self.local_progress_cache
+                .insert(media_id.clone(), watched_percent);
+        }
+        for row in &mut self.view.rows {
+            if row.media_id.as_ref() == Some(media_id) {
+                row.watched_percent = watched_percent;
+            }
+        }
+    }
+
+    /// Mirrors an actively playing backend position into the current Local row.
+    ///
+    /// A backend may temporarily omit the duration while replacing or opening
+    /// media. Such a status cannot produce a trustworthy percentage and must
+    /// not erase a previously hydrated marker.
+    fn update_live_local_progress_view(&mut self) {
+        let Some(media_id) = self
+            .current_media
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(duration) = self
+            .view
+            .playback
+            .duration
+            .map(|value| value.as_secs())
+            .filter(|duration| *duration > 0)
+        else {
+            return;
+        };
+        let now = unix_time();
+        let mut progress = PlaybackProgress::new(media_id.clone(), Some(duration), now);
+        progress.record_position(self.view.playback.position.as_secs(), now);
+        self.update_local_progress_view(&media_id, progress.watched_percent());
     }
 
     /// Rebuilds the Local row model from listing-scoped RAM state.
@@ -5316,12 +6141,11 @@ impl AppController {
             && self.view.subscriptions.focus == SubscriptionPane::Sources
         {
             self.update_selected_subscription_source();
-            self.request_selected_subscription_wikidata();
             self.view.details_focused = true;
             self.view.right_panel_mode = RightPanelMode::Channel;
             self.view.status_line =
                 format!("Channel selected: {}", self.view.subscriptions.source_title);
-            self.request_visible_channel_details();
+            self.schedule_visible_channel_details(Instant::now());
             return;
         }
         let Some(selected) = self.selected_youtube_item().cloned() else {
@@ -5383,7 +6207,7 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = "disabled at build time".to_owned();
         }
-        self.request_visible_channel_details();
+        self.schedule_visible_channel_details(Instant::now());
     }
 
     fn toggle_local_subscription(&mut self) {
@@ -5503,9 +6327,7 @@ impl AppController {
     fn restore_detail_navigation_snapshot(&mut self, snapshot: DetailNavigationSnapshot) {
         self.details_generation = self.details_generation.wrapping_add(1);
         #[cfg(feature = "wikidata")]
-        {
-            self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
-        }
+        self.invalidate_wikidata_lookup();
         self.view.screen = snapshot.screen;
         self.view.selected = snapshot.selected;
         self.view.subscriptions.route = snapshot.subscription_route;
@@ -5655,6 +6477,7 @@ impl AppController {
             if self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
                 && self.view.subscriptions.route == SubscriptionRoute::Items
             {
+                self.pending_subscription_refresh = None;
                 self.view.subscriptions.route = SubscriptionRoute::Sources;
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
@@ -5664,6 +6487,7 @@ impl AppController {
             if self.view.subscriptions.layout == SubscriptionsLayout::Split
                 && self.view.subscriptions.focus == SubscriptionPane::Items
             {
+                self.pending_subscription_refresh = None;
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
                 self.view.status_line = "Subscription source list focused".to_owned();
@@ -6113,14 +6937,6 @@ impl AppController {
             #[cfg(feature = "tracker-music")]
             self.cancel_pending_tracker_autoplay();
         }
-        if !queue_cursor_already_positioned
-            || self
-                .checked_format_retry_for
-                .as_ref()
-                .is_some_and(|media_id| media_id != &item.media.id)
-        {
-            self.checked_format_retry_for = None;
-        }
         if self.player.is_none() {
             let Some(factory) = self.playback_factory.as_mut() else {
                 self.view.status_line = "No playback backend was compiled or configured".to_owned();
@@ -6168,17 +6984,47 @@ impl AppController {
                 }
             }
         };
-        let mut input = PlaybackInput::new(item.playback_location.clone());
-        input.verify_remote_format = self.checked_format_retry_for.as_ref() == Some(&media_id);
-        input.start_at = Duration::from_secs(start_at);
-        input.title = Some(item.media.title.clone());
+        let mut canonical_input = PlaybackInput::new(item.playback_location.clone());
+        canonical_input.start_at = Duration::from_secs(start_at);
+        canonical_input.title = Some(item.media.title.clone());
+        #[cfg(feature = "yt-dlp")]
+        let mut input = canonical_input.clone();
+        #[cfg(not(feature = "yt-dlp"))]
+        let input = canonical_input.clone();
+        let mut load_kind = if media_id.source == SourceKind::YouTube {
+            PlaybackLoadKind::YouTubeCanonical
+        } else {
+            PlaybackLoadKind::Regular
+        };
+        #[cfg(feature = "yt-dlp")]
+        if media_id.source == SourceKind::YouTube
+            && let Some(prewarmed) = self.take_ready_youtube_prewarm(&media_id)
+        {
+            let (media_url, headers) = prewarmed.into_playback_parts();
+            input.location = media_url.into();
+            input.http_headers = headers;
+            input.bypass_ytdl = true;
+            load_kind = PlaybackLoadKind::YouTubeDirect;
+        }
         let had_active_media = self.current_media.is_some();
-        match self
+        let first_result = self
             .player
             .as_mut()
             .expect("player was initialized above")
-            .play(&input)
-        {
+            .play(&input);
+        let play_result = if first_result.is_err() && load_kind == PlaybackLoadKind::YouTubeDirect {
+            // A speculative signed URL is an optimization only. Discard its
+            // error without surfacing potentially sensitive URL context and
+            // immediately use the canonical extractor-backed route.
+            load_kind = PlaybackLoadKind::YouTubeCanonical;
+            self.player
+                .as_mut()
+                .expect("player was initialized above")
+                .play(&canonical_input)
+        } else {
+            first_result
+        };
+        match play_result {
             Ok(()) => {
                 if media_changed {
                     self.seek_back.clear();
@@ -6190,6 +7036,7 @@ impl AppController {
                 self.current_media = Some(media_id.clone());
                 self.current_autoplay_origin = origin;
                 self.playback_phase = PlaybackPhase::Loading;
+                self.playback_load_kind = load_kind;
                 self.begin_playback_start_activity();
                 self.ignore_replaced_stop = had_active_media;
                 self.last_tick = Instant::now();
@@ -6225,6 +7072,7 @@ impl AppController {
                 }
             }
             Err(error) => {
+                self.playback_load_kind = PlaybackLoadKind::Regular;
                 self.show_error("Playback failed", &error);
             }
         }
@@ -6274,8 +7122,13 @@ impl AppController {
                     status.paused = true;
                     status.buffering = true;
                 }
+                // Backends may derive a title from a resolved CDN URL. Youta
+                // already owns the stable user-facing title and must not
+                // replace it with a long, expiring, potentially sensitive URL.
+                status.title = Some(self.current_playback_title());
                 self.view.playback = status;
                 if self.playback_phase == PlaybackPhase::Playing {
+                    self.update_live_local_progress_view();
                     self.skip_current_advertisement_chapter();
                     self.account_listen_time(elapsed);
                     if self.last_position_save.elapsed()
@@ -6351,9 +7204,9 @@ impl AppController {
                 Ok(Some(PlaybackEvent::PlaybackStarted)) => {
                     if self.playback_phase != PlaybackPhase::Playing {
                         self.playback_phase = PlaybackPhase::Playing;
+                        self.playback_load_kind = PlaybackLoadKind::Regular;
                         self.clear_playback_start_activity();
                         self.view.playing_media_id = self.current_media.clone();
-                        self.checked_format_retry_for = None;
                         self.view.playback.idle = false;
                         self.view.playback.paused = false;
                         self.view.playback.buffering = false;
@@ -6406,7 +7259,7 @@ impl AppController {
     }
 
     fn handle_playback_end(&mut self, end: PlaybackEnd, elapsed: Duration) {
-        if self.retry_youtube_with_checked_format(&end, elapsed) {
+        if self.retry_youtube_load(&end) {
             return;
         }
         let playback_started = self.playback_phase == PlaybackPhase::Playing;
@@ -6492,39 +7345,102 @@ impl AppController {
         }
     }
 
-    fn retry_youtube_with_checked_format(&mut self, end: &PlaybackEnd, elapsed: Duration) -> bool {
-        if self.playback_phase == PlaybackPhase::Playing
-            || !matches!(
-                end.reason,
-                PlaybackEndReason::Eof | PlaybackEndReason::Error
-            )
-            || !playback_end_reports_http_403(end)
-        {
+    /// Advances one pre-start `YouTube` load through its bounded fallback chain.
+    ///
+    /// A speculative direct stream may fail for any reason before audible
+    /// playback begins and falls back to the canonical watch URL. This remains
+    /// true when `mpv` emitted [`PlaybackEvent::MediaLoaded`] before discovering
+    /// that the resolved payload cannot be demuxed. Only an HTTP 403 from a
+    /// still-loading canonical attempt enables the slower checked-format route.
+    /// Once [`PlaybackEvent::PlaybackStarted`] arrives, no automatic
+    /// replacement is attempted.
+    fn retry_youtube_load(&mut self, end: &PlaybackEnd) -> bool {
+        if !matches!(
+            end.reason,
+            PlaybackEndReason::Eof | PlaybackEndReason::Error
+        ) {
             return false;
         }
-        let Some(media_id) = self.current_media.clone() else {
+        let next_kind = match self.playback_load_kind {
+            PlaybackLoadKind::YouTubeDirect
+                if matches!(
+                    self.playback_phase,
+                    PlaybackPhase::Loading | PlaybackPhase::Loaded
+                ) =>
+            {
+                PlaybackLoadKind::YouTubeCanonical
+            }
+            PlaybackLoadKind::YouTubeCanonical
+                if self.playback_phase == PlaybackPhase::Loading
+                    && playback_end_reports_http_403(end) =>
+            {
+                PlaybackLoadKind::YouTubeChecked
+            }
+            PlaybackLoadKind::Regular
+            | PlaybackLoadKind::YouTubeDirect
+            | PlaybackLoadKind::YouTubeCanonical
+            | PlaybackLoadKind::YouTubeChecked => return false,
+        };
+        let Some(media_id) = self.current_media.as_ref() else {
             return false;
         };
-        if media_id.source != SourceKind::YouTube
-            || self.checked_format_retry_for.as_ref() == Some(&media_id)
-        {
+        if media_id.source != SourceKind::YouTube {
             return false;
         }
         let Some(item) = self.playback_queue.current().cloned() else {
             return false;
         };
-        if item.media.id != media_id {
+        if &item.media.id != media_id {
             return false;
         }
 
         let title = item.media.title.clone();
-        self.prepare_to_clear_playback(elapsed);
-        self.reset_playback_state();
-        self.checked_format_retry_for = Some(media_id);
-        self.play_queue_item(item, true);
-        if self.playback_phase == PlaybackPhase::Loading {
-            self.view.status_line =
-                format!("Retrying {title} after validating alternate YouTube formats…");
+        let start_at = self
+            .pending_history
+            .as_ref()
+            .map_or(self.view.playback.position.as_secs(), |history| {
+                history.position_seconds
+            });
+        let mut input = PlaybackInput::new(item.playback_location);
+        input.start_at = Duration::from_secs(start_at);
+        input.title = Some(title.clone());
+        input.verify_remote_format = next_kind == PlaybackLoadKind::YouTubeChecked;
+        let result = self
+            .player
+            .as_mut()
+            .expect("an active load always owns a player")
+            .play(&input);
+        match result {
+            Ok(()) => {
+                self.playback_load_kind = next_kind;
+                self.playback_phase = PlaybackPhase::Loading;
+                self.begin_playback_start_activity();
+                self.ignore_replaced_stop = true;
+                self.last_tick = Instant::now();
+                self.view.playback.idle = false;
+                self.view.playback.position = Duration::from_secs(start_at);
+                self.view.playback.paused = true;
+                self.view.playback.buffering = true;
+                self.view.playback.buffered_ranges.clear();
+                self.view.status_line = match next_kind {
+                    PlaybackLoadKind::YouTubeCanonical => {
+                        format!("Retrying {title} through YouTube…")
+                    }
+                    PlaybackLoadKind::YouTubeChecked => {
+                        format!("Retrying {title} after validating alternate YouTube formats…")
+                    }
+                    PlaybackLoadKind::Regular | PlaybackLoadKind::YouTubeDirect => {
+                        unreachable!("the fallback target is canonical or checked")
+                    }
+                };
+            }
+            Err(error) => {
+                self.queued_autoplay_resume_origin = None;
+                #[cfg(feature = "tracker-music")]
+                self.cancel_pending_tracker_autoplay();
+                self.reset_playback_state();
+                self.show_error("Playback failed", &error);
+            }
         }
         true
     }
@@ -6547,6 +7463,7 @@ impl AppController {
 
     fn reset_playback_state(&mut self) {
         self.playback_phase = PlaybackPhase::Idle;
+        self.playback_load_kind = PlaybackLoadKind::Regular;
         self.clear_playback_start_activity();
         self.view.playing_media_id = None;
         self.pending_history = None;
@@ -6620,12 +7537,7 @@ impl AppController {
         progress.record_position(self.view.playback.position.as_secs(), now);
         match self.store.upsert_progress(&progress) {
             Ok(()) => {
-                if progress.media_id.source == SourceKind::Local
-                    && self.local_progress_cache.contains_key(&progress.media_id)
-                {
-                    self.local_progress_cache
-                        .insert(progress.media_id.clone(), progress.watched_percent());
-                }
+                self.update_local_progress_view(&progress.media_id, progress.watched_percent());
             }
             Err(error) => self.show_error("Could not save playback position", &error),
         }
@@ -6633,6 +7545,8 @@ impl AppController {
 
     fn show_screen(&mut self, screen: Screen) {
         self.clear_detail_navigation_history();
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_youtube_prewarm();
         if self.view.screen == Screen::Local && screen != Screen::Local {
             self.invalidate_local_folder_sizes();
         }
@@ -6656,9 +7570,7 @@ impl AppController {
         }
         self.details_generation = self.details_generation.wrapping_add(1);
         #[cfg(feature = "wikidata")]
-        {
-            self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
-        }
+        self.invalidate_wikidata_lookup();
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
         self.view.screen = screen;
@@ -6692,6 +7604,17 @@ impl AppController {
             self.view.subscriptions.route = SubscriptionRoute::Sources;
             self.view.subscriptions.focus = SubscriptionPane::Sources;
             self.view.subscriptions.description_expanded = false;
+        }
+        if screen != Screen::Subscriptions {
+            let cancelled_refresh = self.pending_subscription_refresh.take().is_some();
+            self.active_subscription_channel_id = None;
+            if cancelled_refresh {
+                // A deliberate refresh must not replace the cache after its
+                // channel context is abandoned. Ordinary initial loads may
+                // still populate that channel's cache in the background.
+                self.subscription_generation = self.subscription_generation.wrapping_add(1);
+            }
+            self.view.subscriptions.loading = false;
         }
         self.view.details = None;
         self.view.details_focused = false;
@@ -6787,6 +7710,8 @@ impl AppController {
     }
 
     fn populate_subscriptions(&mut self) {
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_youtube_prewarm();
         match subscriptions::load(&self.config) {
             Ok(tree) => self.subscription_tree = tree,
             Err(error) => {
@@ -6813,6 +7738,7 @@ impl AppController {
         self.view.subscriptions.items.clear();
         self.view.subscriptions.selected_item = 0;
         self.active_subscription_channel_id = None;
+        self.pending_subscription_refresh = None;
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
@@ -6909,6 +7835,8 @@ impl AppController {
         if index >= self.subscription_entries.len() {
             return;
         }
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_youtube_prewarm();
         self.view.subscriptions.selected_source = index;
         self.view.subscriptions.selected_item = 0;
         self.view.subscriptions.description_expanded = false;
@@ -6916,6 +7844,7 @@ impl AppController {
         self.view.subscriptions.loading = false;
         self.view.subscriptions.items.clear();
         self.active_subscription_channel_id = None;
+        self.pending_subscription_refresh = None;
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
@@ -6973,6 +7902,20 @@ impl AppController {
             return;
         }
         self.view.subscriptions.selected_item = index;
+        let selected_video_id = self
+            .selected_subscription_item()
+            .and_then(|item| match item {
+                SearchItem::Video(video) => Some(video.video_id.clone()),
+                SearchItem::Channel(_) => None,
+            });
+        if let Some(pending) = self.pending_subscription_refresh.as_mut()
+            && self.active_subscription_channel_id.as_deref() == Some(pending.channel_id.as_str())
+        {
+            // A deliberate selection made while refresh is in flight takes
+            // precedence over the snapshot captured when refresh started.
+            pending.selected_video_id = selected_video_id;
+            pending.fallback_index = index;
+        }
         self.view.subscriptions.focus = SubscriptionPane::Items;
         self.view.right_panel_mode = RightPanelMode::Details;
         self.request_selected_details();
@@ -7043,6 +7986,80 @@ impl AppController {
         );
     }
 
+    /// Reloads page one for the active channel without blanking cached rows.
+    ///
+    /// The current video identity remains visible while the provider works and
+    /// is restored after replacement when the refreshed page still contains
+    /// it. A second request is ignored until the first one completes.
+    fn refresh_selected_subscription_videos(&mut self) {
+        if self.view.screen != Screen::Subscriptions {
+            self.view.status_line =
+                "Subscription videos can be refreshed only inside a channel".to_owned();
+            return;
+        }
+        if self.view.subscriptions.loading {
+            self.view.status_line = "Subscription videos are already loading".to_owned();
+            return;
+        }
+        let Some(channel_id) = self.active_subscription_channel_id.clone() else {
+            self.view.status_line = "Open a subscribed channel before refreshing videos".to_owned();
+            return;
+        };
+        let selected_video_id = self
+            .selected_subscription_item()
+            .and_then(|item| match item {
+                SearchItem::Video(video) => Some(video.video_id.clone()),
+                SearchItem::Channel(_) => None,
+            });
+        self.pending_subscription_refresh = Some(PendingSubscriptionRefresh {
+            channel_id: channel_id.clone(),
+            selected_video_id,
+            fallback_index: self.view.subscriptions.selected_item,
+            staged_cache: None,
+        });
+        self.request_subscription_videos(channel_id, 1);
+        if self.view.subscriptions.loading {
+            self.view.status_line = format!(
+                "Refreshing videos for {}…",
+                self.view.subscriptions.source_title
+            );
+        } else {
+            self.pending_subscription_refresh = None;
+        }
+    }
+
+    /// Restores the pre-refresh selection after page one replaces the cache.
+    fn restore_subscription_refresh_selection(&mut self, channel_id: &str) {
+        let Some(pending) = self
+            .pending_subscription_refresh
+            .take()
+            .filter(|pending| pending.channel_id == channel_id)
+        else {
+            return;
+        };
+        let refreshed = self
+            .subscription_video_cache
+            .get(channel_id)
+            .map_or(&[][..], |cached| cached.items.as_slice());
+        let selected = pending
+            .selected_video_id
+            .as_deref()
+            .and_then(|video_id| {
+                refreshed.iter().position(|item| {
+                    matches!(
+                        item,
+                        SearchItem::Video(video) if video.video_id == video_id
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                pending
+                    .fallback_index
+                    .min(refreshed.len().saturating_sub(1))
+            });
+        self.view.subscriptions.selected_item = selected;
+    }
+
     /// Loads the next page near the visible end or after empty-list Enter.
     fn load_next_subscription_page_if_needed(&mut self) {
         if self.view.subscriptions.loading
@@ -7068,7 +8085,7 @@ impl AppController {
     /// Touching the separate order deque maintains bounded LRU eviction across
     /// channels. Empty pages retain their continuation because private videos
     /// can otherwise hide a later playable page.
-    fn cache_subscription_video_page(&mut self, channel_id: &str, mut page: SearchPage) {
+    fn cache_subscription_video_page(&mut self, channel_id: &str, page: SearchPage) {
         if page.page == 1 && !self.subscription_video_cache.contains_key(channel_id) {
             while self.subscription_video_cache.len() >= MAX_CACHED_SUBSCRIPTION_CHANNELS {
                 let Some(oldest) = self.subscription_cache_order.pop_front() else {
@@ -7083,6 +8100,13 @@ impl AppController {
             .subscription_video_cache
             .entry(channel_id.to_owned())
             .or_default();
+        Self::apply_subscription_video_page(cached, page);
+        self.touch_subscription_cache(channel_id);
+        self.enforce_subscription_cache_byte_budget(channel_id);
+    }
+
+    /// Applies one validated sequential page to a bounded cache value.
+    fn apply_subscription_video_page(cached: &mut CachedSubscriptionVideos, mut page: SearchPage) {
         if page.page == 1 {
             cached.items.clear();
             cached.consecutive_empty_pages = 0;
@@ -7102,8 +8126,6 @@ impl AppController {
         cached.next_page = (cached.items.len() < MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
             .then_some(page.next_page)
             .flatten();
-        self.touch_subscription_cache(channel_id);
-        self.enforce_subscription_cache_byte_budget(channel_id);
     }
 
     /// Evicts least-recently-used channels until the shared byte budget holds.
@@ -7422,6 +8444,122 @@ impl AppController {
         self.open_external_url(&link.url);
     }
 
+    /// Opens one structured Wikidata value without trusting its display text
+    /// as a URL.
+    fn open_wikidata_item(&mut self, item_id: &str) {
+        let Some(url) = canonical_wikidata_item_url(item_id) else {
+            self.view.status_line = "The selected Wikidata item ID is invalid".to_owned();
+            return;
+        };
+        self.open_external_url(&url);
+    }
+
+    /// Expands or collapses one linked Wikidata item's lazy property spoiler.
+    fn toggle_wikidata_statements(&mut self, index: usize) {
+        let Some(item_id) = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.links.get(index))
+            .and_then(|link| link.wikidata_item_id.clone())
+        else {
+            self.view.status_line =
+                "The selected external link has no Wikidata properties".to_owned();
+            return;
+        };
+        self.view.selected_detail_link = Some(index);
+        let already_expanded = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.expanded_wikidata_item.as_deref())
+            == Some(item_id.as_str());
+        if already_expanded {
+            if let Some(details) = self.view.details.as_mut() {
+                details.expanded_wikidata_item = None;
+            }
+            self.view.details_scroll = 0;
+            self.view.status_line = format!("Collapsed Wikidata properties for {item_id}");
+            return;
+        }
+        if let Some(details) = self.view.details.as_mut() {
+            details.expanded_wikidata_item = Some(item_id.clone());
+        }
+        self.view.details_focused = true;
+        self.view.details_scroll = 0;
+
+        #[cfg(feature = "wikidata")]
+        {
+            if let Some(entity) = self.wikidata_entity_cache.get(&item_id).cloned() {
+                self.touch_wikidata_entity_cache(&item_id);
+                if let Some(details) = self.view.details.as_mut() {
+                    apply_wikidata_entity_to_details(details, &entity);
+                }
+                self.view.status_line =
+                    format!("Expanded cached Wikidata properties for {item_id}");
+                return;
+            }
+            if self.pending_wikidata_entities.contains(&item_id) {
+                if let Some(details) = self.view.details.as_mut() {
+                    details.loading_wikidata_item = Some(item_id);
+                }
+                return;
+            }
+            let sent = self.provider_requests.as_ref().is_some_and(|sender| {
+                sender
+                    .send(ProviderRequest::WikidataStatements {
+                        item_id: item_id.clone(),
+                    })
+                    .is_ok()
+            });
+            if sent {
+                self.pending_wikidata_entities.insert(item_id.clone());
+                if let Some(details) = self.view.details.as_mut() {
+                    details.loading_wikidata_item = Some(item_id.clone());
+                }
+                self.view.status_line = format!("Loading Wikidata properties for {item_id}…");
+            } else {
+                if let Some(details) = self.view.details.as_mut() {
+                    details.loading_wikidata_item = None;
+                }
+                self.view.status_line = "Wikidata provider worker is unavailable".to_owned();
+            }
+        }
+        #[cfg(not(feature = "wikidata"))]
+        {
+            if let Some(details) = self.view.details.as_mut() {
+                details.loading_wikidata_item = None;
+            }
+            self.view.status_line = "This build omits Wikidata property loading".to_owned();
+        }
+    }
+
+    #[cfg(feature = "wikidata")]
+    fn cache_wikidata_entity(
+        &mut self,
+        entity: crate::providers::wikidata::WikidataEntityStatements,
+    ) {
+        let item_id = entity.item_id.clone();
+        if !self.wikidata_entity_cache.contains_key(&item_id) {
+            while self.wikidata_entity_cache.len() >= MAX_CACHED_WIKIDATA_ENTITIES {
+                let Some(oldest) = self.wikidata_entity_cache_order.pop_front() else {
+                    break;
+                };
+                self.wikidata_entity_cache.remove(&oldest);
+            }
+        }
+        self.wikidata_entity_cache.insert(item_id.clone(), entity);
+        self.touch_wikidata_entity_cache(&item_id);
+    }
+
+    #[cfg(feature = "wikidata")]
+    fn touch_wikidata_entity_cache(&mut self, item_id: &str) {
+        self.wikidata_entity_cache_order
+            .retain(|cached| cached != item_id);
+        self.wikidata_entity_cache_order
+            .push_back(item_id.to_owned());
+    }
+
     fn diagnostic_helpers(&mut self) -> Vec<ExternalHelper> {
         if self.diagnostic_helpers_cache.is_none() {
             self.diagnostic_helpers_cache = Some(ExternalHelper::probe_many([
@@ -7478,6 +8616,8 @@ impl AppController {
         title: impl Into<String>,
         report: impl Into<String>,
     ) {
+        #[cfg(feature = "yt-dlp")]
+        self.shutdown_youtube_prewarm();
         if let Some(mut player) = self.player.take() {
             let _ = player.shutdown();
         }
@@ -7646,28 +8786,69 @@ impl AppController {
             self.view.status_line = "The selected file has no basename".to_owned();
             return;
         };
+        let value = name.to_string_lossy().into_owned();
         self.view.local_file_popup = Some(LocalFilePopupView::Rename {
-            value: name.to_string_lossy().into_owned(),
+            cursor_byte: value.len(),
+            value,
             error: None,
         });
     }
 
     fn append_local_rename_character(&mut self, character: char) {
-        let Some(LocalFilePopupView::Rename { value, error }) = self.view.local_file_popup.as_mut()
+        let Some(LocalFilePopupView::Rename {
+            value,
+            cursor_byte,
+            error,
+        }) = self.view.local_file_popup.as_mut()
         else {
             return;
         };
         if value.len().saturating_add(character.len_utf8()) <= 255 {
-            value.push(character);
+            let cursor = rename_cursor_boundary(value, *cursor_byte);
+            value.insert(cursor, character);
+            *cursor_byte = cursor.saturating_add(character.len_utf8());
             *error = None;
         }
     }
 
+    /// Moves the rename insertion point by one whole displayed grapheme.
+    fn move_local_rename_cursor(&mut self, direction: i8) {
+        let Some(LocalFilePopupView::Rename {
+            value, cursor_byte, ..
+        }) = self.view.local_file_popup.as_mut()
+        else {
+            return;
+        };
+        let cursor = rename_cursor_boundary(value, *cursor_byte);
+        *cursor_byte = if direction < 0 {
+            value[..cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(index, _)| index)
+        } else if direction > 0 {
+            value[cursor..]
+                .graphemes(true)
+                .next()
+                .map_or(cursor, |grapheme| cursor.saturating_add(grapheme.len()))
+        } else {
+            cursor
+        };
+    }
+
     fn delete_local_rename_character(&mut self) {
-        if let Some(LocalFilePopupView::Rename { value, error }) =
-            self.view.local_file_popup.as_mut()
+        if let Some(LocalFilePopupView::Rename {
+            value,
+            cursor_byte,
+            error,
+        }) = self.view.local_file_popup.as_mut()
         {
-            value.pop();
+            let cursor = rename_cursor_boundary(value, *cursor_byte);
+            let previous = value[..cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(cursor, |(index, _)| index);
+            value.drain(previous..cursor);
+            *cursor_byte = previous;
             *error = None;
         }
     }
@@ -7823,6 +9004,7 @@ impl AppController {
         let environment_override = [
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
         ]
         .into_iter()
@@ -7832,6 +9014,7 @@ impl AppController {
         self.view.preferences_popup = Some(PreferencesPopupView {
             subscriptions_layout: self.config.ui.subscriptions_layout,
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
+            youtube_prewarm: self.config.playback.youtube_prewarm,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
@@ -7901,6 +9084,19 @@ impl AppController {
         preferences.validation_error = None;
     }
 
+    fn toggle_draft_youtube_prewarm(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.youtube_prewarm = !preferences.youtube_prewarm;
+        preferences.validation_error = None;
+    }
+
     fn toggle_draft_local_folder_sizes(&mut self) {
         let Some(preferences) = self.view.preferences_popup.as_mut() else {
             return;
@@ -7944,12 +9140,17 @@ impl AppController {
         }
         let layout = preferences.subscriptions_layout;
         let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
+        let youtube_prewarm = preferences.youtube_prewarm;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
+        #[cfg(feature = "yt-dlp")]
+        let youtube_prewarm_preference_changed =
+            self.config.playback.youtube_prewarm != youtube_prewarm;
         let local_folder_size_preference_changed =
             self.config.ui.show_local_folder_sizes != show_local_folder_sizes;
         if let Err(error) = self.config.save_tui_preferences(
             layout,
             skip_advertisement_chapters,
+            youtube_prewarm,
             show_local_folder_sizes,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
@@ -7960,6 +9161,16 @@ impl AppController {
         }
         self.view.subscriptions.layout = layout;
         self.view.skip_advertisement_chapters = skip_advertisement_chapters;
+        #[cfg(feature = "yt-dlp")]
+        if youtube_prewarm_preference_changed {
+            self.youtube_prewarm_failure = None;
+            if youtube_prewarm {
+                let selected = self.selected_youtube_item().cloned();
+                self.update_youtube_prewarm_for_selection(selected.as_ref());
+            } else {
+                self.cancel_youtube_prewarm();
+            }
+        }
         if local_folder_size_preference_changed {
             let selected_path = self.selected_local_path();
             self.invalidate_local_folder_sizes();
@@ -7979,13 +9190,14 @@ impl AppController {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
             } else {
                 "off"
-            }
+            },
+            if youtube_prewarm { "on" } else { "off" }
         );
     }
 
@@ -8033,16 +9245,45 @@ impl AppController {
     }
 
     fn spawn_url_opener(&mut self, url: &str) {
-        match Command::new("xdg-open")
-            .arg("--")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => self.view.status_line = format!("Opened {url}"),
-            Err(error) => self.show_error("Cannot open browser", &error),
+        if url.starts_with('-') {
+            self.show_error_message(
+                "Cannot open webpage",
+                "the selected target begins with a command-option marker",
+            );
+            return;
+        }
+        if self.url_open_pending >= MAX_URL_OPEN_TASKS {
+            self.view.status_line =
+                "Wait for an earlier system-opener request to finish".to_owned();
+            return;
+        }
+        match spawn_url_opener_task(
+            PathBuf::from("xdg-open"),
+            url.to_owned(),
+            self.url_open_result_sender.clone(),
+        ) {
+            Ok(()) => {
+                self.url_open_pending = self.url_open_pending.saturating_add(1);
+                self.view.status_line = "Opening selected webpage with xdg-open…".to_owned();
+            }
+            Err(error) => self.show_error("Cannot start webpage opener", &error),
+        }
+    }
+
+    /// Applies URL-free system-opener completions without blocking the TUI.
+    fn drain_url_open_results(&mut self) {
+        loop {
+            match self.url_open_results.try_recv() {
+                Ok(UrlOpenCompletion::Succeeded) => {
+                    self.url_open_pending = self.url_open_pending.saturating_sub(1);
+                    self.view.status_line = "Opened selected webpage with xdg-open".to_owned();
+                }
+                Ok(UrlOpenCompletion::Failed(error)) => {
+                    self.url_open_pending = self.url_open_pending.saturating_sub(1);
+                    self.show_error_message("Could not open webpage", error);
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
         }
     }
 
@@ -8094,6 +9335,8 @@ impl AppController {
         self.clear_search_activity();
         self.clear_playback_start_activity();
         self.view.playing_media_id = None;
+        #[cfg(feature = "yt-dlp")]
+        self.shutdown_youtube_prewarm();
         #[cfg(feature = "yt-dlp")]
         if let Some(mut download) = self.active_download.take() {
             download.cancel_and_join();
@@ -8243,6 +9486,12 @@ impl UiController for AppController {
             UiAction::ActivateDetailLink(index) => {
                 self.view.details_focused = true;
                 self.activate_detail_link(index);
+            }
+            UiAction::ToggleWikidataStatements(index) => {
+                self.toggle_wikidata_statements(index);
+            }
+            UiAction::OpenWikidataItem(item_id) => {
+                self.open_wikidata_item(&item_id);
             }
             UiAction::SetDetailsFocus(focused) => self.view.details_focused = focused,
             UiAction::ScrollDetails(movement) => {
@@ -8455,6 +9704,7 @@ impl UiController for AppController {
             UiAction::ToggleSkipAdvertisementChapters => {
                 self.toggle_draft_skip_advertisement_chapters();
             }
+            UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
             UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
             UiAction::SubmitPreferences => self.submit_preferences(),
             UiAction::DismissPreferences => {
@@ -8464,6 +9714,9 @@ impl UiController for AppController {
             UiAction::BeginLocalRename => self.begin_local_rename(),
             UiAction::AppendLocalRenameCharacter(character) => {
                 self.append_local_rename_character(character);
+            }
+            UiAction::MoveLocalRenameCursor(direction) => {
+                self.move_local_rename_cursor(direction);
             }
             UiAction::DeleteLocalRenameCharacter => {
                 self.delete_local_rename_character();
@@ -8485,6 +9738,9 @@ impl UiController for AppController {
             UiAction::ToggleSubscriptionDescription => {
                 self.toggle_subscription_description();
             }
+            UiAction::RefreshSubscriptionVideos => {
+                self.refresh_selected_subscription_videos();
+            }
         }
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting && !self.diagnostic_only {
@@ -8496,6 +9752,7 @@ impl UiController for AppController {
         if self.diagnostic_only {
             return;
         }
+        self.drain_url_open_results();
         loop {
             match self.local_browse_responses.try_recv() {
                 Ok(response) => self.handle_local_browse_response(response),
@@ -8532,7 +9789,15 @@ impl UiController for AppController {
         }
         self.advance_search_animation();
         self.advance_playback_start_animation();
-        self.request_due_subscription_channel_details(Instant::now());
+        let now = Instant::now();
+        self.request_due_channel_details(now);
+        #[cfg(feature = "wikidata")]
+        self.request_due_channel_wikidata(now);
+        #[cfg(feature = "yt-dlp")]
+        {
+            self.drain_youtube_prewarm_responses();
+            self.request_due_youtube_prewarm(now);
+        }
         #[cfg(feature = "yt-dlp")]
         self.poll_download();
         self.update_player();
@@ -8545,6 +9810,88 @@ impl UiController for AppController {
 impl Drop for AppController {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Builds one system-opener command without a synthetic option separator.
+///
+/// `xdg-open` accepts exactly one target argument; unlike many command-line
+/// tools, it does not recognize `--` as an option terminator.
+fn url_opener_command(executable: &Path, target: &str) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Starts and reaps one system-opener process outside the terminal event loop.
+///
+/// The completion contains no URL so selected links cannot leak into
+/// diagnostics. A successful thread spawn is not treated as a successful open:
+/// the child must also report a zero exit status.
+fn spawn_url_opener_task(
+    executable: PathBuf,
+    target: String,
+    results: Sender<UrlOpenCompletion>,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("youta-url-opener".to_owned())
+        .spawn(move || {
+            let completion = match url_opener_command(&executable, &target).spawn() {
+                Ok(mut child) => match child.wait() {
+                    Ok(status) if status.success() => UrlOpenCompletion::Succeeded,
+                    Ok(status) => UrlOpenCompletion::Failed(status.code().map_or_else(
+                        || "xdg-open was terminated before reporting an exit status".to_owned(),
+                        |code| format!("xdg-open exited with status {code}"),
+                    )),
+                    Err(error) => UrlOpenCompletion::Failed(format!(
+                        "could not wait for xdg-open to finish: {error}"
+                    )),
+                },
+                Err(error) => {
+                    UrlOpenCompletion::Failed(format!("could not start xdg-open: {error}"))
+                }
+            };
+            let _ = results.send(completion);
+        })
+        .map(|_| ())
+}
+
+/// Resolves one latest selected `YouTube` video without blocking the TUI.
+///
+/// Both channels contain at most one value. When the UI has not yet consumed
+/// an obsolete completion, the worker replaces it before publishing the
+/// latest result so shutdown cannot deadlock on a full response channel.
+#[cfg(feature = "yt-dlp")]
+fn youtube_prewarm_worker(
+    requests: Receiver<YouTubePrewarmCommand>,
+    responses: Sender<YouTubePrewarmCompletion>,
+    response_drain: Receiver<YouTubePrewarmCompletion>,
+    resolver: YouTubePrewarmResolver,
+) {
+    while let Ok(command) = requests.recv() {
+        let YouTubePrewarmCommand::Resolve(job) = command else {
+            break;
+        };
+        let result = resolver.resolve(job.request, &job.cancellation);
+        let mut completion = YouTubePrewarmCompletion {
+            media_id: job.media_id,
+            completed_at: Instant::now(),
+            result,
+        };
+        loop {
+            match responses.try_send(completion) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    completion = returned;
+                    let _ = response_drain.try_recv();
+                }
+                Err(TrySendError::Disconnected(_)) => return,
+            }
+        }
     }
 }
 
@@ -8623,6 +9970,9 @@ fn provider_worker(
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
+    #[cfg(feature = "network")]
+    let youtube_channel_page =
+        crate::providers::youtube_channel_page::YouTubeChannelPageClient::new();
     #[cfg(feature = "youtube-music")]
     let youtube_music = YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
         executable: youtube_music_executable,
@@ -8730,21 +10080,41 @@ fn provider_worker(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
-                            .channel_details(&channel_id)
+                            .full_channel_details(&channel_id)
                             .map_err(|error| error.to_string())
                     },
                 );
+                let can_enrich_from_page = result.is_ok();
                 if responses
                     .send(ProviderResponse::ChannelDetails {
                         generation,
                         provider_generation,
-                        channel_id,
+                        channel_id: channel_id.clone(),
                         result,
                     })
                     .is_err()
                 {
                     break;
                 }
+                #[cfg(feature = "network")]
+                if can_enrich_from_page {
+                    let result = youtube_channel_page
+                        .channel_metadata(&channel_id)
+                        .map_err(|error| error.to_string());
+                    if responses
+                        .send(ProviderResponse::ChannelPageMetadata {
+                            generation,
+                            provider_generation,
+                            channel_id,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                #[cfg(not(feature = "network"))]
+                let _ = can_enrich_from_page;
             }
             ProviderRequest::ChannelSubscriberCounts {
                 provider_generation,
@@ -9077,6 +10447,18 @@ fn provider_worker(
                         external_id,
                         result,
                     })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "wikidata")]
+            ProviderRequest::WikidataStatements { item_id } => {
+                let result = wikidata
+                    .load_entity_statements(&item_id)
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::WikidataStatements { item_id, result })
                     .is_err()
                 {
                     break;
@@ -10781,6 +12163,24 @@ fn format_count(value: u64) -> String {
     formatted
 }
 
+/// Prefixes a channel-supplied link label with its recognized destination.
+fn channel_external_link_label(kind: ChannelExternalLinkKind, label: &str) -> String {
+    let destination = match kind {
+        ChannelExternalLinkKind::Website => "Website",
+        ChannelExternalLinkKind::Telegram => "Telegram",
+        ChannelExternalLinkKind::Facebook => "Facebook",
+        ChannelExternalLinkKind::XTwitter => "X/Twitter",
+        ChannelExternalLinkKind::TikTok => "TikTok",
+        ChannelExternalLinkKind::Instagram => "Instagram",
+        ChannelExternalLinkKind::YouTube => "YouTube",
+    };
+    if label.eq_ignore_ascii_case(destination) {
+        destination.to_owned()
+    } else {
+        format!("{destination}: {label}")
+    }
+}
+
 fn format_unix_utc_date(timestamp: i64) -> String {
     const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
     const MIN_SUPPORTED_TIMESTAMP: i64 = -62_135_596_800;
@@ -10894,36 +12294,100 @@ fn format_binary_size(bytes: u64, unit: u64, suffix: &str) -> String {
 }
 
 #[cfg(feature = "wikidata")]
-fn format_wikidata_links(items: &[crate::domain::WikidataLink]) -> String {
-    if items.is_empty() {
-        return "no linked Wikidata item found".to_owned();
-    }
-    items
-        .iter()
-        .map(|item| {
-            let description = item
-                .description
-                .as_ref()
-                .map_or_else(String::new, |description| format!(" — {description}"));
-            format!(
-                "{} ({}){description}: {}",
-                item.label, item.item_id, item.url
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn apply_wikidata_links(details: &mut DetailView, items: &[crate::domain::WikidataLink]) {
+    details.wikidata.clear();
+    details.links.retain(|link| link.wikidata_item_id.is_none());
+    details
+        .links
+        .extend(items.iter().map(|item| DetailLinkView {
+            label: if item.label == item.item_id {
+                item.item_id.clone()
+            } else {
+                format!("{} ({})", item.label, item.item_id)
+            },
+            url: item.url.to_string(),
+            wikidata_item_id: Some(item.item_id.clone()),
+        }));
 }
 
 #[cfg(feature = "wikidata")]
-fn apply_wikidata_links(details: &mut DetailView, items: &[crate::domain::WikidataLink]) {
-    details.wikidata = format_wikidata_links(items);
-    details.links = items
-        .iter()
-        .map(|item| DetailLinkView {
-            label: format!("{} ({})", item.label, item.item_id),
-            url: item.url.to_string(),
-        })
-        .collect();
+fn apply_wikidata_entity_to_details(
+    details: &mut DetailView,
+    entity: &crate::providers::wikidata::WikidataEntityStatements,
+) {
+    let view = format_wikidata_entity(entity);
+    if let Some(existing) = details
+        .wikidata_entities
+        .iter_mut()
+        .find(|cached| cached.item_id == entity.item_id)
+    {
+        *existing = view;
+    } else {
+        details.wikidata_entities.push(view);
+    }
+    if details.loading_wikidata_item.as_deref() == Some(entity.item_id.as_str()) {
+        details.loading_wikidata_item = None;
+    }
+}
+
+#[cfg(feature = "wikidata")]
+fn format_wikidata_entity(
+    entity: &crate::providers::wikidata::WikidataEntityStatements,
+) -> DetailWikidataEntityView {
+    let mut text = format!("Wikidata properties for {}\n", entity.item_id);
+    let mut value_links = Vec::new();
+    if entity.statements.is_empty() {
+        text.push_str("No human-facing statements were found.");
+    } else {
+        for statement in &entity.statements {
+            text.push_str(&format!(
+                "{} ({}): ",
+                statement.property_label, statement.property_id
+            ));
+            for (index, value) in statement.values.iter().enumerate() {
+                if index > 0 {
+                    text.push_str("; ");
+                }
+                if let Some(item_id) = value.item_id.as_ref() {
+                    let start_byte = text.len();
+                    if value.display == *item_id {
+                        text.push_str(item_id);
+                    } else {
+                        text.push_str(&format!("{} ({item_id})", value.display));
+                    }
+                    value_links.push(DetailWikidataValueLinkView {
+                        start_byte,
+                        end_byte: text.len(),
+                        item_id: item_id.clone(),
+                    });
+                } else {
+                    text.push_str(&value.display);
+                }
+            }
+            text.push('\n');
+        }
+        while text.ends_with('\n') {
+            text.pop();
+        }
+    }
+    if entity.truncated {
+        text.push_str("\n\nSome properties, values, or labels were omitted by safety limits.");
+    }
+    DetailWikidataEntityView {
+        item_id: entity.item_id.clone(),
+        text,
+        value_links,
+    }
+}
+
+/// Builds a canonical Wikidata page only for a bounded positive Q identifier.
+fn canonical_wikidata_item_url(item_id: &str) -> Option<String> {
+    let digits = item_id.strip_prefix('Q')?;
+    (item_id.len() <= 32
+        && !digits.is_empty()
+        && !digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| format!("https://www.wikidata.org/wiki/{item_id}"))
 }
 
 fn unix_time() -> i64 {
@@ -11097,6 +12561,51 @@ mod tests {
         assert_eq!(format_count(887_263), "887,263");
         assert_eq!(format_count(1_000_000), "1,000,000");
         assert_eq!(format_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn xdg_open_receives_exactly_one_target_without_option_separator() {
+        let command = url_opener_command(
+            Path::new("xdg-open"),
+            "https://www.youtube.com/channel/UCfixture",
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            ["https://www.youtube.com/channel/UCfixture"],
+            "`xdg-open` rejects the conventional synthetic `--` argument"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_open_task_reports_nonzero_exit_instead_of_false_success() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().expect("temporary opener directory");
+        let opener = temporary.path().join("xdg-open");
+        std::fs::write(&opener, "#!/bin/sh\nexit 23\n").expect("opener fixture");
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))
+            .expect("executable opener fixture");
+        let (sender, receiver) = unbounded();
+
+        spawn_url_opener_task(
+            opener,
+            "https://www.youtube.com/channel/UCfixture".to_owned(),
+            sender,
+        )
+        .expect("opener worker");
+
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("opener completion"),
+            UrlOpenCompletion::Failed("xdg-open exited with status 23".to_owned())
+        );
     }
 
     #[test]
@@ -12093,9 +13602,516 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subscription_refresh_bypasses_cache_and_preserves_video_identity() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let first = subscription_video_summary();
+        let mut second = subscription_video_summary();
+        second.video_id = "M7lc1UVf-VE".to_owned();
+        second.title = "Second fixture video".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first.clone()),
+                    SearchItem::Video(second.clone()),
+                ],
+                next_page: None,
+            }),
+        });
+        while captured_requests.try_recv().is_ok() {}
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        while captured_requests.try_recv().is_ok() {}
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (refresh_generation, refresh_request) = receive_channel_request(&captured_requests);
+        assert_eq!(refresh_request.page, 1);
+        assert_eq!(controller.view.subscriptions.items.len(), 2);
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert!(controller.view.subscriptions.loading);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        assert_no_channel_request(
+            &captured_requests,
+            "a second explicit refresh must not overlap the first",
+        );
+
+        let mut newest = subscription_video_summary();
+        newest.video_id = "newest00000".to_owned();
+        newest.title = "Newest fixture video".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: refresh_generation,
+            request: refresh_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first),
+                    SearchItem::Video(newest),
+                    SearchItem::Video(second),
+                ],
+                next_page: None,
+            }),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 3);
+        assert_eq!(controller.view.subscriptions.selected_item, 2);
+        assert_eq!(
+            controller.view.subscriptions.items[2]
+                .media_id
+                .as_ref()
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("M7lc1UVf-VE")
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+
+        while captured_requests.try_recv().is_ok() {}
+        let titles_before_failure = controller
+            .view
+            .subscriptions
+            .items
+            .iter()
+            .map(|row| row.title.clone())
+            .collect::<Vec<_>>();
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (failure_generation, failure_request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: failure_generation,
+            request: failure_request,
+            result: Err("temporary provider failure".to_owned()),
+        });
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.clone())
+                .collect::<Vec<_>>(),
+            titles_before_failure
+        );
+        assert_eq!(controller.view.subscriptions.selected_item, 2);
+        assert!(controller.pending_subscription_refresh.is_none());
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (replacement_generation, replacement_request) =
+            receive_channel_request(&captured_requests);
+        let mut replacement = subscription_video_summary();
+        replacement.video_id = "replacement0".to_owned();
+        replacement.title = "Replacement fixture".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: replacement_generation,
+            request: replacement_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(replacement)],
+                next_page: None,
+            }),
+        });
+        assert_eq!(
+            controller.view.subscriptions.selected_item, 0,
+            "a removed selected video must clamp its previous index"
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (stale_generation, stale_request) = receive_channel_request(&captured_requests);
+        controller.dispatch(UiAction::ShowScreen(Screen::Search));
+        let mut stale = subscription_video_summary();
+        stale.video_id = "stale000000".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: stale_generation,
+            request: stale_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(stale)],
+                next_page: None,
+            }),
+        });
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert!(matches!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.items.first()),
+            Some(SearchItem::Video(video)) if video.video_id == "replacement0"
+        ));
+    }
+
+    #[test]
+    fn subscription_refresh_stages_filtered_empty_pages_without_blanking_rows() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let first = subscription_video_summary();
+        let mut selected = subscription_video_summary();
+        selected.video_id = "M7lc1UVf-VE".to_owned();
+        selected.title = "Selected fixture".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first.clone()),
+                    SearchItem::Video(selected.clone()),
+                ],
+                next_page: None,
+            }),
+        });
+        while captured_requests.try_recv().is_ok() {}
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        while captured_requests.try_recv().is_ok() {}
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let mut scheduled = subscription_video_summary();
+        scheduled.video_id = "scheduled00".to_owned();
+        scheduled.duration_seconds = Some(0);
+        scheduled.live = false;
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(scheduled)],
+                next_page: Some(2),
+            }),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Selected fixture"],
+            "cached rows must remain visible during filtered refresh pagination"
+        );
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert!(controller.pending_subscription_refresh.is_some());
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 2,
+                items: vec![SearchItem::Video(first), SearchItem::Video(selected)],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert_eq!(
+            controller.view.subscriptions.items[1]
+                .media_id
+                .as_ref()
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("M7lc1UVf-VE")
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+    }
+
+    #[test]
+    fn subscription_refresh_keeps_a_selection_changed_while_loading() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let first = subscription_video_summary();
+        let mut second = subscription_video_summary();
+        second.video_id = "M7lc1UVf-VE".to_owned();
+        second.title = "Second fixture video".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first.clone()),
+                    SearchItem::Video(second.clone()),
+                ],
+                next_page: None,
+            }),
+        });
+        while captured_requests.try_recv().is_ok() {}
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        while captured_requests.try_recv().is_ok() {}
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.dispatch(UiAction::SelectSubscriptionItem(0));
+        while captured_requests.try_recv().is_ok() {}
+        let mut newest = subscription_video_summary();
+        newest.video_id = "newest00000".to_owned();
+        newest.title = "Newest fixture video".to_owned();
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(newest),
+                    SearchItem::Video(second),
+                    SearchItem::Video(first),
+                ],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(
+            controller.view.subscriptions.selected_item, 2,
+            "the video chosen during refresh should win over its initial snapshot"
+        );
+        assert_eq!(
+            controller.view.subscriptions.items[2]
+                .media_id
+                .as_ref()
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("dQw4w9WgXcQ")
+        );
+    }
+
     #[cfg(feature = "wikidata")]
     #[test]
-    fn subscription_channel_full_info_starts_exact_lazy_wikidata_lookup() {
+    fn wikidata_formatter_labels_item_links_without_duplicate_fallback_ids() {
+        use crate::providers::wikidata::{
+            WikidataEntityStatements, WikidataStatement, WikidataStatementValue,
+        };
+
+        let mut entity = WikidataEntityStatements {
+            item_id: "Q61113".to_owned(),
+            statements: vec![WikidataStatement {
+                property_id: "P27".to_owned(),
+                property_label: "country of citizenship".to_owned(),
+                values: vec![
+                    WikidataStatementValue {
+                        display: "Soviet Union".to_owned(),
+                        item_id: Some("Q15180".to_owned()),
+                    },
+                    WikidataStatementValue {
+                        display: "Q212".to_owned(),
+                        item_id: Some("Q212".to_owned()),
+                    },
+                ],
+            }],
+            truncated: false,
+        };
+
+        let formatted = format_wikidata_entity(&entity);
+
+        assert!(
+            formatted
+                .text
+                .contains("country of citizenship (P27): Soviet Union (Q15180); Q212")
+        );
+        assert!(!formatted.text.contains("Q212 (Q212)"));
+        assert_eq!(
+            formatted
+                .value_links
+                .iter()
+                .map(|link| {
+                    (
+                        &formatted.text[link.start_byte..link.end_byte],
+                        link.item_id.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [("Soviet Union (Q15180)", "Q15180"), ("Q212", "Q212"),]
+        );
+        assert_eq!(
+            canonical_wikidata_item_url("Q212").as_deref(),
+            Some("https://www.wikidata.org/wiki/Q212")
+        );
+        assert_eq!(canonical_wikidata_item_url("../Q212"), None);
+        assert_eq!(canonical_wikidata_item_url("Q0"), None);
+
+        let mut details = DetailView::default();
+        apply_wikidata_links(
+            &mut details,
+            &[crate::domain::WikidataLink {
+                item_id: "Q212".to_owned(),
+                label: "Q212".to_owned(),
+                description: None,
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q212").expect("Wikidata URL"),
+            }],
+        );
+        assert_eq!(details.links[0].label, "Q212");
+
+        entity.truncated = true;
+        assert!(
+            format_wikidata_entity(&entity)
+                .text
+                .contains("properties, values, or labels"),
+            "the safety footer must describe label-only truncation accurately"
+        );
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn reopening_subscription_channel_reapplies_persisted_wikidata_link() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
+        save_fixture_subscriptions(&config, &[channel_id]);
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            store
+                .put_cached_wikidata(&CachedWikidataLookup {
+                    property_id: "P2397".to_owned(),
+                    external_id: channel_id.to_owned(),
+                    items: vec![crate::domain::WikidataLink {
+                        item_id: "Q61113".to_owned(),
+                        label: "Foster the People".to_owned(),
+                        description: Some("American indie pop band".to_owned()),
+                        url: url::Url::parse("https://www.wikidata.org/wiki/Q61113")
+                            .expect("Wikidata fixture URL"),
+                    }],
+                    fetched_at: unix_time(),
+                    expires_at: i64::MAX,
+                })
+                .expect("seed cached channel Wikidata link");
+        }
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        let assert_fixture_link = |controller: &AppController| {
+            let details = controller
+                .view
+                .details
+                .as_ref()
+                .expect("subscription channel details");
+            assert_eq!(
+                details
+                    .links
+                    .iter()
+                    .filter_map(|link| link.wikidata_item_id.as_deref())
+                    .collect::<Vec<_>>(),
+                ["Q61113"],
+                "rebuilding the channel panel must restore its fresh Wikidata cache"
+            );
+        };
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_fixture_link(&controller);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Search));
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_fixture_link(&controller);
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn late_wikidata_response_cannot_replace_reopened_cached_channel() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let cached_channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
+        save_fixture_subscriptions(&config, &["UCfirst", cached_channel_id]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        store
+            .put_cached_wikidata(&CachedWikidataLookup {
+                property_id: "P2397".to_owned(),
+                external_id: cached_channel_id.to_owned(),
+                items: vec![crate::domain::WikidataLink {
+                    item_id: "Q61113".to_owned(),
+                    label: "Foster the People".to_owned(),
+                    description: Some("American indie pop band".to_owned()),
+                    url: url::Url::parse("https://www.wikidata.org/wiki/Q61113")
+                        .expect("Wikidata fixture URL"),
+                }],
+                fetched_at: unix_time(),
+                expires_at: i64::MAX,
+            })
+            .expect("seed second channel Wikidata cache");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        let scheduled = controller
+            .scheduled_channel_wikidata
+            .clone()
+            .expect("first channel Wikidata schedule");
+        controller.request_due_channel_wikidata(scheduled.due_at);
+        let ProviderRequest::Wikidata {
+            generation,
+            kind: WikidataExternalKind::YouTubeChannel,
+            external_id,
+        } = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first channel Wikidata request")
+        else {
+            panic!("expected first channel Wikidata request");
+        };
+        assert_eq!(external_id, "UCfirst");
+
+        controller.select_subscription_source(1);
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: "P2397".to_owned(),
+            external_id: "UCfirst".to_owned(),
+            result: Ok(vec![crate::domain::WikidataLink {
+                item_id: "Q42".to_owned(),
+                label: "Douglas Adams".to_owned(),
+                description: Some("English author and humorist".to_owned()),
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q42")
+                    .expect("late Wikidata fixture URL"),
+            }]),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("reopened cached channel details");
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter_map(|link| link.wikidata_item_id.as_deref())
+                .collect::<Vec<_>>(),
+            ["Q61113"],
+            "a response owned by the previous channel must not replace the current row"
+        );
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn subscription_channel_panel_debounces_exact_lazy_wikidata_lookup() {
         use crate::providers::wikidata::WikidataExternalKind;
 
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -12107,7 +14123,15 @@ mod tests {
         controller.provider_requests = Some(requests);
 
         controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
-        controller.dispatch(UiAction::ShowChannel);
+        let scheduled = controller
+            .scheduled_channel_wikidata
+            .clone()
+            .expect("settled-source Wikidata schedule");
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "moving across subscription sources must not immediately query Wikidata"
+        );
+        controller.request_due_channel_wikidata(scheduled.due_at);
         let request = captured_requests
             .recv_timeout(Duration::from_secs(1))
             .expect("Wikidata request");
@@ -12578,12 +14602,12 @@ mod tests {
             .due_at
             .checked_sub(Duration::from_millis(1))
             .expect("scheduled deadline has a preceding instant");
-        controller.request_due_subscription_channel_details(before_due);
+        controller.request_due_channel_details(before_due);
         assert!(
             captured_requests.try_recv().is_err(),
             "moving onto a source must not immediately spend provider quota"
         );
-        controller.request_due_subscription_channel_details(scheduled.due_at);
+        controller.request_due_channel_details(scheduled.due_at);
         let ProviderRequest::ChannelDetails {
             generation,
             provider_generation,
@@ -12602,24 +14626,34 @@ mod tests {
             generation,
             provider_generation,
             channel_id: channel_id.clone(),
-            result: Ok(ChannelSummary {
-                channel_id,
-                name: "Provider channel name".to_owned(),
-                description: "Complete public channel description".to_owned(),
-                subscriber_count: Some(1_850_000),
-                video_count: Some(412),
-                created_at: None,
-                auto_generated: false,
-                thumbnails: vec![Thumbnail {
-                    url: channel_artwork.clone(),
-                    quality: Some("high".to_owned()),
-                    width: Some(800),
-                    height: Some(800),
+            result: Ok(ChannelDetails {
+                summary: ChannelSummary {
+                    channel_id,
+                    name: "Provider channel name".to_owned(),
+                    description: "Complete public channel description".to_owned(),
+                    subscriber_count: Some(1_850_000),
+                    video_count: Some(412),
+                    created_at: Some(1_100_000_000),
+                    auto_generated: false,
+                    thumbnails: vec![Thumbnail {
+                        url: channel_artwork.clone(),
+                        quality: Some("high".to_owned()),
+                        width: Some(800),
+                        height: Some(800),
+                    }],
+                    webpage_url: Some(
+                        url::Url::parse("https://www.youtube.com/@fixture")
+                            .expect("fixture channel URL"),
+                    ),
+                },
+                total_view_count: Some(987_654_321),
+                country: Some("Georgia".to_owned()),
+                external_links: vec![crate::providers::ChannelExternalLink {
+                    label: "Fixture Telegram".to_owned(),
+                    url: url::Url::parse("https://t.me/fixture").expect("Telegram URL"),
+                    kind: ChannelExternalLinkKind::Telegram,
                 }],
-                webpage_url: Some(
-                    url::Url::parse("https://www.youtube.com/@fixture")
-                        .expect("fixture channel URL"),
-                ),
+                external_links_truncated: false,
             }),
         });
 
@@ -12627,6 +14661,18 @@ mod tests {
         assert_eq!(details.channel_name, "Provider channel name");
         assert_eq!(details.description, "Complete public channel description");
         assert_eq!(details.channel_subscriber_count, Some(1_850_000));
+        assert_eq!(details.channel_video_count, Some(412));
+        assert_eq!(details.channel_total_view_count, Some(987_654_321));
+        assert_eq!(details.channel_created, "2004 November 9");
+        assert_eq!(details.channel_country, "Georgia");
+        assert_eq!(
+            details.links,
+            [DetailLinkView {
+                label: "Telegram: Fixture Telegram".to_owned(),
+                url: "https://t.me/fixture".to_owned(),
+                wikidata_item_id: None,
+            }]
+        );
         assert_eq!(
             controller.view.subscriptions.source_subscriber_count,
             Some(1_850_000)
@@ -12645,6 +14691,135 @@ mod tests {
             "a process-local cache hit must not schedule another provider request"
         );
         assert!(captured_requests.try_recv().is_err());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end controller fixture enumerates every requested channel link family"
+    )]
+    fn public_channel_page_enrichment_adds_about_counts_country_and_social_links() {
+        use crate::providers::ChannelExternalLink;
+        use crate::providers::youtube_channel_page::YouTubeChannelPageMetadata;
+
+        let config = Config::for_dir("/tmp/youta-channel-page-enrichment-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.channel_details_generation = 7;
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.details = Some(DetailView {
+            channel_id: "UCfixture".to_owned(),
+            links: vec![DetailLinkView {
+                label: "Fixture entity (Q42)".to_owned(),
+                url: "https://www.wikidata.org/wiki/Q42".to_owned(),
+                wikidata_item_id: Some("Q42".to_owned()),
+            }],
+            ..DetailView::default()
+        });
+        controller.channel_profile_cache.insert(
+            "UCfixture".to_owned(),
+            ChannelDetails {
+                summary: ChannelSummary {
+                    channel_id: "UCfixture".to_owned(),
+                    name: "Fixture channel".to_owned(),
+                    description: "Fixture description".to_owned(),
+                    subscriber_count: Some(13_045),
+                    video_count: None,
+                    created_at: None,
+                    auto_generated: false,
+                    thumbnails: Vec::new(),
+                    webpage_url: None,
+                },
+                total_view_count: None,
+                country: Some("UA".to_owned()),
+                external_links: Vec::new(),
+                external_links_truncated: false,
+            },
+        );
+        let external_link = |label: &str, url: &str, kind| ChannelExternalLink {
+            label: label.to_owned(),
+            url: url::Url::parse(url).expect("fixture external URL"),
+            kind,
+        };
+
+        controller.handle_provider_response(ProviderResponse::ChannelPageMetadata {
+            generation: 7,
+            provider_generation: controller.youtube_provider_generation,
+            channel_id: "UCfixture".to_owned(),
+            result: Ok(YouTubeChannelPageMetadata {
+                channel_id: "UCfixture".to_owned(),
+                country: Some("Ukraine".to_owned()),
+                joined_at: Some(1_398_297_600),
+                video_count: Some(3_977),
+                total_view_count: Some(1_094_367_204),
+                external_links: vec![
+                    external_link(
+                        "Official website",
+                        "https://example.org/",
+                        ChannelExternalLinkKind::Website,
+                    ),
+                    external_link(
+                        "Telegram",
+                        "https://t.me/fixture",
+                        ChannelExternalLinkKind::Telegram,
+                    ),
+                    external_link(
+                        "Facebook",
+                        "https://www.facebook.com/fixture",
+                        ChannelExternalLinkKind::Facebook,
+                    ),
+                    external_link(
+                        "Twitter",
+                        "https://x.com/fixture",
+                        ChannelExternalLinkKind::XTwitter,
+                    ),
+                    external_link(
+                        "TikTok",
+                        "https://www.tiktok.com/@fixture",
+                        ChannelExternalLinkKind::TikTok,
+                    ),
+                    external_link(
+                        "Instagram",
+                        "https://www.instagram.com/fixture",
+                        ChannelExternalLinkKind::Instagram,
+                    ),
+                ],
+                external_links_truncated: false,
+            }),
+        });
+
+        let details = controller.view.details.as_ref().expect("channel details");
+        assert_eq!(details.channel_created, "2014 April 24");
+        assert_eq!(details.channel_video_count, Some(3_977));
+        assert_eq!(details.channel_total_view_count, Some(1_094_367_204));
+        assert_eq!(details.channel_country, "Ukraine");
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .map(|link| link.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Website: Official website",
+                "Telegram",
+                "Facebook",
+                "X/Twitter: Twitter",
+                "TikTok",
+                "Instagram",
+                "Fixture entity (Q42)",
+            ],
+            "public channel links and the independent Wikidata row must coexist"
+        );
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.wikidata_item_id.as_deref() == Some("Q42"))
+                .count(),
+            1,
+            "the About-page response must not duplicate the Wikidata row"
+        );
     }
 
     #[test]
@@ -12715,7 +14890,18 @@ mod tests {
                 .and_then(|details| details.thumbnail_url.as_ref()),
             Some(&first_artwork)
         );
-        assert!(controller.scheduled_channel_details.is_none());
+        assert_eq!(
+            controller
+                .scheduled_channel_details
+                .as_ref()
+                .map(|scheduled| scheduled.channel_id.as_str()),
+            Some("UCfixture"),
+            "persisted artwork is immediate while the richer process-local profile is loaded lazily"
+        );
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "the debounced profile lookup must not block initial artwork"
+        );
 
         controller.select_subscription_source(1);
 
@@ -12728,10 +14914,17 @@ mod tests {
             Some(&second_artwork),
             "switching must reuse the persisted channel summary immediately"
         );
-        assert!(controller.scheduled_channel_details.is_none());
+        assert_eq!(
+            controller
+                .scheduled_channel_details
+                .as_ref()
+                .map(|scheduled| scheduled.channel_id.as_str()),
+            Some("UCsecond"),
+            "switching replaces the pending enrichment with the newly visible channel"
+        );
         assert!(
             captured_requests.try_recv().is_err(),
-            "fresh persisted channel artwork must not trigger provider network work"
+            "fresh persisted artwork must not trigger immediate provider network work"
         );
     }
 
@@ -12970,7 +15163,7 @@ mod tests {
     }
 
     #[test]
-    fn preferences_popup_saves_only_the_implemented_layout_and_applies_it_live() {
+    fn preferences_popup_saves_runtime_preferences_and_applies_them_live() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -12989,6 +15182,7 @@ mod tests {
             config.config_file().display().to_string()
         );
         controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
+        controller.dispatch(UiAction::ToggleYouTubePrewarm);
         controller.view.local_size_sort = LocalSizeSort::Ascending;
         controller.dispatch(UiAction::ToggleLocalFolderSizes);
         controller.dispatch(UiAction::SubmitPreferences);
@@ -13005,10 +15199,13 @@ mod tests {
         assert!(contents.contains("[ui]"));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        assert!(contents.contains("[playback]"));
+        assert!(contents.contains("youtube_prewarm = false"));
         let reloaded =
             Config::load_from_dir(config.config_dir()).expect("reload saved preferences");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        assert!(!reloaded.playback.youtube_prewarm);
     }
 
     #[test]
@@ -13107,6 +15304,51 @@ mod tests {
     }
 
     #[test]
+    fn rename_cursor_edits_whole_graphemes_in_the_middle_of_a_basename() {
+        let (mut controller, _state) = controller_with_mock_statuses(Vec::<PlaybackStatus>::new());
+        let original = "A👩‍💻Б.flac";
+        let after_emoji = "A👩‍💻".len();
+        controller.view.local_file_popup = Some(LocalFilePopupView::Rename {
+            value: original.to_owned(),
+            cursor_byte: after_emoji,
+            error: None,
+        });
+
+        controller.dispatch(UiAction::MoveLocalRenameCursor(-1));
+        let Some(LocalFilePopupView::Rename { cursor_byte, .. }) =
+            controller.view.local_file_popup.as_ref()
+        else {
+            panic!("rename popup must remain open");
+        };
+        assert_eq!(
+            *cursor_byte,
+            "A".len(),
+            "joined emoji must move as one unit"
+        );
+
+        controller.dispatch(UiAction::MoveLocalRenameCursor(1));
+        controller.dispatch(UiAction::AppendLocalRenameCharacter('я'));
+        let Some(LocalFilePopupView::Rename {
+            value, cursor_byte, ..
+        }) = controller.view.local_file_popup.as_ref()
+        else {
+            panic!("rename popup must remain open");
+        };
+        assert_eq!(value, "A👩‍💻яБ.flac");
+        assert_eq!(*cursor_byte, "A👩‍💻я".len());
+
+        controller.dispatch(UiAction::DeleteLocalRenameCharacter);
+        let Some(LocalFilePopupView::Rename {
+            value, cursor_byte, ..
+        }) = controller.view.local_file_popup.as_ref()
+        else {
+            panic!("rename popup must remain open");
+        };
+        assert_eq!(value, original);
+        assert_eq!(*cursor_byte, after_emoji);
+    }
+
+    #[test]
     fn local_browser_rows_and_folder_actions_are_source_specific() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let album = fixture.path().join("A long album folder");
@@ -13145,6 +15387,150 @@ mod tests {
         let file = controller.view.details.as_ref().expect("file details");
         assert!(file.local_renamable);
         assert!(file.local_trashable);
+    }
+
+    #[test]
+    fn local_playback_updates_visible_progress_and_rehydrates_it() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let media_directory = fixture.path().join("Music");
+        std::fs::create_dir(&media_directory).expect("create Local media folder");
+        let track = media_directory.join("01 - Hello World.flac");
+        std::fs::write(&track, b"fixture").expect("create local audio fixture");
+        let listing = crate::local_browser::list_local_directory(
+            &media_directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local listing");
+        let stale_loading = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(100),
+            duration: Some(Duration::from_secs(100)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let missing_duration = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(45),
+            duration: None,
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(45),
+            duration: Some(Duration::from_secs(100)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let config = Config::for_dir(fixture.path().join("state"));
+        let store = StateStore::open(&config).expect("disk-backed state");
+        let (factory, _state, _statuses, events) =
+            mock_playback_factory([stale_loading, missing_duration, active], []);
+        let mut controller = AppController::new(config.clone(), store, None, Some(factory));
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing.clone());
+        controller.hydrate_local_progress_cache();
+        controller.refresh_local_browser_rows();
+        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let row_index = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.media_id.as_ref() == Some(&media_id))
+            .expect("local track row");
+        controller.view.selected = row_index;
+
+        assert_eq!(
+            controller.local_progress_cache.get(&media_id),
+            Some(&0),
+            "first-time local media must still own a cache entry"
+        );
+        assert_eq!(controller.view.rows[row_index].watched_percent, 0);
+
+        controller.activate_local_browser_selection();
+        controller.update_player();
+
+        assert_eq!(controller.playback_phase, PlaybackPhase::Loading);
+        assert_eq!(
+            controller.view.rows[row_index].watched_percent, 0,
+            "a status retained from replaced media must not advance the new file"
+        );
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+
+        assert_eq!(controller.playback_phase, PlaybackPhase::Playing);
+        assert_eq!(
+            controller.view.rows[row_index].watched_percent, 0,
+            "a temporarily unknown duration must not erase or invent progress"
+        );
+        controller.show_screen(Screen::Playlists);
+        controller.update_player();
+        assert_eq!(controller.local_progress_cache.get(&media_id), Some(&45));
+        assert!(
+            controller.view.rows.is_empty(),
+            "another screen must not retain the Local browser rows"
+        );
+        controller.show_screen(Screen::Local);
+        let row_index = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.media_id.as_ref() == Some(&media_id))
+            .expect("restored Local track row");
+        assert_eq!(
+            controller.view.rows[row_index].watched_percent, 45,
+            "returning to Local must rebuild from the live RAM cache"
+        );
+
+        controller.persist_position();
+        assert_eq!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("saved partial progress")
+                .map(|progress| progress.watched_percent()),
+            Some(45)
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(controller.view.rows[row_index].watched_percent, 100);
+        assert_eq!(controller.local_progress_cache.get(&media_id), Some(&100));
+        assert_eq!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("saved finished progress")
+                .map(|progress| progress.watched_percent()),
+            Some(100)
+        );
+
+        drop(controller);
+        let store = StateStore::open(&config).expect("reopen disk-backed state");
+        let mut restarted = AppController::new(config, store, None, None);
+        restarted.view.screen = Screen::Local;
+        restarted.local_listing = Some(listing);
+        restarted.hydrate_local_progress_cache();
+        restarted.rebuild_local_browser_rows();
+        let rehydrated = restarted
+            .view
+            .rows
+            .iter()
+            .find(|row| row.media_id.as_ref() == Some(&media_id))
+            .expect("local row rehydrated after a real database reopen");
+        assert_eq!(rehydrated.watched_percent, 100);
     }
 
     #[cfg(all(feature = "local", feature = "thumbnails"))]
@@ -14409,15 +16795,20 @@ mod tests {
         (controller, state)
     }
 
-    fn controller_with_mock_lifecycle(
-        statuses: impl IntoIterator<Item = crate::playback::PlaybackStatus>,
-        events: impl IntoIterator<Item = PlaybackEvent>,
-    ) -> (
-        AppController,
+    /// Mock player factory together with handles that let tests advance its
+    /// observable status and event queues.
+    type MockPlaybackHarness = (
+        PlaybackFactory,
         Arc<Mutex<MockPlaybackState>>,
         Arc<Mutex<VecDeque<crate::playback::PlaybackStatus>>>,
         Arc<Mutex<VecDeque<PlaybackEvent>>>,
-    ) {
+    );
+
+    /// Builds a mock player independently from controller persistence.
+    fn mock_playback_factory(
+        statuses: impl IntoIterator<Item = crate::playback::PlaybackStatus>,
+        events: impl IntoIterator<Item = PlaybackEvent>,
+    ) -> MockPlaybackHarness {
         let state = Arc::new(Mutex::new(MockPlaybackState::default()));
         let status_queue = Arc::new(Mutex::new(statuses.into_iter().collect::<VecDeque<_>>()));
         let event_queue = Arc::new(Mutex::new(events.into_iter().collect::<VecDeque<_>>()));
@@ -14431,6 +16822,19 @@ mod tests {
                 events: Arc::clone(&factory_events),
             }))
         });
+        (factory, state, status_queue, event_queue)
+    }
+
+    fn controller_with_mock_lifecycle(
+        statuses: impl IntoIterator<Item = crate::playback::PlaybackStatus>,
+        events: impl IntoIterator<Item = PlaybackEvent>,
+    ) -> (
+        AppController,
+        Arc<Mutex<MockPlaybackState>>,
+        Arc<Mutex<VecDeque<crate::playback::PlaybackStatus>>>,
+        Arc<Mutex<VecDeque<PlaybackEvent>>>,
+    ) {
+        let (factory, state, status_queue, event_queue) = mock_playback_factory(statuses, events);
         let config = Config::for_dir("/tmp/youta-queue-controller-test");
         let store = StateStore::open_in_memory().expect("in-memory state");
         (
@@ -15418,6 +17822,7 @@ mod tests {
             links: vec![DetailLinkView {
                 label: "Fixture link".to_owned(),
                 url: "https://example.com".to_owned(),
+                ..DetailLinkView::default()
             }],
             ..DetailView::default()
         });
@@ -16787,6 +19192,260 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn youtube_prewarm_debounce_keeps_not_yet_due_selection_scheduled() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        let video = subscription_video_summary();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+
+        controller.update_youtube_prewarm_for_selection(Some(&SearchItem::Video(video)));
+        let scheduled = controller
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .expect("eligible selection should be debounced");
+        assert_eq!(scheduled.media_id, media_id);
+        let before_deadline = scheduled
+            .due_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("fixture deadline");
+
+        controller.request_due_youtube_prewarm(before_deadline);
+
+        assert!(
+            controller.scheduled_youtube_prewarm.is_some(),
+            "an early UI tick must not discard the debounced request"
+        );
+        assert!(controller.active_youtube_prewarm.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn youtube_prewarm_is_one_shot_and_rejects_stale_or_expiring_streams() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        let fixture_audio = |expires_at_unix| {
+            PrewarmedYouTubeAudio::for_test(
+                url::Url::parse("https://signed.example/audio?token=secret")
+                    .expect("fixture signed URL"),
+                expires_at_unix,
+            )
+        };
+
+        controller.ready_youtube_prewarm = Some(ReadyYouTubePrewarm {
+            media_id: media_id.clone(),
+            completed_at: Instant::now(),
+            audio: fixture_audio(None),
+        });
+        assert!(
+            controller.take_ready_youtube_prewarm(&media_id).is_some(),
+            "a fresh exact result should be consumed"
+        );
+        assert!(
+            controller.take_ready_youtube_prewarm(&media_id).is_none(),
+            "the signed stream must be eligible for only one playback attempt"
+        );
+
+        controller.ready_youtube_prewarm = Some(ReadyYouTubePrewarm {
+            media_id: media_id.clone(),
+            completed_at: Instant::now()
+                .checked_sub(YOUTUBE_PREWARM_TTL + Duration::from_millis(1))
+                .expect("fixture instant"),
+            audio: fixture_audio(None),
+        });
+        assert!(
+            controller.take_ready_youtube_prewarm(&media_id).is_none(),
+            "a result older than the controller TTL must be discarded"
+        );
+
+        let now_unix = u64::try_from(unix_time()).expect("fixture Unix time");
+        controller.ready_youtube_prewarm = Some(ReadyYouTubePrewarm {
+            media_id: media_id.clone(),
+            completed_at: Instant::now(),
+            audio: fixture_audio(Some(
+                now_unix.saturating_add(YOUTUBE_PREWARM_EXPIRY_MARGIN_SECONDS),
+            )),
+        });
+        assert!(
+            controller.take_ready_youtube_prewarm(&media_id).is_none(),
+            "a URL expiring inside the safety margin must not reach playback"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn youtube_prewarm_response_rejects_an_obsolete_generation() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        controller.youtube_prewarm_generation = 8;
+        controller.active_youtube_prewarm = Some(ActiveYouTubePrewarm {
+            generation: 7,
+            media_id: media_id.clone(),
+            cancellation: YouTubePrewarmCancellation::new(),
+        });
+        let (responses, response_receiver) = bounded(1);
+        controller.youtube_prewarm_responses = Some(response_receiver);
+        responses
+            .send(YouTubePrewarmCompletion {
+                media_id,
+                completed_at: Instant::now(),
+                result: YouTubePrewarmResult::for_test(
+                    7,
+                    Ok(PrewarmedYouTubeAudio::for_test(
+                        url::Url::parse("https://signed.example/audio?token=stale")
+                            .expect("fixture signed URL"),
+                        None,
+                    )),
+                ),
+            })
+            .expect("fixture response");
+
+        controller.drain_youtube_prewarm_responses();
+
+        assert!(controller.active_youtube_prewarm.is_none());
+        assert!(controller.ready_youtube_prewarm.is_none());
+        assert!(controller.youtube_prewarm_failure.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn prewarmed_youtube_load_uses_bounded_fallbacks_without_losing_queue_state() {
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle([], []);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        let mut item = fixture_youtube_item("prewarmed fixture");
+        item.start_at_seconds = Some(45);
+        let media_id = item.media.id.clone();
+        controller.ready_youtube_prewarm = Some(ReadyYouTubePrewarm {
+            media_id: media_id.clone(),
+            completed_at: Instant::now(),
+            audio: PrewarmedYouTubeAudio::for_test(
+                url::Url::parse("https://signed.example/audio?token=secret")
+                    .expect("fixture signed URL"),
+                None,
+            ),
+        });
+        let origin = AutoplayOrigin::YouTube {
+            generation: 7,
+            index: 3,
+        };
+
+        controller.play_queue_item_with_origin(item, false, Some(origin.clone()));
+
+        assert_eq!(
+            controller.playback_load_kind,
+            PlaybackLoadKind::YouTubeDirect
+        );
+        assert_eq!(controller.current_autoplay_origin, Some(origin.clone()));
+        assert_eq!(
+            controller
+                .pending_history
+                .as_ref()
+                .map(|history| history.position_seconds),
+            Some(45)
+        );
+        {
+            let state = state.lock().expect("mock state");
+            assert_eq!(state.played.len(), 1);
+            assert!(state.played[0].bypass_ytdl);
+            assert_eq!(
+                state.played[0].location,
+                "https://signed.example/audio?token=secret"
+            );
+            assert!(!format!("{:?}", state.played[0]).contains("signed.example"));
+            assert!(!format!("{:?}", state.played[0]).contains("secret"));
+        }
+
+        {
+            let mut events = events.lock().expect("mock events");
+            events.push_back(PlaybackEvent::MediaLoaded);
+            events.push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Error,
+                error: None,
+                file_error: Some("unrecognized file format".to_owned()),
+                diagnostic: Some("https://signed.example/audio?token=secret".to_owned()),
+            }));
+        }
+        controller.update_player();
+
+        assert!(controller.view.error_popup.is_none());
+        assert_eq!(
+            controller.playback_load_kind,
+            PlaybackLoadKind::YouTubeCanonical
+        );
+        assert_eq!(controller.current_autoplay_origin, Some(origin.clone()));
+        assert_eq!(controller.current_media.as_ref(), Some(&media_id));
+        assert_eq!(
+            controller
+                .playback_queue
+                .current()
+                .map(|queued| &queued.media.id),
+            Some(&media_id)
+        );
+        {
+            let state = state.lock().expect("mock state");
+            assert_eq!(state.played.len(), 2);
+            assert!(!state.played[1].bypass_ytdl);
+            assert!(!state.played[1].verify_remote_format);
+            assert_eq!(
+                state.played[1].location,
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            );
+            assert_eq!(state.played[1].start_at, Duration::from_secs(45));
+        }
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Error,
+                error: Some("canonical stream failed".to_owned()),
+                file_error: Some("HTTP error 403 Forbidden".to_owned()),
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert!(controller.view.error_popup.is_none());
+        assert_eq!(
+            controller.playback_load_kind,
+            PlaybackLoadKind::YouTubeChecked
+        );
+        assert_eq!(controller.current_autoplay_origin, Some(origin));
+        {
+            let state = state.lock().expect("mock state");
+            assert_eq!(state.played.len(), 3);
+            assert!(!state.played[2].bypass_ytdl);
+            assert!(state.played[2].verify_remote_format);
+            assert_eq!(state.played[2].start_at, Duration::from_secs(45));
+        }
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::MediaLoaded);
+        controller.update_player();
+        assert_eq!(controller.playback_phase, PlaybackPhase::Loaded);
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Error,
+                error: Some("decoder failed after load".to_owned()),
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(state.lock().expect("mock state").played.len(), 3);
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str()),
+            Some("Playback failed")
+        );
+    }
+
     #[test]
     fn youtube_non_403_load_failure_does_not_enable_format_validation() {
         let failure = PlaybackEvent::Ended(PlaybackEnd {
@@ -16887,6 +19546,47 @@ mod tests {
         assert_eq!(controller.playback_phase, PlaybackPhase::Idle);
         assert!(!controller.view.playback_starting);
         assert_eq!(controller.view.playing_media_id, None);
+    }
+
+    #[test]
+    fn backend_stream_url_cannot_replace_the_queue_title() {
+        let derived_stream_title = "webm&rqh=1&gir=yes&clen=101236984&dur=7717.401\
+                                    &lmt=1784786265509357&c=ANDROID_VR";
+        let active = PlaybackStatus {
+            idle: false,
+            paused: false,
+            title: Some(derived_stream_title.to_owned()),
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _statuses, events) =
+            controller_with_mock_lifecycle([active.clone(), active], [PlaybackEvent::MediaLoaded]);
+        controller.play_queue_item(fixture_direct_item("Hello World"), false);
+
+        controller.update_player();
+        assert_eq!(
+            controller.view.playback.title.as_deref(),
+            Some("Hello World")
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::PlaybackStarted);
+        controller.update_player();
+
+        assert_eq!(controller.view.status_line, "Playing Hello World");
+        assert_eq!(
+            controller.view.playback.title.as_deref(),
+            Some("Hello World")
+        );
+        assert!(
+            !controller
+                .view
+                .playback
+                .title
+                .as_deref()
+                .is_some_and(|title| { title.contains("clen=") || title.contains("ANDROID_VR") })
+        );
     }
 
     #[test]

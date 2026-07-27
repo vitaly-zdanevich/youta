@@ -11,7 +11,8 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,11 @@ pub const MAX_ISSUE_TITLE_CHARS: usize = 160;
 const NEW_ISSUE_URL: &str = "https://github.com/vitaly-zdanevich/youta/issues/new";
 const SHORT_ISSUE_BODY: &str =
     "Paste the complete diagnostic report copied by Youta below this line.";
-const PROCESS_OBSERVATION_TIME: Duration = Duration::from_secs(3);
+/// Maximum time a synchronous popup action may occupy the terminal event loop.
+///
+/// Helpers that outlive this short window are handed to a background reaper and
+/// are not reported as successful because no zero exit status was observed.
+const PROCESS_OBSERVATION_TIME: Duration = Duration::from_millis(100);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A command and its input, planned without starting a process.
@@ -52,8 +57,8 @@ pub enum ProcessOutcome {
     ExitedSuccessfully,
     /// The process was still running when the observation period ended.
     ///
-    /// Clipboard and browser helpers can intentionally remain alive after
-    /// accepting their input, so this is treated as a successful launch.
+    /// Production execution has transferred the child to a background reaper,
+    /// but callers must not interpret this outcome as confirmed success.
     StillRunning,
     /// The process exited unsuccessfully, with an optional platform exit code.
     ExitedUnsuccessfully(Option<i32>),
@@ -112,7 +117,7 @@ impl ReportActionRunner for SystemRunner {
             }
         }
 
-        observe_process(&mut child, plan.observation_time)
+        observe_process(child, plan.observation_time)
     }
 
     fn write_terminal_escape(&self, escape: &[u8]) -> io::Result<()> {
@@ -123,24 +128,66 @@ impl ReportActionRunner for SystemRunner {
     }
 }
 
-fn observe_process(
-    child: &mut std::process::Child,
-    observation_time: Duration,
-) -> io::Result<ProcessOutcome> {
+fn observe_process(mut child: Child, observation_time: Duration) -> io::Result<ProcessOutcome> {
     let deadline = Instant::now() + observation_time;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(if status.success() {
-                ProcessOutcome::ExitedSuccessfully
-            } else {
-                ProcessOutcome::ExitedUnsuccessfully(status.code())
-            });
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(if status.success() {
+                    ProcessOutcome::ExitedSuccessfully
+                } else {
+                    ProcessOutcome::ExitedUnsuccessfully(status.code())
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_and_reap(&mut child);
+                return Err(error);
+            }
         }
         if Instant::now() >= deadline {
+            hand_to_background_reaper(child)?;
             return Ok(ProcessOutcome::StillRunning);
         }
         thread::sleep(PROCESS_POLL_INTERVAL.min(observation_time));
     }
+}
+
+/// Transfers an unfinished helper to a detached waiter without losing ownership.
+///
+/// The channel is created before the thread, so every failure path still owns
+/// the child and can terminate and reap it synchronously.
+fn hand_to_background_reaper(mut child: Child) -> io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel::<Child>(1);
+    let reaper = match thread::Builder::new()
+        .name("youta-report-helper-reaper".to_owned())
+        .spawn(move || {
+            if let Ok(mut child) = receiver.recv() {
+                let _ = child.wait();
+            }
+        }) {
+        Ok(reaper) => reaper,
+        Err(error) => {
+            terminate_and_reap(&mut child);
+            return Err(error);
+        }
+    };
+
+    if let Err(mpsc::SendError(mut child)) = sender.send(child) {
+        terminate_and_reap(&mut child);
+        let _ = reaper.join();
+        return Err(io::Error::other(
+            "report helper reaper stopped before accepting the child",
+        ));
+    }
+    drop(reaper);
+    Ok(())
+}
+
+/// Makes a best effort to stop and synchronously reap an owned helper.
+fn terminate_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Supported native clipboard helpers.
@@ -312,6 +359,11 @@ pub enum ReportActionError {
         /// Platform exit code, when one was available.
         exit_code: Option<i32>,
     },
+    /// A helper remained alive after the short foreground observation window.
+    ProcessStillRunning {
+        /// Human-readable helper name.
+        helper: &'static str,
+    },
     /// Neither the selected clipboard helper nor OSC 52 could copy the report.
     ClipboardFailed {
         /// Failure from the native clipboard helper, when one was attempted.
@@ -344,6 +396,11 @@ impl fmt::Display for ReportActionError {
                 Some(code) => write!(formatter, "{helper} exited with status {code}"),
                 None => write!(formatter, "{helper} terminated unsuccessfully"),
             },
+            Self::ProcessStillRunning { helper } => write!(
+                formatter,
+                "{helper} did not report a successful exit promptly; \
+                 it remains supervised in the background"
+            ),
             Self::ClipboardFailed {
                 helper_failure,
                 osc52_failure,
@@ -377,6 +434,7 @@ impl std::error::Error for ReportActionError {
             Self::GitHubCliUnavailable
             | Self::UrlOpenerUnavailable
             | Self::ProcessFailed { .. }
+            | Self::ProcessStillRunning { .. }
             | Self::OpenAfterCopy { .. } => None,
         }
     }
@@ -466,7 +524,8 @@ impl<R: ReportActionRunner> ReportActions<R> {
     /// # Errors
     ///
     /// Returns an error when `gh` is unavailable, cannot launch, cannot accept
-    /// its input, or exits unsuccessfully during the observation period.
+    /// its input, exits unsuccessfully, or does not confirm a successful exit
+    /// within the short foreground observation window.
     pub fn fill_github_issue(&self, title: &str, report: &str) -> Result<(), ReportActionError> {
         let Some(github_cli) = &self.tools.github_cli else {
             return Err(ReportActionError::GitHubCliUnavailable);
@@ -484,8 +543,8 @@ impl<R: ReportActionRunner> ReportActions<R> {
     /// # Errors
     ///
     /// Returns an error when copying fails, `xdg-open` is unavailable, or the
-    /// browser helper cannot launch successfully. An opener error states which
-    /// clipboard transport already succeeded.
+    /// browser helper does not promptly confirm a successful exit. An opener
+    /// error states which clipboard transport already succeeded.
     pub fn copy_and_open_github_issue(
         &self,
         title: &str,
@@ -520,10 +579,11 @@ impl<R: ReportActionRunner> ReportActions<R> {
             .execute(plan)
             .map_err(|source| ReportActionError::ProcessIo { helper, source })?
         {
-            ProcessOutcome::ExitedSuccessfully | ProcessOutcome::StillRunning => Ok(()),
+            ProcessOutcome::ExitedSuccessfully => Ok(()),
             ProcessOutcome::ExitedUnsuccessfully(exit_code) => {
                 Err(ReportActionError::ProcessFailed { helper, exit_code })
             }
+            ProcessOutcome::StillRunning => Err(ReportActionError::ProcessStillRunning { helper }),
         }
     }
 }
@@ -550,7 +610,10 @@ fn github_cli_plan(executable: &Path, title: &str, report: &str) -> CommandPlan 
 fn issue_page_plan(executable: &Path, title: &str) -> CommandPlan {
     CommandPlan {
         executable: executable.to_owned(),
-        arguments: vec!["--".into(), short_issue_url(title).into()],
+        // Unlike many command-line tools, `xdg-open` does not accept `--` as
+        // an end-of-options marker. The bounded URL always starts with HTTPS,
+        // so it is safe and valid as the command's sole target argument.
+        arguments: vec![short_issue_url(title).into()],
         standard_input: None,
         observation_time: PROCESS_OBSERVATION_TIME,
     }
@@ -836,6 +899,21 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_native_clipboard_falls_back_to_complete_osc52() {
+        let runner = MockRunner::with_outcomes([ProcessOutcome::StillRunning]);
+        let actions = ReportActions::with_runner(runner, tools());
+        let report = "complete diagnostic\nwith backtrace";
+
+        let transport = actions.copy_report(report).expect("OSC 52 should work");
+
+        assert_eq!(transport, "OSC 52");
+        assert_eq!(
+            actions.runner.terminal_escapes.borrow().as_slice(),
+            [osc52_sequence(report)]
+        );
+    }
+
+    #[test]
     fn osc52_is_used_when_no_native_clipboard_matches() {
         let runner = MockRunner::default();
         let actions = ReportActions::with_runner(
@@ -887,8 +965,8 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].executable, Path::new("/usr/bin/wl-copy"));
         assert_eq!(plans[1].executable, Path::new("/usr/bin/xdg-open"));
-        assert_eq!(plans[1].arguments[0], "--");
-        let url = plans[1].arguments[1].to_string_lossy();
+        assert_eq!(plans[1].arguments.len(), 1);
+        let url = plans[1].arguments[0].to_string_lossy();
         assert!(url.starts_with(NEW_ISSUE_URL));
         assert!(url.contains("title=Decoder%20failed"));
         assert!(url.contains("body=Paste%20the%20complete"));
@@ -909,8 +987,34 @@ mod tests {
             .copy_and_open_github_issue("Failure", "report")
             .expect_err("opener should fail");
 
+        let plans = actions.runner.plans.borrow();
+        assert_eq!(plans[1].arguments.len(), 1);
+        assert!(
+            plans[1].arguments[0]
+                .to_string_lossy()
+                .starts_with(NEW_ISSUE_URL)
+        );
         assert!(error.to_string().contains("report was copied with wl-copy"));
         assert!(error.to_string().contains("xdg-open exited with status 3"));
+    }
+
+    #[test]
+    fn copy_and_open_does_not_claim_success_for_a_running_opener() {
+        let runner = MockRunner::with_outcomes([
+            ProcessOutcome::ExitedSuccessfully,
+            ProcessOutcome::StillRunning,
+        ]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .copy_and_open_github_issue("Failure", "private report")
+            .expect_err("a running opener has not confirmed success");
+        let message = error.to_string();
+
+        assert!(message.contains("report was copied with wl-copy"));
+        assert!(message.contains("xdg-open did not report a successful exit promptly"));
+        assert!(!message.contains("private report"));
+        assert!(!message.contains(NEW_ISSUE_URL));
     }
 
     #[test]
@@ -932,13 +1036,18 @@ mod tests {
     }
 
     #[test]
-    fn running_helper_counts_as_an_accepted_launch() {
+    fn running_helper_is_not_reported_as_a_successful_launch() {
         let runner = MockRunner::with_outcomes([ProcessOutcome::StillRunning]);
         let actions = ReportActions::with_runner(runner, tools());
 
-        actions
+        let error = actions
             .fill_github_issue("Failure", "report")
-            .expect("a launched gh process may still be opening the browser");
+            .expect_err("a running process has not confirmed success");
+
+        assert!(matches!(
+            error,
+            ReportActionError::ProcessStillRunning { helper: "gh" }
+        ));
     }
 
     #[cfg(unix)]
@@ -980,6 +1089,50 @@ mod tests {
         assert_eq!(
             runner.execute(&input_plan).expect("pipe report to cat"),
             ProcessOutcome::ExitedSuccessfully
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_runner_returns_promptly_and_reaps_an_unfinished_helper() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("slow-helper");
+        let pid_file = temporary.path().join("pid");
+        let sleep = find_test_executable(&["/usr/bin/sleep", "/bin/sleep"]);
+        make_executable(&helper);
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\n\"$2\" 0.2\n",
+        )
+        .expect("slow helper fixture");
+        let plan = CommandPlan {
+            executable: helper,
+            arguments: vec![pid_file.as_os_str().to_owned(), sleep.into_os_string()],
+            standard_input: None,
+            observation_time: Duration::from_millis(20),
+        };
+
+        let started_at = Instant::now();
+        let outcome = SystemRunner.execute(&plan).expect("run slow helper");
+        let foreground_elapsed = started_at.elapsed();
+
+        assert_eq!(outcome, ProcessOutcome::StillRunning);
+        assert!(
+            foreground_elapsed < Duration::from_millis(500),
+            "foreground observation took {foreground_elapsed:?}"
+        );
+        let pid = fs::read_to_string(&pid_file)
+            .expect("helper PID")
+            .parse::<u32>()
+            .expect("numeric helper PID");
+        let process_path = PathBuf::from(format!("/proc/{pid}"));
+        let reaping_deadline = Instant::now() + Duration::from_secs(2);
+        while process_path.exists() && Instant::now() < reaping_deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_path.exists(),
+            "background waiter did not reap helper PID {pid}"
         );
     }
 

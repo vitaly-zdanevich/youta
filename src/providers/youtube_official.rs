@@ -18,11 +18,12 @@ use serde_json::Value;
 use url::Url;
 
 use super::{
-    ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary, ChannelVideosRequest,
-    DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider, ProviderCapabilities, ProviderError,
-    SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
-    SearchTarget, Thumbnail, VideoDetails, VideoOrientation, VideoSummary, parse_rfc3339_epoch,
-    provider_agent, validate_base_url, validate_youtube_video_id,
+    ChannelDetails, ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary,
+    ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
+    ProviderCapabilities, ProviderError, SearchDate, SearchDuration, SearchFeature, SearchItem,
+    SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoOrientation,
+    VideoSummary, parse_rfc3339_epoch, provider_agent, validate_base_url,
+    validate_youtube_video_id,
 };
 
 const API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
@@ -386,6 +387,30 @@ impl YouTubeOfficialProvider {
             .collect()
     }
 
+    fn fetch_exact_channel_resource(
+        &self,
+        channel_id: &str,
+    ) -> Result<RawChannelResource, ProviderError> {
+        validate_channel_id(channel_id, "requested channel ID").map_err(|_| {
+            ProviderError::InvalidRequest(
+                "YouTube channel ID contains invalid characters".to_owned(),
+            )
+        })?;
+        let resources = self.fetch_channel_resources(&[channel_id.to_owned()])?;
+        let mut resources = resources.into_iter();
+        let Some((returned_id, resource)) = resources.next() else {
+            return Err(ProviderError::InvalidResponse(
+                "YouTube channel was not found".to_owned(),
+            ));
+        };
+        if returned_id != channel_id || resources.next().is_some() {
+            return Err(ProviderError::InvalidResponse(
+                "channel response identifier does not match the requested channel".to_owned(),
+            ));
+        }
+        Ok(resource)
+    }
+
     /// Resolves and caches the system uploads playlist advertised by a
     /// channel resource.
     ///
@@ -689,24 +714,11 @@ impl Provider for YouTubeOfficialProvider {
     }
 
     fn channel_details(&self, channel_id: &str) -> Result<ChannelSummary, ProviderError> {
-        validate_channel_id(channel_id, "requested channel ID").map_err(|_| {
-            ProviderError::InvalidRequest(
-                "YouTube channel ID contains invalid characters".to_owned(),
-            )
-        })?;
-        let resources = self.fetch_channel_resources(&[channel_id.to_owned()])?;
-        let mut resources = resources.into_iter();
-        let Some((returned_id, resource)) = resources.next() else {
-            return Err(ProviderError::InvalidResponse(
-                "YouTube channel was not found".to_owned(),
-            ));
-        };
-        if returned_id != channel_id || resources.next().is_some() {
-            return Err(ProviderError::InvalidResponse(
-                "channel response identifier does not match the requested channel".to_owned(),
-            ));
-        }
-        channel_summary_from_resource(resource)
+        channel_summary_from_resource(self.fetch_exact_channel_resource(channel_id)?)
+    }
+
+    fn full_channel_details(&self, channel_id: &str) -> Result<ChannelDetails, ProviderError> {
+        full_channel_details_from_resource(self.fetch_exact_channel_resource(channel_id)?)
     }
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
@@ -1201,6 +1213,27 @@ fn channel_summary_from_resource(raw: RawChannelResource) -> Result<ChannelSumma
     })
 }
 
+fn full_channel_details_from_resource(
+    raw: RawChannelResource,
+) -> Result<ChannelDetails, ProviderError> {
+    let total_view_count = raw.statistics.view_count;
+    let country = normalize_country(raw.snippet.country.as_deref());
+    channel_summary_from_resource(raw).map(|summary| ChannelDetails {
+        summary,
+        total_view_count,
+        country,
+        external_links: Vec::new(),
+        external_links_truncated: false,
+    })
+}
+
+fn normalize_country(country: Option<&str>) -> Option<String> {
+    country.and_then(|country| {
+        let country = country.trim();
+        (!country.is_empty() && country.chars().count() <= 128).then(|| country.to_owned())
+    })
+}
+
 fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, ProviderError> {
     validate_response_video_id(&raw.id)?;
     validate_channel_id(&raw.snippet.channel_id, "video channel ID")?;
@@ -1478,6 +1511,8 @@ struct RawSnippet {
     #[serde(default)]
     channel_title: String,
     #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
     live_broadcast_content: Option<String>,
@@ -1598,6 +1633,8 @@ struct RawChannelStatistics {
     subscriber_count: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     video_count: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    view_count: Option<u64>,
     #[serde(default)]
     hidden_subscriber_count: bool,
 }
@@ -1733,6 +1770,8 @@ mod tests {
             "snippet": {
                 "title": "Enriched channel",
                 "description": "Full channel description",
+                "publishedAt": "2014-04-24T10:11:12Z",
+                "country": "UA",
                 "thumbnails": {
                     "high": {
                         "url": "https://yt3.ggpht.com/channel=s800",
@@ -1744,6 +1783,7 @@ mod tests {
             "statistics": {
                 "subscriberCount": "9001",
                 "videoCount": "42",
+                "viewCount": "1094367204",
                 "hiddenSubscriberCount": false
             }
         }]
@@ -2029,6 +2069,7 @@ mod tests {
         assert_eq!(channel.name, "Enriched channel");
         assert_eq!(channel.subscriber_count, Some(9_001));
         assert_eq!(channel.video_count, Some(42));
+        assert_eq!(channel.created_at, Some(1_398_334_272));
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("/channels?"));
 
@@ -2083,6 +2124,30 @@ mod tests {
             pairs.len(),
             4,
             "exact lookup must not add search parameters"
+        );
+    }
+
+    #[test]
+    fn full_channel_details_add_country_and_aggregate_views_in_one_request() {
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", CHANNEL_RESOURCE)]);
+
+        let details = provider
+            .full_channel_details(CHANNEL_ID)
+            .expect("full channel metadata should parse");
+        let requests = server.finish();
+
+        assert_eq!(details.summary.channel_id, CHANNEL_ID);
+        assert_eq!(details.summary.video_count, Some(42));
+        assert_eq!(details.summary.created_at, Some(1_398_334_272));
+        assert_eq!(details.total_view_count, Some(1_094_367_204));
+        assert_eq!(details.country.as_deref(), Some("UA"));
+        assert!(details.external_links.is_empty());
+        assert!(!details.external_links_truncated);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            query_pairs(&requests[0]).get("part").map(String::as_str),
+            Some("snippet,statistics")
         );
     }
 

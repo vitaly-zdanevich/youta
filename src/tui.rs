@@ -29,6 +29,7 @@ use ratatui::widgets::{
 use ratatui::{Terminal, TerminalOptions, Viewport};
 #[cfg(feature = "thumbnails")]
 use ratatui_image::StatefulImage as TerminalImage;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
@@ -88,8 +89,8 @@ impl Screen {
         Self::Search,
         Self::YouTubeMusic,
         Self::TrackerMusic,
-        Self::Local,
         Self::Subscriptions,
+        Self::Local,
         Self::Playlists,
         Self::Downloaded,
         Self::History,
@@ -100,8 +101,8 @@ impl Screen {
     const ALL: [Self; 8] = [
         Self::Search,
         Self::TrackerMusic,
-        Self::Local,
         Self::Subscriptions,
+        Self::Local,
         Self::Playlists,
         Self::Downloaded,
         Self::History,
@@ -339,6 +340,16 @@ pub struct DetailView {
     pub channel_subscribed: bool,
     /// Public channel subscriber count, when exposed by the provider.
     pub channel_subscriber_count: Option<u64>,
+    /// Public channel video count, when exposed by the provider.
+    pub channel_video_count: Option<u64>,
+    /// Aggregate public channel view count, when exposed by the provider.
+    pub channel_total_view_count: Option<u64>,
+    /// Human-readable channel creation/joined date.
+    pub channel_created: String,
+    /// Provider-supplied channel country code or label.
+    pub channel_country: String,
+    /// Whether additional channel profile links exceeded a safety bound.
+    pub channel_links_truncated: bool,
     /// Human-readable length.
     pub length: String,
     /// Description text.
@@ -359,6 +370,12 @@ pub struct DetailView {
     pub wikidata: String,
     /// Selectable external links associated with this media item or channel.
     pub links: Vec<DetailLinkView>,
+    /// Wikidata item whose property spoiler is currently expanded.
+    pub expanded_wikidata_item: Option<String>,
+    /// Wikidata item whose property request is in flight.
+    pub loading_wikidata_item: Option<String>,
+    /// Bounded, already-formatted Wikidata property spoilers.
+    pub wikidata_entities: Vec<DetailWikidataEntityView>,
     /// Remote thumbnail URL consumed by the optional image renderer.
     ///
     /// The URL is never rendered as text. Unsupported terminals omit the
@@ -445,6 +462,8 @@ pub struct PreferencesPopupView {
     pub subscriptions_layout: SubscriptionsLayout,
     /// Draft advertisement-chapter behavior saved only on confirmation.
     pub skip_advertisement_chapters: bool,
+    /// Draft selected-video `YouTube` prewarming saved only on confirmation.
+    pub youtube_prewarm: bool,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
     pub show_local_folder_sizes: bool,
     /// Exact private TOML file updated by the save action.
@@ -462,6 +481,8 @@ pub enum LocalFilePopupView {
     Rename {
         /// Draft basename.
         value: String,
+        /// UTF-8 byte offset at a grapheme boundary where edits are applied.
+        cursor_byte: usize,
         /// Validation or filesystem failure retained in the popup.
         error: Option<String>,
     },
@@ -509,6 +530,30 @@ pub struct DetailLinkView {
     pub label: String,
     /// Absolute URL passed to the controller when the link is activated.
     pub url: String,
+    /// Exact Wikidata Q-ID when this link owns a lazy property spoiler.
+    pub wikidata_item_id: Option<String>,
+}
+
+/// Bounded human-facing Wikidata properties cached for one Details page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetailWikidataEntityView {
+    /// Exact Wikidata Q-ID represented by this spoiler.
+    pub item_id: String,
+    /// Preformatted, scrollable property/value text.
+    pub text: String,
+    /// Item-valued statement spans that open canonical Wikidata pages.
+    pub value_links: Vec<DetailWikidataValueLinkView>,
+}
+
+/// One clickable item-valued statement inside expanded Wikidata properties.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetailWikidataValueLinkView {
+    /// Inclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
+    pub start_byte: usize,
+    /// Exclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
+    pub end_byte: usize,
+    /// Validated Wikidata Q-ID used to construct the canonical target.
+    pub item_id: String,
 }
 
 /// One terminal-cell position inside the visible, selectable Details text.
@@ -823,6 +868,10 @@ pub enum UiAction {
     SelectDetailLink(usize),
     /// Ask the controller to open an exact external link.
     ActivateDetailLink(usize),
+    /// Expand or collapse lazy Wikidata properties for an external-link row.
+    ToggleWikidataStatements(usize),
+    /// Open one item-valued Wikidata statement through its validated Q-ID.
+    OpenWikidataItem(String),
     /// Give or remove explicit keyboard focus from the Details panel.
     SetDetailsFocus(bool),
     /// Scroll the focused or pointer-targeted Details panel.
@@ -934,6 +983,8 @@ pub enum UiAction {
     SetSubscriptionsLayout(SubscriptionsLayout),
     /// Toggle hiding and skipping exact `Реклама` chapters in the draft.
     ToggleSkipAdvertisementChapters,
+    /// Toggle selected-video YouTube prewarming in the draft.
+    ToggleYouTubePrewarm,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
     ToggleLocalFolderSizes,
     /// Persist the draft preference and close the editor.
@@ -944,7 +995,9 @@ pub enum UiAction {
     BeginLocalRename,
     /// Add one printable character to the local rename basename.
     AppendLocalRenameCharacter(char),
-    /// Remove the final character from the local rename basename.
+    /// Move the local rename cursor by one signed grapheme.
+    MoveLocalRenameCursor(i8),
+    /// Remove the grapheme immediately before the local rename cursor.
     DeleteLocalRenameCharacter,
     /// Validate and execute the local rename.
     SubmitLocalRename,
@@ -960,6 +1013,8 @@ pub enum UiAction {
     SelectSubscriptionItem(usize),
     /// Toggle the selected subscription item's expanded description.
     ToggleSubscriptionDescription,
+    /// Refresh page one for the active subscribed channel.
+    RefreshSubscriptionVideos,
 }
 
 /// Controller used by the generic terminal event loop.
@@ -2374,12 +2429,16 @@ fn render_subscriptions_body(
                 })
                 .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
                 .split(area);
+            let list_sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(panes[0]);
             (
                 hit_map.subscription_item_rows,
                 hit_map.subscription_item_first_index,
             ) = render_row_list(
                 frame,
-                panes[0],
+                list_sections[0],
                 &subscription_videos_heading(subscriptions),
                 &subscriptions.items,
                 false,
@@ -2387,6 +2446,15 @@ fn render_subscriptions_body(
                 view.playing_media_id.as_ref(),
                 theme.heading,
                 theme,
+            );
+            render_subscription_item_buttons(
+                frame,
+                list_sections[1],
+                !subscriptions.items.is_empty(),
+                false,
+                show_hotkeys,
+                theme,
+                hit_map,
             );
             render_details(
                 frame,
@@ -2474,11 +2542,17 @@ fn render_subscriptions_body(
                     hit_map,
                     thumbnail_renderer,
                 );
-                add_subscription_description_button(
+                let footer = Rect::new(
+                    panes[1].x,
+                    panes[1].bottom().saturating_sub(1),
+                    panes[1].width,
+                    if panes[1].height > 0 { 1 } else { 0 },
+                );
+                render_subscription_item_buttons(
                     frame,
-                    panes[1],
-                    "i/Esc",
-                    "Back to videos",
+                    footer,
+                    true,
+                    true,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -2513,24 +2587,21 @@ fn render_subscriptions_body(
                     item_heading,
                     theme,
                 );
-                let label = button("i", "Description", show_hotkeys);
-                frame.render_widget(
-                    Paragraph::new(label.clone()).style(theme.accent),
+                render_subscription_item_buttons(
+                    frame,
                     sections[1],
+                    !subscriptions.items.is_empty(),
+                    false,
+                    show_hotkeys,
+                    theme,
+                    hit_map,
                 );
-                let width = terminal_text_width(&label).min(sections[1].width);
-                if width > 0 && !subscriptions.items.is_empty() {
-                    hit_map.detail_buttons.push((
-                        UiAction::ToggleSubscriptionDescription,
-                        Rect::new(sections[1].x, sections[1].y, width, 1),
-                    ));
-                }
             }
         }
     }
 }
 
-/// Builds the shared YouTube source heading for both subscription layouts.
+/// Builds the shared `YouTube` source heading for both subscription layouts.
 fn subscription_videos_heading(subscriptions: &SubscriptionsView) -> String {
     let mut heading = if subscriptions.source_title.is_empty() {
         "YouTube".to_owned()
@@ -2549,25 +2620,56 @@ fn subscription_videos_heading(subscriptions: &SubscriptionsView) -> String {
     heading
 }
 
-fn add_subscription_description_button(
+fn render_subscription_item_buttons(
     frame: &mut Frame<'_>,
     area: Rect,
-    key: &str,
-    label: &str,
+    description_available: bool,
+    description_expanded: bool,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let label = button(key, label, show_hotkeys);
-    let width = terminal_text_width(&label).min(area.width);
-    if width == 0 || area.height == 0 {
+    if area.is_empty() {
         return;
     }
-    let target = Rect::new(area.x, area.bottom().saturating_sub(1), width, 1);
-    frame.render_widget(Paragraph::new(label).style(theme.accent), target);
-    hit_map
-        .detail_buttons
-        .push((UiAction::ToggleSubscriptionDescription, target));
+    let refresh = (
+        button("R", "Refresh videos", show_hotkeys),
+        UiAction::RefreshSubscriptionVideos,
+    );
+    let description = description_available.then(|| {
+        (
+            button(
+                if description_expanded { "i/Esc" } else { "i" },
+                if description_expanded {
+                    "Back to videos"
+                } else {
+                    "Description"
+                },
+                show_hotkeys,
+            ),
+            UiAction::ToggleSubscriptionDescription,
+        )
+    });
+    let mut buttons = Vec::with_capacity(2);
+    if description_expanded && let Some(description) = description.clone() {
+        buttons.push(description);
+    }
+    buttons.push(refresh);
+    if !description_expanded && let Some(description) = description {
+        buttons.push(description);
+    }
+    let mut x = area.x;
+    for (label, action) in buttons {
+        let available = area.right().saturating_sub(x);
+        let width = terminal_text_width(&label).min(available);
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.detail_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
+    }
 }
 
 fn render_details(
@@ -2701,22 +2803,16 @@ fn render_information_panel(
         (line_index, label, UiAction::ToggleSubscription)
     });
     let open_button = (show_text_selection && kind == InformationPanelKind::Video).then(|| {
-        let label = button("o", "Open video", show_hotkeys);
+        let label = button("o", "xdg-open video", show_hotkeys);
         let line_index = lines.len();
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenInBrowser)
     });
-    let open_channel_button = details.channel_webpage_url.is_some().then(|| {
-        let label = button("O", "xdg-open", show_hotkeys);
+    let open_channel_button = details.channel_webpage_url.as_ref().map(|url| {
+        let label = button("O", &format!("xdg-open channel · {url}"), show_hotkeys);
         let line_index = lines.len();
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenChannelInBrowser)
-    });
-    let load_channel_button = (kind == InformationPanelKind::Channel).then(|| {
-        let label = button("c", "Load channel info", show_hotkeys);
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::ShowChannel)
     });
     let rename_button =
         (kind == InformationPanelKind::Local && details.local_renamable).then(|| {
@@ -2752,6 +2848,36 @@ fn render_information_panel(
                     Span::raw(format_count(count)),
                 ]));
             }
+            if !details.channel_created.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Joined: ", theme.muted),
+                    Span::raw(&details.channel_created),
+                ]));
+            }
+            if let Some(count) = details.channel_video_count {
+                lines.push(Line::from(vec![
+                    Span::styled("Videos: ", theme.muted),
+                    Span::raw(format_count(count)),
+                ]));
+            }
+            if let Some(count) = details.channel_total_view_count {
+                lines.push(Line::from(vec![
+                    Span::styled("Total views: ", theme.muted),
+                    Span::raw(format_count(count)),
+                ]));
+            }
+            if !details.channel_country.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Country: ", theme.muted),
+                    Span::raw(&details.channel_country),
+                ]));
+            }
+            if details.channel_links_truncated {
+                lines.push(Line::styled(
+                    "Some channel links were omitted by safety limits.",
+                    theme.muted,
+                ));
+            }
         }
         InformationPanelKind::Local => {
             if !details.length.is_empty() && details.length != "unknown" {
@@ -2767,12 +2893,6 @@ fn render_information_panel(
         lines.push(Line::from(vec![
             Span::styled("License: ", theme.muted),
             Span::styled(display_license_label(&details.license), theme.accent),
-        ]));
-    }
-    if should_render_wikidata(&details.wikidata) {
-        lines.push(Line::from(vec![
-            Span::styled("Wikidata: ", theme.muted),
-            Span::raw(&details.wikidata),
         ]));
     }
     let metadata_height = u16::try_from(lines.len())
@@ -2824,16 +2944,13 @@ fn render_information_panel(
         .chain(subscription_button)
         .chain(open_button)
         .chain(open_channel_button)
-        .chain(load_channel_button)
         .chain(rename_button)
         .chain(trash_button)
     {
         if line_index >= usize::from(metadata_height) {
             continue;
         }
-        let width = u16::try_from(label.chars().count())
-            .unwrap_or(u16::MAX)
-            .min(inner.width);
+        let width = terminal_text_width(&label).min(inner.width);
         if width > 0 {
             hit_map.detail_buttons.push((
                 action,
@@ -2915,16 +3032,46 @@ fn render_information_panel(
             {
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
                 let selected = view.selected_detail_link == Some(index);
-                let line = Line::from(vec![
-                    Span::raw(if selected { "▶ " } else { "  " }),
-                    Span::styled(&link.label, theme.accent),
+                let marker = if selected { "▶ " } else { "  " };
+                let mut spans = vec![Span::styled(
+                    marker,
+                    if selected { theme.accent } else { theme.base },
+                )];
+                if let Some(item_id) = link.wikidata_item_id.as_deref() {
+                    let expanded = details.expanded_wikidata_item.as_deref() == Some(item_id);
+                    let disclosure =
+                        button("W", if expanded { "🧾▾" } else { "🧾▸" }, show_hotkeys);
+                    let disclosure_width = terminal_text_width(&disclosure);
+                    spans.push(Span::styled(
+                        disclosure,
+                        theme.accent.add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::raw(" "));
+                    if disclosure_width > 0 {
+                        hit_map.detail_buttons.push((
+                            UiAction::ToggleWikidataStatements(index),
+                            Rect::new(
+                                link_area.x.saturating_add(terminal_text_width(marker)),
+                                link_area.y,
+                                disclosure_width.min(link_area.width),
+                                1,
+                            ),
+                        ));
+                    }
+                }
+                spans.extend([
+                    Span::styled(
+                        &link.label,
+                        if selected {
+                            theme.base.add_modifier(Modifier::BOLD)
+                        } else {
+                            theme.base
+                        },
+                    ),
                     Span::styled(" — ", theme.muted),
-                    Span::raw(&link.url),
+                    Span::styled(&link.url, theme.muted),
                 ]);
-                frame.render_widget(
-                    Paragraph::new(line).style(if selected { theme.selected } else { theme.base }),
-                    link_area,
-                );
+                frame.render_widget(Paragraph::new(Line::from(spans)), link_area);
                 if show_text_selection {
                     capture_selectable_details_row(frame, hit_map, link_area);
                 }
@@ -2935,7 +3082,33 @@ fn render_information_panel(
         }
     }
 
-    if remaining_height > 0 && !details.description.is_empty() {
+    let expanded_wikidata_entity = details
+        .expanded_wikidata_item
+        .as_deref()
+        .and_then(|item_id| {
+            details
+                .wikidata_entities
+                .iter()
+                .find(|entity| entity.item_id == item_id)
+        });
+    let expanded_wikidata_text = details.expanded_wikidata_item.as_deref().map(|item_id| {
+        expanded_wikidata_entity.map_or_else(
+            || {
+                if details.loading_wikidata_item.as_deref() == Some(item_id) {
+                    "Loading Wikidata properties…"
+                } else {
+                    "Wikidata properties are unavailable."
+                }
+            },
+            |entity| entity.text.as_str(),
+        )
+    });
+    let body_is_wikidata = expanded_wikidata_text.is_some();
+    let body_source = expanded_wikidata_text.unwrap_or(&details.description);
+    let wikidata_value_links = expanded_wikidata_entity
+        .map(|entity| entity.value_links.as_slice())
+        .unwrap_or_default();
+    if remaining_height > 0 && !body_source.is_empty() {
         let description_area = Rect::new(inner.x, cursor_y, inner.width, remaining_height);
         let (description_text_area, scrollbar_area) = if description_area.width > 1 {
             let columns = Layout::default()
@@ -2947,9 +3120,13 @@ fn render_information_panel(
             (description_area, Rect::default())
         };
         let description_lines = wrap_description_source(
-            &details.description,
+            body_source,
             usize::from(description_text_area.width.max(1)),
-            &details.video_links,
+            if body_is_wikidata {
+                &[]
+            } else {
+                &details.video_links
+            },
         );
         let visible_lines = usize::from(description_text_area.height);
         let maximum_offset = description_lines.len().saturating_sub(visible_lines);
@@ -2961,7 +3138,9 @@ fn render_information_panel(
             .skip(offset)
             .take(visible_lines)
             .enumerate();
-        let active_chapter_line = active_description_chapter_line(view, details);
+        let active_chapter_line = (!body_is_wikidata)
+            .then(|| active_description_chapter_line(view, details))
+            .flatten();
         for (visible_index, source_line) in visible {
             let row = description_text_area.y.saturating_add(
                 u16::try_from(visible_index).unwrap_or(description_text_area.height),
@@ -2982,18 +3161,33 @@ fn render_information_panel(
                         start_byte,
                         end_byte,
                     } => {
-                        append_description_source_spans(
-                            details,
-                            start_byte,
-                            end_byte,
-                            active_line,
-                            description_text_area,
-                            row,
-                            theme,
-                            hit_map,
-                            &mut spans,
-                            &mut cell_cursor,
-                        );
+                        if body_is_wikidata {
+                            append_wikidata_source_spans(
+                                body_source,
+                                wikidata_value_links,
+                                start_byte,
+                                end_byte,
+                                description_text_area,
+                                row,
+                                theme,
+                                hit_map,
+                                &mut spans,
+                                &mut cell_cursor,
+                            );
+                        } else {
+                            append_description_source_spans(
+                                details,
+                                start_byte,
+                                end_byte,
+                                active_line,
+                                description_text_area,
+                                row,
+                                theme,
+                                hit_map,
+                                &mut spans,
+                                &mut cell_cursor,
+                            );
+                        }
                     }
                     WrappedDescriptionToken::VideoAction { link_index } => {
                         let Some(link) = details.video_links.get(link_index) else {
@@ -3055,6 +3249,67 @@ fn render_information_panel(
     }
     if show_text_selection {
         highlight_details_text_selection(frame, view, hit_map, theme);
+    }
+}
+
+/// Appends one expanded-Wikidata source token while preserving item links
+/// across terminal wrapping.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render geometry and mutable frame products belong to one row operation"
+)]
+fn append_wikidata_source_spans<'a>(
+    source: &'a str,
+    value_links: &[DetailWikidataValueLinkView],
+    start_byte: usize,
+    end_byte: usize,
+    description_area: Rect,
+    row: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    spans: &mut Vec<Span<'a>>,
+    cell_cursor: &mut u16,
+) {
+    let mut source_cursor = start_byte;
+    for link in value_links
+        .iter()
+        .filter(|link| link.start_byte < end_byte && link.end_byte > start_byte)
+    {
+        let start = link.start_byte.max(start_byte);
+        let end = link.end_byte.min(end_byte);
+        if source_cursor < start {
+            let plain = &source[source_cursor..start];
+            *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
+            spans.push(Span::raw(plain));
+        }
+        let linked = &source[start..end];
+        let linked_width = terminal_text_width(linked);
+        spans.push(Span::styled(
+            linked,
+            theme
+                .accent
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        let available = description_area.width.saturating_sub(*cell_cursor);
+        let target_width = linked_width.min(available);
+        if target_width > 0 {
+            hit_map.detail_buttons.push((
+                UiAction::OpenWikidataItem(link.item_id.clone()),
+                Rect::new(
+                    description_area.x.saturating_add(*cell_cursor),
+                    row,
+                    target_width,
+                    1,
+                ),
+            ));
+        }
+        *cell_cursor = cell_cursor.saturating_add(linked_width);
+        source_cursor = end;
+    }
+    if source_cursor < end_byte {
+        let plain = &source[source_cursor..end_byte];
+        *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
+        spans.push(Span::raw(plain));
     }
 }
 
@@ -3335,12 +3590,6 @@ fn display_license_label(label: &str) -> &str {
     } else {
         label
     }
-}
-
-fn should_render_wikidata(value: &str) -> bool {
-    value
-        .to_ascii_lowercase()
-        .contains("https://www.wikidata.org/wiki/q")
 }
 
 fn render_channel(
@@ -4214,6 +4463,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
         "  Local: Z size order     r rename     Delete move to Trash",
+        "  Subscriptions channel: R refresh videos     i description",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: GPM mouse input is detected automatically.",
         "",
@@ -4633,7 +4883,7 @@ fn render_preferences_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(76, 58, frame.area());
+    let area = centered_rect(76, 64, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -4648,6 +4898,7 @@ fn render_preferences_popup(
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Min(4),
@@ -4723,6 +4974,34 @@ fn render_preferences_popup(
         ),
     ));
 
+    let youtube_prewarm_label = format!(
+        "[y] Prepare selected YouTube audio: {}",
+        if preferences.youtube_prewarm {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    frame.render_widget(
+        Paragraph::new(youtube_prewarm_label.clone())
+            .style(if preferences.youtube_prewarm {
+                theme.selected
+            } else {
+                theme.base
+            })
+            .alignment(Alignment::Center),
+        sections[3],
+    );
+    hit_map.preferences_buttons.push((
+        UiAction::ToggleYouTubePrewarm,
+        Rect::new(
+            centered_line_x(sections[3], terminal_text_width(&youtube_prewarm_label)),
+            sections[3].y,
+            terminal_text_width(&youtube_prewarm_label).min(sections[3].width),
+            1,
+        ),
+    ));
+
     let folder_size_label = format!(
         "[f] Show Local folder sizes: {}",
         if preferences.show_local_folder_sizes {
@@ -4739,20 +5018,20 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[3],
+        sections[4],
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleLocalFolderSizes,
         Rect::new(
-            centered_line_x(sections[3], terminal_text_width(&folder_size_label)),
-            sections[3].y,
-            terminal_text_width(&folder_size_label).min(sections[3].width),
+            centered_line_x(sections[4], terminal_text_width(&folder_size_label)),
+            sections[4].y,
+            terminal_text_width(&folder_size_label).min(sections[4].width),
             1,
         ),
     ));
 
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nFolder sizes are measured lazily with strict limits.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nWill save UI and playback preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -4775,7 +5054,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[4],
+        sections[5],
     );
 
     let buttons = [
@@ -4791,15 +5070,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[5],
+        sections[6],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[5], total_width);
+    let mut x = centered_line_x(sections[6], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[5].y, width, 1)));
+            .push((action, Rect::new(x, sections[6].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -4811,12 +5090,20 @@ fn render_local_file_popup(
     hit_map: &mut HitMap,
 ) {
     let (message, error, confirm_label, confirm_action) = match popup {
-        LocalFilePopupView::Rename { value, error } => (
-            format!("New basename:\n{value}▏"),
-            error.as_deref(),
-            "[Enter] Rename",
-            UiAction::SubmitLocalRename,
-        ),
+        LocalFilePopupView::Rename {
+            value,
+            cursor_byte,
+            error,
+        } => {
+            let cursor_byte = rename_cursor_boundary(value, *cursor_byte);
+            let (before, after) = value.split_at(cursor_byte);
+            (
+                format!("New basename:\n{before}▏{after}"),
+                error.as_deref(),
+                "[Enter] Rename",
+                UiAction::SubmitLocalRename,
+            )
+        }
         LocalFilePopupView::Trash { name, path, error } => (
             format!("Move “{name}” to recoverable system Trash?\nFrom: {path}"),
             error.as_deref(),
@@ -4897,6 +5184,21 @@ fn render_local_file_popup(
             1,
         ),
     ));
+}
+
+/// Clamps a possibly stale rename cursor to the nearest preceding grapheme
+/// boundary so rendering never splits UTF-8 or a visible character cluster.
+fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
+    let requested = requested.min(value.len());
+    if requested == value.len() {
+        return requested;
+    }
+    value
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= requested)
+        .last()
+        .unwrap_or_default()
 }
 
 fn masked_setup_value(value: &str, width: usize) -> String {
@@ -5148,6 +5450,12 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             (LocalFilePopupView::Rename { .. }, KeyCode::Backspace) => {
                 Some(UiAction::DeleteLocalRenameCharacter)
             }
+            (LocalFilePopupView::Rename { .. }, KeyCode::Left) => {
+                Some(UiAction::MoveLocalRenameCursor(-1))
+            }
+            (LocalFilePopupView::Rename { .. }, KeyCode::Right) => {
+                Some(UiAction::MoveLocalRenameCursor(1))
+            }
             (LocalFilePopupView::Rename { .. }, KeyCode::Char(character))
                 if !character.is_control()
                     && !key
@@ -5166,6 +5474,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             KeyCode::Esc | KeyCode::Char('p') => Some(UiAction::DismissPreferences),
             KeyCode::Enter => Some(UiAction::SubmitPreferences),
             KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
+            KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
             KeyCode::Char('d') => Some(UiAction::SetSubscriptionsLayout(
                 SubscriptionsLayout::DrillDown,
@@ -5280,6 +5589,28 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             if view.screen == Screen::Subscriptions && !view.subscriptions.items.is_empty() =>
         {
             Some(UiAction::ToggleSubscriptionDescription)
+        }
+        KeyCode::Char('W')
+            if view
+                .selected_detail_link
+                .and_then(|index| {
+                    view.details
+                        .as_ref()
+                        .and_then(|details| details.links.get(index))
+                })
+                .is_some_and(|link| link.wikidata_item_id.is_some()) =>
+        {
+            Some(UiAction::ToggleWikidataStatements(
+                view.selected_detail_link.unwrap_or_default(),
+            ))
+        }
+        KeyCode::Char('R')
+            if view.screen == Screen::Subscriptions
+                && (view.subscriptions.route == SubscriptionRoute::Items
+                    || (view.subscriptions.layout == SubscriptionsLayout::Split
+                        && view.subscriptions.focus == SubscriptionPane::Items)) =>
+        {
+            Some(UiAction::RefreshSubscriptionVideos)
         }
         KeyCode::Char('t')
             if view.details.is_some() && view.right_panel_mode == RightPanelMode::Details =>
@@ -6386,7 +6717,7 @@ mod tests {
                     media_id: Some(MediaId::new(SourceKind::YouTube, "partial")),
                     title: "Unsubscribed partial row".to_owned(),
                     source: "YouTube".to_owned(),
-                    watched_percent: 64,
+                    watched_percent: 90,
                     subscribed: false,
                     ..RowView::default()
                 },
@@ -6465,8 +6796,8 @@ mod tests {
             "a non-playable channel source has no watched-state marker"
         );
         assert!(
-            rendered.contains(" 64%"),
-            "watched progress remains an independent row field"
+            rendered.contains(" 90%"),
+            "exactly 90 percent remains partial and visible"
         );
         assert!(
             rendered.contains(" 91%"),
@@ -6806,6 +7137,48 @@ mod tests {
     }
 
     #[test]
+    fn rename_popup_maps_arrows_to_cursor_movement_without_seeking() {
+        let view = ViewModel {
+            local_file_popup: Some(LocalFilePopupView::Rename {
+                value: "трек.flac".to_owned(),
+                cursor_byte: "трек".len(),
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveLocalRenameCursor(-1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveLocalRenameCursor(1))
+        );
+    }
+
+    #[test]
+    fn rename_popup_renders_the_caret_at_its_utf8_cursor() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            local_file_popup: Some(LocalFilePopupView::Rename {
+                value: "трек.flac".to_owned(),
+                cursor_byte: "трек".len(),
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw rename popup");
+
+        assert!(rendered_text(&terminal).contains("трек▏.flac"));
+    }
+
+    #[test]
     fn youtube_setup_popup_captures_keyboard_and_edits_only_through_setup_actions() {
         let mut view = ViewModel {
             search_editing: true,
@@ -6878,10 +7251,12 @@ mod tests {
                     DetailLinkView {
                         label: "First".to_owned(),
                         url: "https://example.com/first".to_owned(),
+                        ..DetailLinkView::default()
                     },
                     DetailLinkView {
                         label: "Second".to_owned(),
                         url: "https://example.com/second".to_owned(),
+                        wikidata_item_id: Some("Q42".to_owned()),
                     },
                 ],
                 ..DetailView::default()
@@ -6907,6 +7282,13 @@ mod tests {
             Some(UiAction::SelectDetailLink(1))
         );
         assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::ToggleWikidataStatements(1))
+        );
+        assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &view),
             Some(UiAction::ActivateDetailLink(1))
         );
@@ -6922,6 +7304,10 @@ mod tests {
 
     #[test]
     fn tab_shortcuts_cycle_every_enabled_screen_and_wrap() {
+        assert_eq!(Screen::TrackerMusic.next(), Screen::Subscriptions);
+        assert_eq!(Screen::Subscriptions.next(), Screen::Local);
+        assert_eq!(Screen::Local.previous(), Screen::Subscriptions);
+
         for (index, screen) in Screen::ALL.into_iter().enumerate() {
             let next = Screen::ALL[(index + 1) % Screen::ALL.len()];
             let previous = Screen::ALL[(index + Screen::ALL.len() - 1) % Screen::ALL.len()];
@@ -7235,6 +7621,7 @@ mod tests {
             "the channel title already visible in the source row must not repeat"
         );
         assert!(rendered.contains("[O] xdg-open"));
+        assert!(!rendered.contains("Refresh videos"));
         assert!(hit_map.subscription_source_rows.width > 0);
         assert_eq!(hit_map.subscription_item_rows, Rect::default());
 
@@ -7260,6 +7647,7 @@ mod tests {
             "playing subscription videos keep one compact separator before the watched marker"
         );
         assert!(rendered.contains("Expanded fixture description"));
+        assert!(rendered.contains("[R] Refresh videos"));
         assert!(hit_map.subscription_item_rows.width > 0);
 
         view.subscriptions.layout = SubscriptionsLayout::Split;
@@ -7280,6 +7668,7 @@ mod tests {
             rendered.contains("▶ ● Fixture video"),
             "split subscription rows keep the same compact marker spacing"
         );
+        assert!(rendered.contains("[R] Refresh videos"));
         assert!(rendered.contains("[i] Description"));
         assert!(hit_map.subscription_source_rows.width > 0);
         assert!(hit_map.subscription_item_rows.width > 0);
@@ -7301,6 +7690,28 @@ mod tests {
             ),
             Some(UiAction::ToggleSubscriptionDescription)
         );
+        let (_, refresh_target) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::RefreshSubscriptionVideos)
+            .expect("subscription refresh button target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: refresh_target.x,
+                    row: refresh_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::RefreshSubscriptionVideos)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE), &view),
+            Some(UiAction::RefreshSubscriptionVideos)
+        );
 
         view.subscriptions.description_expanded = true;
         terminal
@@ -7308,6 +7719,7 @@ mod tests {
             .expect("draw split description");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Expanded fixture description"));
+        assert!(rendered.contains("[R] Refresh videos"));
 
         view.subscriptions.description_expanded = false;
         view.subscriptions.source_subscriber_count = None;
@@ -7351,6 +7763,63 @@ mod tests {
         assert_eq!(
             mouse_action(click(30), &hit_map, &view),
             Some(UiAction::SelectSubscriptionItem(0))
+        );
+    }
+
+    #[test]
+    fn narrow_expanded_subscription_buttons_never_overlap_mouse_targets() {
+        let backend = TestBackend::new(38, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            details: Some(DetailView {
+                description: "Expanded fixture description".to_owned(),
+                ..DetailView::default()
+            }),
+            subscriptions: SubscriptionsView {
+                layout: SubscriptionsLayout::Split,
+                focus: SubscriptionPane::Items,
+                description_expanded: true,
+                sources: vec![subscription_row("Source", false)],
+                items: vec![subscription_row("Video", true)],
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw narrow expanded subscription");
+
+        let back = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleSubscriptionDescription)
+            .map(|(_, target)| *target)
+            .expect("back target");
+        let refresh = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::RefreshSubscriptionVideos)
+            .map(|(_, target)| *target)
+            .expect("refresh target");
+        assert!(
+            back.right() <= refresh.x || refresh.right() <= back.x,
+            "visible buttons must own disjoint mouse regions"
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: refresh.x,
+                    row: refresh.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::RefreshSubscriptionVideos)
         );
     }
 
@@ -7400,6 +7869,7 @@ mod tests {
             preferences_popup: Some(PreferencesPopupView {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
+                youtube_prewarm: true,
                 show_local_folder_sizes: true,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
@@ -7415,6 +7885,7 @@ mod tests {
         assert!(rendered.contains("Youta preferences"));
         assert!(rendered.contains("[d] Drill-down"));
         assert!(rendered.contains("[s] Split"));
+        assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[f] Show Local folder sizes: on"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
         assert_eq!(
@@ -7424,6 +7895,10 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
             Some(UiAction::SubmitPreferences)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleYouTubePrewarm)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
@@ -7454,6 +7929,24 @@ mod tests {
             ),
             Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
         );
+        let (_, youtube_prewarm_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleYouTubePrewarm)
+            .expect("YouTube-prewarm target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: youtube_prewarm_target.x,
+                    row: youtube_prewarm_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleYouTubePrewarm)
+        );
         let (_, folder_size_target) = hit_map
             .preferences_buttons
             .iter()
@@ -7481,6 +7974,7 @@ mod tests {
             preferences_popup: Some(PreferencesPopupView {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
+                youtube_prewarm: true,
                 show_local_folder_sizes: true,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
@@ -8140,8 +8634,8 @@ mod tests {
             "the selected source is already visible in the left panel"
         );
         assert!(rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains("[o] Open video"));
-        assert!(rendered.contains("[O] xdg-open"));
+        assert!(rendered.contains("[o] xdg-open video"));
+        assert!(rendered.contains("[O] xdg-open channel · https://www.youtube.com/@fixture"));
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -8256,7 +8750,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("stopped at 0:42"));
-        assert!(!rendered.contains("Open video"));
+        assert!(!rendered.contains("xdg-open video"));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
@@ -8414,8 +8908,8 @@ mod tests {
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(rendered.contains("Select Details text"));
         assert!(!rendered.contains("[t] Select Details text"));
-        assert!(rendered.contains("Open video"));
-        assert!(!rendered.contains("[o] Open video"));
+        assert!(rendered.contains("xdg-open video"));
+        assert!(!rendered.contains("[o] xdg-open video"));
         assert!(!rendered.contains("[O] xdg-open"));
         assert_eq!(hit_map.detail_buttons.len(), 3);
         assert!(
@@ -8519,23 +9013,7 @@ mod tests {
     }
 
     #[test]
-    fn details_render_wikidata_only_after_a_link_is_found() {
-        for completed_empty in [
-            "",
-            "no linked Wikidata item found",
-            "No linked Wikidata items found.",
-            "no Wikidata item found",
-        ] {
-            assert!(!should_render_wikidata(completed_empty));
-        }
-        assert!(!should_render_wikidata("loading P1651 lazily…"));
-        assert!(!should_render_wikidata(
-            "lookup failed: network unavailable"
-        ));
-        assert!(should_render_wikidata(
-            "Douglas Adams (Q42): https://www.wikidata.org/wiki/Q42"
-        ));
-
+    fn details_render_wikidata_only_once_as_an_external_link() {
         let backend = TestBackend::new(120, 28);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
@@ -8562,8 +9040,13 @@ mod tests {
         assert!(!rendered.contains("Wikidata:"));
         assert!(!rendered.contains("no linked Wikidata item found"));
 
-        view.details.as_mut().expect("details").wikidata =
-            "Douglas Adams (Q42): https://www.wikidata.org/wiki/Q42".to_owned();
+        let details = view.details.as_mut().expect("details");
+        details.wikidata = "Douglas Adams (Q42): https://www.wikidata.org/wiki/Q42".to_owned();
+        details.links.push(DetailLinkView {
+            label: "Douglas Adams (Q42)".to_owned(),
+            url: "https://www.wikidata.org/wiki/Q42".to_owned(),
+            wikidata_item_id: Some("Q42".to_owned()),
+        });
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw linked result");
@@ -8574,8 +9057,9 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("Wikidata:"));
+        assert!(!rendered.contains("Wikidata:"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
+        assert_eq!(rendered.matches("Douglas Adams (Q42)").count(), 1);
     }
 
     #[test]
@@ -10577,7 +11061,7 @@ prose 07:25 remains clickable but is not a chapter";
     fn render_shows_selectable_external_links_and_records_hit_areas() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let view = ViewModel {
+        let mut view = ViewModel {
             details: Some(DetailView {
                 title: "Mock video".to_owned(),
                 description: "Mock description".to_owned(),
@@ -10585,6 +11069,7 @@ prose 07:25 remains clickable but is not a chapter";
                 links: vec![DetailLinkView {
                     label: "Douglas Adams (Q42)".to_owned(),
                     url: "https://www.wikidata.org/wiki/Q42".to_owned(),
+                    wikidata_item_id: Some("Q42".to_owned()),
                 }],
                 ..DetailView::default()
             }),
@@ -10608,9 +11093,131 @@ prose 07:25 remains clickable but is not a chapter";
 
         assert!(rendered.contains("External links"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
-        assert!(rendered.contains("▶ Douglas Adams (Q42)"));
+        assert!(rendered.contains("[W]"));
+        assert!(!rendered.contains("instance of (P31)"));
         assert_eq!(hit_map.detail_links.len(), 1);
         assert_eq!(hit_map.detail_links[0].0, 0);
+        let (_, disclosure_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleWikidataStatements(0))
+            .expect("Wikidata disclosure hit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: disclosure_area.x,
+                    row: disclosure_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleWikidataStatements(0))
+        );
+
+        let details = view.details.as_mut().expect("fixture details");
+        details.expanded_wikidata_item = Some("Q42".to_owned());
+        let text = "Wikidata properties for Q42\ninstance of (P31): human (Q5)".to_owned();
+        let start_byte = text.find("human (Q5)").expect("linked value");
+        details.wikidata_entities.push(DetailWikidataEntityView {
+            item_id: "Q42".to_owned(),
+            text,
+            value_links: vec![DetailWikidataValueLinkView {
+                start_byte,
+                end_byte: start_byte + "human (Q5)".len(),
+                item_id: "Q5".to_owned(),
+            }],
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw expanded Wikidata properties");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("instance of (P31): human (Q5)"));
+        let (_, value_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::OpenWikidataItem("Q5".to_owned()))
+            .expect("Wikidata value hit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: value_area.x,
+                    row: value_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenWikidataItem("Q5".to_owned()))
+        );
+    }
+
+    #[test]
+    fn wrapped_unicode_wikidata_value_keeps_every_fragment_clickable() {
+        let backend = TestBackend::new(56, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let value = "Україна з довгою тестовою назвою (Q212)";
+        let text = format!("Wikidata properties for Q61113\ncountry of citizenship (P27): {value}");
+        let start_byte = text.find(value).expect("linked Unicode value");
+        let view = ViewModel {
+            details: Some(DetailView {
+                links: vec![DetailLinkView {
+                    label: "Fixture creator (Q61113)".to_owned(),
+                    url: "https://www.wikidata.org/wiki/Q61113".to_owned(),
+                    wikidata_item_id: Some("Q61113".to_owned()),
+                }],
+                expanded_wikidata_item: Some("Q61113".to_owned()),
+                wikidata_entities: vec![DetailWikidataEntityView {
+                    item_id: "Q61113".to_owned(),
+                    text,
+                    value_links: vec![DetailWikidataValueLinkView {
+                        start_byte,
+                        end_byte: start_byte + value.len(),
+                        item_id: "Q212".to_owned(),
+                    }],
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw wrapped Wikidata value");
+
+        let value_areas = hit_map
+            .detail_buttons
+            .iter()
+            .filter_map(|(action, area)| {
+                (action == &UiAction::OpenWikidataItem("Q212".to_owned())).then_some(*area)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            value_areas.len() >= 2,
+            "the fixture must wrap one Unicode value across clickable rows"
+        );
+        assert!(
+            value_areas.windows(2).any(|areas| areas[0].y != areas[1].y),
+            "wrapped fragments must occupy distinct terminal rows"
+        );
+        for area in value_areas {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::OpenWikidataItem("Q212".to_owned()))
+            );
+        }
     }
 
     #[test]
@@ -10692,6 +11299,10 @@ prose 07:25 remains clickable but is not a chapter";
                 title: "Mock channel".to_owned(),
                 source: "Bilibili channel".to_owned(),
                 channel_subscriber_count: Some(13_045),
+                channel_video_count: Some(412),
+                channel_total_view_count: Some(987_654_321),
+                channel_created: "2018 May 4".to_owned(),
+                channel_country: "Georgia".to_owned(),
                 channel_webpage_url: Some(
                     url::Url::parse("https://www.youtube.com/channel/UCfixture")
                         .expect("fixture channel URL"),
@@ -10701,10 +11312,18 @@ prose 07:25 remains clickable but is not a chapter";
                 views: "must not render".to_owned(),
                 description: "Full channel description".to_owned(),
                 wikidata: "Douglas Adams (Q42): https://www.wikidata.org/wiki/Q42".to_owned(),
-                links: vec![DetailLinkView {
-                    label: "Wikidata Q42".to_owned(),
-                    url: "https://www.wikidata.org/wiki/Q42".to_owned(),
-                }],
+                links: vec![
+                    DetailLinkView {
+                        label: "Telegram: Fixture".to_owned(),
+                        url: "https://t.me/fixture".to_owned(),
+                        wikidata_item_id: None,
+                    },
+                    DetailLinkView {
+                        label: "Douglas Adams (Q42)".to_owned(),
+                        url: "https://www.wikidata.org/wiki/Q42".to_owned(),
+                        wikidata_item_id: Some("Q42".to_owned()),
+                    },
+                ],
                 ..DetailView::default()
             }),
             ..ViewModel::default()
@@ -10726,32 +11345,28 @@ prose 07:25 remains clickable but is not a chapter";
 
         assert!(rendered.contains("Mock channel"));
         assert!(rendered.contains("Subscribers: 13,045"));
+        assert!(rendered.contains("Joined: 2018 May 4"));
+        assert!(rendered.contains("Videos: 412"));
+        assert!(rendered.contains("Total views: 987,654,321"));
+        assert!(rendered.contains("Country: Georgia"));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
-        assert!(rendered.contains("[O] xdg-open"));
-        assert!(rendered.contains("[c] Load channel info"));
+        assert!(
+            rendered.contains("[O] xdg-open channel · https://www.youtube.com/channel/UCfixture")
+        );
+        assert!(!rendered.contains("Load channel info"));
         assert!(rendered.contains("Full channel description"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
-        assert!(rendered.contains("Wikidata Q42"));
-        assert_eq!(hit_map.detail_links.len(), 1);
-        let (_, load_area) = hit_map
-            .detail_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ShowChannel)
-            .expect("load-channel-info hit target");
-        assert_eq!(
-            mouse_action(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: load_area.x,
-                    row: load_area.y,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &hit_map,
-                &view,
-            ),
-            Some(UiAction::ShowChannel)
+        assert_eq!(rendered.matches("Douglas Adams (Q42)").count(), 1);
+        assert!(!rendered.contains("Wikidata:"));
+        assert!(rendered.contains("Telegram: Fixture"));
+        assert_eq!(hit_map.detail_links.len(), 2);
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ShowChannel)
         );
     }
 
@@ -10887,9 +11502,8 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
-    #[cfg(feature = "youtube-music")]
     #[test]
-    fn top_tabs_place_youtube_music_after_youtube_with_exact_click_targets() {
+    fn top_tabs_follow_expected_order_with_exact_click_targets() {
         let backend = TestBackend::new(180, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel::default();
@@ -10905,9 +11519,21 @@ prose 07:25 remains clickable but is not a chapter";
             .iter()
             .map(|(screen, _)| *screen)
             .collect::<Vec<_>>();
-        assert_eq!(screens[0], Screen::Search);
-        assert_eq!(screens[1], Screen::YouTubeMusic);
-        assert_eq!(screens[2], Screen::TrackerMusic);
+        assert_eq!(
+            screens,
+            vec![
+                Screen::Search,
+                #[cfg(feature = "youtube-music")]
+                Screen::YouTubeMusic,
+                Screen::TrackerMusic,
+                Screen::Subscriptions,
+                Screen::Local,
+                Screen::Playlists,
+                Screen::Downloaded,
+                Screen::History,
+                Screen::Statistics,
+            ]
+        );
         for (screen, area) in &hit_map.tabs {
             for column in [area.x, area.right().saturating_sub(1)] {
                 let click = MouseEvent {
@@ -10952,6 +11578,7 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw compact tabs");
+        #[cfg(feature = "youtube-music")]
         assert!(rendered_text(&terminal).contains("YT Music"));
         assert_eq!(compact_hit_map.tabs.len(), Screen::ALL.len());
         for (screen, area) in &compact_hit_map.tabs {

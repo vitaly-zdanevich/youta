@@ -39,6 +39,8 @@ pub mod sponsorblock;
 pub mod tracker;
 #[cfg(feature = "wikidata")]
 pub mod wikidata;
+#[cfg(feature = "network")]
+pub mod youtube_channel_page;
 #[cfg(feature = "youtube-music")]
 pub mod youtube_music;
 #[cfg(feature = "youtube-official")]
@@ -445,6 +447,61 @@ pub struct ChannelSummary {
     pub webpage_url: Option<Url>,
 }
 
+/// Full public metadata loaded for one selected channel.
+///
+/// The compact [`ChannelSummary`] remains stable for search results and old
+/// on-disk cache rows. Fields that are either provider-specific or more
+/// expensive to obtain live here so callers can request them lazily.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChannelDetails {
+    /// Compact identity, description, counts, artwork, and canonical webpage.
+    pub summary: ChannelSummary,
+    /// Aggregate public view count, when exposed.
+    #[serde(default)]
+    pub total_view_count: Option<u64>,
+    /// Provider-supplied country code or human-readable country label.
+    #[serde(default)]
+    pub country: Option<String>,
+    /// Public websites and social profiles advertised by the channel.
+    #[serde(default)]
+    pub external_links: Vec<ChannelExternalLink>,
+    /// Whether additional external links were omitted by a safety bound.
+    #[serde(default)]
+    pub external_links_truncated: bool,
+}
+
+/// One public website or social profile advertised by a channel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChannelExternalLink {
+    /// Channel-supplied label, bounded and normalized for terminal display.
+    pub label: String,
+    /// Direct credential-free HTTP(S) target.
+    pub url: Url,
+    /// Recognized destination family used for stable icons and colors.
+    pub kind: ChannelExternalLinkKind,
+}
+
+/// Recognized family of a channel's public external link.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelExternalLinkKind {
+    /// A general website or an unrecognized HTTP(S) host.
+    #[default]
+    Website,
+    /// A Telegram channel, group, bot, or public profile.
+    Telegram,
+    /// A Facebook page or profile.
+    Facebook,
+    /// An X or legacy Twitter profile.
+    XTwitter,
+    /// A `TikTok` profile.
+    TikTok,
+    /// An Instagram profile.
+    Instagram,
+    /// Another `YouTube` channel or page.
+    YouTube,
+}
+
 /// One entry in a provider search page.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -645,6 +702,27 @@ pub trait Provider: Send + Sync {
     /// bounded data.
     fn channel_details(&self, _channel_id: &str) -> Result<ChannelSummary, ProviderError> {
         Err(ProviderError::Unsupported)
+    }
+
+    /// Loads full public metadata for one exact channel identifier.
+    ///
+    /// The default wraps [`Provider::channel_details`] and leaves optional
+    /// aggregate views, country, and external links empty. Adapters that expose
+    /// those fields should override this method without issuing a second
+    /// channel lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same provider errors as [`Provider::channel_details`].
+    fn full_channel_details(&self, channel_id: &str) -> Result<ChannelDetails, ProviderError> {
+        self.channel_details(channel_id)
+            .map(|summary| ChannelDetails {
+                summary,
+                total_view_count: None,
+                country: None,
+                external_links: Vec::new(),
+                external_links_truncated: false,
+            })
     }
 
     /// Performs one blocking video-details fetch.
@@ -1104,7 +1182,7 @@ mod tests {
     #[test]
     fn full_channel_details_are_unsupported_by_default() {
         assert!(matches!(
-            MinimalProvider.channel_details("channel"),
+            MinimalProvider.full_channel_details("channel"),
             Err(ProviderError::Unsupported)
         ));
     }

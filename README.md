@@ -60,6 +60,20 @@ chapters, or a future waveform sends IPC commands to the same player process.
 The backend requires `mpv` 0.38 or newer so resume positions and extractor
 options can be applied atomically through `loadfile` per-file options.
 
+Youta prepares the selected YouTube video's audio by default so `Enter` can
+start playback without first waiting for a complete foreground resolution.
+Selection must remain unchanged for 200 ms before one bounded worker invokes
+`yt-dlp`; moving through the result list therefore cancels stale work instead
+of resolving every row. Short-lived signed media URLs and their HTTP headers
+remain in RAM only, are never written to session state, history, or
+configuration, and are redacted from debug and diagnostic output. If the
+prepared URL is absent, expired, or fails before audible playback begins,
+Youta falls back to the video's canonical YouTube URL and the normal
+`yt-dlp`/`mpv` path.
+Disable this with
+`playback.youtube_prewarm = false`, `[y] Prepare selected YouTube audio` in
+Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
+
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
 YouTube Music, subscription-channel, Local, or MOD/tracker list. Items added
@@ -191,6 +205,12 @@ No Wikidata request is made at startup. The current mappings are:
 Each response is limited to 512 KiB and 20 matches. Successful lookups are
 cached in SQLite for seven days; successful empty lookups are cached for 24
 hours. Network and response errors are not negative-cache entries.
+
+Each matched entity appears once under External links as a collapsed
+`[W] 🧾▸` row. Activating that row lazily requests the entity's bounded,
+human-readable statements and expands them in the scrollable Details pane;
+activating `[W] 🧾▾` collapses the spoiler again. Property data is not fetched
+for entities the user never expands.
 
 This is exact-ID enrichment, not title, name, or arbitrary-URL matching.
 YouTube video IDs come from validated links, bare IDs, or search results;
@@ -480,9 +500,28 @@ not fit OPML reliably, so they remain in SQLite and can be exported separately.
 YouTube subscriptions are currently local-only channel subscriptions. Choosing
 `Subscribe (locally)` while a video is selected adds its channel to Youta's
 OPML-backed source list; it does not subscribe the signed-in YouTube account.
-OAuth-based synchronization remains roadmap work. In Details, `[O] xdg-open`
-opens the selected YouTube channel's webpage, while lowercase `[o] Open video`
-opens the selected video's webpage.
+OAuth-based synchronization remains roadmap work. In Details,
+`[O] xdg-open channel` opens the selected YouTube channel's webpage, while
+lowercase `[o] xdg-open video` opens the selected video's webpage. Youta waits
+for the system opener's exit status before reporting success; a missing browser
+association or headless-session failure is shown as a diagnostic instead.
+
+Selecting a YouTube channel lazily loads its description, subscriber count,
+joined date, public video count, aggregate public views, and country when those
+fields are available. The configured official API or Invidious adapter remains
+the primary metadata source. A separate best-effort request to the channel's
+public About page can fill missing fields and add the websites and social
+profiles advertised by the channel owner, including Telegram, Facebook,
+X/Twitter, TikTok, Instagram, YouTube, and other website links. This request
+uses no account, cookie, or API key; if YouTube omits a field, changes the page,
+or rejects the public request, Youta keeps the primary provider result and
+omits the unavailable field instead of showing an error placeholder.
+
+Full selected-channel profiles and their external links use a bounded
+process-local RAM cache, so revisiting a channel during the same run does not
+repeat the About-page request. The compact channel summary continues to use
+Youta's existing persistent metadata cache; the richer country, aggregate-view,
+and link data is fetched again after a restart.
 
 `Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
 cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
@@ -493,21 +532,30 @@ subscription-source root. Youta provides two layouts:
 - `drill-down` is the default for narrow terminals. Sources appear on the
   left with channel information on the right. Press `Enter` to load the
   selected YouTube channel's videos in the usual list-and-Details view;
-  `Backspace` or `Esc` returns to the source list.
+  `Backspace` or `Esc` returns to the source list. While inside the channel,
+  `[R] Refresh videos` requests its first page again.
 - `split` keeps sources on the left and the selected source's videos on the
   right. Moving across sources uses only cached rows; press `Enter` to load an
   uncached source and move into its videos. The
   `[i] Description` button expands the selected video's Details; `[i]` or
-  `Esc` returns to the video list.
+  `Esc` returns to the video list. `[R] Refresh videos` is available after the
+  source has been opened.
+
+Refresh deliberately bypasses the process-local channel-list cache so newly
+published videos can appear. The current rows remain visible while the request
+runs, and Youta restores the selected video by provider ID when it is still in
+the refreshed result; a refresh failure also leaves the existing rows intact.
 
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
-skipped, choose whether Local folder sizes are measured, and press `Enter` to
-save. These preferences can be configured directly:
+skipped, choose whether selected YouTube audio is prepared, choose whether
+Local folder sizes are measured, and press `Enter` to save. These preferences
+can be configured directly:
 
 ```toml
 [playback]
 autoplay = false
+youtube_prewarm = true
 skip_advertisement_chapters = true
 
 [ui]
@@ -517,6 +565,7 @@ show_local_folder_sizes = true
 
 `YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
 `YOUTA_PLAYBACK__AUTOPLAY=true` and
+`YOUTA_PLAYBACK__YOUTUBE_PREWARM=false` and
 `YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` override the corresponding
 TOML values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
@@ -689,6 +738,13 @@ exercises Youta's production mpv/yt-dlp integration and decodes a short segment
 through mpv's null audio output. This setup follows yt-dlp's [PO-token
 guidance](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), whose provider
 documentation notes that not every runner address can be accepted.
+
+The changing public channel About-page parser also has an account-free,
+opt-in live check:
+
+```sh
+YOUTA_RUN_LIVE_YOUTUBE_CHANNEL_TEST=1 cargo test --locked --test live_services --all-features -- --ignored --exact youtube_channel_about_profile_is_usable --nocapture
+```
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and
 consumes the release vendor archive. GitHub Actions use Node 24-based action

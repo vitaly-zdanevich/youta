@@ -1,8 +1,9 @@
 //! Required live checks for remote metadata services.
 //!
 //! Each test is ignored by an ordinary local `cargo test` invocation and is
-//! enabled explicitly by its CI job. This keeps accidental local runs offline
-//! while ensuring every pushed commit exercises the production network code.
+//! enabled explicitly by a CI job or an opt-in local command. This keeps
+//! accidental local runs offline while preserving checks against changing
+//! production services.
 
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
 use std::time::{Duration, Instant};
@@ -22,6 +23,13 @@ const APPLE_TEST_URL: &str = "YOUTA_LIVE_APPLE_PODCASTS_URL";
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
 const DEFAULT_APPLE_URL: &str =
     "https://podcasts.apple.com/us/podcast/global-news-podcast/id135067274";
+
+#[cfg(feature = "network")]
+const YOUTUBE_CHANNEL_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_YOUTUBE_CHANNEL_TEST";
+#[cfg(feature = "network")]
+const YOUTUBE_CHANNEL_TEST_ID: &str = "YOUTA_LIVE_YOUTUBE_CHANNEL_ID";
+#[cfg(feature = "network")]
+const DEFAULT_YOUTUBE_CHANNEL_ID: &str = "UC_x5XG1OV2P6uZZ5FSM9Ttw";
 
 /// Resolves a real Apple Podcasts show, parses its RSS feed, and decodes audio.
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
@@ -111,6 +119,66 @@ fn wikidata_finds_the_youtube_fixture_item() {
         lookup.items.iter().any(|item| item.item_id == "Q282456"),
         "Wikidata no longer links the fixture to Q282456: {:?}",
         lookup.items
+    );
+
+    let channel_lookup = WikidataProvider::new()
+        .lookup_external(
+            WikidataExternalKind::YouTubeChannel,
+            "UC6R1juCB5ArnJGMmUlEE_fg",
+        )
+        .expect("query Wikidata for the real YouTube channel fixture");
+    assert_eq!(channel_lookup.kind, WikidataExternalKind::YouTubeChannel);
+    assert_eq!(channel_lookup.external_id, "UC6R1juCB5ArnJGMmUlEE_fg");
+    assert!(
+        channel_lookup
+            .items
+            .iter()
+            .any(|item| item.item_id == "Q61113"),
+        "Wikidata no longer links the channel fixture to Q61113: {:?}",
+        channel_lookup.items
+    );
+}
+
+/// Parses current public About-page counts and profile links for one channel.
+#[cfg(feature = "network")]
+#[test]
+#[ignore = "requires a public YouTube channel About page"]
+fn youtube_channel_about_profile_is_usable() {
+    use youta::providers::youtube_channel_page::YouTubeChannelPageClient;
+
+    assert_eq!(
+        std::env::var(YOUTUBE_CHANNEL_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {YOUTUBE_CHANNEL_TEST_OPT_IN}=1 when invoking this live test"
+    );
+    let channel_id = std::env::var(YOUTUBE_CHANNEL_TEST_ID)
+        .unwrap_or_else(|_| DEFAULT_YOUTUBE_CHANNEL_ID.to_owned());
+    let profile = YouTubeChannelPageClient::new()
+        .channel_metadata(&channel_id)
+        .expect("load and parse the real public channel About page");
+
+    assert_eq!(profile.channel_id, channel_id);
+    assert!(profile.joined_at.is_some(), "joined date is missing");
+    assert!(
+        profile.video_count.is_some(),
+        "public video count is missing"
+    );
+    assert!(
+        profile.total_view_count.is_some(),
+        "aggregate public view count is missing"
+    );
+    assert!(
+        !profile.external_links.is_empty(),
+        "the live fixture no longer advertises public profile links"
+    );
+    assert!(
+        profile.external_links.iter().all(|link| {
+            matches!(link.url.scheme(), "http" | "https")
+                && link.url.host_str().is_some()
+                && link.url.username().is_empty()
+                && link.url.password().is_none()
+        }),
+        "all parsed profile links must remain credential-free HTTP(S) URLs"
     );
 }
 

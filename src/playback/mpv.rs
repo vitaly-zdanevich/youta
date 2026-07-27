@@ -421,6 +421,13 @@ mod unix {
                 Value::String(input.start_at.as_secs_f64().to_string()),
             );
         }
+        if let Some(title) = input.title.as_ref() {
+            // Direct CDN URLs have long, expiring query strings from which mpv
+            // otherwise derives an unreadable `media-title`. Keep the
+            // application-owned title authoritative for the OSD, MPRIS, and
+            // status polling surfaces.
+            options.insert("force-media-title".to_owned(), Value::String(title.clone()));
+        }
         if input.verify_remote_format {
             options.insert(
                 "ytdl-raw-options".to_owned(),
@@ -1024,7 +1031,10 @@ mod unix {
 
         #[test]
         fn resolved_loadfile_bypasses_ytdl_and_escapes_sensitive_headers() {
-            let mut input = PlaybackInput::new("https://cdn.example/audio");
+            let mut input = PlaybackInput::new(
+                "https://cdn.example/videoplayback?mime=audio%2Fwebm&rqh=1&gir=yes&clen=101236984",
+            );
+            input.title = Some("Human-readable video name".to_owned());
             input.bypass_ytdl = true;
             input.http_headers = PlaybackHttpHeaders::new(std::collections::BTreeMap::from([
                 ("Accept".to_owned(), "audio/webm,audio/ogg".to_owned()),
@@ -1035,10 +1045,13 @@ mod unix {
                 loadfile_command(&input).expect("resolved loadfile command"),
                 vec![
                     json!("loadfile"),
-                    json!("https://cdn.example/audio"),
+                    json!(
+                        "https://cdn.example/videoplayback?mime=audio%2Fwebm&rqh=1&gir=yes&clen=101236984"
+                    ),
                     json!("replace"),
                     json!(-1),
                     json!({
+                        "force-media-title": "Human-readable video name",
                         "http-header-fields": r"Accept: audio/webm\,audio/ogg,X-Path: one\\two",
                         "ytdl": "no",
                     }),

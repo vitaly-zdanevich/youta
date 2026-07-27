@@ -23,7 +23,8 @@ mouse events ───┼─> application reducer ─> immutable UI snapshot ─
 timers ─────────┤            │
 provider events ┤            ├─> command queue ─> provider workers
 player events ──┘            ├─> persistence worker ─> SQLite / OPML
-                             └─> playback worker ─> mpv JSON IPC
+                             ├─> playback worker ─> mpv JSON IPC
+                             └─> prewarm worker ─> yt-dlp selected-audio URL
 ```
 
 The reducer is the single owner of interactive state. Workers return typed
@@ -227,6 +228,14 @@ Wikidata matching is advisory. Exact external-ID claims rank above URL and
 normalized-title matches. Ambiguous title matches are displayed as suggestions,
 not asserted links.
 
+A matching entity is represented by one collapsed External links row rather
+than duplicated in the channel/video metadata body. Activating its `[W] 🧾`
+control starts a separate bounded EntityData and label request, then replaces
+the Details description body with a scrollable property spoiler. Only
+human-facing statements are formatted; closing the spoiler restores the
+ordinary Details body. Entity statements therefore remain lazy even after the
+lighter exact-ID match has completed.
+
 ### Subscription navigation and channel videos
 
 Subscriptions are local OPML entries. Selecting `Subscribe (locally)` for a
@@ -242,11 +251,39 @@ The TUI reducer owns two subscription layouts over the same state:
 Uppercase `S` resets either layout to the source root from any main screen;
 `Tab` and `Shift+Tab` cycle the enabled top-level screens. The
 Preferences popup changes `ui.subscriptions_layout` together with
-`playback.skip_advertisement_chapters`; their `YOUTA_` environment overrides
-have higher precedence and prevent a partial in-app save until removed. The
-targeted configuration writer updates both tables atomically and preserves
-unrelated TOML content instead of serializing secret-bearing configuration
-state again.
+`playback.skip_advertisement_chapters` and `playback.youtube_prewarm`; their
+`YOUTA_` environment overrides have higher precedence and prevent a partial
+in-app save until removed. The targeted configuration writer updates both
+tables atomically and preserves unrelated TOML content instead of serializing
+secret-bearing configuration state again.
+
+Selected-channel profile work is debounced and lazy. The configured official
+API or Invidious adapter first returns `ChannelDetails`, so its description,
+subscriber count, joined timestamp, public video count, aggregate public views,
+country, artwork, and canonical URL can be rendered without waiting for
+page enrichment. When the `network` feature is enabled and that primary request
+succeeds, the provider worker performs a second best-effort request for the
+exact public `/channel/{UC…}/about?hl=en` page. It reads the embedded
+`ytInitialData` only
+to fill missing joined/video/view/country fields and the channel owner's public
+website and social links. Recognized destinations include Telegram, Facebook,
+X/Twitter, TikTok, Instagram, and YouTube; other credential-free HTTP(S)
+website links retain their channel-supplied labels.
+
+The About-page supplement sends no account credential, cookie, or API key.
+Its HTML is capped at 8 MiB, JSON traversal at 100,000 values, external links
+at 32, and each link label at 128 characters. The exact channel ID is validated
+before the request and again against the parsed model. Oversized, malformed,
+consent-gated, or changed pages are ignored after the primary provider result;
+individual unavailable fields are omitted from the UI.
+
+Full `ChannelDetails`, including country, aggregate views, and external links,
+uses the existing 64-entry process-local channel-details LRU and is discarded
+at shutdown. Compact `ChannelSummary` fields such as description, subscriber
+count, joined timestamp, video count, artwork, and canonical URL continue
+through the seven-day SQLite summary cache. This separation avoids repeating
+About-page work while moving between channels without persisting the richer
+external-link profile.
 
 Channel-video work is selected-source lazy. For the official API, the worker
 uses `channels.list` to find the uploads playlist,
@@ -268,6 +305,12 @@ pages. Cache entries survive layout switches during the process but are not
 persisted across restarts. Every response carries a subscription generation;
 a response for an older selection is ignored and cannot replace the newly
 selected channel's rows.
+
+Inside an activated channel, uppercase `R` explicitly refreshes page one. This
+request bypasses the RAM list cache but does not clear the rendered rows while
+it is in flight. A successful response restores selection by stable provider
+video ID, with the previous index as a fallback; a failed response leaves the
+old rows and selection available.
 
 ## Playback
 
@@ -341,6 +384,29 @@ Arbitrary `yt-dlp` configuration files, plugins, `--exec`, `--netrc-cmd`,
 postprocessor commands, and user-supplied output templates are outside the safe
 default. The command is for media a user is allowed to access; it is not a
 rights or policy bypass.
+
+### Selected YouTube audio prewarm
+
+With `playback.youtube_prewarm = true`, the reducer waits for a YouTube video
+selection to remain stable for 200 ms, then submits only that row to a
+latest-only bounded resolver worker. Selection changes cancel stale work, so
+keyboard navigation does not create a request per result. The equivalent
+environment override is `YOUTA_PLAYBACK__YOUTUBE_PREWARM`; the Preferences
+popup exposes the setting as `[y] Prepare selected YouTube audio`.
+On Unix, each resolver runs in a dedicated process group so cancellation,
+timeout, and shutdown terminate extractor helper descendants as well as the
+top-level `yt-dlp` process.
+
+The resolver returns a short-lived direct audio URL, required HTTP headers,
+and expiry metadata. These values remain in process memory only; the queue,
+history, and persisted session retain the canonical video identity, while
+diagnostics redact URLs and headers. A prepared result is discarded when its
+selection or lifetime no longer matches. If no usable result exists, or direct
+loading fails before `mpv` reports audible playback, the controller retries
+the canonical YouTube URL. This includes a speculative payload that reaches
+`file-loaded` but then fails demuxing before `playback-restart`. The existing
+bounded checked-format retry remains the final response to a canonical
+pre-start HTTP 403; playback does not loop across fallback paths.
 
 ## Terminal rendering
 

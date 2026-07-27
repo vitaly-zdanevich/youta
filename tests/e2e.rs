@@ -161,7 +161,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
     let xdg_open = helpers.join("xdg-open");
     fs::write(
         &xdg_open,
-        "#!/bin/sh\n[ \"$1\" = '--' ] || exit 64\nprintf '%s\\n' \"$2\" >> \"$YOUTA_TEST_OPEN_LOG\"\n",
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] || exit 64\nprintf '%s\\n' \"$1\" >> \"$YOUTA_TEST_OPEN_LOG\"\n",
     )
     .expect("browser helper");
     fs::set_permissions(&xdg_open, fs::Permissions::from_mode(0o700))
@@ -284,7 +284,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
 
 #[cfg(all(target_os = "linux", feature = "tui"))]
 #[test]
-fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
+fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temporary = tempdir().expect("temporary directory");
@@ -314,7 +314,10 @@ fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
     let xdg_open = helpers.join("xdg-open");
     fs::write(
         &xdg_open,
-        "#!/bin/sh\n[ \"$1\" = '--' ] || exit 64\nprintf '%s\\n' \"$2\" >> \"$YOUTA_TEST_OPEN_LOG\"\n",
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] || exit 64\n\
+         printf 'start %s\\n' \"$1\" >> \"$YOUTA_TEST_OPEN_LOG\"\n\
+         /bin/sleep 1\n\
+         printf 'done %s\\n' \"$1\" >> \"$YOUTA_TEST_OPEN_LOG\"\n",
     )
     .expect("browser helper");
     fs::set_permissions(&xdg_open, fs::Permissions::from_mode(0o700))
@@ -339,9 +342,14 @@ fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
         None,
         &[
             (b"S", 300),
-            (b"O", 300),
+            // Both opener hotkeys must be accepted while the first helper is
+            // still running; otherwise the ordered log below exposes a blocked
+            // terminal event loop.
+            (b"o", 100),
+            (b"O", 1_200),
             (b"p", 300),
             (b"s", 200),
+            (b"y", 200),
             (b"\r", 400),
             (b"q", 200),
         ],
@@ -357,6 +365,7 @@ fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
         "Fixture channel",
         "Youta preferences",
         "Split",
+        "Prepare selected YouTube audio: off",
     ] {
         assert!(
             first_output.contains(expected),
@@ -368,12 +377,19 @@ fn tui_subscriptions_channel_open_and_preferences_persist_end_to_end() {
             .expect("opened channel link")
             .lines()
             .collect::<Vec<_>>(),
-        ["https://www.youtube.com/channel/UCfixture"]
+        [
+            "start https://www.youtube.com/channel/UCfixture",
+            "start https://www.youtube.com/channel/UCfixture",
+            "done https://www.youtube.com/channel/UCfixture",
+            "done https://www.youtube.com/channel/UCfixture",
+        ]
     );
     let config_path = config_directory.join("config.toml");
     let saved_config = fs::read_to_string(&config_path).expect("saved preferences");
     assert!(saved_config.contains("[ui]"));
     assert!(saved_config.contains("subscriptions_layout = \"split\""));
+    assert!(saved_config.contains("[playback]"));
+    assert!(saved_config.contains("youtube_prewarm = false"));
 
     let output = run_tui_session(
         &launcher,
@@ -433,7 +449,7 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     );
     write_executable(
         &helpers.join("xdg-open"),
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$YOUTA_TEST_OPEN_LOG\"\n",
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] || exit 64\nprintf '%s\\n' \"$1\" > \"$YOUTA_TEST_OPEN_LOG\"\n",
     );
     write_executable(
         &helpers.join("gh"),
@@ -542,6 +558,7 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     assert!(copied.contains("Youta diagnostic report"));
     assert!(copied.contains("Forced backtrace:"));
     let opened = fs::read_to_string(&open_log).expect("opened issue URL");
+    assert_eq!(opened.lines().count(), 1, "xdg-open must receive one URL");
     assert!(opened.contains("github.com/vitaly-zdanevich/youta/issues/new"));
     assert!(
         opened.len() < 1_000,

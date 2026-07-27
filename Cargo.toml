@@ -43,7 +43,13 @@ default = [
 ]
 
 # User interface and playback backends.
-tui = ["dep:chrono", "dep:crossterm", "dep:ratatui", "dep:toml_edit"]
+tui = [
+    "dep:chrono",
+    "dep:crossterm",
+    "dep:ratatui",
+    "dep:toml_edit",
+    "dep:unicode-segmentation",
+]
 # Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
 # This links no system GPM library and silently falls back when no daemon runs.
 gpm = ["tui", "dep:mio"]
@@ -73,7 +79,7 @@ vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
 youtube-music = ["yt-dlp"]
-yt-dlp = []
+yt-dlp = ["dep:rustix"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]
@@ -134,10 +140,12 @@ directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 opml = "1.1.6"
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"] }
+rustix = { version = "1.1.4", features = ["process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
 toml_edit = { version = "0.22.27", optional = true }
+unicode-segmentation = { version = "1.13.3", optional = true }
 url = { version = "2.5.8", features = ["serde"] }
 
 crossterm = { version = "0.29.0", optional = true }
