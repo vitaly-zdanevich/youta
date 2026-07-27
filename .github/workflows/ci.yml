@@ -76,6 +76,14 @@ jobs:
             feature_arguments: ''
           - feature_set: no default features
             feature_arguments: --no-default-features
+          - feature_set: TUI only
+            feature_arguments: --no-default-features --features tui
+          - feature_set: TUI with Local
+            feature_arguments: --no-default-features --features tui,local
+          - feature_set: TUI with Apple Podcasts
+            feature_arguments: --no-default-features --features tui,apple-podcasts
+          - feature_set: TUI with Bandcamp
+            feature_arguments: --no-default-features --features tui,bandcamp
           - feature_set: all features
             feature_arguments: --all-features
     steps:
@@ -270,6 +278,62 @@ jobs:
             sleep 10
           done
 
+  live-youtube-music:
+    name: Live keyless YouTube Music search
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the pinned yt-dlp search helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-venv
+          python3 -m venv "${RUNNER_TEMP}/youta-live-music-venv"
+          "${RUNNER_TEMP}/youta-live-music-venv/bin/pip" \
+            install \
+            --disable-pip-version-check \
+            'yt-dlp[default]==2026.7.4'
+          echo "YOUTA_TEST_YT_DLP=${RUNNER_TEMP}/youta-live-music-venv/bin/yt-dlp" \
+            >> "${GITHUB_ENV}"
+
+      - name: Search the public YouTube Music songs section
+        env:
+          YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features youtube-music \
+              -- \
+              --ignored \
+              --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
   live-apple-podcasts:
     name: Live Apple Podcasts playback
     runs-on: ubuntu-24.04
@@ -295,6 +359,29 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes mpv
+
+      - name: Search Apple Podcasts and list a show's episodes
+        env:
+          YOUTA_RUN_LIVE_APPLE_PODCASTS_SEARCH_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features apple-podcasts \
+              -- \
+              --ignored \
+              --exact apple_podcasts_public_search_returns_normalized_shows \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: Resolve Apple metadata, RSS, and audio
         env:
@@ -373,10 +460,10 @@ jobs:
 
       - name: Install Rust with coverage tools
         run: |
-          rustup toolchain install stable \
+          rustup toolchain install "${RUST_VERSION}" \
             --profile minimal \
             --component llvm-tools-preview
-          rustup default stable
+          rustup default "${RUST_VERSION}"
 
       - name: Restore Cargo registry cache
         uses: actions/cache@v5
@@ -384,7 +471,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-stable-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install the pinned coverage runner
         run: cargo install cargo-llvm-cov --locked --version 0.8.7

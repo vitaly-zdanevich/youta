@@ -53,6 +53,23 @@ mkdir -p "${package_root}/.cargo"
 # Make network isolation explicit for consumers that use the supplied config.
 printf '\n[net]\noffline = true\n' >> "${package_root}/.cargo/config.toml"
 
+# Prove that the generated source replacement is complete before publishing it.
+# Fresh Cargo and target directories prevent an existing registry/source cache
+# from hiding an omitted dependency, and both remain outside the archive root.
+verification_cargo_home="${staging_directory}/offline-cargo-home"
+verification_target="${staging_directory}/offline-target"
+mkdir -p "${verification_cargo_home}" "${verification_target}"
+(
+	cd "${package_root}"
+	CARGO_HOME="${verification_cargo_home}" \
+		CARGO_TARGET_DIR="${verification_target}" \
+		cargo build \
+			--manifest-path "${repository_root}/Cargo.toml" \
+			--locked \
+			--offline \
+			--all-features
+)
+
 archive="${output_directory}/youta-${version}-vendor.tar.xz"
 source_date_epoch=${SOURCE_DATE_EPOCH:-0}
 
