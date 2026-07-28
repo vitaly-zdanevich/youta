@@ -248,11 +248,18 @@ pub struct PlaybackStatus {
     /// end-of-file signal. An idle status observed before media becomes active
     /// is not treated as completion.
     pub idle: bool,
-    /// Whether the active item is an endless live stream without a seekable timeline.
+    /// Whether the active item is an endless live stream.
     ///
     /// Controllers own this semantic flag because a backend may expose live
-    /// transport timestamps as a large, apparently finite duration.
+    /// transport timestamps as a large, apparently finite duration. Seeking
+    /// is available only when [`Self::live_seekable_range`] is populated.
     pub live: bool,
+    /// Backend media-time interval currently available for live cache seeking.
+    ///
+    /// Controllers may normalize [`Self::position`] and [`Self::duration`] to
+    /// this rolling interval for display, but retain these absolute timestamps
+    /// when translating a seek-bar percentage back to a backend command.
+    pub live_seekable_range: Option<BufferedRange>,
     /// Current position.
     pub position: Duration,
     /// Total duration when known.
@@ -283,6 +290,18 @@ pub struct PlaybackStatus {
     pub stream_title: Option<String>,
 }
 
+impl PlaybackStatus {
+    /// Returns whether keyboard or mouse seeking has a usable timeline.
+    ///
+    /// Finite media keeps its historical behavior even while duration is
+    /// unknown. A live stream becomes seekable only after its backend reports
+    /// an exact cached interval.
+    #[must_use]
+    pub const fn seeking_available(&self) -> bool {
+        !self.live || self.live_seekable_range.is_some()
+    }
+}
+
 /// A half-open media-time interval available without another network fetch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferedRange {
@@ -297,6 +316,7 @@ impl Default for PlaybackStatus {
         Self {
             idle: true,
             live: false,
+            live_seekable_range: None,
             position: Duration::ZERO,
             duration: None,
             paused: true,

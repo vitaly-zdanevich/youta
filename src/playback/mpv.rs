@@ -799,6 +799,7 @@ mod unix {
             Ok(PlaybackStatus {
                 idle,
                 live: false,
+                live_seekable_range: None,
                 position,
                 duration,
                 paused,

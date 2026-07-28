@@ -362,7 +362,7 @@ jobs:
       - name: Install the playback helper
         run: |
           sudo apt-get update
-          sudo apt-get install --yes mpv
+          sudo apt-get install --yes ffmpeg mpv
 
       - name: Search Apple Podcasts and list a show's episodes
         env:
@@ -478,22 +478,41 @@ jobs:
       - name: Install the playback helper
         run: |
           sudo apt-get update
-          sudo apt-get install --yes mpv
+          sudo apt-get install --yes ffmpeg mpv
 
       - name: Decode a public stream and parse passive metadata
         env:
           YOUTA_RUN_LIVE_RADIO_TEST: '1'
+          YOUTA_RUN_LIVE_BBC_RADIO_TEST: '1'
         run: |
           for attempt in 1 2; do
             if cargo test \
-              --locked \
-              --test live_services \
-              --no-default-features \
-              --features radio,backend-mpv \
-              -- \
-              --ignored \
-              --exact radio_stream_and_passive_metadata_are_usable \
-              --nocapture
+                --locked \
+                --test live_services \
+                --no-default-features \
+                --features radio,backend-mpv \
+                -- \
+                --ignored \
+                --exact radio_stream_and_passive_metadata_are_usable \
+                --nocapture \
+              && cargo test \
+                --locked \
+                --test live_services \
+                --no-default-features \
+                --features radio,backend-mpv \
+                -- \
+                --ignored \
+                --exact generated_npr_station_stream_and_program_are_usable \
+                --nocapture \
+              && cargo test \
+                --locked \
+                --test live_services \
+                --no-default-features \
+                --features bbc-radio,backend-mpv \
+                -- \
+                --ignored \
+                --exact bbc_sounds_resolution_and_audio_are_usable \
+                --nocapture
             then
               exit 0
             fi

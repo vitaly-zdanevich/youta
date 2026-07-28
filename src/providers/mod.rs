@@ -919,6 +919,7 @@ pub fn validate_youtube_video_id(video_id: &str) -> Result<(), ProviderError> {
 }
 
 #[cfg(any(
+    feature = "bbc-radio",
     feature = "dearrow",
     feature = "funkwhale",
     feature = "invidious",

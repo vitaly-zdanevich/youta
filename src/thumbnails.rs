@@ -6,9 +6,9 @@
 //! Fetching, bounded image validation, resizing, and protocol encoding all
 //! happen away from the TUI render thread. Background prefetch uses an
 //! independent worker, persists validated bytes only, and never delays selected
-//! artwork or requests a redraw. Recently encoded remote terminal images
-//! remain in an entry- and decoded-byte-bounded in-memory cache so revisiting
-//! subscription channels is immediate. Local images always revalidate their
+//! artwork or requests a redraw. Recently encoded local and remote terminal
+//! images remain in an entry- and decoded-byte-bounded in-memory cache so
+//! revisiting media is immediate. Local images always revalidate their
 //! filesystem fingerprint before reuse.
 
 use std::collections::{HashSet, VecDeque};
@@ -296,6 +296,7 @@ struct PreparedThumbnailKey {
     source: Url,
     width: u16,
     height: u16,
+    local_fingerprint: Option<LocalThumbnailFingerprint>,
 }
 
 impl From<&ThumbnailTarget> for PreparedThumbnailKey {
@@ -304,11 +305,46 @@ impl From<&ThumbnailTarget> for PreparedThumbnailKey {
             source: target.source.clone(),
             width: target.area.width,
             height: target.area.height,
+            local_fingerprint: None,
         }
     }
 }
 
-/// One remote encoded terminal image retained for fast keyboard navigation.
+impl PreparedThumbnailKey {
+    /// Captures the current replacement-sensitive identity for a local target.
+    ///
+    /// Remote targets need no filesystem identity because their URL is already
+    /// the cache key. A local failure remains a worker-visible error rather
+    /// than reusing an entry whose source can no longer be verified.
+    fn current(target: &ThumbnailTarget) -> Option<Self> {
+        let mut key = Self::from(target);
+        if target.source.scheme() == "file" {
+            let path = target.source.to_file_path().ok()?;
+            key.local_fingerprint = Some(LocalThumbnailFingerprint::capture(&path).ok()?);
+        }
+        Some(key)
+    }
+
+    fn from_loaded(
+        target: &ThumbnailTarget,
+        local_fingerprint: Option<LocalThumbnailFingerprint>,
+    ) -> Option<Self> {
+        let mut key = Self::from(target);
+        if target.source.scheme() == "file" {
+            key.local_fingerprint = Some(local_fingerprint?);
+        }
+        Some(key)
+    }
+
+    fn same_target(&self, other: &Self) -> bool {
+        self.source == other.source && self.width == other.width && self.height == other.height
+    }
+}
+
+/// One encoded terminal image retained for fast keyboard navigation.
+///
+/// Local entries include the exact filesystem fingerprint captured by the
+/// worker that decoded their pixels.
 struct PreparedThumbnail {
     key: PreparedThumbnailKey,
     protocol: StatefulProtocol,
@@ -319,6 +355,7 @@ struct PreparedThumbnail {
 struct EncodedThumbnail {
     protocol: StatefulProtocol,
     decoded_bytes: usize,
+    local_fingerprint: Option<LocalThumbnailFingerprint>,
 }
 
 /// One terminal protocol plus an optional local derivative to persist after
@@ -326,6 +363,7 @@ struct EncodedThumbnail {
 struct LoadedThumbnail {
     protocol: StatefulProtocol,
     decoded_bytes: usize,
+    local_fingerprint: Option<LocalThumbnailFingerprint>,
     deferred_local_preview: Option<DeferredLocalPreview>,
 }
 
@@ -1378,6 +1416,7 @@ pub struct ThumbnailManager {
     target: Option<ThumbnailTarget>,
     protocol: Option<StatefulProtocol>,
     protocol_decoded_bytes: usize,
+    protocol_key: Option<PreparedThumbnailKey>,
     prepared: VecDeque<PreparedThumbnail>,
     prepared_decoded_bytes: usize,
     picker: Option<Picker>,
@@ -1454,6 +1493,7 @@ impl ThumbnailManager {
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
+            protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
             picker: Some(picker),
@@ -1480,6 +1520,7 @@ impl ThumbnailManager {
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
+            protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
             picker: None,
@@ -1532,6 +1573,7 @@ impl ThumbnailManager {
             return true;
         }
         if let Some(prepared) = self.take_prepared_thumbnail(&target) {
+            self.protocol_key = Some(prepared.key);
             self.protocol = Some(prepared.protocol);
             self.protocol_decoded_bytes = prepared.decoded_bytes;
             self.state = ThumbnailState::Ready;
@@ -1704,11 +1746,15 @@ impl ThumbnailManager {
                     changed = true;
                     match result.result {
                         Ok(encoded) => {
+                            self.protocol_key = self.target.as_ref().and_then(|target| {
+                                PreparedThumbnailKey::from_loaded(target, encoded.local_fingerprint)
+                            });
                             self.protocol = Some(encoded.protocol);
                             self.protocol_decoded_bytes = encoded.decoded_bytes;
                             self.state = ThumbnailState::Ready;
                         }
                         Err(error) => {
+                            self.protocol_key = None;
                             self.protocol = None;
                             self.protocol_decoded_bytes = 0;
                             self.state = ThumbnailState::Failed(error);
@@ -1730,6 +1776,7 @@ impl ThumbnailManager {
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
                 self.protocol_decoded_bytes = 0;
+                self.protocol_key = None;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
                 changed = true;
             }
@@ -1770,6 +1817,7 @@ impl ThumbnailManager {
             self.target = None;
             self.protocol = None;
             self.protocol_decoded_bytes = 0;
+            self.protocol_key = None;
             self.generation = self.generation.wrapping_add(1);
             self.state = ThumbnailState::Idle;
         }
@@ -1778,32 +1826,32 @@ impl ThumbnailManager {
 
     /// Moves the visible encoded image into the bounded recency cache.
     fn retain_current_protocol(&mut self) {
-        let (Some(target), Some(protocol)) = (self.target.as_ref(), self.protocol.take()) else {
+        let (Some(key), Some(protocol)) = (self.protocol_key.take(), self.protocol.take()) else {
             return;
         };
         let decoded_bytes = std::mem::take(&mut self.protocol_decoded_bytes);
-        // Local files already have a replacement-sensitive persistent preview
-        // key. A path-only prepared key would bypass that fingerprint and could
-        // display an older image after an in-process file replacement.
-        if target.source.scheme() == "file" {
-            return;
-        }
-        let key = PreparedThumbnailKey::from(target);
         self.cache_prepared_protocol(key, protocol, decoded_bytes);
     }
 
-    /// Inserts one remote protocol while enforcing both count and RAM bounds.
+    /// Inserts one prepared protocol while enforcing count and RAM bounds.
     fn cache_prepared_protocol(
         &mut self,
         key: PreparedThumbnailKey,
         protocol: StatefulProtocol,
         decoded_bytes: usize,
     ) {
-        if let Some(index) = self.prepared.iter().position(|entry| entry.key == key) {
-            if let Some(replaced) = self.prepared.remove(index) {
+        let mut index = 0;
+        while index < self.prepared.len() {
+            if self.prepared[index].key.same_target(&key) {
+                let replaced = self
+                    .prepared
+                    .remove(index)
+                    .expect("prepared cache index checked above");
                 self.prepared_decoded_bytes = self
                     .prepared_decoded_bytes
                     .saturating_sub(replaced.decoded_bytes);
+            } else {
+                index += 1;
             }
         }
         if decoded_bytes == 0 || decoded_bytes > PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES {
@@ -1827,12 +1875,18 @@ impl ThumbnailManager {
         }
     }
 
-    /// Takes an encoded image matching this remote source and cell size.
+    /// Takes an encoded image matching this source, cell size, and local
+    /// filesystem fingerprint.
     fn take_prepared_thumbnail(&mut self, target: &ThumbnailTarget) -> Option<PreparedThumbnail> {
-        if target.source.scheme() == "file" {
+        let base_key = PreparedThumbnailKey::from(target);
+        if !self
+            .prepared
+            .iter()
+            .any(|entry| entry.key.same_target(&base_key))
+        {
             return None;
         }
-        let key = PreparedThumbnailKey::from(target);
+        let key = PreparedThumbnailKey::current(target)?;
         let index = self.prepared.iter().position(|entry| entry.key == key)?;
         let prepared = self.prepared.remove(index)?;
         self.prepared_decoded_bytes = self
@@ -2120,11 +2174,13 @@ fn render_worker_request<T: ThumbnailTransport>(
         Ok(LoadedThumbnail {
             protocol,
             decoded_bytes,
+            local_fingerprint,
             deferred_local_preview,
         }) => (
             Ok(EncodedThumbnail {
                 protocol,
                 decoded_bytes,
+                local_fingerprint,
             }),
             deferred_local_preview,
         ),
@@ -2232,6 +2288,7 @@ fn load_thumbnail(
         return result.map(|encoded| LoadedThumbnail {
             protocol: encoded.protocol,
             decoded_bytes: encoded.decoded_bytes,
+            local_fingerprint: None,
             deferred_local_preview: None,
         });
     }
@@ -2244,6 +2301,7 @@ fn load_thumbnail(
     encode_thumbnail(picker, target.area, image).map(|encoded| LoadedThumbnail {
         protocol: encoded.protocol,
         decoded_bytes: encoded.decoded_bytes,
+        local_fingerprint: None,
         deferred_local_preview: None,
     })
 }
@@ -2270,9 +2328,13 @@ fn load_local_thumbnail(
             && fingerprint.is_current()
         {
             let encoded = encode_thumbnail(picker, target.area, image)?;
+            if !fingerprint.is_current() {
+                return Err(ThumbnailFailure::InvalidImage);
+            }
             return Ok(LoadedThumbnail {
                 protocol: encoded.protocol,
                 decoded_bytes: encoded.decoded_bytes,
+                local_fingerprint: Some(fingerprint),
                 deferred_local_preview: None,
             });
         }
@@ -2289,9 +2351,13 @@ fn load_local_thumbnail(
         .then(|| encode_local_preview_record(&image))
         .flatten();
     let encoded = encode_thumbnail(picker, target.area, image)?;
+    if !fingerprint.is_current() {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
     Ok(LoadedThumbnail {
         protocol: encoded.protocol,
         decoded_bytes: encoded.decoded_bytes,
+        local_fingerprint: Some(fingerprint.clone()),
         deferred_local_preview: record.map(|record| DeferredLocalPreview {
             cache_key,
             record,
@@ -2355,6 +2421,7 @@ fn encode_thumbnail(
         Some(Ok(())) => Ok(EncodedThumbnail {
             protocol,
             decoded_bytes,
+            local_fingerprint: None,
         }),
         Some(Err(_)) | None => Err(ThumbnailFailure::EncodingFailed),
     }
@@ -3204,6 +3271,7 @@ pub(crate) mod tests {
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
+            protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
             picker: None,
@@ -3748,17 +3816,20 @@ pub(crate) mod tests {
             source: Url::parse("https://images.example/first-budget.png").expect("first URL"),
             width: area.width,
             height: area.height,
+            local_fingerprint: None,
         };
         let second = PreparedThumbnailKey {
             source: Url::parse("https://images.example/second-budget.png").expect("second URL"),
             width: area.width,
             height: area.height,
+            local_fingerprint: None,
         };
         let oversized = PreparedThumbnailKey {
             source: Url::parse("https://images.example/oversized-budget.png")
                 .expect("oversized URL"),
             width: area.width,
             height: area.height,
+            local_fingerprint: None,
         };
         let more_than_half = PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES / 2 + 1;
 
@@ -3784,7 +3855,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replacing_local_image_at_same_path_bypasses_the_prepared_protocol_cache() {
+    fn revisiting_a_small_local_jpeg_reuses_protocol_and_replacement_invalidates_it() {
         let directory = tempfile::tempdir().expect("temporary local replacement fixture");
         let cache_directory = directory.path().join("thumbnail-cache");
         let first_path = directory.path().join("first.jpg");
@@ -3795,6 +3866,13 @@ pub(crate) mod tests {
         let second = Url::from_file_path(&second_path).expect("second local URL");
         let area = Rect::new(1, 1, 40, 10);
         let mut manager = local_thumbnail_manager(cache_directory.clone());
+        assert!(
+            fs::metadata(&first_path)
+                .expect("small JPEG metadata")
+                .len()
+                < 64 * 1024,
+            "regression fixture must remain comparable to a small local cover"
+        );
 
         assert!(manager.synchronize(Some(&first), area));
         assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
@@ -3802,13 +3880,46 @@ pub(crate) mod tests {
         wait_for_local_preview(&cache_directory, &old_cache_key);
         assert_eq!(local_source_decode_count(&first_path), 1);
 
+        assert!(manager.synchronize(None, area));
+        assert_eq!(manager.state(), &ThumbnailState::Idle);
+        assert!(manager.synchronize(Some(&first), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Ready,
+            "returning from a file without artwork must reuse the local protocol"
+        );
+        assert_eq!(local_source_decode_count(&first_path), 1);
+
         assert!(manager.synchronize(Some(&second), area));
         assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(local_source_decode_count(&second_path), 1);
         assert!(
-            manager.prepared.is_empty(),
-            "local protocols must never enter the path-only prepared cache"
+            manager
+                .prepared
+                .iter()
+                .any(|entry| entry.key.source == first),
+            "leaving a local JPEG must retain its fingerprinted protocol"
         );
 
+        assert!(manager.synchronize(Some(&first), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Ready,
+            "A→B→A navigation must reuse the prepared local protocol synchronously"
+        );
+        assert!(manager.protocol().is_some());
+        assert_eq!(
+            local_source_decode_count(&first_path),
+            1,
+            "an unchanged revisit must bypass source decode and terminal re-encoding"
+        );
+
+        assert!(manager.synchronize(Some(&second), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Ready,
+            "the second unchanged local image must also remain prepared"
+        );
         write_jpeg_fixture(&first_path, 96, 48);
         let replacement_cache_key = local_preview_cache_key(&first_path, area);
         assert_ne!(replacement_cache_key, old_cache_key);
@@ -3825,7 +3936,6 @@ pub(crate) mod tests {
             2,
             "the same-path replacement must be decoded instead of reusing stale pixels"
         );
-        assert!(manager.prepared.is_empty());
     }
 
     #[test]
@@ -3869,6 +3979,7 @@ pub(crate) mod tests {
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
+            protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
             picker: None,
@@ -4171,6 +4282,7 @@ pub(crate) mod tests {
             }),
             protocol: None,
             protocol_decoded_bytes: 0,
+            protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
             picker: None,
@@ -4587,6 +4699,7 @@ pub(crate) mod tests {
                 target: None,
                 protocol: None,
                 protocol_decoded_bytes: 0,
+                protocol_key: None,
                 prepared: VecDeque::new(),
                 prepared_decoded_bytes: 0,
                 picker: None,

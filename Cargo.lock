@@ -3012,6 +3012,7 @@ dependencies = [
  "crossterm",
  "delharc",
  "directories",
+ "encoding_rs",
  "feed-rs",
  "figment",
  "flate2",

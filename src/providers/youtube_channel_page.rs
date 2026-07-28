@@ -620,6 +620,34 @@ mod tests {
     }
 
     #[test]
+    fn external_link_without_visible_youtube_text_uses_its_hostname() {
+        let value = serde_json::json!({
+            "channelExternalLinkViewModel": {
+                "title": {"content": "   "},
+                "link": {
+                    "content": "",
+                    "commandRuns": [{
+                        "onTap": {
+                            "innertubeCommand": {
+                                "commandMetadata": {
+                                    "webCommandMetadata": {
+                                        "url": "https://example.org/channel"
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let link = normalize_external_link(&value).expect("validated external link");
+
+        assert_eq!(link.label, "example.org");
+        assert_eq!(link.url.as_str(), "https://example.org/channel");
+    }
+
+    #[test]
     fn merge_fills_missing_provider_fields_without_replacing_core_metadata() {
         let metadata =
             parse_channel_about_html(ABOUT_FIXTURE).expect("fixture metadata should parse");

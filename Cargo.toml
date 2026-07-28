@@ -77,7 +77,7 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
-local = ["dep:lofty", "dep:rustix", "dep:trash"]
+local = ["dep:encoding_rs", "dep:lofty", "dep:rustix", "dep:trash"]
 rss = ["network", "dep:feed-rs"]
 invidious = ["network"]
 peertube = ["network"]
@@ -97,7 +97,7 @@ litres = ["network", "dep:sha2"]
 podcast-index = ["rss"]
 gpodder = ["rss"]
 radio = ["network"]
-bbc-radio = ["yt-dlp"]
+bbc-radio = ["radio"]
 funkwhale = ["network"]
 jamendo = ["network"]
 soundcloud = ["network", "yt-dlp"]
@@ -157,6 +157,7 @@ url = { version = "2.5.8", features = ["serde"] }
 
 crossterm = { version = "0.29.0", optional = true }
 delharc = { version = "0.7.0", optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
 feed-rs = { version = "2.4.0", optional = true }
 flate2 = { version = "1.1.9", optional = true }
 lofty = { version = "0.24.0", optional = true }

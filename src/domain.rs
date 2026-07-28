@@ -1197,6 +1197,9 @@ pub struct SessionState {
     /// while this identity survives changes to the active station ordering.
     #[serde(default)]
     pub radio_selected_station_id: Option<String>,
+    /// Last accepted local filter entered on the Radio tab.
+    #[serde(default)]
+    pub radio_filter_text: String,
     /// Vertical scroll offset in the details panel.
     pub details_scroll: u64,
     /// Last search text.
@@ -1501,12 +1504,14 @@ mod tests {
             .expect("session must encode as an object");
         object.remove("radio_selected_row");
         object.remove("radio_selected_station_id");
+        object.remove("radio_filter_text");
 
         let restored: SessionState =
             serde_json::from_value(encoded).expect("decode pre-Radio session");
 
         assert_eq!(restored.radio_selected_row, None);
         assert_eq!(restored.radio_selected_station_id, None);
+        assert!(restored.radio_filter_text.is_empty());
     }
 
     #[test]

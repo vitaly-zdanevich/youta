@@ -286,14 +286,36 @@ The implemented Radio tab is a credential-free static-catalog adapter behind
 the independent `radio` feature. Presets keep a stable application ID, station
 homepage, direct stream or M3U entry point, and only quality fields supported
 by a reviewed source or probe. Merely enabling the feature performs no startup
-network request. Enter starts `MediaKind::LiveStream`; progress, seeking,
+network request. Enter starts `MediaKind::LiveStream`; persistent progress,
 chapters, completion, and repeat-one are disabled for that item, while
 listening-time checkpoints update source statistics without creating a
-position row. History and playlists persist the stable ID plus canonical
-homepage, then resolve the current built-in stream at replay time.
+position row. mpv's `demuxer-cache-state.seekable-ranges` is the sole authority
+for transient rewind: Youta selects the newest contiguous range containing the
+current position, caps its visible rolling window at 24 hours, normalizes its
+transport timestamps to zero for display, and translates clicks or keyboard
+percentages back to bounded absolute backend timestamps. Without such a range,
+the stream remains non-seekable. History and playlists persist the stable ID
+plus canonical homepage, then resolve the current built-in stream at replay
+time.
+
+The larger NPR portion is a checked-in generated module rather than a runtime
+directory client. Its maintenance tool queries NPR's official station finder
+once per US state and territory, retains every discovered service with an
+HTTPS audio URL, and deduplicates inherited station records by stream GUID.
+Distinct non-primary services remain separate presets, while their station
+aliases stay in the searchable summary. NPR exposes no pagination/total
+contract and no stream-quality fields, so the snapshot documents its query
+date and discovered count without claiming exhaustive coverage or guessed
+bitrates. Current-program lookups are passive playback/selection metadata
+requests and tolerate empty schedules; they do not mutate the static
+catalogue.
+
 Name and bitrate sorting are presentation choices: restart-safe session state
 persists the selected preset ID independently of its legacy numeric row, so
 changing the order cannot change the selected station after restart.
+The accepted Radio filter is persisted independently from every provider
+search. Filtering runs synchronously over stable preset metadata after sorting;
+it never searches changing now-playing text or starts a network request.
 
 At most one selected-or-playing Radio metadata request can be active.
 Provider metadata is preferred only while fresh, followed by player-observed
@@ -341,11 +363,16 @@ download locators as credential-free HTTPS. It retains `license_ccurl`
 verbatim as licence metadata; a download flag or Creative Commons label is not
 an automatic Wikimedia Commons upload decision.
 
-Direct-URL adapters are deliberately smaller. Vimeo, RuTube, BBC Sounds, and
-SoundCloud can initially resolve through `yt-dlp`, while official search needs
-a service-specific documented API and credentials. The generic `yt-dlp`
-provider accepts installed built-in extractors for URL resolution only; it does
-not synthesize search, channel subscription, or account support.
+Direct-URL adapters are deliberately smaller. Vimeo, RuTube, and SoundCloud can
+initially resolve through `yt-dlp`, while official search needs a
+service-specific documented API and credentials. BBC Sounds live radio is the
+exception: its compile-time station catalogue maps stable public pages into the
+Radio model, while every explicit Play action reads a fresh public-page token
+and geo-aware Media Selector response. The signed HTTPS manifest is passed
+directly to the backend and is never persisted or reused for a later action.
+The generic `yt-dlp` provider accepts installed built-in extractors for URL
+resolution only; it does not synthesize search, channel subscription, or
+account support.
 
 Tracker modules have their own source boundary. The Mod Archive search adapter
 uses a user-provided official API key and caches within its request allowance.
@@ -665,6 +692,10 @@ Thumbnail support is a separate feature and runtime capability:
   show text details only;
 - selected artwork has priority; one bounded worker may then prefetch the
   currently loaded global Search rows into the persistent cache;
+- recently encoded terminal images share a 16-entry, 16 MiB decoded-pixel LRU;
+  local entries carry the worker-captured filesystem fingerprint, and a
+  fingerprint check makes an unchanged revisit synchronous without reusing a
+  same-path replacement;
 - unseen pagination, subscription feeds, and non-Search screens are excluded
   from background prefetch;
 - cache has byte and entry limits and can be disabled.

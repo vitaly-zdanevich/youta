@@ -82,8 +82,8 @@ use crate::playback::ytdlp::{
     DownloadFormat, DownloadProcess, DownloadRequest, YtDlp, YtDlpConfig, parse_download_event,
 };
 use crate::playback::{
-    PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent, PlaybackInput,
-    PlaybackStatus, PlayerCommand, Result as PlaybackResult,
+    BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent,
+    PlaybackInput, PlaybackStatus, PlayerCommand, Result as PlaybackResult,
 };
 #[cfg(feature = "apple-podcasts")]
 use crate::providers::apple_podcasts::{
@@ -95,10 +95,20 @@ use crate::providers::bandcamp::{
     BandcampMediaKind, BandcampMediaUrl, BandcampResolution, BandcampResolvePurpose,
     BandcampResolver, BandcampSearchClient, BandcampSearchPage,
 };
+#[cfg(feature = "bbc-radio")]
+use crate::providers::bbc::{
+    BbcLiveResolution, BbcLiveResolver, BbcStationPreset, STATIONS as BBC_STATIONS,
+    station_by_id as bbc_station_by_id, station_from_url as bbc_station_from_url,
+};
+#[cfg(feature = "bbc-radio")]
+use crate::providers::radio::RadioStreamKind;
+#[cfg(all(feature = "radio", test))]
+use crate::providers::radio::STATIONS as RADIO_STATIONS;
 #[cfg(feature = "radio")]
 use crate::providers::radio::{
     MIN_NOW_PLAYING_REFRESH, RadioCodec, RadioNowPlaying, RadioNowPlayingEndpoint,
-    RadioNowPlayingKind, RadioStationPreset, STATIONS as RADIO_STATIONS, station_by_id,
+    RadioNowPlayingKind, RadioStationPreset, all_stations as curated_radio_stations,
+    station_by_id as curated_radio_station_by_id, station_count as curated_radio_station_count,
 };
 #[cfg(feature = "youtube-music")]
 use crate::providers::youtube_music::{
@@ -151,6 +161,48 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
 
 /// Maximum UTF-8 payload stored for one private local note.
 pub const MAX_PRIVATE_NOTE_BYTES: usize = 16 * 1024;
+
+/// Maximum rolling live-cache interval exposed by the TUI.
+///
+/// mpv normally bounds the cache by bytes, but a malformed transport can
+/// still report synthetic timestamps spanning days. The UI needs only a
+/// recent rewind window and must never turn that transport clock into a
+/// multi-day seek bar.
+const MAX_LIVE_SEEK_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Keeps absolute seeks inside [`BufferedRange`]'s half-open upper boundary.
+const LIVE_SEEK_END_GUARD: Duration = Duration::from_millis(1);
+
+/// Selects the newest contiguous cached interval containing live playback.
+///
+/// The returned range uses backend timestamps for absolute seek commands. A
+/// larger range is clipped to its latest 24 hours, and is discarded if that
+/// clipped interval no longer contains the current playback timestamp.
+fn live_seekable_range(
+    position: Duration,
+    buffered_ranges: &[BufferedRange],
+) -> Option<BufferedRange> {
+    buffered_ranges
+        .iter()
+        .filter_map(|range| {
+            let start = range
+                .start
+                .max(range.end.saturating_sub(MAX_LIVE_SEEK_WINDOW));
+            (start <= position && position <= range.end).then_some(BufferedRange {
+                start,
+                end: range.end,
+            })
+        })
+        .max_by_key(|range| range.end)
+}
+
+/// Returns the last timestamp safely inside a live cached interval.
+fn live_seek_upper_bound(range: BufferedRange) -> Duration {
+    range
+        .end
+        .saturating_sub(LIVE_SEEK_END_GUARD)
+        .max(range.start)
+}
 
 /// Normalizes an optional editor field without retaining surrounding spacing.
 fn optional_trimmed_text(value: &str) -> Option<String> {
@@ -1118,6 +1170,11 @@ enum ProviderRequest {
         station_id: String,
         endpoint: RadioNowPlayingEndpoint,
     },
+    #[cfg(feature = "bbc-radio")]
+    ResolveBbcLive {
+        generation: u64,
+        station_id: String,
+    },
     Shutdown,
 }
 
@@ -1373,6 +1430,12 @@ enum ProviderResponse {
         generation: u64,
         station_id: String,
         result: Result<RadioNowPlaying, String>,
+    },
+    #[cfg(feature = "bbc-radio")]
+    BbcLive {
+        generation: u64,
+        station_id: String,
+        result: Result<BbcLiveResolution, String>,
     },
 }
 
@@ -2159,12 +2222,30 @@ struct PendingRadioNowPlaying {
     station_id: String,
 }
 
+/// Exact BBC Radio playback action awaiting a short-lived manifest.
+#[cfg(feature = "bbc-radio")]
+#[derive(Clone, Debug)]
+struct PendingBbcPlayback {
+    generation: u64,
+    item: QueueItem,
+    queue_cursor_already_positioned: bool,
+    origin: Option<AutoplayOrigin>,
+}
+
 /// Station-scoped passive-metadata retry state.
 #[cfg(feature = "radio")]
 #[derive(Clone, Copy, Debug)]
 struct RadioNowPlayingRetry {
     retry_at: Instant,
     consecutive_failures: u8,
+}
+
+/// Accepted Radio state restored when an in-progress live filter is cancelled.
+#[cfg(feature = "radio")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadioFilterEditSnapshot {
+    query: String,
+    selected_station_id: Option<String>,
 }
 
 #[cfg(feature = "radio")]
@@ -2219,6 +2300,14 @@ pub struct AppController {
     apple_podcasts_selected: usize,
     /// Selected public radio station retained while another tab is visible.
     radio_selected: usize,
+    /// Stable selected station identity independent of sorting and filtering.
+    #[cfg(feature = "radio")]
+    radio_selected_station_id: Option<String>,
+    /// Accepted Radio filter retained independently from provider searches.
+    radio_filter_query: String,
+    /// Radio query and selection captured when `/` starts live editing.
+    #[cfg(feature = "radio")]
+    radio_filter_edit_snapshot: Option<RadioFilterEditSnapshot>,
     /// Successful selected/playing radio metadata, bounded by the static catalogue.
     #[cfg(feature = "radio")]
     radio_now_playing_cache: HashMap<String, CachedRadioNowPlaying>,
@@ -2231,6 +2320,16 @@ pub struct AppController {
     /// Request owner rejecting completions after route changes.
     #[cfg(feature = "radio")]
     radio_now_playing_generation: u64,
+    /// Monotonic owner rejecting BBC manifests for superseded play actions.
+    #[cfg(feature = "bbc-radio")]
+    bbc_playback_generation: u64,
+    /// Exact BBC station action waiting for its geo-aware public manifest.
+    #[cfg(feature = "bbc-radio")]
+    pending_bbc_playback: Option<PendingBbcPlayback>,
+    /// Resolved BBC quality metadata retained for this process only.
+    #[cfg(feature = "bbc-radio")]
+    /// Last advertised BBC quality per station; signed manifests are never cached.
+    bbc_quality_cache: HashMap<String, String>,
     /// Storefront-specific show summaries returned by Apple's public catalogue.
     apple_podcasts_results: Vec<PodcastShowSummary>,
     /// Current navigation level inside the Apple Podcasts tab.
@@ -2630,6 +2729,8 @@ impl AppController {
                 #[cfg(feature = "bandcamp")]
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
+                #[cfg(feature = "radio")]
+                StoredScreen::Radio => saved.radio_filter_text.clone(),
                 _ => saved.search_text.clone(),
             },
             selected: saved.selected_row,
@@ -2795,8 +2896,13 @@ impl AppController {
             }
         });
         #[cfg(feature = "radio")]
-        let radio_selected = saved
-            .radio_selected_station_id
+        let radio_selected_station_id = saved.radio_selected_station_id.clone().or_else(|| {
+            sorted_radio_stations(RadioSort::Name)
+                .get(radio_selected_row)
+                .map(|station| station.id.to_owned())
+        });
+        #[cfg(feature = "radio")]
+        let radio_selected = radio_selected_station_id
             .as_deref()
             .and_then(|station_id| {
                 sorted_radio_stations(view.radio_sort)
@@ -2806,10 +2912,11 @@ impl AppController {
             .unwrap_or(radio_selected_row);
         #[cfg(not(feature = "radio"))]
         let radio_selected = radio_selected_row;
+        let radio_filter_query = saved.radio_filter_text.clone();
         if view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
-                view.selected = radio_selected.min(RADIO_STATIONS.len().saturating_sub(1));
+                view.selected = radio_selected.min(station_count().saturating_sub(1));
             }
             #[cfg(not(feature = "radio"))]
             {
@@ -2858,6 +2965,11 @@ impl AppController {
             apple_podcasts_selected,
             radio_selected,
             #[cfg(feature = "radio")]
+            radio_selected_station_id,
+            radio_filter_query,
+            #[cfg(feature = "radio")]
+            radio_filter_edit_snapshot: None,
+            #[cfg(feature = "radio")]
             radio_now_playing_cache: HashMap::new(),
             #[cfg(feature = "radio")]
             radio_now_playing_retry_at: HashMap::new(),
@@ -2865,6 +2977,12 @@ impl AppController {
             pending_radio_now_playing: None,
             #[cfg(feature = "radio")]
             radio_now_playing_generation: 0,
+            #[cfg(feature = "bbc-radio")]
+            bbc_playback_generation: 0,
+            #[cfg(feature = "bbc-radio")]
+            pending_bbc_playback: None,
+            #[cfg(feature = "bbc-radio")]
+            bbc_quality_cache: HashMap::new(),
             apple_podcasts_results,
             apple_podcasts_route: ApplePodcastsRoute::Shows,
             #[cfg(feature = "apple-podcasts")]
@@ -3424,6 +3542,76 @@ impl AppController {
         }
     }
 
+    /// Starts editing the active search or local Radio filter.
+    fn begin_search_input(&mut self) {
+        #[cfg(feature = "radio")]
+        if self.view.screen == Screen::Radio {
+            let selected_station_id = self
+                .selected_radio_station()
+                .map(|station| station.id.to_owned())
+                .or_else(|| self.radio_selected_station_id.clone());
+            self.view.search_query.clone_from(&self.radio_filter_query);
+            self.radio_filter_edit_snapshot = Some(RadioFilterEditSnapshot {
+                query: self.radio_filter_query.clone(),
+                selected_station_id,
+            });
+        }
+        self.view.search_editing = true;
+    }
+
+    /// Appends one character and applies a Radio filter without waiting for Enter.
+    fn append_search_input(&mut self, character: char) {
+        if character.is_control() {
+            return;
+        }
+        self.view.search_query.push(character);
+        self.refresh_live_radio_filter();
+    }
+
+    /// Removes one Unicode scalar and immediately broadens a Radio filter.
+    fn delete_search_input_character(&mut self) {
+        self.view.search_query.pop();
+        self.refresh_live_radio_filter();
+    }
+
+    /// Rebuilds the local Radio catalogue after one query mutation.
+    fn refresh_live_radio_filter(&mut self) {
+        if self.view.screen != Screen::Radio {
+            return;
+        }
+        self.radio_filter_query.clone_from(&self.view.search_query);
+        self.populate_radio();
+    }
+
+    /// Cancels editing, restoring Radio's previously accepted query and station.
+    fn cancel_search_input(&mut self) {
+        self.view.search_editing = false;
+        #[cfg(feature = "radio")]
+        if self.view.screen == Screen::Radio
+            && let Some(snapshot) = self.radio_filter_edit_snapshot.take()
+        {
+            self.radio_filter_query.clone_from(&snapshot.query);
+            self.view.search_query = snapshot.query;
+            self.radio_selected_station_id = snapshot.selected_station_id;
+            self.populate_radio();
+        }
+    }
+
+    /// Accepts Radio's already-applied local filter or submits a provider search.
+    fn submit_search_input(&mut self) {
+        self.view.search_editing = false;
+        if self.view.screen == Screen::Radio {
+            self.radio_filter_query.clone_from(&self.view.search_query);
+            #[cfg(feature = "radio")]
+            {
+                self.radio_filter_edit_snapshot = None;
+            }
+            self.populate_radio();
+            return;
+        }
+        self.submit_search();
+    }
+
     fn submit_search(&mut self) {
         let query = self.view.search_query.trim().to_owned();
         if query.is_empty() {
@@ -3583,6 +3771,11 @@ impl AppController {
     }
 
     fn open_direct_source(&mut self, direct: DirectSourceInput) {
+        #[cfg(feature = "bbc-radio")]
+        if direct.source == SourceKind::BbcRadio {
+            self.open_direct_bbc_station(&direct.url);
+            return;
+        }
         self.supersede_search_generation();
         self.clear_youtube_search_snapshot();
         self.youtube_results.clear();
@@ -3647,6 +3840,30 @@ impl AppController {
             )
         };
         self.request_direct_wikidata(&direct);
+    }
+
+    /// Opens a stable BBC Sounds URL as a Radio selection without resolving it.
+    ///
+    /// The geo-specific manifest remains action-scoped: only a subsequent
+    /// Enter/play action asks BBC Media Selector for one.
+    #[cfg(feature = "bbc-radio")]
+    fn open_direct_bbc_station(&mut self, url: &url::Url) {
+        let Some(station) = bbc_station_from_url(url) else {
+            self.show_error_message(
+                "BBC Sounds link failed",
+                "the link is not a stable BBC live-station page in this build",
+            );
+            return;
+        };
+        self.radio_filter_query.clear();
+        self.radio_selected_station_id = Some(station.id.to_owned());
+        self.radio_selected = sorted_radio_stations(self.view.radio_sort)
+            .iter()
+            .position(|candidate| candidate.id == station.id)
+            .unwrap_or_default();
+        self.show_screen(Screen::Radio);
+        self.view.status_line =
+            format!("Selected {}; press Enter to resolve and play", station.name);
     }
 
     fn classify_configured_instance(&self, mut direct: DirectSourceInput) -> DirectSourceInput {
@@ -4270,6 +4487,7 @@ impl AppController {
         self.clear_detail_navigation_history();
         self.previous_detail = None;
         self.view.details_scroll = 0;
+        self.view.selected_detail_link = None;
         let Some(selected) = self.selected_youtube_item().cloned() else {
             self.details_generation = self.details_generation.wrapping_add(1);
             #[cfg(feature = "yt-dlp")]
@@ -6075,6 +6293,12 @@ impl AppController {
                 station_id,
                 result,
             } => self.handle_radio_now_playing(generation, station_id, result),
+            #[cfg(feature = "bbc-radio")]
+            ProviderResponse::BbcLive {
+                generation,
+                station_id,
+                result,
+            } => self.handle_bbc_live(generation, station_id, result),
         }
     }
 
@@ -7818,7 +8042,6 @@ impl AppController {
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
         } else if self.view.screen == Screen::Radio {
-            self.radio_selected = self.view.selected;
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
             match self.playlists_route {
@@ -7869,7 +8092,6 @@ impl AppController {
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
         } else if self.view.screen == Screen::Radio {
-            self.radio_selected = self.view.selected;
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
             match self.playlists_route {
@@ -9806,6 +10028,7 @@ impl AppController {
         if matches!(
             entry.media_id.source,
             SourceKind::ApplePodcasts
+                | SourceKind::BbcRadio
                 | SourceKind::SoundStream
                 | SourceKind::LitRes
                 | SourceKind::Jamendo
@@ -9911,9 +10134,7 @@ impl AppController {
             return;
         };
         if listing.parent.is_some() && self.view.selected == 0 {
-            let parent = listing.parent.clone().expect("parent checked above");
-            let child = listing.path.clone();
-            self.browse_local_directory_with_reselection(parent, Some(child));
+            self.open_local_parent();
             return;
         }
         let Some(index) = self.local_entry_index() else {
@@ -9935,6 +10156,27 @@ impl AppController {
                 }
             }
         }
+    }
+
+    /// Opens the parent directory and reselects the child that was just left.
+    ///
+    /// Keeping this independent from Details navigation prevents Local's
+    /// file-manager `Esc` behavior from changing global Backspace or Alt+Left.
+    fn open_local_parent(&mut self) {
+        let Some(listing) = self.local_listing.as_ref() else {
+            self.view.status_line = if self.view.local_browse_pending {
+                "Wait for the Local folder to finish loading".to_owned()
+            } else {
+                "No local folder is loaded".to_owned()
+            };
+            return;
+        };
+        let Some(parent) = listing.parent.clone() else {
+            self.view.status_line = "Already at the filesystem root".to_owned();
+            return;
+        };
+        let child = listing.path.clone();
+        self.browse_local_directory_with_reselection(parent, Some(child));
     }
 
     /// Starts bounded background preparation for a selected remote module.
@@ -10031,6 +10273,10 @@ impl AppController {
             && station_by_id(&item.media.id.external_id).is_some()
         {
             self.view.screen = Screen::Radio;
+            self.radio_filter_query.clear();
+            self.view.search_query.clear();
+            self.radio_filter_edit_snapshot = None;
+            self.radio_selected_station_id = Some(item.media.id.external_id.clone());
             self.populate_radio();
             if let Some(index) = self.view.rows.iter().position(|row| {
                 row.media_id.as_ref().is_some_and(|media_id| {
@@ -10038,7 +10284,6 @@ impl AppController {
                         && media_id.external_id == item.media.id.external_id
                 })
             }) {
-                self.radio_selected = index;
                 self.view.selected = index;
                 self.update_radio_detail();
             }
@@ -10734,6 +10979,72 @@ impl AppController {
         }
     }
 
+    /// Seeks by seconds while constraining live Radio to mpv's cached window.
+    fn seek_relative(&mut self, seconds: i64) {
+        if !self.current_media_is_radio() {
+            self.player_command(PlayerCommand::SeekRelative(seconds));
+            return;
+        }
+        let Some(range) = self.live_radio_seek_range() else {
+            self.view.status_line = "No rewind buffer is available for this live radio".to_owned();
+            return;
+        };
+        let current = range
+            .start
+            .saturating_add(self.view.playback.position)
+            .clamp(range.start, range.end);
+        let distance = Duration::from_secs(seconds.unsigned_abs());
+        let target = if seconds.is_negative() {
+            current.saturating_sub(distance)
+        } else {
+            current.saturating_add(distance)
+        }
+        .clamp(range.start, range.end);
+        self.player_command(PlayerCommand::SeekAbsolute(
+            target.min(live_seek_upper_bound(range)),
+        ));
+    }
+
+    /// Seeks by bar percentage while preserving a live Radio cache origin.
+    fn seek_percent(&mut self, percent: f64) {
+        if !self.current_media_is_radio() {
+            self.player_command(PlayerCommand::SeekPercent(percent));
+            return;
+        }
+        let Some(range) = self.live_radio_seek_range() else {
+            self.view.status_line = "No rewind buffer is available for this live radio".to_owned();
+            return;
+        };
+        if !percent.is_finite() {
+            self.view.status_line = "The live-radio seek percentage is invalid".to_owned();
+            return;
+        }
+        let offset = range
+            .end
+            .saturating_sub(range.start)
+            .mul_f64(percent.clamp(0.0, 100.0) / 100.0);
+        self.player_command(PlayerCommand::SeekAbsolute(
+            range
+                .start
+                .saturating_add(offset)
+                .min(live_seek_upper_bound(range)),
+        ));
+    }
+
+    /// Returns whether the active queue item is a curated Radio stream.
+    fn current_media_is_radio(&self) -> bool {
+        self.current_media
+            .as_ref()
+            .is_some_and(|media| media.source == SourceKind::Radio)
+    }
+
+    /// Returns the backend-time interval backing the live Radio seek bar.
+    fn live_radio_seek_range(&self) -> Option<BufferedRange> {
+        self.current_media_is_radio()
+            .then_some(self.view.playback.live_seekable_range)
+            .flatten()
+    }
+
     /// Seeks the active item, or starts the selected item, at a description timecode.
     fn activate_timecode(&mut self, media_id: MediaId, seconds: u64) {
         if self.current_media.as_ref() == Some(&media_id) && self.player.is_some() {
@@ -10782,6 +11093,10 @@ impl AppController {
 
     /// Navigates parsed description chapters without relying on backend metadata.
     fn change_chapter(&mut self, delta: i32) {
+        if self.current_media_is_radio() {
+            self.view.status_line = "Chapters are unavailable for live radio".to_owned();
+            return;
+        }
         if self.seek_is_unavailable_for_live_radio() {
             return;
         }
@@ -10829,14 +11144,11 @@ impl AppController {
         self.activate_timecode(media_id, chapter.start_seconds);
     }
 
-    /// Rejects finite-media navigation for an endless Radio stream.
+    /// Rejects a Radio seek until mpv reports an exact cached interval.
     fn seek_is_unavailable_for_live_radio(&mut self) -> bool {
-        let unavailable = self
-            .current_media
-            .as_ref()
-            .is_some_and(|media| media.source == SourceKind::Radio);
+        let unavailable = self.current_media_is_radio() && self.live_radio_seek_range().is_none();
         if unavailable {
-            self.view.status_line = "Seeking is unavailable for live radio".to_owned();
+            self.view.status_line = "No rewind buffer is available for this live radio".to_owned();
         }
         unavailable
     }
@@ -11187,6 +11499,20 @@ impl AppController {
             #[cfg(feature = "tracker-music")]
             self.cancel_pending_tracker_autoplay();
         }
+        #[cfg(feature = "bbc-radio")]
+        if resolved_input.is_none()
+            && item.media.id.source == SourceKind::Radio
+            && station_by_id(&item.media.id.external_id)
+                .is_some_and(|station| station.stream_kind == RadioStreamKind::BbcSounds)
+        {
+            self.request_bbc_live(item, queue_cursor_already_positioned, origin);
+            return;
+        }
+        #[cfg(feature = "bbc-radio")]
+        if self.pending_bbc_playback.take().is_some() {
+            self.bbc_playback_generation = self.bbc_playback_generation.wrapping_add(1);
+            self.clear_playback_start_activity();
+        }
         if self.player.is_none() {
             let Some(factory) = self.playback_factory.as_mut() else {
                 self.view.status_line = "No playback backend was compiled or configured".to_owned();
@@ -11383,8 +11709,9 @@ impl AppController {
     /// Applies source-level playback semantics that a backend cannot infer reliably.
     ///
     /// Some live transports expose large synthetic `time-pos` and `duration`
-    /// values. `MediaKind::LiveStream` items are endless in Youta, so those
-    /// transport timestamps must never become a finite, seekable user timeline.
+    /// values. For a [`MediaKind::LiveStream`], only mpv's exact cached seek
+    /// range becomes a rolling user timeline; the transport duration itself
+    /// remains hidden.
     fn normalize_playback_status(&self, status: &mut PlaybackStatus) {
         let live_stream = self.current_media.as_ref().is_some_and(|media_id| {
             self.playback_queue.current().is_some_and(|item| {
@@ -11392,11 +11719,27 @@ impl AppController {
             })
         });
         status.live = live_stream;
+        status.live_seekable_range = None;
         if live_stream {
-            status.position = Duration::ZERO;
             status.duration = None;
             status.chapter = None;
+            let backend_position = status.position;
+            let live_range = live_seekable_range(backend_position, &status.buffered_ranges);
             status.buffered_ranges.clear();
+            if let Some(range) = live_range {
+                let duration = range.end.saturating_sub(range.start);
+                status.position = backend_position
+                    .clamp(range.start, range.end)
+                    .saturating_sub(range.start);
+                status.duration = Some(duration);
+                status.live_seekable_range = Some(range);
+                status.buffered_ranges.push(BufferedRange {
+                    start: Duration::ZERO,
+                    end: duration,
+                });
+            } else {
+                status.position = Duration::ZERO;
+            }
         }
     }
 
@@ -11910,12 +12253,21 @@ impl AppController {
         true
     }
 
+    /// Switches top-level routes while accepting any already-applied local edit.
+    ///
+    /// Radio filtering is live, so leaving its editor keeps the visible query
+    /// instead of restoring the snapshot captured when `/` was pressed.
     fn show_screen(&mut self, screen: Screen) {
         self.clear_detail_navigation_history();
         #[cfg(feature = "yt-dlp")]
         self.cancel_youtube_prewarm();
         if self.view.screen == Screen::Local && screen != Screen::Local {
             self.invalidate_local_folder_sizes();
+        }
+        self.view.search_editing = false;
+        #[cfg(feature = "radio")]
+        if self.view.screen == Screen::Radio {
+            self.radio_filter_edit_snapshot = None;
         }
         match self.view.screen {
             Screen::Search => {
@@ -11949,7 +12301,13 @@ impl AppController {
                 }
             }
             Screen::Radio => {
-                self.radio_selected = self.view.selected;
+                self.radio_filter_query.clone_from(&self.view.search_query);
+                #[cfg(feature = "radio")]
+                self.remember_selected_radio_station();
+                #[cfg(not(feature = "radio"))]
+                {
+                    self.radio_selected = self.view.selected;
+                }
             }
             Screen::TrackerMusic => {
                 self.tracker_search_query
@@ -12006,11 +12364,10 @@ impl AppController {
                 };
             }
             Screen::Radio => {
+                self.view.search_query.clone_from(&self.radio_filter_query);
                 #[cfg(feature = "radio")]
                 {
-                    self.view.selected = self
-                        .radio_selected
-                        .min(RADIO_STATIONS.len().saturating_sub(1));
+                    self.view.selected = self.radio_selected.min(station_count().saturating_sub(1));
                 }
                 #[cfg(not(feature = "radio"))]
                 {
@@ -12052,6 +12409,7 @@ impl AppController {
         self.view.details = None;
         self.view.details_focused = false;
         self.view.details_scroll = 0;
+        self.view.selected_detail_link = None;
         self.populate_local_screen();
         if screen == Screen::Search && !self.youtube_results.is_empty() {
             self.request_visible_channel_subscriber_counts();
@@ -12202,19 +12560,16 @@ impl AppController {
     /// Rebuilds the zero-network Radio catalogue from compile-time presets.
     #[cfg(feature = "radio")]
     fn populate_radio(&mut self) {
-        let stations = sorted_radio_stations(self.view.radio_sort);
-        let selected_id = self
-            .view
-            .rows
-            .get(self.view.selected)
-            .and_then(|row| row.media_id.as_ref())
-            .filter(|media_id| media_id.source == SourceKind::Radio)
-            .map(|media_id| media_id.external_id.clone())
-            .or_else(|| {
-                stations
-                    .get(self.radio_selected)
-                    .map(|station| station.id.to_owned())
-            });
+        let stations =
+            filtered_radio_stations(self.view.radio_sort, self.radio_filter_query.as_str());
+        let selected_id = self.radio_selected_station_id.clone().or_else(|| {
+            self.view
+                .rows
+                .get(self.view.selected)
+                .and_then(|row| row.media_id.as_ref())
+                .filter(|media_id| media_id.source == SourceKind::Radio)
+                .map(|media_id| media_id.external_id.clone())
+        });
         self.view.rows = stations
             .iter()
             .map(|station| RowView {
@@ -12236,17 +12591,24 @@ impl AppController {
                         .is_some_and(|media_id| media_id.external_id == selected_id)
                 })
             })
-            .unwrap_or_else(|| {
-                self.radio_selected
-                    .min(self.view.rows.len().saturating_sub(1))
-            });
-        self.radio_selected = self.view.selected;
+            .unwrap_or(0);
         self.update_radio_detail();
-        self.view.status_line = format!(
-            "{} public radio station{}; Enter plays the selected live stream",
-            RADIO_STATIONS.len(),
-            if RADIO_STATIONS.len() == 1 { "" } else { "s" }
-        );
+        let query = self.radio_filter_query.trim();
+        self.view.status_line = if query.is_empty() {
+            format!(
+                "{} public radio station{}; Enter plays the selected live stream",
+                station_count(),
+                if station_count() == 1 { "" } else { "s" }
+            )
+        } else if self.view.rows.is_empty() {
+            format!("No public radio stations match “{query}”")
+        } else {
+            format!(
+                "{} of {} public radio stations match “{query}”; Enter plays the selected live stream",
+                self.view.rows.len(),
+                station_count()
+            )
+        };
     }
 
     /// Leaves a safe empty view when Radio was omitted at compile time.
@@ -12266,11 +12628,113 @@ impl AppController {
             .and_then(|row| row.media_id.as_ref())
             .filter(|media_id| media_id.source == SourceKind::Radio)
             .and_then(|media_id| station_by_id(&media_id.external_id))
-            .or_else(|| {
-                sorted_radio_stations(self.view.radio_sort)
-                    .get(self.view.selected)
-                    .copied()
-            })
+    }
+
+    /// Maps the visible filtered selection back to the complete sorted catalogue.
+    #[cfg(feature = "radio")]
+    fn remember_selected_radio_station(&mut self) {
+        let Some(station) = self.selected_radio_station() else {
+            return;
+        };
+        self.radio_selected_station_id = Some(station.id.to_owned());
+        if let Some(index) = sorted_radio_stations(self.view.radio_sort)
+            .iter()
+            .position(|candidate| candidate.id == station.id)
+        {
+            self.radio_selected = index;
+        }
+    }
+
+    /// Starts one BBC Sounds manifest lookup while retaining only its stable page.
+    #[cfg(feature = "bbc-radio")]
+    fn request_bbc_live(
+        &mut self,
+        item: QueueItem,
+        queue_cursor_already_positioned: bool,
+        origin: Option<AutoplayOrigin>,
+    ) {
+        let station_id = item.media.id.external_id.clone();
+        if bbc_station_by_id(&station_id).is_none() {
+            self.show_error_message(
+                "BBC Radio playback failed",
+                "the selected BBC station is not present in this build",
+            );
+            return;
+        }
+        let generation = self.bbc_playback_generation.wrapping_add(1);
+        if !self.send_provider_request(
+            ProviderRequest::ResolveBbcLive {
+                generation,
+                station_id,
+            },
+            "Could not resolve the BBC live stream",
+        ) {
+            return;
+        }
+        self.bbc_playback_generation = generation;
+        self.pending_bbc_playback = Some(PendingBbcPlayback {
+            generation,
+            item,
+            queue_cursor_already_positioned,
+            origin,
+        });
+        self.begin_playback_start_activity();
+        self.view.status_line =
+            "Resolving the highest BBC audio quality available in this region…".to_owned();
+    }
+
+    /// Applies only the manifest belonging to the latest BBC playback action.
+    #[cfg(feature = "bbc-radio")]
+    fn handle_bbc_live(
+        &mut self,
+        generation: u64,
+        station_id: String,
+        result: Result<BbcLiveResolution, String>,
+    ) {
+        let owns_response = self.pending_bbc_playback.as_ref().is_some_and(|pending| {
+            pending.generation == generation
+                && pending.item.media.id.source == SourceKind::Radio
+                && pending.item.media.id.external_id == station_id
+        });
+        if !owns_response {
+            return;
+        }
+        let pending = self
+            .pending_bbc_playback
+            .take()
+            .expect("matching BBC playback ownership was checked above");
+        self.clear_playback_start_activity();
+        let resolution = match result {
+            Ok(resolution) if resolution.station.id == station_id => resolution,
+            Ok(_) => {
+                self.show_error_message(
+                    "BBC Radio playback failed",
+                    "BBC returned a manifest for a different station",
+                );
+                return;
+            }
+            Err(error) => {
+                self.show_error_message("BBC Radio playback failed", error);
+                return;
+            }
+        };
+        self.bbc_quality_cache
+            .insert(station_id.clone(), format_bbc_quality(&resolution));
+        if self.view.screen == Screen::Radio
+            && self
+                .selected_radio_station()
+                .is_some_and(|station| station.id == station_id)
+        {
+            self.update_radio_detail();
+        }
+        let mut input = PlaybackInput::new(resolution.manifest_url.to_string());
+        input.bypass_ytdl = true;
+        self.play_queue_item_with_origin_and_input(
+            pending.item,
+            pending.queue_cursor_already_positioned,
+            pending.origin,
+            Some(input),
+        );
     }
 
     /// Refreshes selected station details without contacting the stream.
@@ -12280,9 +12744,18 @@ impl AppController {
             self.view.details = None;
             return;
         };
-        self.radio_selected = self.view.selected;
+        self.remember_selected_radio_station();
         let mut description = station.summary.to_owned();
         description.push_str("\n\nQuality: ");
+        #[cfg(feature = "bbc-radio")]
+        if let Some(quality) = self.bbc_quality_cache.get(station.id) {
+            description.push_str(quality);
+        } else if bbc_station_by_id(station.id).is_some() {
+            description.push_str("resolved on play for the current region");
+        } else {
+            description.push_str(&radio_station_quality(&station, true));
+        }
+        #[cfg(not(feature = "bbc-radio"))]
         description.push_str(&radio_station_quality(&station, true));
         description.push_str("\nStream: ");
         description.push_str(station.stream);
@@ -12316,11 +12789,6 @@ impl AppController {
             source: "Radio".to_owned(),
             channel_webpage_url: station.homepage_url().ok(),
             description,
-            links: vec![DetailLinkView {
-                label: "Station website".to_owned(),
-                url: station.homepage.to_owned(),
-                wikidata_item_id: None,
-            }],
             ..DetailView::default()
         });
     }
@@ -12802,6 +13270,7 @@ impl AppController {
         if matches!(
             entry.media.id.source,
             SourceKind::ApplePodcasts
+                | SourceKind::BbcRadio
                 | SourceKind::SoundStream
                 | SourceKind::LitRes
                 | SourceKind::Jamendo
@@ -13061,6 +13530,7 @@ impl AppController {
         self.view.subscriptions.focus = SubscriptionPane::Sources;
         self.view.subscriptions.loading = false;
         self.view.subscriptions.items.clear();
+        self.view.selected_detail_link = None;
         self.active_subscription_channel_id = None;
         self.pending_subscription_refresh = None;
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
@@ -13122,6 +13592,7 @@ impl AppController {
             return;
         }
         self.view.subscriptions.selected_item = index;
+        self.view.selected_detail_link = None;
         let selected_video_id = self
             .selected_subscription_item()
             .and_then(|item| match item {
@@ -15820,16 +16291,20 @@ impl AppController {
                 ApplePodcastsRoute::Direct => {}
             }
         } else if self.view.screen == Screen::Radio {
-            self.radio_selected = self.view.selected;
+            self.radio_filter_query.clone_from(&self.view.search_query);
+            #[cfg(feature = "radio")]
+            self.remember_selected_radio_station();
+            #[cfg(not(feature = "radio"))]
+            {
+                self.radio_selected = self.view.selected;
+            }
         } else if self.view.screen == Screen::TrackerMusic {
             self.tracker_search_query
                 .clone_from(&self.view.search_query);
             self.tracker_selected = self.view.selected;
         }
         #[cfg(feature = "radio")]
-        let selected_radio_station_id = sorted_radio_stations(self.view.radio_sort)
-            .get(self.radio_selected)
-            .map(|station| station.id);
+        let selected_radio_station_id = self.radio_selected_station_id.as_deref();
         #[cfg(feature = "radio")]
         let persisted_radio_selected_row = selected_radio_station_id
             .and_then(|station_id| {
@@ -15860,6 +16335,7 @@ impl AppController {
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
             radio_selected_row: Some(persisted_radio_selected_row),
             radio_selected_station_id,
+            radio_filter_text: self.radio_filter_query.clone(),
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
@@ -15981,16 +16457,11 @@ impl UiController for AppController {
             }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
             UiAction::ShowScreen(screen) => self.show_screen(screen),
-            UiAction::BeginSearch => self.view.search_editing = true,
-            UiAction::CancelSearch => self.view.search_editing = false,
-            UiAction::AppendSearch(character) => self.view.search_query.push(character),
-            UiAction::DeleteSearchCharacter => {
-                self.view.search_query.pop();
-            }
-            UiAction::SubmitSearch => {
-                self.view.search_editing = false;
-                self.submit_search();
-            }
+            UiAction::BeginSearch => self.begin_search_input(),
+            UiAction::CancelSearch => self.cancel_search_input(),
+            UiAction::AppendSearch(character) => self.append_search_input(character),
+            UiAction::DeleteSearchCharacter => self.delete_search_input_character(),
+            UiAction::SubmitSearch => self.submit_search_input(),
             UiAction::ToggleSearchKind => {
                 if self.view.screen != Screen::Search {
                     self.view.status_line =
@@ -16067,12 +16538,14 @@ impl UiController for AppController {
                 self.view.details_focused = false;
                 self.view.details_scroll = 0;
                 self.view.details_text_selection = None;
+                self.view.selected_detail_link = None;
                 self.move_selection(delta);
             }
             UiAction::SelectRow(row) => {
                 self.view.details_focused = false;
                 self.view.details_scroll = 0;
                 self.view.details_text_selection = None;
+                self.view.selected_detail_link = None;
                 self.select_row(row);
             }
             UiAction::ActivateSelection => self.activate_selection(),
@@ -16213,16 +16686,8 @@ impl UiController for AppController {
                 start_seconds,
             } => self.activate_description_video(video_id, start_seconds),
             UiAction::TogglePause => self.player_command(PlayerCommand::TogglePause),
-            UiAction::SeekRelative(seconds) => {
-                if !self.seek_is_unavailable_for_live_radio() {
-                    self.player_command(PlayerCommand::SeekRelative(seconds));
-                }
-            }
-            UiAction::SeekPercent(percent) => {
-                if !self.seek_is_unavailable_for_live_radio() {
-                    self.player_command(PlayerCommand::SeekPercent(percent));
-                }
-            }
+            UiAction::SeekRelative(seconds) => self.seek_relative(seconds),
+            UiAction::SeekPercent(percent) => self.seek_percent(percent),
             UiAction::ChangeVolume(delta) => {
                 let volume = i16::from(self.view.playback.volume)
                     .saturating_add(i16::from(delta))
@@ -16285,6 +16750,7 @@ impl UiController for AppController {
                     };
             }
             UiAction::ShowChannel => self.show_selected_channel(),
+            UiAction::OpenLocalParent => self.open_local_parent(),
             UiAction::GoBack => self.go_back(),
             UiAction::GoForward => self.go_forward(),
             UiAction::OpenInBrowser => self.open_current_in_browser(),
@@ -17173,6 +17639,8 @@ fn provider_worker(
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
     #[cfg(feature = "radio")]
     let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
+    #[cfg(feature = "bbc-radio")]
+    let bbc_live = BbcLiveResolver::new();
     #[cfg(feature = "network")]
     let youtube_channel_page =
         crate::providers::youtube_channel_page::YouTubeChannelPageClient::new();
@@ -17562,6 +18030,26 @@ fn provider_worker(
                             Err("this build omits the `jamendo` feature".to_owned())
                         }
                     }
+                    SourceKind::BbcRadio => {
+                        #[cfg(feature = "bbc-radio")]
+                        {
+                            bbc_station_from_url(&direct.url)
+                                .ok_or_else(|| {
+                                    "the BBC Sounds link is not a stable live-station page"
+                                        .to_owned()
+                                })
+                                .and_then(|station| {
+                                    bbc_live
+                                        .resolve_station(station)
+                                        .map(resolved_bbc_media)
+                                        .map_err(|error| error.to_string())
+                                })
+                        }
+                        #[cfg(not(feature = "bbc-radio"))]
+                        {
+                            Err("this build omits the `bbc-radio` feature".to_owned())
+                        }
+                    }
                     _ => Err("the requested source has no first-class direct resolver".to_owned()),
                 };
                 if responses
@@ -17838,6 +18326,29 @@ fn provider_worker(
                     break;
                 }
             }
+            #[cfg(feature = "bbc-radio")]
+            ProviderRequest::ResolveBbcLive {
+                generation,
+                station_id,
+            } => {
+                let result = bbc_station_by_id(&station_id)
+                    .ok_or_else(|| "the BBC station is not present in this build".to_owned())
+                    .and_then(|station| {
+                        bbc_live
+                            .resolve_station(station)
+                            .map_err(|error| error.to_string())
+                    });
+                if responses
+                    .send(ProviderResponse::BbcLive {
+                        generation,
+                        station_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ProviderRequest::Shutdown => break,
         }
     }
@@ -17963,6 +18474,7 @@ fn resolved_apple_media(
 fn direct_source_label(source: &SourceKind) -> &'static str {
     match source {
         SourceKind::ApplePodcasts => "Apple Podcasts",
+        SourceKind::BbcRadio => "BBC Sounds",
         SourceKind::SoundStream => "SoundStream",
         SourceKind::LitRes => "LitRes",
         SourceKind::Jamendo => "Jamendo",
@@ -17973,8 +18485,29 @@ fn direct_source_label(source: &SourceKind) -> &'static str {
 fn requires_first_class_direct_resolution(source: &SourceKind) -> bool {
     matches!(
         source,
-        SourceKind::SoundStream | SourceKind::LitRes | SourceKind::Jamendo
+        SourceKind::BbcRadio | SourceKind::SoundStream | SourceKind::LitRes | SourceKind::Jamendo
     )
+}
+
+/// Converts one action-scoped BBC manifest into first-class display metadata.
+#[cfg(feature = "bbc-radio")]
+fn resolved_bbc_media(resolution: BbcLiveResolution) -> ResolvedDirectMedia {
+    let station = resolution.station;
+    let quality = format_bbc_quality(&resolution);
+    ResolvedDirectMedia {
+        source: SourceKind::BbcRadio,
+        external_id: station.id.to_owned(),
+        title: station.name.to_owned(),
+        row_subtitle: quality.clone(),
+        description: format!("{}\nQuality: {quality}", station.group.summary()),
+        license: "BBC terms".to_owned(),
+        published: None,
+        artwork_url: None,
+        duration_seconds: None,
+        playback_url: Some(resolution.manifest_url),
+        webpage_url: station.sounds_url().ok(),
+        status_line: "BBC live radio resolved; press Enter to play".to_owned(),
+    }
 }
 
 fn apply_resolved_direct_view(view: &mut ViewModel, media: &ResolvedDirectMedia) {
@@ -18566,7 +19099,6 @@ fn read_local_tags(item: &mut LocalMediaItem) {
     use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
-    use lofty::tag::{Accessor, ItemKey};
 
     if item
         .path
@@ -18574,6 +19106,15 @@ fn read_local_tags(item: &mut LocalMediaItem) {
         .and_then(std::ffi::OsStr::to_str)
         .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
         && read_local_flac_tags(item)
+    {
+        return;
+    }
+    if item
+        .path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+        && read_local_mpeg_tags(item)
     {
         return;
     }
@@ -18596,16 +19137,7 @@ fn read_local_tags(item: &mut LocalMediaItem) {
     (item.container, item.codec) = local_lofty_container_and_codec(tagged.file_type());
 
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        if let Some(title) = trimmed_tag_value(tag.title().as_deref()) {
-            item.title = title;
-        }
-        item.artist = trimmed_tag_value(tag.get_string(ItemKey::TrackArtists))
-            .or_else(|| trimmed_tag_value(tag.artist().as_deref()));
-        item.album = trimmed_tag_value(tag.album().as_deref());
-        item.genre = trimmed_tag_value(tag.genre().as_deref());
-        item.comment = trimmed_tag_value(tag.comment().as_deref());
-        item.metadata_url = local_standard_tag_url(tag);
-        item.acoustid_id = trimmed_tag_value(tag.get_string(ItemKey::AcoustId));
+        apply_local_generic_tag(item, tag);
     }
 }
 
@@ -18637,6 +19169,243 @@ fn local_lofty_container_and_codec(file_type: lofty::file::FileType) -> (String,
 
 #[cfg(not(feature = "local"))]
 fn read_local_tags(_item: &mut LocalMediaItem) {}
+
+/// Reads one MPEG file while retaining the declared encoding of ID3 text frames.
+///
+/// Generic Lofty tags intentionally erase format-specific frame encodings.
+/// Keeping the MPEG representation lets Youta repair a narrowly recognized
+/// Windows-1251-as-Latin-1 display error without changing the source file.
+#[cfg(feature = "local")]
+fn read_local_mpeg_tags(item: &mut LocalMediaItem) -> bool {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::mpeg::MpegFile;
+
+    let Ok(mut file) = std::fs::File::open(&item.path) else {
+        return false;
+    };
+    let options = ParseOptions::new()
+        .read_properties(true)
+        .read_cover_art(false);
+    let Ok(mpeg) = MpegFile::read_from(&mut file, options) else {
+        return false;
+    };
+    let properties = mpeg.properties();
+    item.duration_seconds =
+        (!properties.duration().is_zero()).then(|| properties.duration().as_secs());
+    item.bitrate_kbps = (properties.audio_bitrate() > 0)
+        .then(|| properties.audio_bitrate())
+        .or_else(|| (properties.overall_bitrate() > 0).then(|| properties.overall_bitrate()));
+    item.sample_rate_hz = (properties.sample_rate() > 0).then(|| properties.sample_rate());
+    item.channels = (properties.channels() > 0).then(|| properties.channels());
+    item.container = "MPEG".to_owned();
+    item.codec = "MP3".to_owned();
+
+    if let Some(tag) = mpeg.id3v2() {
+        apply_local_id3v2_tag(item, tag);
+    } else if let Some(tag) = mpeg.id3v1() {
+        apply_local_id3v1_tag(item, tag);
+    } else if let Some(tag) = mpeg.ape() {
+        let generic = tag.clone().into();
+        apply_local_generic_tag(item, &generic);
+    }
+    true
+}
+
+/// Applies ID3v2 fields and repairs only frames explicitly declared Latin-1.
+#[cfg(feature = "local")]
+fn apply_local_id3v2_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v2::Id3v2Tag) {
+    use lofty::tag::{Accessor, ItemKey};
+
+    let generic: lofty::tag::Tag = tag.clone().into();
+
+    if let Some(title) = normalized_local_id3v2_value(
+        generic.title().as_deref(),
+        local_id3v2_text_encoding(tag, "TIT2"),
+    ) {
+        item.title = title;
+    }
+    let artist_encoding = local_id3v2_text_encoding(tag, "TPE1");
+    item.artist =
+        normalized_local_id3v2_value(generic.get_string(ItemKey::TrackArtists), artist_encoding)
+            .or_else(|| normalized_local_id3v2_value(generic.artist().as_deref(), artist_encoding));
+    item.album = normalized_local_id3v2_value(
+        generic.album().as_deref(),
+        local_id3v2_text_encoding(tag, "TALB"),
+    );
+    item.genre = normalized_local_id3v2_value(
+        generic.genre().as_deref(),
+        local_id3v2_text_encoding(tag, "TCON"),
+    );
+    item.comment = normalized_local_id3v2_value(
+        generic.comment().as_deref(),
+        local_id3v2_comment_encoding(tag),
+    );
+
+    apply_local_generic_identifiers(item, &generic);
+}
+
+/// Returns the declared encoding for one ID3v2 text-information frame.
+#[cfg(feature = "local")]
+fn local_id3v2_text_encoding(
+    tag: &lofty::id3::v2::Id3v2Tag,
+    frame_id: &str,
+) -> Option<lofty::TextEncoding> {
+    use lofty::id3::v2::Frame;
+
+    tag.into_iter().find_map(|frame| match frame {
+        Frame::Text(text) if text.id().as_str() == frame_id => Some(text.encoding),
+        _ => None,
+    })
+}
+
+/// Returns the declared encoding of the default ID3v2 comment frame.
+#[cfg(feature = "local")]
+fn local_id3v2_comment_encoding(tag: &lofty::id3::v2::Id3v2Tag) -> Option<lofty::TextEncoding> {
+    use lofty::id3::v2::Frame;
+
+    tag.into_iter().find_map(|frame| match frame {
+        Frame::Comment(comment) if comment.description.is_empty() => Some(comment.encoding),
+        _ => None,
+    })
+}
+
+/// Applies ambiguous ID3v1 fields through the conservative legacy repair.
+#[cfg(feature = "local")]
+fn apply_local_id3v1_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v1::Id3v1Tag) {
+    use lofty::tag::Accessor;
+
+    if let Some(title) = normalized_legacy_windows_1251_value(tag.title.as_deref()) {
+        item.title = title;
+    }
+    item.artist = normalized_legacy_windows_1251_value(tag.artist.as_deref());
+    item.album = normalized_legacy_windows_1251_value(tag.album.as_deref());
+    item.genre = trimmed_tag_value(tag.genre().as_deref());
+    item.comment = normalized_legacy_windows_1251_value(tag.comment.as_deref());
+}
+
+/// Normalizes one ID3v2 value without guessing for Unicode-declared frames.
+#[cfg(feature = "local")]
+fn normalized_local_id3v2_value(
+    value: Option<&str>,
+    encoding: Option<lofty::TextEncoding>,
+) -> Option<String> {
+    if encoding == Some(lofty::TextEncoding::Latin1) {
+        normalized_legacy_windows_1251_value(value)
+    } else {
+        trimmed_tag_value(value)
+    }
+}
+
+/// Repairs a strong Windows-1251-as-Latin-1 signature for display only.
+///
+/// The repair is deliberately restricted to long, Cyrillic-looking words and
+/// never writes metadata back to the media file. Ambiguous short strings and
+/// ordinary accented Latin text retain the exact value supplied by Lofty.
+#[cfg(feature = "local")]
+fn normalized_legacy_windows_1251_value(value: Option<&str>) -> Option<String> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty())?;
+    let bytes = value
+        .chars()
+        .map(|character| u8::try_from(u32::from(character)))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(bytes) = bytes else {
+        return Some(value.to_owned());
+    };
+    let (decoded, had_errors) =
+        encoding_rs::WINDOWS_1251.decode_without_bom_handling(bytes.as_slice());
+    if had_errors || !has_strong_legacy_windows_1251_signature(value, decoded.as_ref()) {
+        return Some(value.to_owned());
+    }
+    Some(decoded.into_owned())
+}
+
+/// Recognizes word-level Cyrillic evidence while rejecting common Latin names.
+#[cfg(feature = "local")]
+fn has_strong_legacy_windows_1251_signature(source: &str, decoded: &str) -> bool {
+    #[derive(Default)]
+    struct WordEvidence {
+        letters: usize,
+        source_high_latin: usize,
+        decoded_cyrillic: usize,
+        cyrillic_vowels: usize,
+        cyrillic_consonants: usize,
+    }
+
+    fn qualifies(word: &WordEvidence, minimum_letters: usize) -> bool {
+        word.letters >= minimum_letters
+            && word.source_high_latin.saturating_mul(5) >= word.letters.saturating_mul(4)
+            && word.decoded_cyrillic.saturating_mul(5) >= word.letters.saturating_mul(4)
+            && word.cyrillic_vowels > 0
+            && word.cyrillic_consonants > 0
+    }
+
+    fn is_cyrillic(character: char) -> bool {
+        matches!(character, '\u{0400}'..='\u{052f}')
+    }
+
+    fn is_cyrillic_vowel(character: char) -> bool {
+        matches!(
+            character,
+            'А' | 'Е'
+                | 'Ё'
+                | 'И'
+                | 'О'
+                | 'У'
+                | 'Ы'
+                | 'Э'
+                | 'Ю'
+                | 'Я'
+                | 'а'
+                | 'е'
+                | 'ё'
+                | 'и'
+                | 'о'
+                | 'у'
+                | 'ы'
+                | 'э'
+                | 'ю'
+                | 'я'
+                | 'І'
+                | 'Ї'
+                | 'Є'
+                | 'і'
+                | 'ї'
+                | 'є'
+        )
+    }
+
+    if source == decoded || source.chars().any(is_cyrillic) {
+        return false;
+    }
+    let mut word = WordEvidence::default();
+    let mut strong_words = 0_usize;
+    let mut medium_words = 0_usize;
+    for (source_character, decoded_character) in
+        source.chars().zip(decoded.chars()).chain([(' ', ' ')])
+    {
+        if decoded_character.is_alphabetic() {
+            word.letters = word.letters.saturating_add(1);
+            word.source_high_latin = word.source_high_latin.saturating_add(usize::from(matches!(
+                source_character,
+                '\u{00c0}'..='\u{00ff}'
+            )));
+            if is_cyrillic(decoded_character) {
+                word.decoded_cyrillic = word.decoded_cyrillic.saturating_add(1);
+                if is_cyrillic_vowel(decoded_character) {
+                    word.cyrillic_vowels = word.cyrillic_vowels.saturating_add(1);
+                } else {
+                    word.cyrillic_consonants = word.cyrillic_consonants.saturating_add(1);
+                }
+            }
+            continue;
+        }
+        strong_words = strong_words.saturating_add(usize::from(qualifies(&word, 6)));
+        medium_words = medium_words.saturating_add(usize::from(qualifies(&word, 4)));
+        word = WordEvidence::default();
+    }
+    strong_words > 0 || medium_words >= 2
+}
 
 #[cfg(feature = "local")]
 fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
@@ -18684,6 +19453,31 @@ fn apply_local_vorbis_comments(item: &mut LocalMediaItem, tag: &lofty::ogg::Vorb
     item.acoustid_id = trimmed_tag_value(tag.get("ACOUSTID_ID"));
 }
 
+/// Applies format-agnostic tags without legacy character-set guessing.
+#[cfg(feature = "local")]
+fn apply_local_generic_tag(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
+    use lofty::tag::{Accessor, ItemKey};
+
+    if let Some(title) = trimmed_tag_value(tag.title().as_deref()) {
+        item.title = title;
+    }
+    item.artist = trimmed_tag_value(tag.get_string(ItemKey::TrackArtists))
+        .or_else(|| trimmed_tag_value(tag.artist().as_deref()));
+    item.album = trimmed_tag_value(tag.album().as_deref());
+    item.genre = trimmed_tag_value(tag.genre().as_deref());
+    item.comment = trimmed_tag_value(tag.comment().as_deref());
+    apply_local_generic_identifiers(item, tag);
+}
+
+/// Applies URL and identifier values without any character-set repair.
+#[cfg(feature = "local")]
+fn apply_local_generic_identifiers(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
+    use lofty::tag::ItemKey;
+
+    item.metadata_url = local_standard_tag_url(tag);
+    item.acoustid_id = trimmed_tag_value(tag.get_string(ItemKey::AcoustId));
+}
+
 #[cfg(feature = "local")]
 fn trimmed_tag_value(value: Option<&str>) -> Option<String> {
     value
@@ -18716,7 +19510,18 @@ fn local_standard_tag_url(tag: &lofty::tag::Tag) -> Option<String> {
         ItemKey::RadioStationUrl,
     ]
     .into_iter()
-    .find_map(|key| trimmed_tag_value(tag.get_string(key)))
+    .find_map(|key| trimmed_tag_value(local_tag_text_or_locator(tag, key)))
+}
+
+/// Reads a generic tag's textual or locator value without altering its bytes.
+///
+/// Lofty represents ID3 URL frames as locators, while `Tag::get_string` only
+/// accepts ordinary text values. Keeping both variants here preserves URLs
+/// when a format-specific ID3v2 tag is converted into a generic tag.
+#[cfg(feature = "local")]
+fn local_tag_text_or_locator(tag: &lofty::tag::Tag, key: lofty::tag::ItemKey) -> Option<&str> {
+    tag.get(key)
+        .and_then(|item| item.value().text().or_else(|| item.value().locator()))
 }
 
 fn local_media_subtitle(item: &LocalMediaItem) -> String {
@@ -19774,6 +20579,79 @@ fn queue_item_from_radio_station(station: &RadioStationPreset) -> Result<QueueIt
     })
 }
 
+/// Adapts one stable BBC Sounds entry to the shared Radio catalogue model.
+///
+/// The `stream` field deliberately retains the credential-free BBC page. A
+/// short-lived geo-specific manifest is resolved only for an explicit playback
+/// action and is passed to the backend outside this persisted model.
+#[cfg(feature = "bbc-radio")]
+fn radio_station_from_bbc(station: BbcStationPreset) -> RadioStationPreset {
+    RadioStationPreset {
+        id: station.id,
+        name: station.name,
+        homepage: station.page,
+        stream: station.page,
+        summary: station.group.summary(),
+        codec: None,
+        bitrate_kbps: None,
+        sample_rate_hz: None,
+        channels: None,
+        stream_kind: RadioStreamKind::BbcSounds,
+        now_playing: None,
+    }
+}
+
+/// Formats public BBC selector metadata without exposing its transient URL.
+#[cfg(feature = "bbc-radio")]
+fn format_bbc_quality(resolution: &BbcLiveResolution) -> String {
+    let codec = resolution.codec.to_ascii_uppercase();
+    let bitrate = resolution.bitrate_kbps.map_or_else(
+        || "bitrate not published".to_owned(),
+        |value| format!("{value} kbps"),
+    );
+    format!(
+        "{codec} · {bitrate} · {} · {}",
+        resolution.transfer_format.label(),
+        resolution.audience.label()
+    )
+}
+
+/// Iterates over every station visible in the Radio tab for this build.
+#[cfg(all(feature = "radio", feature = "bbc-radio"))]
+fn all_stations() -> impl Iterator<Item = RadioStationPreset> {
+    curated_radio_stations().chain(BBC_STATIONS.iter().copied().map(radio_station_from_bbc))
+}
+
+/// Iterates over the non-BBC Radio catalogue in minimal builds.
+#[cfg(all(feature = "radio", not(feature = "bbc-radio")))]
+fn all_stations() -> impl Iterator<Item = RadioStationPreset> {
+    curated_radio_stations()
+}
+
+/// Resolves one visible Radio identifier without contacting its stream.
+#[cfg(all(feature = "radio", feature = "bbc-radio"))]
+fn station_by_id(id: &str) -> Option<RadioStationPreset> {
+    curated_radio_station_by_id(id).or_else(|| bbc_station_by_id(id).map(radio_station_from_bbc))
+}
+
+/// Resolves one non-BBC Radio identifier in minimal builds.
+#[cfg(all(feature = "radio", not(feature = "bbc-radio")))]
+fn station_by_id(id: &str) -> Option<RadioStationPreset> {
+    curated_radio_station_by_id(id)
+}
+
+/// Returns the complete Radio row count for this build.
+#[cfg(all(feature = "radio", feature = "bbc-radio"))]
+fn station_count() -> usize {
+    curated_radio_station_count().saturating_add(BBC_STATIONS.len())
+}
+
+/// Returns the non-BBC Radio row count for minimal builds.
+#[cfg(all(feature = "radio", not(feature = "bbc-radio")))]
+fn station_count() -> usize {
+    curated_radio_station_count()
+}
+
 #[cfg(feature = "radio")]
 fn radio_codec_label(codec: Option<RadioCodec>) -> &'static str {
     match codec {
@@ -19797,7 +20675,7 @@ fn radio_station_row_summary(station: &RadioStationPreset) -> String {
 /// an absent quality claim never outranks an advertised stream.
 #[cfg(feature = "radio")]
 fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
-    let mut stations = RADIO_STATIONS.to_vec();
+    let mut stations: Vec<_> = all_stations().collect();
     stations.sort_by(|left, right| {
         let name_order = || {
             left.name
@@ -19827,6 +20705,51 @@ fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
     stations
 }
 
+/// Returns sorted Radio presets whose stable metadata contains every query term.
+///
+/// Matching is local, case-insensitive, and deliberately excludes transient
+/// now-playing text. Visible quality labels and their raw numeric values make
+/// filters such as `flac`, `aac`, `320`, and `44100 stereo` useful. Stereo is
+/// searchable even though the routine two-channel label is omitted from rows.
+#[cfg(feature = "radio")]
+fn filtered_radio_stations(sort: RadioSort, query: &str) -> Vec<RadioStationPreset> {
+    sorted_radio_stations(sort)
+        .into_iter()
+        .filter(|station| radio_station_matches_filter(station, query))
+        .collect()
+}
+
+/// Checks one Radio preset against whitespace-separated local filter terms.
+#[cfg(feature = "radio")]
+fn radio_station_matches_filter(station: &RadioStationPreset, query: &str) -> bool {
+    let quality = radio_station_quality(station, true);
+    let raw_bitrate = station
+        .bitrate_kbps
+        .map_or_else(String::new, |value| value.to_string());
+    let raw_sample_rate = station
+        .sample_rate_hz
+        .map_or_else(String::new, |value| value.to_string());
+    let raw_channels = station
+        .channels
+        .map_or_else(String::new, |value| value.to_string());
+    let channel_layout = match station.channels {
+        Some(1) => "mono",
+        Some(2) => "stereo",
+        Some(_) => "multichannel",
+        None => "",
+    };
+    let searchable = format!(
+        "{} {} {quality} {raw_bitrate} {raw_sample_rate} {raw_channels} {channel_layout}",
+        station.name, station.summary
+    )
+    .to_lowercase();
+
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .all(|term| searchable.contains(&term))
+}
+
 /// Formats only trustworthy quality attributes supplied by the preset.
 #[cfg(feature = "radio")]
 fn radio_station_quality(station: &RadioStationPreset, include_unknown_bitrate: bool) -> String {
@@ -19847,10 +20770,11 @@ fn radio_station_quality(station: &RadioStationPreset, include_unknown_bitrate: 
             format!("{kilohertz:.1} kHz")
         });
     }
-    if let Some(channels) = station.channels {
+    if let Some(channels) = station.channels
+        && channels != 2
+    {
         parts.push(match channels {
             1 => "mono".to_owned(),
-            2 => "stereo".to_owned(),
             channels => format!("{channels} channels"),
         });
     }
@@ -21237,7 +22161,6 @@ mod tests {
             })
             .expect("fixture Radio station row");
         controller.view.selected = index;
-        controller.radio_selected = index;
         controller.update_radio_detail();
         index
     }
@@ -22188,6 +23111,7 @@ mod tests {
             controller.playlists_route,
             PlaylistsRoute::Entries { .. }
         ));
+        assert!(controller.view.playlist_back_available);
         assert_eq!(controller.view.rows[0].title, "Fixture video");
         assert_eq!(
             controller.current_url().as_deref(),
@@ -22205,6 +23129,7 @@ mod tests {
 
         controller.dispatch(UiAction::GoBack);
         assert_eq!(controller.playlists_route, PlaylistsRoute::Index);
+        assert!(!controller.view.playlist_back_available);
         assert_eq!(controller.view.rows[0].title, "Queue");
     }
 
@@ -28524,6 +29449,180 @@ mod tests {
 
     #[cfg(feature = "local")]
     #[test]
+    fn latin1_declared_id3v2_cyrillic_mojibake_is_repaired_for_display() {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{CommentFrame, Frame, FrameId, Id3v2Tag, TextInformationFrame};
+        use std::borrow::Cow;
+
+        let mut tag = Id3v2Tag::new();
+        for (frame_id, value) in [
+            ("TIT2", "Ïèñüìî 4"),
+            ("TPE1", "Ñâÿòèòåëü Èîàíí Çëàòîóñò"),
+            ("TALB", "Ïèñüìà äèàêîíèññå Îëèìïèàäå"),
+        ] {
+            let _ = tag.insert(Frame::Text(TextInformationFrame::new(
+                FrameId::Valid(Cow::Owned(frame_id.to_owned())),
+                TextEncoding::Latin1,
+                value.to_owned(),
+            )));
+        }
+        let _ = tag.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::Latin1,
+            *b"rus",
+            "",
+            "êîëëåêöèÿ www.predanie.ru",
+        )));
+        let mut item = local_media_item_stub(PathBuf::from("/tmp/mock.mp3"), Some(0));
+
+        apply_local_id3v2_tag(&mut item, &tag);
+
+        assert_eq!(item.title, "Письмо 4");
+        assert_eq!(item.artist.as_deref(), Some("Святитель Иоанн Златоуст"));
+        assert_eq!(item.album.as_deref(), Some("Письма диакониссе Олимпиаде"));
+        assert_eq!(item.comment.as_deref(), Some("коллекция www.predanie.ru"));
+        let description = local_media_description(&item);
+        assert!(description.contains("Artists: Святитель Иоанн Златоуст"));
+        assert!(description.contains("Album: Письма диакониссе Олимпиаде"));
+        assert!(description.contains("Comment: коллекция www.predanie.ru"));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn unicode_declared_id3_and_valid_latin_metadata_are_not_repaired() {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{CommentFrame, Frame, FrameId, Id3v2Tag, TextInformationFrame};
+        use std::borrow::Cow;
+
+        let mut tag = Id3v2Tag::new();
+        for (frame_id, encoding, value) in [
+            ("TIT2", TextEncoding::UTF8, "Ïèñüìî 4"),
+            ("TPE1", TextEncoding::UTF16, "Ñâÿòèòåëü Èîàíí Çëàòîóñò"),
+            ("TALB", TextEncoding::UTF16BE, "Ïèñüìà äèàêîíèññå Îëèìïèàäå"),
+        ] {
+            let _ = tag.insert(Frame::Text(TextInformationFrame::new(
+                FrameId::Valid(Cow::Owned(frame_id.to_owned())),
+                encoding,
+                value.to_owned(),
+            )));
+        }
+        let _ = tag.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            "",
+            "êîëëåêöèÿ www.predanie.ru",
+        )));
+        let mut item = local_media_item_stub(PathBuf::from("/tmp/mock.mp3"), Some(0));
+
+        apply_local_id3v2_tag(&mut item, &tag);
+
+        assert_eq!(item.title, "Ïèñüìî 4");
+        assert_eq!(item.artist.as_deref(), Some("Ñâÿòèòåëü Èîàíí Çëàòîóñò"));
+        assert_eq!(item.album.as_deref(), Some("Ïèñüìà äèàêîíèññå Îëèìïèàäå"));
+        assert_eq!(item.comment.as_deref(), Some("êîëëåêöèÿ www.predanie.ru"));
+
+        for value in [
+            "Björk",
+            "François",
+            "Beyoncé",
+            "Motörhead",
+            "Sigur Rós",
+            "Café del Mar",
+            "Письмо 4",
+            "https://predanie.ru/письмо",
+            "39e08d1e-ce43-465f-a802-041995e9d150",
+        ] {
+            assert_eq!(
+                normalized_legacy_windows_1251_value(Some(value)).as_deref(),
+                Some(value),
+                "{value:?} must retain its declared display text"
+            );
+        }
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn id3v2_keeps_generic_artist_url_and_acoustid_semantics() {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{
+            ExtendedTextFrame, Frame, FrameId, Id3v2Tag, TextInformationFrame, UrlLinkFrame,
+        };
+        use std::borrow::Cow;
+
+        let mut tag = Id3v2Tag::new();
+        let _ = tag.insert(Frame::Text(TextInformationFrame::new(
+            FrameId::Valid(Cow::Borrowed("TPE1")),
+            TextEncoding::Latin1,
+            "Ïåðâûé\0Âòîðîé",
+        )));
+        let _ = tag.insert(Frame::Url(UrlLinkFrame::new(
+            FrameId::Valid(Cow::Borrowed("WOAF")),
+            "https://artist.example/Ïèñüìî",
+        )));
+        let _ = tag.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::Latin1,
+            "Acoustid Id",
+            "39e08d1e-ce43-465f-a802-041995e9d150",
+        )));
+        let mut item = local_media_item_stub(PathBuf::from("/tmp/mock.mp3"), Some(0));
+
+        apply_local_id3v2_tag(&mut item, &tag);
+
+        assert_eq!(
+            item.artist.as_deref(),
+            Some("Первый"),
+            "the MPEG adapter must preserve the generic tag's first-artist behavior"
+        );
+        assert_eq!(
+            item.metadata_url.as_deref(),
+            Some("https://artist.example/Ïèñüìî"),
+            "URL frames are locators and must never pass through legacy text repair"
+        );
+        assert_eq!(
+            item.acoustid_id.as_deref(),
+            Some("39e08d1e-ce43-465f-a802-041995e9d150")
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn id3v1_is_conservatively_repaired_but_vorbis_utf8_is_not() {
+        let mut id3v1 = lofty::id3::v1::Id3v1Tag {
+            title: Some("Ïèñüìî 4".to_owned()),
+            artist: Some("Ñâÿòèòåëü Èîàíí Çëàòîóñò".to_owned()),
+            album: Some("Ïèñüìà äèàêîíèññå Îëèìïèàäå".to_owned()),
+            comment: Some("êîëëåêöèÿ www.predanie.ru".to_owned()),
+            ..lofty::id3::v1::Id3v1Tag::default()
+        };
+        let mut id3_item = local_media_item_stub(PathBuf::from("/tmp/id3v1.mp3"), Some(0));
+
+        apply_local_id3v1_tag(&mut id3_item, &id3v1);
+
+        assert_eq!(id3_item.title, "Письмо 4");
+        assert_eq!(id3_item.artist.as_deref(), Some("Святитель Иоанн Златоуст"));
+        assert_eq!(
+            id3_item.album.as_deref(),
+            Some("Письма диакониссе Олимпиаде")
+        );
+        assert_eq!(
+            id3_item.comment.as_deref(),
+            Some("коллекция www.predanie.ru")
+        );
+
+        id3v1.title = Some("Björk".to_owned());
+        apply_local_id3v1_tag(&mut id3_item, &id3v1);
+        assert_eq!(id3_item.title, "Björk");
+
+        let mut vorbis = lofty::ogg::VorbisComments::new();
+        vorbis.push("TITLE".to_owned(), "Ïèñüìî 4".to_owned());
+        vorbis.push("ARTIST".to_owned(), "Björk".to_owned());
+        let mut vorbis_item = local_media_item_stub(PathBuf::from("/tmp/vorbis.flac"), Some(0));
+        apply_local_vorbis_comments(&mut vorbis_item, &vorbis);
+        assert_eq!(vorbis_item.title, "Ïèñüìî 4");
+        assert_eq!(vorbis_item.artist.as_deref(), Some("Björk"));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
     fn local_vorbis_metadata_maps_human_fields_and_identifiers() {
         let mut item = LocalMediaItem {
             path: PathBuf::from("/tmp/mock.flac"),
@@ -28633,6 +29732,112 @@ mod tests {
                 .get(controller.view.selected)
                 .map(|row| row.title.as_str()),
             Some("album")
+        );
+    }
+
+    #[test]
+    fn local_parent_action_ascends_from_any_selected_row_and_reselects_the_child() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let child = fixture.path().join("album");
+        std::fs::create_dir(&child).expect("create child folder");
+        std::fs::write(child.join("track.flac"), b"fixture").expect("create Local media fixture");
+        let child_listing = crate::local_browser::list_local_directory(
+            &child,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("child listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.config.ui.show_local_folder_sizes = false;
+        controller.view.local_folder_sizes_enabled = false;
+        controller.local_listing = Some(child_listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = 1;
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .get(controller.view.selected)
+                .map(|row| row.title.as_str()),
+            Some("track.flac"),
+            "the dedicated action must not depend on selecting the synthetic parent row"
+        );
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.dispatch(UiAction::OpenLocalParent);
+
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+        } = captured.try_recv().expect("parent browse request")
+        else {
+            panic!("expected Local parent browse request");
+        };
+        assert_eq!(directory, fixture.path());
+        assert_eq!(preferred_child.as_deref(), Some(child.as_path()));
+        let parent_listing = crate::local_browser::list_local_directory_with_preferred_child(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+        )
+        .expect("parent listing");
+        controller.handle_local_browse_response(LocalBrowseResponse::Browse {
+            generation,
+            result: Ok(parent_listing),
+        });
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(child.as_path())
+        );
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .get(controller.view.selected)
+                .map(|row| row.title.as_str()),
+            Some("album")
+        );
+    }
+
+    #[test]
+    fn local_parent_action_is_bounded_at_root_and_while_navigation_is_pending() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+            path: PathBuf::from("/"),
+            parent: None,
+            entries: Vec::new(),
+            truncated: false,
+            inspected_entries: 0,
+        });
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.dispatch(UiAction::OpenLocalParent);
+
+        assert_eq!(
+            controller.view.status_line,
+            "Already at the filesystem root"
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "root navigation must not start a directory request"
+        );
+
+        controller.local_listing = None;
+        controller.view.local_browse_pending = true;
+        controller.dispatch(UiAction::OpenLocalParent);
+
+        assert_eq!(
+            controller.view.status_line,
+            "Wait for the Local folder to finish loading"
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "a pending Local route must not start a duplicate request"
         );
     }
 
@@ -30059,6 +31264,58 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_and_filtered_selection_survive_restart_by_station_id() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::Radio);
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "flac".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+        controller.dispatch(UiAction::SubmitSearch);
+        select_radio_station(&mut controller, "sector-radio-progressive-flac");
+        assert!(controller.save_session());
+        let saved = controller
+            .store
+            .session()
+            .expect("saved session")
+            .expect("active session");
+        let canonical_name_row = sorted_radio_stations(RadioSort::Name)
+            .iter()
+            .position(|station| station.id == "sector-radio-progressive-flac")
+            .expect("Sector Radio in canonical catalogue");
+        assert_eq!(saved.radio_filter_text, "flac");
+        assert_eq!(
+            saved.radio_selected_station_id.as_deref(),
+            Some("sector-radio-progressive-flac")
+        );
+        assert_eq!(saved.radio_selected_row, Some(canonical_name_row));
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let restored = AppController::new(config, store, None, None);
+
+        assert_eq!(restored.view.screen, Screen::Radio);
+        assert_eq!(restored.view.search_query, "flac");
+        assert_eq!(restored.radio_filter_query, "flac");
+        assert!(restored.view.rows.iter().all(|row| {
+            let station = row
+                .media_id
+                .as_ref()
+                .and_then(|media_id| station_by_id(&media_id.external_id))
+                .expect("restored filtered row");
+            radio_station_matches_filter(&station, "flac")
+        }));
+        assert_eq!(
+            restored.selected_radio_station().map(|station| station.id),
+            Some("sector-radio-progressive-flac")
+        );
+    }
+
     #[test]
     fn timecode_seek_and_back_use_absolute_backend_commands_and_bounded_chapters() {
         let (mut controller, state) = controller_with_mock_statuses([]);
@@ -30772,6 +32029,20 @@ mod tests {
         queue_item_from_radio_station(&station).expect("valid built-in radio station")
     }
 
+    /// Builds an action-scoped BBC selector result without network access.
+    #[cfg(feature = "bbc-radio")]
+    fn fixture_bbc_resolution(id: &str, manifest: &str) -> BbcLiveResolution {
+        BbcLiveResolution {
+            station: bbc_station_by_id(id).expect("fixture BBC station"),
+            manifest_url: url::Url::parse(manifest).expect("fixture BBC manifest"),
+            bitrate_kbps: Some(320),
+            codec: "aac".to_owned(),
+            mime_type: "audio/mp4".to_owned(),
+            transfer_format: crate::providers::bbc::BbcTransferFormat::Hls,
+            audience: crate::providers::bbc::BbcAudience::International,
+        }
+    }
+
     fn fixture_youtube_item(name: &str) -> QueueItem {
         let mut video = subscription_video_summary();
         video.title = name.to_owned();
@@ -31086,6 +32357,7 @@ mod tests {
             .as_mut()
             .expect("first details")
             .thumbnail_expanded = true;
+        controller.view.selected_detail_link = Some(0);
 
         controller.dispatch(UiAction::SelectRow(1));
 
@@ -31095,6 +32367,10 @@ mod tests {
             Some(&MediaId::new(SourceKind::YouTube, &second.video_id))
         );
         assert!(!details.thumbnail_expanded);
+        assert_eq!(
+            controller.view.selected_detail_link, None,
+            "external-link selection must not leak into a different media item"
+        );
     }
 
     #[test]
@@ -33338,7 +34614,7 @@ mod tests {
 
         controller.show_screen(Screen::Radio);
 
-        assert_eq!(controller.view.rows.len(), RADIO_STATIONS.len());
+        assert_eq!(controller.view.rows.len(), station_count());
         assert!(controller.view.rows.iter().all(|row| row.compact));
         assert!(
             controller
@@ -33357,14 +34633,15 @@ mod tests {
         let sector_index = select_radio_station(&mut controller, "sector-radio-progressive-flac");
         assert_eq!(
             controller.view.rows[sector_index].subtitle,
-            "FLAC · 44.1 kHz · stereo"
+            "FLAC · 44.1 kHz"
         );
         let details = controller.view.details.as_ref().expect("radio details");
         assert!(
             details
                 .description
-                .contains("Quality: FLAC · bitrate unknown · 44.1 kHz · stereo")
+                .contains("Quality: FLAC · bitrate unknown · 44.1 kHz")
         );
+        assert!(!details.description.contains("stereo"));
         assert!(
             details
                 .description
@@ -33373,6 +34650,218 @@ mod tests {
         assert!(details.length.is_empty());
         assert!(details.likes.is_empty());
         assert!(details.views.is_empty());
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn radio_catalogue_includes_every_stable_bbc_station_without_a_manifest() {
+        let stations = all_stations().collect::<Vec<_>>();
+
+        assert_eq!(
+            stations.len(),
+            curated_radio_station_count() + BBC_STATIONS.len()
+        );
+        for bbc in BBC_STATIONS {
+            let station = stations
+                .iter()
+                .find(|station| station.id == bbc.id)
+                .unwrap_or_else(|| panic!("BBC station {} is absent from Radio", bbc.id));
+            assert_eq!(station.name, bbc.name);
+            assert_eq!(station.homepage, bbc.page);
+            assert_eq!(station.stream, bbc.page);
+            assert_eq!(station.stream_kind, RadioStreamKind::BbcSounds);
+            assert_eq!(station.codec, None);
+            assert_eq!(station.bitrate_kbps, None);
+        }
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn pasted_bbc_station_selects_radio_without_resolving_a_manifest() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        let station = bbc_station_by_id("bbc_radio_three").expect("BBC fixture");
+
+        controller.open_direct_source(DirectSourceInput {
+            url: station.sounds_url().expect("BBC fixture URL"),
+            source: SourceKind::BbcRadio,
+        });
+
+        assert_eq!(controller.view.screen, Screen::Radio);
+        assert_eq!(
+            controller
+                .selected_radio_station()
+                .map(|selected| selected.id),
+            Some(station.id)
+        );
+        assert!(controller.resolved_direct.is_none());
+        assert!(controller.pending_bbc_playback.is_none());
+        assert!(captured_requests.try_recv().is_err());
+        assert!(playback.lock().expect("mock playback").played.is_empty());
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn bbc_playback_uses_one_ram_only_manifest_then_resolves_fresh_again() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "bbc_radio_three");
+        let item = fixture_radio_item("bbc_radio_three");
+
+        controller.play_queue_item(item.clone(), false);
+
+        let ProviderRequest::ResolveBbcLive {
+            generation: first_generation,
+            station_id,
+        } = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("BBC manifest request")
+        else {
+            panic!("expected a BBC live request");
+        };
+        assert!(playback.lock().expect("mock playback").played.is_empty());
+        controller.handle_bbc_live(
+            first_generation,
+            station_id.clone(),
+            Ok(fixture_bbc_resolution(
+                &station_id,
+                "https://audio.example.test/radio-three.m3u8",
+            )),
+        );
+
+        {
+            let playback = playback.lock().expect("mock playback");
+            assert_eq!(playback.played.len(), 1);
+            assert_eq!(
+                playback.played[0].location,
+                "https://audio.example.test/radio-three.m3u8"
+            );
+            assert!(playback.played[0].bypass_ytdl);
+        }
+        assert_eq!(
+            controller
+                .bbc_quality_cache
+                .get(&station_id)
+                .map(String::as_str),
+            Some("AAC · 320 kbps · HLS · international")
+        );
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details
+                .description
+                .contains("Quality: AAC · 320 kbps · HLS · international")
+        }));
+
+        controller.play_queue_item(item, false);
+        let second_generation = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fresh BBC manifest request")
+        {
+            ProviderRequest::ResolveBbcLive {
+                generation,
+                station_id: second_station,
+            } => {
+                assert_eq!(second_station, station_id);
+                generation
+            }
+            _ => panic!("expected another BBC live request"),
+        };
+        assert_ne!(second_generation, first_generation);
+        assert_eq!(
+            playback.lock().expect("mock playback").played.len(),
+            1,
+            "cached quality must never replay the earlier signed manifest"
+        );
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn bbc_manifest_error_opens_diagnostics_without_starting_playback() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        use_mock_diagnostics(&mut controller);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.play_queue_item(fixture_radio_item("bbc_radio_fourfm"), false);
+        let ProviderRequest::ResolveBbcLive {
+            generation,
+            station_id,
+        } = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("BBC manifest request")
+        else {
+            panic!("expected a BBC live request");
+        };
+
+        controller.handle_bbc_live(
+            generation,
+            station_id,
+            Err("BBC fixture is geo-restricted".to_owned()),
+        );
+
+        assert!(controller.pending_bbc_playback.is_none());
+        assert!(!controller.view.playback_starting);
+        assert!(playback.lock().expect("mock playback").played.is_empty());
+        let popup = controller.view.error_popup.as_ref().expect("error popup");
+        assert_eq!(popup.title, "BBC Radio playback failed");
+        assert!(popup.report.contains("BBC fixture is geo-restricted"));
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn superseded_bbc_manifest_cannot_start_the_previous_station() {
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.play_queue_item(fixture_radio_item("bbc_radio_one"), false);
+        let first = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first BBC request");
+        controller.play_queue_item(fixture_radio_item("bbc_radio_two"), false);
+        let second = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second BBC request");
+        let ProviderRequest::ResolveBbcLive {
+            generation: first_generation,
+            station_id: first_station,
+        } = first
+        else {
+            panic!("expected first BBC request");
+        };
+        let ProviderRequest::ResolveBbcLive {
+            generation: second_generation,
+            station_id: second_station,
+        } = second
+        else {
+            panic!("expected second BBC request");
+        };
+
+        controller.handle_bbc_live(
+            first_generation,
+            first_station.clone(),
+            Ok(fixture_bbc_resolution(
+                &first_station,
+                "https://audio.example.test/stale.m3u8",
+            )),
+        );
+        assert!(playback.lock().expect("mock playback").played.is_empty());
+        assert!(controller.view.error_popup.is_none());
+
+        controller.handle_bbc_live(
+            second_generation,
+            second_station.clone(),
+            Ok(fixture_bbc_resolution(
+                &second_station,
+                "https://audio.example.test/current.m3u8",
+            )),
+        );
+        let playback = playback.lock().expect("mock playback");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(
+            playback.played[0].location,
+            "https://audio.example.test/current.m3u8"
+        );
     }
 
     #[cfg(feature = "radio")]
@@ -33390,6 +34879,238 @@ mod tests {
         for (codec, label) in expected {
             assert_eq!(radio_codec_label(codec), label);
         }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_matches_name_summary_format_bitrate_and_audio_layout() {
+        let mut station = RADIO_STATIONS[0];
+        station.name = "Fixture Aurora";
+        station.summary = "Mystic mantra and ambient soundscapes";
+        station.codec = Some(RadioCodec::Flac);
+        station.bitrate_kbps = Some(320);
+        station.sample_rate_hz = Some(44_100);
+        station.channels = Some(2);
+
+        for query in [
+            "fixture",
+            "AURORA",
+            "mystic",
+            "mantra ambient",
+            "flac",
+            "320",
+            "320 FLAC",
+            "44.1 kHz",
+            "44100 stereo",
+            "  mantra   320  ",
+        ] {
+            assert!(
+                radio_station_matches_filter(&station, query),
+                "stable Radio metadata must match {query:?}"
+            );
+        }
+
+        station.codec = Some(RadioCodec::Mp3);
+        assert!(radio_station_matches_filter(&station, "mp3 320"));
+        assert_eq!(
+            radio_station_quality(&station, false),
+            "MP3 · 320 kbps · 44.1 kHz",
+            "routine stereo streams should not repeat a low-value label"
+        );
+        station.codec = Some(RadioCodec::Aac);
+        assert!(radio_station_matches_filter(&station, "aac 320"));
+        assert!(!radio_station_matches_filter(&station, "flac"));
+        assert!(!radio_station_matches_filter(&station, "speech"));
+
+        station.channels = Some(1);
+        assert!(
+            radio_station_quality(&station, false).ends_with(" · mono"),
+            "the exceptional mono layout remains useful"
+        );
+
+        let npr = station_by_id("npr-514afffd028e455fb0f5b35301f9afc5")
+            .expect("generated KQED NPR search fixture");
+        for query in ["kqed", "san francisco", "ca", "npr member"] {
+            assert!(
+                radio_station_matches_filter(&npr, query),
+                "generated NPR station metadata must match {query:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_updates_after_each_character_and_backspace() {
+        let config = Config::for_dir("/tmp/youta-radio-live-filter-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        let complete_count = controller.view.rows.len();
+
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "flac".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+            let expected =
+                filtered_radio_stations(controller.view.radio_sort, &controller.view.search_query);
+            assert_eq!(
+                controller.view.rows.len(),
+                expected.len(),
+                "each typed character must rebuild the visible Radio rows"
+            );
+            assert!(controller.view.search_editing);
+        }
+        assert!(!controller.view.rows.is_empty());
+        assert!(controller.view.rows.len() < complete_count);
+        assert!(controller.view.rows.iter().all(|row| {
+            let station = row
+                .media_id
+                .as_ref()
+                .and_then(|media_id| station_by_id(&media_id.external_id))
+                .expect("filtered Radio row");
+            radio_station_matches_filter(&station, "flac")
+        }));
+
+        for expected_query in ["fla", "fl", "f", ""] {
+            controller.dispatch(UiAction::DeleteSearchCharacter);
+            assert_eq!(controller.view.search_query, expected_query);
+            assert_eq!(
+                controller.view.rows.len(),
+                filtered_radio_stations(controller.view.radio_sort, expected_query).len(),
+                "Backspace must broaden the filter immediately"
+            );
+        }
+        assert_eq!(controller.view.rows.len(), complete_count);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_cancel_restores_query_selection_and_details() {
+        let config = Config::for_dir("/tmp/youta-radio-filter-cancel-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "sector-radio-progressive-flac");
+
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "aac".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+        assert!(controller.view.rows.iter().all(|row| !row.title.is_empty()));
+        assert_ne!(
+            controller
+                .selected_radio_station()
+                .map(|station| station.id),
+            Some("sector-radio-progressive-flac")
+        );
+
+        controller.dispatch(UiAction::CancelSearch);
+
+        assert!(!controller.view.search_editing);
+        assert!(controller.view.search_query.is_empty());
+        assert_eq!(controller.view.rows.len(), station_count());
+        assert_eq!(
+            controller
+                .selected_radio_station()
+                .map(|station| station.id),
+            Some("sector-radio-progressive-flac")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("sector-radio-progressive-flac")
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_accepts_locally_and_clears_stale_details_on_no_match() {
+        let config = Config::for_dir("/tmp/youta-radio-filter-submit-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+
+        controller.dispatch(UiAction::BeginSearch);
+        controller.dispatch(UiAction::AppendSearch('🦀'));
+        assert!(controller.view.rows.is_empty());
+        assert!(controller.view.details.is_none());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("No public radio stations")
+        );
+
+        controller.dispatch(UiAction::SubmitSearch);
+
+        assert!(!controller.view.search_editing);
+        assert_eq!(controller.view.search_query, "🦀");
+        assert_eq!(controller.radio_filter_query, "🦀");
+        assert!(controller.view.rows.is_empty());
+        assert!(!controller.view.status_line.contains("not available"));
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_and_youtube_query_remain_independent_between_tabs() {
+        let config = Config::for_dir("/tmp/youta-radio-independent-filter-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.search_query = "documentary".to_owned();
+
+        controller.show_screen(Screen::Radio);
+        assert!(controller.view.search_query.is_empty());
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "flac".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+        controller.dispatch(UiAction::SubmitSearch);
+
+        controller.show_screen(Screen::Search);
+        assert_eq!(controller.view.search_query, "documentary");
+        controller.show_screen(Screen::Radio);
+        assert_eq!(controller.view.search_query, "flac");
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| row.subtitle.to_lowercase().contains("flac"))
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn tab_switch_accepts_the_live_radio_filter_and_closes_its_editor() {
+        let config = Config::for_dir("/tmp/youta-radio-tab-filter-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "flac".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+
+        assert!(controller.view.search_editing);
+        assert!(controller.radio_filter_edit_snapshot.is_some());
+        controller.dispatch(UiAction::ShowScreen(Screen::Search));
+
+        assert!(!controller.view.search_editing);
+        assert!(controller.radio_filter_edit_snapshot.is_none());
+        assert_eq!(controller.radio_filter_query, "flac");
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Radio));
+        assert_eq!(controller.view.search_query, "flac");
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| row.subtitle.to_lowercase().contains("flac"))
+        );
     }
 
     #[cfg(feature = "radio")]
@@ -33434,6 +35155,9 @@ mod tests {
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
         controller.show_screen(Screen::Radio);
+        controller.radio_filter_query = "radio".to_owned();
+        controller.view.search_query = "radio".to_owned();
+        controller.populate_radio();
         select_radio_station(&mut controller, "4duk-radio");
 
         for expected_sort in [
@@ -33450,6 +35174,14 @@ mod tests {
                     .map(|media_id| media_id.external_id.as_str()),
                 Some("4duk-radio")
             );
+            assert!(controller.view.rows.iter().all(|row| {
+                let station = row
+                    .media_id
+                    .as_ref()
+                    .and_then(|media_id| station_by_id(&media_id.external_id))
+                    .expect("sorted filtered Radio row");
+                radio_station_matches_filter(&station, "radio")
+            }));
         }
     }
 
@@ -33739,9 +35471,13 @@ mod tests {
 
     #[cfg(feature = "radio")]
     #[test]
-    fn radio_backend_timeline_is_normalized_to_non_seekable_live_state() {
+    fn radio_backend_timeline_uses_only_the_exact_cached_rewind_range() {
         let bogus_position = Duration::from_secs(8_641_222);
         let bogus_duration = Duration::from_secs(8_641_235);
+        let absolute_range = crate::playback::BufferedRange {
+            start: Duration::from_secs(8_641_000),
+            end: bogus_duration,
+        };
         let backend_status = PlaybackStatus {
             idle: false,
             live: false,
@@ -33749,10 +35485,7 @@ mod tests {
             duration: Some(bogus_duration),
             paused: false,
             chapter: Some(7),
-            buffered_ranges: vec![crate::playback::BufferedRange {
-                start: Duration::from_secs(8_641_000),
-                end: bogus_duration,
-            }],
+            buffered_ranges: vec![absolute_range],
             ..PlaybackStatus::default()
         };
         let (mut controller, _state, _statuses, _events) = controller_with_mock_lifecycle(
@@ -33768,13 +35501,77 @@ mod tests {
         controller.update_player();
 
         assert!(controller.view.playback.live);
-        assert_eq!(controller.view.playback.position, Duration::ZERO);
-        assert_eq!(controller.view.playback.duration, None);
+        assert_eq!(controller.view.playback.position, Duration::from_secs(222));
+        assert_eq!(
+            controller.view.playback.duration,
+            Some(Duration::from_secs(235))
+        );
+        assert_eq!(
+            controller.view.playback.live_seekable_range,
+            Some(absolute_range)
+        );
         assert_eq!(controller.view.playback.chapter, None);
-        assert!(controller.view.playback.buffered_ranges.is_empty());
+        assert_eq!(
+            controller.view.playback.buffered_ranges,
+            vec![crate::playback::BufferedRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(235),
+            }]
+        );
         assert_eq!(
             controller.view.playback.title.as_deref(),
             Some("4duk Radio")
+        );
+    }
+
+    #[test]
+    fn live_rewind_range_is_recent_bounded_and_requires_the_current_interval() {
+        let position = Duration::from_hours(10 * 24);
+        let end = position.saturating_add(Duration::from_secs(10));
+        let selected = live_seekable_range(
+            position,
+            &[
+                BufferedRange {
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(2),
+                },
+                BufferedRange {
+                    start: Duration::ZERO,
+                    end,
+                },
+            ],
+        )
+        .expect("current live cache range");
+
+        assert_eq!(
+            selected.end.saturating_sub(selected.start),
+            MAX_LIVE_SEEK_WINDOW
+        );
+        assert!(selected.start < position);
+        assert!(position <= selected.end);
+        assert_eq!(
+            live_seekable_range(
+                Duration::from_mins(1),
+                &[BufferedRange {
+                    start: Duration::from_mins(1),
+                    end: Duration::from_secs(90),
+                }]
+            ),
+            Some(BufferedRange {
+                start: Duration::from_mins(1),
+                end: Duration::from_secs(90),
+            }),
+            "seeking to the first cached timestamp must not hide the live seek bar"
+        );
+        assert!(
+            live_seekable_range(
+                Duration::from_secs(50),
+                &[BufferedRange {
+                    start: Duration::from_mins(1),
+                    end: Duration::from_secs(90),
+                }]
+            )
+            .is_none()
         );
     }
 
@@ -33835,6 +35632,35 @@ mod tests {
         );
         assert!(controller.view.error_popup.is_none());
         assert!(!controller.view.repeating);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn live_radio_seek_commands_are_absolute_and_clamped_to_the_cached_range() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_radio_item("4duk-radio"), false);
+        controller.view.playback.live = true;
+        controller.view.playback.position = Duration::from_secs(60);
+        controller.view.playback.duration = Some(Duration::from_secs(120));
+        controller.view.playback.live_seekable_range = Some(BufferedRange {
+            start: Duration::from_secs(1_000),
+            end: Duration::from_secs(1_120),
+        });
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::SeekRelative(-80));
+        controller.dispatch(UiAction::SeekRelative(500));
+        controller.dispatch(UiAction::SeekPercent(25.0));
+
+        assert_eq!(
+            state.lock().expect("mock state").commands,
+            [
+                PlayerCommand::SeekAbsolute(Duration::from_secs(1_000)),
+                PlayerCommand::SeekAbsolute(Duration::from_millis(1_119_999)),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(1_030)),
+            ]
+        );
+        assert!(controller.view.error_popup.is_none());
     }
 
     #[cfg(feature = "radio")]
@@ -34155,6 +35981,8 @@ mod tests {
         controller.view.radio_now_playing = Some("Track: Artist — Title".to_owned());
         controller.view.screen = Screen::History;
         controller.view.selected = 0;
+        controller.radio_filter_query = "flac".to_owned();
+        controller.view.search_query = "stale History query".to_owned();
 
         controller.show_now_playing();
 
@@ -34169,6 +35997,8 @@ mod tests {
             })
             .expect("4duk row");
         assert_eq!(controller.view.screen, Screen::Radio);
+        assert!(controller.radio_filter_query.is_empty());
+        assert!(controller.view.search_query.is_empty());
         assert_eq!(controller.view.selected, expected);
         assert_eq!(controller.radio_selected, expected);
         assert_eq!(

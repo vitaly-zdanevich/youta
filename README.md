@@ -43,9 +43,14 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   authoritative. Recursive folder sizes are enabled by default, calculated
   asynchronously one folder at a time, and never follow symbolic links. `[Z]`
   cycles size sorting off, ascending, and descending; unknown folders remain
-  after known sizes. Selecting media shows filename metadata immediately while
+  after known sizes. `Enter` opens a folder, `Esc` returns to its parent while
+  reselecting the folder just left, and `PageUp`/`PageDown` move by the visible
+  Local page. Selecting media shows filename metadata immediately while
   tags and bounded `ffprobe` codec/container details load off the TUI thread;
   completed records remain in a fixed-size RAM cache for fast revisits.
+  A conservative display-only fallback repairs strong Windows-1251 text that
+  legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
+  are never rewritten.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. Youta does not attempt thumbnail
@@ -162,10 +167,15 @@ resolver:
   `yt-dlp`. Rich Vimeo search requires a registered application and a Vimeo API
   token; it is a later adapter. Youta does not assume a stable public RuTube
   catalog API.
-- **BBC Radio** accepts BBC Sounds landing URLs through `yt-dlp` and imports
-  official BBC podcast/RSS feeds through the RSS provider. Youta does not claim
-  a stable public BBC Sounds catalog API. Its `bbc-radio` build feature is
-  independent from the curated `radio` feature.
+- **BBC Radio** adds the stable services exposed by the public
+  [BBC Sounds station directory](https://www.bbc.co.uk/sounds/stations) to the
+  Radio tab. On each explicit Play action, Youta reads the public station page,
+  asks BBC Media Selector for the highest HTTPS HLS or DASH audio profile
+  offered to the current region, and passes that action-scoped manifest
+  directly to `mpv`. Playback tokens and manifests stay in RAM and are not
+  reused for a later Play action or persisted. BBC podcast feeds remain
+  importable through RSS/OPML. The `bbc-radio` feature enables the shared
+  `radio` feature.
 - **SoundCloud** accepts direct URLs through `yt-dlp`. Rich search and
   subscriptions use the official API only when users provide their own
   application credentials; the API uses OAuth 2.1. See the [SoundCloud API
@@ -206,99 +216,75 @@ resolver:
 The default build includes a separate **Radio** tab. Its catalogue is compiled
 into Youta, needs no account, and performs no directory request at startup.
 `Enter` sends the selected live stream directly to the normal invisible `mpv`
-backend. Live streams do not restore or save a playback position; seeking and
-repeat are disabled. They remain marker-free as
+backend. Live streams do not restore or save a playback position. When `mpv`
+reports a cached seekable range, Youta shows that rolling buffer as a bounded
+seek bar: mouse clicks, left/right, and number keys seek only inside bytes
+already retained by `mpv`. A station without a reported cache range stays
+non-seekable, and synthetic multi-day stream timestamps are never displayed.
+Repeat remains disabled. Live streams remain marker-free as
 `Radio · live` entries in
 History, `todo`, and other playlists. Listening time still contributes to the
 Radio total on the Stats screen.
 
-The current station set is:
+`[/] Search` is a zero-network live filter on this tab: every typed character
+immediately narrows the catalogue. Whitespace-separated terms match station
+names, summaries, formats, bitrates, sample rates, and channel layouts, so
+queries such as `flac`, `aac 320`, and `44100 stereo` work. `Enter` accepts the
+current filter, `Esc` restores the filter and station selected before editing,
+and Backspace broadens the list immediately.
 
-- regional stations from [Euroradio](https://euroradio.fm/radio),
-  [Radio Palitra](https://www.radiopalitra.ge/),
-  [Arirang Radio](https://www.arirang.com/radio),
-  [EBS FM](https://www.ebs.co.kr/radio/home?ch=RADIO), and
-  [Korean Central Broadcasting Station via intchoson](https://www.intchoson.com/kcbs/).
-  KCBS is explicitly labeled as an independent satellite relay, not a
-  first-party DPRK Internet stream. Philippine stations include
-  [96.3 Easy Rock Manila](https://www.easyrock.com.ph/radio),
-  [Love Radio Manila](https://www.loveradio.com.ph/radio), and
-  [Radio Maria Philippines](https://www.radiomaria.ph/); Thai stations include
-  [MCOT Thinking Radio 96.5](https://www.mcot.net/),
-  [Thai Lanna Radio](https://www.lannaradio.com/),
-  [Chili Radio Thailand](https://chiliradio.asia/), and
-  [BKK.FM](https://bkk.fm/);
-- [Sector Radio — Progressive](https://sectorradio.com/), [4duk Radio](https://4duk.ru/),
-  [KEXP](https://www.kexp.org/), [NTS 1 and NTS 2](https://www.nts.live/),
-  [WFMU](https://wfmu.org/), and [Radio Paradise](https://radioparadise.com/);
-- ambient channels from [SomaFM](https://somafm.com/), including Groove Salad,
-  Drone Zone, The Dark Zone, Deep Space One, and Space Station Soma;
-- meditation channels from
-  [Positively Meditation](https://play.you.radio/station/1121),
-  [NeuroRadio](https://neuroradio.uk/the-meditation-channel/),
-  [HearMe.fm East Asian Meditation](https://hearme.fm/radio/east-asian-meditation/),
-  and [HearMe.fm Tibetan Singing Bowls](https://hearme.fm/radio/tibetan-singing-bowls/);
-- mantra and devotional channels from
-  [Catholic.fm](https://catholic.fm/),
-  [Hare Krsna Radio](https://hkradio.in/),
-  [Mantra Radio](https://www.mantraradio.eu/), and
-  [SikhNet Radio — Simran](https://play.sikhnet.com/radio/simran);
-- nature-sound channels from [Birdsong Radio](https://www.birdsong.fm/),
-  [24/7 Nature Radio](https://www.247natureradio.com/), and
-  [Nature Radio Rain](https://radiosuitenetwork.torontocast.stream/nature-radio-rain/).
-  The last station also mixes in sleep and relaxation music;
-- MOD, demoscene, and game-music channels from
-  [RadioSEGA](https://www.radiosega.net/), [CVGM Radio](https://radio.cvgm.net/),
-  [Kohina](https://www.kohina.com/), [SLAY Radio](https://www.slayradio.org/),
-  [SceneSat](https://scenesat.com/), and
-  [Nectarine Demoscene Radio](https://www.scenestream.net/demovibes/);
-- [R/a/dio](https://r-a-d.io/), [AnimeRadio.de](https://www.animeradio.de/),
-  [Anison.FM](https://en.anison.fm/), and [LISTEN.moe](https://listen.moe/);
-- film and soundtrack channels from
-  [France Musique — La B.O.](https://www.radiofrance.fr/francemusique),
-  [Cinemix](https://www.cinemix.us/),
-  [Matt's Movie Trax](https://www.mattsmovietrax.com/), and
-  [StreamingSoundtracks.com](https://streamingsoundtracks.com/);
-- [FIP](https://www.radiofrance.fr/fip),
-  [Radio Swiss Classic](https://www.radioswissclassic.ch/en),
-  [France Musique](https://www.radiofrance.fr/francemusique),
-  [All Classical Radio](https://www.allclassical.org/),
-  [NPO Klassiek](https://www.npoklassiek.nl/), and
-  [Deutschlandfunk](https://www.deutschlandfunk.de/);
-- retro, industrial, and dark stations including
-  [Retro FM Russia](https://retrofm.ru/),
-  [SomaFM Underground 80s](https://somafm.com/u80s/),
-  [EBM-Radio.com](https://ebm-radio.com/),
-  [80s80s EBM](https://www.80s80s.de/ebm),
-  [80s80s Dark Wave](https://www.80s80s.de/80s80s-dark-wave),
-  [SomaFM Doomed](https://somafm.com/doomed/),
-  [SomaFM Cliqhop IDM](https://somafm.com/cliqhop/),
-  [RADCAP DSBM](https://www.radcap.ru/depressiveblack.html), and
-  [Dark Star Radio](https://darkstarradio.com/home/).
+The station catalogue is maintained in the
+[curated preset source](src/providers/radio.rs) and the checked-in
+[generated NPR snapshot](src/providers/npr_stations_generated.rs), rather than
+duplicated in this README. It covers public-service, regional, talk, music,
+ambient, classical, soundtrack, game-music, meditation, and lossless FLAC
+streams. Each preset records only quality data supported by a reviewed source
+or a live probe.
+
+The NPR snapshot is generated from NPR's official
+[station finder](https://www.npr.org/stations), includes primary and additional
+services, and deduplicates inherited transmitters by stream GUID. NPR publishes
+no bitrate, sample-rate, or channel fields in that directory, so Youta does not
+invent them. The unpaginated API has no complete-enumeration contract; the
+checked-in count describes a dated state-and-territory snapshot rather than a
+permanent total. Short-lived signed stream URLs are omitted, while static
+PLS/M3U entry points are resolved during generation. Regenerate and review the
+snapshot with
+`cargo run --locked --example update_npr_stations --features radio`; see NPR's
+[Terms of Use](https://www.npr.org/about-npr/179876898/terms-of-use).
+
+When a station explicitly publishes a suitable 128 kbps AAC alternative, the
+bundled preset can prefer it over a larger MP3 stream. That generally improves
+compression efficiency, but does not guarantee higher fidelity than a 192,
+256, or 320 kbps MP3 stream. Encoder quality and the station's source chain
+still matter; Youta does not choose a 64 or 48 kbps AAC alternative merely
+because it uses AAC.
 
 Details shows only quality attributes known for that preset, the readable
-playback endpoint, a summary, and the station homepage. `[O] xdg-open` opens
-the homepage rather than the audio endpoint. The same stable station identity
-is used for playlists, History replay, private station notes, and the
-now-playing click target; transient redirects are never persisted. `[B]`
-cycles name, high-to-low bitrate, and low-to-high bitrate order while the
-selected station remains stable across ordering changes and restarts.
+playback endpoint, and a summary. `[O] xdg-open · <URL>` is the sole station
+website row and opens the homepage rather than the audio endpoint. The same
+stable station identity is used for playlists, History replay, private station
+notes, and the now-playing click target; transient redirects are never
+persisted. `[B]` cycles name, high-to-low bitrate, and low-to-high bitrate order
+while the selected station remains stable across ordering changes and
+restarts. Routine two-channel streams omit the repetitive `stereo` label;
+known mono or unusual multichannel streams still disclose that distinction.
 
 Station ICY metadata observed by `mpv` can appear beside the stable station
-title. Sector Radio, 4duk, BKK.FM, Birdsong Radio, and France Musique also have
-bounded passive metadata adapters: fresh provider data wins, ICY is the
-playing fallback, and a failed refresh retains the last successful value only
-as clearly stale selected-station details. Failures stay silent and retry with
-a station-scoped capped 1/2/5/10-minute backoff, so an unavailable service
-does not create an idle polling loop.
+title. Selected presets and generated NPR services also have bounded passive
+metadata adapters. NPR's endpoint supplies the current programme when
+available, not dependable song/artist metadata. Fresh provider data wins, ICY
+is the playing fallback, and a failed refresh retains the last successful
+value only as clearly stale selected-station details. Failures stay silent and
+retry with a station-scoped capped 1/2/5/10-minute backoff, so an unavailable
+service does not create an idle polling loop.
 
-Sector Radio, 4duk, Euroradio, Radio Maria Philippines, RADCAP DSBM, Dark Star
-Radio, WFMU, Radio Paradise, and StreamingSoundtracks.com currently publish
-the selected playback endpoint over plain HTTP. These streams are enabled by
-default as requested, but transport is unauthenticated and can be observed or
-modified on the network. Youta sends no credentials to them. Inclusion
-describes technical public reachability, not an assertion that the broadcast
-content is openly licensed or reusable.
+Some providers publish only plain-HTTP streams or HTTPS playlists that resolve
+to plain-HTTP audio. Those presets remain enabled by default as requested, but
+the transport is unauthenticated and can be observed or modified on the
+network. Youta sends no credentials to them. Inclusion describes technical
+public reachability, not an assertion that broadcast content is openly
+licensed or reusable.
 
 ### Lazy Wikidata enrichment
 
@@ -710,7 +696,12 @@ Validated original image bytes are cached across restarts in
 directory). The private cache expires entries after 30 days and evicts its
 oldest files above 512 entries or 64 MiB. Corrupt entries are discarded and
 fetched again. The image URL is never printed as detail-panel text or stored as
-a filename.
+a filename. Within one run, Youta also keeps up to 16 recently prepared
+terminal images within a 16 MiB decoded-pixel budget. Returning from one local
+file to an unchanged JPEG therefore reuses its encoded terminal image without
+another decode or protocol-encoding pass. Local entries include a filesystem
+fingerprint in that RAM key, so replacing an image at the same path invalidates
+the prepared result.
 
 On a Linux virtual console, serial terminal, `TERM=dumb`, or a terminal without
 one of those image protocols, Youta neither fetches nor renders artwork. The
@@ -802,10 +793,10 @@ one or more playlists. The line wraps with the Details panel and remains
 selectable in Details text-selection mode.
 
 Open the **Playlists** tab with `F4` or normal tab navigation. `Enter` opens the
-selected playlist; another `Enter` replays its selected item, and `Backspace`
-returns to the playlist index. Local entries replay their original file when
-it still exists. Remote entries resolve a fresh stream from their saved
-canonical public page.
+selected playlist; another `Enter` replays its selected item, and `Esc` or
+`Backspace` returns to the playlist index. Local entries replay their original
+file when it still exists. Remote entries resolve a fresh stream from their
+saved canonical public page.
 
 On the playlist index, `e` opens the same name-and-description editor. The
 built-in `todo` playlist can also be renamed or described, but its internal
@@ -1111,12 +1102,17 @@ Run the same keyless YouTube Music search check locally with:
 YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
 ```
 
-Run the Radio smoke locally to resolve and decode a real HTTPS M3U stream
-through Youta's `mpv` backend, observe real ICY metadata, and parse the bounded
-public now-playing responses from 4duk and Sector Radio:
+Run the Radio smokes locally to resolve and decode real HTTP(S) M3U, PLS, MP3,
+and FLAC streams through Youta's `mpv` backend, independently confirm declared
+FLAC codecs with `ffprobe`, observe real ICY metadata, and parse bounded public
+now-playing responses from curated and NPR providers. The
+separate BBC smoke follows Youta's production Sounds-page and Media Selector
+path, then decodes the returned regional manifest:
 
 ```sh
 YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact radio_stream_and_passive_metadata_are_usable --nocapture
+YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact generated_npr_station_stream_and_program_are_usable --nocapture
+YOUTA_RUN_LIVE_BBC_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features bbc-radio,backend-mpv -- --ignored --exact bbc_sounds_resolution_and_audio_are_usable --nocapture
 ```
 
 The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and

@@ -43,6 +43,54 @@ const DEFAULT_YOUTUBE_MUSIC_QUERY: &str = "Massive Attack Teardrop";
 
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 const RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_RADIO_TEST";
+#[cfg(all(feature = "backend-mpv", feature = "bbc-radio"))]
+const BBC_RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_BBC_RADIO_TEST";
+
+/// Probes one public radio endpoint with an independent decoder tool.
+///
+/// The mpv smoke below proves Youta can play the stream. This probe separately
+/// prevents a provider from silently replacing a declared FLAC endpoint with a
+/// lossy codec while leaving the URL unchanged.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+fn probe_live_audio_codec(station_id: &str, stream: &str) -> String {
+    use std::process::Command;
+
+    let executable = std::env::var_os("YOUTA_TEST_FFPROBE").unwrap_or_else(|| "ffprobe".into());
+    let output = Command::new(executable)
+        .args([
+            "-v",
+            "error",
+            "-rw_timeout",
+            "15000000",
+            "-analyzeduration",
+            "5000000",
+            "-probesize",
+            "1048576",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(stream)
+        .output()
+        .unwrap_or_else(|error| panic!("start ffprobe for {station_id}: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ffprobe rejected {station_id}: {}",
+        stderr.trim()
+    );
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("ffprobe returned non-UTF-8 for {station_id}: {error}"));
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| panic!("ffprobe returned no audio codec for {station_id}"))
+        .to_ascii_lowercase()
+}
 
 /// Resolves a real Apple Podcasts show, parses its RSS feed, and decodes audio.
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
@@ -380,10 +428,10 @@ fn youtube_music_keyless_search_returns_playable_tracks_before_timeout() {
     }));
 }
 
-/// Resolves a public HTTPS radio playlist and parses optional station metadata.
+/// Decodes public playlist and FLAC radio streams, then parses station metadata.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 #[test]
-#[ignore = "requires public radio streams, 4duk and Sector metadata, and mpv"]
+#[ignore = "requires public radio streams, metadata endpoints, mpv, and ffprobe"]
 fn radio_stream_and_passive_metadata_are_usable() {
     use std::time::{Duration, Instant};
 
@@ -452,13 +500,89 @@ fn radio_stream_and_passive_metadata_are_usable() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    backend.shutdown().expect("stop Radio playback cleanly");
     assert!(
         active && position >= Duration::from_secs(2) && stream_title.is_some(),
         "public M3U Radio audio or ICY metadata did not become active; last position: \
          {position:?}; stream title: {stream_title:?}; backend diagnostic: {}",
         backend_diagnostic.as_deref().unwrap_or("none")
     );
+
+    for station_id in [
+        "kalx-berkeley-flac",
+        "radio-calico-flac",
+        "intense-radio-flac",
+        "openbroadcast-flac",
+        "radio-bergeijk-flac",
+        "punkrockers-radio-flac",
+        "pure-classix-radio-flac",
+        "radio-campus-grenoble-flac",
+        "rlocale-radio-flac",
+        "1zwolle-flac",
+    ] {
+        let lossless = station_by_id(station_id).expect("public FLAC radio fixture");
+        assert_eq!(
+            probe_live_audio_codec(station_id, lossless.stream),
+            "flac",
+            "{station_id} no longer serves FLAC audio"
+        );
+        let fixture_title = format!("Youta live FLAC smoke: {station_id}");
+        let mut input = PlaybackInput::new(lossless.stream);
+        input.title = Some(fixture_title.clone());
+        backend
+            .play(&input)
+            .unwrap_or_else(|error| panic!("open {station_id} through Youta: {error}"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut lossless_active = false;
+        let mut lossless_baseline = None;
+        let mut lossless_advance = Duration::ZERO;
+        let mut lossless_diagnostic = None;
+        while Instant::now() < deadline {
+            match backend.status() {
+                Ok(status) => {
+                    let is_lossless_fixture =
+                        status.title.as_deref() == Some(fixture_title.as_str());
+                    lossless_active |= is_lossless_fixture && !status.idle;
+                    if is_lossless_fixture && !status.idle {
+                        if let Some(baseline) = lossless_baseline {
+                            if status.position < baseline {
+                                lossless_baseline = Some(status.position);
+                                lossless_advance = Duration::ZERO;
+                            } else {
+                                lossless_advance =
+                                    lossless_advance.max(status.position.saturating_sub(baseline));
+                            }
+                        } else {
+                            lossless_baseline = Some(status.position);
+                        }
+                    }
+                }
+                Err(error) => {
+                    lossless_diagnostic = Some(error.to_string());
+                    break;
+                }
+            }
+            match backend.poll_event() {
+                Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
+                | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
+                    lossless_diagnostic = Some(format!("{event:?}"));
+                }
+                Ok(_) => {}
+                Err(error) => lossless_diagnostic = Some(error.to_string()),
+            }
+            if lossless_active && lossless_advance >= Duration::from_secs(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            lossless_active && lossless_advance >= Duration::from_secs(1),
+            "{station_id} FLAC audio did not advance after its first current-title timestamp; \
+             baseline: {lossless_baseline:?}; advance: {lossless_advance:?}; backend \
+             diagnostic: {}",
+            lossless_diagnostic.as_deref().unwrap_or("none")
+        );
+    }
+    backend.shutdown().expect("stop Radio playback cleanly");
 
     let four_duk = station_by_id("4duk-radio").expect("4duk metadata fixture");
     let endpoint = four_duk
@@ -484,6 +608,210 @@ fn radio_stream_and_passive_metadata_are_usable() {
     assert!(
         metadata.title.is_some() || metadata.artist.is_some(),
         "Sector returned no current title or artist"
+    );
+}
+
+/// Decodes one generated NPR preset and parses its current-program endpoint.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires a public NPR member stream, NPR metadata, and mpv"]
+fn generated_npr_station_stream_and_program_are_usable() {
+    use std::time::{Duration, Instant};
+
+    use youta::playback::mpv::MpvBackend;
+    use youta::playback::{
+        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackInput,
+        PlaybackProfile, ProcessPlaybackConfig,
+    };
+    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
+
+    assert_eq!(
+        std::env::var(RADIO_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {RADIO_TEST_OPT_IN}=1 when invoking this live test"
+    );
+
+    let station = station_by_id("npr-4fcf71471a22460b8c99eb9f58fac6ca")
+        .expect("generated WAMU NPR PLS service fixture");
+    let temporary = tempfile::tempdir().expect("temporary NPR playback directory");
+    let config = ProcessPlaybackConfig {
+        mpv_executable: std::env::var_os("YOUTA_TEST_MPV").map_or_else(|| "mpv".into(), Into::into),
+        yt_dlp_executable: std::env::var_os("YOUTA_TEST_YT_DLP")
+            .map_or_else(|| "yt-dlp".into(), Into::into),
+        runtime_dir: temporary.path().join("runtime"),
+        audio_output: AudioOutputDriver::Null,
+        audio_device: None,
+        profile: PlaybackProfile::Balanced,
+        audiophile: AudiophilePlaybackOptions::default(),
+    };
+    let mut backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    let mut input = PlaybackInput::new(station.stream);
+    input.title = Some("Youta NPR live smoke".to_owned());
+    backend
+        .play(&input)
+        .expect("open the generated NPR stream through Youta");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut active = false;
+    let mut baseline = None;
+    let mut advance = Duration::ZERO;
+    let mut diagnostic = None;
+    while Instant::now() < deadline {
+        match backend.status() {
+            Ok(status) => {
+                let fixture = status.title.as_deref() == Some("Youta NPR live smoke");
+                active |= fixture && !status.idle;
+                if fixture && !status.idle {
+                    if let Some(first) = baseline {
+                        if status.position < first {
+                            baseline = Some(status.position);
+                            advance = Duration::ZERO;
+                        } else {
+                            advance = advance.max(status.position.saturating_sub(first));
+                        }
+                    } else {
+                        baseline = Some(status.position);
+                    }
+                }
+            }
+            Err(error) => {
+                diagnostic = Some(error.to_string());
+                break;
+            }
+        }
+        match backend.poll_event() {
+            Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
+            | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
+                diagnostic = Some(format!("{event:?}"));
+            }
+            Ok(_) => {}
+            Err(error) => diagnostic = Some(error.to_string()),
+        }
+        if active && advance >= Duration::from_secs(2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    backend.shutdown().expect("stop NPR playback cleanly");
+    assert!(
+        active && advance >= Duration::from_secs(2),
+        "generated NPR audio did not advance after its first current-title timestamp; \
+         baseline: {baseline:?}; advance: {advance:?}; diagnostic: {}",
+        diagnostic.as_deref().unwrap_or("none")
+    );
+
+    let endpoint = station
+        .now_playing
+        .expect("generated NPR service has a current-program endpoint");
+    let metadata = RadioNowPlayingClient::with_options(Duration::from_secs(20), 16 * 1024)
+        .expect("bounded NPR metadata client")
+        .fetch(endpoint)
+        .expect("fetch and parse NPR's current-program JSON");
+    assert!(
+        metadata
+            .programme
+            .as_deref()
+            .is_some_and(|programme| !programme.trim().is_empty()),
+        "NPR returned no current programme"
+    );
+}
+
+/// Resolves a fresh regional BBC manifest and decodes it through Youta's backend.
+#[cfg(all(feature = "backend-mpv", feature = "bbc-radio"))]
+#[test]
+#[ignore = "requires BBC Sounds, BBC Media Selector, and mpv"]
+fn bbc_sounds_resolution_and_audio_are_usable() {
+    use std::time::{Duration, Instant};
+
+    use youta::playback::mpv::MpvBackend;
+    use youta::playback::{
+        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackInput,
+        PlaybackProfile, ProcessPlaybackConfig,
+    };
+    use youta::providers::bbc::{BbcLiveResolver, station_by_id};
+
+    assert_eq!(
+        std::env::var(BBC_RADIO_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {BBC_RADIO_TEST_OPT_IN}=1 when invoking this live test"
+    );
+
+    let station_id =
+        std::env::var("YOUTA_LIVE_BBC_STATION").unwrap_or_else(|_| "bbc_radio_three".to_owned());
+    let station = station_by_id(&station_id).expect("configured BBC live station");
+    let resolution = BbcLiveResolver::new()
+        .resolve_station(station)
+        .expect("resolve the public BBC Sounds page and Media Selector response");
+    assert_eq!(resolution.station.id, station.id);
+    assert_eq!(resolution.manifest_url.scheme(), "https");
+    assert!(resolution.mime_type.starts_with("audio/"));
+    assert!(!resolution.codec.trim().is_empty());
+
+    let temporary = tempfile::tempdir().expect("temporary BBC playback directory");
+    let config = ProcessPlaybackConfig {
+        mpv_executable: std::env::var_os("YOUTA_TEST_MPV").map_or_else(|| "mpv".into(), Into::into),
+        yt_dlp_executable: std::env::var_os("YOUTA_TEST_YT_DLP")
+            .map_or_else(|| "yt-dlp".into(), Into::into),
+        runtime_dir: temporary.path().join("runtime"),
+        audio_output: AudioOutputDriver::Null,
+        audio_device: None,
+        profile: PlaybackProfile::Balanced,
+        audiophile: AudiophilePlaybackOptions::default(),
+    };
+    let mut backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    let mut input = PlaybackInput::new(resolution.manifest_url.to_string());
+    input.title = Some("Youta BBC Sounds live smoke".to_owned());
+    input.bypass_ytdl = true;
+    backend
+        .play(&input)
+        .expect("open the action-scoped BBC manifest through Youta");
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut active = false;
+    let mut baseline = None;
+    let mut advance = Duration::ZERO;
+    let mut diagnostic = None;
+    while Instant::now() < deadline {
+        match backend.status() {
+            Ok(status) => {
+                let fixture = status.title.as_deref() == Some("Youta BBC Sounds live smoke");
+                active |= fixture && !status.idle;
+                if fixture && !status.idle {
+                    if let Some(first) = baseline {
+                        if status.position < first {
+                            baseline = Some(status.position);
+                            advance = Duration::ZERO;
+                        } else {
+                            advance = advance.max(status.position.saturating_sub(first));
+                        }
+                    } else {
+                        baseline = Some(status.position);
+                    }
+                }
+            }
+            Err(error) => {
+                diagnostic = Some(error.to_string());
+                break;
+            }
+        }
+        match backend.poll_event() {
+            Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
+            | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
+                diagnostic = Some(format!("{event:?}"));
+            }
+            Ok(_) => {}
+            Err(error) => diagnostic = Some(error.to_string()),
+        }
+        if active && advance >= Duration::from_secs(2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    backend.shutdown().expect("stop BBC playback cleanly");
+    assert!(
+        active && advance >= Duration::from_secs(2),
+        "BBC Sounds audio did not advance after its first current-title timestamp; baseline: \
+         {baseline:?}; advance: {advance:?}; diagnostic: {}",
+        diagnostic.as_deref().unwrap_or("none")
     );
 }
 

@@ -1302,6 +1302,8 @@ pub enum UiAction {
     ToggleWaveform,
     /// Show information about the playing channel.
     ShowChannel,
+    /// Open the parent of the currently displayed Local directory.
+    OpenLocalParent,
     /// Return to the previous internal Details page or seek position.
     GoBack,
     /// Move forward to a Details page previously left with [`Self::GoBack`].
@@ -1693,7 +1695,11 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
             match input.read()? {
                 Event::Key(key) => match virtual_cursor.handle_key(key) {
                     VirtualCursorKey::PassThrough => {
-                        if let Some(action) = key_action(key, controller.view()) {
+                        if let Some(action) = key_action_with_page_rows(
+                            key,
+                            controller.view(),
+                            visible_main_list_page_rows(&hit_map),
+                        ) {
                             controller.dispatch(action);
                         }
                     }
@@ -2686,8 +2692,9 @@ fn search_panel_title(view: &ViewModel) -> String {
                 return format!(" Local — {} ", view.local_path);
             }
             Screen::Local => return " Local ".to_owned(),
-            Screen::Radio
-            | Screen::Subscriptions
+            Screen::Radio if view.search_query.trim().is_empty() => return String::new(),
+            Screen::Radio => {}
+            Screen::Subscriptions
             | Screen::Downloaded
             | Screen::History
             | Screen::Playlists
@@ -2700,7 +2707,17 @@ fn search_panel_title(view: &ViewModel) -> String {
         }
     }
     let search_title = if view.search_editing {
-        format!(" Search: {}▏ ", view.search_query)
+        format!(
+            " {}: {}▏ ",
+            if view.screen == Screen::Radio {
+                "Filter"
+            } else {
+                "Search"
+            },
+            view.search_query
+        )
+    } else if view.screen == Screen::Radio {
+        format!(" Filter: {} ", view.search_query.trim())
     } else if view.search_query.is_empty() {
         match view.screen {
             Screen::Search => format!(
@@ -3839,6 +3856,7 @@ fn render_information_panel(
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
                 let selected = view.selected_detail_link == Some(index);
                 let marker = if selected { "› " } else { "  " };
+                let mut clickable_width = terminal_text_width(marker);
                 let mut spans = vec![Span::styled(
                     marker,
                     if selected { theme.accent } else { theme.base },
@@ -3853,6 +3871,8 @@ fn render_information_panel(
                         theme.accent.add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::raw(" "));
+                    clickable_width =
+                        clickable_width.saturating_add(disclosure_width.saturating_add(1));
                     if disclosure_width > 0 {
                         hit_map.detail_buttons.push((
                             UiAction::ToggleWikidataStatements(index),
@@ -3877,11 +3897,23 @@ fn render_information_panel(
                     Span::styled(" — ", theme.muted),
                     Span::styled(&link.url, theme.muted),
                 ]);
+                clickable_width = clickable_width
+                    .saturating_add(terminal_text_width(&link.label))
+                    .saturating_add(terminal_text_width(" — "))
+                    .saturating_add(terminal_text_width(&link.url));
                 frame.render_widget(Paragraph::new(Line::from(spans)), link_area);
                 if show_text_selection {
                     capture_selectable_details_row(frame, hit_map, link_area);
                 }
-                hit_map.detail_links.push((index, link_area));
+                let clickable_area = Rect::new(
+                    link_area.x,
+                    link_area.y,
+                    clickable_width.min(link_area.width),
+                    1,
+                );
+                if clickable_area.width > 0 {
+                    hit_map.detail_links.push((index, clickable_area));
+                }
                 cursor_y = cursor_y.saturating_add(1);
             }
             remaining_height = inner.bottom().saturating_sub(cursor_y);
@@ -4549,13 +4581,16 @@ fn render_seek_bar(
     } else {
         (view.playback.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
     };
-    let state = if view.playback.buffering {
-        "buffering"
+    let state = if view.playback.idle {
+        None
+    } else if view.playback.buffering {
+        Some("buffering")
     } else if view.playback.paused {
-        PLAYBACK_RESUME_SYMBOL
+        Some(PLAYBACK_RESUME_SYMBOL)
     } else {
-        PLAYBACK_PAUSE_SYMBOL
+        Some(PLAYBACK_PAUSE_SYMBOL)
     };
+    let state_suffix = state.map_or_else(String::new, |state| format!(" {state}"));
     let marker = match settings.seek_bar_style {
         SeekBarStyle::Line => "",
         SeekBarStyle::NyanCat => " =^.^= ",
@@ -4565,15 +4600,27 @@ fn render_seek_bar(
     } else {
         ""
     };
+    let live_seekable =
+        view.playback.live && view.playback.live_seekable_range.is_some() && !duration.is_zero();
     let status_prefix = if view.playback.live {
-        format!(
-            "LIVE  {}×  vol {}% {state}{title_spacing}",
-            trim_speed(view.playback.speed),
-            view.playback.volume,
-        )
+        if live_seekable {
+            format!(
+                "LIVE −{} / {} buffer  {}×  vol {}%{state_suffix}{title_spacing}",
+                format_duration(duration.saturating_sub(view.playback.position)),
+                format_duration(duration),
+                trim_speed(view.playback.speed),
+                view.playback.volume,
+            )
+        } else {
+            format!(
+                "LIVE  {}×  vol {}%{state_suffix}{title_spacing}",
+                trim_speed(view.playback.speed),
+                view.playback.volume,
+            )
+        }
     } else {
         format!(
-            "{} / {}  {}×  vol {}%{} {state}{title_spacing}",
+            "{} / {}  {}×  vol {}%{}{state_suffix}{title_spacing}",
             format_duration(view.playback.position),
             if duration.is_zero() {
                 "--:--".to_owned()
@@ -4603,7 +4650,7 @@ fn render_seek_bar(
         "{status_prefix}{}{marker}",
         title.as_deref().unwrap_or_default()
     );
-    if view.playback.live {
+    if view.playback.live && !live_seekable {
         let status_area = if area.height >= 2 {
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1)
         } else {
@@ -5186,10 +5233,10 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
         "  ↪ internal video: click the marker after a YouTube URL",
-        "  Local: Z size order     r rename     m move     Shift+J/K extend move selection     Delete move to Trash",
+        "  Local: Esc parent     PageUp/Down page     Z size     r rename     m move     Shift+J/K mark     Delete trash",
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
         "  Subscriptions channel: R refresh videos     i description",
-        "  Playlists: e edit selected playlist",
+        "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: GPM mouse input is detected automatically.",
         "",
@@ -5215,9 +5262,18 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "",
         "Press ? or Esc to close help. Press q or Ctrl+C to quit.",
     ];
+    let footer = Line::styled(
+        format!(
+            " Youta v{} · {} ",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY")
+        ),
+        theme.muted,
+    )
+    .centered();
     frame.render_widget(
         Paragraph::new(help.join("\n"))
-            .block(panel_block(" Youta help ", theme))
+            .block(panel_block(" Youta help ", theme).title_bottom(footer))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -6984,7 +7040,30 @@ fn wrap_diagnostic_report(report: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+/// Returns the number of model rows occupying one currently rendered list page.
+///
+/// A non-empty sub-row rectangle still represents one selectable row. An empty
+/// rectangle produces no page action, which avoids surprising jumps in
+/// terminals too small to render the list.
+fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
+    if hit_map.rows.height == 0 {
+        return None;
+    }
+    let row_height = hit_map.rows_row_height.max(1);
+    Some(usize::from((hit_map.rows.height / row_height).max(1)))
+}
+
+#[cfg(test)]
 fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
+    key_action_with_page_rows(key, view, None)
+}
+
+/// Maps one key using the current rendered main-list page capacity.
+fn key_action_with_page_rows(
+    key: KeyEvent,
+    view: &ViewModel,
+    page_rows: Option<usize>,
+) -> Option<UiAction> {
     if view.error_popup.is_some() {
         return match key.code {
             KeyCode::Esc => Some(UiAction::DismissErrorPopup),
@@ -7393,12 +7472,20 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
             Some(UiAction::GoBack)
         }
         KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
+        KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
+        KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         KeyCode::PageUp if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(-1)))
         }
         KeyCode::PageDown if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
         }
+        KeyCode::PageUp if view.screen == Screen::Local => page_rows
+            .filter(|rows| *rows > 0)
+            .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX))),
+        KeyCode::PageDown if view.screen == Screen::Local => page_rows
+            .filter(|rows| *rows > 0)
+            .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX))),
         KeyCode::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
         KeyCode::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
         KeyCode::Char('j') => Some(UiAction::MoveSelection(1)),
@@ -7421,8 +7508,8 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char(' ') => Some(UiAction::TogglePause),
         KeyCode::Left if alt => Some(UiAction::GoBack),
         KeyCode::Right if alt => Some(UiAction::GoForward),
-        KeyCode::Left if !view.playback.live => Some(UiAction::SeekRelative(-5)),
-        KeyCode::Right if !view.playback.live => Some(UiAction::SeekRelative(5)),
+        KeyCode::Left if view.playback.seeking_available() => Some(UiAction::SeekRelative(-5)),
+        KeyCode::Right if view.playback.seeking_available() => Some(UiAction::SeekRelative(5)),
         KeyCode::Up => Some(UiAction::ChangeVolume(5)),
         KeyCode::Down => Some(UiAction::ChangeVolume(-5)),
         KeyCode::Char('<') | KeyCode::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
@@ -7448,7 +7535,7 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
         KeyCode::Char('O') => Some(UiAction::OpenChannelInBrowser),
         KeyCode::Char('y') => Some(UiAction::CopyLink),
         KeyCode::Char('e') => Some(UiAction::OpenEqualizer),
-        KeyCode::Char(digit @ '0'..='9') if !view.playback.live => {
+        KeyCode::Char(digit @ '0'..='9') if view.playback.seeking_available() => {
             let percentage = f64::from(digit.to_digit(10).unwrap_or_default()) * 10.0;
             Some(UiAction::SeekPercent(percentage))
         }
@@ -7702,14 +7789,15 @@ fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option
                         return Some(action.clone());
                     }
                 }
-                if contains(hit_map.seek_bar, mouse.column, mouse.row) && hit_map.seek_bar.width > 1
-                {
-                    let offset = mouse.column.saturating_sub(hit_map.seek_bar.x);
-                    let percent = f64::from(offset)
-                        / f64::from(hit_map.seek_bar.width.saturating_sub(1))
-                        * 100.0;
-                    return Some(UiAction::SeekPercent(percent.clamp(0.0, 100.0)));
-                }
+            }
+            if view.playback.seeking_available()
+                && contains(hit_map.seek_bar, mouse.column, mouse.row)
+                && hit_map.seek_bar.width > 1
+            {
+                let offset = mouse.column.saturating_sub(hit_map.seek_bar.x);
+                let percent =
+                    f64::from(offset) / f64::from(hit_map.seek_bar.width.saturating_sub(1)) * 100.0;
+                return Some(UiAction::SeekPercent(percent.clamp(0.0, 100.0)));
             }
             if contains(hit_map.rows, mouse.column, mouse.row) {
                 let relative_row = mouse.row.saturating_sub(hit_map.rows.y);
@@ -8448,8 +8536,20 @@ mod tests {
 
         view.screen = Screen::Search;
         assert_eq!(search_panel_title(&view), " fixture query ");
+        view.screen = Screen::Radio;
+        assert_eq!(
+            search_panel_title(&view),
+            " Filter: fixture query ",
+            "Radio must expose its accepted local filter without repeating the tab name"
+        );
+        view.search_editing = true;
+        assert_eq!(
+            search_panel_title(&view),
+            " Filter: fixture query▏ ",
+            "Radio's live editor must describe itself as a filter"
+        );
+        view.search_editing = false;
         for screen in [
-            Screen::Radio,
             Screen::Subscriptions,
             Screen::Playlists,
             Screen::Downloaded,
@@ -8926,10 +9026,13 @@ mod tests {
         assert!(rendered.contains("Youta help"));
         assert!(rendered.contains("Alt+←/→ Details back/forward"));
         assert!(rendered.contains("Backspace Details back"));
-        assert!(rendered.contains("Local: Z size order"));
-        assert!(rendered.contains("Playlists: e edit selected playlist"));
+        assert!(rendered.contains("Local: Esc parent"));
+        assert!(rendered.contains("PageUp/Down page"));
+        assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
+        assert!(rendered.contains(&format!("Youta v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(rendered.contains(env!("CARGO_PKG_REPOSITORY")));
         assert!(!rendered.contains("M/F6 MOD/tracker music"));
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
@@ -8963,6 +9066,27 @@ mod tests {
         );
         let five = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE);
         assert_eq!(key_action(five, &view), Some(UiAction::SeekPercent(50.0)));
+        let mut live = ViewModel {
+            playback: PlaybackStatus {
+                live: true,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &live),
+            None
+        );
+        assert_eq!(key_action(five, &live), None);
+        live.playback.live_seekable_range = Some(crate::playback::BufferedRange {
+            start: Duration::from_secs(1_000),
+            end: Duration::from_secs(1_120),
+        });
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &live),
+            Some(UiAction::SeekRelative(-5))
+        );
+        assert_eq!(key_action(five, &live), Some(UiAction::SeekPercent(50.0)));
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
@@ -9044,6 +9168,102 @@ mod tests {
                 &unfocused
             ),
             None
+        );
+    }
+
+    #[test]
+    fn local_page_keys_use_the_current_visible_capacity_and_keep_details_precedence() {
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                &local,
+                Some(7),
+            ),
+            Some(UiAction::MoveSelection(-7))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &local,
+                Some(7),
+            ),
+            Some(UiAction::MoveSelection(7))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &local,
+                None,
+            ),
+            None,
+            "an invisible Local list must not guess a page size"
+        );
+
+        let focused_local = ViewModel {
+            details_focused: true,
+            ..local
+        };
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &focused_local,
+                Some(7),
+            ),
+            Some(UiAction::ScrollDetails(DetailsScroll::Pages(1))),
+            "focused Details must retain PageDown before Local list paging"
+        );
+    }
+
+    #[test]
+    fn visible_local_page_capacity_tracks_compact_rows_and_tiny_terminals() {
+        let mut hit_map = HitMap {
+            rows: Rect::new(0, 0, 40, 9),
+            rows_row_height: 1,
+            ..HitMap::default()
+        };
+        assert_eq!(visible_main_list_page_rows(&hit_map), Some(9));
+
+        hit_map.rows_row_height = 2;
+        assert_eq!(visible_main_list_page_rows(&hit_map), Some(4));
+
+        hit_map.rows.height = 1;
+        assert_eq!(visible_main_list_page_rows(&hit_map), Some(1));
+
+        hit_map.rows.height = 0;
+        assert_eq!(visible_main_list_page_rows(&hit_map), None);
+    }
+
+    #[test]
+    fn local_escape_opens_parent_after_higher_priority_escape_modes() {
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &local),
+            Some(UiAction::OpenLocalParent)
+        );
+
+        let focused = ViewModel {
+            details_focused: true,
+            ..local.clone()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &focused),
+            Some(UiAction::SetDetailsFocus(false))
+        );
+
+        let editing = ViewModel {
+            search_editing: true,
+            ..local
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &editing),
+            Some(UiAction::CancelSearch)
         );
     }
 
@@ -11681,7 +11901,7 @@ mod tests {
             rows: vec![RowView {
                 media_id: Some(media_id.clone()),
                 title: "Sector Radio — Progressive".to_owned(),
-                subtitle: "FLAC · 44.1 kHz · stereo".to_owned(),
+                subtitle: "FLAC · 44.1 kHz".to_owned(),
                 source: "Radio".to_owned(),
                 watched_percent: 42,
                 hide_watched_marker: true,
@@ -11695,18 +11915,12 @@ mod tests {
                 channel_webpage_url: Some(
                     url::Url::parse("https://sectorradio.com/").expect("station URL"),
                 ),
-                description: "Lossless progressive electronic music.\n\nQuality: FLAC · bitrate unknown · 44.1 kHz · stereo\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
-                links: vec![DetailLinkView {
-                    label: "Station website".to_owned(),
-                    url: "https://sectorradio.com/".to_owned(),
-                    ..DetailLinkView::default()
-                }],
+                description: "Lossless progressive electronic music.\n\nQuality: FLAC · bitrate unknown · 44.1 kHz\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
                 length: "must not render".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
                 ..DetailView::default()
             }),
-            selected_detail_link: Some(0),
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -11719,10 +11933,11 @@ mod tests {
         assert!(rendered.contains("▶ Sector Radio — Progressive"));
         assert!(!rendered.contains("▶ ● Sector Radio"));
         assert!(!rendered.contains("42%"));
-        assert!(rendered.contains("FLAC · 44.1 kHz · stereo"));
+        assert!(rendered.contains("FLAC · 44.1 kHz"));
+        assert!(!rendered.contains("stereo"));
         assert!(rendered.contains("[O] xdg-open · https://sectorradio.com/"));
-        assert!(rendered.contains("› Station website"));
-        assert!(!rendered.contains("▶ Station website"));
+        assert!(!rendered.contains("External links"));
+        assert!(!rendered.contains("Station website"));
         assert!(!rendered.contains("[B] Sort:"));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
@@ -13359,6 +13574,10 @@ mod tests {
             key_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &view),
             Some(UiAction::GoBack)
         );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::GoBack)
+        );
         assert!(
             hit_map
                 .buttons
@@ -13366,6 +13585,49 @@ mod tests {
                 .all(|(action, _)| action != &UiAction::GoBack)
         );
         assert_minimal_footer_actions(&hit_map);
+    }
+
+    #[test]
+    fn playlist_escape_preserves_transient_context_precedence() {
+        let view = ViewModel {
+            screen: Screen::Playlists,
+            playlist_back_available: true,
+            ..ViewModel::default()
+        };
+
+        let mut details_focused = view.clone();
+        details_focused.details_focused = true;
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &details_focused
+            ),
+            Some(UiAction::SetDetailsFocus(false))
+        );
+
+        let mut search_editing = view.clone();
+        search_editing.search_editing = true;
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &search_editing
+            ),
+            Some(UiAction::CancelSearch)
+        );
+
+        let mut help_open = view.clone();
+        help_open.help_open = true;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &help_open),
+            Some(UiAction::ToggleHelp)
+        );
+
+        let mut popup_open = view;
+        popup_open.playlist_popup = Some(PlaylistPopupView::default());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &popup_open),
+            Some(UiAction::DismissPlaylistPopup)
+        );
     }
 
     #[test]
@@ -13784,6 +14046,67 @@ mod tests {
         assert!(
             hit_map.now_playing.is_some(),
             "the live title must remain a navigation target"
+        );
+    }
+
+    #[test]
+    fn live_cached_range_restores_a_bounded_clickable_seek_bar() {
+        let backend = TestBackend::new(160, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                live: true,
+                live_seekable_range: Some(crate::playback::BufferedRange {
+                    start: Duration::from_secs(8_641_000),
+                    end: Duration::from_secs(8_641_235),
+                }),
+                position: Duration::from_secs(222),
+                duration: Some(Duration::from_secs(235)),
+                paused: false,
+                volume: 80,
+                speed: 1.0,
+                title: Some("Fixture live station".to_owned()),
+                buffered_ranges: vec![crate::playback::BufferedRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(235),
+                }],
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw cached live seek bar");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("LIVE −0:13 / 3:55 buffer"));
+        assert!(rendered.contains("Fixture live station"));
+        assert!(!rendered.contains("2400:20"));
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 0, 160, 1));
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 80,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SeekPercent(80.0 / 159.0 * 100.0))
         );
     }
 
@@ -14357,6 +14680,7 @@ prose 07:25 remains clickable but is not a chapter";
         let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
         let view = ViewModel {
             playback: PlaybackStatus {
+                idle: false,
                 position: Duration::from_secs(18 * 60 + 28),
                 duration: Some(Duration::from_secs(60 * 60 + 33 * 60 + 6)),
                 paused: true,
@@ -14470,6 +14794,24 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(playing.contains("vol 80% ⏸"));
         assert!(!playing.contains("paused"));
         assert!(!playing.contains("playing"));
+
+        view.playback.idle = true;
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw idle seek status");
+        let idle = rendered_text(&terminal);
+        assert!(idle.contains("vol 80%"));
+        assert!(!idle.contains("vol 80% ▶"));
+        assert!(!idle.contains("vol 80% ⏸"));
     }
 
     #[test]
@@ -15547,6 +15889,67 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn external_link_mouse_target_excludes_heading_and_trailing_blank_cells() {
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                links: vec![DetailLinkView {
+                    label: "Home".to_owned(),
+                    url: "https://example.org/".to_owned(),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw short external link");
+
+        let (_, link_area) = hit_map.detail_links[0];
+        assert_eq!(link_area.height, 1);
+        assert!(
+            link_area.right() < hit_map.details_panel.right(),
+            "a short link must not make blank trailing panel cells clickable"
+        );
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(
+                click(link_area.right().saturating_sub(1), link_area.y),
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::ActivateDetailLink(0))
+        );
+        assert_eq!(
+            mouse_action(
+                click(link_area.x, link_area.y.saturating_sub(1)),
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::SetDetailsFocus(true)),
+            "the External links heading must not select the first link"
+        );
+        assert_eq!(
+            mouse_action(
+                click(hit_map.details_panel.right().saturating_sub(1), link_area.y),
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::SetDetailsFocus(true)),
+            "blank cells after a short link must only focus Details"
+        );
+    }
+
+    #[test]
     fn wrapped_unicode_wikipedia_article_keeps_every_fragment_clickable() {
         let backend = TestBackend::new(56, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -16090,7 +16493,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn live_playback_ignores_stale_mouse_seek_targets() {
-        let view = ViewModel {
+        let mut view = ViewModel {
             playback: PlaybackStatus {
                 live: true,
                 ..PlaybackStatus::default()
@@ -16118,6 +16521,38 @@ prose 07:25 remains clickable but is not a chapter";
                 None
             );
         }
+
+        view.playback.live_seekable_range = Some(crate::playback::BufferedRange {
+            start: Duration::from_secs(100),
+            end: Duration::from_secs(200),
+        });
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 60,
+                    row: 20,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SeekPercent(50.0))
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 35,
+                    row: 19,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            None,
+            "live streams never expose finite-media chapter markers"
+        );
     }
 
     #[test]
