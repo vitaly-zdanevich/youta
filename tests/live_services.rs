@@ -380,10 +380,10 @@ fn youtube_music_keyless_search_returns_playable_tracks_before_timeout() {
     }));
 }
 
-/// Decodes a public HTTPS radio stream and parses optional station metadata.
+/// Resolves a public HTTPS radio playlist and parses optional station metadata.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 #[test]
-#[ignore = "requires public radio streams, 4duk metadata, and mpv"]
+#[ignore = "requires public radio streams, 4duk and Sector metadata, and mpv"]
 fn radio_stream_and_passive_metadata_are_usable() {
     use std::time::{Duration, Instant};
 
@@ -400,7 +400,7 @@ fn radio_stream_and_passive_metadata_are_usable() {
         "set {RADIO_TEST_OPT_IN}=1 when invoking this live test"
     );
 
-    let station = station_by_id("radio-swiss-classic").expect("HTTPS live-radio fixture");
+    let station = station_by_id("somafm-groove-salad").expect("HTTPS M3U live-radio fixture");
     let temporary = tempfile::tempdir().expect("temporary Radio playback directory");
     let config = ProcessPlaybackConfig {
         mpv_executable: std::env::var_os("YOUTA_TEST_MPV").map_or_else(|| "mpv".into(), Into::into),
@@ -455,8 +455,8 @@ fn radio_stream_and_passive_metadata_are_usable() {
     backend.shutdown().expect("stop Radio playback cleanly");
     assert!(
         active && position >= Duration::from_secs(2) && stream_title.is_some(),
-        "public Radio audio or ICY metadata did not become active; last position: {position:?}; \
-         stream title: {stream_title:?}; backend diagnostic: {}",
+        "public M3U Radio audio or ICY metadata did not become active; last position: \
+         {position:?}; stream title: {stream_title:?}; backend diagnostic: {}",
         backend_diagnostic.as_deref().unwrap_or("none")
     );
 
@@ -471,6 +471,19 @@ fn radio_stream_and_passive_metadata_are_usable() {
     assert!(
         metadata.title.is_some() || metadata.artist.is_some(),
         "4duk returned no current title or artist"
+    );
+
+    let sector = station_by_id("sector-radio-progressive-flac").expect("Sector metadata fixture");
+    let endpoint = sector
+        .now_playing
+        .expect("Sector retains its optional metadata endpoint");
+    let metadata = RadioNowPlayingClient::with_options(Duration::from_secs(20), 16 * 1024)
+        .expect("bounded Radio metadata client")
+        .fetch(endpoint)
+        .expect("fetch and parse Sector's public now-playing text");
+    assert!(
+        metadata.title.is_some() || metadata.artist.is_some(),
+        "Sector returned no current title or artist"
     );
 }
 

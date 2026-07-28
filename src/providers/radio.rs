@@ -13,23 +13,25 @@ use std::{
 use serde::Deserialize;
 use url::Url;
 
-use super::{DEFAULT_REQUEST_TIMEOUT, ProviderError, get_bounded_json, provider_agent};
+use super::{
+    DEFAULT_REQUEST_TIMEOUT, ProviderError, get_bounded_json, map_ureq_error, provider_agent,
+};
 
 const DEFAULT_MAX_NOW_PLAYING_BYTES: usize = 16 * 1024;
 const MAX_CONFIGURED_NOW_PLAYING_BYTES: usize = 64 * 1024;
 const MAX_NOW_PLAYING_TEXT_BYTES: usize = 512;
 const MAX_START_TIME_BYTES: usize = 32;
 const MAX_TRACK_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60;
-const MIN_RADIO_FRANCE_REFRESH: Duration = Duration::from_secs(60);
+const MIN_RADIO_FRANCE_REFRESH: Duration = Duration::from_mins(1);
 
 /// Shortest interval accepted from a station's refresh advice.
 pub const MIN_NOW_PLAYING_REFRESH: Duration = Duration::from_secs(15);
 
 /// Longest interval accepted from a station's refresh advice.
-pub const MAX_NOW_PLAYING_REFRESH: Duration = Duration::from_secs(10 * 60);
+pub const MAX_NOW_PLAYING_REFRESH: Duration = Duration::from_mins(10);
 
 /// Refresh interval used when a station omits its recommendation.
-pub const DEFAULT_NOW_PLAYING_REFRESH: Duration = Duration::from_secs(60);
+pub const DEFAULT_NOW_PLAYING_REFRESH: Duration = Duration::from_mins(1);
 
 /// How a player should interpret a radio playback URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,15 +53,23 @@ pub enum RadioCodec {
     Mp3,
     /// Opus interactive audio codec.
     Opus,
+    /// Vorbis audio carried in an Ogg container.
+    Vorbis,
 }
 
 /// Wire format exposed by a station's optional now-playing endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadioNowPlayingFormat {
+    /// Icecast status JSON returned by BKK.FM's public relay.
+    BkkFmIcecastJson,
     /// JSON returned by `4duk`'s public now-playing endpoint.
     FourDukJson,
+    /// Radio.co status JSON carrying one current programme or track title.
+    RadioCoStatusJson,
     /// Layered schedule JSON returned by Radio France's live-metadata API.
     RadioFranceLiveMeta,
+    /// Plain text returned by Sector Radio's current-track endpoint.
+    SectorRadioPlainText,
 }
 
 /// Meaning of one optional radio metadata record.
@@ -119,7 +129,7 @@ pub struct RadioNowPlaying {
 #[derive(Clone)]
 pub struct RadioNowPlayingClient {
     agent: ureq::Agent,
-    max_json_bytes: usize,
+    max_response_bytes: usize,
 }
 
 impl Default for RadioNowPlayingClient {
@@ -134,7 +144,7 @@ impl RadioNowPlayingClient {
     pub fn new() -> Self {
         Self {
             agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
-            max_json_bytes: DEFAULT_MAX_NOW_PLAYING_BYTES,
+            max_response_bytes: DEFAULT_MAX_NOW_PLAYING_BYTES,
         }
     }
 
@@ -144,13 +154,16 @@ impl RadioNowPlayingClient {
     ///
     /// Returns [`ProviderError::InvalidRequest`] when the timeout is zero or
     /// the response cap is outside the supported range.
-    pub fn with_options(timeout: Duration, max_json_bytes: usize) -> Result<Self, ProviderError> {
+    pub fn with_options(
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Self, ProviderError> {
         if timeout.is_zero() {
             return Err(ProviderError::InvalidRequest(
                 "radio metadata timeout must be greater than zero".to_owned(),
             ));
         }
-        if !(1..=MAX_CONFIGURED_NOW_PLAYING_BYTES).contains(&max_json_bytes) {
+        if !(1..=MAX_CONFIGURED_NOW_PLAYING_BYTES).contains(&max_response_bytes) {
             return Err(ProviderError::InvalidRequest(format!(
                 "radio metadata response limit must be between 1 and \
                  {MAX_CONFIGURED_NOW_PLAYING_BYTES} bytes"
@@ -158,7 +171,7 @@ impl RadioNowPlayingClient {
         }
         Ok(Self {
             agent: provider_agent(timeout),
-            max_json_bytes,
+            max_response_bytes,
         })
     }
 
@@ -171,25 +184,152 @@ impl RadioNowPlayingClient {
     /// # Errors
     ///
     /// Returns a [`ProviderError`] for transport/status failures, oversized or
-    /// malformed JSON, remote error responses, or invalid remote fields.
+    /// malformed responses, remote error responses, or invalid remote fields.
     pub fn fetch(
         &self,
         endpoint: RadioNowPlayingEndpoint,
     ) -> Result<RadioNowPlaying, ProviderError> {
         let url = endpoint.parsed_url()?;
-        match endpoint.format {
+        self.fetch_url_at(&url, endpoint.format, unix_time_millis())
+    }
+
+    fn fetch_url_at(
+        &self,
+        url: &Url,
+        format: RadioNowPlayingFormat,
+        now_epoch_millis: u128,
+    ) -> Result<RadioNowPlaying, ProviderError> {
+        match format {
+            RadioNowPlayingFormat::BkkFmIcecastJson => {
+                let response: BkkFmIcecastResponse =
+                    get_bounded_json(&self.agent, url, self.max_response_bytes)?;
+                normalize_bkk_fm_response(response)
+            }
             RadioNowPlayingFormat::FourDukJson => {
                 let response: FourDukNowPlayingResponse =
-                    get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+                    get_bounded_json(&self.agent, url, self.max_response_bytes)?;
                 normalize_four_duk_response(response)
+            }
+            RadioNowPlayingFormat::RadioCoStatusJson => {
+                let response: RadioCoStatusResponse =
+                    get_bounded_json(&self.agent, url, self.max_response_bytes)?;
+                normalize_radio_co_response(response)
             }
             RadioNowPlayingFormat::RadioFranceLiveMeta => {
                 let response: RadioFranceLiveMetaResponse =
-                    get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
-                normalize_radio_france_response(response, unix_time())
+                    get_bounded_json(&self.agent, url, self.max_response_bytes)?;
+                normalize_radio_france_response(&response, unix_time())
+            }
+            RadioNowPlayingFormat::SectorRadioPlainText => {
+                let request_url = sector_now_playing_request_url(url, now_epoch_millis);
+                let payload =
+                    get_bounded_radio_text(&self.agent, &request_url, self.max_response_bytes)?;
+                parse_sector_radio_payload(payload.as_bytes(), self.max_response_bytes)
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RadioCoStatusResponse {
+    status: Option<String>,
+    current_track: Option<RadioCoCurrentTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RadioCoCurrentTrack {
+    title: Option<String>,
+}
+
+fn normalize_radio_co_response(
+    response: RadioCoStatusResponse,
+) -> Result<RadioNowPlaying, ProviderError> {
+    if response.status.as_deref() != Some("online") {
+        return Err(ProviderError::InvalidResponse(
+            "Radio.co station is not online".to_owned(),
+        ));
+    }
+    let title = normalize_remote_text(
+        response.current_track.and_then(|track| track.title),
+        "current title",
+        MAX_NOW_PLAYING_TEXT_BYTES,
+    )?;
+    if title.is_none() {
+        return Err(ProviderError::InvalidResponse(
+            "Radio.co status has no current title".to_owned(),
+        ));
+    }
+    Ok(RadioNowPlaying {
+        kind: RadioNowPlayingKind::OnAir,
+        title,
+        artist: None,
+        programme: None,
+        station_start_time: None,
+        duration: None,
+        refresh_after: DEFAULT_NOW_PLAYING_REFRESH,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BkkFmIcecastResponse {
+    icestats: BkkFmIcecastStats,
+}
+
+#[derive(Debug, Deserialize)]
+struct BkkFmIcecastStats {
+    source: BkkFmIcecastSources,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BkkFmIcecastSources {
+    One(BkkFmIcecastSource),
+    Many(Vec<BkkFmIcecastSource>),
+}
+
+#[derive(Debug, Deserialize)]
+struct BkkFmIcecastSource {
+    mount: Option<String>,
+    title: Option<String>,
+}
+
+fn normalize_bkk_fm_response(
+    response: BkkFmIcecastResponse,
+) -> Result<RadioNowPlaying, ProviderError> {
+    let sources = match response.icestats.source {
+        BkkFmIcecastSources::One(source) => vec![source],
+        BkkFmIcecastSources::Many(sources) => sources,
+    };
+    let raw = sources
+        .iter()
+        .find(|source| source.mount.as_deref() == Some("/bkkrelay"))
+        .or_else(|| sources.iter().find(|source| source.title.is_some()))
+        .and_then(|source| source.title.clone())
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("BKK.FM Icecast status has no current track".to_owned())
+        })?;
+    let (artist, title) = raw
+        .split_once(" - ")
+        .map_or((None, Some(raw.clone())), |(artist, title)| {
+            (Some(artist.to_owned()), Some(title.to_owned()))
+        });
+    let title = normalize_remote_text(title, "title", MAX_NOW_PLAYING_TEXT_BYTES)?;
+    let artist = normalize_remote_text(artist, "artist", MAX_NOW_PLAYING_TEXT_BYTES)?;
+    if title.is_none() && artist.is_none() {
+        return Err(ProviderError::InvalidResponse(
+            "BKK.FM Icecast status has no current track".to_owned(),
+        ));
+    }
+
+    Ok(RadioNowPlaying {
+        kind: RadioNowPlayingKind::Track,
+        title,
+        artist,
+        programme: None,
+        station_start_time: None,
+        duration: None,
+        refresh_after: DEFAULT_NOW_PLAYING_REFRESH,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +371,7 @@ fn normalize_four_duk_response(
         )?,
         duration: response
             .duration
+            .as_ref()
             .map(normalize_four_duk_duration)
             .transpose()?,
         refresh_after: clamp_refresh_interval(response.millis_until_next_request),
@@ -258,11 +399,11 @@ struct RadioFranceLevel {
 }
 
 fn normalize_radio_france_response(
-    response: RadioFranceLiveMetaResponse,
+    response: &RadioFranceLiveMetaResponse,
     now_epoch_seconds: u64,
 ) -> Result<RadioNowPlaying, ProviderError> {
-    let programme_step = current_radio_france_step(&response, 0);
-    let segment_step = current_radio_france_step(&response, 1);
+    let programme_step = current_radio_france_step(response, 0);
+    let segment_step = current_radio_france_step(response, 1);
     let programme = normalize_remote_text(
         programme_step.and_then(|step| step.title.clone()),
         "programme",
@@ -311,9 +452,9 @@ fn current_radio_france_step(
 }
 
 fn radio_france_refresh_after(end_epoch_seconds: Option<u64>, now_epoch_seconds: u64) -> Duration {
-    let advised = end_epoch_seconds
-        .map(|end| Duration::from_secs(end.saturating_sub(now_epoch_seconds)))
-        .unwrap_or(DEFAULT_NOW_PLAYING_REFRESH);
+    let advised = end_epoch_seconds.map_or(DEFAULT_NOW_PLAYING_REFRESH, |end| {
+        Duration::from_secs(end.saturating_sub(now_epoch_seconds))
+    });
     advised.clamp(MIN_RADIO_FRANCE_REFRESH, MAX_NOW_PLAYING_REFRESH)
 }
 
@@ -323,7 +464,136 @@ fn unix_time() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn normalize_four_duk_duration(raw: FourDukDuration) -> Result<Duration, ProviderError> {
+/// Returns the current Unix timestamp in milliseconds for cache-busting URLs.
+fn unix_time_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+/// Builds Sector Radio's request URL with one fresh `t` query parameter.
+fn sector_now_playing_request_url(base_url: &Url, now_epoch_millis: u128) -> Url {
+    let retained_query: Vec<(String, String)> = base_url
+        .query_pairs()
+        .filter(|(key, _)| key != "t")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let mut request_url = base_url.clone();
+    request_url.set_query(None);
+    {
+        let mut query = request_url.query_pairs_mut();
+        query.extend_pairs(retained_query);
+        query.append_pair("t", &now_epoch_millis.to_string());
+    }
+    request_url
+}
+
+/// Downloads one bounded plain-text radio metadata response.
+fn get_bounded_radio_text(
+    agent: &ureq::Agent,
+    url: &Url,
+    limit: usize,
+) -> Result<String, ProviderError> {
+    let mut response = agent
+        .get(url.as_str())
+        .header("Accept", "text/plain")
+        .call()
+        .map_err(map_ureq_error)?;
+
+    if response
+        .body()
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ProviderError::ResponseTooLarge { limit });
+    }
+
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_vec()
+        .map_err(|error| match error {
+            ureq::Error::BodyExceedsLimit(_) => ProviderError::ResponseTooLarge { limit },
+            other => ProviderError::Transport(other.to_string()),
+        })?;
+    if bytes.len() > limit {
+        return Err(ProviderError::ResponseTooLarge { limit });
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        ProviderError::InvalidResponse(format!("radio metadata is not UTF-8: {error}"))
+    })
+}
+
+/// Parses Sector Radio's optional feature, artist, title, and duration fields.
+fn parse_sector_radio_payload(
+    payload: &[u8],
+    max_response_bytes: usize,
+) -> Result<RadioNowPlaying, ProviderError> {
+    if payload.len() > max_response_bytes {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: max_response_bytes,
+        });
+    }
+    let raw = std::str::from_utf8(payload)
+        .map_err(|error| {
+            ProviderError::InvalidResponse(format!("radio metadata is not UTF-8: {error}"))
+        })?
+        .trim();
+    if raw.is_empty() {
+        return Err(ProviderError::InvalidResponse(
+            "Sector Radio metadata is empty".to_owned(),
+        ));
+    }
+
+    let track = raw.split_once(" | ").map_or(raw, |(_, track)| track).trim();
+    let (track, duration) = sector_track_and_duration(track)?;
+    let (artist, title) = track
+        .split_once(" - ")
+        .map_or((None, Some(track.to_owned())), |(artist, title)| {
+            (Some(artist.to_owned()), Some(title.to_owned()))
+        });
+    let title = normalize_remote_text(title, "title", MAX_NOW_PLAYING_TEXT_BYTES)?;
+    let artist = normalize_remote_text(artist, "artist", MAX_NOW_PLAYING_TEXT_BYTES)?;
+    if title.is_none() && artist.is_none() {
+        return Err(ProviderError::InvalidResponse(
+            "Sector Radio metadata has no track title".to_owned(),
+        ));
+    }
+
+    Ok(RadioNowPlaying {
+        kind: RadioNowPlayingKind::Track,
+        title,
+        artist,
+        programme: None,
+        station_start_time: None,
+        duration,
+        refresh_after: MIN_NOW_PLAYING_REFRESH,
+    })
+}
+
+/// Removes Sector Radio's trailing `:: seconds` field when it is present.
+fn sector_track_and_duration(raw: &str) -> Result<(&str, Option<Duration>), ProviderError> {
+    let Some((track, duration)) = raw.rsplit_once("::") else {
+        return Ok((raw.trim(), None));
+    };
+    let duration = duration.trim();
+    if duration.is_empty() || !duration.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok((raw.trim(), None));
+    }
+    let seconds = duration
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= MAX_TRACK_DURATION_SECONDS)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Sector Radio duration is outside supported bounds".to_owned(),
+            )
+        })?;
+    Ok((track.trim(), Some(Duration::from_secs(seconds))))
+}
+
+fn normalize_four_duk_duration(raw: &FourDukDuration) -> Result<Duration, ProviderError> {
     if raw.seconds >= 60 {
         return Err(ProviderError::InvalidResponse(
             "4duk duration seconds must be less than 60".to_owned(),
@@ -374,6 +644,36 @@ fn clamp_refresh_interval(milliseconds: Option<i64>) -> Duration {
 }
 
 #[cfg(test)]
+fn parse_bkk_fm_payload(
+    payload: &[u8],
+    max_json_bytes: usize,
+) -> Result<RadioNowPlaying, ProviderError> {
+    if payload.len() > max_json_bytes {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: max_json_bytes,
+        });
+    }
+    let response = serde_json::from_slice(payload)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    normalize_bkk_fm_response(response)
+}
+
+#[cfg(test)]
+fn parse_radio_co_payload(
+    payload: &[u8],
+    max_json_bytes: usize,
+) -> Result<RadioNowPlaying, ProviderError> {
+    if payload.len() > max_json_bytes {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: max_json_bytes,
+        });
+    }
+    let response = serde_json::from_slice(payload)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    normalize_radio_co_response(response)
+}
+
+#[cfg(test)]
 fn parse_four_duk_payload(
     payload: &[u8],
     max_json_bytes: usize,
@@ -401,7 +701,7 @@ fn parse_radio_france_payload(
     }
     let response = serde_json::from_slice(payload)
         .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-    normalize_radio_france_response(response, now_epoch_seconds)
+    normalize_radio_france_response(&response, now_epoch_seconds)
 }
 
 /// Static metadata for one built-in internet-radio station.
@@ -462,7 +762,7 @@ pub const STATIONS: &[RadioStationPreset] = &[
     RadioStationPreset {
         id: "sector-radio-progressive-flac",
         name: "Sector Radio — Progressive",
-        homepage: "https://sectorradio.com/",
+        homepage: "https://www.sectorradio.com/",
         stream: "http://89.223.45.5:8000/progressive-flac",
         summary: "Lossless progressive electronic music.",
         codec: Some(RadioCodec::Flac),
@@ -470,14 +770,17 @@ pub const STATIONS: &[RadioStationPreset] = &[
         sample_rate_hz: Some(44_100),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
-        now_playing: None,
+        now_playing: Some(RadioNowPlayingEndpoint {
+            url: "https://www.sectorradio.com/nowplaying-progressive.txt",
+            format: RadioNowPlayingFormat::SectorRadioPlainText,
+        }),
     },
     RadioStationPreset {
         id: "4duk-radio",
         name: "4duk Radio",
         homepage: "https://4duk.ru/",
         stream: "http://radio.4duk.ru/4duk256.mp3",
-        summary: "Community internet radio.",
+        summary: "Russian funk radio with jokes",
         codec: Some(RadioCodec::Mp3),
         bitrate_kbps: Some(256),
         sample_rate_hz: None,
@@ -487,6 +790,178 @@ pub const STATIONS: &[RadioStationPreset] = &[
             url: "http://www.4duk.ru/4duk/whatsPlaying.action",
             format: RadioNowPlayingFormat::FourDukJson,
         }),
+    },
+    RadioStationPreset {
+        id: "euroradio-belarus",
+        name: "Euroradio",
+        homepage: "https://euroradio.fm/radio",
+        stream: "http://stream.euroradio.fm:8000/euroradio1",
+        summary: "Belarusian-language news, talk, and alternative music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "radio-palitra",
+        name: "Radio Palitra",
+        homepage: "https://www.radiopalitra.ge/",
+        stream: "https://radiostream.palitra.ge/stream.mp3",
+        summary: "Georgian-language news, talk, and music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "kcbs-via-intchoson",
+        name: "Korean Central Broadcasting Station — via intchoson",
+        homepage: "https://www.intchoson.com/kcbs/",
+        stream: "https://stream.intchoson.com/kcbs/index.m3u8",
+        summary: "North Korean domestic radio delivered by an independent satellite relay.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(195),
+        sample_rate_hz: Some(48_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "arirang-radio",
+        name: "Arirang Radio",
+        homepage: "https://www.arirang.com/radio",
+        stream: "https://amdlive-ch03-ctnd-com.akamaized.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+        summary: "South Korean English-language K-pop, music, and culture.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "ebs-fm",
+        name: "EBS FM",
+        homepage: "https://www.ebs.co.kr/radio/home?ch=RADIO",
+        stream: "https://ebsonair.ebs.co.kr/fmradiofamilypc/familypc1m/playlist.m3u8",
+        summary: "South Korean educational, cultural, and humanities programming.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "easy-rock-manila",
+        name: "96.3 Easy Rock Manila",
+        homepage: "https://www.easyrock.com.ph/radio",
+        stream: "https://azura.easyrock.com.ph/listen/easy_rock_manila/radio.mp3",
+        summary: "Philippine English/Filipino easy-listening, adult-contemporary, and love songs.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "love-radio-manila",
+        name: "Love Radio Manila",
+        homepage: "https://www.loveradio.com.ph/radio",
+        stream: "https://azura.loveradio.com.ph/listen/love_radio_manila/radio.mp3",
+        summary: "Philippine Filipino/English pop, OPM, love songs, talk, and DJ programmes.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "radio-maria-philippines",
+        name: "Radio Maria Philippines — managed relay",
+        homepage: "https://www.radiomaria.ph/",
+        stream: "http://dreamsiteradiocp.com:8028/stream",
+        summary: "Philippine English/Filipino Catholic talk, prayer, teaching, and music over an external HTTP relay.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(44_100),
+        channels: Some(1),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "mcot-thinking-radio",
+        name: "MCOT Thinking Radio 96.5",
+        homepage: "https://www.mcot.net/",
+        stream: "https://live-org-01-cdn.mcot.net/radiocdn_edge/fm965.stream_aac/chunklist.m3u8",
+        summary: "Thai-language knowledge, news, business, culture, and talk.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(48_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "thai-lanna-radio",
+        name: "Thai Lanna Radio",
+        homepage: "https://www.lannaradio.com/",
+        stream: "https://inter.lannaradio.com/radio/8000/radio.mp3",
+        summary: "Thai and Lanna luk thung, phuea chiwit, regional, indie, and pop music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "chili-radio-thailand",
+        name: "Chili Radio Thailand",
+        homepage: "https://chiliradio.asia/",
+        stream: "https://stream.chiliradio.app/chiliclassics",
+        summary: "English-language Chiang Mai hits from the 1970s onward, plus Thai news in English.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "bkk-fm",
+        name: "BKK.FM",
+        homepage: "https://bkk.fm/",
+        stream: "https://rsas.bkk.fm/radio",
+        summary: "English-led Bangkok rock, alternative, and electronic music.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: Some(RadioNowPlayingEndpoint {
+            url: "https://rsas.bkk.fm/status-json.xsl",
+            format: RadioNowPlayingFormat::BkkFmIcecastJson,
+        }),
+    },
+    RadioStationPreset {
+        id: "retro-fm-russia",
+        name: "Retro FM Russia",
+        homepage: "https://retrofm.ru/",
+        stream: "https://retroserver.streamr.ru:8043/retro256.mp3",
+        summary: "Russian and international hits from the 1970s, 1980s, and 1990s.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
     },
     RadioStationPreset {
         id: "somafm-groove-salad",
@@ -499,6 +974,308 @@ pub const STATIONS: &[RadioStationPreset] = &[
         sample_rate_hz: None,
         channels: None,
         stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-drone-zone",
+        name: "SomaFM Drone Zone",
+        homepage: "https://somafm.com/dronezone/",
+        stream: "https://somafm.com/m3u/dronezone256.m3u",
+        summary: "Atmospheric space music and ambient textures with minimal beats.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: None,
+        channels: None,
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-dark-zone",
+        name: "SomaFM The Dark Zone",
+        homepage: "https://somafm.com/darkzone/",
+        stream: "https://somafm.com/m3u/darkzone256.m3u",
+        summary: "Dark, flowing, mostly beatless ambient soundscapes.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: None,
+        channels: None,
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-deep-space-one",
+        name: "SomaFM Deep Space One",
+        homepage: "https://somafm.com/deepspaceone/",
+        stream: "https://somafm.com/m3u/deepspaceone130.m3u",
+        summary: "Deep ambient electronic, experimental, and space music.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-space-station-soma",
+        name: "SomaFM Space Station Soma",
+        homepage: "https://somafm.com/spacestation/",
+        stream: "https://somafm.com/m3u/spacestation320.m3u",
+        summary: "Ambient and mid-tempo electronica for space exploration.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "catholic-fm",
+        name: "Catholic.fm",
+        homepage: "https://catholic.fm/",
+        stream: "https://radio.catholic.fm/listen/catholic-fm-radio/radio.mp3",
+        summary: "Spiritual music, prayer, and contemplative sound.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "positively-meditation",
+        name: "Positively Meditation",
+        homepage: "https://play.you.radio/station/1121",
+        stream: "https://streaming.positivity.radio/pr/posimeditation/icecast.audio",
+        summary: "Binaural, alpha-wave, and chakra-focused meditation music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "neuroradio-meditation",
+        name: "NeuroRadio — The Meditation Station",
+        homepage: "https://neuroradio.uk/the-meditation-channel/",
+        stream: "https://visual.shoutca.st:2020/8576/stream",
+        summary: "Meditative soundscapes with Vipassana-style guided-awareness prompts.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "hearme-east-asian-meditation",
+        name: "HearMe.fm — East Asian Meditation",
+        homepage: "https://hearme.fm/radio/east-asian-meditation/",
+        stream: "https://radio.hearme.fm:8144/stream",
+        summary: "Traditional East Asian instruments and melodies for mindful meditation.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "hearme-tibetan-singing-bowls",
+        name: "HearMe.fm — Tibetan Singing Bowls",
+        homepage: "https://hearme.fm/radio/tibetan-singing-bowls/",
+        stream: "https://radio.hearme.fm:8204/stream",
+        summary: "Singing-bowl harmonics for meditation, yoga, breathwork, and sound baths.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "hare-krsna-radio",
+        name: "Hare Krsna Radio",
+        homepage: "https://hkradio.in/",
+        stream: "https://cast5.my-control-panel.com/proxy/harekrsn/stream",
+        summary: "Gaudiya Vaishnava kirtans, bhajans, sacred chants, and spiritual discourses.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "mantra-radio-eu",
+        name: "Mantra Radio",
+        homepage: "https://www.mantraradio.eu/",
+        stream: "https://whsh4u-panel.com/proxy/gsedemag?mp=/stream",
+        summary: "Hare Krishna mantras, kirtans, and Gaudiya Vaishnava devotional music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(32),
+        sample_rate_hz: Some(22_050),
+        channels: Some(1),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "sikhnet-simran",
+        name: "SikhNet Radio — Simran",
+        homepage: "https://play.sikhnet.com/radio/simran",
+        stream: "https://radio.sikhnet.com/proxy/channel4/stream_high_autodj",
+        summary: "Sikh Naam Simran with meditative repetition of Waheguru by traditional and Western artists.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(96),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "birdsong-radio",
+        name: "Birdsong Radio",
+        homepage: "https://www.birdsong.fm/",
+        stream: "https://a1.radio.co/s5c5da6a36/listen",
+        summary: "Continuous woodland birdsong, changing from morning calls through twilight.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: Some(RadioNowPlayingEndpoint {
+            url: "https://public.radio.co/stations/s5c5da6a36/status",
+            format: RadioNowPlayingFormat::RadioCoStatusJson,
+        }),
+    },
+    RadioStationPreset {
+        id: "247-nature-radio",
+        name: "24/7 Nature Radio",
+        homepage: "https://www.247natureradio.com/",
+        stream: "https://ec3.yesstreaming.net:3545/stream",
+        summary: "Natural soundscapes including sea waves, waterfalls, forests, and rain.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "nature-radio-rain",
+        name: "Nature Radio Rain",
+        homepage: "https://radiosuitenetwork.torontocast.stream/nature-radio-rain/",
+        stream: "https://maggie.torontocast.com:2020/stream/natureradiorain",
+        summary: "Rain and nature soundscapes blended with sleep and relaxation music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-underground-80s",
+        name: "SomaFM Underground 80s",
+        homepage: "https://somafm.com/u80s/",
+        stream: "https://somafm.com/m3u/u80s256.m3u",
+        summary: "Early-1980s synth-pop and new wave.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: None,
+        channels: None,
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "ebm-radio-com",
+        name: "EBM-Radio.com",
+        homepage: "https://ebm-radio.com/",
+        stream: "https://djstream.live/listen/ebmr/256",
+        summary: "EBM, industrial, darkwave, synthpop, electro, and futurepop.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-doomed",
+        name: "SomaFM Doomed",
+        homepage: "https://somafm.com/doomed/",
+        stream: "https://somafm.com/m3u/doomed256.m3u",
+        summary: "Industrial, EBM, neofolk, and dark ambient.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "somafm-cliqhop-idm",
+        name: "SomaFM Cliqhop IDM",
+        homepage: "https://somafm.com/cliqhop/",
+        stream: "https://somafm.com/m3u/cliqhop256.m3u",
+        summary: "Intelligent dance music and experimental electronic beats.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "80s80s-ebm",
+        name: "80s80s EBM",
+        homepage: "https://www.80s80s.de/ebm",
+        stream: "https://streams.80s80s.de/ebm/mp3-192/streams.80s80s.de/",
+        summary: "1980s electronic body music and industrial dance-floor beats.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "80s80s-dark-wave",
+        name: "80s80s Dark Wave",
+        homepage: "https://www.80s80s.de/80s80s-dark-wave",
+        stream: "https://streams.80s80s.de/darkwave/mp3-192/streams.80s80s.de/",
+        summary: "Dark wave, gothic rock, and depressive post-punk from the 1980s.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "radcap-dsbm",
+        name: "RADCAP — Depressive Suicidal Black Metal",
+        homepage: "https://www.radcap.ru/depressiveblack.html",
+        stream: "http://79.111.119.111:8000/dsbm",
+        summary: "Depressive suicidal black metal and dark atmospheric metal.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "dark-star-radio",
+        name: "Dark Star Radio",
+        homepage: "https://darkstarradio.com/home/",
+        stream: "http://s4.radio.co/s21ae5f2ee/listen",
+        summary: "Goth, metal, industrial, and dark alternative music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
     RadioStationPreset {
@@ -580,6 +1357,84 @@ pub const STATIONS: &[RadioStationPreset] = &[
         now_playing: None,
     },
     RadioStationPreset {
+        id: "radiosega",
+        name: "RadioSEGA",
+        homepage: "https://www.radiosega.net/",
+        stream: "https://icecast.radiosega.net/live",
+        summary: "SEGA video-game music around the clock.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(48_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "cvgm-radio",
+        name: "CVGM Radio",
+        homepage: "https://radio.cvgm.net/",
+        stream: "https://slacker.cvgm.net/cvgm192",
+        summary: "Video-game, demoscene, and computer-platform music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "kohina",
+        name: "Kohina",
+        homepage: "https://www.kohina.com/",
+        stream: "https://kohina.duckdns.org/playlist_https.m3u",
+        summary: "Original old-school game and demo music.",
+        codec: Some(RadioCodec::Vorbis),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "slay-radio",
+        name: "SLAY Radio",
+        homepage: "https://www.slayradio.org/",
+        stream: "https://www.slayradio.org/tune_in.php/128kbps/slayradio.128.m3u",
+        summary: "C64 and Amiga game-music remixes.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "scenesat",
+        name: "SceneSat",
+        homepage: "https://scenesat.com/",
+        stream: "https://scenesat.com/listen/normal/max.m3u",
+        summary: "Demoscene and video-game music and remixes.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(320),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::M3u,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "nectarine-demoscene-radio",
+        name: "Nectarine Demoscene Radio",
+        homepage: "https://www.scenestream.net/demovibes/",
+        stream: "https://nectarine.inversi0n.org/necta192.mp3",
+        summary: "Demoscene and tracker music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
         id: "animeradio-de",
         name: "AnimeRadio.de",
         homepage: "https://www.animeradio.de/",
@@ -614,6 +1469,58 @@ pub const STATIONS: &[RadioStationPreset] = &[
         codec: Some(RadioCodec::Opus),
         bitrate_kbps: None,
         sample_rate_hz: Some(48_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "france-musique-la-bo",
+        name: "France Musique — La B.O.",
+        homepage: "https://www.radiofrance.fr/francemusique",
+        stream: "https://icecast.radiofrance.fr/francemusiquelabo-hifi.aac",
+        summary: "Film scores and soundtrack compositions from French public radio.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(48_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "cinemix",
+        name: "Cinemix",
+        homepage: "https://www.cinemix.us/",
+        stream: "https://kathy.torontocast.com:1825/stream",
+        summary: "Film scores and soundtrack music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "matts-movie-trax",
+        name: "Matt's Movie Trax",
+        homepage: "https://www.mattsmovietrax.com/",
+        stream: "https://s8.myradiostream.com/11732/;",
+        summary: "Movie music and film scores around the clock.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "streaming-soundtracks",
+        name: "StreamingSoundtracks.com",
+        homepage: "https://streamingsoundtracks.com/",
+        stream: "http://hi5.streamingsoundtracks.com/",
+        summary: "Instrumental film, television, game, and anime scores.",
+        codec: Some(RadioCodec::Aac),
+        bitrate_kbps: Some(192),
+        sample_rate_hz: Some(44_100),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
@@ -709,7 +1616,12 @@ pub fn station_by_id(id: &str) -> Option<RadioStationPreset> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        thread,
+    };
 
     use super::*;
 
@@ -757,14 +1669,22 @@ mod tests {
             .expect("Sector Radio preset should exist");
         let four_duk = station_by_id("4duk-radio").expect("4duk preset should exist");
 
-        assert_eq!(sector.homepage, "https://sectorradio.com/");
+        assert_eq!(sector.homepage, "https://www.sectorradio.com/");
         assert_eq!(sector.stream, "http://89.223.45.5:8000/progressive-flac");
         assert_eq!(sector.codec, Some(RadioCodec::Flac));
         assert_eq!(sector.bitrate_kbps, None);
         assert_eq!(sector.sample_rate_hz, Some(44_100));
         assert_eq!(sector.channels, Some(2));
+        assert_eq!(
+            sector.now_playing,
+            Some(RadioNowPlayingEndpoint {
+                url: "https://www.sectorradio.com/nowplaying-progressive.txt",
+                format: RadioNowPlayingFormat::SectorRadioPlainText,
+            })
+        );
         assert_eq!(four_duk.homepage, "https://4duk.ru/");
         assert_eq!(four_duk.stream, "http://radio.4duk.ru/4duk256.mp3");
+        assert_eq!(four_duk.summary, "Russian funk radio with jokes");
         assert_eq!(four_duk.bitrate_kbps, Some(256));
         assert_eq!(
             four_duk
@@ -772,6 +1692,272 @@ mod tests {
                 .expect("4duk metadata endpoint should exist")
                 .url,
             "http://www.4duk.ru/4duk/whatsPlaying.action"
+        );
+    }
+
+    #[test]
+    fn film_soundtrack_presets_keep_live_probed_stream_quality() {
+        let expected = [
+            (
+                "france-musique-la-bo",
+                "https://icecast.radiofrance.fr/francemusiquelabo-hifi.aac",
+                RadioCodec::Aac,
+                192,
+                48_000,
+                RadioStreamKind::Direct,
+            ),
+            (
+                "cinemix",
+                "https://kathy.torontocast.com:1825/stream",
+                RadioCodec::Mp3,
+                128,
+                44_100,
+                RadioStreamKind::Direct,
+            ),
+            (
+                "matts-movie-trax",
+                "https://s8.myradiostream.com/11732/;",
+                RadioCodec::Mp3,
+                128,
+                44_100,
+                RadioStreamKind::Direct,
+            ),
+            (
+                "streaming-soundtracks",
+                "http://hi5.streamingsoundtracks.com/",
+                RadioCodec::Aac,
+                192,
+                44_100,
+                RadioStreamKind::Direct,
+            ),
+        ];
+
+        for (id, stream, codec, bitrate_kbps, sample_rate_hz, stream_kind) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing film-radio preset: {id}"));
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(sample_rate_hz));
+            assert_eq!(station.channels, Some(2));
+            assert_eq!(station.stream_kind, stream_kind);
+            assert!(
+                station.summary.to_ascii_lowercase().contains("film")
+                    || station.summary.to_ascii_lowercase().contains("movie")
+            );
+        }
+    }
+
+    #[test]
+    fn korean_presets_disclose_region_and_relay_provenance() {
+        let kcbs = station_by_id("kcbs-via-intchoson").expect("KCBS relay preset");
+        assert_eq!(kcbs.stream, "https://stream.intchoson.com/kcbs/index.m3u8");
+        assert!(kcbs.name.contains("via intchoson"));
+        assert!(kcbs.summary.contains("independent satellite relay"));
+        assert_eq!(kcbs.codec, Some(RadioCodec::Aac));
+        assert_eq!(kcbs.bitrate_kbps, Some(195));
+        assert_eq!(kcbs.sample_rate_hz, Some(48_000));
+        assert_eq!(kcbs.channels, Some(2));
+
+        for (id, bitrate_kbps) in [("arirang-radio", 128), ("ebs-fm", 64)] {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing South Korean preset: {id}"));
+            assert!(station.summary.starts_with("South Korean"));
+            assert_eq!(station.codec, Some(RadioCodec::Aac));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+        }
+    }
+
+    #[test]
+    fn philippine_and_thai_presets_keep_validated_stream_quality() {
+        let expected = [
+            (
+                "easy-rock-manila",
+                RadioCodec::Mp3,
+                128,
+                44_100,
+                2,
+                "Philippine",
+            ),
+            (
+                "love-radio-manila",
+                RadioCodec::Mp3,
+                128,
+                44_100,
+                2,
+                "Philippine",
+            ),
+            (
+                "radio-maria-philippines",
+                RadioCodec::Mp3,
+                64,
+                44_100,
+                1,
+                "Philippine",
+            ),
+            (
+                "mcot-thinking-radio",
+                RadioCodec::Aac,
+                128,
+                48_000,
+                2,
+                "Thai",
+            ),
+            ("thai-lanna-radio", RadioCodec::Mp3, 320, 44_100, 2, "Thai"),
+            (
+                "chili-radio-thailand",
+                RadioCodec::Mp3,
+                256,
+                44_100,
+                2,
+                "English-language Chiang Mai",
+            ),
+            ("bkk-fm", RadioCodec::Aac, 64, 44_100, 2, "Bangkok"),
+        ];
+
+        for (id, codec, bitrate_kbps, sample_rate_hz, channels, region) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing regional preset: {id}"));
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(sample_rate_hz));
+            assert_eq!(station.channels, Some(channels));
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+            assert!(station.summary.contains(region));
+        }
+
+        let radio_maria =
+            station_by_id("radio-maria-philippines").expect("Radio Maria Philippines preset");
+        assert!(radio_maria.name.contains("managed relay"));
+        assert!(radio_maria.summary.contains("external HTTP relay"));
+        let bkk = station_by_id("bkk-fm").expect("BKK.FM preset");
+        assert_eq!(
+            bkk.now_playing,
+            Some(RadioNowPlayingEndpoint {
+                url: "https://rsas.bkk.fm/status-json.xsl",
+                format: RadioNowPlayingFormat::BkkFmIcecastJson,
+            })
+        );
+    }
+
+    #[test]
+    fn meditation_presets_are_distinct_and_keep_live_probed_quality() {
+        let expected = [
+            (
+                "positively-meditation",
+                "https://streaming.positivity.radio/pr/posimeditation/icecast.audio",
+                RadioCodec::Mp3,
+                128,
+                "Binaural",
+            ),
+            (
+                "neuroradio-meditation",
+                "https://visual.shoutca.st:2020/8576/stream",
+                RadioCodec::Aac,
+                128,
+                "Vipassana",
+            ),
+            (
+                "hearme-east-asian-meditation",
+                "https://radio.hearme.fm:8144/stream",
+                RadioCodec::Mp3,
+                320,
+                "East Asian",
+            ),
+            (
+                "hearme-tibetan-singing-bowls",
+                "https://radio.hearme.fm:8204/stream",
+                RadioCodec::Mp3,
+                320,
+                "Singing-bowl",
+            ),
+        ];
+
+        for (id, stream, codec, bitrate_kbps, distinguishing_text) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing meditation preset: {id}"));
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+            assert!(station.summary.contains(distinguishing_text));
+        }
+    }
+
+    #[test]
+    fn mantra_and_devotional_presets_keep_live_probed_quality() {
+        let expected = [
+            (
+                "hare-krsna-radio",
+                RadioCodec::Mp3,
+                128,
+                44_100,
+                2,
+                "kirtans",
+            ),
+            ("mantra-radio-eu", RadioCodec::Mp3, 32, 22_050, 1, "mantras"),
+            ("sikhnet-simran", RadioCodec::Mp3, 96, 44_100, 2, "Simran"),
+        ];
+
+        for (id, codec, bitrate_kbps, sample_rate_hz, channels, content) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing mantra preset: {id}"));
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(sample_rate_hz));
+            assert_eq!(station.channels, Some(channels));
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+            assert!(station.summary.contains(content));
+        }
+    }
+
+    #[test]
+    fn nature_sound_presets_keep_live_probed_quality_and_content_caveats() {
+        let expected = [
+            (
+                "birdsong-radio",
+                "https://a1.radio.co/s5c5da6a36/listen",
+                128,
+                "woodland birdsong",
+            ),
+            (
+                "247-nature-radio",
+                "https://ec3.yesstreaming.net:3545/stream",
+                64,
+                "sea waves",
+            ),
+            (
+                "nature-radio-rain",
+                "https://maggie.torontocast.com:2020/stream/natureradiorain",
+                128,
+                "relaxation music",
+            ),
+        ];
+
+        for (id, stream, bitrate_kbps, content) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing nature-sound preset: {id}"));
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.codec, Some(RadioCodec::Mp3));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+            assert!(station.summary.contains(content));
+        }
+
+        assert_eq!(
+            station_by_id("birdsong-radio")
+                .expect("Birdsong Radio preset")
+                .now_playing,
+            Some(RadioNowPlayingEndpoint {
+                url: "https://public.radio.co/stations/s5c5da6a36/status",
+                format: RadioNowPlayingFormat::RadioCoStatusJson,
+            })
         );
     }
 
@@ -826,6 +2012,309 @@ mod tests {
                     .stream,
                 stream
             );
+        }
+    }
+
+    #[test]
+    fn regional_and_genre_presets_keep_verified_stream_quality() {
+        let expected = [
+            (
+                "euroradio-belarus",
+                "https://euroradio.fm/radio",
+                "http://stream.euroradio.fm:8000/euroradio1",
+                RadioCodec::Mp3,
+                192,
+                Some(44_100),
+                Some(2),
+                RadioStreamKind::Direct,
+                "Belarusian",
+            ),
+            (
+                "radio-palitra",
+                "https://www.radiopalitra.ge/",
+                "https://radiostream.palitra.ge/stream.mp3",
+                RadioCodec::Mp3,
+                128,
+                Some(44_100),
+                Some(2),
+                RadioStreamKind::Direct,
+                "Georgian",
+            ),
+            (
+                "somafm-drone-zone",
+                "https://somafm.com/dronezone/",
+                "https://somafm.com/m3u/dronezone256.m3u",
+                RadioCodec::Mp3,
+                256,
+                None,
+                None,
+                RadioStreamKind::M3u,
+                "ambient",
+            ),
+            (
+                "somafm-dark-zone",
+                "https://somafm.com/darkzone/",
+                "https://somafm.com/m3u/darkzone256.m3u",
+                RadioCodec::Mp3,
+                256,
+                None,
+                None,
+                RadioStreamKind::M3u,
+                "ambient",
+            ),
+            (
+                "radiosega",
+                "https://www.radiosega.net/",
+                "https://icecast.radiosega.net/live",
+                RadioCodec::Aac,
+                256,
+                Some(48_000),
+                Some(2),
+                RadioStreamKind::Direct,
+                "video-game",
+            ),
+            (
+                "catholic-fm",
+                "https://catholic.fm/",
+                "https://radio.catholic.fm/listen/catholic-fm-radio/radio.mp3",
+                RadioCodec::Mp3,
+                192,
+                Some(44_100),
+                Some(2),
+                RadioStreamKind::Direct,
+                "Spiritual",
+            ),
+            (
+                "somafm-underground-80s",
+                "https://somafm.com/u80s/",
+                "https://somafm.com/m3u/u80s256.m3u",
+                RadioCodec::Mp3,
+                256,
+                None,
+                None,
+                RadioStreamKind::M3u,
+                "1980",
+            ),
+            (
+                "retro-fm-russia",
+                "https://retrofm.ru/",
+                "https://retroserver.streamr.ru:8043/retro256.mp3",
+                RadioCodec::Mp3,
+                320,
+                Some(44_100),
+                Some(2),
+                RadioStreamKind::Direct,
+                "Russian",
+            ),
+        ];
+
+        for (
+            id,
+            homepage,
+            stream,
+            codec,
+            bitrate_kbps,
+            sample_rate_hz,
+            channels,
+            stream_kind,
+            summary_fragment,
+        ) in expected
+        {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing requested radio preset: {id}"));
+            assert_eq!(station.homepage, homepage);
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, sample_rate_hz);
+            assert_eq!(station.channels, channels);
+            assert_eq!(station.stream_kind, stream_kind);
+            assert!(station.summary.contains(summary_fragment));
+        }
+    }
+
+    #[test]
+    fn ambient_industrial_electro_and_dark_presets_keep_verified_stream_quality() {
+        let expected = [
+            (
+                "somafm-deep-space-one",
+                "https://somafm.com/deepspaceone/",
+                "https://somafm.com/m3u/deepspaceone130.m3u",
+                RadioCodec::Aac,
+                128,
+                RadioStreamKind::M3u,
+                "ambient",
+            ),
+            (
+                "somafm-space-station-soma",
+                "https://somafm.com/spacestation/",
+                "https://somafm.com/m3u/spacestation320.m3u",
+                RadioCodec::Mp3,
+                320,
+                RadioStreamKind::M3u,
+                "Ambient",
+            ),
+            (
+                "ebm-radio-com",
+                "https://ebm-radio.com/",
+                "https://djstream.live/listen/ebmr/256",
+                RadioCodec::Mp3,
+                256,
+                RadioStreamKind::Direct,
+                "industrial",
+            ),
+            (
+                "somafm-doomed",
+                "https://somafm.com/doomed/",
+                "https://somafm.com/m3u/doomed256.m3u",
+                RadioCodec::Mp3,
+                256,
+                RadioStreamKind::M3u,
+                "neofolk",
+            ),
+            (
+                "somafm-cliqhop-idm",
+                "https://somafm.com/cliqhop/",
+                "https://somafm.com/m3u/cliqhop256.m3u",
+                RadioCodec::Mp3,
+                256,
+                RadioStreamKind::M3u,
+                "electronic",
+            ),
+            (
+                "80s80s-ebm",
+                "https://www.80s80s.de/ebm",
+                "https://streams.80s80s.de/ebm/mp3-192/streams.80s80s.de/",
+                RadioCodec::Mp3,
+                192,
+                RadioStreamKind::Direct,
+                "electronic body music",
+            ),
+            (
+                "80s80s-dark-wave",
+                "https://www.80s80s.de/80s80s-dark-wave",
+                "https://streams.80s80s.de/darkwave/mp3-192/streams.80s80s.de/",
+                RadioCodec::Mp3,
+                192,
+                RadioStreamKind::Direct,
+                "depressive post-punk",
+            ),
+            (
+                "radcap-dsbm",
+                "https://www.radcap.ru/depressiveblack.html",
+                "http://79.111.119.111:8000/dsbm",
+                RadioCodec::Aac,
+                320,
+                RadioStreamKind::Direct,
+                "Depressive suicidal black metal",
+            ),
+            (
+                "dark-star-radio",
+                "https://darkstarradio.com/home/",
+                "http://s4.radio.co/s21ae5f2ee/listen",
+                RadioCodec::Mp3,
+                128,
+                RadioStreamKind::Direct,
+                "dark alternative",
+            ),
+        ];
+
+        for (id, homepage, stream, codec, bitrate_kbps, stream_kind, summary_fragment) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing requested radio preset: {id}"));
+            assert_eq!(station.homepage, homepage);
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+            assert_eq!(station.stream_kind, stream_kind);
+            assert_eq!(station.now_playing, None);
+            assert!(station.summary.contains(summary_fragment));
+        }
+
+        for id in ["radcap-dsbm", "dark-star-radio"] {
+            let station = station_by_id(id)
+                .unwrap_or_else(|| panic!("missing intentional HTTP preset: {id}"));
+            assert_eq!(
+                station
+                    .stream_url()
+                    .expect("intentional HTTP stream URL should parse")
+                    .scheme(),
+                "http",
+                "{id} must retain the station-published HTTP endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn mod_tracker_chiptune_and_game_presets_keep_verified_stream_quality() {
+        let expected = [
+            (
+                "cvgm-radio",
+                "CVGM Radio",
+                "https://radio.cvgm.net/",
+                "https://slacker.cvgm.net/cvgm192",
+                RadioCodec::Mp3,
+                192,
+                RadioStreamKind::Direct,
+                "Video-game, demoscene, and computer-platform music.",
+            ),
+            (
+                "kohina",
+                "Kohina",
+                "https://www.kohina.com/",
+                "https://kohina.duckdns.org/playlist_https.m3u",
+                RadioCodec::Vorbis,
+                128,
+                RadioStreamKind::M3u,
+                "Original old-school game and demo music.",
+            ),
+            (
+                "slay-radio",
+                "SLAY Radio",
+                "https://www.slayradio.org/",
+                "https://www.slayradio.org/tune_in.php/128kbps/slayradio.128.m3u",
+                RadioCodec::Mp3,
+                128,
+                RadioStreamKind::M3u,
+                "C64 and Amiga game-music remixes.",
+            ),
+            (
+                "scenesat",
+                "SceneSat",
+                "https://scenesat.com/",
+                "https://scenesat.com/listen/normal/max.m3u",
+                RadioCodec::Mp3,
+                320,
+                RadioStreamKind::M3u,
+                "Demoscene and video-game music and remixes.",
+            ),
+            (
+                "nectarine-demoscene-radio",
+                "Nectarine Demoscene Radio",
+                "https://www.scenestream.net/demovibes/",
+                "https://nectarine.inversi0n.org/necta192.mp3",
+                RadioCodec::Mp3,
+                192,
+                RadioStreamKind::Direct,
+                "Demoscene and tracker music.",
+            ),
+        ];
+
+        for (id, name, homepage, stream, codec, bitrate_kbps, stream_kind, summary) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing game-radio preset: {id}"));
+            assert_eq!(station.name, name);
+            assert_eq!(station.homepage, homepage);
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.summary, summary);
+            assert_eq!(station.codec, Some(codec));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+            assert_eq!(station.stream_kind, stream_kind);
+            assert_eq!(station.now_playing, None);
         }
     }
 
@@ -970,6 +2459,90 @@ mod tests {
     #[test]
     fn lookup_rejects_unknown_station() {
         assert_eq!(station_by_id("not-a-station"), None);
+    }
+
+    #[test]
+    fn bkk_fm_status_selects_the_main_mount_and_splits_artist_and_title() {
+        let payload = br#"{
+            "icestats": {
+                "source": [
+                    {"mount":"/95txrelay","title":"Other Artist - Other Track"},
+                    {"mount":"/bkkrelay","title":"The Script - No Good In Goodbye"}
+                ]
+            }
+        }"#;
+
+        assert_eq!(
+            parse_bkk_fm_payload(payload, DEFAULT_MAX_NOW_PLAYING_BYTES)
+                .expect("BKK.FM Icecast fixture should parse"),
+            RadioNowPlaying {
+                kind: RadioNowPlayingKind::Track,
+                title: Some("No Good In Goodbye".to_owned()),
+                artist: Some("The Script".to_owned()),
+                programme: None,
+                station_start_time: None,
+                duration: None,
+                refresh_after: DEFAULT_NOW_PLAYING_REFRESH,
+            }
+        );
+    }
+
+    #[test]
+    fn bkk_fm_status_rejects_empty_malformed_and_oversized_payloads() {
+        let empty = br#"{"icestats":{"source":[{"mount":"/bkkrelay","title":" "}]}}"#;
+        assert!(matches!(
+            parse_bkk_fm_payload(empty, DEFAULT_MAX_NOW_PLAYING_BYTES),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            parse_bkk_fm_payload(b"{", DEFAULT_MAX_NOW_PLAYING_BYTES),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            parse_bkk_fm_payload(b"123456789", 8),
+            Err(ProviderError::ResponseTooLarge { limit: 8 })
+        ));
+    }
+
+    #[test]
+    fn radio_co_status_preserves_the_current_birdsong_programme() {
+        let payload = br#"{
+            "status":"online",
+            "current_track":{
+                "title":"Drift off to the woodland night - Twilight Songs"
+            }
+        }"#;
+
+        assert_eq!(
+            parse_radio_co_payload(payload, DEFAULT_MAX_NOW_PLAYING_BYTES)
+                .expect("Radio.co fixture should parse"),
+            RadioNowPlaying {
+                kind: RadioNowPlayingKind::OnAir,
+                title: Some("Drift off to the woodland night - Twilight Songs".to_owned()),
+                artist: None,
+                programme: None,
+                station_start_time: None,
+                duration: None,
+                refresh_after: DEFAULT_NOW_PLAYING_REFRESH,
+            }
+        );
+    }
+
+    #[test]
+    fn radio_co_status_rejects_offline_empty_and_oversized_payloads() {
+        for payload in [
+            br#"{"status":"offline","current_track":{"title":"Twilight"}}"#.as_slice(),
+            br#"{"status":"online","current_track":{"title":" "}}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                parse_radio_co_payload(payload, DEFAULT_MAX_NOW_PLAYING_BYTES),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
+        assert!(matches!(
+            parse_radio_co_payload(b"123456789", 8),
+            Err(ProviderError::ResponseTooLarge { limit: 8 })
+        ));
     }
 
     #[test]
@@ -1138,6 +2711,177 @@ mod tests {
         assert!(matches!(
             parse_radio_france_payload(empty, DEFAULT_MAX_NOW_PLAYING_BYTES, 1000),
             Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn sector_radio_fixture_preserves_track_details_and_duration() {
+        let payload = b"Benoit Pioulard - If i could possibly tell the difference, \
+            i wouldn't care anyway, 2012 [- \xe2\x80\xa2 -] :: 353";
+
+        assert_eq!(
+            parse_sector_radio_payload(payload, DEFAULT_MAX_NOW_PLAYING_BYTES)
+                .expect("verified Sector Radio payload should parse"),
+            RadioNowPlaying {
+                kind: RadioNowPlayingKind::Track,
+                title: Some(
+                    "If i could possibly tell the difference, i wouldn't care anyway, \
+                     2012 [- \u{2022} -]"
+                        .to_owned()
+                ),
+                artist: Some("Benoit Pioulard".to_owned()),
+                programme: None,
+                station_start_time: None,
+                duration: Some(Duration::from_secs(353)),
+                refresh_after: MIN_NOW_PLAYING_REFRESH,
+            }
+        );
+    }
+
+    #[test]
+    fn sector_radio_optional_feature_prefix_and_missing_duration_are_supported() {
+        let with_prefix =
+            parse_sector_radio_payload(b"Hi-Res | Artist - Track [Chicago - USA] :: 198", 1024)
+                .expect("feature prefix should be ignored");
+        assert_eq!(with_prefix.artist.as_deref(), Some("Artist"));
+        assert_eq!(with_prefix.title.as_deref(), Some("Track [Chicago - USA]"));
+        assert_eq!(with_prefix.duration, Some(Duration::from_secs(198)));
+
+        let without_duration = parse_sector_radio_payload(b"Exalot - Mixtorum, 1996", 1024)
+            .expect("duration is optional");
+        assert_eq!(without_duration.artist.as_deref(), Some("Exalot"));
+        assert_eq!(without_duration.title.as_deref(), Some("Mixtorum, 1996"));
+        assert_eq!(without_duration.duration, None);
+    }
+
+    #[test]
+    fn sector_radio_rejects_empty_invalid_utf8_control_and_oversized_payloads() {
+        for payload in [b"".as_slice(), b" \r\n".as_slice(), b"\xff".as_slice()] {
+            assert!(matches!(
+                parse_sector_radio_payload(payload, 1024),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
+        assert!(matches!(
+            parse_sector_radio_payload(b"Artist - unsafe\ntrack", 1024),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            parse_sector_radio_payload(b"123456789", 8),
+            Err(ProviderError::ResponseTooLarge { limit: 8 })
+        ));
+        let excessive_duration = format!(
+            "Artist - Track :: {}",
+            MAX_TRACK_DURATION_SECONDS.saturating_add(1)
+        );
+        assert!(matches!(
+            parse_sector_radio_payload(excessive_duration.as_bytes(), 1024),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn sector_radio_request_replaces_cache_buster_and_preserves_other_query_pairs() {
+        let base = Url::parse("https://example.test/now.txt?station=progressive&t=old")
+            .expect("fixture URL");
+
+        assert_eq!(
+            sector_now_playing_request_url(&base, 1_700_000_000_123).as_str(),
+            "https://example.test/now.txt?station=progressive&t=1700000000123"
+        );
+    }
+
+    #[test]
+    fn sector_radio_client_sends_dynamic_cache_buster_and_plain_text_accept_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock metadata endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept metadata request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone mock stream"));
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request line");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                lines.push(line.trim_end().to_owned());
+            }
+            assert_eq!(
+                lines.first().map(String::as_str),
+                Some("GET /now.txt?station=progressive&t=1700000000123 HTTP/1.1")
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.eq_ignore_ascii_case("accept: text/plain"))
+            );
+
+            let payload = "Artist - Track :: 42";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .expect("write mock response");
+            stream.flush().expect("flush mock response");
+        });
+
+        let client = RadioNowPlayingClient::with_options(Duration::from_secs(1), 1024)
+            .expect("valid test client");
+        let url = Url::parse(&format!(
+            "http://{address}/now.txt?station=progressive&t=stale"
+        ))
+        .expect("mock endpoint URL");
+        let metadata = client
+            .fetch_url_at(
+                &url,
+                RadioNowPlayingFormat::SectorRadioPlainText,
+                1_700_000_000_123,
+            )
+            .expect("mock Sector Radio response");
+        server.join().expect("mock metadata server");
+
+        assert_eq!(metadata.artist.as_deref(), Some("Artist"));
+        assert_eq!(metadata.title.as_deref(), Some("Track"));
+        assert_eq!(metadata.duration, Some(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn sector_radio_client_bounds_streamed_responses_without_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock metadata endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept metadata request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone mock stream"));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request line");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                      Connection: close\r\n\r\n123456789",
+                )
+                .expect("write oversized mock response");
+        });
+
+        let client = RadioNowPlayingClient::with_options(Duration::from_secs(1), 8)
+            .expect("valid small response cap");
+        let url =
+            Url::parse(&format!("http://{address}/now.txt")).expect("mock metadata endpoint URL");
+        let error = client
+            .fetch_url_at(&url, RadioNowPlayingFormat::SectorRadioPlainText, 1)
+            .expect_err("streamed response must obey the configured cap");
+        server.join().expect("mock metadata server");
+
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge { limit: 8 }
         ));
     }
 

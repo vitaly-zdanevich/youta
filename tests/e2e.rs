@@ -312,7 +312,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
-    wait_for_transcript_text(&transcript, "YouTube video search");
+    wait_for_transcript_text(&transcript, "Video search");
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input.write_all(b"/ambient focus\r").expect("submit search");
     input.flush().expect("flush search");
@@ -476,7 +476,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
     );
     let first_output = fs::read_to_string(&first_transcript).expect("first transcript");
     for expected in [
-        "Subscription sources",
+        "Sources",
         "Fixture channel",
         "Youta preferences",
         "Split",
@@ -625,7 +625,7 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
-    wait_for_transcript_text(&transcript, "YouTube video search");
+    wait_for_transcript_text(&transcript, "Video search");
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input
         .write_all(b"/https://media.example.test/fixture.opus\r")

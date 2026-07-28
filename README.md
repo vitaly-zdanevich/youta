@@ -43,7 +43,9 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   authoritative. Recursive folder sizes are enabled by default, calculated
   asynchronously one folder at a time, and never follow symbolic links. `[Z]`
   cycles size sorting off, ascending, and descending; unknown folders remain
-  after known sizes.
+  after known sizes. Selecting media shows filename metadata immediately while
+  tags and bounded `ffprobe` codec/container details load off the TUI thread;
+  completed records remain in a fixed-size RAM cache for fast revisits.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. Youta does not attempt thumbnail
@@ -212,39 +214,91 @@ Radio total on the Stats screen.
 
 The current station set is:
 
+- regional stations from [Euroradio](https://euroradio.fm/radio),
+  [Radio Palitra](https://www.radiopalitra.ge/),
+  [Arirang Radio](https://www.arirang.com/radio),
+  [EBS FM](https://www.ebs.co.kr/radio/home?ch=RADIO), and
+  [Korean Central Broadcasting Station via intchoson](https://www.intchoson.com/kcbs/).
+  KCBS is explicitly labeled as an independent satellite relay, not a
+  first-party DPRK Internet stream. Philippine stations include
+  [96.3 Easy Rock Manila](https://www.easyrock.com.ph/radio),
+  [Love Radio Manila](https://www.loveradio.com.ph/radio), and
+  [Radio Maria Philippines](https://www.radiomaria.ph/); Thai stations include
+  [MCOT Thinking Radio 96.5](https://www.mcot.net/),
+  [Thai Lanna Radio](https://www.lannaradio.com/),
+  [Chili Radio Thailand](https://chiliradio.asia/), and
+  [BKK.FM](https://bkk.fm/);
 - [Sector Radio — Progressive](https://sectorradio.com/), [4duk Radio](https://4duk.ru/),
-  [SomaFM Groove Salad](https://somafm.com/groovesalad/), [KEXP](https://www.kexp.org/),
-  [NTS 1 and NTS 2](https://www.nts.live/), [WFMU](https://wfmu.org/), and
-  [Radio Paradise](https://radioparadise.com/);
+  [KEXP](https://www.kexp.org/), [NTS 1 and NTS 2](https://www.nts.live/),
+  [WFMU](https://wfmu.org/), and [Radio Paradise](https://radioparadise.com/);
+- ambient channels from [SomaFM](https://somafm.com/), including Groove Salad,
+  Drone Zone, The Dark Zone, Deep Space One, and Space Station Soma;
+- meditation channels from
+  [Positively Meditation](https://play.you.radio/station/1121),
+  [NeuroRadio](https://neuroradio.uk/the-meditation-channel/),
+  [HearMe.fm East Asian Meditation](https://hearme.fm/radio/east-asian-meditation/),
+  and [HearMe.fm Tibetan Singing Bowls](https://hearme.fm/radio/tibetan-singing-bowls/);
+- mantra and devotional channels from
+  [Catholic.fm](https://catholic.fm/),
+  [Hare Krsna Radio](https://hkradio.in/),
+  [Mantra Radio](https://www.mantraradio.eu/), and
+  [SikhNet Radio — Simran](https://play.sikhnet.com/radio/simran);
+- nature-sound channels from [Birdsong Radio](https://www.birdsong.fm/),
+  [24/7 Nature Radio](https://www.247natureradio.com/), and
+  [Nature Radio Rain](https://radiosuitenetwork.torontocast.stream/nature-radio-rain/).
+  The last station also mixes in sleep and relaxation music;
+- MOD, demoscene, and game-music channels from
+  [RadioSEGA](https://www.radiosega.net/), [CVGM Radio](https://radio.cvgm.net/),
+  [Kohina](https://www.kohina.com/), [SLAY Radio](https://www.slayradio.org/),
+  [SceneSat](https://scenesat.com/), and
+  [Nectarine Demoscene Radio](https://www.scenestream.net/demovibes/);
 - [R/a/dio](https://r-a-d.io/), [AnimeRadio.de](https://www.animeradio.de/),
   [Anison.FM](https://en.anison.fm/), and [LISTEN.moe](https://listen.moe/);
+- film and soundtrack channels from
+  [France Musique — La B.O.](https://www.radiofrance.fr/francemusique),
+  [Cinemix](https://www.cinemix.us/),
+  [Matt's Movie Trax](https://www.mattsmovietrax.com/), and
+  [StreamingSoundtracks.com](https://streamingsoundtracks.com/);
 - [FIP](https://www.radiofrance.fr/fip),
   [Radio Swiss Classic](https://www.radioswissclassic.ch/en),
   [France Musique](https://www.radiofrance.fr/francemusique),
   [All Classical Radio](https://www.allclassical.org/),
   [NPO Klassiek](https://www.npoklassiek.nl/), and
-  [Deutschlandfunk](https://www.deutschlandfunk.de/).
+  [Deutschlandfunk](https://www.deutschlandfunk.de/);
+- retro, industrial, and dark stations including
+  [Retro FM Russia](https://retrofm.ru/),
+  [SomaFM Underground 80s](https://somafm.com/u80s/),
+  [EBM-Radio.com](https://ebm-radio.com/),
+  [80s80s EBM](https://www.80s80s.de/ebm),
+  [80s80s Dark Wave](https://www.80s80s.de/80s80s-dark-wave),
+  [SomaFM Doomed](https://somafm.com/doomed/),
+  [SomaFM Cliqhop IDM](https://somafm.com/cliqhop/),
+  [RADCAP DSBM](https://www.radcap.ru/depressiveblack.html), and
+  [Dark Star Radio](https://darkstarradio.com/home/).
 
 Details shows only quality attributes known for that preset, the readable
 playback endpoint, a summary, and the station homepage. `[O] xdg-open` opens
 the homepage rather than the audio endpoint. The same stable station identity
 is used for playlists, History replay, private station notes, and the
-now-playing click target; transient redirects are never persisted.
+now-playing click target; transient redirects are never persisted. `[B]`
+cycles name, high-to-low bitrate, and low-to-high bitrate order while the
+selected station remains stable across ordering changes and restarts.
 
 Station ICY metadata observed by `mpv` can appear beside the stable station
-title. France Musique and 4duk also have bounded passive metadata adapters:
-fresh provider data wins, ICY is the playing fallback, and a failed refresh
-retains the last successful value only as clearly stale selected-station
-details. Failures stay silent and retry with a station-scoped capped
-1/2/5/10-minute backoff, so an unavailable service does not create an idle
-polling loop.
+title. Sector Radio, 4duk, BKK.FM, Birdsong Radio, and France Musique also have
+bounded passive metadata adapters: fresh provider data wins, ICY is the
+playing fallback, and a failed refresh retains the last successful value only
+as clearly stale selected-station details. Failures stay silent and retry with
+a station-scoped capped 1/2/5/10-minute backoff, so an unavailable service
+does not create an idle polling loop.
 
-Sector Radio, 4duk, WFMU, and Radio Paradise currently publish the selected
-playback endpoint over plain HTTP. These streams are enabled by default as
-requested, but transport is unauthenticated and can be observed or modified
-on the network. Youta sends no credentials to them. Inclusion describes
-technical public reachability, not an assertion that the broadcast content is
-openly licensed or reusable.
+Sector Radio, 4duk, Euroradio, Radio Maria Philippines, RADCAP DSBM, Dark Star
+Radio, WFMU, Radio Paradise, and StreamingSoundtracks.com currently publish
+the selected playback endpoint over plain HTTP. These streams are enabled by
+default as requested, but transport is unauthenticated and can be observed or
+modified on the network. Youta sends no credentials to them. Inclusion
+describes technical public reachability, not an assertion that the broadcast
+content is openly licensed or reusable.
 
 ### Lazy Wikidata enrichment
 
@@ -466,7 +520,7 @@ deleting it.
 
 ## Private notes
 
-Press `m`, or activate the **Add private note** / **Edit private note** row in
+Press `n`, or activate the **Add private note** / **Edit private note** row in
 Details, to open the focused multiline editor. The row is highlighted when the
 exact selection already has a note and remains a selectable mouse action.
 Youta keeps one private note per exact target:
@@ -1057,9 +1111,9 @@ Run the same keyless YouTube Music search check locally with:
 YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
 ```
 
-Run the Radio smoke locally to decode a real HTTPS stream through Youta's
-`mpv` backend, observe real ICY metadata, and parse 4duk's bounded public
-now-playing response:
+Run the Radio smoke locally to resolve and decode a real HTTPS M3U stream
+through Youta's `mpv` backend, observe real ICY metadata, and parse the bounded
+public now-playing responses from 4duk and Sector Radio:
 
 ```sh
 YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact radio_stream_and_passive_metadata_are_usable --nocapture

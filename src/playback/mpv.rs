@@ -200,6 +200,15 @@ mod unix {
                         .get("reason")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
+                    if reason_text == "redirect" {
+                        // mpv reports an intermediate `end-file` while it
+                        // replaces an M3U or similar playlist entry with the
+                        // resolved stream. A new `start-file` follows; this is
+                        // not the logical end of Youta's queue item.
+                        self.warnings.clear();
+                        self.stream_title = None;
+                        return;
+                    }
                     let reason = match reason_text {
                         "eof" => PlaybackEndReason::Eof,
                         "stop" | "quit" => PlaybackEndReason::Stop,
@@ -789,6 +798,7 @@ mod unix {
 
             Ok(PlaybackStatus {
                 idle,
+                live: false,
                 position,
                 duration,
                 paused,
@@ -1724,6 +1734,43 @@ mod unix {
                 }))
             );
             assert!(ipc.events.is_empty());
+        }
+
+        #[test]
+        fn playlist_redirect_is_not_reported_as_a_terminal_playback_event() {
+            let mut ipc = ipc_after_script(vec![
+                json!({"event": "start-file"}),
+                json!({
+                    "event": "log-message",
+                    "level": "warn",
+                    "prefix": "demux",
+                    "text": "intermediate playlist warning"
+                }),
+                json!({
+                    "event": "property-change",
+                    "id": ICY_TITLE_OBSERVER_ID,
+                    "name": ICY_TITLE_PROPERTY,
+                    "data": "Playlist placeholder"
+                }),
+                json!({
+                    "event": "end-file",
+                    "reason": "redirect",
+                    "playlist_insert_id": 2,
+                    "playlist_insert_num_entries": 3
+                }),
+                json!({"event": "start-file"}),
+                json!({"event": "file-loaded"}),
+                json!({"event": "playback-restart"}),
+            ]);
+
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::MediaLoaded));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::PlaybackStarted));
+            assert!(
+                ipc.events.is_empty(),
+                "mpv follows the inserted playlist stream without ending the queue item"
+            );
+            assert!(ipc.warnings.is_empty());
+            assert_eq!(ipc.stream_title, None);
         }
 
         #[test]

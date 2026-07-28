@@ -120,6 +120,8 @@ use crate::tui::DetailLinkView;
 use crate::tui::DownloadView;
 #[cfg(feature = "local")]
 use crate::tui::LocalMoveDestinationView;
+#[cfg(feature = "radio")]
+use crate::tui::RadioSort;
 use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
     DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
@@ -579,11 +581,190 @@ struct LocalMediaItem {
     acoustid_id: Option<String>,
     duration_seconds: Option<u64>,
     size_bytes: u64,
+    container: String,
     codec: String,
     bitrate_kbps: Option<u32>,
     sample_rate_hz: Option<u32>,
     channels: Option<u8>,
     embedded_artwork: bool,
+    technical_metadata_probed: bool,
+}
+
+const MAX_LOCAL_FFPROBE_JSON_BYTES: usize = 64 * 1024;
+const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_CACHED_LOCAL_MEDIA_ITEMS: usize = 128;
+
+/// Technical container and first-audio-stream metadata returned by a local probe.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LocalTechnicalMetadata {
+    /// Human-readable media container name.
+    container: Option<String>,
+    /// Human-readable audio codec name.
+    audio_codec: Option<String>,
+    /// Audio bitrate in kilobits per second.
+    bitrate_kbps: Option<u32>,
+    /// Audio sample rate in hertz.
+    sample_rate_hz: Option<u32>,
+    /// Audio channel count.
+    channels: Option<u8>,
+    /// Whole-media duration rounded down to seconds.
+    duration_seconds: Option<u64>,
+}
+
+/// Injectable metadata boundary for one selected local-media file.
+trait LocalMediaProbe {
+    /// Returns best-effort technical metadata without surfacing helper failures.
+    fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata>;
+}
+
+/// Shell-free probe using the installed `ffprobe` executable.
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemLocalMediaProbe;
+
+impl LocalMediaProbe for SystemLocalMediaProbe {
+    fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata> {
+        let mut child = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,codec_long_name,bit_rate,sample_rate,channels:\
+                 format=format_name,duration",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now().checked_add(LOCAL_FFPROBE_TIMEOUT)?;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(remaining.min(LOCAL_FFPROBE_POLL_INTERVAL));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() || output.stdout.len() > MAX_LOCAL_FFPROBE_JSON_BYTES {
+            return None;
+        }
+        parse_local_ffprobe_output(path, &output.stdout)
+    }
+}
+
+/// Background boundary for complete selected-file metadata.
+trait LocalMediaLoader: Send + Sync {
+    /// Reads tags and technical metadata for one exact path.
+    fn load(&self, path: PathBuf) -> LocalMediaItem;
+}
+
+/// System metadata loader combining Lofty tags with a bounded `ffprobe` call.
+#[derive(Debug, Default)]
+struct SystemLocalMediaLoader;
+
+impl LocalMediaLoader for SystemLocalMediaLoader {
+    fn load(&self, path: PathBuf) -> LocalMediaItem {
+        local_media_item(path)
+    }
+}
+
+/// Captures replacement-sensitive identity for one regular local file.
+fn local_file_identity(path: &Path) -> Option<LocalFileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Some(LocalFileIdentity {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(LocalFileIdentity {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LocalFfprobeOutput {
+    #[serde(default)]
+    streams: Vec<LocalFfprobeStream>,
+    format: Option<LocalFfprobeFormat>,
+}
+
+#[derive(serde::Deserialize)]
+struct LocalFfprobeStream {
+    codec_name: Option<String>,
+    codec_long_name: Option<String>,
+    bit_rate: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u16>,
+}
+
+#[derive(serde::Deserialize)]
+struct LocalFfprobeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+}
+
+/// Filesystem identity preventing selected-file metadata from surviving replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalFileIdentity {
+    length: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+/// One identity-bound selected-file metadata record.
+#[derive(Clone, Debug)]
+struct CachedLocalMediaItem {
+    identity: LocalFileIdentity,
+    item: LocalMediaItem,
+}
+
+/// Completion from one short-lived selected-file metadata worker.
+struct LocalMediaMetadataResponse {
+    path: PathBuf,
+    result: Option<(LocalFileIdentity, LocalMediaItem)>,
 }
 
 /// One process-local folder-size result valid only for its Local generation.
@@ -1761,6 +1942,10 @@ const MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES: u32 = 3;
 const CHANNEL_DETAILS_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Maximum compact channel records retained by the process.
 const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
+/// Maximum full YouTube video-detail records retained by the process.
+const MAX_CACHED_YOUTUBE_VIDEO_DETAILS: usize = 64;
+/// Approximate heap budget for process-local YouTube video details.
+const MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES: usize = 8 * 1024 * 1024;
 /// Provider channel metadata remains fresh for seven days, but stale artwork
 /// is still rendered immediately while a background refresh runs.
 const CHANNEL_DETAILS_CACHE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -2090,6 +2275,18 @@ pub struct AppController {
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
     /// Watched percentages hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, u8>,
+    /// Complete selected-file metadata retained for fast in-process revisits.
+    local_media_cache: HashMap<PathBuf, CachedLocalMediaItem>,
+    /// Least-recently-used order for the bounded selected-file metadata cache.
+    local_media_cache_order: VecDeque<PathBuf>,
+    /// Sole metadata path currently being read by a lazy worker.
+    pending_local_media_metadata: Option<PathBuf>,
+    /// Injectable selected-file metadata boundary used by lazy workers.
+    local_media_loader: Arc<dyn LocalMediaLoader>,
+    /// Completion sender cloned into short-lived selected-file workers.
+    local_media_metadata_sender: Sender<LocalMediaMetadataResponse>,
+    /// Completed selected-file metadata drained by the TUI event loop.
+    local_media_metadata_responses: Receiver<LocalMediaMetadataResponse>,
     /// Generation rejecting directory responses for an older Local route.
     local_generation: u64,
     /// Shared cancellation generation checked during recursive folder walks.
@@ -2187,6 +2384,12 @@ pub struct AppController {
     channel_details_fresh_until: HashMap<String, i64>,
     /// Least-recently-used order for compact channel metadata.
     channel_details_cache_order: VecDeque<String>,
+    /// Full video details retained so revisits restore likes and chapters at once.
+    youtube_video_details_cache: HashMap<String, VideoDetails>,
+    /// Least-recently-used order for full YouTube video details.
+    youtube_video_details_cache_order: VecDeque<String>,
+    /// Conservative owned-heap estimate for full YouTube video details.
+    youtube_video_details_cache_bytes: usize,
     /// Channel identifiers currently owned by the provider worker.
     pending_channel_details: HashSet<String>,
     /// Selection generation rejecting metadata for a different visible source.
@@ -2344,6 +2547,7 @@ impl AppController {
         let (request_sender, request_receiver) = unbounded();
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
+        let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
         let (url_open_result_sender, url_open_results) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
@@ -2583,13 +2787,25 @@ impl AppController {
         if view.screen == Screen::ApplePodcasts {
             view.selected = apple_podcasts_selected;
         }
-        let radio_selected = saved.radio_selected_row.unwrap_or_else(|| {
+        let radio_selected_row = saved.radio_selected_row.unwrap_or_else(|| {
             if view.screen == Screen::Radio {
                 view.selected
             } else {
                 0
             }
         });
+        #[cfg(feature = "radio")]
+        let radio_selected = saved
+            .radio_selected_station_id
+            .as_deref()
+            .and_then(|station_id| {
+                sorted_radio_stations(view.radio_sort)
+                    .iter()
+                    .position(|station| station.id == station_id)
+            })
+            .unwrap_or(radio_selected_row);
+        #[cfg(not(feature = "radio"))]
+        let radio_selected = radio_selected_row;
         if view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
@@ -2674,6 +2890,12 @@ impl AppController {
             pending_playlist_replay: None,
             local_listing: None,
             local_progress_cache: HashMap::new(),
+            local_media_cache: HashMap::new(),
+            local_media_cache_order: VecDeque::new(),
+            pending_local_media_metadata: None,
+            local_media_loader: Arc::new(SystemLocalMediaLoader),
+            local_media_metadata_sender,
+            local_media_metadata_responses,
             local_generation: 0,
             local_folder_size_generation: Arc::new(AtomicU64::new(0)),
             local_folder_size_cache: HashMap::new(),
@@ -2738,6 +2960,9 @@ impl AppController {
             channel_profile_cache: HashMap::new(),
             channel_details_fresh_until: HashMap::new(),
             channel_details_cache_order: VecDeque::new(),
+            youtube_video_details_cache: HashMap::new(),
+            youtube_video_details_cache_order: VecDeque::new(),
+            youtube_video_details_cache_bytes: 0,
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
             scheduled_channel_details: None,
@@ -3180,6 +3405,9 @@ impl AppController {
         self.channel_details_cache.clear();
         self.channel_profile_cache.clear();
         self.channel_details_cache_order.clear();
+        self.youtube_video_details_cache.clear();
+        self.youtube_video_details_cache_order.clear();
+        self.youtube_video_details_cache_bytes = 0;
         self.pending_channel_details.clear();
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
@@ -4065,13 +4293,20 @@ impl AppController {
         if let SearchItem::Video(video) = &selected
             && self.youtube_provider_available
         {
-            self.send_provider_request(
-                ProviderRequest::Details {
+            if let Some(details) = self.cached_youtube_video_details(&video.video_id) {
+                self.handle_provider_response(ProviderResponse::Details {
                     generation: self.details_generation,
-                    video_id: video.video_id.clone(),
-                },
-                "Could not load YouTube video details",
-            );
+                    result: Ok(details),
+                });
+            } else {
+                self.send_provider_request(
+                    ProviderRequest::Details {
+                        generation: self.details_generation,
+                        video_id: video.video_id.clone(),
+                    },
+                    "Could not load YouTube video details",
+                );
+            }
         }
         self.request_selected_channel_subscriber_count(&selected);
         self.request_selected_wikidata(&selected);
@@ -4354,6 +4589,64 @@ impl AppController {
             .retain(|cached| cached != channel_id);
         self.channel_details_cache_order
             .push_back(channel_id.to_owned());
+    }
+
+    /// Returns cached YouTube details and promotes the record in the LRU.
+    fn cached_youtube_video_details(&mut self, video_id: &str) -> Option<VideoDetails> {
+        let details = self.youtube_video_details_cache.get(video_id).cloned();
+        if details.is_some() {
+            self.touch_youtube_video_details_cache(video_id);
+        }
+        details
+    }
+
+    /// Inserts one successful YouTube detail response into the bounded RAM LRU.
+    fn cache_youtube_video_details(&mut self, details: &VideoDetails) {
+        let video_id = details.video_id.clone();
+        if let Some(replaced) = self.youtube_video_details_cache.remove(&video_id) {
+            self.youtube_video_details_cache_bytes = self
+                .youtube_video_details_cache_bytes
+                .saturating_sub(youtube_video_details_estimated_heap_bytes(&replaced));
+            self.youtube_video_details_cache_order
+                .retain(|cached| cached != &video_id);
+        }
+
+        let bytes = youtube_video_details_estimated_heap_bytes(details);
+        if bytes > MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES {
+            return;
+        }
+        while self.youtube_video_details_cache.len() >= MAX_CACHED_YOUTUBE_VIDEO_DETAILS
+            || self.youtube_video_details_cache_bytes.saturating_add(bytes)
+                > MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES
+        {
+            let Some(oldest) = self.youtube_video_details_cache_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.youtube_video_details_cache.remove(&oldest) {
+                self.youtube_video_details_cache_bytes = self
+                    .youtube_video_details_cache_bytes
+                    .saturating_sub(youtube_video_details_estimated_heap_bytes(&evicted));
+            }
+        }
+        if self.youtube_video_details_cache_bytes.saturating_add(bytes)
+            > MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES
+        {
+            return;
+        }
+
+        self.youtube_video_details_cache
+            .insert(video_id.clone(), details.clone());
+        self.youtube_video_details_cache_bytes =
+            self.youtube_video_details_cache_bytes.saturating_add(bytes);
+        self.youtube_video_details_cache_order.push_back(video_id);
+    }
+
+    /// Marks one full YouTube detail record as most recently used.
+    fn touch_youtube_video_details_cache(&mut self, video_id: &str) {
+        self.youtube_video_details_cache_order
+            .retain(|cached| cached != video_id);
+        self.youtube_video_details_cache_order
+            .push_back(video_id.to_owned());
     }
 
     /// Applies provider metadata only to a matching visible Channel panel.
@@ -5305,6 +5598,7 @@ impl AppController {
                 }
                 match result {
                     Ok(details) => {
+                        self.cache_youtube_video_details(&details);
                         let known_orientation = self
                             .youtube_results
                             .iter()
@@ -6187,6 +6481,185 @@ impl AppController {
         self.update_non_youtube_detail();
     }
 
+    /// Returns cached selected-file metadata and promotes its LRU entry.
+    fn cached_local_media_item(&mut self, path: &Path, size_bytes: u64) -> Option<LocalMediaItem> {
+        let current_identity = local_file_identity(path)?;
+        let cached = self.local_media_cache.get(path).cloned();
+        if current_identity.length != size_bytes
+            || cached
+                .as_ref()
+                .is_some_and(|cached| cached.identity != current_identity)
+        {
+            self.local_media_cache.remove(path);
+            self.local_media_cache_order
+                .retain(|cached_path| cached_path != path);
+            return None;
+        }
+        if cached.is_some() {
+            self.local_media_cache_order
+                .retain(|cached_path| cached_path != path);
+            self.local_media_cache_order.push_back(path.to_owned());
+        }
+        cached.map(|cached| cached.item)
+    }
+
+    /// Inserts one complete selected-file record into the bounded RAM LRU.
+    fn cache_local_media_item(&mut self, identity: LocalFileIdentity, item: LocalMediaItem) {
+        let path = item.path.clone();
+        self.local_media_cache.remove(&path);
+        self.local_media_cache_order
+            .retain(|cached_path| cached_path != &path);
+        while self.local_media_cache.len() >= MAX_CACHED_LOCAL_MEDIA_ITEMS {
+            let Some(oldest) = self.local_media_cache_order.pop_front() else {
+                break;
+            };
+            self.local_media_cache.remove(&oldest);
+        }
+        self.local_media_cache
+            .insert(path.clone(), CachedLocalMediaItem { identity, item });
+        self.local_media_cache_order.push_back(path);
+    }
+
+    /// Starts at most one lazy metadata read without blocking terminal input.
+    fn request_local_media_metadata(&mut self, path: PathBuf) {
+        if self.local_media_cache.contains_key(&path) || self.pending_local_media_metadata.is_some()
+        {
+            return;
+        }
+        self.pending_local_media_metadata = Some(path.clone());
+        let loader = Arc::clone(&self.local_media_loader);
+        let responses = self.local_media_metadata_sender.clone();
+        let worker_path = path.clone();
+        if thread::Builder::new()
+            .name("youta-local-metadata".to_owned())
+            .spawn(move || {
+                let result = local_file_identity(&worker_path).and_then(|before| {
+                    let item = loader.load(worker_path.clone());
+                    (local_file_identity(&worker_path).as_ref() == Some(&before))
+                        .then_some((before, item))
+                });
+                let _ = responses.send(LocalMediaMetadataResponse {
+                    path: worker_path,
+                    result,
+                });
+            })
+            .is_err()
+        {
+            self.pending_local_media_metadata = None;
+        }
+    }
+
+    /// Returns the regular local file currently owning the visible Details panel.
+    fn selected_local_metadata_path(&self) -> Option<PathBuf> {
+        match self.view.screen {
+            Screen::Local => self.selected_local_regular_file(),
+            Screen::Search => self
+                .view
+                .rows
+                .get(self.view.selected)
+                .and_then(|row| row.media_id.as_ref())
+                .filter(|media_id| media_id.source == SourceKind::Local)
+                .map(|media_id| PathBuf::from(&media_id.external_id)),
+            Screen::YouTubeMusic
+            | Screen::Bandcamp
+            | Screen::ApplePodcasts
+            | Screen::Radio
+            | Screen::Subscriptions
+            | Screen::TrackerMusic
+            | Screen::Downloaded
+            | Screen::History
+            | Screen::Playlists
+            | Screen::Statistics => None,
+        }
+    }
+
+    /// Applies completed lazy metadata and immediately schedules the latest row.
+    fn drain_local_media_metadata_responses(&mut self) {
+        while let Ok(LocalMediaMetadataResponse { path, result }) =
+            self.local_media_metadata_responses.try_recv()
+        {
+            if self.pending_local_media_metadata.as_ref() == Some(&path) {
+                self.pending_local_media_metadata = None;
+            }
+            let Some((identity, item)) = result
+                .filter(|(identity, _)| local_file_identity(&path).as_ref() == Some(identity))
+            else {
+                if self
+                    .selected_local_metadata_path()
+                    .as_deref()
+                    .is_some_and(|selected| selected != path)
+                {
+                    match self.view.screen {
+                        Screen::Local => self.update_local_browser_detail(),
+                        Screen::Search => self.update_non_youtube_detail(),
+                        Screen::YouTubeMusic
+                        | Screen::Bandcamp
+                        | Screen::ApplePodcasts
+                        | Screen::Radio
+                        | Screen::Subscriptions
+                        | Screen::TrackerMusic
+                        | Screen::Downloaded
+                        | Screen::History
+                        | Screen::Playlists
+                        | Screen::Statistics => {}
+                    }
+                }
+                continue;
+            };
+            self.cache_local_media_item(identity, item.clone());
+            if let Some(index) = self
+                .local_results
+                .iter()
+                .position(|candidate| candidate.path == path)
+            {
+                self.local_results[index] = item;
+                if self.view.screen == Screen::Search
+                    && let Some(row) = self.view.rows.get_mut(index)
+                    && row.media_id.as_ref().is_some_and(|media_id| {
+                        media_id.source == SourceKind::Local
+                            && Path::new(&media_id.external_id) == path
+                    })
+                {
+                    row.subtitle = local_media_subtitle(&self.local_results[index]);
+                }
+            }
+            match self.view.screen {
+                Screen::Local => self.update_local_browser_detail(),
+                Screen::Search => self.update_non_youtube_detail(),
+                Screen::YouTubeMusic
+                | Screen::Bandcamp
+                | Screen::ApplePodcasts
+                | Screen::Radio
+                | Screen::Subscriptions
+                | Screen::TrackerMusic
+                | Screen::Downloaded
+                | Screen::History
+                | Screen::Playlists
+                | Screen::Statistics => {}
+            }
+        }
+    }
+
+    /// Loads one lazily selected recursive-scan result and refreshes its row.
+    fn ensure_local_result_technical_metadata(&mut self, index: usize) {
+        let Some(item) = self.local_results.get(index) else {
+            return;
+        };
+        if item.technical_metadata_probed {
+            return;
+        }
+        let path = item.path.clone();
+        let size_bytes = item.size_bytes;
+        if let Some(item) = self.cached_local_media_item(&path, size_bytes) {
+            if let Some(row) = self.view.rows.get_mut(index) {
+                row.subtitle = local_media_subtitle(&item);
+            }
+            self.local_results[index] = item;
+        } else {
+            self.request_local_media_metadata(path);
+        }
+    }
+
     /// Starts one lazy artwork lookup for selected Local media or a folder.
     #[cfg(all(feature = "local", feature = "thumbnails"))]
     fn request_selected_local_artwork(&mut self) {
@@ -6960,9 +7433,13 @@ impl AppController {
             self.view.details = None;
             return;
         };
-        let entry = &listing.entries[index];
+        let entry = listing.entries[index].clone();
         if entry.kind.is_playable() {
-            let item = local_media_item(entry.path.clone());
+            let size_bytes = entry.size_bytes.unwrap_or_default();
+            let item = self
+                .cached_local_media_item(&entry.path, size_bytes)
+                .unwrap_or_else(|| local_media_item_stub(entry.path.clone(), Some(size_bytes)));
+            let metadata_pending = !item.technical_metadata_probed;
             self.view.details = Some(DetailView {
                 media_id: Some(MediaId::new(
                     SourceKind::Local,
@@ -6980,13 +7457,17 @@ impl AppController {
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
                 description: local_media_description(&item),
                 local_renamable: true,
+                local_movable: true,
                 local_trashable: true,
                 ..DetailView::default()
             });
+            if metadata_pending {
+                self.request_local_media_metadata(entry.path);
+            }
         } else {
             let is_directory = entry.kind == LocalEntryKind::Directory;
             let known_size = (!is_directory)
-                .then(|| self.known_local_entry_size(entry))
+                .then(|| self.known_local_entry_size(&entry))
                 .flatten();
             self.view.details = Some(DetailView {
                 title: entry.display_name().into_owned(),
@@ -7011,6 +7492,7 @@ impl AppController {
                     .then(|| url::Url::from_file_path(&entry.path).ok())
                     .flatten(),
                 local_renamable: !is_directory,
+                local_movable: true,
                 local_trashable: true,
                 ..DetailView::default()
             });
@@ -7188,6 +7670,9 @@ impl AppController {
                 self.view.details = None;
                 return;
             }
+        }
+        if self.view.screen == Screen::Search {
+            self.ensure_local_result_technical_metadata(self.view.selected);
         }
         if self.view.screen == Screen::Search
             && let Some(item) = self.local_results.get(self.view.selected)
@@ -7427,10 +7912,10 @@ impl AppController {
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
-                let station = RADIO_STATIONS
-                    .get(self.view.selected)
+                let station = self
+                    .selected_radio_station()
                     .ok_or_else(|| "No radio station is selected".to_owned())?;
-                return queue_item_from_radio_station(station);
+                return queue_item_from_radio_station(&station);
             }
             #[cfg(not(feature = "radio"))]
             {
@@ -7993,7 +8478,7 @@ impl AppController {
             Screen::Radio => {
                 #[cfg(feature = "radio")]
                 {
-                    let station = RADIO_STATIONS.get(self.view.selected)?;
+                    let station = self.selected_radio_station()?;
                     Some(PrivateNoteSelection {
                         target: CommentTarget::Source {
                             source_id: MediaId::new(SourceKind::Radio, station.id),
@@ -9543,14 +10028,20 @@ impl AppController {
 
         #[cfg(feature = "radio")]
         if item.media.id.source == SourceKind::Radio
-            && let Some(index) = RADIO_STATIONS
-                .iter()
-                .position(|station| station.id == item.media.id.external_id)
+            && station_by_id(&item.media.id.external_id).is_some()
         {
             self.view.screen = Screen::Radio;
-            self.radio_selected = index;
-            self.view.selected = index;
             self.populate_radio();
+            if let Some(index) = self.view.rows.iter().position(|row| {
+                row.media_id.as_ref().is_some_and(|media_id| {
+                    media_id.source == SourceKind::Radio
+                        && media_id.external_id == item.media.id.external_id
+                })
+            }) {
+                self.radio_selected = index;
+                self.view.selected = index;
+                self.update_radio_detail();
+            }
             self.view.right_panel_mode = RightPanelMode::Details;
             self.view.details_focused = true;
             self.view.status_line = format!("Selected playing station: {}", item.media.title);
@@ -10006,13 +10497,20 @@ impl AppController {
         if let Some(video_id) = pending_video_id
             && self.youtube_provider_available
         {
-            self.send_provider_request(
-                ProviderRequest::Details {
+            if let Some(details) = self.cached_youtube_video_details(&video_id) {
+                self.handle_provider_response(ProviderResponse::Details {
                     generation: self.details_generation,
-                    video_id: video_id.clone(),
-                },
-                "Could not resume loading linked YouTube video",
-            );
+                    result: Ok(details),
+                });
+            } else {
+                self.send_provider_request(
+                    ProviderRequest::Details {
+                        generation: self.details_generation,
+                        video_id: video_id.clone(),
+                    },
+                    "Could not resume loading linked YouTube video",
+                );
+            }
         }
         #[cfg(feature = "wikidata")]
         if let Some(video_id) = self
@@ -10039,13 +10537,16 @@ impl AppController {
         }
 
         let generation = self.details_generation.wrapping_add(1);
-        if !self.send_provider_request(
-            ProviderRequest::Details {
-                generation,
-                video_id: video_id.clone(),
-            },
-            "Could not load linked YouTube video",
-        ) {
+        let cached_details = self.cached_youtube_video_details(&video_id);
+        if cached_details.is_none()
+            && !self.send_provider_request(
+                ProviderRequest::Details {
+                    generation,
+                    video_id: video_id.clone(),
+                },
+                "Could not load linked YouTube video",
+            )
+        {
             return;
         }
 
@@ -10081,6 +10582,12 @@ impl AppController {
                 )
             },
         );
+        if let Some(details) = cached_details {
+            self.handle_provider_response(ProviderResponse::Details {
+                generation,
+                result: Ok(details),
+            });
+        }
         #[cfg(feature = "wikidata")]
         self.request_wikidata(
             crate::providers::wikidata::WikidataExternalKind::YouTubeVideo,
@@ -10327,8 +10834,7 @@ impl AppController {
         let unavailable = self
             .current_media
             .as_ref()
-            .is_some_and(|media| media.source == SourceKind::Radio)
-            && self.view.playback.duration.is_none();
+            .is_some_and(|media| media.source == SourceKind::Radio);
         if unavailable {
             self.view.status_line = "Seeking is unavailable for live radio".to_owned();
         }
@@ -10833,6 +11339,7 @@ impl AppController {
                 });
                 self.view.playback = PlaybackStatus {
                     idle: false,
+                    live: live_stream,
                     position: Duration::from_secs(start_at),
                     duration: item.media.duration_seconds.map(Duration::from_secs),
                     paused: true,
@@ -10873,6 +11380,26 @@ impl AppController {
         }
     }
 
+    /// Applies source-level playback semantics that a backend cannot infer reliably.
+    ///
+    /// Some live transports expose large synthetic `time-pos` and `duration`
+    /// values. `MediaKind::LiveStream` items are endless in Youta, so those
+    /// transport timestamps must never become a finite, seekable user timeline.
+    fn normalize_playback_status(&self, status: &mut PlaybackStatus) {
+        let live_stream = self.current_media.as_ref().is_some_and(|media_id| {
+            self.playback_queue.current().is_some_and(|item| {
+                &item.media.id == media_id && item.media.kind == MediaKind::LiveStream
+            })
+        });
+        status.live = live_stream;
+        if live_stream {
+            status.position = Duration::ZERO;
+            status.duration = None;
+            status.chapter = None;
+            status.buffered_ranges.clear();
+        }
+    }
+
     fn update_player(&mut self) {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_tick);
@@ -10889,6 +11416,7 @@ impl AppController {
         }
         match status_result {
             Ok(mut status) => {
+                self.normalize_playback_status(&mut status);
                 if self.playback_phase == PlaybackPhase::Idle {
                     self.view.playback = status;
                     return;
@@ -11674,7 +12202,20 @@ impl AppController {
     /// Rebuilds the zero-network Radio catalogue from compile-time presets.
     #[cfg(feature = "radio")]
     fn populate_radio(&mut self) {
-        self.view.rows = RADIO_STATIONS
+        let stations = sorted_radio_stations(self.view.radio_sort);
+        let selected_id = self
+            .view
+            .rows
+            .get(self.view.selected)
+            .and_then(|row| row.media_id.as_ref())
+            .filter(|media_id| media_id.source == SourceKind::Radio)
+            .map(|media_id| media_id.external_id.clone())
+            .or_else(|| {
+                stations
+                    .get(self.radio_selected)
+                    .map(|station| station.id.to_owned())
+            });
+        self.view.rows = stations
             .iter()
             .map(|station| RowView {
                 media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
@@ -11686,9 +12227,19 @@ impl AppController {
                 ..RowView::default()
             })
             .collect();
-        self.view.selected = self
-            .radio_selected
-            .min(self.view.rows.len().saturating_sub(1));
+        self.view.selected = selected_id
+            .as_deref()
+            .and_then(|selected_id| {
+                self.view.rows.iter().position(|row| {
+                    row.media_id
+                        .as_ref()
+                        .is_some_and(|media_id| media_id.external_id == selected_id)
+                })
+            })
+            .unwrap_or_else(|| {
+                self.radio_selected
+                    .min(self.view.rows.len().saturating_sub(1))
+            });
         self.radio_selected = self.view.selected;
         self.update_radio_detail();
         self.view.status_line = format!(
@@ -11706,17 +12257,33 @@ impl AppController {
         self.view.status_line = "This build omits the `radio` feature".to_owned();
     }
 
+    /// Resolves the selected Radio row by its stable station identifier.
+    #[cfg(feature = "radio")]
+    fn selected_radio_station(&self) -> Option<RadioStationPreset> {
+        self.view
+            .rows
+            .get(self.view.selected)
+            .and_then(|row| row.media_id.as_ref())
+            .filter(|media_id| media_id.source == SourceKind::Radio)
+            .and_then(|media_id| station_by_id(&media_id.external_id))
+            .or_else(|| {
+                sorted_radio_stations(self.view.radio_sort)
+                    .get(self.view.selected)
+                    .copied()
+            })
+    }
+
     /// Refreshes selected station details without contacting the stream.
     #[cfg(feature = "radio")]
     fn update_radio_detail(&mut self) {
-        let Some(station) = RADIO_STATIONS.get(self.view.selected) else {
+        let Some(station) = self.selected_radio_station() else {
             self.view.details = None;
             return;
         };
         self.radio_selected = self.view.selected;
         let mut description = station.summary.to_owned();
         description.push_str("\n\nQuality: ");
-        description.push_str(&radio_station_quality(station, true));
+        description.push_str(&radio_station_quality(&station, true));
         description.push_str("\nStream: ");
         description.push_str(station.stream);
         let selected_metadata = self
@@ -11734,16 +12301,14 @@ impl AppController {
                 media.source == SourceKind::Radio && media.external_id == station.id
             })
         });
-        if let Some(now_playing) = playing_metadata.as_ref().or(selected_metadata.as_ref()) {
+        let canonical_metadata = if playing_metadata.is_some() {
+            playing_metadata.as_ref()
+        } else {
+            selected_metadata.as_ref()
+        };
+        if let Some(now_playing) = canonical_metadata {
             description.push_str("\n\n");
             description.push_str(now_playing);
-        }
-        if let Some(last_known) = selected_metadata
-            .as_ref()
-            .filter(|selected| playing_metadata.as_ref() != Some(selected))
-        {
-            description.push_str("\n");
-            description.push_str(last_known);
         }
         self.view.details = Some(DetailView {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
@@ -11772,7 +12337,7 @@ impl AppController {
         })();
         playing.or_else(|| {
             (self.view.screen == Screen::Radio)
-                .then(|| RADIO_STATIONS.get(self.view.selected).copied())
+                .then(|| self.selected_radio_station())
                 .flatten()
                 .filter(|station| station.now_playing.is_some())
         })
@@ -11871,8 +12436,8 @@ impl AppController {
             self.refresh_playing_radio_metadata(icy_title.as_deref());
         }
         if self.view.screen == Screen::Radio
-            && RADIO_STATIONS
-                .get(self.view.selected)
+            && self
+                .selected_radio_station()
                 .is_some_and(|station| station.id == station_id)
         {
             self.update_radio_detail();
@@ -13186,8 +13751,8 @@ impl AppController {
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
-                return RADIO_STATIONS
-                    .get(self.view.selected)
+                return self
+                    .selected_radio_station()
                     .map(|station| station.homepage.to_owned());
             }
             #[cfg(not(feature = "radio"))]
@@ -14963,6 +15528,20 @@ impl AppController {
             .clone_into(&mut self.view.status_line);
     }
 
+    /// Cycles deterministic Radio ordering while retaining the selected station.
+    fn cycle_radio_sort(&mut self) {
+        if self.view.screen != Screen::Radio {
+            self.view.status_line = "Radio ordering applies only to Radio".to_owned();
+            return;
+        }
+        self.view.radio_sort = self.view.radio_sort.next();
+        self.populate_radio();
+        self.view
+            .radio_sort
+            .label()
+            .clone_into(&mut self.view.status_line);
+    }
+
     fn submit_preferences(&mut self) {
         let Some(preferences) = self.view.preferences_popup.as_ref() else {
             return;
@@ -15247,6 +15826,24 @@ impl AppController {
                 .clone_from(&self.view.search_query);
             self.tracker_selected = self.view.selected;
         }
+        #[cfg(feature = "radio")]
+        let selected_radio_station_id = sorted_radio_stations(self.view.radio_sort)
+            .get(self.radio_selected)
+            .map(|station| station.id);
+        #[cfg(feature = "radio")]
+        let persisted_radio_selected_row = selected_radio_station_id
+            .and_then(|station_id| {
+                sorted_radio_stations(RadioSort::Name)
+                    .iter()
+                    .position(|station| station.id == station_id)
+            })
+            .unwrap_or(self.radio_selected);
+        #[cfg(not(feature = "radio"))]
+        let persisted_radio_selected_row = self.radio_selected;
+        #[cfg(feature = "radio")]
+        let radio_selected_station_id = selected_radio_station_id.map(str::to_owned);
+        #[cfg(not(feature = "radio"))]
+        let radio_selected_station_id = None;
         let state = SessionState {
             screen: stored_session_screen(self.view.screen, &self.playlists_route),
             focus: if self.view.details_focused {
@@ -15261,7 +15858,8 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
-            radio_selected_row: Some(self.radio_selected),
+            radio_selected_row: Some(persisted_radio_selected_row),
+            radio_selected_station_id,
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
@@ -15677,6 +16275,7 @@ impl UiController for AppController {
             }
             UiAction::ToggleAutoplay => self.toggle_autoplay(),
             UiAction::ToggleLocalSizeSort => self.toggle_local_size_sort(),
+            UiAction::CycleRadioSort => self.cycle_radio_sort(),
             UiAction::ToggleWaveform => {
                 self.view.right_panel_mode =
                     if self.view.right_panel_mode == RightPanelMode::Waveform {
@@ -15900,6 +16499,7 @@ impl UiController for AppController {
             return;
         }
         self.drain_url_open_results();
+        self.drain_local_media_metadata_responses();
         self.drain_local_browse_responses(true);
         loop {
             match self.provider_responses.try_recv() {
@@ -17705,22 +18305,227 @@ fn tracker_item_from_provider(item: crate::providers::tracker::TrackerSearchResu
     }
 }
 
+/// Parses one bounded `ffprobe` JSON document for its first audio stream.
+fn parse_local_ffprobe_output(path: &Path, payload: &[u8]) -> Option<LocalTechnicalMetadata> {
+    if payload.len() > MAX_LOCAL_FFPROBE_JSON_BYTES {
+        return None;
+    }
+    let output: LocalFfprobeOutput = serde_json::from_slice(payload).ok()?;
+    let stream = output.streams.first();
+    let format = output.format.as_ref();
+    Some(LocalTechnicalMetadata {
+        container: format
+            .and_then(|format| format.format_name.as_deref())
+            .and_then(|format_name| local_probe_container_label(path, format_name)),
+        audio_codec: stream.and_then(|stream| {
+            local_probe_codec_label(
+                stream.codec_name.as_deref(),
+                stream.codec_long_name.as_deref(),
+            )
+        }),
+        bitrate_kbps: stream
+            .and_then(|stream| stream.bit_rate.as_deref())
+            .and_then(parse_local_probe_bitrate),
+        sample_rate_hz: stream
+            .and_then(|stream| stream.sample_rate.as_deref())
+            .and_then(|sample_rate| sample_rate.parse::<u32>().ok())
+            .filter(|sample_rate| *sample_rate > 0),
+        channels: stream
+            .and_then(|stream| stream.channels)
+            .and_then(|channels| u8::try_from(channels).ok())
+            .filter(|channels| *channels > 0),
+        duration_seconds: format
+            .and_then(|format| format.duration.as_deref())
+            .and_then(parse_local_probe_duration),
+    })
+}
+
+/// Converts an `ffprobe` format identifier into a stable container label.
+fn local_probe_container_label(path: &Path, format_name: &str) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let label = match extension.as_str() {
+        "webm" => "WebM",
+        "mkv" => "Matroska",
+        "mp4" | "m4a" | "m4v" => "MP4",
+        "mov" => "QuickTime",
+        "avi" => "AVI",
+        "ogg" | "oga" | "opus" => "Ogg",
+        "wav" => "WAV",
+        "flac" => "FLAC",
+        "mp3" => "MP3",
+        "aac" => "ADTS",
+        _ if format_name.split(',').any(|format| format == "webm") => "WebM",
+        _ if format_name.split(',').any(|format| format == "matroska") => "Matroska",
+        _ if format_name
+            .split(',')
+            .any(|format| matches!(format, "mov" | "mp4" | "m4a")) =>
+        {
+            "MP4"
+        }
+        _ if format_name.split(',').any(|format| format == "ogg") => "Ogg",
+        _ => return normalized_local_probe_label(format_name, 64),
+    };
+    Some(label.to_owned())
+}
+
+/// Converts an `ffprobe` codec identifier into a stable audio-codec label.
+fn local_probe_codec_label(
+    codec_name: Option<&str>,
+    codec_long_name: Option<&str>,
+) -> Option<String> {
+    let codec_name = codec_name?.trim();
+    let label = match codec_name.to_ascii_lowercase().as_str() {
+        "aac" => "AAC",
+        "ac3" => "AC-3",
+        "alac" => "ALAC",
+        "eac3" => "E-AC-3",
+        "flac" => "FLAC",
+        "mp1" => "MP1",
+        "mp2" => "MP2",
+        "mp3" => "MP3",
+        "opus" => "Opus",
+        "speex" => "Speex",
+        "vorbis" => "Vorbis",
+        _ => {
+            return codec_long_name
+                .and_then(|value| normalized_local_probe_label(value, 128))
+                .or_else(|| normalized_local_probe_label(codec_name, 64));
+        }
+    };
+    Some(label.to_owned())
+}
+
+/// Normalizes one helper-provided display label without retaining controls.
+fn normalized_local_probe_label(value: &str, maximum_bytes: usize) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= maximum_bytes
+        && !value.bytes().any(|byte| byte.is_ascii_control()))
+    .then(|| value.to_owned())
+}
+
+/// Converts an audio-stream bitrate in bits per second to rounded kilobits.
+fn parse_local_probe_bitrate(value: &str) -> Option<u32> {
+    let bits_per_second = value.parse::<u64>().ok()?;
+    let kilobits = bits_per_second.saturating_add(500) / 1_000;
+    u32::try_from(kilobits).ok().filter(|bitrate| *bitrate > 0)
+}
+
+/// Converts a finite positive decimal duration to whole seconds.
+fn parse_local_probe_duration(value: &str) -> Option<u64> {
+    let seconds = value.parse::<f64>().ok()?;
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .filter(|seconds| *seconds > 0)
+}
+
+/// Returns the best-effort container label available without a media probe.
+fn local_container_label_from_path(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "webm" => "WebM".to_owned(),
+        "mkv" => "Matroska".to_owned(),
+        "mp4" | "m4a" | "m4v" => "MP4".to_owned(),
+        "mov" => "QuickTime".to_owned(),
+        "avi" => "AVI".to_owned(),
+        "ogg" | "oga" | "opus" => "Ogg".to_owned(),
+        "wav" => "WAV".to_owned(),
+        "aac" => "ADTS".to_owned(),
+        "flac" => "FLAC".to_owned(),
+        "mp3" => "MP3".to_owned(),
+        _ if extension.is_empty() => "unknown".to_owned(),
+        _ => extension.to_ascii_uppercase(),
+    }
+}
+
+/// Returns the codec implied by a codec-native extension, when trustworthy.
+fn local_codec_label_from_path(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "aac" => "AAC".to_owned(),
+        "flac" => "FLAC".to_owned(),
+        "mp3" => "MP3".to_owned(),
+        "opus" => "Opus".to_owned(),
+        "mod" | "xm" | "it" | "s3m" | "mptm" | "stm" | "mtm" | "669" => {
+            extension.to_ascii_uppercase()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// Applies trustworthy probe fields while preserving library-derived fallbacks.
+fn apply_local_technical_metadata(item: &mut LocalMediaItem, metadata: LocalTechnicalMetadata) {
+    if let Some(container) = metadata.container {
+        item.container = container;
+    }
+    if let Some(audio_codec) = metadata.audio_codec {
+        item.codec = audio_codec;
+    }
+    if let Some(bitrate_kbps) = metadata.bitrate_kbps {
+        item.bitrate_kbps = Some(bitrate_kbps);
+    }
+    if let Some(sample_rate_hz) = metadata.sample_rate_hz {
+        item.sample_rate_hz = Some(sample_rate_hz);
+    }
+    if let Some(channels) = metadata.channels {
+        item.channels = Some(channels);
+    }
+    if let Some(duration_seconds) = metadata.duration_seconds {
+        item.duration_seconds = Some(duration_seconds);
+    }
+}
+
+/// Reads one local item and enriches it through the installed media probe.
 fn local_media_item(path: PathBuf) -> LocalMediaItem {
-    let size_bytes = std::fs::metadata(&path)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
+    local_media_item_with_probe(path, &mut SystemLocalMediaProbe)
+}
+
+/// Reads one local item through an injectable technical-metadata probe.
+fn local_media_item_with_probe(path: PathBuf, probe: &mut dyn LocalMediaProbe) -> LocalMediaItem {
+    let mut item = local_media_item_without_probe(path);
+    if let Some(metadata) = probe.probe(&item.path) {
+        apply_local_technical_metadata(&mut item, metadata);
+    }
+    item.technical_metadata_probed = true;
+    item
+}
+
+/// Reads tags and cheap file properties without spawning `ffprobe`.
+fn local_media_item_without_probe(path: PathBuf) -> LocalMediaItem {
+    let mut item = local_media_item_stub(path, None);
+    read_local_tags(&mut item);
+    item
+}
+
+/// Builds immediate filename-based metadata without opening media contents.
+fn local_media_item_stub(path: PathBuf, known_size_bytes: Option<u64>) -> LocalMediaItem {
+    let size_bytes = known_size_bytes.unwrap_or_else(|| {
+        std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default()
+    });
     let title = path
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
         .filter(|title| !title.is_empty())
         .unwrap_or("untitled local media")
         .to_owned();
-    let codec = path
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .map(str::to_ascii_uppercase)
-        .unwrap_or_else(|| "unknown".to_owned());
-    let mut item = LocalMediaItem {
+    let container = local_container_label_from_path(&path);
+    let codec = local_codec_label_from_path(&path);
+    LocalMediaItem {
         path,
         title,
         artist: None,
@@ -17731,14 +18536,14 @@ fn local_media_item(path: PathBuf) -> LocalMediaItem {
         acoustid_id: None,
         duration_seconds: None,
         size_bytes,
+        container,
         codec,
         bitrate_kbps: None,
         sample_rate_hz: None,
         channels: None,
         embedded_artwork: false,
-    };
-    read_local_tags(&mut item);
-    item
+        technical_metadata_probed: false,
+    }
 }
 
 /// Selects `~/Music` when it exists, otherwise the user's home directory.
@@ -17788,7 +18593,7 @@ fn read_local_tags(item: &mut LocalMediaItem) {
     item.bitrate_kbps = properties.audio_bitrate().or(properties.overall_bitrate());
     item.sample_rate_hz = properties.sample_rate();
     item.channels = properties.channels();
-    item.codec = format!("{:?}", tagged.file_type());
+    (item.container, item.codec) = local_lofty_container_and_codec(tagged.file_type());
 
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
         if let Some(title) = trimmed_tag_value(tag.title().as_deref()) {
@@ -17802,6 +18607,32 @@ fn read_local_tags(item: &mut LocalMediaItem) {
         item.metadata_url = local_standard_tag_url(tag);
         item.acoustid_id = trimmed_tag_value(tag.get_string(ItemKey::AcoustId));
     }
+}
+
+/// Maps Lofty's audio-oriented file type to separate container and codec labels.
+#[cfg(feature = "local")]
+fn local_lofty_container_and_codec(file_type: lofty::file::FileType) -> (String, String) {
+    use lofty::file::FileType;
+
+    let (container, codec) = match file_type {
+        FileType::Aac => ("ADTS", "AAC"),
+        FileType::Aiff => ("AIFF", "unknown"),
+        FileType::Ape => ("APE", "Monkey's Audio"),
+        FileType::Flac => ("FLAC", "FLAC"),
+        FileType::Mpeg => ("MPEG", "MP3"),
+        FileType::Mp4 => ("MP4", "unknown"),
+        FileType::Mpc => ("Musepack", "Musepack"),
+        FileType::Opus => ("Ogg", "Opus"),
+        FileType::Vorbis => ("Ogg", "Vorbis"),
+        FileType::Speex => ("Ogg", "Speex"),
+        FileType::Wav => ("WAV", "unknown"),
+        FileType::WavPack => ("WavPack", "WavPack"),
+        _ => {
+            let label = format!("{file_type:?}");
+            return (label.clone(), label);
+        }
+    };
+    (container.to_owned(), codec.to_owned())
 }
 
 #[cfg(not(feature = "local"))]
@@ -17830,6 +18661,7 @@ fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
         .or_else(|| (properties.overall_bitrate() > 0).then(|| properties.overall_bitrate()));
     item.sample_rate_hz = (properties.sample_rate() > 0).then(|| properties.sample_rate());
     item.channels = (properties.channels() > 0).then(|| properties.channels());
+    item.container = "FLAC".to_owned();
     item.codec = "FLAC".to_owned();
 
     if let Some(tag) = flac.vorbis_comments() {
@@ -17937,6 +18769,7 @@ fn local_media_description(item: &LocalMediaItem) -> String {
         lines.push("Identifiers:".to_owned());
         lines.push(format!("AcoustID ID: {acoustid_id}"));
     }
+    lines.push(format!("Container: {}", item.container));
     lines.push(format!("Codec: {}", item.codec));
     lines.push(format!("Size: {}", human_bytes(item.size_bytes)));
     if let Some(value) = item.bitrate_kbps {
@@ -17982,7 +18815,7 @@ fn scan_local_media(root: &Path) -> Result<Vec<LocalMediaItem>, String> {
             } else if file_type.is_file()
                 && is_supported_media_path(&entry.path().to_string_lossy())
             {
-                media.push(local_media_item(entry.path()));
+                media.push(local_media_item_without_probe(entry.path()));
                 if media.len() >= MAX_MEDIA_FILES {
                     media.sort_by(|left, right| left.path.cmp(&right.path));
                     return Ok(media);
@@ -18390,6 +19223,59 @@ fn subscription_item_estimated_heap_bytes(item: &SearchItem) -> usize {
             base.saturating_add(strings)
         }
     }
+}
+
+/// Conservatively estimates heap ownership for one full YouTube detail record.
+fn youtube_video_details_estimated_heap_bytes(details: &VideoDetails) -> usize {
+    let strings = [
+        // The cache owns one cloned ID as its `HashMap` key.
+        details.video_id.capacity(),
+        details.video_id.capacity(),
+        details.title.capacity(),
+        details.channel_name.capacity(),
+        details.channel_id.capacity(),
+        details.description.capacity(),
+        details.published_text.as_ref().map_or(0, String::capacity),
+        details.license.as_ref().map_or(0, String::capacity),
+        details
+            .webpage_url
+            .as_ref()
+            .map_or(0, |url| url.as_str().len()),
+        details
+            .stream_url
+            .as_ref()
+            .map_or(0, |url| url.as_str().len()),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add);
+    let keywords = details.keywords.iter().map(String::capacity).fold(
+        details
+            .keywords
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>()),
+        usize::saturating_add,
+    );
+    let thumbnails = details
+        .thumbnails
+        .iter()
+        .map(|thumbnail| {
+            thumbnail
+                .url
+                .as_str()
+                .len()
+                .saturating_add(thumbnail.quality.as_ref().map_or(0, String::capacity))
+        })
+        .fold(
+            details
+                .thumbnails
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Thumbnail>()),
+            usize::saturating_add,
+        );
+    std::mem::size_of::<VideoDetails>()
+        .saturating_add(strings)
+        .saturating_add(keywords)
+        .saturating_add(thumbnails)
 }
 
 fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTree) -> DetailView {
@@ -18895,6 +19781,7 @@ fn radio_codec_label(codec: Option<RadioCodec>) -> &'static str {
         Some(RadioCodec::Flac) => "FLAC",
         Some(RadioCodec::Mp3) => "MP3",
         Some(RadioCodec::Opus) => "Opus",
+        Some(RadioCodec::Vorbis) => "Ogg Vorbis",
         None => "not published",
     }
 }
@@ -18902,6 +19789,42 @@ fn radio_codec_label(codec: Option<RadioCodec>) -> &'static str {
 #[cfg(feature = "radio")]
 fn radio_station_row_summary(station: &RadioStationPreset) -> String {
     radio_station_quality(station, false)
+}
+
+/// Returns the Radio catalogue in the requested deterministic display order.
+///
+/// Both bitrate modes retain unknown bitrates after every known bitrate, so
+/// an absent quality claim never outranks an advertised stream.
+#[cfg(feature = "radio")]
+fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
+    let mut stations = RADIO_STATIONS.to_vec();
+    stations.sort_by(|left, right| {
+        let name_order = || {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(right.id))
+        };
+        match sort {
+            RadioSort::Name => name_order(),
+            RadioSort::BitrateDescending | RadioSort::BitrateAscending => {
+                let bitrate_order = match (left.bitrate_kbps, right.bitrate_kbps) {
+                    (Some(left), Some(right)) => {
+                        if sort == RadioSort::BitrateDescending {
+                            right.cmp(&left)
+                        } else {
+                            left.cmp(&right)
+                        }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                bitrate_order.then_with(name_order)
+            }
+        }
+    });
+    stations
 }
 
 /// Formats only trustworthy quality attributes supplied by the preset.
@@ -20299,6 +21222,24 @@ mod tests {
             .expect("note-capable selection");
         assert_eq!(selected.target, expected);
         assert_eq!(selected.label, expected_label);
+    }
+
+    #[cfg(feature = "radio")]
+    fn select_radio_station(controller: &mut AppController, station_id: &str) -> usize {
+        let index = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == station_id)
+            })
+            .expect("fixture Radio station row");
+        controller.view.selected = index;
+        controller.radio_selected = index;
+        controller.update_radio_detail();
+        index
     }
 
     #[test]
@@ -25208,6 +26149,136 @@ mod tests {
     }
 
     #[test]
+    fn revisiting_a_youtube_video_restores_likes_without_another_details_request() {
+        let config = Config::for_dir("/tmp/youta-video-details-cache-revisit-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        let mut first = subscription_video_summary();
+        first.title = "First video".to_owned();
+        let mut second = subscription_video_summary();
+        second.video_id = "9bZkp7q19f0".to_owned();
+        second.title = "Second video".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(second.clone()),
+        ];
+        controller.refresh_youtube_rows();
+
+        controller.view.selected = 0;
+        controller.request_selected_details();
+        let first_generation = captured_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Details {
+                    generation,
+                    video_id,
+                } if video_id == first.video_id => Some(generation),
+                _ => None,
+            })
+            .expect("first selection details request");
+        let mut first_details = subscription_video_details("First video");
+        first_details.like_count = Some(13_045);
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: first_generation,
+            result: Ok(first_details),
+        });
+
+        controller.view.selected = 1;
+        controller.request_selected_details();
+        let second_generation = captured_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Details {
+                    generation,
+                    video_id,
+                } if video_id == second.video_id => Some(generation),
+                _ => None,
+            })
+            .expect("second selection details request");
+
+        controller.view.selected = 0;
+        controller.request_selected_details();
+        assert!(
+            captured_requests
+                .try_iter()
+                .all(|request| !matches!(request, ProviderRequest::Details { .. })),
+            "a cached revisit must not enqueue another full details request"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| (details.title.as_str(), details.likes.as_str())),
+            Some(("First video", "13,045"))
+        );
+
+        let mut late_second = subscription_video_details("Late second video");
+        late_second.video_id = second.video_id;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: second_generation,
+            result: Ok(late_second),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| (details.title.as_str(), details.likes.as_str())),
+            Some(("First video", "13,045")),
+            "a late response for the intervening selection must not replace cached details"
+        );
+    }
+
+    #[test]
+    fn youtube_video_details_cache_enforces_entry_and_heap_bounds() {
+        let config = Config::for_dir("/tmp/youta-video-details-cache-bounds-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for index in 0..=MAX_CACHED_YOUTUBE_VIDEO_DETAILS {
+            let mut details = subscription_video_details("Cached video");
+            details.video_id = format!("A{index:010}");
+            controller.cache_youtube_video_details(&details);
+        }
+
+        assert_eq!(
+            controller.youtube_video_details_cache.len(),
+            MAX_CACHED_YOUTUBE_VIDEO_DETAILS
+        );
+        assert!(
+            !controller
+                .youtube_video_details_cache
+                .contains_key("A0000000000")
+        );
+        assert!(
+            controller
+                .youtube_video_details_cache
+                .contains_key(&format!("A{MAX_CACHED_YOUTUBE_VIDEO_DETAILS:010}"))
+        );
+        assert!(
+            controller.youtube_video_details_cache_bytes <= MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES
+        );
+
+        let mut oversized = subscription_video_details("Oversized video");
+        oversized.video_id = "oversized01".to_owned();
+        oversized.description = "x".repeat(MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES + 1);
+        controller.cache_youtube_video_details(&oversized);
+        assert!(
+            !controller
+                .youtube_video_details_cache
+                .contains_key("oversized01")
+        );
+        assert!(
+            controller.youtube_video_details_cache_bytes <= MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES
+        );
+    }
+
+    #[test]
     fn full_subscription_description_replaces_summary_chapters_for_seekbar_and_queue() {
         let config = Config::for_dir("/tmp/youta-subscription-chapter-details-test");
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -26987,17 +28058,26 @@ mod tests {
                 .parent
                 .is_some(),
         );
+        if parent_offset == 1 {
+            controller.view.selected = 0;
+            controller.update_local_browser_detail();
+            let parent = controller.view.details.as_ref().expect("parent details");
+            assert_eq!(parent.title, "..");
+            assert!(!parent.local_movable);
+        }
         controller.view.selected = parent_offset;
         controller.update_local_browser_detail();
         let folder = controller.view.details.as_ref().expect("folder details");
         assert_eq!(folder.title, "A long album folder");
         assert!(!folder.local_renamable);
+        assert!(folder.local_movable);
         assert!(folder.local_trashable);
 
         controller.view.selected = parent_offset.saturating_add(1);
         controller.update_local_browser_detail();
         let file = controller.view.details.as_ref().expect("file details");
         assert!(file.local_renamable);
+        assert!(file.local_movable);
         assert!(file.local_trashable);
     }
 
@@ -27186,6 +28266,262 @@ mod tests {
         assert!(!controller.view.local_artwork_pending);
     }
 
+    #[test]
+    fn local_webm_metadata_separates_mocked_opus_codec_from_container() {
+        struct MockLocalMediaProbe {
+            expected_path: PathBuf,
+            metadata: Option<LocalTechnicalMetadata>,
+            calls: usize,
+        }
+
+        impl LocalMediaProbe for MockLocalMediaProbe {
+            fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata> {
+                assert_eq!(path, self.expected_path);
+                self.calls = self.calls.saturating_add(1);
+                self.metadata.take()
+            }
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary local metadata fixture");
+        let media_path = fixture.path().join("mock.webm");
+        std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
+        let metadata = parse_local_ffprobe_output(
+            &media_path,
+            br#"{
+                "streams": [{
+                    "codec_name": "opus",
+                    "codec_long_name": "Opus (Opus Interactive Audio Codec)",
+                    "bit_rate": "128000",
+                    "sample_rate": "48000",
+                    "channels": 2
+                }],
+                "format": {
+                    "format_name": "matroska,webm",
+                    "duration": "42.750000"
+                }
+            }"#,
+        )
+        .expect("valid ffprobe fixture");
+        let mut probe = MockLocalMediaProbe {
+            expected_path: media_path.clone(),
+            metadata: Some(metadata),
+            calls: 0,
+        };
+
+        let item = local_media_item_with_probe(media_path, &mut probe);
+
+        assert_eq!(probe.calls, 1);
+        assert_eq!(item.container, "WebM");
+        assert_eq!(item.codec, "Opus");
+        assert_eq!(item.duration_seconds, Some(42));
+        assert_eq!(item.bitrate_kbps, Some(128));
+        assert_eq!(item.sample_rate_hz, Some(48_000));
+        assert_eq!(item.channels, Some(2));
+        assert!(item.technical_metadata_probed);
+        let description = local_media_description(&item);
+        assert!(description.contains("Container: WebM\nCodec: Opus"));
+        let subtitle = local_media_subtitle(&item);
+        assert!(subtitle.contains("Opus"));
+        assert!(!subtitle.contains("WEBM"));
+    }
+
+    #[test]
+    fn local_browser_metadata_loads_off_ui_thread_and_reuses_ram_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MockLocalMediaLoader {
+            ui_thread: thread::ThreadId,
+            expected_path: PathBuf,
+            calls: Arc<AtomicUsize>,
+            observed: Sender<PathBuf>,
+        }
+
+        impl LocalMediaLoader for MockLocalMediaLoader {
+            fn load(&self, path: PathBuf) -> LocalMediaItem {
+                assert_ne!(
+                    thread::current().id(),
+                    self.ui_thread,
+                    "selected-file metadata must never run on the TUI thread"
+                );
+                assert_eq!(path, self.expected_path);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.observed
+                    .send(path.clone())
+                    .expect("report background metadata read");
+                let mut item = local_media_item_stub(path, None);
+                apply_local_technical_metadata(
+                    &mut item,
+                    LocalTechnicalMetadata {
+                        container: Some("WebM".to_owned()),
+                        audio_codec: Some("Opus".to_owned()),
+                        bitrate_kbps: Some(128),
+                        sample_rate_hz: Some(48_000),
+                        channels: Some(2),
+                        duration_seconds: Some(42),
+                    },
+                );
+                item.technical_metadata_probed = true;
+                item
+            }
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary Local browser fixture");
+        let media_path = fixture.path().join("mock.webm");
+        std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local listing");
+        let parent_offset = usize::from(listing.parent.is_some());
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.selected = parent_offset;
+        controller.local_listing = Some(listing);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (observed, observations) = unbounded();
+        controller.local_media_loader = Arc::new(MockLocalMediaLoader {
+            ui_thread: thread::current().id(),
+            expected_path: media_path.clone(),
+            calls: Arc::clone(&calls),
+            observed,
+        });
+
+        controller.refresh_local_browser_rows();
+
+        assert_eq!(
+            controller.pending_local_media_metadata.as_deref(),
+            Some(media_path.as_path())
+        );
+        assert_eq!(
+            observations
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background metadata read"),
+            media_path
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while controller.pending_local_media_metadata.is_some() && Instant::now() < deadline {
+            controller.drain_local_media_metadata_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.pending_local_media_metadata.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details
+                    .description
+                    .contains("Container: WebM\nCodec: Opus"))
+        );
+
+        controller.update_local_browser_detail();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(controller.pending_local_media_metadata.is_none());
+    }
+
+    #[test]
+    fn local_media_metadata_cache_has_a_fixed_lru_bound() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let fixture = tempfile::tempdir().expect("temporary metadata cache fixture");
+        for index in 0..=MAX_CACHED_LOCAL_MEDIA_ITEMS {
+            let path = fixture.path().join(format!("{index}.flac"));
+            std::fs::write(&path, [u8::try_from(index % 256).expect("bounded byte")])
+                .expect("write cache fixture");
+            let mut item = local_media_item_stub(path.clone(), Some(1));
+            item.technical_metadata_probed = true;
+            controller.cache_local_media_item(
+                local_file_identity(&path).expect("cache fixture identity"),
+                item,
+            );
+        }
+
+        assert_eq!(
+            controller.local_media_cache.len(),
+            MAX_CACHED_LOCAL_MEDIA_ITEMS
+        );
+        assert!(
+            !controller
+                .local_media_cache
+                .contains_key(&fixture.path().join("0.flac"))
+        );
+        assert!(
+            controller.local_media_cache.contains_key(
+                &fixture
+                    .path()
+                    .join(format!("{MAX_CACHED_LOCAL_MEDIA_ITEMS}.flac"))
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_media_metadata_cache_rejects_same_size_path_replacement() {
+        let fixture = tempfile::tempdir().expect("temporary replacement fixture");
+        let media_path = fixture.path().join("track.flac");
+        let replacement_path = fixture.path().join("replacement.flac");
+        std::fs::write(&media_path, b"old!").expect("write original fixture");
+        std::fs::write(&replacement_path, b"new!").expect("write replacement fixture");
+        let mut item = local_media_item_stub(media_path.clone(), Some(4));
+        item.title = "stale title".to_owned();
+        item.technical_metadata_probed = true;
+        let original_identity = local_file_identity(&media_path).expect("original identity");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.cache_local_media_item(original_identity, item);
+
+        std::fs::rename(&replacement_path, &media_path).expect("replace fixture atomically");
+
+        assert!(
+            controller.cached_local_media_item(&media_path, 4).is_none(),
+            "a same-size replacement must not inherit stale tags"
+        );
+        assert!(!controller.local_media_cache.contains_key(&media_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_metadata_worker_discards_a_file_replaced_during_loading() {
+        struct ReplacingLocalMediaLoader {
+            replacement: PathBuf,
+        }
+
+        impl LocalMediaLoader for ReplacingLocalMediaLoader {
+            fn load(&self, path: PathBuf) -> LocalMediaItem {
+                std::fs::rename(&self.replacement, &path)
+                    .expect("replace selected file during metadata read");
+                let mut item = local_media_item_stub(path, Some(4));
+                item.title = "stale worker result".to_owned();
+                item.technical_metadata_probed = true;
+                item
+            }
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary worker race fixture");
+        let media_path = fixture.path().join("track.flac");
+        let replacement_path = fixture.path().join("replacement.flac");
+        std::fs::write(&media_path, b"old!").expect("write original fixture");
+        std::fs::write(&replacement_path, b"new!").expect("write replacement fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.local_media_loader = Arc::new(ReplacingLocalMediaLoader {
+            replacement: replacement_path,
+        });
+
+        controller.request_local_media_metadata(media_path.clone());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while controller.pending_local_media_metadata.is_some() && Instant::now() < deadline {
+            controller.drain_local_media_metadata_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(controller.pending_local_media_metadata.is_none());
+        assert!(
+            !controller.local_media_cache.contains_key(&media_path),
+            "metadata read across path replacement must never enter the cache"
+        );
+    }
+
     #[cfg(feature = "local")]
     #[test]
     fn local_vorbis_metadata_maps_human_fields_and_identifiers() {
@@ -27200,11 +28536,13 @@ mod tests {
             acoustid_id: None,
             duration_seconds: None,
             size_bytes: 0,
+            container: "FLAC".to_owned(),
             codec: "FLAC".to_owned(),
             bitrate_kbps: None,
             sample_rate_hz: None,
             channels: None,
             embedded_artwork: false,
+            technical_metadata_probed: true,
         };
         let mut tag = lofty::ogg::VorbisComments::new();
         for (key, value) in [
@@ -28671,6 +30009,56 @@ mod tests {
         assert_eq!(restored.radio_selected, selected);
     }
 
+    #[cfg(feature = "radio")]
+    #[test]
+    fn bitrate_sorted_radio_selection_restores_by_stable_station_id() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "4duk-radio");
+        controller.dispatch(UiAction::CycleRadioSort);
+
+        assert_eq!(controller.view.radio_sort, RadioSort::BitrateDescending);
+        let sorted_row = controller.view.selected;
+        let name_row = sorted_radio_stations(RadioSort::Name)
+            .iter()
+            .position(|station| station.id == "4duk-radio")
+            .expect("4duk in canonical Radio order");
+        assert_ne!(
+            sorted_row, name_row,
+            "fixture must prove that a numeric sorted row is not stable"
+        );
+        assert!(controller.save_session());
+        let saved = controller
+            .store
+            .session()
+            .expect("saved session")
+            .expect("active session");
+        assert_eq!(
+            saved.radio_selected_station_id.as_deref(),
+            Some("4duk-radio")
+        );
+        assert_eq!(saved.radio_selected_row, Some(name_row));
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let restored = AppController::new(config, store, None, None);
+
+        assert_eq!(restored.view.screen, Screen::Radio);
+        assert_eq!(restored.view.radio_sort, RadioSort::Name);
+        assert_eq!(restored.view.selected, name_row);
+        assert_eq!(restored.radio_selected, name_row);
+        assert_eq!(
+            restored.view.rows[name_row]
+                .media_id
+                .as_ref()
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("4duk-radio")
+        );
+    }
+
     #[test]
     fn timecode_seek_and_back_use_absolute_backend_commands_and_bounded_chapters() {
         let (mut controller, state) = controller_with_mock_statuses([]);
@@ -29278,6 +30666,8 @@ mod tests {
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
         controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+        controller.cache_youtube_video_details(&subscription_video_details("Old provider"));
+        assert_eq!(controller.youtube_video_details_cache.len(), 1);
         controller.view.search_query = "API fixture".to_owned();
         controller.dispatch(UiAction::SubmitSearch);
         controller
@@ -29291,6 +30681,9 @@ mod tests {
 
         assert!(controller.view.youtube_setup_popup.is_none());
         assert!(controller.youtube_provider_available);
+        assert!(controller.youtube_video_details_cache.is_empty());
+        assert!(controller.youtube_video_details_cache_order.is_empty());
+        assert_eq!(controller.youtube_video_details_cache_bytes, 0);
         assert_eq!(
             controller.view.search_activity,
             Some(SearchActivity::YouTube)
@@ -30130,11 +31523,13 @@ mod tests {
             acoustid_id: Some("39e08d1e-ce43-465f-a802-041995e9d150".to_owned()),
             duration_seconds: Some(10),
             size_bytes: 1,
+            container: "FLAC".to_owned(),
             codec: "FLAC".to_owned(),
             bitrate_kbps: None,
             sample_rate_hz: None,
             channels: None,
             embedded_artwork: false,
+            technical_metadata_probed: true,
         };
         let queued_local = queue_item_from_local(&local).expect("local queue item");
         assert_eq!(queued_local.media.id.source, SourceKind::Local);
@@ -31959,16 +33354,11 @@ mod tests {
                 .iter()
                 .all(|row| !row.subtitle.trim().is_empty())
         );
-        let sector_index = RADIO_STATIONS
-            .iter()
-            .position(|station| station.id == "sector-radio-progressive-flac")
-            .expect("Sector station");
+        let sector_index = select_radio_station(&mut controller, "sector-radio-progressive-flac");
         assert_eq!(
             controller.view.rows[sector_index].subtitle,
             "FLAC · 44.1 kHz · stereo"
         );
-        controller.view.selected = sector_index;
-        controller.update_radio_detail();
         let details = controller.view.details.as_ref().expect("radio details");
         assert!(
             details
@@ -31983,6 +33373,84 @@ mod tests {
         assert!(details.length.is_empty());
         assert!(details.likes.is_empty());
         assert!(details.views.is_empty());
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_codec_labels_are_human_readable() {
+        let expected = [
+            (Some(RadioCodec::Aac), "AAC"),
+            (Some(RadioCodec::Flac), "FLAC"),
+            (Some(RadioCodec::Mp3), "MP3"),
+            (Some(RadioCodec::Opus), "Opus"),
+            (Some(RadioCodec::Vorbis), "Ogg Vorbis"),
+            (None, "not published"),
+        ];
+
+        for (codec, label) in expected {
+            assert_eq!(radio_codec_label(codec), label);
+        }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_sort_orders_known_bitrates_and_preserves_the_selected_station() {
+        let names = sorted_radio_stations(RadioSort::Name);
+        assert!(
+            names
+                .windows(2)
+                .all(|pair| { pair[0].name.to_lowercase() <= pair[1].name.to_lowercase() })
+        );
+
+        for (sort, descending) in [
+            (RadioSort::BitrateDescending, true),
+            (RadioSort::BitrateAscending, false),
+        ] {
+            let stations = sorted_radio_stations(sort);
+            let first_unknown = stations
+                .iter()
+                .position(|station| station.bitrate_kbps.is_none())
+                .unwrap_or(stations.len());
+            assert!(
+                stations[first_unknown..]
+                    .iter()
+                    .all(|station| station.bitrate_kbps.is_none()),
+                "unknown bitrates must remain after every known bitrate"
+            );
+            let bitrates = stations[..first_unknown]
+                .iter()
+                .filter_map(|station| station.bitrate_kbps)
+                .collect::<Vec<_>>();
+            assert!(bitrates.windows(2).all(|pair| {
+                if descending {
+                    pair[0] >= pair[1]
+                } else {
+                    pair[0] <= pair[1]
+                }
+            }));
+        }
+
+        let config = Config::for_dir("/tmp/youta-radio-sort-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "4duk-radio");
+
+        for expected_sort in [
+            RadioSort::BitrateDescending,
+            RadioSort::BitrateAscending,
+            RadioSort::Name,
+        ] {
+            controller.dispatch(UiAction::CycleRadioSort);
+            assert_eq!(controller.view.radio_sort, expected_sort);
+            assert_eq!(
+                controller.view.rows[controller.view.selected]
+                    .media_id
+                    .as_ref()
+                    .map(|media_id| media_id.external_id.as_str()),
+                Some("4duk-radio")
+            );
+        }
     }
 
     #[cfg(feature = "radio")]
@@ -32069,14 +33537,9 @@ mod tests {
     #[test]
     fn radio_todo_round_trip_stays_live_marker_free_and_replays_the_builtin_stream() {
         let station = station_by_id("radio-swiss-classic").expect("Radio station");
-        let station_index = RADIO_STATIONS
-            .iter()
-            .position(|candidate| candidate.id == station.id)
-            .expect("station index");
         let (mut controller, state) = controller_with_mock_statuses([]);
         controller.show_screen(Screen::Radio);
-        controller.view.selected = station_index;
-        controller.update_radio_detail();
+        select_radio_station(&mut controller, station.id);
         let media_id = MediaId::new(SourceKind::Radio, station.id);
         let mut obsolete_progress = PlaybackProgress::new(media_id.clone(), Some(600), 1);
         obsolete_progress.record_position(300, 2);
@@ -32172,10 +33635,6 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let station = station_by_id("radio-swiss-classic").expect("Radio station");
-        let station_index = RADIO_STATIONS
-            .iter()
-            .position(|candidate| candidate.id == station.id)
-            .expect("station index");
         let source_id = MediaId::new(SourceKind::Radio, station.id);
         let target = CommentTarget::Source {
             source_id: source_id.clone(),
@@ -32185,8 +33644,7 @@ mod tests {
             let store = StateStore::open(&config).expect("disk state");
             let mut controller = AppController::new(config.clone(), store, None, None);
             controller.show_screen(Screen::Radio);
-            controller.view.selected = station_index;
-            controller.update_radio_detail();
+            select_radio_station(&mut controller, station.id);
             assert_private_note_target(&controller, target.clone(), station.name);
             controller
                 .store
@@ -32212,8 +33670,7 @@ mod tests {
         let store = StateStore::open(&config).expect("reopened disk state");
         let mut controller = AppController::new(config, store, None, None);
         controller.show_screen(Screen::Radio);
-        controller.view.selected = station_index;
-        controller.update_radio_detail();
+        select_radio_station(&mut controller, station.id);
         controller.refresh_selected_playlist_state();
         assert_private_note_target(&controller, target.clone(), station.name);
         assert!(
@@ -32282,6 +33739,47 @@ mod tests {
 
     #[cfg(feature = "radio")]
     #[test]
+    fn radio_backend_timeline_is_normalized_to_non_seekable_live_state() {
+        let bogus_position = Duration::from_secs(8_641_222);
+        let bogus_duration = Duration::from_secs(8_641_235);
+        let backend_status = PlaybackStatus {
+            idle: false,
+            live: false,
+            position: bogus_position,
+            duration: Some(bogus_duration),
+            paused: false,
+            chapter: Some(7),
+            buffered_ranges: vec![crate::playback::BufferedRange {
+                start: Duration::from_secs(8_641_000),
+                end: bogus_duration,
+            }],
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _statuses, _events) = controller_with_mock_lifecycle(
+            [backend_status],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+
+        controller.play_queue_item(fixture_radio_item("4duk-radio"), false);
+        assert!(
+            controller.view.playback.live,
+            "Radio must be live before the backend reports its first status"
+        );
+        controller.update_player();
+
+        assert!(controller.view.playback.live);
+        assert_eq!(controller.view.playback.position, Duration::ZERO);
+        assert_eq!(controller.view.playback.duration, None);
+        assert_eq!(controller.view.playback.chapter, None);
+        assert!(controller.view.playback.buffered_ranges.is_empty());
+        assert_eq!(
+            controller.view.playback.title.as_deref(),
+            Some("4duk Radio")
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
     fn graceful_shutdown_flushes_radio_stats_without_progress() {
         let config = Config::for_dir("/tmp/youta-radio-shutdown-test");
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -32317,6 +33815,9 @@ mod tests {
     fn live_radio_rejects_seek_and_repeat_commands_without_a_popup() {
         let (mut controller, state) = controller_with_mock_statuses([]);
         controller.play_queue_item(fixture_radio_item("4duk-radio"), false);
+        controller.view.playback.live = false;
+        controller.view.playback.position = Duration::from_secs(8_641_222);
+        controller.view.playback.duration = Some(Duration::from_secs(8_641_235));
         state.lock().expect("mock state").commands.clear();
 
         controller.dispatch(UiAction::SeekRelative(5));
@@ -32342,11 +33843,8 @@ mod tests {
         let config = Config::for_dir("/tmp/youta-radio-metadata-priority-test");
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
-        controller.view.screen = Screen::Radio;
-        controller.view.selected = RADIO_STATIONS
-            .iter()
-            .position(|station| station.id == "4duk-radio")
-            .expect("selected 4duk station");
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "4duk-radio");
         controller.current_media = Some(MediaId::new(SourceKind::Radio, "france-musique"));
 
         assert_eq!(
@@ -32474,11 +33972,8 @@ mod tests {
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
         controller.current_media = Some(MediaId::new(SourceKind::Radio, "4duk-radio"));
-        controller.view.screen = Screen::Radio;
-        controller.view.selected = RADIO_STATIONS
-            .iter()
-            .position(|station| station.id == "4duk-radio")
-            .expect("4duk row");
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "4duk-radio");
         controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
             generation: 1,
             station_id: "4duk-radio".to_owned(),
@@ -32530,8 +34025,71 @@ mod tests {
                 .as_ref()
                 .expect("selected stale details")
                 .description
+                .contains("Track: Fresh ICY title")
+        );
+        assert!(
+            !controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected canonical details")
+                .description
                 .contains("Last known track: Known artist — Known title")
         );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_details_render_one_canonical_current_track_row() {
+        let config = Config::for_dir("/tmp/youta-radio-metadata-dedup-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "4duk-radio");
+        controller.current_media = Some(MediaId::new(SourceKind::Radio, "4duk-radio"));
+        controller.view.radio_now_playing = Some("Track: Known artist — Known title".to_owned());
+        controller.radio_now_playing_cache.insert(
+            "4duk-radio".to_owned(),
+            CachedRadioNowPlaying {
+                value: RadioNowPlaying {
+                    kind: RadioNowPlayingKind::Track,
+                    title: Some("Known title".to_owned()),
+                    artist: Some("Known artist".to_owned()),
+                    programme: None,
+                    station_start_time: None,
+                    duration: None,
+                    refresh_after: Duration::from_secs(60),
+                },
+                refresh_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        controller.update_radio_detail();
+
+        let description = &controller
+            .view
+            .details
+            .as_ref()
+            .expect("4duk details")
+            .description;
+        assert_eq!(
+            description
+                .matches("Track: Known artist — Known title")
+                .count(),
+            1
+        );
+
+        controller.view.radio_now_playing = Some("Track: ICY title".to_owned());
+        controller.update_radio_detail();
+        let description = &controller
+            .view
+            .details
+            .as_ref()
+            .expect("4duk details with provider/ICY overlap")
+            .description;
+        assert_eq!(description.matches("Track:").count(), 1);
+        assert!(description.contains("Track: ICY title"));
+        assert!(!description.contains("Known artist — Known title"));
     }
 
     #[cfg(feature = "radio")]
@@ -32600,9 +34158,15 @@ mod tests {
 
         controller.show_now_playing();
 
-        let expected = RADIO_STATIONS
+        let expected = controller
+            .view
+            .rows
             .iter()
-            .position(|station| station.id == "4duk-radio")
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == "4duk-radio")
+            })
             .expect("4duk row");
         assert_eq!(controller.view.screen, Screen::Radio);
         assert_eq!(controller.view.selected, expected);

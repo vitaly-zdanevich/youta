@@ -4,15 +4,19 @@
 //! Capability detection is conservative: automatic mode never writes a probe
 //! to the terminal, and unsupported terminals never start the network worker.
 //! Fetching, bounded image validation, resizing, and protocol encoding all
-//! happen away from the TUI render thread. Background prefetch shares the
-//! selected-artwork worker, persists validated bytes only, and never requests
-//! a redraw.
+//! happen away from the TUI render thread. Background prefetch uses an
+//! independent worker, persists validated bytes only, and never delays selected
+//! artwork or requests a redraw. Recently encoded remote terminal images
+//! remain in an entry- and decoded-byte-bounded in-memory cache so revisiting
+//! subscription channels is immediate. Local images always revalidate their
+//! filesystem fingerprint before reuse.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -55,6 +59,8 @@ const CACHE_MAX_ENTRIES: usize = 512;
 const CACHE_FILE_EXTENSION: &str = "image";
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
+const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 16;
+const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
 const LOCAL_PREVIEW_MAGIC: &[u8; 8] = b"YTPRV001";
 const LOCAL_PREVIEW_HEADER_BYTES: usize = LOCAL_PREVIEW_MAGIC.len() + 4 + 4 + 1;
@@ -67,6 +73,8 @@ const MAX_LOCAL_ARTWORK_PICTURES: usize = 64;
 #[cfg(feature = "local")]
 const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CACHE_TEMPORARIES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 #[cfg(test)]
 static LOCAL_SOURCE_DECODE_COUNTS: std::sync::Mutex<Vec<(PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
@@ -280,13 +288,44 @@ struct WorkerRequest {
 
 struct WorkerResult {
     generation: u64,
-    result: Result<StatefulProtocol, ThumbnailFailure>,
+    result: Result<EncodedThumbnail, ThumbnailFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedThumbnailKey {
+    source: Url,
+    width: u16,
+    height: u16,
+}
+
+impl From<&ThumbnailTarget> for PreparedThumbnailKey {
+    fn from(target: &ThumbnailTarget) -> Self {
+        Self {
+            source: target.source.clone(),
+            width: target.area.width,
+            height: target.area.height,
+        }
+    }
+}
+
+/// One remote encoded terminal image retained for fast keyboard navigation.
+struct PreparedThumbnail {
+    key: PreparedThumbnailKey,
+    protocol: StatefulProtocol,
+    decoded_bytes: usize,
+}
+
+/// One encoded protocol and the decoded source allocation it retains.
+struct EncodedThumbnail {
+    protocol: StatefulProtocol,
+    decoded_bytes: usize,
 }
 
 /// One terminal protocol plus an optional local derivative to persist after
 /// the ready result has been published.
 struct LoadedThumbnail {
     protocol: StatefulProtocol,
+    decoded_bytes: usize,
     deferred_local_preview: Option<DeferredLocalPreview>,
 }
 
@@ -498,6 +537,7 @@ impl ThumbnailCache {
             std::process::id(),
             sequence
         ));
+        let active_temporary = ActiveCacheTemporary::register(temporary.clone());
         let result = (|| {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -516,6 +556,7 @@ impl ThumbnailCache {
             let _ = fs::File::open(&self.directory).and_then(|directory| directory.sync_all());
             Ok(())
         })();
+        drop(active_temporary);
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
@@ -528,6 +569,9 @@ impl ThumbnailCache {
             let entry = entry?;
             if is_cache_temp_name(&entry.file_name()) {
                 let path = entry.path();
+                if cache_temporary_is_active(&path) {
+                    continue;
+                }
                 if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
                 {
                     remove_cache_entry(&path);
@@ -576,6 +620,38 @@ impl ThumbnailCache {
         }
         Ok(())
     }
+}
+
+/// Registration preventing concurrent cache eviction from deleting a live
+/// atomic-write temporary.
+struct ActiveCacheTemporary {
+    path: PathBuf,
+}
+
+impl ActiveCacheTemporary {
+    fn register(path: PathBuf) -> Self {
+        ACTIVE_CACHE_TEMPORARIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone());
+        Self { path }
+    }
+}
+
+impl Drop for ActiveCacheTemporary {
+    fn drop(&mut self) {
+        ACTIVE_CACHE_TEMPORARIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
+fn cache_temporary_is_active(path: &Path) -> bool {
+    ACTIVE_CACHE_TEMPORARIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(path)
 }
 
 struct CacheEntry {
@@ -1301,6 +1377,9 @@ pub struct ThumbnailManager {
     generation: u64,
     target: Option<ThumbnailTarget>,
     protocol: Option<StatefulProtocol>,
+    protocol_decoded_bytes: usize,
+    prepared: VecDeque<PreparedThumbnail>,
+    prepared_decoded_bytes: usize,
     picker: Option<Picker>,
     cache_directory: Option<PathBuf>,
     request_sender: Option<Sender<WorkerRequest>>,
@@ -1374,6 +1453,9 @@ impl ThumbnailManager {
             generation: 0,
             target: None,
             protocol: None,
+            protocol_decoded_bytes: 0,
+            prepared: VecDeque::new(),
+            prepared_decoded_bytes: 0,
             picker: Some(picker),
             cache_directory,
             request_sender: None,
@@ -1397,6 +1479,9 @@ impl ThumbnailManager {
             generation: 0,
             target: None,
             protocol: None,
+            protocol_decoded_bytes: 0,
+            prepared: VecDeque::new(),
+            prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
             request_sender: None,
@@ -1439,11 +1524,17 @@ impl ThumbnailManager {
             return false;
         }
 
+        self.retain_current_protocol();
         self.generation = self.generation.wrapping_add(1);
         self.target = Some(target.clone());
-        self.protocol = None;
         if !is_safe_thumbnail_source(&target.source) {
             self.state = ThumbnailState::Failed(ThumbnailFailure::InvalidSource);
+            return true;
+        }
+        if let Some(prepared) = self.take_prepared_thumbnail(&target) {
+            self.protocol = Some(prepared.protocol);
+            self.protocol_decoded_bytes = prepared.decoded_bytes;
+            self.state = ThumbnailState::Ready;
             return true;
         }
         self.state = ThumbnailState::Loading;
@@ -1451,7 +1542,7 @@ impl ThumbnailManager {
             generation: self.generation,
             target,
         };
-        if !self.ensure_worker() || !self.send_latest(request) {
+        if !self.ensure_visible_worker() || !self.send_latest(request) {
             self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
         }
         true
@@ -1460,11 +1551,13 @@ impl ThumbnailManager {
     /// Replaces the bounded background backlog of artwork to persist.
     ///
     /// Sources retain their caller-provided order after unsafe, oversized, and
-    /// duplicate URLs are removed. The currently visible source is omitted
-    /// because [`Self::synchronize`] already gives it display priority. A
-    /// background request validates and stores original image bytes in the
-    /// existing persistent cache; it does not encode a terminal image, change
-    /// [`Self::state`], or produce a redraw result.
+    /// duplicate URLs are removed. The normalized list is remembered across
+    /// visible-selection changes, while the currently visible source is
+    /// omitted only from the delivered workload because [`Self::synchronize`]
+    /// already gives it display priority. A background request validates and
+    /// stores original image bytes in the existing persistent cache; it does
+    /// not encode a terminal image, change [`Self::state`], or produce a redraw
+    /// result.
     ///
     /// Passing an empty slice cancels work that has not started. At most one
     /// blocking transfer can already be in progress. Unsupported terminals,
@@ -1478,35 +1571,42 @@ impl ThumbnailManager {
             return false;
         }
 
-        let active_source = self.target.as_ref().map(|target| &target.source);
         let mut seen = HashSet::with_capacity(sources.len().min(MAX_PREFETCH_SOURCES));
-        let accepted = sources
+        let normalized = sources
             .iter()
             .filter(|source| {
                 source.as_str().len() <= MAX_PREFETCH_URL_BYTES
                     && matches!(source.scheme(), "http" | "https")
                     && is_safe_thumbnail_source(source)
-                    && active_source != Some(*source)
                     && seen.insert(source.as_str())
             })
             .take(MAX_PREFETCH_SOURCES)
             .cloned()
             .collect::<Vec<_>>();
-        if accepted == self.prefetch_sources {
+        if normalized == self.prefetch_sources {
             return false;
         }
-        if accepted.is_empty() && self.prefetch_sender.is_none() {
-            self.prefetch_sources.clear();
+        let active_source = self.target.as_ref().map(|target| &target.source);
+        let accepted = normalized
+            .iter()
+            .filter(|source| active_source != Some(*source))
+            .cloned()
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            if self.prefetch_sender.is_some() && !self.send_latest_prefetch(Vec::new()) {
+                return false;
+            }
+            self.prefetch_sources = normalized;
+            return true;
+        }
+        if !self.ensure_prefetch_worker() || !self.send_latest_prefetch(accepted) {
             return false;
         }
-        if !self.ensure_worker() || !self.send_latest_prefetch(accepted.clone()) {
-            return false;
-        }
-        self.prefetch_sources = accepted;
+        self.prefetch_sources = normalized;
         true
     }
 
-    fn ensure_worker(&mut self) -> bool {
+    fn ensure_visible_worker(&mut self) -> bool {
         if self.request_sender.is_some() {
             return true;
         }
@@ -1515,22 +1615,37 @@ impl ThumbnailManager {
         };
         let (request_sender, request_receiver) = bounded(1);
         let request_discarder = request_receiver.clone();
-        let (prefetch_sender, prefetch_receiver) = bounded(1);
-        let prefetch_discarder = prefetch_receiver.clone();
         let (result_sender, result_receiver) = bounded(1);
-        let spawned = spawn_worker(
+        let spawned = spawn_visible_worker(
             picker,
             request_receiver,
-            prefetch_receiver,
             result_sender,
             self.cache_directory.clone(),
         );
+        if !spawned {
+            return false;
+        }
         self.request_sender = Some(request_sender);
         self.request_discarder = Some(request_discarder);
+        self.result_receiver = Some(result_receiver);
+        true
+    }
+
+    fn ensure_prefetch_worker(&mut self) -> bool {
+        if self.prefetch_sender.is_some() {
+            return true;
+        }
+        let Some(cache_directory) = self.cache_directory.clone() else {
+            return false;
+        };
+        let (prefetch_sender, prefetch_receiver) = bounded(1);
+        let prefetch_discarder = prefetch_receiver.clone();
+        if !spawn_prefetch_worker(prefetch_receiver, cache_directory) {
+            return false;
+        }
         self.prefetch_sender = Some(prefetch_sender);
         self.prefetch_discarder = Some(prefetch_discarder);
-        self.result_receiver = Some(result_receiver);
-        spawned
+        true
     }
 
     fn send_latest(&mut self, request: WorkerRequest) -> bool {
@@ -1574,6 +1689,7 @@ impl ThumbnailManager {
         if self.result_receiver.is_none() {
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
+                self.protocol_decoded_bytes = 0;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
                 return true;
             }
@@ -1587,12 +1703,14 @@ impl ThumbnailManager {
                 Ok(result) if result.generation == self.generation => {
                     changed = true;
                     match result.result {
-                        Ok(protocol) => {
-                            self.protocol = Some(protocol);
+                        Ok(encoded) => {
+                            self.protocol = Some(encoded.protocol);
+                            self.protocol_decoded_bytes = encoded.decoded_bytes;
                             self.state = ThumbnailState::Ready;
                         }
                         Err(error) => {
                             self.protocol = None;
+                            self.protocol_decoded_bytes = 0;
                             self.state = ThumbnailState::Failed(error);
                         }
                     }
@@ -1608,12 +1726,10 @@ impl ThumbnailManager {
         if disconnected {
             self.request_sender = None;
             self.request_discarder = None;
-            self.prefetch_sender = None;
-            self.prefetch_discarder = None;
-            self.prefetch_sources.clear();
             self.result_receiver = None;
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
+                self.protocol_decoded_bytes = 0;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
                 changed = true;
             }
@@ -1642,32 +1758,99 @@ impl ThumbnailManager {
     ///
     /// Returns `true` when visible state was cleared.
     pub fn clear(&mut self) -> bool {
-        let changed = self.target.take().is_some()
-            || self.protocol.take().is_some()
+        let changed = self.target.is_some()
+            || self.protocol.is_some()
             || self.state == ThumbnailState::Loading
             || matches!(
                 self.state,
                 ThumbnailState::Ready | ThumbnailState::Failed(_)
             );
         if changed {
+            self.retain_current_protocol();
+            self.target = None;
+            self.protocol = None;
+            self.protocol_decoded_bytes = 0;
             self.generation = self.generation.wrapping_add(1);
             self.state = ThumbnailState::Idle;
         }
         changed
     }
+
+    /// Moves the visible encoded image into the bounded recency cache.
+    fn retain_current_protocol(&mut self) {
+        let (Some(target), Some(protocol)) = (self.target.as_ref(), self.protocol.take()) else {
+            return;
+        };
+        let decoded_bytes = std::mem::take(&mut self.protocol_decoded_bytes);
+        // Local files already have a replacement-sensitive persistent preview
+        // key. A path-only prepared key would bypass that fingerprint and could
+        // display an older image after an in-process file replacement.
+        if target.source.scheme() == "file" {
+            return;
+        }
+        let key = PreparedThumbnailKey::from(target);
+        self.cache_prepared_protocol(key, protocol, decoded_bytes);
+    }
+
+    /// Inserts one remote protocol while enforcing both count and RAM bounds.
+    fn cache_prepared_protocol(
+        &mut self,
+        key: PreparedThumbnailKey,
+        protocol: StatefulProtocol,
+        decoded_bytes: usize,
+    ) {
+        if let Some(index) = self.prepared.iter().position(|entry| entry.key == key) {
+            if let Some(replaced) = self.prepared.remove(index) {
+                self.prepared_decoded_bytes = self
+                    .prepared_decoded_bytes
+                    .saturating_sub(replaced.decoded_bytes);
+            }
+        }
+        if decoded_bytes == 0 || decoded_bytes > PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES {
+            return;
+        }
+        self.prepared.push_front(PreparedThumbnail {
+            key,
+            protocol,
+            decoded_bytes,
+        });
+        self.prepared_decoded_bytes = self.prepared_decoded_bytes.saturating_add(decoded_bytes);
+        while self.prepared.len() > PREPARED_THUMBNAIL_CACHE_ENTRIES
+            || self.prepared_decoded_bytes > PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES
+        {
+            let Some(evicted) = self.prepared.pop_back() else {
+                break;
+            };
+            self.prepared_decoded_bytes = self
+                .prepared_decoded_bytes
+                .saturating_sub(evicted.decoded_bytes);
+        }
+    }
+
+    /// Takes an encoded image matching this remote source and cell size.
+    fn take_prepared_thumbnail(&mut self, target: &ThumbnailTarget) -> Option<PreparedThumbnail> {
+        if target.source.scheme() == "file" {
+            return None;
+        }
+        let key = PreparedThumbnailKey::from(target);
+        let index = self.prepared.iter().position(|entry| entry.key == key)?;
+        let prepared = self.prepared.remove(index)?;
+        self.prepared_decoded_bytes = self
+            .prepared_decoded_bytes
+            .saturating_sub(prepared.decoded_bytes);
+        Some(prepared)
+    }
 }
 
-fn spawn_worker(
+fn spawn_visible_worker(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    prefetch_updates: Receiver<Vec<Url>>,
     results: Sender<WorkerResult>,
     cache_directory: Option<PathBuf>,
 ) -> bool {
-    spawn_worker_with_transport(
+    spawn_visible_worker_with_transport(
         picker,
         requests,
-        prefetch_updates,
         results,
         HttpThumbnailTransport {
             agent: thumbnail_agent(),
@@ -1677,6 +1860,89 @@ fn spawn_worker(
     )
 }
 
+fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
+    picker: Picker,
+    requests: Receiver<WorkerRequest>,
+    results: Sender<WorkerResult>,
+    mut transport: T,
+    mut cache: Option<ThumbnailCache>,
+    debounce: Duration,
+) -> bool {
+    thread::Builder::new()
+        .name("youta-thumbnail-visible".to_owned())
+        .spawn(move || {
+            loop {
+                let request = match requests.recv() {
+                    Ok(mut request) => {
+                        for newer in requests.try_iter() {
+                            request = newer;
+                        }
+                        request
+                    }
+                    Err(_) => break,
+                };
+                if !render_worker_request(
+                    request,
+                    &requests,
+                    &results,
+                    &mut transport,
+                    cache.as_mut(),
+                    &picker,
+                    debounce,
+                ) {
+                    break;
+                }
+            }
+        })
+        .is_ok()
+}
+
+fn spawn_prefetch_worker(prefetch_updates: Receiver<Vec<Url>>, cache_directory: PathBuf) -> bool {
+    spawn_prefetch_worker_with_transport(
+        prefetch_updates,
+        HttpThumbnailTransport {
+            agent: thumbnail_agent(),
+        },
+        ThumbnailCache::new(cache_directory),
+    )
+}
+
+fn spawn_prefetch_worker_with_transport<T: ThumbnailTransport>(
+    prefetch_updates: Receiver<Vec<Url>>,
+    mut transport: T,
+    mut cache: ThumbnailCache,
+) -> bool {
+    thread::Builder::new()
+        .name("youta-thumbnail-prefetch".to_owned())
+        .spawn(move || {
+            if cache.prepare().is_err() {
+                return;
+            }
+            let mut backlog = VecDeque::new();
+            loop {
+                match latest_prefetch_update(&prefetch_updates) {
+                    WorkerInput::Item(sources) => backlog = sources.into(),
+                    WorkerInput::Disconnected => break,
+                    WorkerInput::Empty => {}
+                }
+
+                if let Some(source) = backlog.pop_front() {
+                    if prefetch_thumbnail(&mut transport, &mut cache, &source).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                let Ok(sources) = prefetch_updates.recv() else {
+                    break;
+                };
+                backlog = sources.into();
+            }
+        })
+        .is_ok()
+}
+
+#[cfg(test)]
 fn spawn_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
@@ -1793,6 +2059,7 @@ enum WorkerInput<T> {
     Disconnected,
 }
 
+#[cfg(test)]
 fn latest_worker_request(requests: &Receiver<WorkerRequest>) -> WorkerInput<WorkerRequest> {
     match requests.try_recv() {
         Ok(mut request) => {
@@ -1852,8 +2119,15 @@ fn render_worker_request<T: ThumbnailTransport>(
     let (result, deferred_local_preview) = match loaded {
         Ok(LoadedThumbnail {
             protocol,
+            decoded_bytes,
             deferred_local_preview,
-        }) => (Ok(protocol), deferred_local_preview),
+        }) => (
+            Ok(EncodedThumbnail {
+                protocol,
+                decoded_bytes,
+            }),
+            deferred_local_preview,
+        ),
         Err(error) => (Err(error), None),
     };
     if results
@@ -1955,8 +2229,9 @@ fn load_thumbnail(
     if persistent_cache_allowed
         && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, target)
     {
-        return result.map(|protocol| LoadedThumbnail {
-            protocol,
+        return result.map(|encoded| LoadedThumbnail {
+            protocol: encoded.protocol,
+            decoded_bytes: encoded.decoded_bytes,
             deferred_local_preview: None,
         });
     }
@@ -1966,8 +2241,9 @@ fn load_thumbnail(
     if persistent_cache_allowed && let Some(cache) = cache {
         let _ = cache.store(&target.source, &bytes);
     }
-    encode_thumbnail(picker, target.area, image).map(|protocol| LoadedThumbnail {
-        protocol,
+    encode_thumbnail(picker, target.area, image).map(|encoded| LoadedThumbnail {
+        protocol: encoded.protocol,
+        decoded_bytes: encoded.decoded_bytes,
         deferred_local_preview: None,
     })
 }
@@ -1993,9 +2269,10 @@ fn load_local_thumbnail(
         if let Some(image) = decode_local_preview_record(&bytes)
             && fingerprint.is_current()
         {
-            let protocol = encode_thumbnail(picker, target.area, image)?;
+            let encoded = encode_thumbnail(picker, target.area, image)?;
             return Ok(LoadedThumbnail {
-                protocol,
+                protocol: encoded.protocol,
+                decoded_bytes: encoded.decoded_bytes,
                 deferred_local_preview: None,
             });
         }
@@ -2011,9 +2288,10 @@ fn load_local_thumbnail(
         .is_some()
         .then(|| encode_local_preview_record(&image))
         .flatten();
-    let protocol = encode_thumbnail(picker, target.area, image)?;
+    let encoded = encode_thumbnail(picker, target.area, image)?;
     Ok(LoadedThumbnail {
-        protocol,
+        protocol: encoded.protocol,
+        decoded_bytes: encoded.decoded_bytes,
         deferred_local_preview: record.map(|record| DeferredLocalPreview {
             cache_key,
             record,
@@ -2047,7 +2325,7 @@ fn load_cached_thumbnail(
     cache: Option<&mut ThumbnailCache>,
     picker: &Picker,
     target: &ThumbnailTarget,
-) -> Option<Result<StatefulProtocol, ThumbnailFailure>> {
+) -> Option<Result<EncodedThumbnail, ThumbnailFailure>> {
     let cache = cache?;
     let bytes = cache.read(&target.source).ok().flatten()?;
     let image = match decode_thumbnail(&bytes) {
@@ -2065,11 +2343,19 @@ fn encode_thumbnail(
     picker: &Picker,
     area: Rect,
     image: DynamicImage,
-) -> Result<StatefulProtocol, ThumbnailFailure> {
+) -> Result<EncodedThumbnail, ThumbnailFailure> {
+    // `StatefulProtocol` owns its source image. Retaining only the pixels that
+    // can fit this terminal area bounds the prepared-image LRU and avoids
+    // repeating a full-resolution resize in protocol encoders such as Sixel.
+    let image = prefit_thumbnail(image, local_preview_target(picker, area));
+    let decoded_bytes = image.as_bytes().len();
     let mut protocol = picker.new_resize_protocol(image);
     protocol.resize_encode(&Resize::Fit(None), area.into());
     match protocol.last_encoding_result() {
-        Some(Ok(())) => Ok(protocol),
+        Some(Ok(())) => Ok(EncodedThumbnail {
+            protocol,
+            decoded_bytes,
+        }),
         Some(Err(_)) | None => Err(ThumbnailFailure::EncodingFailed),
     }
 }
@@ -2917,6 +3203,9 @@ pub(crate) mod tests {
             generation: 0,
             target: None,
             protocol: None,
+            protocol_decoded_bytes: 0,
+            prepared: VecDeque::new(),
+            prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
             request_sender: Some(request_sender),
@@ -3039,8 +3328,8 @@ pub(crate) mod tests {
         ]));
         assert_eq!(
             manager.prefetch_sources,
-            [first.clone(), second.clone()],
-            "active, unsafe, oversized, and duplicate sources must be omitted"
+            [selected.clone(), first.clone(), second.clone()],
+            "normalized sources must retain the active item while omitting unsafe, oversized, and duplicate URLs"
         );
         assert!(
             !manager.synchronize_prefetch(&[
@@ -3362,6 +3651,265 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn revisiting_subscription_artwork_reuses_the_encoded_protocol_immediately() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let first =
+            Url::parse("https://yt3.ggpht.com/first-encoded=s800").expect("first artwork URL");
+        let second =
+            Url::parse("https://yt3.ggpht.com/second-encoded=s800").expect("second artwork URL");
+        let area = Rect::new(1, 1, 40, 16);
+
+        for source in [&first, &second] {
+            assert!(manager.synchronize(Some(source), area));
+            assert_eq!(
+                observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cold artwork request"),
+                *source
+            );
+            replies
+                .send(Ok(fixture_png()))
+                .expect("release cold artwork request");
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        }
+
+        assert!(manager.synchronize(Some(&first), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Ready,
+            "a revisited channel must not expose a loading frame"
+        );
+        assert!(manager.protocol().is_some());
+        assert!(
+            matches!(observed.try_recv(), Err(TryRecvError::Empty)),
+            "encoded in-memory artwork must bypass the worker and transport"
+        );
+    }
+
+    #[test]
+    fn prepared_thumbnail_cache_is_bounded_and_evicts_least_recently_used() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let area = Rect::new(1, 1, 20, 8);
+        let sources = (0..PREPARED_THUMBNAIL_CACHE_ENTRIES + 2)
+            .map(|index| {
+                Url::parse(&format!("https://yt3.ggpht.com/channel-{index}=s800"))
+                    .expect("artwork URL")
+            })
+            .collect::<Vec<_>>();
+
+        for source in &sources {
+            assert!(manager.synchronize(Some(source), area));
+            assert_eq!(
+                observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cold artwork request"),
+                *source
+            );
+            replies
+                .send(Ok(fixture_png()))
+                .expect("release cold artwork request");
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        }
+        assert_eq!(manager.prepared.len(), PREPARED_THUMBNAIL_CACHE_ENTRIES);
+
+        assert!(manager.synchronize(Some(&sources[0]), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Loading,
+            "the least-recently-used protocol must be evicted at the fixed bound"
+        );
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("evicted artwork request"),
+            sources[0]
+        );
+        replies
+            .send(Ok(fixture_png()))
+            .expect("release evicted artwork request");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+    }
+
+    #[test]
+    fn prepared_thumbnail_cache_evicts_by_decoded_bytes_and_rejects_one_oversized_entry() {
+        let mut manager =
+            ThumbnailManager::from_terminal_info(ThumbnailMode::Auto, &graphical_terminal());
+        let area = Rect::new(0, 0, 1, 1);
+        let protocol = || {
+            encode_thumbnail(
+                &picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+                area,
+                DynamicImage::new_rgba8(1, 1),
+            )
+            .expect("encode cache-policy fixture")
+            .protocol
+        };
+        let first = PreparedThumbnailKey {
+            source: Url::parse("https://images.example/first-budget.png").expect("first URL"),
+            width: area.width,
+            height: area.height,
+        };
+        let second = PreparedThumbnailKey {
+            source: Url::parse("https://images.example/second-budget.png").expect("second URL"),
+            width: area.width,
+            height: area.height,
+        };
+        let oversized = PreparedThumbnailKey {
+            source: Url::parse("https://images.example/oversized-budget.png")
+                .expect("oversized URL"),
+            width: area.width,
+            height: area.height,
+        };
+        let more_than_half = PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES / 2 + 1;
+
+        manager.cache_prepared_protocol(first.clone(), protocol(), more_than_half);
+        manager.cache_prepared_protocol(second.clone(), protocol(), more_than_half);
+
+        assert_eq!(manager.prepared.len(), 1);
+        assert_eq!(
+            manager.prepared.front().map(|entry| &entry.key),
+            Some(&second)
+        );
+        assert_eq!(manager.prepared_decoded_bytes, more_than_half);
+
+        manager.cache_prepared_protocol(
+            oversized.clone(),
+            protocol(),
+            PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES + 1,
+        );
+
+        assert_eq!(manager.prepared.len(), 1);
+        assert!(manager.prepared.iter().all(|entry| entry.key != oversized));
+        assert!(manager.prepared_decoded_bytes <= PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES);
+    }
+
+    #[test]
+    fn replacing_local_image_at_same_path_bypasses_the_prepared_protocol_cache() {
+        let directory = tempfile::tempdir().expect("temporary local replacement fixture");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let first_path = directory.path().join("first.jpg");
+        let second_path = directory.path().join("second.jpg");
+        write_jpeg_fixture(&first_path, 80, 40);
+        write_jpeg_fixture(&second_path, 64, 32);
+        let first = Url::from_file_path(&first_path).expect("first local URL");
+        let second = Url::from_file_path(&second_path).expect("second local URL");
+        let area = Rect::new(1, 1, 40, 10);
+        let mut manager = local_thumbnail_manager(cache_directory.clone());
+
+        assert!(manager.synchronize(Some(&first), area));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        let old_cache_key = local_preview_cache_key(&first_path, area);
+        wait_for_local_preview(&cache_directory, &old_cache_key);
+        assert_eq!(local_source_decode_count(&first_path), 1);
+
+        assert!(manager.synchronize(Some(&second), area));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(
+            manager.prepared.is_empty(),
+            "local protocols must never enter the path-only prepared cache"
+        );
+
+        write_jpeg_fixture(&first_path, 96, 48);
+        let replacement_cache_key = local_preview_cache_key(&first_path, area);
+        assert_ne!(replacement_cache_key, old_cache_key);
+
+        assert!(manager.synchronize(Some(&first), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Loading,
+            "a replaced local image must be fingerprinted by the worker"
+        );
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            local_source_decode_count(&first_path),
+            2,
+            "the same-path replacement must be decoded instead of reusing stale pixels"
+        );
+        assert!(manager.prepared.is_empty());
+    }
+
+    #[test]
+    fn blocking_prefetch_cannot_delay_a_visible_thumbnail_request() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let (visible_request_sender, visible_request_receiver) = bounded(1);
+        let visible_request_discarder = visible_request_receiver.clone();
+        let (result_sender, result_receiver) = bounded(1);
+        let (visible_observed_sender, visible_observed) = bounded(1);
+        let (visible_reply_sender, visible_reply_receiver) = bounded(1);
+        assert!(spawn_visible_worker_with_transport(
+            picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+            visible_request_receiver,
+            result_sender,
+            MockTransport {
+                observed: visible_observed_sender,
+                replies: visible_reply_receiver,
+            },
+            Some(ThumbnailCache::new(cache_directory.clone())),
+            Duration::ZERO,
+        ));
+
+        let (prefetch_sender, prefetch_receiver) = bounded(1);
+        let prefetch_discarder = prefetch_receiver.clone();
+        let (prefetch_observed_sender, prefetch_observed) = bounded(1);
+        let (prefetch_reply_sender, prefetch_reply_receiver) = bounded(1);
+        assert!(spawn_prefetch_worker_with_transport(
+            prefetch_receiver,
+            MockTransport {
+                observed: prefetch_observed_sender,
+                replies: prefetch_reply_receiver,
+            },
+            ThumbnailCache::new(cache_directory.clone()),
+        ));
+
+        let mut manager = ThumbnailManager {
+            capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
+            state: ThumbnailState::Idle,
+            generation: 0,
+            target: None,
+            protocol: None,
+            protocol_decoded_bytes: 0,
+            prepared: VecDeque::new(),
+            prepared_decoded_bytes: 0,
+            picker: None,
+            cache_directory: Some(cache_directory),
+            request_sender: Some(visible_request_sender),
+            request_discarder: Some(visible_request_discarder),
+            prefetch_sender: Some(prefetch_sender),
+            prefetch_discarder: Some(prefetch_discarder),
+            prefetch_sources: Vec::new(),
+            result_receiver: Some(result_receiver),
+        };
+        let background =
+            Url::parse("https://images.example/blocked-prefetch.png").expect("prefetch URL");
+        let selected =
+            Url::parse("https://images.example/visible-selection.png").expect("visible URL");
+
+        assert!(manager.synchronize_prefetch(std::slice::from_ref(&background)));
+        assert_eq!(
+            prefetch_observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocking prefetch must start"),
+            background
+        );
+        assert!(manager.synchronize(Some(&selected), Rect::new(1, 1, 20, 8)));
+        assert_eq!(
+            visible_observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible transport must remain independent"),
+            selected
+        );
+        visible_reply_sender
+            .send(Ok(fixture_png()))
+            .expect("release visible request");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+
+        prefetch_reply_sender
+            .send(Ok(fixture_png()))
+            .expect("release background prefetch");
+    }
+
+    #[test]
     fn corrupt_persistent_entry_is_removed_fetched_and_replaced() {
         let directory = tempfile::tempdir().expect("temporary config directory");
         let cache_directory = directory.path().join("thumbnail-cache");
@@ -3484,6 +4032,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cache_eviction_never_removes_a_concurrent_atomic_write() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let cache = ThumbnailCache::new(cache_directory.clone());
+        cache.prepare().expect("prepare thumbnail cache");
+        let temporary =
+            cache_directory.join(format!(".thumbnail.{}.987654.tmp", std::process::id()));
+        fs::write(&temporary, b"in-flight image").expect("write active temporary");
+        let registration = ActiveCacheTemporary::register(temporary.clone());
+
+        cache.prepare().expect("evict beside active write");
+        assert!(
+            temporary.exists(),
+            "another cache worker must not delete an active atomic write"
+        );
+
+        drop(registration);
+        cache.prepare().expect("prune abandoned temporary");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
     fn cache_evicts_expired_excess_count_and_excess_bytes() {
         let directory = tempfile::tempdir().expect("temporary cache roots");
         let image = fixture_png();
@@ -3600,6 +4170,9 @@ pub(crate) mod tests {
                 area: Rect::new(0, 0, 20, 8),
             }),
             protocol: None,
+            protocol_decoded_bytes: 0,
+            prepared: VecDeque::new(),
+            prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
             request_sender: Some(request_sender),
@@ -4013,6 +4586,9 @@ pub(crate) mod tests {
                 generation: 0,
                 target: None,
                 protocol: None,
+                protocol_decoded_bytes: 0,
+                prepared: VecDeque::new(),
+                prepared_decoded_bytes: 0,
                 picker: None,
                 cache_directory,
                 request_sender: Some(request_sender),

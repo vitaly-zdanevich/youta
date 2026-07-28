@@ -1191,6 +1191,12 @@ pub struct SessionState {
     /// Last selected row in the independent Radio station list.
     #[serde(default)]
     pub radio_selected_row: Option<usize>,
+    /// Stable identifier of the last selected Radio station.
+    ///
+    /// The numeric row remains for backward compatibility with older sessions,
+    /// while this identity survives changes to the active station ordering.
+    #[serde(default)]
+    pub radio_selected_station_id: Option<String>,
     /// Vertical scroll offset in the details panel.
     pub details_scroll: u64,
     /// Last search text.
@@ -1490,15 +1496,17 @@ mod tests {
     fn older_sessions_default_independent_radio_selection() {
         let mut encoded =
             serde_json::to_value(SessionState::default()).expect("encode session fixture");
-        encoded
+        let object = encoded
             .as_object_mut()
-            .expect("session must encode as an object")
-            .remove("radio_selected_row");
+            .expect("session must encode as an object");
+        object.remove("radio_selected_row");
+        object.remove("radio_selected_station_id");
 
         let restored: SessionState =
             serde_json::from_value(encoded).expect("decode pre-Radio session");
 
         assert_eq!(restored.radio_selected_row, None);
+        assert_eq!(restored.radio_selected_station_id, None);
     }
 
     #[test]

@@ -248,6 +248,11 @@ pub struct PlaybackStatus {
     /// end-of-file signal. An idle status observed before media becomes active
     /// is not treated as completion.
     pub idle: bool,
+    /// Whether the active item is an endless live stream without a seekable timeline.
+    ///
+    /// Controllers own this semantic flag because a backend may expose live
+    /// transport timestamps as a large, apparently finite duration.
+    pub live: bool,
     /// Current position.
     pub position: Duration,
     /// Total duration when known.
@@ -291,6 +296,7 @@ impl Default for PlaybackStatus {
     fn default() -> Self {
         Self {
             idle: true,
+            live: false,
             position: Duration::ZERO,
             duration: None,
             paused: true,
