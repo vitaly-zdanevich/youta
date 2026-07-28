@@ -340,7 +340,9 @@ jobs:
 
   live-apple-podcasts:
     name: Live Apple Podcasts playback
-    runs-on: ubuntu-24.04
+    # Ubuntu 24.04 packages mpv 0.37, older than Youta's documented 0.38
+    # minimum and its indexed `loadfile` JSON-IPC command.
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
       - name: Check out sources
@@ -363,6 +365,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ffmpeg mpv
+          mpv --version
+          dpkg --compare-versions \
+            "$(dpkg-query --show --showformat='${Version}' mpv)" \
+            ge \
+            0.38
 
       - name: Search Apple Podcasts and list a show's episodes
         env:
@@ -456,7 +463,9 @@ jobs:
 
   live-radio:
     name: Live public radio playback
-    runs-on: ubuntu-24.04
+    # The live test supplies per-file titles through the indexed `loadfile`
+    # JSON-IPC signature introduced by mpv 0.38.
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
       - name: Check out sources
@@ -479,6 +488,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ffmpeg mpv
+          mpv --version
+          dpkg --compare-versions \
+            "$(dpkg-query --show --showformat='${Version}' mpv)" \
+            ge \
+            0.38
 
       - name: Decode a public stream and parse passive metadata
         env:
