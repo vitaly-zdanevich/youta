@@ -29167,6 +29167,7 @@ mod tests {
         assert_eq!(file.local_trashable, cfg!(feature = "local-trash"));
     }
 
+    #[cfg(feature = "local-browser")]
     #[test]
     fn local_playback_updates_visible_progress_and_rehydrates_it() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");

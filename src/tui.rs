@@ -9258,8 +9258,13 @@ mod tests {
         assert!(rendered.contains("Youta help"));
         assert!(rendered.contains("Alt+←/→ Details back/forward"));
         assert!(rendered.contains("Backspace Details back"));
-        assert!(rendered.contains("Local: Esc parent"));
-        assert!(rendered.contains("PageUp/Down page"));
+        if cfg!(feature = "local-browser") {
+            assert!(rendered.contains("Local: Esc parent"));
+            assert!(rendered.contains("PageUp/Down page"));
+        } else {
+            assert!(!rendered.contains("Local: Esc parent"));
+            assert!(!rendered.contains("PageUp/Down page"));
+        }
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
