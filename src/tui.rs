@@ -2208,7 +2208,8 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     };
     let wait = if view.local_browse_pending || view.local_artwork_pending {
         playback_wait.min(LOCAL_BROWSE_RESPONSE_POLL_INTERVAL)
-    } else if view.search_activity.is_some() || view.playback_starting {
+    } else if view.search_activity.is_some() || view.subscriptions.loading || view.playback_starting
+    {
         playback_wait.min(settings.playing_tick)
     } else {
         playback_wait
@@ -2681,6 +2682,7 @@ fn render_frame(
             .then_some(view.local_size_sort),
         &status_line,
         !view.playback.idle,
+        subscription_refresh_available(view),
         hit_map,
     );
     if view.help_open {
@@ -3133,6 +3135,10 @@ fn render_row_list(
     let first_index = selected_index
         .saturating_sub(visible_rows.saturating_sub(1))
         .min(rows.len().saturating_sub(visible_rows));
+    let playing_index = playing_media_id.and_then(|media_id| {
+        rows.iter()
+            .position(|row| row.media_id.as_ref() == Some(media_id))
+    });
     let items = rows
         .iter()
         .enumerate()
@@ -3140,8 +3146,7 @@ fn render_row_list(
         .take(visible_rows)
         .map(|(index, row)| {
             let selected = index == selected_index;
-            let playing =
-                playing_media_id.is_some_and(|media_id| row.media_id.as_ref() == Some(media_id));
+            let playing = playing_index == Some(index);
             let row_style = if selected {
                 theme.selected.fg(Color::Black)
             } else if playing {
@@ -3187,6 +3192,11 @@ fn render_row_list(
                 row_style
             } else {
                 theme.accent
+            };
+            let favorite_style = if selected || playing {
+                row_style
+            } else {
+                theme.accent.add_modifier(Modifier::BOLD)
             };
             let watched_marker = if has_playback_progress {
                 watched_marker(row.watched_percent)
@@ -3321,6 +3331,8 @@ fn render_subscriptions_body(
                 list_sections[1],
                 false,
                 false,
+                subscriptions.loading,
+                view.search_animation_frame,
                 show_hotkeys,
                 theme,
                 hit_map,
@@ -3418,6 +3430,8 @@ fn render_subscriptions_body(
                     footer,
                     true,
                     true,
+                    subscriptions.loading,
+                    view.search_animation_frame,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3457,6 +3471,8 @@ fn render_subscriptions_body(
                     sections[1],
                     !subscriptions.items.is_empty(),
                     false,
+                    subscriptions.loading,
+                    view.search_animation_frame,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3529,6 +3545,8 @@ fn render_subscription_item_buttons(
     area: Rect,
     description_available: bool,
     description_expanded: bool,
+    loading: bool,
+    animation_frame: usize,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
@@ -3536,8 +3554,14 @@ fn render_subscription_item_buttons(
     if area.is_empty() {
         return;
     }
+    let refresh_label = if loading {
+        let frame = ASCII_ACTIVITY_FRAMES[animation_frame % ASCII_ACTIVITY_FRAMES.len()];
+        format!("Refresh videos {frame}")
+    } else {
+        "Refresh videos".to_owned()
+    };
     let refresh = (
-        button("R", "Refresh videos", show_hotkeys),
+        button("R", &refresh_label, show_hotkeys),
         UiAction::RefreshSubscriptionVideos,
     );
     let description = description_available.then(|| {
@@ -3960,18 +3984,27 @@ fn render_information_panel(
             (line_index, label, UiAction::RequestLocalTrash)
         });
     match kind {
-        InformationPanelKind::Video => lines.extend([
-            Line::from(vec![
-                Span::styled("Length: ", theme.muted),
-                Span::raw(&details.length),
-            ]),
-            Line::from(vec![
-                Span::styled("Likes: ", theme.muted),
-                Span::raw(&details.likes),
-                Span::styled("  Views: ", theme.muted),
-                Span::raw(&details.views),
-            ]),
-        ]),
+        InformationPanelKind::Video => {
+            let mut spans = Vec::new();
+            for (name, value) in [
+                ("Length", details.length.as_str()),
+                ("Likes", details.likes.as_str()),
+                ("Views", details.views.as_str()),
+            ] {
+                let value = value.trim();
+                if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
+                    continue;
+                }
+                if !spans.is_empty() {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(format!("{name}: "), theme.muted));
+                spans.push(Span::raw(value.to_owned()));
+            }
+            if !spans.is_empty() {
+                lines.push(Line::from(spans));
+            }
+        }
         InformationPanelKind::Podcast => {
             if !details.length.is_empty() {
                 lines.push(Line::from(vec![
@@ -5481,6 +5514,18 @@ fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     frame.buffer_mut().set_span(x, y, &label, width);
 }
 
+/// Returns whether the active Subscriptions route owns a refreshable item list.
+fn subscription_refresh_available(view: &ViewModel) -> bool {
+    view.screen == Screen::Subscriptions
+        && match view.subscriptions.layout {
+            SubscriptionsLayout::DrillDown => view.subscriptions.route == SubscriptionRoute::Items,
+            SubscriptionsLayout::Split => {
+                view.subscriptions.focus == SubscriptionPane::Items
+                    || view.subscriptions.description_expanded
+            }
+        }
+}
+
 fn render_buttons(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -5498,9 +5543,10 @@ fn render_buttons(
     _local_size_sort: Option<LocalSizeSort>,
     _status: &str,
     _playback_active: bool,
+    subscription_refresh_available: bool,
     hit_map: &mut HitMap,
 ) {
-    let full_buttons = vec![
+    let mut full_buttons = vec![
         (
             button("/", "Search", settings.show_hotkeys),
             UiAction::BeginSearch,
@@ -5542,6 +5588,12 @@ fn render_buttons(
             UiAction::ToggleHelp,
         ),
     ];
+    if subscription_refresh_available {
+        full_buttons.push((
+            button("R", "Refresh", settings.show_hotkeys),
+            UiAction::RefreshSubscriptionVideos,
+        ));
+    }
     let full_width = full_buttons
         .iter()
         .map(|(label, _)| usize::from(terminal_text_width(label)))
@@ -5550,7 +5602,7 @@ fn render_buttons(
     let buttons = if full_width <= usize::from(area.width) {
         full_buttons
     } else {
-        vec![
+        let mut compact_buttons = vec![
             (
                 button("/", "Search", settings.show_hotkeys),
                 UiAction::BeginSearch,
@@ -5587,7 +5639,14 @@ fn render_buttons(
                 button("?", "Help", settings.show_hotkeys),
                 UiAction::ToggleHelp,
             ),
-        ]
+        ];
+        if subscription_refresh_available {
+            compact_buttons.push((
+                button("R", "Refresh", settings.show_hotkeys),
+                UiAction::RefreshSubscriptionVideos,
+            ));
+        }
+        compact_buttons
     };
     let controls = buttons
         .iter()
@@ -8815,6 +8874,9 @@ mod tests {
         view.search_activity = Some(SearchActivity::YouTube);
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
         view.search_activity = None;
+        view.subscriptions.loading = true;
+        assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
+        view.subscriptions.loading = false;
         view.playback_starting = true;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
         view.playback_starting = false;
@@ -9173,6 +9235,63 @@ mod tests {
         assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
         assert_eq!(buffer[(0, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, Color::Cyan);
+        assert_eq!(
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.symbol() == "▶")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_history_identity_marks_only_the_newest_matching_row_as_playing() {
+        let backend = TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let playing = MediaId::new(SourceKind::YouTube, "duplicate-history-item");
+        let view = ViewModel {
+            screen: Screen::History,
+            rows: vec![
+                RowView {
+                    media_id: Some(playing.clone()),
+                    title: "Newest History occurrence".to_owned(),
+                    source: "YouTube".to_owned(),
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(playing.clone()),
+                    title: "Older History occurrence".to_owned(),
+                    source: "YouTube".to_owned(),
+                    ..RowView::default()
+                },
+            ],
+            playing_media_id: Some(playing),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw duplicate History identities");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(hit_map.rows.x, hit_map.rows.y)].symbol(), "▶");
+        assert_ne!(
+            buffer[(hit_map.rows.x, hit_map.rows.y.saturating_add(2))].symbol(),
+            "▶"
+        );
         assert_eq!(
             buffer
                 .content()
@@ -11080,6 +11199,13 @@ mod tests {
         assert!(rendered.contains("Expanded fixture description"));
         assert!(rendered.contains("[R] Refresh videos"));
         assert!(
+            hit_map
+                .buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::RefreshSubscriptionVideos),
+            "the global footer must advertise refresh while a channel is open"
+        );
+        assert!(
             !rendered.contains("[i] Description"),
             "drill-down already renders Details beside the video list"
         );
@@ -11089,6 +11215,14 @@ mod tests {
             "drill-down Details does not need a description toggle"
         );
         assert!(hit_map.subscription_item_rows.width > 0);
+
+        view.subscriptions.loading = true;
+        view.search_animation_frame = 2;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw animated subscription refresh");
+        assert!(rendered_text(&terminal).contains("[R] Refresh videos -"));
+        view.subscriptions.loading = false;
 
         view.subscriptions.layout = SubscriptionsLayout::Split;
         view.subscriptions.route = SubscriptionRoute::Sources;
@@ -14323,6 +14457,7 @@ mod tests {
                     Some(LocalSizeSort::Off),
                     "",
                     false,
+                    false,
                     &mut hit_map,
                 );
             })
@@ -14382,6 +14517,7 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     "",
+                    false,
                     false,
                     &mut hit_map,
                 );
@@ -14447,6 +14583,7 @@ mod tests {
                     true,
                     None,
                     "",
+                    false,
                     false,
                     &mut hit_map,
                 );
@@ -14548,6 +14685,7 @@ mod tests {
                     None,
                     "",
                     false,
+                    false,
                     &mut hit_map,
                 );
             })
@@ -14606,6 +14744,7 @@ mod tests {
                     None,
                     "",
                     false,
+                    false,
                     &mut hit_map,
                 );
             })
@@ -14652,6 +14791,7 @@ mod tests {
                     false,
                     None,
                     "",
+                    false,
                     false,
                     &mut hit_map,
                 );
@@ -14829,6 +14969,7 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     "",
+                    false,
                     false,
                     &mut hit_map,
                 );
@@ -17271,9 +17412,7 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw video details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("Length: 4:05"));
-        assert!(rendered.contains("Likes: 13,045"));
-        assert!(rendered.contains("Views: 887,263"));
+        assert!(rendered.contains("Length: 4:05  Likes: 13,045  Views: 887,263"));
         assert!(!rendered.contains("Load channel info"));
     }
 

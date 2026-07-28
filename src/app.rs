@@ -2171,6 +2171,12 @@ struct PendingSubscriptionRefresh {
     fallback_index: usize,
     /// Replacement pages staged while filtered page one is temporarily empty.
     staged_cache: Option<CachedSubscriptionVideos>,
+    /// Whether a failed refresh should interrupt the cached view with a popup.
+    ///
+    /// Explicit `[R]` refreshes report failures. The automatic refresh that
+    /// follows a disk-cache restore keeps usable cached rows visible and
+    /// reports only a concise status.
+    report_errors: bool,
 }
 
 /// Maximum number of internal Details pages retained in either direction.
@@ -3444,9 +3450,9 @@ impl AppController {
         self.view.search_animation_frame = 0;
     }
 
-    /// Advances the ASCII animation once per existing controller tick.
+    /// Advances the shared ASCII activity frame for searches or channel loads.
     fn advance_search_animation(&mut self) {
-        if self.view.search_activity.is_some() {
+        if self.view.search_activity.is_some() || self.view.subscriptions.loading {
             self.view.search_animation_frame = self.view.search_animation_frame.wrapping_add(1);
         }
     }
@@ -5706,6 +5712,11 @@ impl AppController {
                                 .iter()
                                 .any(|item| !matches!(item, SearchItem::Video(_)))
                         {
+                            let report_errors = self
+                                .pending_subscription_refresh
+                                .as_ref()
+                                .filter(|pending| pending.channel_id == request.channel_id)
+                                .is_none_or(|pending| pending.report_errors);
                             if self
                                 .pending_subscription_refresh
                                 .as_ref()
@@ -5714,10 +5725,17 @@ impl AppController {
                                 self.pending_subscription_refresh = None;
                             }
                             if self.view.screen == Screen::Subscriptions {
-                                self.show_error_message(
-                                    "Subscription videos failed",
-                                    "the provider returned inconsistent channel-video pagination",
-                                );
+                                if report_errors {
+                                    self.show_error_message(
+                                        "Subscription videos failed",
+                                        "the provider returned inconsistent channel-video pagination",
+                                    );
+                                } else {
+                                    self.view.status_line = format!(
+                                        "Showing cached videos for {}; background refresh returned invalid data",
+                                        self.view.subscriptions.source_title
+                                    );
+                                }
                             }
                             return;
                         }
@@ -5848,6 +5866,11 @@ impl AppController {
                         self.refresh_selected_playlist_state();
                     }
                     Err(error) => {
+                        let report_errors = self
+                            .pending_subscription_refresh
+                            .as_ref()
+                            .filter(|pending| pending.channel_id == request.channel_id)
+                            .is_none_or(|pending| pending.report_errors);
                         if self
                             .pending_subscription_refresh
                             .as_ref()
@@ -5856,7 +5879,14 @@ impl AppController {
                             self.pending_subscription_refresh = None;
                         }
                         if self.view.screen == Screen::Subscriptions {
-                            self.show_error_message("Subscription videos failed", error);
+                            if report_errors {
+                                self.show_error_message("Subscription videos failed", error);
+                            } else {
+                                self.view.status_line = format!(
+                                    "Showing cached videos for {}; background refresh failed",
+                                    self.view.subscriptions.source_title
+                                );
+                            }
                         }
                     }
                 }
@@ -8378,7 +8408,9 @@ impl AppController {
                 return Err("Focus a subscription video before using queue actions".to_owned());
             }
             return match self.selected_subscription_item() {
-                Some(SearchItem::Video(video)) => Ok(self.selected_video_queue_item(video, None)),
+                Some(SearchItem::Video(video)) => {
+                    Ok(self.selected_video_queue_item(video, self.selected_start_override))
+                }
                 Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
                 None => Err("No subscription video is selected".to_owned()),
             };
@@ -11291,17 +11323,29 @@ impl AppController {
             return;
         }
 
-        let selected_matches = self
+        let selected_item = (self
             .view
             .details
             .as_ref()
             .and_then(|details| details.media_id.as_ref())
-            == Some(&media_id)
-            && self
-                .selected_queue_item()
-                .is_ok_and(|item| item.media.id == media_id);
-        if selected_matches {
-            self.selected_start_override = Some(seconds);
+            == Some(&media_id))
+        .then(|| self.selected_queue_item().ok())
+        .flatten()
+        .filter(|item| item.media.id == media_id);
+        if let Some(item) = selected_item {
+            if item
+                .media
+                .duration_seconds
+                .is_some_and(|duration| seconds >= duration)
+            {
+                self.view.status_line = "That timecode is outside the media duration".to_owned();
+                return;
+            }
+            if self.view.screen == Screen::YouTubeMusic {
+                self.youtube_music_start_override = Some(seconds);
+            } else {
+                self.selected_start_override = Some(seconds);
+            }
             self.activate_selection();
         } else {
             self.view.status_line =
@@ -13936,7 +13980,7 @@ impl AppController {
             {
                 self.request_selected_details();
             }
-            self.refresh_selected_subscription_videos();
+            self.refresh_selected_subscription_videos_with_feedback(false);
             self.refresh_selected_playlist_state();
             return;
         }
@@ -14019,8 +14063,21 @@ impl AppController {
 
     /// Queues one guarded sequential channel page and marks the pane loading.
     fn request_subscription_videos(&mut self, channel_id: String, page: u32) {
+        let report_errors = self
+            .pending_subscription_refresh
+            .as_ref()
+            .filter(|pending| pending.channel_id == channel_id)
+            .is_none_or(|pending| pending.report_errors);
         if !self.youtube_provider_available {
-            self.open_youtube_setup();
+            if report_errors {
+                self.open_youtube_setup();
+            } else {
+                self.view.status_line = format!(
+                    "Showing cached videos for {}; press R to configure or refresh",
+                    self.view.subscriptions.source_title
+                );
+                self.pending_subscription_refresh = None;
+            }
             return;
         }
         if self.view.subscriptions.loading {
@@ -14028,13 +14085,25 @@ impl AppController {
         }
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         let request = ChannelVideosRequest { channel_id, page };
-        if !self.send_provider_request(
-            ProviderRequest::ChannelVideos {
-                generation: self.subscription_generation,
-                request,
-            },
-            "Could not load subscription videos",
-        ) {
+        let provider_request = ProviderRequest::ChannelVideos {
+            generation: self.subscription_generation,
+            request,
+        };
+        let sent = if report_errors {
+            self.send_provider_request(provider_request, "Could not load subscription videos")
+        } else {
+            self.provider_requests
+                .as_ref()
+                .is_some_and(|sender| sender.send(provider_request).is_ok())
+        };
+        if !sent {
+            if !report_errors {
+                self.view.status_line = format!(
+                    "Showing cached videos for {}; background refresh is unavailable",
+                    self.view.subscriptions.source_title
+                );
+                self.pending_subscription_refresh = None;
+            }
             return;
         }
         self.view.subscriptions.loading = true;
@@ -14050,19 +14119,43 @@ impl AppController {
     /// is restored after replacement when the refreshed page still contains
     /// it. A second request is ignored until the first one completes.
     fn refresh_selected_subscription_videos(&mut self) {
+        self.refresh_selected_subscription_videos_with_feedback(true);
+    }
+
+    /// Reloads page one while choosing whether failures may cover cached rows.
+    ///
+    /// Cache-restoration refreshes are best-effort: an unavailable provider or
+    /// worker leaves the restored rows usable. Explicit `[R]` refreshes retain
+    /// the setup and diagnostic flow because the user requested fresh data.
+    fn refresh_selected_subscription_videos_with_feedback(&mut self, report_errors: bool) {
         if self.view.screen != Screen::Subscriptions {
-            self.view.status_line =
-                "Subscription videos can be refreshed only inside a channel".to_owned();
+            if report_errors {
+                self.view.status_line =
+                    "Subscription videos can be refreshed only inside a channel".to_owned();
+            }
             return;
         }
         if self.view.subscriptions.loading {
-            self.view.status_line = "Subscription videos are already loading".to_owned();
+            if report_errors {
+                self.view.status_line = "Subscription videos are already loading".to_owned();
+            }
             return;
         }
         let Some(channel_id) = self.active_subscription_channel_id.clone() else {
-            self.view.status_line = "Open a subscribed channel before refreshing videos".to_owned();
+            if report_errors {
+                self.view.status_line =
+                    "Open a subscribed channel before refreshing videos".to_owned();
+            }
             return;
         };
+        if !report_errors && (!self.youtube_provider_available || self.provider_requests.is_none())
+        {
+            self.view.status_line = format!(
+                "Showing cached videos for {}; press R to configure or refresh",
+                self.view.subscriptions.source_title
+            );
+            return;
+        }
         let selected_video_id = self
             .selected_subscription_item()
             .and_then(|item| match item {
@@ -14074,6 +14167,7 @@ impl AppController {
             selected_video_id,
             fallback_index: self.view.subscriptions.selected_item,
             staged_cache: None,
+            report_errors,
         });
         self.request_subscription_videos(channel_id, 1);
         if self.view.subscriptions.loading {
@@ -15322,14 +15416,7 @@ impl AppController {
                     let reselected_path = self.remove_confirmed_local_trash_target(&source);
                     self.browse_local_directory_with_reselection(directory, reselected_path);
                 }
-                Err(error) => {
-                    if let Some(LocalFilePopupView::Trash {
-                        error: popup_error, ..
-                    }) = self.view.local_file_popup.as_mut()
-                    {
-                        *popup_error = Some(error.to_string());
-                    }
-                }
+                Err(error) => self.show_local_trash_error(&error),
             }
         }
         #[cfg(not(feature = "local-trash"))]
@@ -15339,6 +15426,22 @@ impl AppController {
         {
             *popup_error = Some("this build omits the `local-trash` feature".to_owned());
         }
+    }
+
+    /// Keeps the confirmation context and exposes the complete Trash error chain.
+    ///
+    /// A single popup row cannot represent nested operating-system or desktop
+    /// Trash errors. The normal scrollable diagnostic therefore owns the full
+    /// report while the confirmation retains a concise summary underneath it.
+    #[cfg(any(feature = "local-trash", test))]
+    fn show_local_trash_error(&mut self, error: &crate::local_browser::LocalBrowserError) {
+        if let Some(LocalFilePopupView::Trash {
+            error: popup_error, ..
+        }) = self.view.local_file_popup.as_mut()
+        {
+            *popup_error = Some(error.to_string());
+        }
+        self.show_error("Could not move local entry to Trash", error);
     }
 
     /// Toggles the selected real Local entry and advances one signed row.
@@ -17327,6 +17430,8 @@ impl UiController for AppController {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.clear_search_activity();
+                    self.pending_subscription_refresh = None;
+                    self.view.subscriptions.loading = false;
                     if !self.provider_disconnect_reported {
                         self.provider_disconnect_reported = true;
                         self.show_error_message(
@@ -25738,6 +25843,17 @@ mod tests {
             result: Err("temporary provider failure".to_owned()),
         });
         assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert!(
+            controller.view.error_popup.is_none(),
+            "automatic refresh failure must not cover a usable disk cache"
+        );
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("background refresh failed"),
+            "automatic refresh failure should remain visible as a concise status"
+        );
         assert_eq!(
             controller
                 .store
@@ -25786,6 +25902,60 @@ mod tests {
                 .subscription_video_cache
                 .get("UCfixture")
                 .is_some_and(|cached| cached.items.is_empty())
+        );
+    }
+
+    #[test]
+    fn subscription_disk_cache_opens_without_provider_setup_interruption() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        store
+            .put_cached_subscription_items(&CachedSubscriptionItems {
+                source: SourceKind::YouTube,
+                source_id: "UCfixture".to_owned(),
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                fetched_at: 1,
+            })
+            .expect("seed subscription snapshot");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = false;
+        let (requests, _captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        // This test isolates cache refresh from unrelated helper diagnostics
+        // produced by the deliberately backend-free fixture.
+        controller.view.error_popup = None;
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert!(
+            controller.view.youtube_setup_popup.is_none(),
+            "automatic refresh must not cover cached rows with provider setup"
+        );
+        assert!(
+            controller.view.error_popup.is_none(),
+            "automatic refresh must not cover cached rows with a diagnostic: {:?}",
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str())
+        );
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("Showing cached videos"),
+            "the cache-only state should be explicit"
+        );
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        assert!(
+            controller.view.youtube_setup_popup.is_some(),
+            "an explicit refresh should still offer provider setup"
         );
     }
 
@@ -30471,6 +30641,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trash_failure_opens_the_complete_scrollable_diagnostic() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        controller.view.local_file_popup = Some(LocalFilePopupView::Trash {
+            name: "fixture".to_owned(),
+            path: "/tmp/fixture".to_owned(),
+            error: None,
+        });
+        let error = crate::local_browser::LocalBrowserError::Trash {
+            path: PathBuf::from("/tmp/fixture"),
+            source: std::io::Error::other("desktop Trash service rejected the entry"),
+        };
+
+        controller.show_local_trash_error(&error);
+
+        let LocalFilePopupView::Trash {
+            error: Some(summary),
+            ..
+        } = controller
+            .view
+            .local_file_popup
+            .as_ref()
+            .expect("confirmation context")
+        else {
+            panic!("Trash summary should remain behind the diagnostic");
+        };
+        assert!(summary.contains("desktop Trash service rejected the entry"));
+        let diagnostic = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("scrollable diagnostic");
+        assert_eq!(diagnostic.title, "Could not move local entry to Trash");
+        assert!(
+            diagnostic
+                .report
+                .contains("desktop Trash service rejected the entry")
+        );
+    }
+
     #[cfg(all(feature = "local-artwork", feature = "images"))]
     #[test]
     fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
@@ -31861,6 +32072,102 @@ mod tests {
     }
 
     #[test]
+    fn inactive_youtube_music_timecode_uses_the_music_start_override() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let mut video = subscription_video_summary();
+        video.duration_seconds = Some(180);
+        video.description = "00:00 Intro\n00:01:35 Main section".to_owned();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        controller.view.screen = Screen::YouTubeMusic;
+        controller.youtube_music_results = vec![SearchItem::Video(video.clone())];
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+        controller.refresh_youtube_music_rows();
+
+        controller.dispatch(UiAction::ActivateTimecode {
+            media_id,
+            seconds: 95,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(state.played[0].start_at, Duration::from_secs(95));
+        assert!(controller.youtube_music_start_override.is_none());
+        assert!(controller.selected_start_override.is_none());
+    }
+
+    #[test]
+    fn inactive_timecode_at_or_after_known_duration_does_not_start_playback() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let mut video = subscription_video_summary();
+        video.duration_seconds = Some(180);
+        video.description = "00:00 Intro\n00:03:00 Invalid endpoint".to_owned();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+        controller.refresh_youtube_rows();
+
+        controller.dispatch(UiAction::ActivateTimecode {
+            media_id,
+            seconds: 180,
+        });
+
+        assert!(state.lock().expect("mock state").played.is_empty());
+        assert_eq!(
+            controller.view.status_line,
+            "That timecode is outside the media duration"
+        );
+        assert!(controller.selected_start_override.is_none());
+    }
+
+    #[test]
+    fn inactive_subscription_timecode_starts_that_video_at_the_clicked_position() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_direct_item("different-current-media"), false);
+        let mut video = subscription_video_summary();
+        video.duration_seconds = Some(180);
+        video.description = "00:00 Intro\n00:01:35 Main section".to_owned();
+        let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
+        controller.subscription_video_cache.insert(
+            "UCfixture".to_owned(),
+            CachedSubscriptionVideos {
+                items: vec![SearchItem::Video(video.clone())],
+                next_page: None,
+                consecutive_empty_pages: 0,
+            },
+        );
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.layout = SubscriptionsLayout::DrillDown;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.refresh_subscription_video_rows();
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+
+        controller.dispatch(UiAction::ActivateTimecode {
+            media_id,
+            seconds: 95,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 2);
+        assert_eq!(state.played[1].start_at, Duration::from_secs(95));
+        assert_eq!(
+            controller.current_media.as_ref(),
+            Some(&MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"))
+        );
+        assert!(controller.selected_start_override.is_none());
+    }
+
+    #[test]
     fn advertisement_chapter_is_skipped_once_until_playback_leaves_it() {
         let (mut controller, state) = controller_with_mock_statuses([]);
         controller.play_queue_item(fixture_direct_item("advertisement-skip"), false);
@@ -31954,6 +32261,15 @@ mod tests {
 
         assert!(controller.view.search_activity.is_none());
         assert_eq!(controller.view.search_animation_frame, 0);
+        controller.view.subscriptions.loading = true;
+        controller.advance_search_animation();
+        assert_eq!(
+            controller.view.search_animation_frame, 1,
+            "subscription loading must reuse the visible activity animation"
+        );
+        controller.view.subscriptions.loading = false;
+        controller.advance_search_animation();
+        assert_eq!(controller.view.search_animation_frame, 1);
         assert_eq!(controller.view.status_line, "0 YouTube results loaded");
         let saved = controller
             .store
@@ -32288,6 +32604,7 @@ mod tests {
         assert_eq!(controller.view.search_animation_frame, 0);
 
         controller.begin_search_activity(SearchActivity::YouTube);
+        controller.view.subscriptions.loading = true;
         let (response_sender, provider_responses) = unbounded();
         drop(response_sender);
         controller.provider_responses = provider_responses;
@@ -32296,6 +32613,10 @@ mod tests {
 
         assert!(controller.view.search_activity.is_none());
         assert_eq!(controller.view.search_animation_frame, 0);
+        assert!(
+            !controller.view.subscriptions.loading,
+            "a disconnected refresh worker must not leave its animation active"
+        );
     }
 
     #[test]
