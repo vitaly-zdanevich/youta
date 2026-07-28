@@ -245,6 +245,36 @@ fn fatal_configuration_error_prints_a_redacted_diagnostic_report() {
         .stderr(predicate::str::contains("fatal-secret-canary").not());
 }
 
+#[cfg(feature = "tui")]
+#[test]
+fn second_tui_instance_exits_before_terminal_initialization_with_one_plain_line() {
+    use youta::config::Config;
+    use youta::persistence::StateStore;
+
+    let temporary = tempdir().expect("temporary directory");
+    let config = Config::for_dir(temporary.path());
+    let _running_instance = StateStore::open(&config).expect("first Youta instance state lock");
+
+    let output = cargo_bin_cmd!("youta")
+        .env_clear()
+        .args(["--config-dir"])
+        .arg(temporary.path())
+        .arg("tui")
+        .output()
+        .expect("second Youta instance output");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "terminal UI wrote to stdout before rejecting the second instance: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        output.stderr,
+        b"Another instance of Youta is already running\n"
+    );
+}
+
 #[cfg(all(
     target_os = "linux",
     feature = "tui",

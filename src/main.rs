@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 use youta::config::Config;
 use youta::diagnostics::{ExternalHelper, ExternalHelperKind};
+use youta::persistence::PersistenceError;
 #[cfg(feature = "tui")]
 use youta::persistence::StateStore;
 #[cfg(feature = "yt-dlp")]
@@ -53,18 +54,36 @@ enum CliCommand {
     Extractors,
 }
 
+/// Plain terminal notice for a second process rejected by the state lock.
+const ANOTHER_INSTANCE_MESSAGE: &str = "Another instance of Youta is already running";
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let report = youta::diagnostics::DiagnosticReport::capture_error(
-                error.as_ref(),
-                probe_diagnostic_helpers(PathBuf::from("mpv"), PathBuf::from("yt-dlp")),
-            );
-            eprintln!("{}", report.render());
+            if is_another_instance_error(&error) {
+                eprintln!("{ANOTHER_INSTANCE_MESSAGE}");
+            } else {
+                let report = youta::diagnostics::DiagnosticReport::capture_error(
+                    error.as_ref(),
+                    probe_diagnostic_helpers(PathBuf::from("mpv"), PathBuf::from("yt-dlp")),
+                );
+                eprintln!("{}", report.render());
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+/// Identifies the expected conflict raised when another process owns the state lock.
+///
+/// The downcast remains valid through the context added by [`run_tui`], so
+/// unrelated persistence and startup errors continue through full diagnostics.
+fn is_another_instance_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PersistenceError>(),
+        Some(PersistenceError::FileStateAlreadyOpen)
+    )
 }
 
 fn probe_diagnostic_helpers(
