@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["audio", "podcasts", "terminal", "tui", "youtube"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+[[example]]
+name = "update_npr_stations"
+path = "examples/update_npr_stations.rs"
+required-features = ["radio"]
+
 [features]
 default = [
     "tui",
