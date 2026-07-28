@@ -13,13 +13,16 @@ pub mod persistence;
 pub mod playback;
 pub mod providers;
 pub mod report_actions;
+#[cfg(feature = "subscriptions")]
 pub mod subscriptions;
+#[cfg(feature = "tui")]
+pub(crate) mod terminal_environment;
 pub mod waveform;
 
 #[cfg(feature = "tui")]
 pub mod git_sync;
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-move", feature = "local-rename"))]
 pub mod local_move;
 
 #[cfg(feature = "network")]
@@ -31,7 +34,7 @@ pub(crate) mod gpm;
 #[cfg(feature = "tracker-music")]
 pub mod tracker_media;
 
-#[cfg(feature = "thumbnails")]
+#[cfg(feature = "images")]
 pub mod thumbnails;
 
 #[cfg(feature = "tui")]

@@ -25,9 +25,12 @@ use crate::domain::{
     SessionState, SourceKind, TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink,
     remote_url_has_non_public_host,
 };
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 use crate::local_move::LocalIdentityRemapError;
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 use crate::local_move::{
     LocalMoveMapping, remap_local_media_id, remap_local_path_prefix, remap_local_replay_locator,
 };
@@ -72,7 +75,7 @@ pub const MAX_PLAYLIST_DESCRIPTION_BYTES: usize = 16 * 1024;
 pub const MAX_PLAYLISTS: usize = 1_024;
 /// Maximum number of entries accepted in one local playlist.
 pub const MAX_PLAYLIST_ENTRIES: usize = 10_000;
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 const MAX_LOCAL_MOVE_MAPPINGS: usize = 10_000;
 
 /// Maximum number of `YouTube` summaries retained in one restart snapshot.
@@ -529,7 +532,7 @@ pub struct ListenTotal {
 /// supported path-bearing state in one transaction. Callers may then discard
 /// the mappings. On error the transaction is rolled back, so callers must keep
 /// and retry the complete mapping slice rather than only a suffix.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LocalMoveStateRemap {
     /// Provider-qualified playback-progress identities changed.
@@ -550,7 +553,7 @@ pub struct LocalMoveStateRemap {
     pub playlist_entries: usize,
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 impl LocalMoveStateRemap {
     /// Returns the number of persistent rows changed across every table.
     #[must_use]
@@ -1879,7 +1882,7 @@ impl SqliteStateStore {
     /// identity conflicts with unrelated state, stored JSON cannot be decoded
     /// within its existing bound, remapped JSON or a replay locator violates
     /// its bound, or the transaction cannot be completed.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     pub fn remap_local_move_state(
         &self,
         mappings: &[LocalMoveMapping],
@@ -1920,7 +1923,7 @@ impl SqliteStateStore {
     /// Returns an error when mappings are unsafe, durable state would collide
     /// or exceed an existing bound, the journal bound would be exceeded, an
     /// identity is already pending, or the transaction fails.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     pub fn journal_local_move_intent(
         &self,
         mappings: &[LocalMoveMapping],
@@ -1973,7 +1976,7 @@ impl SqliteStateStore {
     /// # Errors
     ///
     /// Returns an error when the journal cannot be queried.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     pub fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError> {
         let mut statement = self.connection.prepare_cached(
             r"
@@ -2002,7 +2005,7 @@ impl SqliteStateStore {
     ///
     /// Returns an error when mappings are unsafe, no longer match the journal,
     /// or the transaction fails.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     pub fn discard_local_move_intents(
         &self,
         mappings: &[LocalMoveMapping],
@@ -3226,23 +3229,23 @@ pub trait StateBackend {
     /// Loads the active session.
     fn session(&self) -> Result<Option<SessionState>, PersistenceError>;
     /// Atomically remaps state after Local moves.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn remap_local_move_state(
         &self,
         mappings: &[LocalMoveMapping],
     ) -> Result<LocalMoveStateRemap, PersistenceError>;
     /// Journals Local move intentions.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn journal_local_move_intent(
         &self,
         mappings: &[LocalMoveMapping],
         created_at: i64,
     ) -> Result<(), PersistenceError>;
     /// Loads Local move intentions.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError>;
     /// Discards completed Local move intentions.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn discard_local_move_intents(
         &self,
         mappings: &[LocalMoveMapping],
@@ -3647,7 +3650,7 @@ impl StateBackend for SqliteStateStore {
         SqliteStateStore::session(self)
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn remap_local_move_state(
         &self,
         mappings: &[LocalMoveMapping],
@@ -3655,7 +3658,7 @@ impl StateBackend for SqliteStateStore {
         SqliteStateStore::remap_local_move_state(self, mappings)
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn journal_local_move_intent(
         &self,
         mappings: &[LocalMoveMapping],
@@ -3664,12 +3667,12 @@ impl StateBackend for SqliteStateStore {
         SqliteStateStore::journal_local_move_intent(self, mappings, created_at)
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError> {
         SqliteStateStore::local_move_intents(self)
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn discard_local_move_intents(
         &self,
         mappings: &[LocalMoveMapping],
@@ -3957,7 +3960,7 @@ pub enum PersistenceError {
         reason: String,
     },
     /// Completed Local move mappings or their durable destinations conflict.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[error("local move state remap is invalid: {reason}")]
     InvalidLocalMoveStateRemap {
         /// Mapping, path, row, or destination invariant that was rejected.
@@ -4735,14 +4738,20 @@ fn playlist_entry_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistEntry> {
     })
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalIdentityUpdate {
     old_external_id: String,
     new_external_id: String,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalHistoryUpdate {
     id: i64,
@@ -4750,21 +4759,30 @@ struct LocalHistoryUpdate {
     replay_locator: Option<String>,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalJsonUpdate {
     id: i64,
     json: String,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalSessionUpdate {
     slot: String,
     state_json: String,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalMetadataUpdate {
     old_external_id: String,
@@ -4774,7 +4792,10 @@ struct LocalMetadataUpdate {
 }
 
 /// One validated rewrite of a Local playlist row after a filesystem move.
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalPlaylistEntryUpdate {
     /// Surrogate row identity used for the guarded update.
@@ -4788,7 +4809,10 @@ struct LocalPlaylistEntryUpdate {
 }
 
 /// Raw bounded fields read for one Local playlist entry during move planning.
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalPlaylistEntryRow {
     id: i64,
@@ -4799,7 +4823,10 @@ struct LocalPlaylistEntryRow {
 }
 
 /// Collision identity and optional rewrite produced for one Local playlist row.
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct PreparedLocalPlaylistEntry {
     whole_media_owner: Option<((String, String), String)>,
@@ -4810,7 +4837,10 @@ struct PreparedLocalPlaylistEntry {
 ///
 /// The row key and its embedded summaries are applied together so readers can
 /// never observe a moved folder identity paired with stale descendant paths.
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug)]
 struct LocalSubscriptionItemsUpdate {
     /// Folder identity currently stored in the composite primary key.
@@ -4821,7 +4851,10 @@ struct LocalSubscriptionItemsUpdate {
     items_json: String,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 #[derive(Debug, Default)]
 struct LocalMoveStatePlan {
     playback_progress: Vec<LocalIdentityUpdate>,
@@ -4834,7 +4867,10 @@ struct LocalMoveStatePlan {
     playlist_entries: Vec<LocalPlaylistEntryUpdate>,
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 impl LocalMoveStatePlan {
     fn report(&self) -> LocalMoveStateRemap {
         LocalMoveStateRemap {
@@ -4850,14 +4886,17 @@ impl LocalMoveStatePlan {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn invalid_local_move_state(reason: impl Into<String>) -> PersistenceError {
     PersistenceError::InvalidLocalMoveStateRemap {
         reason: reason.into(),
     }
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn local_move_path_text<'a>(
     path: &'a Path,
     field: &'static str,
@@ -4870,7 +4909,7 @@ fn local_move_path_text<'a>(
     })
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn validate_local_move_mappings(mappings: &[LocalMoveMapping]) -> Result<(), PersistenceError> {
     if mappings.len() > MAX_LOCAL_MOVE_MAPPINGS {
         return Err(invalid_local_move_state(format!(
@@ -4953,7 +4992,7 @@ fn validate_local_move_mappings(mappings: &[LocalMoveMapping]) -> Result<(), Per
     Ok(())
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn validate_local_move_mapping_path(
     path: &Path,
     index: usize,
@@ -4985,12 +5024,12 @@ fn validate_local_move_mapping_path(
     Ok(())
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn local_paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_move_state_remap(
     connection: &Connection,
@@ -5012,7 +5051,7 @@ fn prepare_local_move_state_remap(
     })
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_playlist_entry_updates(
     connection: &Connection,
@@ -5062,7 +5101,7 @@ fn prepare_local_playlist_entry_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn local_playlist_entry_row_from_sql(row: &Row<'_>) -> rusqlite::Result<LocalPlaylistEntryRow> {
     Ok(LocalPlaylistEntryRow {
@@ -5074,7 +5113,10 @@ fn local_playlist_entry_row_from_sql(row: &Row<'_>) -> rusqlite::Result<LocalPla
     })
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn decode_local_playlist_entry(
     row: &LocalPlaylistEntryRow,
 ) -> Result<(PlaylistMediaSnapshot, Option<crate::domain::Segment>), PersistenceError> {
@@ -5130,7 +5172,10 @@ fn decode_local_playlist_entry(
     Ok((media, segment))
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn prepare_one_local_playlist_entry(
     row: LocalPlaylistEntryRow,
     mappings: &[LocalMoveMapping],
@@ -5206,7 +5251,7 @@ fn prepare_one_local_playlist_entry(
     })
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_keyed_identity_updates(
     connection: &Connection,
@@ -5249,7 +5294,7 @@ fn prepare_local_keyed_identity_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_subscription_items_updates(
     connection: &Connection,
@@ -5370,7 +5415,10 @@ fn prepare_local_subscription_items_updates(
     Ok(updates)
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remap_local_subscription_items(
     source_id: &str,
     items: &mut [SearchItem],
@@ -5416,7 +5464,7 @@ fn remap_local_subscription_items(
     Ok(changed)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_history_updates(
     connection: &Connection,
@@ -5466,7 +5514,7 @@ fn prepare_local_history_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_comment_updates(
     connection: &Connection,
@@ -5504,7 +5552,7 @@ fn prepare_local_comment_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_bookmark_updates(
     connection: &Connection,
@@ -5531,7 +5579,7 @@ fn prepare_local_bookmark_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_session_updates(
     connection: &Connection,
@@ -5570,7 +5618,7 @@ fn prepare_local_session_updates(
     Ok(updates)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn prepare_local_metadata_updates(
     connection: &Connection,
@@ -5637,7 +5685,10 @@ fn prepare_local_metadata_updates(
     Ok(updates)
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remapped_local_external_id(
     external_id: &str,
     mappings: &[LocalMoveMapping],
@@ -5650,7 +5701,10 @@ fn remapped_local_external_id(
     }
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remap_local_string_path(
     path: &mut String,
     mappings: &[LocalMoveMapping],
@@ -5668,7 +5722,10 @@ fn remap_local_string_path(
     Ok(true)
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remap_local_screen(
     screen: &mut crate::domain::Screen,
     mappings: &[LocalMoveMapping],
@@ -5681,7 +5738,10 @@ fn remap_local_screen(
     }
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remap_local_media_file_urls(
     media: &mut MediaItem,
     mappings: &[LocalMoveMapping],
@@ -5696,7 +5756,10 @@ fn remap_local_media_file_urls(
     Ok(changed)
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn remap_local_file_url(
     url: &mut Url,
     mappings: &[LocalMoveMapping],
@@ -5724,7 +5787,10 @@ fn remap_local_file_url(
     Ok(true)
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn local_identity_remap_error(error: LocalIdentityRemapError) -> PersistenceError {
     match error {
         LocalIdentityRemapError::NonUtf8Destination(path) => invalid_local_move_state(format!(
@@ -5734,7 +5800,7 @@ fn local_identity_remap_error(error: LocalIdentityRemapError) -> PersistenceErro
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn apply_local_move_state_remap(
     connection: &Connection,
@@ -5836,7 +5902,7 @@ fn apply_local_move_state_remap(
     Ok(())
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[cfg(feature = "sqlite-state")]
 fn apply_local_playlist_entry_updates(
     connection: &Connection,
@@ -5863,7 +5929,10 @@ fn apply_local_playlist_entry_updates(
     Ok(())
 }
 
-#[cfg(all(feature = "local", feature = "sqlite-state"))]
+#[cfg(all(
+    any(feature = "local-rename", feature = "local-move"),
+    feature = "sqlite-state"
+))]
 fn ensure_one_local_move_row(changed: usize, table: &'static str) -> Result<(), PersistenceError> {
     if changed == 1 {
         Ok(())
@@ -6659,14 +6728,14 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(all(test, feature = "sqlite-state"))]
 mod tests {
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     use std::path::PathBuf;
 
     use tempfile::tempdir;
 
     use super::SqliteStateStore as StateStore;
     use super::*;
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     use crate::domain::CaptionTrack;
     use crate::domain::{
         MediaKind, MediaLicense, MediaStatistics, PanelFocus, Screen, SearchQuery,
@@ -6699,7 +6768,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_media_id(path: &Path) -> MediaId {
         MediaId::new(
             SourceKind::Local,
@@ -6707,7 +6776,7 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_media(path: &Path, artwork: Option<&Path>, caption: Option<&Path>) -> MediaItem {
         MediaItem {
             id: local_media_id(path),
@@ -6759,7 +6828,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_subscription_video(
         media_path: &Path,
         channel_path: &Path,
@@ -6797,7 +6866,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn assert_local_subscription_video_paths(
         item: &SearchItem,
         media_path: &Path,
@@ -6928,7 +6997,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_playlist_media(path: &Path, artwork: Option<&Path>) -> PlaylistMediaSnapshot {
         PlaylistMediaSnapshot {
             id: local_media_id(path),
@@ -7288,7 +7357,7 @@ mod tests {
         assert_eq!(store.bandcamp_search().expect("new Bandcamp table"), None);
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn migration_from_v10_adds_durable_local_move_journal() {
         let connection = Connection::open_in_memory().expect("open SQLite");
@@ -8218,7 +8287,7 @@ mod tests {
         assert_eq!(store.bookmarks(&media_id).expect("bookmarks"), vec![late]);
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_file_move_atomically_remaps_path_bearing_state_and_preserves_remote_rows() {
         let paths = tempdir().expect("fixture paths");
@@ -8485,7 +8554,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_folder_move_remaps_descendants_and_survives_restart() {
         let directory = tempdir().expect("temporary directory");
@@ -8600,7 +8669,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_destination_key_collision_is_rejected_without_mutation() {
         let paths = tempdir().expect("fixture paths");
@@ -8661,7 +8730,7 @@ mod tests {
                 if video.video_id == target_track.to_string_lossy()));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_move_journal_preflights_subscription_destination_key_bounds() {
         let store = StateStore::open_in_memory().expect("open store");
@@ -8697,7 +8766,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_remap_scan_rejects_rows_beyond_normal_cache_bound() {
         let store = StateStore::open_in_memory().expect("open store");
@@ -8727,7 +8796,7 @@ mod tests {
         assert!(store.local_move_intents().expect("move journal").is_empty());
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_embedded_media_collision_is_rejected_without_mutation() {
         let paths = tempdir().expect("fixture paths");
@@ -8778,7 +8847,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_update_failure_rolls_back_earlier_table_updates() {
         let paths = tempdir().expect("fixture paths");
@@ -8862,7 +8931,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_json_bound_is_checked_before_decoding() {
         let paths = tempdir().expect("fixture paths");
@@ -8907,7 +8976,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_subscription_remap_rejects_reencoded_json_over_bound() {
         let paths = tempdir().expect("fixture paths");
@@ -8960,7 +9029,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_playlist_destination_collision_is_rejected_before_journaling() {
         let paths = tempdir().expect("fixture paths");
@@ -9006,7 +9075,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_playlist_identity_is_scoped_per_playlist_during_move() {
         let paths = tempdir().expect("fixture paths");
@@ -9043,7 +9112,7 @@ mod tests {
         assert!(memberships.contains(&second.id));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_move_destination_identity_collision_is_rejected_without_mutation() {
         let paths = tempdir().expect("fixture paths");
@@ -9102,7 +9171,7 @@ mod tests {
         assert_eq!(history[0].replay_locator.as_deref(), source.to_str());
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_move_database_failure_rolls_back_earlier_table_updates() {
         let paths = tempdir().expect("fixture paths");
@@ -9171,7 +9240,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_move_rejects_overlapping_or_chained_mappings() {
         let paths = tempdir().expect("fixture paths");

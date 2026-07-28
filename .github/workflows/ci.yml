@@ -76,6 +76,8 @@ jobs:
             feature_arguments: ''
           - feature_set: no default features
             feature_arguments: --no-default-features
+          - feature_set: text-only application
+            feature_arguments: --no-default-features --features app
           - feature_set: optional SQLite state
             feature_arguments: --no-default-features --features sqlite-state
           - feature_set: TUI only
@@ -112,6 +114,121 @@ jobs:
 
       - name: Run Rustdoc tests
         run: cargo test --locked --doc ${{ matrix.feature_arguments }}
+
+  feature-contract:
+    name: Optional feature compile contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: feature-contract-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # Keep the small capability features independently compilable. This is
+      # deliberately a check matrix rather than another set of duplicate test
+      # jobs; the complete default and all-feature suites exercise behavior.
+      - name: Check supported feature boundaries
+        run: |
+          cargo check --locked --no-default-features --features cli --bin youta
+          cargo check --locked --no-default-features --features subscriptions --lib
+          cargo check --locked --no-default-features --features tui
+          cargo check --locked --no-default-features --features images
+          cargo check --locked --no-default-features --features tui,local-browser
+          cargo check --locked --no-default-features --features tui,local-metadata
+          cargo check --locked --no-default-features --features tui,local-rename
+          cargo check --locked --no-default-features --features tui,local-trash
+          cargo check --locked --no-default-features --features tui,local-move
+          cargo check --locked --no-default-features --features images,local-artwork
+          cargo check --locked --no-default-features --features tui,local
+          cargo check --locked --no-default-features --features app
+
+  windows-compile:
+    name: Windows compile (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - architecture: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-compile-${{ matrix.architecture }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # Windows remains compile-only until the mpv backend has named-pipe IPC
+      # and the platform opener replaces the Unix-only runtime adapters.
+      - name: Check the standard application
+        run: cargo check --locked --target "${{ matrix.target }}"
+
+      - name: Check the text-only application
+        run: >-
+          cargo check --locked --target "${{ matrix.target }}"
+          --no-default-features --features app
+
+  freebsd-compile:
+    name: FreeBSD compile feasibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add x86_64-unknown-freebsd
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: freebsd-compile-x86_64-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # GitHub has no native FreeBSD runner. `cargo check` validates the core
+      # TUI and Unix mpv code without pretending that an unexecuted artifact is
+      # a tested release binary.
+      - name: Check the portable TUI and local browser
+        run: >-
+          cargo check --locked --target x86_64-unknown-freebsd
+          --no-default-features
+          --features tui,local-browser,backend-mpv
 
   e2e:
     name: End-to-end terminal test

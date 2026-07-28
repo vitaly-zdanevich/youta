@@ -688,8 +688,10 @@ Thumbnail support is a separate feature and runtime capability:
 - remote artwork rejects non-public literal, DNS-resolved, `.local`,
   `.internal`, and single-label destinations, and HTTP redirects are not
   followed;
-- Linux virtual console, serial/real TTY, `TERM=dumb`, or unknown protocol:
-  show text details only;
+- a confirmed, directly attached Linux `/dev/ttyN` uses bounded Unicode
+  half-block rendering through terminal cells, without raw framebuffer access;
+- serial terminals, SSH, `TERM=dumb`, Linux-looking PTYs, and unknown
+  protocols show text details only and do not fetch artwork;
 - selected artwork has priority; one bounded worker may then prefetch the
   currently loaded global Search rows into the persistent cache;
 - recently encoded terminal images share a 16-entry, 16 MiB decoded-pixel LRU;
@@ -850,7 +852,11 @@ include both official YouTube metadata and Invidious adapters; runtime
 `sqlite-state` adds optional system-SQLite persistence, while `bundled-sqlite`
 adds the same backend with vendored SQLite.
 
-Tagged releases are produced natively on amd64 and arm64. The release also
+Tagged releases are produced natively for Linux and macOS on amd64 and arm64.
+Every pair has a default artifact built with `images` and a `-text` artifact
+built with the `app` profile; neither opts into SQLite. Windows amd64/arm64 and the
+portable FreeBSD x86_64 boundary are compile-checked, but are not release
+targets until their runtime playback paths can be validated. The release also
 contains a `cargo vendor` archive and matching Cargo source configuration so
 Gentoo and other external/offline builders use the exact locked dependency
 graph. The Gentoo ebuild is maintained as

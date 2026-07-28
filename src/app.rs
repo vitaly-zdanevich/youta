@@ -52,10 +52,12 @@ use crate::links::{
     parse_description_chapters, parse_description_links, parse_description_video_links,
     parse_youtube_url,
 };
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
+use crate::local_move::LocalMoveMapping;
+#[cfg(feature = "local-move")]
 use crate::local_move::{
-    LocalMoveDestinationLimits, LocalMoveError, LocalMoveLimits, LocalMoveMapping, LocalMovePlan,
-    LocalMoveRecovery, LocalMoveReport,
+    LocalMoveDestinationLimits, LocalMoveError, LocalMoveLimits, LocalMovePlan, LocalMoveRecovery,
+    LocalMoveReport,
 };
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
@@ -129,7 +131,7 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::tui::DetailLinkView;
 #[cfg(feature = "yt-dlp")]
 use crate::tui::DownloadView;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-move")]
 use crate::tui::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
 use crate::tui::RadioSort;
@@ -850,7 +852,7 @@ struct LocalFolderSizeWorkerResult {
 }
 
 /// Lazy artwork lookup selected for one Local Details target.
-#[cfg(all(feature = "local", feature = "thumbnails"))]
+#[cfg(all(feature = "local-artwork", feature = "images"))]
 #[derive(Clone, Copy)]
 enum LocalArtworkKind {
     /// Extracts bounded embedded artwork from a playable media file.
@@ -1138,11 +1140,12 @@ enum ProviderRequest {
         item_key: String,
         request: crate::tracker_media::TrackerMediaRequest,
     },
+    #[cfg(feature = "local-browser")]
     ScanLocal {
         generation: u64,
         root: PathBuf,
     },
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -1398,12 +1401,13 @@ enum ProviderResponse {
         item_key: String,
         result: Result<Vec<crate::tracker_media::PreparedTrackerModule>, String>,
     },
+    #[cfg(feature = "local-browser")]
     LocalScan {
         generation: u64,
         root: PathBuf,
         result: Result<Vec<LocalMediaItem>, String>,
     },
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -1449,10 +1453,10 @@ enum LocalBrowseRequest {
         preferred_child: Option<PathBuf>,
     },
     /// Lists only real directories for the non-blocking Move destination chooser.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     MoveDestinations { generation: u64, directory: PathBuf },
     /// Executes one prevalidated, no-overwrite move batch off the UI thread.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     Move {
         generation: u64,
         plan: LocalMovePlan,
@@ -1469,13 +1473,13 @@ enum LocalBrowseResponse {
         result: Result<crate::local_browser::LocalDirectoryListing, String>,
     },
     /// A directory-only Move destination snapshot.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     MoveDestinations {
         generation: u64,
         result: Result<crate::local_move::LocalMoveDestinationListing, String>,
     },
     /// A completed or partially completed no-overwrite move batch.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     Move {
         generation: u64,
         planned: Vec<LocalMoveMapping>,
@@ -1890,7 +1894,7 @@ struct PendingPlaylistReplay {
 }
 
 /// Exact, non-lossy paths owned by the open Local Move destination chooser.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-move")]
 #[derive(Debug, Default)]
 struct LocalMoveSelection {
     /// Canonical folder containing every selected source.
@@ -1904,7 +1908,7 @@ struct LocalMoveSelection {
 }
 
 /// Startup result for durable move intents left by an interrupted process.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[derive(Debug, Default)]
 struct LocalMoveJournalReconciliation {
     /// Mappings whose published targets were atomically remapped into storage.
@@ -1916,7 +1920,7 @@ struct LocalMoveJournalReconciliation {
 }
 
 /// Whether a pending Local identity transaction is a user-requested retry.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalMovePersistenceAttempt {
     /// Periodic work may report a new failure once but never retry a known one.
@@ -2018,7 +2022,7 @@ const MAX_LAZY_LOCAL_FOLDER_SIZES: usize = 256;
 /// Maximum completed directory sizes retained across Local navigation.
 const MAX_CACHED_LOCAL_FOLDER_SIZES: usize = 512;
 /// Maximum positive or negative embedded-artwork lookups retained in RAM.
-#[cfg(all(feature = "local", feature = "thumbnails"))]
+#[cfg(all(feature = "local-artwork", feature = "images"))]
 const MAX_CACHED_LOCAL_ARTWORK: usize = 256;
 /// Maximum time a traversal can be reused when nested changes may be invisible.
 const LOCAL_FOLDER_SIZE_CACHE_TTL: Duration = Duration::from_mins(1);
@@ -2447,37 +2451,37 @@ pub struct AppController {
     /// Child path reselected after an asynchronous move to its parent.
     pending_local_reselection: Option<(u64, PathBuf)>,
     /// Exact current-directory entries toggled into the next move batch.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     local_move_marks: HashSet<PathBuf>,
     /// Generation rejecting destination or move results for an older popup.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     local_move_generation: u64,
     /// Exact source and destination paths hidden from the lossy TUI model.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     local_move_selection: Option<LocalMoveSelection>,
     /// Whether the worker may already be mutating an explicitly approved batch.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     local_move_execution_pending: bool,
     /// Authoritative completed mappings awaiting durable `StateStore` remapping.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     local_move_persistence_queue: Vec<LocalMoveMapping>,
     /// Last unchanged persistence failure, suppressing automatic retry storms.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     local_move_persistence_failure: Option<String>,
     /// Whether durable journal rows still await completion or reconciliation.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     local_move_journal_pending: bool,
     /// Monotonic owner for the sole embedded-artwork extraction request.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     local_artwork_generation: u64,
     /// Media path currently being inspected by the provider worker.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     pending_local_artwork: Option<(u64, PathBuf)>,
     /// Process-local positive and negative artwork results by exact path.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     local_artwork_cache: HashMap<PathBuf, Option<url::Url>>,
     /// Insertion order bounding the process-local artwork result cache.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     local_artwork_cache_order: VecDeque<PathBuf>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
@@ -2663,9 +2667,9 @@ impl AppController {
         youtube_provider: Option<Box<dyn Provider>>,
         playback_factory: Option<PlaybackFactory>,
     ) -> Self {
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         let local_move_reconciliation = reconcile_local_move_journal(&store);
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         let local_move_journal_pending = match &local_move_reconciliation {
             Ok(report) => !report.unresolved.is_empty(),
             Err(_) => true,
@@ -3063,27 +3067,27 @@ impl AppController {
             local_folder_size_queue: VecDeque::new(),
             local_folder_size_pending: None,
             pending_local_reselection: None,
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             local_move_marks: HashSet::new(),
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             local_move_generation: 0,
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             local_move_selection: None,
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             local_move_execution_pending: false,
-            #[cfg(feature = "local")]
+            #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_persistence_queue: Vec::new(),
-            #[cfg(feature = "local")]
+            #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_persistence_failure: None,
-            #[cfg(feature = "local")]
+            #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_journal_pending,
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             local_artwork_generation: 0,
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             pending_local_artwork: None,
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             local_artwork_cache: HashMap::new(),
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             local_artwork_cache_order: VecDeque::new(),
             tracker_results: Vec::new(),
             subscription_tree,
@@ -3295,7 +3299,7 @@ impl AppController {
         if let Some(error) = local_browse_thread_error {
             controller.show_error("Could not start the Local browser worker", &error);
         }
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         match local_move_reconciliation {
             Ok(report) if !report.unresolved.is_empty() => {
                 let message = format_local_move_reconciliation(&report);
@@ -3929,6 +3933,7 @@ impl AppController {
         direct
     }
 
+    #[cfg(feature = "local-browser")]
     fn open_local_input(&mut self, local: DirectLocalInput) {
         self.supersede_search_generation();
         self.clear_youtube_search_snapshot();
@@ -3974,6 +3979,12 @@ impl AppController {
             self.view.status_line = "Local media file recognized; press Enter to play".to_owned();
             self.refresh_selected_playlist_state();
         }
+    }
+
+    #[cfg(not(feature = "local-browser"))]
+    fn open_local_input(&mut self, _local: DirectLocalInput) {
+        self.view.status_line =
+            "This build omits the `local-browser` feature; local paths cannot be opened".to_owned();
     }
 
     fn submit_tracker_search(&mut self, query: String) {
@@ -6170,6 +6181,7 @@ impl AppController {
                     },
                 }
             }
+            #[cfg(feature = "local-browser")]
             ProviderResponse::LocalScan {
                 generation,
                 root,
@@ -6196,7 +6208,7 @@ impl AppController {
                     }
                 }
             }
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             ProviderResponse::LocalArtwork {
                 generation,
                 path,
@@ -6924,7 +6936,7 @@ impl AppController {
     }
 
     /// Starts one lazy artwork lookup for selected Local media or a folder.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     fn request_selected_local_artwork(&mut self) {
         let selected = if self.view.screen == Screen::Local {
             self.local_entry_index()
@@ -6989,7 +7001,7 @@ impl AppController {
     }
 
     /// Stores one process-local artwork result with deterministic FIFO eviction.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     fn cache_local_artwork(&mut self, path: PathBuf, artwork: Option<url::Url>) {
         self.local_artwork_cache.insert(path.clone(), artwork);
         self.local_artwork_cache_order
@@ -7004,7 +7016,7 @@ impl AppController {
     }
 
     /// Applies a cached cover only when the same Local path still owns Details.
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     fn apply_cached_local_artwork(&mut self, path: &Path) {
         let Some(artwork) = self.local_artwork_cache.get(path) else {
             return;
@@ -7032,11 +7044,11 @@ impl AppController {
             LocalBrowseResponse::Browse { generation, result } => {
                 self.handle_local_directory_response(generation, result);
             }
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             LocalBrowseResponse::MoveDestinations { generation, result } => {
                 self.handle_local_move_destinations_response(generation, result);
             }
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             LocalBrowseResponse::Move {
                 generation,
                 planned,
@@ -7070,7 +7082,7 @@ impl AppController {
                 self.sort_local_listing();
                 self.view.selected = 0;
                 self.select_local_path(reselected_path.as_deref());
-                #[cfg(feature = "local")]
+                #[cfg(feature = "local-move")]
                 {
                     let visible_paths = self
                         .local_listing
@@ -7112,7 +7124,7 @@ impl AppController {
         directory: PathBuf,
         reselect_child: Option<PathBuf>,
     ) {
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-move")]
         {
             let leaves_current_directory = self
                 .local_listing
@@ -7624,9 +7636,9 @@ impl AppController {
                 .and_then(|id| self.local_progress_cache.get(id))
                 .copied()
                 .unwrap_or_default();
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             let local_marked = self.local_move_marks.contains(&entry.path);
-            #[cfg(not(feature = "local"))]
+            #[cfg(not(feature = "local-move"))]
             let local_marked = false;
             let subtitle = match entry.kind {
                 LocalEntryKind::Directory => self
@@ -7719,9 +7731,9 @@ impl AppController {
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
                 description: local_media_description(&item),
-                local_renamable: true,
-                local_movable: true,
-                local_trashable: true,
+                local_renamable: cfg!(feature = "local-rename"),
+                local_movable: cfg!(feature = "local-move"),
+                local_trashable: cfg!(feature = "local-trash"),
                 ..DetailView::default()
             });
             if metadata_pending {
@@ -7754,13 +7766,13 @@ impl AppController {
                 thumbnail_url: (entry.kind == LocalEntryKind::Image)
                     .then(|| url::Url::from_file_path(&entry.path).ok())
                     .flatten(),
-                local_renamable: !is_directory,
-                local_movable: true,
-                local_trashable: true,
+                local_renamable: cfg!(feature = "local-rename") && !is_directory,
+                local_movable: cfg!(feature = "local-move"),
+                local_trashable: cfg!(feature = "local-trash"),
                 ..DetailView::default()
             });
         }
-        #[cfg(all(feature = "local", feature = "thumbnails"))]
+        #[cfg(all(feature = "local-artwork", feature = "images"))]
         self.request_selected_local_artwork();
     }
 
@@ -7956,7 +7968,7 @@ impl AppController {
                 thumbnail_url: None,
                 ..DetailView::default()
             });
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             self.request_selected_local_artwork();
         } else if self.view.screen == Screen::TrackerMusic
             && let Some(item) = self.tracker_results.get(self.view.selected)
@@ -8381,11 +8393,11 @@ impl AppController {
         snapshot: &PlaylistMediaSnapshot,
     ) -> Result<(), String> {
         ensure_playlist_snapshot_available(snapshot)?;
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         if snapshot.id.source == SourceKind::Local
             && (!self.local_move_persistence_queue.is_empty()
                 || self.local_move_journal_pending
-                || self.local_move_execution_pending)
+                || self.local_move_is_executing())
         {
             return Err(
                 "Finish or recover the pending Local move before changing playlists".to_owned(),
@@ -12204,7 +12216,7 @@ impl AppController {
     /// checkpoints therefore do not scan a growing human-readable progress
     /// document.
     fn current_progress_at_player_position(&mut self) -> Option<PlaybackProgress> {
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         if !self.local_move_persistence_queue.is_empty() {
             return None;
         }
@@ -12573,6 +12585,14 @@ impl AppController {
                     "MOD/tracker search uses its own archive sources; press / to search".to_owned();
             }
             Screen::Local => {
+                #[cfg(not(feature = "local-browser"))]
+                {
+                    self.view.rows.clear();
+                    self.view.details = None;
+                    self.view.status_line =
+                        "This build omits the `local-browser` feature".to_owned();
+                }
+                #[cfg(feature = "local-browser")]
                 if self.local_listing.is_some() {
                     self.sort_local_listing();
                     self.refresh_local_browser_rows();
@@ -14174,7 +14194,7 @@ impl AppController {
             description: format!("Full path: {}", path.display()),
             ..DetailView::default()
         });
-        #[cfg(all(feature = "local", feature = "thumbnails"))]
+        #[cfg(all(feature = "local-artwork", feature = "images"))]
         self.request_selected_local_artwork();
     }
 
@@ -14845,6 +14865,7 @@ impl AppController {
         Some((listing.path.clone(), entry.path.clone()))
     }
 
+    #[cfg(feature = "local-rename")]
     fn begin_local_rename(&mut self) {
         let Some(path) = self.selected_local_regular_file() else {
             self.view.status_line = "Select a local file before renaming".to_owned();
@@ -14860,6 +14881,11 @@ impl AppController {
             value,
             error: None,
         });
+    }
+
+    #[cfg(not(feature = "local-rename"))]
+    fn begin_local_rename(&mut self) {
+        self.view.status_line = "This build omits the `local-rename` feature".to_owned();
     }
 
     fn append_local_rename_character(&mut self, character: char) {
@@ -14931,9 +14957,9 @@ impl AppController {
             self.view.status_line = "The selected local file is no longer available".to_owned();
             return;
         };
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "local-rename"))]
         let _ = (&value, &source);
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-rename")]
         {
             let target = match crate::local_browser::validate_local_rename(
                 &source,
@@ -14985,6 +15011,7 @@ impl AppController {
                 Ok(_) => {
                     let warnings =
                         self.apply_completed_local_move_mappings(std::slice::from_ref(&mapping));
+                    #[cfg(feature = "local-move")]
                     self.local_move_marks.remove(&source);
                     self.view.local_file_popup = None;
                     self.view.status_line = format!("Renamed to {}", target.display());
@@ -15029,15 +15056,16 @@ impl AppController {
                 }
             }
         }
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "local-rename"))]
         if let Some(LocalFilePopupView::Rename {
             error: popup_error, ..
         }) = self.view.local_file_popup.as_mut()
         {
-            *popup_error = Some("this build omits the `local` feature".to_owned());
+            *popup_error = Some("this build omits the `local-rename` feature".to_owned());
         }
     }
 
+    #[cfg(feature = "local-trash")]
     fn request_local_trash(&mut self) {
         let Some((_, path)) = self.selected_local_trash_target() else {
             self.view.status_line =
@@ -15055,12 +15083,17 @@ impl AppController {
         });
     }
 
+    #[cfg(not(feature = "local-trash"))]
+    fn request_local_trash(&mut self) {
+        self.view.status_line = "This build omits the `local-trash` feature".to_owned();
+    }
+
     /// Removes a confirmed Trash target from the visible snapshot immediately.
     ///
     /// The following background refresh remains authoritative, while this
     /// optimistic update avoids a blank or already-deleted row. Unchanged
     /// sibling cache entries remain available for identity validation.
-    #[cfg(any(feature = "local", test))]
+    #[cfg(any(feature = "local-trash", test))]
     fn remove_confirmed_local_trash_target(&mut self, source: &Path) -> Option<PathBuf> {
         let listing = self.local_listing.as_mut()?;
         let removed_index = listing
@@ -15102,9 +15135,9 @@ impl AppController {
             self.view.status_line = "The selected local entry is no longer available".to_owned();
             return;
         };
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "local-trash"))]
         let _ = (&directory, &source);
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-trash")]
         {
             let mut actions = crate::local_browser::SystemLocalFileActions;
             match crate::local_browser::trash_local_entry(&mut actions, &directory, &source) {
@@ -15124,12 +15157,12 @@ impl AppController {
                 }
             }
         }
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "local-trash"))]
         if let Some(LocalFilePopupView::Trash {
             error: popup_error, ..
         }) = self.view.local_file_popup.as_mut()
         {
-            *popup_error = Some("this build omits the `local` feature".to_owned());
+            *popup_error = Some("this build omits the `local-trash` feature".to_owned());
         }
     }
 
@@ -15137,7 +15170,7 @@ impl AppController {
     ///
     /// The synthetic `..` row is navigation only and can never enter a move
     /// batch. Marks are exact paths, so sorting does not change their meaning.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn extend_local_move_selection(&mut self, direction: i32) {
         if self.view.screen != Screen::Local {
             return;
@@ -15158,7 +15191,7 @@ impl AppController {
     }
 
     /// Opens the asynchronous destination chooser for marks or the current row.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn begin_local_move(&mut self) {
         if self.view.screen != Screen::Local {
             self.view.status_line = "Move is available in the Local browser".to_owned();
@@ -15222,7 +15255,7 @@ impl AppController {
     }
 
     /// Selects one exact destination row without interpreting its display text.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn select_local_move_destination(&mut self, index: usize) {
         let Some(LocalFilePopupView::Move {
             directories,
@@ -15240,7 +15273,7 @@ impl AppController {
     }
 
     /// Moves the destination chooser by a signed number of rows.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn move_local_move_destination(&mut self, direction: i32) {
         let Some(LocalFilePopupView::Move {
             directories,
@@ -15257,7 +15290,7 @@ impl AppController {
     }
 
     /// Opens the exact selected parent or child in the destination chooser.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn activate_local_move_destination(&mut self) {
         let Some(LocalFilePopupView::Move {
             selected, pending, ..
@@ -15287,7 +15320,7 @@ impl AppController {
     }
 
     /// Sends one bounded directory-only destination listing to the Local worker.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn request_local_move_destinations(&mut self, directory: PathBuf) {
         self.local_move_generation = self.local_move_generation.wrapping_add(1);
         let generation = self.local_move_generation;
@@ -15306,7 +15339,7 @@ impl AppController {
     }
 
     /// Starts the explicit no-overwrite batch move on the isolated worker.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn confirm_local_move_here(&mut self) {
         let Some(LocalFilePopupView::Move { pending, .. }) = self.view.local_file_popup.as_ref()
         else {
@@ -15391,7 +15424,7 @@ impl AppController {
     }
 
     /// Applies one current destination listing without disturbing Local rows.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn handle_local_move_destinations_response(
         &mut self,
         generation: u64,
@@ -15465,7 +15498,7 @@ impl AppController {
 
     /// Finds the first deterministic destination key that would overwrite
     /// independently cached watched progress.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_progress_cache_collision(&self, mappings: &[LocalMoveMapping]) -> Option<MediaId> {
         let mut collisions = self
             .local_progress_cache
@@ -15494,7 +15527,7 @@ impl AppController {
     }
 
     /// Applies only authoritative completed mappings from one move result.
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     fn handle_local_move_response(
         &mut self,
         generation: u64,
@@ -15622,7 +15655,7 @@ impl AppController {
     /// The persistence layer consumes [`Self::take_local_move_mappings_for_persistence`]
     /// separately, allowing filesystem success to remain authoritative even if
     /// a later database transaction fails.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn apply_completed_local_move_mappings(
         &mut self,
         mappings: &[LocalMoveMapping],
@@ -15742,7 +15775,7 @@ impl AppController {
     }
 
     /// Drains filesystem mappings that must be applied in one StateStore transaction.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     pub fn take_local_move_mappings_for_persistence(&mut self) -> Vec<LocalMoveMapping> {
         std::mem::take(&mut self.local_move_persistence_queue)
     }
@@ -15752,7 +15785,7 @@ impl AppController {
     /// Failed transactions restore the entire batch. Automatic callers report
     /// a new failure once and then stop touching SQLite until an explicit Move
     /// or Quit action requests another attempt.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn persist_pending_local_move_mappings(
         &mut self,
         attempt: LocalMovePersistenceAttempt,
@@ -15791,7 +15824,7 @@ impl AppController {
 
     /// Rechecks durable crash-recovery intents without retrying known failures
     /// from a periodic tick.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn reconcile_pending_local_move_journal(
         &mut self,
         attempt: LocalMovePersistenceAttempt,
@@ -15838,7 +15871,7 @@ impl AppController {
     }
 
     /// Drops cached filesystem facts whose source or destination identity changed.
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn purge_moved_local_cache_paths(&mut self, mappings: &[LocalMoveMapping]) {
         let affected = |path: &Path| {
             mappings.iter().any(|mapping| {
@@ -15861,7 +15894,7 @@ impl AppController {
         {
             self.local_folder_size_pending = None;
         }
-        #[cfg(all(feature = "local", feature = "thumbnails"))]
+        #[cfg(all(feature = "local-artwork", feature = "images"))]
         {
             self.local_artwork_cache.retain(|path, _| !affected(path));
             self.local_artwork_cache_order
@@ -15879,11 +15912,11 @@ impl AppController {
 
     /// Reports whether an approved Local move may currently mutate the filesystem.
     fn local_move_is_executing(&self) -> bool {
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-move")]
         {
             self.local_move_execution_pending
         }
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(feature = "local-move"))]
         {
             false
         }
@@ -15891,7 +15924,7 @@ impl AppController {
 
     /// Closes a Local popup unless an approved move is already executing.
     fn dismiss_local_file_popup(&mut self) {
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-move")]
         if self.local_move_execution_pending
             && matches!(
                 self.view.local_file_popup.as_ref(),
@@ -15902,7 +15935,7 @@ impl AppController {
                 "Wait for the Local move to finish before closing it".to_owned();
             return;
         }
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-move")]
         if matches!(
             self.view.local_file_popup.as_ref(),
             Some(LocalFilePopupView::Move { .. })
@@ -15914,26 +15947,26 @@ impl AppController {
         self.view.status_line = "Local file was not changed".to_owned();
     }
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn begin_local_move(&mut self) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn extend_local_move_selection(&mut self, _direction: i32) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn select_local_move_destination(&mut self, _index: usize) {}
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn move_local_move_destination(&mut self, _direction: i32) {}
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn activate_local_move_destination(&mut self) {}
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(feature = "local-move"))]
     fn confirm_local_move_here(&mut self) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
@@ -16289,7 +16322,7 @@ impl AppController {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.view.local_browse_pending = false;
-                    #[cfg(feature = "local")]
+                    #[cfg(feature = "local-move")]
                     if self.local_move_execution_pending {
                         self.local_move_execution_pending = false;
                         self.local_move_journal_pending = true;
@@ -16329,7 +16362,7 @@ impl AppController {
             let _ = handle.join();
         }
         self.drain_local_browse_responses(false);
-        #[cfg(feature = "local")]
+        #[cfg(feature = "local-move")]
         if self.local_move_execution_pending {
             self.local_move_execution_pending = false;
             self.local_move_journal_pending = true;
@@ -16342,7 +16375,7 @@ impl AppController {
 
     fn save_session(&mut self) -> bool {
         self.save_session_with_local_move_attempt(
-            #[cfg(feature = "local")]
+            #[cfg(any(feature = "local-rename", feature = "local-move"))]
             LocalMovePersistenceAttempt::Automatic,
         )
     }
@@ -16350,9 +16383,10 @@ impl AppController {
     /// Saves a session only after every authoritative Local mapping is durable.
     fn save_session_with_local_move_attempt(
         &mut self,
-        #[cfg(feature = "local")] attempt: LocalMovePersistenceAttempt,
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
+        attempt: LocalMovePersistenceAttempt,
     ) -> bool {
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         if !self.persist_pending_local_move_mappings(attempt) {
             self.session_dirty = true;
             return false;
@@ -16494,10 +16528,10 @@ impl AppController {
         if let Some(mut download) = self.active_download.take() {
             download.cancel_and_join();
         }
-        #[cfg(feature = "local")]
+        #[cfg(any(feature = "local-rename", feature = "local-move"))]
         let local_move_state_ready =
             self.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Explicit);
-        #[cfg(not(feature = "local"))]
+        #[cfg(not(any(feature = "local-rename", feature = "local-move")))]
         let local_move_state_ready = true;
         let mut persistence_succeeded = true;
         if !self.diagnostic_only {
@@ -16510,7 +16544,7 @@ impl AppController {
                 // before Git sees the state tree.
                 let checkpoint_published = position_saved && self.publish_playback_checkpoint();
                 let session_saved = self.save_session_with_local_move_attempt(
-                    #[cfg(feature = "local")]
+                    #[cfg(any(feature = "local-rename", feature = "local-move"))]
                     LocalMovePersistenceAttempt::Explicit,
                 );
                 persistence_succeeded = position_saved && checkpoint_published && session_saved;
@@ -16539,6 +16573,11 @@ impl UiController for AppController {
     }
 
     fn dispatch(&mut self, action: UiAction) {
+        if !self.view.external_opener_available && action.requires_external_opener() {
+            self.view.status_line =
+                "External URL opening is unavailable on this Linux virtual console".to_owned();
+            return;
+        }
         match action {
             UiAction::Quit => {
                 if self.local_move_is_executing() {
@@ -16548,6 +16587,9 @@ impl UiController for AppController {
                     self.clear_playback_start_activity();
                     self.view.quitting = true;
                 }
+            }
+            UiAction::SetExternalOpenerAvailable(available) => {
+                self.view.external_opener_available = available;
             }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
             UiAction::ShowScreen(screen) => self.show_screen(screen),
@@ -17043,7 +17085,7 @@ impl UiController for AppController {
         if self.view.quitting
             && !self.diagnostic_only
             && !self.save_session_with_local_move_attempt(
-                #[cfg(feature = "local")]
+                #[cfg(any(feature = "local-rename", feature = "local-move"))]
                 LocalMovePersistenceAttempt::Explicit,
             )
         {
@@ -17245,7 +17287,7 @@ fn local_browse_worker(
                 .map_err(|error| error.to_string());
                 LocalBrowseResponse::Browse { generation, result }
             }
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             LocalBrowseRequest::MoveDestinations {
                 generation,
                 directory,
@@ -17257,7 +17299,7 @@ fn local_browse_worker(
                 .map_err(|error| error.to_string());
                 LocalBrowseResponse::MoveDestinations { generation, result }
             }
-            #[cfg(feature = "local")]
+            #[cfg(feature = "local-move")]
             LocalBrowseRequest::Move { generation, plan } => {
                 let planned = plan.mappings();
                 LocalBrowseResponse::Move {
@@ -17275,7 +17317,7 @@ fn local_browse_worker(
 }
 
 /// Adds one independently actionable Local move message to a popup payload.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-move")]
 fn append_local_move_message(message: &mut Option<String>, addition: String) {
     if addition.is_empty() {
         return;
@@ -17290,7 +17332,7 @@ fn append_local_move_message(message: &mut Option<String>, addition: String) {
 }
 
 /// Formats every retained recovery path without hiding duplicate locations.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-move")]
 fn local_move_recovery_message(recovery: &[LocalMoveRecovery]) -> Option<String> {
     if recovery.is_empty() {
         return None;
@@ -17321,7 +17363,7 @@ fn local_move_recovery_message(recovery: &[LocalMoveRecovery]) -> Option<String>
 
 /// Reconciles durable move intents by observing only exact source/target
 /// presence, never overwriting or deleting a filesystem entry.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn reconcile_local_move_journal(
     store: &StateStore,
 ) -> Result<LocalMoveJournalReconciliation, String> {
@@ -17377,7 +17419,7 @@ fn reconcile_local_move_journal(
 }
 
 /// Reports whether a path has any directory entry, including a dangling link.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn local_move_path_exists(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -17387,7 +17429,7 @@ fn local_move_path_exists(path: &Path) -> std::io::Result<bool> {
 }
 
 /// Formats a bounded actionable summary for unresolved durable move intents.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn format_local_move_reconciliation(report: &LocalMoveJournalReconciliation) -> String {
     const MAX_DETAILS: usize = 16;
 
@@ -17412,7 +17454,7 @@ fn format_local_move_reconciliation(report: &LocalMoveJournalReconciliation) -> 
 }
 
 /// Remaps path-bearing fields of an ephemeral Local queue entry.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_local_queue_item(item: &mut QueueItem, mappings: &[LocalMoveMapping]) {
     if item.media.id.source != SourceKind::Local {
         return;
@@ -17439,7 +17481,7 @@ fn remap_local_queue_item(item: &mut QueueItem, mappings: &[LocalMoveMapping]) {
 }
 
 /// Remaps exact Local-browser paths retained for same-source autoplay.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_local_autoplay_origin(origin: &mut AutoplayOrigin, mappings: &[LocalMoveMapping]) {
     let AutoplayOrigin::LocalBrowser {
         directory, entries, ..
@@ -18273,6 +18315,7 @@ fn provider_worker(
                     break;
                 }
             }
+            #[cfg(feature = "local-browser")]
             ProviderRequest::ScanLocal { generation, root } => {
                 let result = scan_local_media(&root);
                 if responses
@@ -18286,7 +18329,7 @@ fn provider_worker(
                     break;
                 }
             }
-            #[cfg(all(feature = "local", feature = "thumbnails"))]
+            #[cfg(all(feature = "local-artwork", feature = "images"))]
             ProviderRequest::LocalArtwork {
                 generation,
                 path,
@@ -19174,6 +19217,7 @@ fn local_media_item_stub(path: PathBuf, known_size_bytes: Option<u64>) -> LocalM
 }
 
 /// Selects `~/Music` when it exists, otherwise the user's home directory.
+#[cfg(feature = "local-browser")]
 fn default_local_browse_root() -> PathBuf {
     directories::BaseDirs::new().map_or_else(
         || PathBuf::from("."),
@@ -19188,7 +19232,7 @@ fn default_local_browse_root() -> PathBuf {
     )
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn read_local_tags(item: &mut LocalMediaItem) {
     use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -19236,7 +19280,7 @@ fn read_local_tags(item: &mut LocalMediaItem) {
 }
 
 /// Maps Lofty's audio-oriented file type to separate container and codec labels.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn local_lofty_container_and_codec(file_type: lofty::file::FileType) -> (String, String) {
     use lofty::file::FileType;
 
@@ -19261,7 +19305,7 @@ fn local_lofty_container_and_codec(file_type: lofty::file::FileType) -> (String,
     (container.to_owned(), codec.to_owned())
 }
 
-#[cfg(not(feature = "local"))]
+#[cfg(not(feature = "local-metadata"))]
 fn read_local_tags(_item: &mut LocalMediaItem) {}
 
 /// Reads one MPEG file while retaining the declared encoding of ID3 text frames.
@@ -19269,7 +19313,7 @@ fn read_local_tags(_item: &mut LocalMediaItem) {}
 /// Generic Lofty tags intentionally erase format-specific frame encodings.
 /// Keeping the MPEG representation lets Youta repair a narrowly recognized
 /// Windows-1251-as-Latin-1 display error without changing the source file.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn read_local_mpeg_tags(item: &mut LocalMediaItem) -> bool {
     use lofty::config::ParseOptions;
     use lofty::file::AudioFile;
@@ -19307,7 +19351,7 @@ fn read_local_mpeg_tags(item: &mut LocalMediaItem) -> bool {
 }
 
 /// Applies ID3v2 fields and repairs only frames explicitly declared Latin-1.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn apply_local_id3v2_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v2::Id3v2Tag) {
     use lofty::tag::{Accessor, ItemKey};
 
@@ -19340,7 +19384,7 @@ fn apply_local_id3v2_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v2::Id3v2T
 }
 
 /// Returns the declared encoding for one ID3v2 text-information frame.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn local_id3v2_text_encoding(
     tag: &lofty::id3::v2::Id3v2Tag,
     frame_id: &str,
@@ -19354,7 +19398,7 @@ fn local_id3v2_text_encoding(
 }
 
 /// Returns the declared encoding of the default ID3v2 comment frame.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn local_id3v2_comment_encoding(tag: &lofty::id3::v2::Id3v2Tag) -> Option<lofty::TextEncoding> {
     use lofty::id3::v2::Frame;
 
@@ -19365,7 +19409,7 @@ fn local_id3v2_comment_encoding(tag: &lofty::id3::v2::Id3v2Tag) -> Option<lofty:
 }
 
 /// Applies ambiguous ID3v1 fields through the conservative legacy repair.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn apply_local_id3v1_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v1::Id3v1Tag) {
     use lofty::tag::Accessor;
 
@@ -19379,7 +19423,7 @@ fn apply_local_id3v1_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v1::Id3v1T
 }
 
 /// Normalizes one ID3v2 value without guessing for Unicode-declared frames.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn normalized_local_id3v2_value(
     value: Option<&str>,
     encoding: Option<lofty::TextEncoding>,
@@ -19396,7 +19440,7 @@ fn normalized_local_id3v2_value(
 /// The repair is deliberately restricted to long, Cyrillic-looking words and
 /// never writes metadata back to the media file. Ambiguous short strings and
 /// ordinary accented Latin text retain the exact value supplied by Lofty.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn normalized_legacy_windows_1251_value(value: Option<&str>) -> Option<String> {
     let value = value.map(str::trim).filter(|value| !value.is_empty())?;
     let bytes = value
@@ -19415,7 +19459,7 @@ fn normalized_legacy_windows_1251_value(value: Option<&str>) -> Option<String> {
 }
 
 /// Recognizes word-level Cyrillic evidence while rejecting common Latin names.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn has_strong_legacy_windows_1251_signature(source: &str, decoded: &str) -> bool {
     #[derive(Default)]
     struct WordEvidence {
@@ -19501,7 +19545,7 @@ fn has_strong_legacy_windows_1251_signature(source: &str, decoded: &str) -> bool
     strong_words > 0 || medium_words >= 2
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
     use lofty::config::ParseOptions;
     use lofty::file::AudioFile;
@@ -19533,7 +19577,7 @@ fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
     true
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn apply_local_vorbis_comments(item: &mut LocalMediaItem, tag: &lofty::ogg::VorbisComments) {
     if let Some(title) = trimmed_tag_value(tag.get("TITLE")) {
         item.title = title;
@@ -19548,7 +19592,7 @@ fn apply_local_vorbis_comments(item: &mut LocalMediaItem, tag: &lofty::ogg::Vorb
 }
 
 /// Applies format-agnostic tags without legacy character-set guessing.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn apply_local_generic_tag(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
     use lofty::tag::{Accessor, ItemKey};
 
@@ -19564,7 +19608,7 @@ fn apply_local_generic_tag(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
 }
 
 /// Applies URL and identifier values without any character-set repair.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn apply_local_generic_identifiers(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
     use lofty::tag::ItemKey;
 
@@ -19572,7 +19616,7 @@ fn apply_local_generic_identifiers(item: &mut LocalMediaItem, tag: &lofty::tag::
     item.acoustid_id = trimmed_tag_value(tag.get_string(ItemKey::AcoustId));
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn trimmed_tag_value(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -19580,7 +19624,7 @@ fn trimmed_tag_value(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn joined_tag_values<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
     let values = values
         .map(str::trim)
@@ -19589,7 +19633,7 @@ fn joined_tag_values<'a>(values: impl Iterator<Item = &'a str>) -> Option<String
     (!values.is_empty()).then(|| values.join("; "))
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn local_standard_tag_url(tag: &lofty::tag::Tag) -> Option<String> {
     use lofty::tag::ItemKey;
 
@@ -19612,7 +19656,7 @@ fn local_standard_tag_url(tag: &lofty::tag::Tag) -> Option<String> {
 /// Lofty represents ID3 URL frames as locators, while `Tag::get_string` only
 /// accepts ordinary text values. Keeping both variants here preserves URLs
 /// when a format-specific ID3v2 tag is converted into a generic tag.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-metadata")]
 fn local_tag_text_or_locator(tag: &lofty::tag::Tag, key: lofty::tag::ItemKey) -> Option<&str> {
     tag.get(key)
         .and_then(|item| item.value().text().or_else(|| item.value().locator()))
@@ -19683,6 +19727,7 @@ fn local_media_description(item: &LocalMediaItem) -> String {
     lines.join("\n")
 }
 
+#[cfg(any(feature = "local-browser", test))]
 fn scan_local_media(root: &Path) -> Result<Vec<LocalMediaItem>, String> {
     const MAX_VISITED_ENTRIES: usize = 100_000;
     const MAX_MEDIA_FILES: usize = 10_000;
@@ -23319,7 +23364,7 @@ mod tests {
         assert_eq!(controller.view.rows[1].title, "Second entry");
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-browser")]
     #[test]
     fn removed_local_playlist_entry_hides_actions_and_cannot_be_copied() {
         let fixture = tempfile::tempdir().expect("temporary Local playlist");
@@ -23689,7 +23734,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-browser")]
     #[test]
     fn local_playlist_snapshot_uses_an_existing_absolute_file() {
         let temporary = tempfile::tempdir().expect("temporary local folder");
@@ -23727,7 +23772,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-browser")]
     #[test]
     fn asynchronous_local_listing_restores_playlist_actions_without_selection_movement() {
         let temporary = tempfile::tempdir().expect("temporary local folder");
@@ -27752,7 +27797,7 @@ mod tests {
         assert_eq!(*cursor_byte, after_emoji);
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-rename")]
     #[test]
     fn local_rename_remaps_playlist_progress_and_history_across_restart() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -27894,7 +27939,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_extension_marks_real_rows_and_never_marks_parent_navigation() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -27940,7 +27985,7 @@ mod tests {
         assert!(!controller.local_move_marks.contains(&first));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_chooser_keeps_rows_and_rejects_stale_destination_responses() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28008,7 +28053,7 @@ mod tests {
         assert!(!directories.is_empty());
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_validation_error_keeps_sources_and_queues_no_mapping() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28080,7 +28125,7 @@ mod tests {
         assert!(source.exists());
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_progress_collision_is_rejected_before_journal_or_worker() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28141,7 +28186,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn durable_progress_collision_is_rejected_before_journal_or_worker() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28207,7 +28252,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_intent_is_durable_before_the_worker_can_mutate_files() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28270,7 +28315,7 @@ mod tests {
         controller.local_move_journal_pending = false;
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_success_remaps_memory_and_refreshes_without_blank_rows() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28361,7 +28406,7 @@ mod tests {
         assert_eq!(directory, source_directory);
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn completed_local_move_mappings_are_persisted_as_one_batch() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28425,7 +28470,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_retains_the_complete_batch() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28483,7 +28528,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_blocks_local_playlist_mutations() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28548,7 +28593,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_is_not_retried_by_repeated_ticks() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28612,7 +28657,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn failed_mapping_blocks_session_save_and_quit_until_explicit_retry_succeeds() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28684,7 +28729,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_partial_failure_shows_every_recovery_path_and_keeps_remainder() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28783,7 +28828,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_filesystem_worker_executes_moves_off_the_controller_thread() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28828,7 +28873,7 @@ mod tests {
         worker.join().expect("worker joins");
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn shutdown_joins_and_drains_local_move_before_persisting_session() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -28948,7 +28993,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn startup_reconciles_completed_and_untouched_parts_of_a_move_intent() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -29016,7 +29061,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-move")]
     #[test]
     fn durable_identity_collision_retains_journal_and_blocks_quit() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -29104,15 +29149,15 @@ mod tests {
         let folder = controller.view.details.as_ref().expect("folder details");
         assert_eq!(folder.title, "A long album folder");
         assert!(!folder.local_renamable);
-        assert!(folder.local_movable);
-        assert!(folder.local_trashable);
+        assert_eq!(folder.local_movable, cfg!(feature = "local-move"));
+        assert_eq!(folder.local_trashable, cfg!(feature = "local-trash"));
 
         controller.view.selected = parent_offset.saturating_add(1);
         controller.update_local_browser_detail();
         let file = controller.view.details.as_ref().expect("file details");
-        assert!(file.local_renamable);
-        assert!(file.local_movable);
-        assert!(file.local_trashable);
+        assert_eq!(file.local_renamable, cfg!(feature = "local-rename"));
+        assert_eq!(file.local_movable, cfg!(feature = "local-move"));
+        assert_eq!(file.local_trashable, cfg!(feature = "local-trash"));
     }
 
     #[test]
@@ -29259,7 +29304,7 @@ mod tests {
         assert_eq!(rehydrated.watched_percent, 100);
     }
 
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     #[test]
     fn local_artwork_worker_response_updates_only_the_matching_details_path() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -29556,7 +29601,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-metadata")]
     #[test]
     fn latin1_declared_id3v2_cyrillic_mojibake_is_repaired_for_display() {
         use lofty::TextEncoding;
@@ -29595,7 +29640,7 @@ mod tests {
         assert!(description.contains("Comment: коллекция www.predanie.ru"));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-metadata")]
     #[test]
     fn unicode_declared_id3_and_valid_latin_metadata_are_not_repaired() {
         use lofty::TextEncoding;
@@ -29648,7 +29693,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-metadata")]
     #[test]
     fn id3v2_keeps_generic_artist_url_and_acoustid_semantics() {
         use lofty::TextEncoding;
@@ -29692,7 +29737,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-metadata")]
     #[test]
     fn id3v1_is_conservatively_repaired_but_vorbis_utf8_is_not() {
         let mut id3v1 = lofty::id3::v1::Id3v1Tag {
@@ -29730,7 +29775,7 @@ mod tests {
         assert_eq!(vorbis_item.artist.as_deref(), Some("Björk"));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-metadata")]
     #[test]
     fn local_vorbis_metadata_maps_human_fields_and_identifiers() {
         let mut item = LocalMediaItem {
@@ -30103,7 +30148,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "local", feature = "thumbnails"))]
+    #[cfg(all(feature = "local-artwork", feature = "images"))]
     #[test]
     fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -32323,6 +32368,36 @@ mod tests {
                 .as_ref()
                 .and_then(|popup| popup.action_status.as_deref())
                 .is_some_and(|status| status.contains("pre-filled issue"))
+        );
+    }
+
+    #[test]
+    fn physical_console_policy_rejects_external_opener_actions_in_controller() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::clone(&calls),
+            gh_available: true,
+        });
+        controller.show_diagnostic_report("Playback failed", "complete report");
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(false));
+
+        controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("Linux virtual console")
+        );
+        controller.dispatch(UiAction::FillGitHubIssue);
+
+        assert_eq!(
+            *calls.lock().expect("diagnostic calls"),
+            [DiagnosticCall::Fill {
+                title: "Youta error: Playback failed".to_owned(),
+                report: "complete report".to_owned(),
+            }]
         );
     }
 

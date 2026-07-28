@@ -53,8 +53,9 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   are never rewritten.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
-- A plain Linux TTY is a primary target. Youta does not attempt thumbnail
-  graphics when no supported terminal image protocol is available.
+- A plain Linux TTY is a primary target. A confirmed local `/dev/ttyN` can use
+  Unicode half-block thumbnails; unsupported, remote, and serial terminals
+  remain text-only.
 
 See [Architecture](docs/ARCHITECTURE.md), [feasibility and service
 tiers](docs/FEASIBILITY.md), and [audiophile guidance](docs/AUDIOPHILE.md).
@@ -376,8 +377,19 @@ cargo run --locked -- --help
 The default build expects `mpv` and `yt-dlp` at runtime for online playback.
 They remain separate executables so they can be updated quickly when sites
 change. Human-readable persistence is part of the core build. The default
-feature set also enables `thumbnails`; runtime capability checks decide whether
-the TUI may fetch and render artwork.
+feature set enables `images`. Runtime capability checks decide whether the TUI
+may fetch and render artwork.
+
+Build the otherwise complete default application without image decoding or
+terminal-image dependencies with:
+
+```sh
+cargo build --release --locked --no-default-features \
+	--features app
+```
+
+Both configurations use human-readable TOML persistence. SQLite is included
+only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
 
 After installation, the current commands are:
 
@@ -438,7 +450,7 @@ cargo build --release --no-default-features \
 ```
 
 This intentionally omits terminal thumbnails. A custom
-`--no-default-features` build must list `thumbnails` explicitly when artwork is
+`--no-default-features` build must list `images` explicitly when artwork is
 wanted.
 
 For a small TUI build containing only the curated Radio catalogue and `mpv`
@@ -453,7 +465,7 @@ For metadata through the official YouTube Data API instead of Invidious:
 
 ```sh
 cargo build --release --no-default-features \
-	--features tui,thumbnails,local,rss,youtube-official,backend-mpv
+	--features tui,images,local,rss,youtube-official,backend-mpv
 ```
 
 Copy [config.example.toml](config.example.toml) to
@@ -709,8 +721,8 @@ original title remains available and the feature is toggleable.
 
 ## Thumbnails and real TTYs
 
-The default build includes the `thumbnails` feature. Youta renders the selected
-item's artwork only when it detects the [Kitty graphics
+The default build includes the positive `images` feature. Youta renders the
+selected item's artwork only when it detects the [Kitty graphics
 protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), [iTerm2 inline
 images](https://iterm2.com/documentation-images.html), or
 [Sixel](https://vt100.net/docs/vt3xx-gp/chapter14.html). It downloads
@@ -729,15 +741,23 @@ another decode or protocol-encoding pass. Local entries include a filesystem
 fingerprint in that RAM key, so replacing an image at the same path invalidates
 the prepared result.
 
-On a Linux virtual console, serial terminal, `TERM=dumb`, or a terminal without
-one of those image protocols, Youta neither fetches nor renders artwork. The
-detail panel remains text-only. Accepted remote images are limited to bounded
-JPEG, PNG, and WebP input before decoding, which prevents unbounded downloads
-and image allocations. Remote image fetches reject non-public literal and
-DNS-resolved addresses, `.local`, `.internal`, and single-label hosts;
-redirects are not followed. These gates avoid stray escape sequences and
-reduce network traffic, decoding work, memory use, heat, and battery
-consumption.
+A directly attached Linux virtual console (`TERM=linux`, with output resolved
+to `/dev/ttyN`) uses Unicode half-block cells as a conservative artwork
+fallback. This does not access `/dev/fb0` or draw outside the terminal; image
+quality is limited by the console font and palette. Serial terminals, SSH,
+`TERM=dumb`, a Linux-looking PTY, and terminals without a supported graphics
+protocol remain text-only and perform no thumbnail network work. Accepted
+remote images are limited to bounded JPEG, PNG, and WebP input before decoding,
+which prevents unbounded downloads and image allocations. Remote image fetches
+reject non-public literal and DNS-resolved addresses, `.local`, `.internal`,
+and single-label hosts; redirects are not followed. These gates avoid stray
+escape sequences and reduce network traffic, decoding work, memory use, heat,
+and battery consumption.
+
+On that confirmed physical console, Youta also hides external `xdg-open`
+controls and ignores their hotkeys because no graphical session is attached.
+URLs remain visible and selectable as text. Pseudo-terminals and SSH sessions
+retain the controls because their opener may be configured on the host.
 
 Configure the runtime policy in `~/.config/youta/config.toml`:
 
@@ -758,12 +778,12 @@ YouTube and YouTube Music search results; the equivalent environment override
 is `YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Previously learned channel
 artwork for local subscriptions is warmed independently, so moving between
 known channels can reuse the persistent cache without a foreground network
-request. Unsupported terminals and plain TTYs perform no thumbnail network
-work regardless of this preference. To exclude the renderer and its image
-dependencies from the binary, use
-`--no-default-features` and omit `thumbnails` from `--features`; include
-`thumbnails` explicitly in a custom feature list to restore it. The rendering
-integration uses
+request. Unsupported terminals perform no thumbnail network work regardless of
+this preference. To exclude the renderer and its image
+dependencies while retaining the other defaults, build with
+`--no-default-features --features app`. For a smaller custom build, omit
+`images`; include it explicitly to restore rendering. The rendering integration
+uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
 
 ## Mouse input on a Linux virtual console
@@ -1096,11 +1116,19 @@ Apple metadata through its RSS enclosure and silent audio decode. YouTube Music
 is checked through yt-dlp's public songs search with a 15-second process bound
 and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
-failure fails CI. Tagged releases build on native amd64 and arm64 runners and
-publish:
+failure fails CI. Tagged releases build natively for Linux and macOS on amd64
+and arm64. Each operating-system/architecture pair publishes a normal archive
+and a `-text` archive, plus the release publishes one Cargo vendor archive for
+offline/external build systems. The normal archive enables `images`; the text
+archive omits it. Neither binary archive enables SQLite; human-readable TOML
+remains the standard release persistence backend.
 
-- a binary archive for each architecture; and
-- a Cargo vendor archive for offline/external build systems.
+Windows amd64 and arm64 are compile-checked in CI, but Youta does not publish
+Windows binaries yet: the current `mpv` adapter uses Unix-domain-socket IPC and
+the external-link opener is Unix-specific. FreeBSD x86_64 receives a
+cross-target compile check of the portable TUI/local-browser boundary. It is
+not advertised as a release target until a native or validated cross-build can
+also run playback tests.
 
 Live YouTube playback is temporarily excluded from automatic hosted CI because
 YouTube returns `LOGIN_REQUIRED` for GitHub-hosted runner addresses even with
@@ -1146,13 +1174,16 @@ The Gentoo ebuild is maintained as
 in the
 [`vitaly-zdanevich-overlay`](https://github.com/vitaly-zdanevich/gentoo-overlay).
 It maps provider choices to USE flags and consumes the release vendor archive.
+Its positive `images` USE flag is enabled by default; Gentoo users who want a
+text-only build use the conventional `USE="-images"` override.
 GitHub Actions use Node 24-based action majors and set the maximum requested job
 timeout to 360 minutes.
 
 To produce the same artifacts locally:
 
 ```sh
-scripts/package-release.sh
+scripts/package-release.sh x86_64-unknown-linux-gnu dist images
+scripts/package-release.sh x86_64-unknown-linux-gnu dist text
 scripts/package-vendor.sh
 ```
 

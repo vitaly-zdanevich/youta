@@ -78,6 +78,7 @@ jobs:
         run: |
           cargo test --locked --all-targets
           cargo test --locked --all-targets --no-default-features
+          cargo test --locked --all-targets --no-default-features --features app
           cargo test --locked --all-targets --no-default-features --features sqlite-state
           cargo test --locked --all-targets --no-default-features --features tui
           cargo test --locked --all-targets --no-default-features --features tui,local
@@ -95,6 +96,7 @@ jobs:
         run: |
           cargo test --locked --doc
           cargo test --locked --doc --no-default-features
+          cargo test --locked --doc --no-default-features --features app
           cargo test --locked --doc --no-default-features --features sqlite-state
           cargo test --locked --doc --no-default-features --features tui
           cargo test --locked --doc --no-default-features --features tui,local
@@ -104,18 +106,32 @@ jobs:
           cargo test --locked --doc --all-features
 
   binaries:
-    name: Linux ${{ matrix.architecture }}
+    name: ${{ matrix.operating_system }} ${{ matrix.architecture }}
     needs: validate
     strategy:
       fail-fast: false
       matrix:
         include:
-          - architecture: amd64
+          - operating_system: Linux
+            artifact_os: linux
+            architecture: amd64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - architecture: arm64
+          - operating_system: Linux
+            artifact_os: linux
+            architecture: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - operating_system: macOS
+            artifact_os: macos
+            architecture: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - operating_system: macOS
+            artifact_os: macos
+            architecture: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     steps:
@@ -128,6 +144,10 @@ jobs:
           rustup default "${RUST_VERSION}"
           rustup target add "${{ matrix.target }}"
 
+      - name: Install reproducible archive tooling on macOS
+        if: runner.os == 'macOS'
+        run: brew install gnu-tar
+
       - name: Restore Cargo registry cache
         uses: actions/cache@v5
         with:
@@ -139,13 +159,16 @@ jobs:
       - name: Set reproducible archive timestamp
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
 
-      - name: Build the architecture-specific archive
-        run: scripts/package-release.sh "${{ matrix.target }}" dist
+      - name: Build the default archive with image support
+        run: scripts/package-release.sh "${{ matrix.target }}" dist images
 
-      - name: Upload binary archive
+      - name: Build the text-only archive
+        run: scripts/package-release.sh "${{ matrix.target }}" dist text
+
+      - name: Upload binary archives
         uses: actions/upload-artifact@v7
         with:
-          name: youta-linux-${{ matrix.architecture }}
+          name: youta-${{ matrix.artifact_os }}-${{ matrix.architecture }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

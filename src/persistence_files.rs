@@ -266,7 +266,7 @@ impl LocalMovesDocument {
         }
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn canonicalize(&mut self) {
         self.intents
             .sort_by(|left, right| left.source.cmp(&right.source));
@@ -989,7 +989,7 @@ impl FileStateStore {
         Ok(())
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn persist_local_moves(&self, document: &LocalMovesDocument) -> Result<(), PersistenceError> {
         if let Some(paths) = &self.paths {
             self.persist_document(
@@ -1777,7 +1777,7 @@ impl StateBackend for FileStateStore {
         Ok(self.lock()?.runtime.session.clone())
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn remap_local_move_state(
         &self,
         mappings: &[LocalMoveMapping],
@@ -1832,7 +1832,7 @@ impl StateBackend for FileStateStore {
         Ok(plan.report)
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn journal_local_move_intent(
         &self,
         mappings: &[LocalMoveMapping],
@@ -1877,7 +1877,7 @@ impl StateBackend for FileStateStore {
         Ok(())
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_move_intents(&self) -> Result<Vec<LocalMoveMapping>, PersistenceError> {
         self.lock()?
             .local_moves
@@ -1892,7 +1892,7 @@ impl StateBackend for FileStateStore {
             .collect()
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn discard_local_move_intents(
         &self,
         mappings: &[LocalMoveMapping],
@@ -2423,7 +2423,7 @@ enum EntryMutation {
     Toggle,
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 struct FileLocalMovePlan {
     progress: ProgressDocument,
     history: HistoryDocument,
@@ -2441,7 +2441,7 @@ struct FileLocalMovePlan {
 ///
 /// The same preflight is used before journaling and before publication, so a
 /// destination identity collision can never authorize filesystem mutation.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn prepare_file_local_move_state(
     documents: &FileDocuments,
     mappings: &[LocalMoveMapping],
@@ -2554,7 +2554,7 @@ fn prepare_file_local_move_state(
     })
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn validate_file_local_move_plan(
     progress_document: &ProgressDocument,
     playlists: &PlaylistsDocument,
@@ -3150,7 +3150,7 @@ fn validate_local_moves_document(document: &LocalMovesDocument) -> Result<(), Pe
         document.intents.len(),
         MAX_FILE_LOCAL_MOVE_MAPPINGS,
     )?;
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     {
         let mappings = document
             .intents
@@ -3163,11 +3163,11 @@ fn validate_local_moves_document(document: &LocalMovesDocument) -> Result<(), Pe
         validate_local_move_mappings(&mappings)
             .map_err(|error| invalid_file_document("Local move journal", error.to_string()))?;
     }
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(any(feature = "local-rename", feature = "local-move")))]
     if !document.intents.is_empty() {
         return Err(invalid_file_document(
             "Local move journal",
-            "cannot be restored by a build without the `local` feature",
+            "cannot be restored by a build without local rename or move support",
         ));
     }
     Ok(())
@@ -3605,7 +3605,7 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_media_id(
     media_id: &mut MediaId,
     mappings: &[LocalMoveMapping],
@@ -3614,7 +3614,7 @@ fn remap_media_id(
         .map_err(|error| invalid_local_move_state(format!("cannot remap Local identity: {error}")))
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_string_path(
     path: &mut String,
     mappings: &[LocalMoveMapping],
@@ -3629,7 +3629,7 @@ fn remap_string_path(
     Ok(true)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_replay_locator(
     locator: &mut String,
     mappings: &[LocalMoveMapping],
@@ -3639,7 +3639,7 @@ fn remap_replay_locator(
     })
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_screen(
     screen: &mut crate::domain::Screen,
     mappings: &[LocalMoveMapping],
@@ -3650,7 +3650,7 @@ fn remap_screen(
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_file_url(
     url: &mut url::Url,
     mappings: &[LocalMoveMapping],
@@ -3669,7 +3669,7 @@ fn remap_file_url(
     Ok(true)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_media_file_urls(
     media: &mut MediaItem,
     mappings: &[LocalMoveMapping],
@@ -3684,7 +3684,7 @@ fn remap_media_file_urls(
     Ok(changed)
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_search_item(
     item: &mut SearchItem,
     mappings: &[LocalMoveMapping],
@@ -4527,7 +4527,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
     #[test]
     fn local_remap_flushes_and_moves_pending_checkpoint_progress() {
         let temporary = tempdir().expect("temporary state root");

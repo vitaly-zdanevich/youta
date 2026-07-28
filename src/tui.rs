@@ -27,7 +27,7 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use ratatui::{Terminal, TerminalOptions, Viewport};
-#[cfg(feature = "thumbnails")]
+#[cfg(feature = "images")]
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -40,8 +40,9 @@ use crate::domain::{Chapter, MediaId, MediaKind};
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
-#[cfg(feature = "thumbnails")]
-use crate::thumbnails::{ThumbnailManager, ThumbnailState};
+use crate::terminal_environment::TerminalAttachment;
+#[cfg(feature = "images")]
+use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::Peak;
 
 /// Official Google instructions for creating and restricting a `YouTube` API key.
@@ -1085,6 +1086,8 @@ pub struct ViewModel {
     pub status_line: String,
     /// Whether the help overlay is open.
     pub help_open: bool,
+    /// Whether this terminal attachment can launch a graphical external opener.
+    pub external_opener_available: bool,
     /// Scrollable diagnostic popup, when a recoverable error is being reported.
     pub error_popup: Option<ErrorPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
@@ -1151,6 +1154,7 @@ impl Default for ViewModel {
             repeating: false,
             status_line: "Press / to search or ? for help".to_owned(),
             help_open: false,
+            external_opener_available: true,
             error_popup: None,
             youtube_setup_popup: None,
             rss_subscription_popup: None,
@@ -1196,6 +1200,8 @@ pub enum DetailsScroll {
 pub enum UiAction {
     /// Exit Youta after saving state.
     Quit,
+    /// Record whether this terminal attachment can launch graphical URLs.
+    SetExternalOpenerAvailable(bool),
     /// Open or close the help overlay.
     ToggleHelp,
     /// Switch to a top-level screen.
@@ -1454,6 +1460,23 @@ pub enum UiAction {
     RefreshSubscriptionVideos,
 }
 
+impl UiAction {
+    /// Returns whether this action exists only to launch an external URL.
+    pub(crate) fn requires_external_opener(&self) -> bool {
+        matches!(
+            self,
+            Self::ActivateDetailLink(_)
+                | Self::OpenWikidataValue(_)
+                | Self::OpenInBrowser
+                | Self::OpenChannelInBrowser
+                | Self::CopyAndOpenGitHubIssue
+                | Self::OpenYouTubeApiKeyGuide
+                | Self::OpenGoogleCloudCredentials
+                | Self::OpenInvidiousInstances
+        )
+    }
+}
+
 /// Controller used by the generic terminal event loop.
 pub trait UiController {
     /// Returns the view for the next frame.
@@ -1491,7 +1514,7 @@ trait ThumbnailRenderer {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, theme: &Theme);
 }
 
-#[cfg(feature = "thumbnails")]
+#[cfg(feature = "images")]
 struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
     clear_before_ready: bool,
@@ -1501,7 +1524,7 @@ struct TerminalThumbnailRenderer {
     prefetch_sources: Vec<url::Url>,
 }
 
-#[cfg(feature = "thumbnails")]
+#[cfg(feature = "images")]
 impl TerminalThumbnailRenderer {
     /// Wraps the asynchronous manager with terminal-frame transition state.
     fn new(manager: ThumbnailManager) -> Self {
@@ -1516,7 +1539,7 @@ impl TerminalThumbnailRenderer {
     }
 }
 
-#[cfg(feature = "thumbnails")]
+#[cfg(feature = "images")]
 impl ThumbnailRenderer for TerminalThumbnailRenderer {
     fn poll(&mut self) -> bool {
         let changed = self.manager.poll();
@@ -1601,6 +1624,12 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
                     self.followup_frame_pending = true;
                 } else if let Some(protocol) = self.manager.protocol_mut() {
                     frame.render_stateful_widget(TerminalImage::default(), area, protocol);
+                    if matches!(
+                        self.manager.capability(),
+                        ThumbnailCapability::Supported(ThumbnailProtocol::Halfblocks)
+                    ) {
+                        quantize_linux_console_thumbnail(frame.buffer_mut(), area);
+                    }
                     self.followup_frame_pending = false;
                 }
             }
@@ -1621,7 +1650,63 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
     }
 }
 
-#[cfg(feature = "thumbnails")]
+/// Converts half-block image cells to the Linux VT's dependable 16-color set.
+///
+/// `ratatui-image` emits true-color cells for its half-block protocol. A Linux
+/// virtual console does not reliably implement 24-bit SGR, so emitting those
+/// cells verbatim can produce incorrect colors or escape-sequence artifacts.
+#[cfg(feature = "images")]
+fn quantize_linux_console_thumbnail(buffer: &mut ratatui::buffer::Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            cell.fg = nearest_ansi16_color(cell.fg);
+            cell.bg = nearest_ansi16_color(cell.bg);
+        }
+    }
+}
+
+/// Conventional RGB values of the Linux virtual console's named ANSI colors.
+#[cfg(feature = "images")]
+const LINUX_CONSOLE_ANSI16: [(Color, [u8; 3]); 16] = [
+    (Color::Black, [0, 0, 0]),
+    (Color::Red, [170, 0, 0]),
+    (Color::Green, [0, 170, 0]),
+    (Color::Yellow, [170, 85, 0]),
+    (Color::Blue, [0, 0, 170]),
+    (Color::Magenta, [170, 0, 170]),
+    (Color::Cyan, [0, 170, 170]),
+    (Color::Gray, [170, 170, 170]),
+    (Color::DarkGray, [85, 85, 85]),
+    (Color::LightRed, [255, 85, 85]),
+    (Color::LightGreen, [85, 255, 85]),
+    (Color::LightYellow, [255, 255, 85]),
+    (Color::LightBlue, [85, 85, 255]),
+    (Color::LightMagenta, [255, 85, 255]),
+    (Color::LightCyan, [85, 255, 255]),
+    (Color::White, [255, 255, 255]),
+];
+
+/// Maps an RGB color to the nearest conventional Linux-console ANSI color.
+#[cfg(feature = "images")]
+fn nearest_ansi16_color(color: Color) -> Color {
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    LINUX_CONSOLE_ANSI16
+        .into_iter()
+        .min_by_key(|(_, candidate)| {
+            let red_delta = i32::from(red) - i32::from(candidate[0]);
+            let green_delta = i32::from(green) - i32::from(candidate[1]);
+            let blue_delta = i32::from(blue) - i32::from(candidate[2]);
+            red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta
+        })
+        .map_or(Color::Reset, |(color, _)| color)
+}
+
+#[cfg(feature = "images")]
 #[allow(
     clippy::unnecessary_wraps,
     reason = "the no-thumbnails build returns None through the same interface"
@@ -1639,9 +1724,33 @@ fn create_thumbnail_renderer(settings: &UiSettings) -> Option<Box<dyn ThumbnailR
     Some(Box::new(TerminalThumbnailRenderer::new(manager)))
 }
 
-#[cfg(not(feature = "thumbnails"))]
+#[cfg(not(feature = "images"))]
 fn create_thumbnail_renderer(_settings: &UiSettings) -> Option<Box<dyn ThumbnailRenderer>> {
     None
+}
+
+/// Captures the bounded terminal facts used to decide whether `xdg-open`
+/// controls apply. The result does not depend on terminal-image support.
+fn current_terminal_attachment() -> TerminalAttachment {
+    let term = std::env::var("TERM").ok();
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let tmux = std::env::var_os("TMUX").is_some()
+        || term
+            .as_deref()
+            .is_some_and(|value| value.starts_with("tmux"))
+        || term_program.as_deref() == Some("tmux");
+    let ssh = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some());
+    TerminalAttachment {
+        linux: cfg!(target_os = "linux"),
+        stdin_is_terminal: io::stdin().is_terminal(),
+        stdout_is_terminal: io::stdout().is_terminal(),
+        term,
+        ssh,
+        tmux,
+        output_device: std::fs::read_link("/proc/self/fd/1").ok(),
+    }
 }
 
 /// Runs Youta in the current terminal until the controller requests shutdown.
@@ -1653,6 +1762,9 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         ));
     }
 
+    controller.dispatch(UiAction::SetExternalOpenerAvailable(
+        current_terminal_attachment().external_opener_available(),
+    ));
     let mut session = TerminalSession::enter()?;
     let mut input = TerminalInput::new();
     let mut thumbnail_renderer = create_thumbnail_renderer(settings);
@@ -2463,7 +2575,13 @@ fn render_frame(
     hit_map.youtube_setup_fields.clear();
     hit_map.youtube_setup_buttons.clear();
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
-        render_youtube_setup_popup(frame, setup, &theme, hit_map);
+        render_youtube_setup_popup(
+            frame,
+            setup,
+            view.external_opener_available,
+            &theme,
+            hit_map,
+        );
     }
     hit_map.rss_subscription_field = None;
     hit_map.rss_subscription_buttons.clear();
@@ -2493,7 +2611,13 @@ fn render_frame(
     }
     hit_map.error_buttons.clear();
     if let Some(error) = view.error_popup.as_ref() {
-        render_error_popup(frame, error, &theme, hit_map);
+        render_error_popup(
+            frame,
+            error,
+            view.external_opener_available,
+            &theme,
+            hit_map,
+        );
     }
 }
 
@@ -3530,7 +3654,8 @@ fn render_information_panel(
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::ToggleSubscription)
     });
-    let open_button = (show_text_selection
+    let open_button = (view.external_opener_available
+        && show_text_selection
         && matches!(
             kind,
             InformationPanelKind::Video
@@ -3559,7 +3684,8 @@ fn render_information_panel(
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::OpenInBrowser)
     });
-    let open_channel_button = (kind != InformationPanelKind::Radio)
+    let open_channel_button = (view.external_opener_available
+        && kind != InformationPanelKind::Radio)
         .then_some(details.channel_webpage_url.as_ref())
         .flatten()
         .map(|url| {
@@ -3568,21 +3694,28 @@ fn render_information_panel(
             lines.push(Line::styled(label.clone(), theme.accent));
             (line_index, label, UiAction::OpenChannelInBrowser)
         });
-    let rename_button =
-        (kind == InformationPanelKind::Local && details.local_renamable).then(|| {
+    let rename_button = (cfg!(feature = "local-rename")
+        && kind == InformationPanelKind::Local
+        && details.local_renamable)
+        .then(|| {
             let label = button("r", "Rename", show_hotkeys);
             let line_index = lines.len();
             lines.push(Line::styled(label.clone(), theme.accent));
             (line_index, label, UiAction::BeginLocalRename)
         });
-    let move_button = (kind == InformationPanelKind::Local && details.local_movable).then(|| {
-        let label = button("m", "Move", show_hotkeys);
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::BeginLocalMove)
-    });
-    let trash_button =
-        (kind == InformationPanelKind::Local && details.local_trashable).then(|| {
+    let move_button = (cfg!(feature = "local-move")
+        && kind == InformationPanelKind::Local
+        && details.local_movable)
+        .then(|| {
+            let label = button("m", "Move", show_hotkeys);
+            let line_index = lines.len();
+            lines.push(Line::styled(label.clone(), theme.accent));
+            (line_index, label, UiAction::BeginLocalMove)
+        });
+    let trash_button = (cfg!(feature = "local-trash")
+        && kind == InformationPanelKind::Local
+        && details.local_trashable)
+        .then(|| {
             let label = button("Delete", "Move to Trash", show_hotkeys);
             let line_index = lines.len();
             lines.push(Line::styled(label.clone(), theme.accent));
@@ -3854,7 +3987,8 @@ fn render_information_panel(
                 .take(visible_links)
             {
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
-                let selected = view.selected_detail_link == Some(index);
+                let selected =
+                    view.external_opener_available && view.selected_detail_link == Some(index);
                 let marker = if selected { "› " } else { "  " };
                 let mut clickable_width = terminal_text_width(marker);
                 let mut spans = vec![Span::styled(
@@ -3911,7 +4045,7 @@ fn render_information_panel(
                     clickable_width.min(link_area.width),
                     1,
                 );
-                if clickable_area.width > 0 {
+                if view.external_opener_available && clickable_area.width > 0 {
                     hit_map.detail_links.push((index, clickable_area));
                 }
                 cursor_y = cursor_y.saturating_add(1);
@@ -4005,6 +4139,7 @@ fn render_information_panel(
                                 view.playing_media_id.as_ref(),
                                 &view.playback,
                                 view.selected_wikidata_media,
+                                view.external_opener_available,
                                 theme,
                                 hit_map,
                                 &mut spans,
@@ -4105,6 +4240,7 @@ fn append_wikidata_source_spans<'a>(
     playing_media_id: Option<&MediaId>,
     playback: &PlaybackStatus,
     selected_media: Option<usize>,
+    external_opener_available: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
     spans: &mut Vec<Span<'a>>,
@@ -4185,13 +4321,17 @@ fn append_wikidata_source_spans<'a>(
             let linked_width = terminal_text_width(linked);
             spans.push(Span::styled(
                 linked,
-                theme
-                    .accent
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                if external_opener_available {
+                    theme
+                        .accent
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    theme.muted
+                },
             ));
             let available = description_area.width.saturating_sub(*cell_cursor);
             let target_width = linked_width.min(available);
-            if target_width > 0 {
+            if external_opener_available && target_width > 0 {
                 hit_map.detail_buttons.push((
                     UiAction::OpenWikidataValue(link.url.clone()),
                     Rect::new(
@@ -5224,6 +5364,19 @@ fn centered_line_x(area: Rect, line_width: u16) -> u16 {
 fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
+    let mut local_help = "  Local: Esc parent     PageUp/Down page     Z size".to_owned();
+    if cfg!(feature = "local-rename") {
+        local_help.push_str("     r rename");
+    }
+    if cfg!(feature = "local-move") {
+        local_help.push_str("     m move     Shift+J/K mark");
+    }
+    if cfg!(feature = "local-trash") {
+        local_help.push_str("     Delete trash");
+    }
+    if !cfg!(feature = "local-browser") {
+        local_help.clear();
+    }
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -5233,7 +5386,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
         "  ↪ internal video: click the marker after a YouTube URL",
-        "  Local: Esc parent     PageUp/Down page     Z size     r rename     m move     Shift+J/K mark     Delete trash",
+        local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
         "  Subscriptions channel: R refresh videos     i description",
         "  Playlists: e edit selected playlist     Esc or Backspace up",
@@ -5282,6 +5435,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
 fn render_error_popup(
     frame: &mut Frame<'_>,
     error: &ErrorPopupView,
+    external_opener_available: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -5373,10 +5527,10 @@ fn render_error_popup(
         position_area,
     );
 
-    let mut buttons = vec![
-        ("[c] Copy", UiAction::CopyErrorReport),
-        ("[i] Copy + open issue", UiAction::CopyAndOpenGitHubIssue),
-    ];
+    let mut buttons = vec![("[c] Copy", UiAction::CopyErrorReport)];
+    if external_opener_available {
+        buttons.push(("[i] Copy + open issue", UiAction::CopyAndOpenGitHubIssue));
+    }
     if error.gh_available {
         buttons.push(("[g] Fill GitHub issue", UiAction::FillGitHubIssue));
     }
@@ -5413,6 +5567,7 @@ fn render_error_popup(
 fn render_youtube_setup_popup(
     frame: &mut Frame<'_>,
     setup: &YouTubeSetupPopupView,
+    external_opener_available: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -5549,35 +5704,66 @@ fn render_youtube_setup_popup(
         .wrap(Wrap { trim: false }),
         guide_sections[0],
     );
+    let external_link_style = if external_opener_available {
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme.muted
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[F1] Google guide: ", theme.accent),
+            Span::styled(
+                if external_opener_available {
+                    "[F1] Google guide: "
+                } else {
+                    "Google guide: "
+                },
+                if external_opener_available {
+                    theme.accent
+                } else {
+                    theme.muted
+                },
+            ),
             Span::styled(
                 YOUTUBE_API_KEY_GUIDE_URL.trim_start_matches("https://"),
-                theme.accent.add_modifier(Modifier::UNDERLINED),
+                external_link_style,
             ),
         ]))
         .wrap(Wrap { trim: false }),
         guide_sections[1],
     );
-    hit_map
-        .youtube_setup_buttons
-        .push((UiAction::OpenYouTubeApiKeyGuide, guide_sections[1]));
+    if external_opener_available {
+        hit_map
+            .youtube_setup_buttons
+            .push((UiAction::OpenYouTubeApiKeyGuide, guide_sections[1]));
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[F2] Google Cloud: ", theme.accent),
+            Span::styled(
+                if external_opener_available {
+                    "[F2] Google Cloud: "
+                } else {
+                    "Google Cloud: "
+                },
+                if external_opener_available {
+                    theme.accent
+                } else {
+                    theme.muted
+                },
+            ),
             Span::styled(
                 GOOGLE_CLOUD_CREDENTIALS_URL.trim_start_matches("https://"),
-                theme.accent.add_modifier(Modifier::UNDERLINED),
+                external_link_style,
             ),
         ]))
         .wrap(Wrap { trim: false }),
         guide_sections[2],
     );
-    hit_map
-        .youtube_setup_buttons
-        .push((UiAction::OpenGoogleCloudCredentials, guide_sections[2]));
+    if external_opener_available {
+        hit_map
+            .youtube_setup_buttons
+            .push((UiAction::OpenGoogleCloudCredentials, guide_sections[2]));
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -5593,18 +5779,31 @@ fn render_youtube_setup_popup(
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[F3] Instance list: ", theme.accent),
+            Span::styled(
+                if external_opener_available {
+                    "[F3] Instance list: "
+                } else {
+                    "Instance list: "
+                },
+                if external_opener_available {
+                    theme.accent
+                } else {
+                    theme.muted
+                },
+            ),
             Span::styled(
                 INVIDIOUS_INSTANCES_URL.trim_start_matches("https://"),
-                theme.accent.add_modifier(Modifier::UNDERLINED),
+                external_link_style,
             ),
         ]))
         .wrap(Wrap { trim: false }),
         guide_sections[4],
     );
-    hit_map
-        .youtube_setup_buttons
-        .push((UiAction::OpenInvidiousInstances, guide_sections[4]));
+    if external_opener_available {
+        hit_map
+            .youtube_setup_buttons
+            .push((UiAction::OpenInvidiousInstances, guide_sections[4]));
+    }
 
     let storage = format!(
         "API key saves to: {}\nInvidious URL saves to: {}\nAPI keys are plaintext; Unix permissions: directories 0700, files 0600. Environment variables override saved values.{}",
@@ -7064,6 +7263,16 @@ fn key_action_with_page_rows(
     view: &ViewModel,
     page_rows: Option<usize>,
 ) -> Option<UiAction> {
+    key_action_with_page_rows_unfiltered(key, view, page_rows)
+        .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps one key before applying terminal-capability policy.
+fn key_action_with_page_rows_unfiltered(
+    key: KeyEvent,
+    view: &ViewModel,
+    page_rows: Option<usize>,
+) -> Option<UiAction> {
     if view.error_popup.is_some() {
         return match key.code {
             KeyCode::Esc => Some(UiAction::DismissErrorPopup),
@@ -7379,7 +7588,9 @@ fn key_action_with_page_rows(
         }
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
         KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
+        #[cfg(feature = "local-rename")]
         KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
+        #[cfg(feature = "local-move")]
         KeyCode::Char('m')
             if view.screen == Screen::Local
                 && !key.modifiers.intersects(
@@ -7388,26 +7599,31 @@ fn key_action_with_page_rows(
         {
             Some(UiAction::BeginLocalMove)
         }
+        #[cfg(feature = "local-move")]
         KeyCode::Char('J')
             if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
+        #[cfg(feature = "local-move")]
         KeyCode::Char('K')
             if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }
+        #[cfg(feature = "local-move")]
         KeyCode::Char('j')
             if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
+        #[cfg(feature = "local-move")]
         KeyCode::Char('k')
             if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }
+        #[cfg(feature = "local-trash")]
         KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
         KeyCode::Char('i')
             if view.screen == Screen::Subscriptions
@@ -7544,6 +7760,16 @@ fn key_action_with_page_rows(
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
+    mouse_action_unfiltered(mouse, hit_map, view)
+        .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps one pointer event before applying terminal-capability policy.
+fn mouse_action_unfiltered(
+    mouse: MouseEvent,
+    hit_map: &HitMap,
+    view: &ViewModel,
+) -> Option<UiAction> {
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         // Terminals conventionally reserve Shift-drag for native text
         // selection even while mouse reporting is enabled. Never turn the
@@ -11842,6 +12068,204 @@ mod tests {
     }
 
     #[test]
+    fn physical_linux_console_hides_and_blocks_external_openers() {
+        let attachment = TerminalAttachment {
+            linux: true,
+            stdin_is_terminal: true,
+            stdout_is_terminal: true,
+            term: Some("linux".to_owned()),
+            ssh: false,
+            tmux: false,
+            output_device: Some(PathBuf::from("/dev/tty3")),
+        };
+        let mut view = ViewModel {
+            external_opener_available: attachment.external_opener_available(),
+            details: Some(DetailView {
+                source: "YouTube".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                links: vec![DetailLinkView {
+                    label: "Fixture website".to_owned(),
+                    url: "https://example.com/fixture".to_owned(),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            selected_detail_link: Some(0),
+            ..ViewModel::default()
+        };
+        assert!(!view.external_opener_available);
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw physical-console details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(!rendered.contains("xdg-open"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| !action.requires_external_opener())
+        );
+        assert!(hit_map.detail_links.is_empty());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+                &view
+            ),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &view),
+            None
+        );
+
+        let stale_external_target = Rect::new(3, 4, 8, 1);
+        let stale_hit_map = HitMap {
+            detail_buttons: vec![(UiAction::OpenInBrowser, stale_external_target)],
+            description_video_actions: vec![(
+                UiAction::ActivateDescriptionVideo {
+                    video_id: "dQw4w9WgXcQ".to_owned(),
+                    start_seconds: None,
+                },
+                Rect::new(20, 4, 1, 1),
+            )],
+            ..HitMap::default()
+        };
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: stale_external_target.x,
+                    row: stale_external_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &stale_hit_map,
+                &view,
+            ),
+            None,
+            "a stale hit map must not bypass physical-console policy"
+        );
+        assert!(matches!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 20,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &stale_hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateDescriptionVideo { .. })
+        ));
+
+        view.youtube_setup_popup = Some(YouTubeSetupPopupView::default());
+        hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw physical-console setup popup");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("[F1]"));
+        assert!(!rendered.contains("[F2]"));
+        assert!(!rendered.contains("[F3]"));
+        assert_eq!(hit_map.youtube_setup_buttons.len(), 2);
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitYouTubeSetup)
+        );
+
+        view.youtube_setup_popup = None;
+        view.error_popup = Some(ErrorPopupView {
+            gh_available: true,
+            ..ErrorPopupView::default()
+        });
+        hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw physical-console error popup");
+        assert!(!rendered_text(&terminal).contains("Copy + open issue"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            Some(UiAction::FillGitHubIssue)
+        );
+    }
+
+    #[test]
+    fn graphical_pty_keeps_external_opener_controls_and_hotkeys() {
+        let attachment = TerminalAttachment {
+            linux: true,
+            stdin_is_terminal: true,
+            stdout_is_terminal: true,
+            term: Some("xterm-256color".to_owned()),
+            ssh: false,
+            tmux: false,
+            output_device: Some(PathBuf::from("/dev/pts/7")),
+        };
+        let view = ViewModel {
+            external_opener_available: attachment.external_opener_available(),
+            details: Some(DetailView {
+                source: "YouTube".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert!(view.external_opener_available);
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw PTY details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("[o] xdg-open video"));
+        assert!(rendered.contains("[O] xdg-open channel"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenInBrowser)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenInBrowser)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenChannelInBrowser)
+        );
+    }
+
+    #[test]
     fn history_details_omit_video_only_controls_and_statistics() {
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -13136,7 +13560,28 @@ mod tests {
         assert!(rendered_text(&terminal).contains("Reserved description row"));
     }
 
-    #[cfg(feature = "thumbnails")]
+    #[cfg(feature = "images")]
+    #[test]
+    fn linux_console_halfblocks_are_quantized_to_named_ansi_colors() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        buffer[(0, 0)].fg = Color::Rgb(250, 80, 90);
+        buffer[(0, 0)].bg = Color::Rgb(4, 7, 9);
+        buffer[(1, 0)].fg = Color::Indexed(42);
+        buffer[(2, 0)].fg = Color::Rgb(255, 255, 255);
+
+        quantize_linux_console_thumbnail(&mut buffer, Rect::new(0, 0, 2, 1));
+
+        assert_eq!(buffer[(0, 0)].fg, Color::LightRed);
+        assert_eq!(buffer[(0, 0)].bg, Color::Black);
+        assert_eq!(buffer[(1, 0)].fg, Color::Indexed(42));
+        assert_eq!(
+            buffer[(2, 0)].fg,
+            Color::Rgb(255, 255, 255),
+            "cells outside the rendered thumbnail must remain untouched"
+        );
+    }
+
+    #[cfg(feature = "images")]
     #[test]
     fn repeated_tui_frames_replace_loading_with_the_real_thumbnail_protocol() {
         use std::collections::BTreeSet;
@@ -13279,7 +13724,7 @@ mod tests {
         assert!(rendered.contains("Thumbnail unavailable: thumbnail download failed"));
     }
 
-    #[cfg(feature = "thumbnails")]
+    #[cfg(feature = "images")]
     #[test]
     fn revisited_subscription_artwork_is_ready_without_another_worker_request() {
         use std::time::{Duration, Instant};
@@ -16112,6 +16557,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_shortcuts_are_scoped_to_the_local_screen() {
         let local = ViewModel {
@@ -16159,6 +16605,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    #[cfg(feature = "local-move")]
     #[test]
     fn local_move_popup_renders_and_exposes_keyboard_and_mouse_controls() {
         let backend = TestBackend::new(120, 32);
@@ -16392,11 +16839,14 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn local_details_offer_move_for_files_and_folders_but_not_parent_navigation() {
-        for (title, renamable, movable, trashable) in [
+        for (title, requested_rename, requested_move, requested_trash) in [
             ("Album", false, true, true),
             ("01 - Track.flac", true, true, true),
             ("..", false, false, false),
         ] {
+            let renamable = requested_rename && cfg!(feature = "local-rename");
+            let movable = requested_move && cfg!(feature = "local-move");
+            let trashable = requested_trash && cfg!(feature = "local-trash");
             let backend = TestBackend::new(100, 18);
             let mut terminal = Terminal::new(backend).expect("terminal");
             let view = ViewModel {
@@ -16405,9 +16855,9 @@ prose 07:25 remains clickable but is not a chapter";
                     title: title.to_owned(),
                     source: "Local folder".to_owned(),
                     description: format!("Full path: /music/{title}"),
-                    local_renamable: renamable,
-                    local_movable: movable,
-                    local_trashable: trashable,
+                    local_renamable: requested_rename,
+                    local_movable: requested_move,
+                    local_trashable: requested_trash,
                     ..DetailView::default()
                 }),
                 ..ViewModel::default()

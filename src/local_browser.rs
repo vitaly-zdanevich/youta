@@ -262,39 +262,63 @@ pub trait LocalFileActions {
     fn move_file_to_trash(&mut self, path: &Path) -> io::Result<()>;
 }
 
-/// Production local-file actions using no-replace links and the system Trash.
+/// Production local-file actions selected by the granular mutation features.
 ///
 /// On Unix, a same-directory regular-file rename is implemented by creating a
 /// hard link at the validated new name and then unlinking the old name. The
 /// link creation is atomic and fails if the destination appears after
-/// validation, so an existing file is never overwritten.
-#[cfg(feature = "local")]
+/// validation, so an existing file is never overwritten. A method whose
+/// corresponding `local-rename` or `local-trash` feature is omitted returns
+/// [`io::ErrorKind::Unsupported`]; the TUI does not expose that action.
+#[cfg(any(feature = "local-rename", feature = "local-trash"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemLocalFileActions;
 
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local-rename", feature = "local-trash"))]
 impl LocalFileActions for SystemLocalFileActions {
     fn rename_file_no_replace(&mut self, source: &Path, target: &Path) -> io::Result<()> {
-        #[cfg(unix)]
+        #[cfg(feature = "local-rename")]
         {
-            fs::hard_link(source, target)?;
-            if let Err(error) = fs::remove_file(source) {
-                let _ = fs::remove_file(target);
-                return Err(error);
+            #[cfg(unix)]
+            {
+                fs::hard_link(source, target)?;
+                if let Err(error) = fs::remove_file(source) {
+                    let _ = fs::remove_file(target);
+                    return Err(error);
+                }
+                Ok(())
             }
-            Ok(())
+            #[cfg(not(unix))]
+            {
+                if target.exists() {
+                    return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+                }
+                fs::rename(source, target)
+            }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(feature = "local-rename"))]
         {
-            if target.exists() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(source, target)
+            let _ = (source, target);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this build omits local rename support",
+            ))
         }
     }
 
     fn move_file_to_trash(&mut self, path: &Path) -> io::Result<()> {
-        trash::delete(path).map_err(io::Error::other)
+        #[cfg(feature = "local-trash")]
+        {
+            trash::delete(path).map_err(io::Error::other)
+        }
+        #[cfg(not(feature = "local-trash"))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this build omits system Trash support",
+            ))
+        }
     }
 }
 

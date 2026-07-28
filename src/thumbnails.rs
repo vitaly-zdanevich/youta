@@ -20,11 +20,11 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 use std::fmt;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 use std::fs::File;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 use std::io::{BufReader, SeekFrom};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
@@ -44,6 +44,7 @@ use url::Url;
 
 use crate::config::ThumbnailMode;
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
+use crate::terminal_environment::{TerminalAttachment, is_linux_virtual_console};
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4_096;
@@ -64,13 +65,13 @@ const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
 const LOCAL_PREVIEW_MAGIC: &[u8; 8] = b"YTPRV001";
 const LOCAL_PREVIEW_HEADER_BYTES: usize = LOCAL_PREVIEW_MAGIC.len() + 4 + 4 + 1;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 const MAX_LOCAL_ARTWORK_READ_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 const MAX_LOCAL_ARTWORK_TAG_ITEM_BYTES: usize = MAX_DOWNLOAD_BYTES + 64 * 1024;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 const MAX_LOCAL_ARTWORK_PICTURES: usize = 64;
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CACHE_TEMPORARIES: LazyLock<Mutex<HashSet<PathBuf>>> =
@@ -88,6 +89,8 @@ pub enum ThumbnailProtocol {
     Iterm2,
     /// DEC Sixel graphics.
     Sixel,
+    /// Unicode upper-half-block rendering for a confirmed Linux virtual console.
+    Halfblocks,
 }
 
 impl ThumbnailProtocol {
@@ -96,6 +99,7 @@ impl ThumbnailProtocol {
             Self::Kitty => ProtocolType::Kitty,
             Self::Iterm2 => ProtocolType::Iterm2,
             Self::Sixel => ProtocolType::Sixel,
+            Self::Halfblocks => ProtocolType::Halfblocks,
         }
     }
 }
@@ -185,6 +189,8 @@ pub struct TerminalInfo {
     pub wezterm_pane: bool,
     /// Whether the process is nested inside tmux.
     pub tmux: bool,
+    /// Whether an SSH transport is present in the process environment.
+    pub ssh: bool,
     /// Resolved terminal device for standard output, when available.
     pub output_device: Option<PathBuf>,
     /// Cell width and height in pixels, when the terminal ioctl reports them.
@@ -203,6 +209,9 @@ impl TerminalInfo {
                 .as_deref()
                 .is_some_and(|value| value.starts_with("tmux"))
             || term_program.as_deref() == Some("tmux");
+        let ssh = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .into_iter()
+            .any(|name| std::env::var_os(name).is_some());
         Self {
             stdin_is_terminal: io::stdin().is_terminal(),
             stdout_is_terminal: io::stdout().is_terminal(),
@@ -212,13 +221,28 @@ impl TerminalInfo {
             kitty_window: std::env::var_os("KITTY_WINDOW_ID").is_some(),
             wezterm_pane: std::env::var_os("WEZTERM_PANE").is_some(),
             tmux,
+            ssh,
             output_device: std::fs::read_link("/proc/self/fd/1").ok(),
             font_size: terminal_font_size(),
         }
     }
 
+    /// Returns whether output is a directly attached Linux virtual console.
+    fn confirmed_linux_virtual_console(&self) -> bool {
+        TerminalAttachment {
+            linux: cfg!(target_os = "linux"),
+            stdin_is_terminal: self.stdin_is_terminal,
+            stdout_is_terminal: self.stdout_is_terminal,
+            term: self.term.clone(),
+            ssh: self.ssh,
+            tmux: self.tmux,
+            output_device: self.output_device.clone(),
+        }
+        .is_physical_linux_virtual_console()
+    }
+
     fn hard_unsupported(&self) -> bool {
-        if !self.stdin_is_terminal || !self.stdout_is_terminal || self.tmux {
+        if !self.stdin_is_terminal || !self.stdout_is_terminal || self.tmux || self.ssh {
             return true;
         }
         let Some(term) = self.term.as_deref() else {
@@ -226,12 +250,12 @@ impl TerminalInfo {
         };
         let normalized = term.to_ascii_lowercase();
         normalized == "dumb"
-            || normalized == "linux"
             || normalized.starts_with("vt")
-            || self
-                .output_device
-                .as_deref()
-                .is_some_and(is_plain_linux_console_or_serial)
+            || self.output_device.as_deref().is_some_and(|path| {
+                is_serial_terminal(path)
+                    || (is_linux_virtual_console(path) && !self.confirmed_linux_virtual_console())
+            })
+            || (normalized == "linux" && !self.confirmed_linux_virtual_console())
     }
 
     fn environment_protocol(&self) -> Option<ThumbnailProtocol> {
@@ -254,7 +278,9 @@ impl TerminalInfo {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if self.kitty_window || term.contains("kitty") {
+        if self.confirmed_linux_virtual_console() {
+            Some(ThumbnailProtocol::Halfblocks)
+        } else if self.kitty_window || term.contains("kitty") {
             Some(ThumbnailProtocol::Kitty)
         } else if self.wezterm_pane
             || term_program == "wezterm"
@@ -985,7 +1011,7 @@ fn decode_local_preview_record(bytes: &[u8]) -> Option<DynamicImage> {
 ///
 /// Messages intentionally omit the media path so callers can safely surface a
 /// concise failure without disclosing a private filesystem layout.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalArtworkError {
     /// The requested path was a symlink, directory, or another non-file object.
@@ -1034,7 +1060,7 @@ pub(crate) enum LocalArtworkError {
 /// Returns [`LocalArtworkError`] when the source is unsafe, changes during
 /// extraction, exceeds a hard limit, cannot be parsed, or cannot be persisted
 /// in the private cache.
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 pub(crate) fn cached_local_artwork(
     media_path: &Path,
     cache_directory: &Path,
@@ -1042,7 +1068,7 @@ pub(crate) fn cached_local_artwork(
     cached_local_artwork_with_extractor(media_path, cache_directory, extract_local_artwork)
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn cached_local_artwork_with_extractor<F>(
     media_path: &Path,
     cache_directory: &Path,
@@ -1081,7 +1107,7 @@ where
     cached_local_artwork_url(&cache, &cache_key).map(Some)
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn cached_local_artwork_url(
     cache: &ThumbnailCache,
     cache_key: &[u8],
@@ -1091,7 +1117,7 @@ fn cached_local_artwork_url(
     Url::from_file_path(path).map_err(|()| LocalArtworkError::CacheUrl)
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn extract_local_artwork(
     fingerprint: &LocalMediaFingerprint,
 ) -> Result<Option<ValidatedArtwork>, LocalArtworkError> {
@@ -1142,7 +1168,7 @@ fn extract_local_artwork(
     Ok(artwork)
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn local_picture_priority(picture_type: lofty::picture::PictureType) -> u8 {
     use lofty::picture::PictureType;
 
@@ -1153,10 +1179,10 @@ fn local_picture_priority(picture_type: lofty::picture::PictureType) -> u8 {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 struct ValidatedArtwork(Vec<u8>);
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl ValidatedArtwork {
     fn from_slice(bytes: &[u8]) -> Option<Self> {
         if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
@@ -1168,7 +1194,7 @@ impl ValidatedArtwork {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalMediaFingerprint {
     canonical_path: PathBuf,
@@ -1189,7 +1215,7 @@ struct LocalMediaFingerprint {
     modified_nanoseconds: i64,
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl LocalMediaFingerprint {
     fn capture(path: &Path) -> Result<Self, LocalArtworkError> {
         let supplied_metadata = fs::symlink_metadata(path).map_err(LocalArtworkError::SourceIo)?;
@@ -1262,7 +1288,7 @@ impl LocalMediaFingerprint {
     }
 }
 
-#[cfg(all(feature = "local", unix))]
+#[cfg(all(feature = "local-artwork", unix))]
 fn hash_local_path(digest: &mut Sha256, path: &Path) {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1271,7 +1297,7 @@ fn hash_local_path(digest: &mut Sha256, path: &Path) {
     digest.update(bytes);
 }
 
-#[cfg(all(feature = "local", windows))]
+#[cfg(all(feature = "local-artwork", windows))]
 fn hash_local_path(digest: &mut Sha256, path: &Path) {
     use std::os::windows::ffi::OsStrExt;
 
@@ -1282,14 +1308,14 @@ fn hash_local_path(digest: &mut Sha256, path: &Path) {
     }
 }
 
-#[cfg(all(feature = "local", not(any(unix, windows))))]
+#[cfg(all(feature = "local-artwork", not(any(unix, windows))))]
 fn hash_local_path(digest: &mut Sha256, path: &Path) {
     let path = path.as_os_str().to_string_lossy();
     digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
     digest.update(path.as_bytes());
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn hash_system_time(digest: &mut Sha256, time: Option<SystemTime>) {
     let Some(time) = time else {
         digest.update([0]);
@@ -1310,13 +1336,13 @@ fn hash_system_time(digest: &mut Sha256, time: Option<SystemTime>) {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 struct ReadBudget<R> {
     inner: R,
     remaining: usize,
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl<R> ReadBudget<R> {
     const fn new(inner: R, limit: usize) -> Self {
         Self {
@@ -1326,7 +1352,7 @@ impl<R> ReadBudget<R> {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl<R: Read> Read for ReadBudget<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -1347,28 +1373,28 @@ impl<R: Read> Read for ReadBudget<R> {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl<R: Seek> Seek for ReadBudget<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.inner.seek(position)
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 #[derive(Debug)]
 struct LocalArtworkReadLimit;
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl fmt::Display for LocalArtworkReadLimit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("embedded artwork read limit exceeded")
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl std::error::Error for LocalArtworkReadLimit {}
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn is_local_artwork_read_limit(error: &io::Error) -> bool {
     error
         .get_ref()
@@ -1376,7 +1402,7 @@ fn is_local_artwork_read_limit(error: &io::Error) -> bool {
         .is_some()
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn map_local_artwork_io(error: io::Error) -> LocalArtworkError {
     if is_local_artwork_read_limit(&error) {
         LocalArtworkError::LimitExceeded
@@ -1385,7 +1411,7 @@ fn map_local_artwork_io(error: io::Error) -> LocalArtworkError {
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 fn map_local_artwork_tag_error(error: lofty::error::LoftyError) -> LocalArtworkError {
     use lofty::error::ErrorKind;
 
@@ -1398,10 +1424,10 @@ fn map_local_artwork_tag_error(error: lofty::error::LoftyError) -> LocalArtworkE
     }
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 struct LoftyGlobalOptionsReset;
 
-#[cfg(feature = "local")]
+#[cfg(feature = "local-artwork")]
 impl Drop for LoftyGlobalOptionsReset {
     fn drop(&mut self) {
         lofty::config::apply_global_options(lofty::config::GlobalOptions::default());
@@ -2733,7 +2759,7 @@ fn terminal_font_size() -> Option<(u16, u16)> {
     ))
 }
 
-fn is_plain_linux_console_or_serial(path: &Path) -> bool {
+fn is_serial_terminal(path: &Path) -> bool {
     let text = path.to_string_lossy();
     if text == "/dev/console" {
         return true;
@@ -2741,9 +2767,7 @@ fn is_plain_linux_console_or_serial(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
-    (name.strip_prefix("tty").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })) || ["ttyS", "ttyUSB", "ttyACM", "rfcomm"]
+    ["ttyS", "ttyUSB", "ttyACM", "rfcomm"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
 }
@@ -2788,6 +2812,7 @@ pub(crate) mod tests {
             kitty_window: true,
             wezterm_pane: false,
             tmux: false,
+            ssh: false,
             output_device: Some(PathBuf::from("/dev/pts/7")),
             font_size: Some((9, 18)),
         }
@@ -2818,6 +2843,17 @@ pub(crate) mod tests {
         };
         assert_eq!(foot.environment_protocol(), Some(ThumbnailProtocol::Sixel));
 
+        let linux_console = TerminalInfo {
+            term: Some("linux".to_owned()),
+            kitty_window: false,
+            output_device: Some(PathBuf::from("/dev/tty3")),
+            ..kitty.clone()
+        };
+        assert_eq!(
+            linux_console.environment_protocol(),
+            Some(ThumbnailProtocol::Halfblocks)
+        );
+
         let unknown = TerminalInfo {
             term: Some("xterm-256color".to_owned()),
             kitty_window: false,
@@ -2827,12 +2863,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn automatic_detection_rejects_ttys_serial_tmux_and_missing_term() {
+    fn automatic_detection_rejects_unconfirmed_consoles_serial_ssh_and_tmux() {
         for terminal in [
             TerminalInfo {
                 term: Some("linux".to_owned()),
                 kitty_window: false,
-                output_device: Some(PathBuf::from("/dev/tty1")),
+                output_device: Some(PathBuf::from("/dev/pts/1")),
                 ..graphical_terminal()
             },
             TerminalInfo {
@@ -2842,6 +2878,13 @@ pub(crate) mod tests {
             },
             TerminalInfo {
                 tmux: true,
+                ..graphical_terminal()
+            },
+            TerminalInfo {
+                term: Some("linux".to_owned()),
+                kitty_window: false,
+                ssh: true,
+                output_device: Some(PathBuf::from("/dev/tty4")),
                 ..graphical_terminal()
             },
             TerminalInfo {
@@ -2869,7 +2912,7 @@ pub(crate) mod tests {
         let unsupported_info = TerminalInfo {
             term: Some("linux".to_owned()),
             kitty_window: false,
-            output_device: Some(PathBuf::from("/dev/tty2")),
+            output_device: Some(PathBuf::from("/dev/pts/2")),
             ..graphical_terminal()
         };
         let mut unsupported =
@@ -2877,6 +2920,29 @@ pub(crate) mod tests {
         let url = Url::parse("https://images.example/thumbnail.jpg").expect("fixture URL");
         assert!(!unsupported.synchronize(Some(&url), Rect::new(0, 0, 20, 8)));
         assert_eq!(unsupported.state(), &ThumbnailState::Unsupported);
+    }
+
+    #[test]
+    fn confirmed_linux_console_uses_halfblocks_without_terminal_queries() {
+        let console = TerminalInfo {
+            term: Some("linux".to_owned()),
+            kitty_window: false,
+            output_device: Some(PathBuf::from("/dev/tty2")),
+            font_size: None,
+            ..graphical_terminal()
+        };
+
+        let manager = ThumbnailManager::from_terminal_info(ThumbnailMode::Auto, &console);
+
+        assert_eq!(
+            manager.capability(),
+            ThumbnailCapability::Supported(ThumbnailProtocol::Halfblocks)
+        );
+        assert_eq!(manager.state(), &ThumbnailState::Idle);
+        assert_eq!(
+            manager.picker.as_ref().map(Picker::protocol_type),
+            Some(ProtocolType::Halfblocks)
+        );
     }
 
     #[test]
@@ -2898,7 +2964,7 @@ pub(crate) mod tests {
         let terminal = TerminalInfo {
             term: Some("linux".to_owned()),
             kitty_window: false,
-            output_device: Some(PathBuf::from("/dev/tty3")),
+            output_device: Some(PathBuf::from("/dev/pts/3")),
             ..graphical_terminal()
         };
         let mut manager = ThumbnailManager::from_terminal_info_with_cache(
@@ -4352,7 +4418,7 @@ pub(crate) mod tests {
         assert!(!rendered.contains("images.example"));
     }
 
-    #[cfg(feature = "local")]
+    #[cfg(feature = "local-artwork")]
     mod local_artwork {
         use std::cell::Cell;
         use std::fs::OpenOptions;

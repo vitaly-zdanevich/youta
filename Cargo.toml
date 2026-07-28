@@ -11,16 +11,32 @@ readme = "README.md"
 keywords = ["audio", "podcasts", "terminal", "tui", "youtube"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+[[bin]]
+name = "youta"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [[example]]
 name = "update_npr_stations"
 path = "examples/update_npr_stations.rs"
 required-features = ["radio"]
 
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["cli"]
+
 [features]
 default = [
+    "app",
+    "images",
+]
+
+# Complete application profile shared by default and text-only builds.
+# Image rendering and SQLite remain independent opt-in features.
+app = [
     "tui",
     "gpm",
-    "thumbnails",
     "local",
     "rss",
     "invidious",
@@ -48,11 +64,19 @@ default = [
     "yt-dlp",
 ]
 
+# Command-line parsing and the executable target.
+cli = ["dep:anyhow", "dep:clap"]
+
+# Portable local subscriptions and OPML interchange.
+subscriptions = ["dep:opml"]
+
 # Optional SQLite persistence for users who prefer one transactional database.
 sqlite-state = ["dep:rusqlite"]
 
 # User interface and playback backends.
 tui = [
+    "cli",
+    "subscriptions",
     "dep:chrono",
     "dep:crossbeam-channel",
     "dep:crossterm",
@@ -70,7 +94,8 @@ jack = []
 pulseaudio = []
 pipewire = []
 waveform = []
-thumbnails = [
+# Terminal artwork and thumbnail decoding and rendering.
+images = [
     "tui",
     "network",
     "dep:image",
@@ -78,11 +103,34 @@ thumbnails = [
     "dep:ratatui-image",
     "dep:sha2",
 ]
+# Compatibility alias for builds that used the original feature name.
+thumbnails = ["images"]
 keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
-local = ["dep:encoding_rs", "dep:lofty", "dep:rustix", "dep:trash"]
+# Compatibility umbrella retaining every Local-file capability.
+local = [
+    "local-browser",
+    "local-metadata",
+    "local-rename",
+    "local-trash",
+    "local-move",
+    "local-artwork",
+]
+# Read-only directory browsing and local-media playback.
+local-browser = []
+# Tag, codec, and technical metadata extraction.
+local-metadata = ["local-browser", "dep:encoding_rs", "dep:lofty"]
+# Restart-safe no-overwrite local-file renaming.
+local-rename = ["local-browser", "dep:rustix"]
+# Recoverable platform Trash integration.
+local-trash = ["local-browser", "dep:trash"]
+# No-overwrite file and directory movement with durable identity remapping.
+local-move = ["local-browser", "dep:rustix"]
+# Embedded and sidecar artwork discovery. Rendering additionally requires
+# `images`, so `local` remains usable in text-only builds.
+local-artwork = ["local-metadata"]
 rss = ["network", "dep:feed-rs"]
 invidious = ["network"]
 peertube = ["network"]
@@ -143,13 +191,13 @@ torrent = []
 bundled-sqlite = ["sqlite-state", "rusqlite/bundled"]
 
 [dependencies]
-anyhow = "1.0.104"
+anyhow = { version = "1.0.104", optional = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"], optional = true }
 crossbeam-channel = { version = "0.5.16", optional = true }
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
-opml = "1.1.6"
+opml = { version = "1.1.6", optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -170,7 +218,7 @@ mio = { version = "1.2.0", features = ["net", "os-ext", "os-poll"], optional = t
 trash = { version = "5.2.5", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 jpeg-decoder = { version = "0.3.2", default-features = false, optional = true }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros"], optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"], optional = true }
 quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
