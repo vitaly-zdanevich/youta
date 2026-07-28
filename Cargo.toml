@@ -68,7 +68,7 @@ app = [
 cli = ["dep:anyhow", "dep:clap"]
 
 # Portable local subscriptions and OPML interchange.
-subscriptions = ["dep:opml"]
+subscriptions = ["dep:opml", "dep:percent-encoding"]
 
 # Optional SQLite persistence for users who prefer one transactional database.
 sqlite-state = ["dep:rusqlite"]
@@ -132,7 +132,7 @@ local-move = ["local-browser", "dep:rustix"]
 # `images`, so `local` remains usable in text-only builds.
 local-artwork = ["local-metadata"]
 rss = ["network", "dep:feed-rs"]
-invidious = ["network"]
+invidious = ["network", "dep:percent-encoding"]
 peertube = ["network"]
 vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
@@ -198,6 +198,7 @@ crossbeam-channel = { version = "0.5.16", optional = true }
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 opml = { version = "1.1.6", optional = true }
+percent-encoding = { version = "2.3.2", optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -3010,6 +3010,7 @@ dependencies = [
  "lofty",
  "mio",
  "opml",
+ "percent-encoding",
  "predicates",
  "quick-xml",
  "ratatui",

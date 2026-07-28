@@ -35,7 +35,7 @@ use crate::config::{
     BandcampAudioFormat, DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout,
     ThumbnailMode,
 };
-use crate::domain::{Chapter, MediaId, MediaKind};
+use crate::domain::{Chapter, MediaId, MediaKind, decode_url_path_segment_once};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
@@ -3697,7 +3697,7 @@ enum InformationPanelKind {
 ///
 /// Display names are handled separately so UI text can never be converted
 /// into a guessed channel address.
-fn youtube_channel_handle(url: Option<&url::Url>) -> Option<&str> {
+fn youtube_channel_handle(url: Option<&url::Url>) -> Option<String> {
     let url = url?;
     if url.scheme() != "https"
         || !url.host_str().is_some_and(|host| {
@@ -3705,14 +3705,33 @@ fn youtube_channel_handle(url: Option<&url::Url>) -> Option<&str> {
                 || host.eq_ignore_ascii_case("www.youtube.com")
                 || host.eq_ignore_ascii_case("m.youtube.com")
         })
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
         return None;
     }
     let mut segments = url.path_segments()?;
-    let handle = segments.next()?;
-    (segments.next().is_none() && handle.starts_with('@') && handle.len() > 1).then_some(handle)
+    let handle = decode_url_path_segment_once(segments.next()?)?;
+    (segments.next().is_none()
+        && handle
+            .strip_prefix('@')
+            .is_some_and(valid_youtube_channel_display_alias))
+    .then_some(handle)
+}
+
+/// Checks a decoded handle before presenting it as an actionable channel URL.
+fn valid_youtube_channel_display_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && !matches!(alias, "." | "..")
+        && !alias.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+        })
 }
 
 fn render_information_panel(
@@ -3920,10 +3939,13 @@ fn render_information_panel(
         .map(|_| {
             let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
                 .or_else(|| {
-                    (!details.channel_name.trim().is_empty()).then_some(details.channel_name.trim())
+                    (!details.channel_name.trim().is_empty())
+                        .then(|| details.channel_name.trim().to_owned())
                 })
-                .or_else(|| (!details.title.trim().is_empty()).then_some(details.title.trim()))
-                .unwrap_or("channel");
+                .or_else(|| {
+                    (!details.title.trim().is_empty()).then(|| details.title.trim().to_owned())
+                })
+                .unwrap_or_else(|| "channel".to_owned());
             let label = button(
                 "O",
                 &format!("{} channel · {channel_label}", system_url_opener_name()),
@@ -12355,7 +12377,7 @@ mod tests {
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
                 channel_webpage_url: Some(
-                    url::Url::parse("https://www.youtube.com/@fixture")
+                    url::Url::parse("https://www.youtube.com/@ქართული")
                         .expect("fixture channel URL"),
                 ),
                 ..DetailView::default()
@@ -12390,7 +12412,7 @@ mod tests {
         assert!(rendered.contains("[s] Subscribe (locally)"));
         assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
         assert!(rendered.contains(&format!(
-            "[O] {} channel · @fixture",
+            "[O] {} channel · @ქართული",
             system_url_opener_name()
         )));
         let (_, subscribe_area) = hit_map

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::{Config, ConfigError};
+use crate::domain::decode_url_path_segment_once;
 
 /// A complete portable subscription document.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -343,6 +344,7 @@ fn safe_youtube_channel_website_url(url: &Url, channel_id: &str) -> bool {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.port().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || !url.host_str().is_some_and(|host| {
@@ -353,16 +355,37 @@ fn safe_youtube_channel_website_url(url: &Url, channel_id: &str) -> bool {
     {
         return false;
     }
-    let Some(segments) = url.path_segments() else {
+    let Some(segments) = url.path_segments().and_then(|segments| {
+        segments
+            .map(decode_url_path_segment_once)
+            .collect::<Option<Vec<_>>>()
+    }) else {
         return false;
     };
-    let segments = segments.collect::<Vec<_>>();
     match segments.as_slice() {
-        ["channel", candidate] => *candidate == channel_id,
-        [handle] => handle.starts_with('@') && handle.len() > 1,
-        [namespace @ ("c" | "user"), name] => !namespace.is_empty() && !name.is_empty(),
+        [namespace, candidate] if namespace == "channel" => {
+            candidate == channel_id && valid_youtube_channel_id(candidate)
+        }
+        [handle] => handle
+            .strip_prefix('@')
+            .is_some_and(valid_youtube_channel_website_alias),
+        [namespace, name] if matches!(namespace.as_str(), "c" | "user") => {
+            valid_youtube_channel_website_alias(name)
+        }
         _ => false,
     }
+}
+
+/// Checks one decoded YouTube handle or legacy channel-name segment.
+fn valid_youtube_channel_website_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && !matches!(alias, "." | "..")
+        && !alias.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+        })
 }
 
 /// One outline in a subscription tree.
@@ -838,23 +861,30 @@ mod tests {
 
     #[test]
     fn youtube_subscription_preserves_safe_preferred_channel_website() {
-        let mut tree = SubscriptionTree::default();
-        let handle = parse("https://www.youtube.com/@fixture");
+        for handle in [
+            parse("https://www.youtube.com/@fixture"),
+            parse("https://www.youtube.com/@ქართული"),
+        ] {
+            let mut tree = SubscriptionTree::default();
+            assert!(tree.subscribe_youtube_channel_with_website(
+                "Fixture channel",
+                "UCfixture",
+                Some(&handle),
+            ));
+            let xml = tree.to_opml().expect("serialize preferred channel URL");
+            assert!(
+                xml.contains(&format!("htmlUrl=\"{}\"", handle.as_str())),
+                "OPML must retain the validated canonical channel URL"
+            );
 
-        assert!(tree.subscribe_youtube_channel_with_website(
-            "Fixture channel",
-            "UCfixture",
-            Some(&handle),
-        ));
-        let xml = tree.to_opml().expect("serialize preferred channel URL");
-        assert!(xml.contains("htmlUrl=\"https://www.youtube.com/@fixture\""));
-
-        let restored = SubscriptionTree::from_opml(&xml).expect("restore preferred channel URL");
-        let flattened = restored.flattened_subscriptions();
-        let [FlattenedSubscription { subscription, .. }] = flattened.as_slice() else {
-            panic!("expected one restored subscription");
-        };
-        assert_eq!(subscription.website_url.as_ref(), Some(&handle));
+            let restored =
+                SubscriptionTree::from_opml(&xml).expect("restore preferred channel URL");
+            let flattened = restored.flattened_subscriptions();
+            let [FlattenedSubscription { subscription, .. }] = flattened.as_slice() else {
+                panic!("expected one restored subscription");
+            };
+            assert_eq!(subscription.website_url.as_ref(), Some(&handle));
+        }
     }
 
     #[test]
@@ -862,6 +892,9 @@ mod tests {
         for website in [
             parse("https://evil.example/@fixture"),
             parse("https://www.youtube.com/channel/UCdifferent"),
+            parse("https://www.youtube.com/@fixture%2Fwatch"),
+            parse("https://www.youtube.com/@fixture%252Fwatch"),
+            parse("https://www.youtube.com/c/%2E%2E"),
         ] {
             let mut tree = SubscriptionTree::default();
             assert!(tree.subscribe_youtube_channel_with_website(
@@ -871,7 +904,7 @@ mod tests {
             ));
             let xml = tree.to_opml().expect("serialize fallback channel URL");
             assert!(xml.contains("https://www.youtube.com/channel/UCfixture"));
-            assert!(!xml.contains(website.as_str()));
+            assert!(!xml.contains(&format!("htmlUrl=\"{}\"", website.as_str())));
         }
     }
 

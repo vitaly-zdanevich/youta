@@ -7,8 +7,38 @@
 use std::fmt;
 use std::net::IpAddr;
 
+#[cfg(any(feature = "invidious", feature = "subscriptions"))]
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
+
+/// Decodes one URL path segment after validating every percent escape.
+///
+/// The result is decoded exactly once. Callers must still validate the decoded
+/// value for their route grammar; in particular, an encoded delimiter becomes
+/// a literal delimiter for that validation rather than a second path segment.
+/// Invalid escapes and non-UTF-8 bytes are rejected.
+#[cfg(any(feature = "invidious", feature = "subscriptions"))]
+pub(crate) fn decode_url_path_segment_once(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let escape = bytes.get(index + 1..index + 3)?;
+            if !escape.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+
+    percent_decode_str(segment)
+        .decode_utf8()
+        .ok()
+        .map(std::borrow::Cow::into_owned)
+}
 
 /// Returns whether a remote URL names an explicitly non-public network host.
 ///
@@ -1272,6 +1302,25 @@ mod tests {
 
     fn id(value: &str) -> MediaId {
         MediaId::new(SourceKind::YouTube, value)
+    }
+
+    #[cfg(any(feature = "invidious", feature = "subscriptions"))]
+    #[test]
+    fn url_path_segment_decoding_is_strict_and_happens_once() {
+        assert_eq!(
+            decode_url_path_segment_once(
+                "%E1%83%A5%E1%83%90%E1%83%A0%E1%83%97%E1%83%A3%E1%83%9A%E1%83%98"
+            )
+            .as_deref(),
+            Some("ქართული")
+        );
+        assert_eq!(
+            decode_url_path_segment_once("%252Fwatch").as_deref(),
+            Some("%2Fwatch"),
+            "a second decoding pass could turn stored text into a route delimiter"
+        );
+        assert!(decode_url_path_segment_once("%ZZ").is_none());
+        assert!(decode_url_path_segment_once("%E1%83").is_none());
     }
 
     #[test]

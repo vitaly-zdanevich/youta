@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
+use crate::domain::decode_url_path_segment_once;
+
 use super::{
     ChannelDetails, ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary,
     ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
@@ -533,6 +535,7 @@ fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) 
     if parsed.scheme() != "https"
         || !parsed.username().is_empty()
         || parsed.password().is_some()
+        || parsed.port().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || !parsed.host_str().is_some_and(|host| {
@@ -544,11 +547,20 @@ fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) 
         return None;
     }
 
-    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    let segments = parsed
+        .path_segments()?
+        .map(decode_url_path_segment_once)
+        .collect::<Option<Vec<_>>>()?;
     let safe = match segments.as_slice() {
-        ["channel", channel_id] => *channel_id == expected_id,
-        [handle] => handle.starts_with('@') && handle.len() > 1,
-        [namespace @ ("c" | "user"), name] => !namespace.is_empty() && !name.is_empty(),
+        [namespace, channel_id] if namespace == "channel" => {
+            channel_id == expected_id && valid_youtube_channel_route_id(channel_id)
+        }
+        [handle] => handle
+            .strip_prefix('@')
+            .is_some_and(valid_youtube_channel_route_alias),
+        [namespace, name] if matches!(namespace.as_str(), "c" | "user") => {
+            valid_youtube_channel_route_alias(name)
+        }
         _ => false,
     };
     if !safe {
@@ -561,6 +573,27 @@ fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) 
         .pop_if_empty()
         .extend(segments);
     Some(url)
+}
+
+/// Checks a decoded stable YouTube channel identifier before URL rebuilding.
+fn valid_youtube_channel_route_id(channel_id: &str) -> bool {
+    !channel_id.is_empty()
+        && channel_id.len() <= 128
+        && channel_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Checks one decoded YouTube handle or legacy channel-name segment.
+fn valid_youtube_channel_route_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && !matches!(alias, "." | "..")
+        && !alias.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+        })
 }
 
 impl Provider for InvidiousProvider {
@@ -1301,6 +1334,33 @@ mod tests {
         assert!(
             youtube_channel_url_from_author(Some("https://evil.example/@fixture"), "UCfixture",)
                 .is_none()
+        );
+        for unsafe_route in [
+            "/@fixture%2Fwatch",
+            "/@fixture%252Fwatch",
+            "/@fixture%ZZ",
+            "/c/%2E%2E",
+            "/user/fixture/shorts",
+        ] {
+            assert!(
+                youtube_channel_url_from_author(Some(unsafe_route), "UCfixture").is_none(),
+                "{unsafe_route:?} must not become an official channel URL"
+            );
+        }
+    }
+
+    #[test]
+    fn invidious_author_url_decodes_and_reencodes_unicode_handle_once() {
+        let url = youtube_channel_url_from_author(Some("/@ქართული"), "UCfixture")
+            .expect("Unicode handle should be accepted");
+
+        assert_eq!(
+            url.as_str(),
+            "https://www.youtube.com/@%E1%83%A5%E1%83%90%E1%83%A0%E1%83%97%E1%83%A3%E1%83%9A%E1%83%98"
+        );
+        assert!(
+            !url.as_str().contains("%25E1"),
+            "an already encoded path segment must not be encoded a second time"
         );
     }
 

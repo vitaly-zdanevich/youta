@@ -47,7 +47,7 @@ use crate::domain::{
     Chapter, CommentTarget, HistoryEntry, MediaId, MediaItem, MediaKind, MediaLicense,
     MediaStatistics, PanelFocus, PlaybackProgress, PlaybackQueue, Playlist, PlaylistEntry,
     PlaylistMediaSnapshot, PlaylistSummary, PodcastShowSummary, QueueItem, Screen as StoredScreen,
-    SessionState, SourceKind, TODO_PLAYLIST_ID,
+    SessionState, SourceKind, TODO_PLAYLIST_ID, decode_url_path_segment_once,
 };
 use crate::links::{
     LinkTarget, is_advertisement_chapter_title, normalize_description_chapter_lines,
@@ -20735,19 +20735,24 @@ fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
     {
         return false;
     }
-    let Some(segments) = url.path_segments() else {
+    let Some(segments) = url.path_segments().and_then(|segments| {
+        segments
+            .map(decode_url_path_segment_once)
+            .collect::<Option<Vec<_>>>()
+    }) else {
         return false;
     };
-    let segments = segments.collect::<Vec<_>>();
     match segments.as_slice() {
         [handle] => handle
             .strip_prefix('@')
             .is_some_and(valid_youtube_channel_webpage_alias),
-        ["channel", candidate] => {
+        [namespace, candidate] if namespace == "channel" => {
             canonical_youtube_channel_url(candidate).is_some()
-                && (channel_id.is_empty() || *candidate == channel_id)
+                && (channel_id.is_empty() || candidate == channel_id)
         }
-        ["c" | "user", legacy_name] => valid_youtube_channel_webpage_alias(legacy_name),
+        [namespace, legacy_name] if matches!(namespace.as_str(), "c" | "user") => {
+            valid_youtube_channel_webpage_alias(legacy_name)
+        }
         _ => false,
     }
 }
@@ -25029,6 +25034,8 @@ mod tests {
             "https://www.youtube.com/redirect",
             "https://www.youtube.com/@",
             "https://www.youtube.com/@fixture%2Fwatch",
+            "https://www.youtube.com/@fixture%252Fwatch",
+            "https://www.youtube.com/@fixture%ZZ",
             "https://www.youtube.com/c/../watch",
             "https://www.youtube.com/user/fixture/shorts",
             "https://youtube.com@example.org/@fixture",
@@ -25062,6 +25069,7 @@ mod tests {
             "https://www.youtube.com/@fixture",
             "https://www.youtube.com/c/FixtureChannel",
             "https://www.youtube.com/user/fixture",
+            "https://www.youtube.com/@%E1%83%A5%E1%83%90%E1%83%A0%E1%83%97%E1%83%A3%E1%83%9A%E1%83%98",
         ] {
             let item = SearchItem::Channel(ChannelSummary {
                 channel_id: "UCfixture".to_owned(),
@@ -25079,6 +25087,31 @@ mod tests {
 
             assert_eq!(search_item_url(&item).as_deref(), Some(safe_url));
         }
+    }
+
+    #[test]
+    fn unicode_channel_webpage_survives_channel_detail_creation() {
+        let webpage_url = url::Url::parse("https://www.youtube.com/@ქართული")
+            .expect("Unicode channel fixture URL");
+        let channel = ChannelSummary {
+            channel_id: "UCfixture".to_owned(),
+            name: "ქართული არხი".to_owned(),
+            description: String::new(),
+            subscriber_count: None,
+            video_count: None,
+            created_at: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: Some(webpage_url.clone()),
+        };
+
+        let details = detail_from_channel(&channel, &SubscriptionTree::default());
+
+        assert_eq!(details.channel_webpage_url.as_ref(), Some(&webpage_url));
+        assert_eq!(
+            search_item_url(&SearchItem::Channel(channel)).as_deref(),
+            Some(webpage_url.as_str())
+        );
     }
 
     #[test]
