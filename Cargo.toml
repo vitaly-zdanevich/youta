@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -49,6 +49,7 @@ sqlite-state = ["dep:rusqlite"]
 # User interface and playback backends.
 tui = [
     "dep:chrono",
+    "dep:crossbeam-channel",
     "dep:crossterm",
     "dep:ratatui",
     "dep:toml_edit",
@@ -140,7 +141,7 @@ bundled-sqlite = ["sqlite-state", "rusqlite/bundled"]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4.6.4", features = ["derive"] }
-crossbeam-channel = "0.5.16"
+crossbeam-channel = { version = "0.5.16", optional = true }
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 opml = "1.1.6"

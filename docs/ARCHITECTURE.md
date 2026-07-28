@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.7.2`. Items marked **roadmap** are design decisions, not support
+present in `0.8.0`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -135,6 +135,12 @@ finished or never began. If both endpoints exist or both are missing, Youta
 does not guess: it blocks new moves and orderly quit until the user repairs the
 ambiguous filesystem state and retries.
 
+Local selection never parses media on the terminal thread. Filename, extension,
+and listing size render immediately; one short-lived worker reads tags and runs
+a five-second, stderr-discarding `ffprobe` process for the selected path.
+Completed records enter a 128-entry process-local LRU, and rapid navigation
+never queues more than one metadata read at a time.
+
 Apple Podcasts discovery is isolated from the YouTube routes. The tab uses a
 bounded, storefront-specific public catalogue search and persists only compact
 show summaries. Selecting a show does not resolve every result in advance;
@@ -189,7 +195,7 @@ RSS/podcast subscriptions, and Apple Podcasts shows. Stable provider IDs
 prevent identical display titles from colliding, and source notes remain
 independent from their child-media notes.
 
-Details exposes a selectable `[m] Add private note` or `[m] Edit private note`
+Details exposes a selectable `[n] Add private note` or `[n] Edit private note`
 action; the existing-note form is highlighted without placing the private body
 in `DetailView`, diagnostic snapshots, or error reports. The focused multiline
 popup accepts `Enter` for a newline, grapheme-safe `Backspace`, cursor movement,
@@ -285,6 +291,9 @@ chapters, completion, and repeat-one are disabled for that item, while
 listening-time checkpoints update source statistics without creating a
 position row. History and playlists persist the stable ID plus canonical
 homepage, then resolve the current built-in stream at replay time.
+Name and bitrate sorting are presentation choices: restart-safe session state
+persists the selected preset ID independently of its legacy numeric row, so
+changing the order cannot change the selected station after restart.
 
 At most one selected-or-playing Radio metadata request can be active.
 Provider metadata is preferred only while fresh, followed by player-observed
