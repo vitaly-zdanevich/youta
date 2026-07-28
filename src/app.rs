@@ -97,8 +97,9 @@ use crate::providers::bandcamp::{
 };
 #[cfg(feature = "bbc-radio")]
 use crate::providers::bbc::{
-    BbcLiveResolution, BbcLiveResolver, BbcStationPreset, STATIONS as BBC_STATIONS,
-    station_by_id as bbc_station_by_id, station_from_url as bbc_station_from_url,
+    BbcAudience, BbcLiveResolution, BbcLiveResolver, BbcStationPreset, BbcTransferFormat,
+    STATIONS as BBC_STATIONS, station_by_id as bbc_station_by_id,
+    station_from_url as bbc_station_from_url,
 };
 #[cfg(feature = "bbc-radio")]
 use crate::providers::radio::RadioStreamKind;
@@ -2232,6 +2233,43 @@ struct PendingBbcPlayback {
     origin: Option<AutoplayOrigin>,
 }
 
+/// Trusted, action-resolved BBC quality retained without its signed manifest.
+#[cfg(feature = "bbc-radio")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedBbcQuality {
+    codec: String,
+    bitrate_kbps: Option<u32>,
+    transfer_format: BbcTransferFormat,
+    audience: BbcAudience,
+}
+
+#[cfg(feature = "bbc-radio")]
+impl CachedBbcQuality {
+    /// Copies stable quality fields from one validated BBC resolution.
+    fn from_resolution(resolution: &BbcLiveResolution) -> Self {
+        Self {
+            codec: resolution.codec.to_ascii_uppercase(),
+            bitrate_kbps: resolution.bitrate_kbps,
+            transfer_format: resolution.transfer_format,
+            audience: resolution.audience,
+        }
+    }
+
+    /// Formats cached BBC quality without reparsing a display string.
+    fn display(&self) -> String {
+        let bitrate = self.bitrate_kbps.map_or_else(
+            || "bitrate not published".to_owned(),
+            |value| format!("{value} kbps"),
+        );
+        format!(
+            "{} · {bitrate} · {} · {}",
+            self.codec,
+            self.transfer_format.label(),
+            self.audience.label()
+        )
+    }
+}
+
 /// Station-scoped passive-metadata retry state.
 #[cfg(feature = "radio")]
 #[derive(Clone, Copy, Debug)]
@@ -2329,7 +2367,7 @@ pub struct AppController {
     /// Resolved BBC quality metadata retained for this process only.
     #[cfg(feature = "bbc-radio")]
     /// Last advertised BBC quality per station; signed manifests are never cached.
-    bbc_quality_cache: HashMap<String, String>,
+    bbc_quality_cache: HashMap<String, CachedBbcQuality>,
     /// Storefront-specific show summaries returned by Apple's public catalogue.
     apple_podcasts_results: Vec<PodcastShowSummary>,
     /// Current navigation level inside the Apple Podcasts tab.
@@ -3857,7 +3895,8 @@ impl AppController {
         };
         self.radio_filter_query.clear();
         self.radio_selected_station_id = Some(station.id.to_owned());
-        self.radio_selected = sorted_radio_stations(self.view.radio_sort)
+        self.radio_selected = self
+            .sorted_radio_stations(self.view.radio_sort)
             .iter()
             .position(|candidate| candidate.id == station.id)
             .unwrap_or_default();
@@ -12561,7 +12600,7 @@ impl AppController {
     #[cfg(feature = "radio")]
     fn populate_radio(&mut self) {
         let stations =
-            filtered_radio_stations(self.view.radio_sort, self.radio_filter_query.as_str());
+            self.filtered_radio_stations(self.view.radio_sort, self.radio_filter_query.as_str());
         let selected_id = self.radio_selected_station_id.clone().or_else(|| {
             self.view
                 .rows
@@ -12575,7 +12614,7 @@ impl AppController {
             .map(|station| RowView {
                 media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
                 title: station.name.to_owned(),
-                subtitle: radio_station_row_summary(station),
+                subtitle: self.radio_station_row_summary(station),
                 source: "Radio".to_owned(),
                 hide_watched_marker: true,
                 compact: true,
@@ -12637,12 +12676,69 @@ impl AppController {
             return;
         };
         self.radio_selected_station_id = Some(station.id.to_owned());
-        if let Some(index) = sorted_radio_stations(self.view.radio_sort)
+        if let Some(index) = self
+            .sorted_radio_stations(self.view.radio_sort)
             .iter()
             .position(|candidate| candidate.id == station.id)
         {
             self.radio_selected = index;
         }
+    }
+
+    /// Formats one stable Radio row, reusing action-resolved BBC quality when available.
+    #[cfg(feature = "radio")]
+    fn radio_station_row_summary(&self, station: &RadioStationPreset) -> String {
+        #[cfg(feature = "bbc-radio")]
+        if station.stream_kind == RadioStreamKind::BbcSounds {
+            return self
+                .bbc_quality_cache
+                .get(station.id)
+                .map(CachedBbcQuality::display)
+                .unwrap_or_else(|| "resolved on play · current region".to_owned());
+        }
+
+        radio_station_quality(station, false)
+    }
+
+    /// Returns the effective bitrate used by local Radio filtering and sorting.
+    #[cfg(feature = "radio")]
+    fn radio_station_bitrate(&self, station: &RadioStationPreset) -> Option<u32> {
+        #[cfg(feature = "bbc-radio")]
+        if station.stream_kind == RadioStreamKind::BbcSounds {
+            return self
+                .bbc_quality_cache
+                .get(station.id)
+                .and_then(|quality| quality.bitrate_kbps);
+        }
+
+        station.bitrate_kbps.map(u32::from)
+    }
+
+    /// Sorts Radio presets using action-resolved BBC bitrate when available.
+    #[cfg(feature = "radio")]
+    fn sorted_radio_stations(&self, sort: RadioSort) -> Vec<RadioStationPreset> {
+        sorted_radio_stations_by(sort, |station| self.radio_station_bitrate(station))
+    }
+
+    /// Checks a Radio preset against stable metadata and trusted cached quality.
+    #[cfg(feature = "radio")]
+    fn radio_station_matches_filter(&self, station: &RadioStationPreset, query: &str) -> bool {
+        let quality = self.radio_station_row_summary(station);
+        radio_station_matches_filter_with_quality(
+            station,
+            query,
+            &quality,
+            self.radio_station_bitrate(station),
+        )
+    }
+
+    /// Filters Radio presets using the same effective quality rendered in rows.
+    #[cfg(feature = "radio")]
+    fn filtered_radio_stations(&self, sort: RadioSort, query: &str) -> Vec<RadioStationPreset> {
+        self.sorted_radio_stations(sort)
+            .into_iter()
+            .filter(|station| self.radio_station_matches_filter(station, query))
+            .collect()
     }
 
     /// Starts one BBC Sounds manifest lookup while retaining only its stable page.
@@ -12718,14 +12814,12 @@ impl AppController {
                 return;
             }
         };
-        self.bbc_quality_cache
-            .insert(station_id.clone(), format_bbc_quality(&resolution));
-        if self.view.screen == Screen::Radio
-            && self
-                .selected_radio_station()
-                .is_some_and(|station| station.id == station_id)
-        {
-            self.update_radio_detail();
+        self.bbc_quality_cache.insert(
+            station_id.clone(),
+            CachedBbcQuality::from_resolution(&resolution),
+        );
+        if self.view.screen == Screen::Radio {
+            self.populate_radio();
         }
         let mut input = PlaybackInput::new(resolution.manifest_url.to_string());
         input.bypass_ytdl = true;
@@ -12749,7 +12843,7 @@ impl AppController {
         description.push_str("\n\nQuality: ");
         #[cfg(feature = "bbc-radio")]
         if let Some(quality) = self.bbc_quality_cache.get(station.id) {
-            description.push_str(quality);
+            description.push_str(&quality.display());
         } else if bbc_station_by_id(station.id).is_some() {
             description.push_str("resolved on play for the current region");
         } else {
@@ -20604,16 +20698,7 @@ fn radio_station_from_bbc(station: BbcStationPreset) -> RadioStationPreset {
 /// Formats public BBC selector metadata without exposing its transient URL.
 #[cfg(feature = "bbc-radio")]
 fn format_bbc_quality(resolution: &BbcLiveResolution) -> String {
-    let codec = resolution.codec.to_ascii_uppercase();
-    let bitrate = resolution.bitrate_kbps.map_or_else(
-        || "bitrate not published".to_owned(),
-        |value| format!("{value} kbps"),
-    );
-    format!(
-        "{codec} · {bitrate} · {} · {}",
-        resolution.transfer_format.label(),
-        resolution.audience.label()
-    )
+    CachedBbcQuality::from_resolution(resolution).display()
 }
 
 /// Iterates over every station visible in the Radio tab for this build.
@@ -20659,14 +20744,10 @@ fn radio_codec_label(codec: Option<RadioCodec>) -> &'static str {
         Some(RadioCodec::Flac) => "FLAC",
         Some(RadioCodec::Mp3) => "MP3",
         Some(RadioCodec::Opus) => "Opus",
+        Some(RadioCodec::Pcm) => "PCM",
         Some(RadioCodec::Vorbis) => "Ogg Vorbis",
         None => "not published",
     }
-}
-
-#[cfg(feature = "radio")]
-fn radio_station_row_summary(station: &RadioStationPreset) -> String {
-    radio_station_quality(station, false)
 }
 
 /// Returns the Radio catalogue in the requested deterministic display order.
@@ -20675,6 +20756,15 @@ fn radio_station_row_summary(station: &RadioStationPreset) -> String {
 /// an absent quality claim never outranks an advertised stream.
 #[cfg(feature = "radio")]
 fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
+    sorted_radio_stations_by(sort, |station| station.bitrate_kbps.map(u32::from))
+}
+
+/// Sorts Radio presets by an explicit effective-bitrate projection.
+#[cfg(feature = "radio")]
+fn sorted_radio_stations_by(
+    sort: RadioSort,
+    effective_bitrate: impl Fn(&RadioStationPreset) -> Option<u32>,
+) -> Vec<RadioStationPreset> {
     let mut stations: Vec<_> = all_stations().collect();
     stations.sort_by(|left, right| {
         let name_order = || {
@@ -20686,7 +20776,7 @@ fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
         match sort {
             RadioSort::Name => name_order(),
             RadioSort::BitrateDescending | RadioSort::BitrateAscending => {
-                let bitrate_order = match (left.bitrate_kbps, right.bitrate_kbps) {
+                let bitrate_order = match (effective_bitrate(left), effective_bitrate(right)) {
                     (Some(left), Some(right)) => {
                         if sort == RadioSort::BitrateDescending {
                             right.cmp(&left)
@@ -20711,7 +20801,7 @@ fn sorted_radio_stations(sort: RadioSort) -> Vec<RadioStationPreset> {
 /// now-playing text. Visible quality labels and their raw numeric values make
 /// filters such as `flac`, `aac`, `320`, and `44100 stereo` useful. Stereo is
 /// searchable even though the routine two-channel label is omitted from rows.
-#[cfg(feature = "radio")]
+#[cfg(all(feature = "radio", test))]
 fn filtered_radio_stations(sort: RadioSort, query: &str) -> Vec<RadioStationPreset> {
     sorted_radio_stations(sort)
         .into_iter()
@@ -20720,12 +20810,26 @@ fn filtered_radio_stations(sort: RadioSort, query: &str) -> Vec<RadioStationPres
 }
 
 /// Checks one Radio preset against whitespace-separated local filter terms.
-#[cfg(feature = "radio")]
+#[cfg(all(feature = "radio", test))]
 fn radio_station_matches_filter(station: &RadioStationPreset, query: &str) -> bool {
     let quality = radio_station_quality(station, true);
-    let raw_bitrate = station
-        .bitrate_kbps
-        .map_or_else(String::new, |value| value.to_string());
+    radio_station_matches_filter_with_quality(
+        station,
+        query,
+        &quality,
+        station.bitrate_kbps.map(u32::from),
+    )
+}
+
+/// Checks one Radio preset with an explicit effective quality projection.
+#[cfg(feature = "radio")]
+fn radio_station_matches_filter_with_quality(
+    station: &RadioStationPreset,
+    query: &str,
+    quality: &str,
+    effective_bitrate: Option<u32>,
+) -> bool {
+    let raw_bitrate = effective_bitrate.map_or_else(String::new, |value| value.to_string());
     let raw_sample_rate = station
         .sample_rate_hz
         .map_or_else(String::new, |value| value.to_string());
@@ -20751,6 +20855,9 @@ fn radio_station_matches_filter(station: &RadioStationPreset, query: &str) -> bo
 }
 
 /// Formats only trustworthy quality attributes supplied by the preset.
+///
+/// FLAC's missing encoded bitrate is content-dependent and distinct from
+/// metadata that a lossy-stream publisher did not provide.
 #[cfg(feature = "radio")]
 fn radio_station_quality(station: &RadioStationPreset, include_unknown_bitrate: bool) -> String {
     let mut parts = Vec::with_capacity(4);
@@ -20759,6 +20866,8 @@ fn radio_station_quality(station: &RadioStationPreset, include_unknown_bitrate: 
     }
     if let Some(rate) = station.bitrate_kbps {
         parts.push(format!("{rate} kbps"));
+    } else if station.codec == Some(RadioCodec::Flac) {
+        parts.push("variable bitrate".to_owned());
     } else if include_unknown_bitrate {
         parts.push("bitrate unknown".to_owned());
     }
@@ -34633,13 +34742,13 @@ mod tests {
         let sector_index = select_radio_station(&mut controller, "sector-radio-progressive-flac");
         assert_eq!(
             controller.view.rows[sector_index].subtitle,
-            "FLAC · 44.1 kHz"
+            "FLAC · variable bitrate · 44.1 kHz"
         );
         let details = controller.view.details.as_ref().expect("radio details");
         assert!(
             details
                 .description
-                .contains("Quality: FLAC · bitrate unknown · 44.1 kHz")
+                .contains("Quality: FLAC · variable bitrate · 44.1 kHz")
         );
         assert!(!details.description.contains("stereo"));
         assert!(
@@ -34650,6 +34759,83 @@ mod tests {
         assert!(details.length.is_empty());
         assert!(details.likes.is_empty());
         assert!(details.views.is_empty());
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn curated_radio_rows_never_render_literal_quality_unknown() {
+        let config = Config::for_dir("/tmp/youta-radio-curated-quality-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.show_screen(Screen::Radio);
+
+        for station in RADIO_STATIONS {
+            let row = controller
+                .view
+                .rows
+                .iter()
+                .find(|row| {
+                    row.media_id
+                        .as_ref()
+                        .is_some_and(|media_id| media_id.external_id == station.id)
+                })
+                .unwrap_or_else(|| panic!("missing curated Radio row: {}", station.id));
+            assert_ne!(
+                row.subtitle, "quality unknown",
+                "{} must expose its reviewed static quality",
+                station.id
+            );
+        }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn curated_flac_without_nominal_bitrate_renders_variable_bitrate() {
+        let stations = RADIO_STATIONS
+            .iter()
+            .filter(|station| {
+                station.codec == Some(RadioCodec::Flac) && station.bitrate_kbps.is_none()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!stations.is_empty(), "the FLAC regression set must exist");
+        for station in stations {
+            assert!(
+                radio_station_quality(station, false).contains("variable bitrate"),
+                "{} compact quality must describe content-dependent FLAC bitrate",
+                station.id
+            );
+            assert!(
+                radio_station_quality(station, true).contains("variable bitrate"),
+                "{} detailed quality must describe content-dependent FLAC bitrate",
+                station.id
+            );
+        }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn listen_moe_row_and_details_disclose_available_quality() {
+        let config = Config::for_dir("/tmp/youta-radio-listen-moe-quality-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.show_screen(Screen::Radio);
+        let index = select_radio_station(&mut controller, "listen-moe");
+
+        assert_eq!(controller.view.rows[index].subtitle, "Opus · 48 kHz");
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("LISTEN.moe details");
+        assert!(
+            details
+                .description
+                .contains("Quality: Opus · bitrate unknown · 48 kHz")
+        );
+        assert!(!details.description.contains("variable bitrate"));
     }
 
     #[cfg(feature = "bbc-radio")]
@@ -34710,6 +34896,20 @@ mod tests {
         controller.show_screen(Screen::Radio);
         select_radio_station(&mut controller, "bbc_radio_three");
         let item = fixture_radio_item("bbc_radio_three");
+        let initial_row = controller
+            .view
+            .rows
+            .iter()
+            .find(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == "bbc_radio_three")
+            })
+            .expect("BBC Radio 3 row");
+        assert_eq!(
+            initial_row.subtitle, "resolved on play · current region",
+            "region-specific BBC quality must not be reported as unknown"
+        );
 
         controller.play_queue_item(item.clone(), false);
 
@@ -34745,13 +34945,67 @@ mod tests {
             controller
                 .bbc_quality_cache
                 .get(&station_id)
-                .map(String::as_str),
+                .map(CachedBbcQuality::display)
+                .as_deref(),
             Some("AAC · 320 kbps · HLS · international")
+        );
+        let refreshed_row = controller
+            .view
+            .rows
+            .iter()
+            .find(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == station_id)
+            })
+            .expect("resolved BBC Radio 3 row");
+        assert_eq!(
+            refreshed_row.subtitle,
+            "AAC · 320 kbps · HLS · international"
         );
         assert!(controller.view.details.as_ref().is_some_and(|details| {
             details
                 .description
                 .contains("Quality: AAC · 320 kbps · HLS · international")
+        }));
+
+        let resolved_station = station_by_id(&station_id).expect("resolved BBC fixture");
+        assert!(
+            controller.radio_station_matches_filter(&resolved_station, "aac 320 hls international")
+        );
+        controller.view.radio_sort = RadioSort::BitrateDescending;
+        controller.populate_radio();
+        let resolved_index = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == station_id)
+            })
+            .expect("resolved BBC row in bitrate order");
+        let four_duk_index = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.external_id == "4duk-radio")
+            })
+            .expect("256 kbps comparison row");
+        assert!(
+            resolved_index < four_duk_index,
+            "resolved 320 kbps BBC quality must participate in bitrate sorting"
+        );
+
+        controller.radio_filter_query = "aac 320 hls international".to_owned();
+        controller.populate_radio();
+        assert!(controller.view.rows.iter().any(|row| {
+            row.media_id
+                .as_ref()
+                .is_some_and(|media_id| media_id.external_id == station_id)
         }));
 
         controller.play_queue_item(item, false);
@@ -34872,6 +35126,7 @@ mod tests {
             (Some(RadioCodec::Flac), "FLAC"),
             (Some(RadioCodec::Mp3), "MP3"),
             (Some(RadioCodec::Opus), "Opus"),
+            (Some(RadioCodec::Pcm), "PCM"),
             (Some(RadioCodec::Vorbis), "Ogg Vorbis"),
             (None, "not published"),
         ];
@@ -34921,6 +35176,30 @@ mod tests {
         assert!(radio_station_matches_filter(&station, "aac 320"));
         assert!(!radio_station_matches_filter(&station, "flac"));
         assert!(!radio_station_matches_filter(&station, "speech"));
+
+        station.bitrate_kbps = None;
+        station.codec = Some(RadioCodec::Flac);
+        assert_eq!(
+            radio_station_quality(&station, false),
+            "FLAC · variable bitrate · 44.1 kHz"
+        );
+        assert!(radio_station_matches_filter(&station, "variable bitrate"));
+
+        for (codec, label) in [
+            (RadioCodec::Opus, "Opus"),
+            (RadioCodec::Vorbis, "Ogg Vorbis"),
+        ] {
+            station.codec = Some(codec);
+            assert_eq!(
+                radio_station_quality(&station, false),
+                format!("{label} · 44.1 kHz")
+            );
+            assert_eq!(
+                radio_station_quality(&station, true),
+                format!("{label} · bitrate unknown · 44.1 kHz")
+            );
+            assert!(!radio_station_matches_filter(&station, "variable bitrate"));
+        }
 
         station.channels = Some(1);
         assert!(

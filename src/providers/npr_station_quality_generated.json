@@ -1,0 +1,3988 @@
+{
+  "format_version": 1,
+  "last_probe_attempt_on": "2026-07-28",
+  "services": {
+    "00b035ccf998440088d2a5d6e39f05c1": {
+      "stream_url": "https://icecast.will.illinois.edu/WILL-Classical",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "01102cd581834690b6bd8092bef58b09": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WQCSFM_RRS_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "0457e4a367db4374b61381a07eee9875": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WESMFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0550ce9a8bac47b59b58270c5d122946": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/wypr-1-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "08c583db532047358e6b1b834119e1ac": {
+      "stream_url": "https://wpln.streamguys1.com/wnxpfm.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "0bcaf3720f6746b2b549c24ccee86359": {
+      "stream_url": "https://wgbh-live.streamguys1.com/BostonEarlyMusic-8112",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0bd3e320710548aea9a95d4597354389": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WITFFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "0c5fc739639844848d4bd9835db1542f": {
+      "stream_url": "https://kera.streamguys1.com/wrrlive",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0c850ef16a2d4b76a59b0bcedae05a94": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KPCWFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0d27ef132036461e96973c2e3a141505": {
+      "stream_url": "https://wshu-iad.streamguys1.com/wshu-classical",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0dc474e85a824b9cb438d64ae147d66e": {
+      "stream_url": "https://peridot.streamguys1.com:7835/WUCF_QL",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0e0afb32855245d28be29cf46f415b7a": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTPRFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "0faffbf5da6a4017a0bdf3b47d3cd780": {
+      "stream_url": "https://stream.cinradio.org/wvxuhd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "0fdb4fbbc8584b5591ad9819579a4800": {
+      "stream_url": "https://live.streamguys1.com:2385/troy1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 160,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "109ab39a548148d7a06a88674b0ff6ed": {
+      "stream_url": "https://utulsa.streamguys1.com/KWGSHD2-MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "10c75c9e0de143aba481444cb7e1b70f": {
+      "stream_url": "https://quarrel.streamguys1.com:7405/wtjxfm",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13d8e00399c00fc4a0295f4afccf587b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUOWFM_LOW_MP3.mp3?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "13d8ea16a6d002d42439606ea0f2919e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WTEBFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "13dcbbb26a803284706af9dec180e7da": {
+      "stream_url": "https://stream.wbez.org/WBEZ-npr128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcbf0e6c5018d4bf989c43bda1c731": {
+      "stream_url": "https://wlrn.streamguys1.com/wlrn-news-npr/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcbf47aec03a44b13ab5fa9c2b2c0c": {
+      "stream_url": "https://wlrn.streamguys1.com/wlrn-classical-npr/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcc34a3bd02ad49b194c9d870d0dcb": {
+      "stream_url": "https://kpbs.streamguys1.com/kpbs-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcc43d3ac03e447dc85f99b1197d02": {
+      "stream_url": "https://knkx-live-a.edge.audiocdn.com/6284_128k?aw_0_1st.playerid=stationconnect",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcc5b8752013a4a85ab4625893396b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WAMCFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13dcc6ea338028045d0a23450ed29a4c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCCUFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13e3dc0e2e2012a4d19b1eb5a8003e89": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WIAAFM.mp3?dist=IPRWebsite",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13e484f2d8502a545dfb0f3b1456fb3d": {
+      "stream_url": "https://kmuw.streamguys1.com:80/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13ed3374a91011149c4b41bef70b8fbf": {
+      "stream_url": "https://war.streamguys1.com:7883/wdiy_7880",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13efb13be6f0117418e906a2db1d5eb9": {
+      "stream_url": "https://onair.wfuv.org/onair-hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13efb515e25035d44d6a940ffed563f0": {
+      "stream_url": "https://wxpn.xpn.org/xpn2mp3hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13efbfa4a8101a148f7a75cef72df682": {
+      "stream_url": "https://boisestate.streamguys1.com/Music1-aac-128k-icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13f0f97cd6700b74b9ea02f16b004165": {
+      "stream_url": "https://northernpr.streamguys1.com/WNIJ",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "13f0f997ac6006643d7900d240f4dccd": {
+      "stream_url": "https://northernpr.streamguys1.com/WNIU",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "13f0fb3328c02244ea988707b7816b25": {
+      "stream_url": "https://wyoming-public-ice.streamguys1.com/CLS128MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13f0fd17cc70277448dae1e3fcf78abe": {
+      "stream_url": "https://lpm.streamguys1.com/wuol-npr.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 112,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13f1aa85fe4027c477dbe71ea5ab902d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/CLASSICALSTREAM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13f1f33492900b9459c92b3e3ad6a5ad": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMPNFM_56_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "13f1feffd5c00544adcb58fb15f6f42d": {
+      "stream_url": "https://wvia.streamguys1.com:80/WVIAHD3AAC",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "13f20281f1a02e24834b971527a3436e": {
+      "stream_url": "https://peridot.streamguys1.com:7145/live",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "13f5cfa2bd602064d36af42879862023": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WDDEFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "13f77d802ff029f4467964761c4c1667": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUAL_HD1.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "14059639f7b034348bb80a2bf3cf878f": {
+      "stream_url": "https://wvik.streamguys1.com/live.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "140798c275903c94f228a473afc677c0": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KNAUFM_128_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1407e9b183400d448e6b25894a71b84d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WAERHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "1408787f75c02344497bfdc372cfbe4e": {
+      "stream_url": "https://live.ideastream.org/wclv.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "140bb5f1ce501ad495b94d147fa391df": {
+      "stream_url": "https://wuky.streamguys1.com/HD3",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "141ff585a400170430aaa9cb7f915d80": {
+      "stream_url": "https://peridot.streamguys1.com:5095/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 100,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "141ff619289025943549c5910e22c55b": {
+      "stream_url": "https://ais-sa1.streamon.fm/7891_96k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 99,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "1424de07e71017945cdb421c098e90f9": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMEA_CLASSICAL.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "1426c044e7e036e45eaabe92d0532232": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WLPRFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "144b2496e3c02bc4d1db87c3743262da": {
+      "stream_url": "https://war.streamguys1.com:8435/",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 140,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "145d81550b603064ac48b20004f39c54": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRKFHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "146aae6222b00f34d6092094490f84df": {
+      "stream_url": "https://kcbx-ice.streamguys1.com/kcbx-hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1478241397601a6475caaba0eece618f": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WAERFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "147a4167a6274cfa9ff0a3ce5150ab78": {
+      "stream_url": "https://wshu.streamguys.org/wshu-baroque-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "147f536b793028b45e0911ecd295edf8": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WVPEHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "148603a81d00090492fb94eb60450d93": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMEAFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "14879cb9397032f441eb073028c44cbb": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WEMUFM_ADP.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "148f0be433303cb44d1b831fafaa54af": {
+      "stream_url": "https://wvpublic.streamguys1.com/wvpb",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "1499bb447b102b94e998bdfab0f55100": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WLTRFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1499bbaada2000a440bbf90fb72744b2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRJAFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "149a034ea8f035f44e2ba21212549dc8": {
+      "stream_url": "https://hls.kansaspublicradio.org/kpr2/kpr_2_hls.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "14b3d09c63e02d64e9d89d2ca4954b93": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUOWFM_HIGH_MP3.mp3?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "14b506ffe5d0365414c97a7982b36415": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WAMCHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "14b79c94bd1010146c592f11fc322a99": {
+      "stream_url": "https://wgbh-live.streamguys1.com/wgbh_hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 67,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "14b9974dad500dd48218bad2f682df5b": {
+      "stream_url": "https://whqr.streamguys1.com/whqr_hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "185286ff474a4bdeb79c0cf7676c54e4": {
+      "stream_url": "https://stream.wmnf.org:4443/wmnf_hd3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 170,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "18756ed6f42b4a72bbc4421abac5ba5b": {
+      "stream_url": "https://azpm.streamguys1.com/kuat/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "1988f4ab591549c9af51bf062d6055f0": {
+      "stream_url": "https://kjzz.streamguys1.com/kjzzhd2_mp3_128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "19f05585986f4b52a90c1b1804a90263": {
+      "stream_url": "https://uprxstreamer.usu.edu:8022/",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "19fa87befe604a0d85f2b2b7a677e364": {
+      "stream_url": "https://wucx.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1af05d6483f84f2b99d64051830114bc": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WJCT_HD4AAC_SC?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1be4f55462ab458bb8acce24c365962f": {
+      "stream_url": "https://wnmu.streamguys1.com/wnmu-fm",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "1c614cd30b6a4fd083b72e18247ba189": {
+      "stream_url": "https://kzyx.mcn.org/kzyxlive",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "1f82853428b341b3ba3f057cbadb48d9": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KAMPUS_FMAAC.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "21364efa5ec74605983201d630fd0652": {
+      "stream_url": "https://kamu.streamguys1.com/hd1-192",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "248c3f87070e4fc3a026586db60e483e": {
+      "stream_url": "https://northernpr.streamguys1.com/NIRIS",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "255c4d51316e48a19254cf9582f6869a": {
+      "stream_url": "https://live.amperwave.net/direct/wncpr-wcqshd2mp3128-ibc4",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "258d7b8f72ea439980205b5233f058dc": {
+      "stream_url": "https://wyms.streamguys1.com/hyfin",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "272cdb2be373448587ac93b05f603b6e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WJCT_HD2AAC_SC?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "2b3367a0dba94ec3ac3c8867136a4343": {
+      "stream_url": "https://whcp.broadcasttool.stream/whcp",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "2b89187c32aa420e8dc81348cdb70ba6": {
+      "stream_url": "https://uprxstreamer.usu.edu:8028/",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "2c295a62b7b54b5b9be902d6e8824ed1": {
+      "stream_url": "https://stream.wbez.org/vocalo128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "2ebca61667b545b99a791bd8a4f5bade": {
+      "stream_url": "https://media.publicbroadcasting.net/kbut/newscast/newscast.wav",
+      "probed_on": "2026-07-28",
+      "codec": "pcm",
+      "bitrate_kbps": 3072,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "304dac4bd55146998d3d5867f5919c51": {
+      "stream_url": "https://streams.audio.wgbh.org/holiday4.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "308efd7d9c234bf28ed6d1e6e7b4be6f": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KDAQHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "3099b743f7b54a338eb31d3863d7b127": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCTIAM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "30bc9a5b9a574c42a6991381e02fe302": {
+      "stream_url": "https://thesiren.stream.publicradio.org/thesiren.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "30c598bc79e145ab94b92363b1588bde": {
+      "stream_url": "https://studioone-stream.iowapublicradio.org/StudioOne.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "31993d7a786b4e7b9a884c927fa48bca": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCNVFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "319bf4f7a04e466db3f93561a7b25bbf": {
+      "stream_url": "https://wfyi-live.streamguys1.com//wbaa-classical",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "321eed34f1cc4a91afd37ba79220e678": {
+      "stream_url": "https://wfae-ice.streamguys1.com/wfae2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "32fa6480d53c4f8cb974b7275ad64f94": {
+      "stream_url": "https://kucb.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 100,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "33417b996b3344fcbbf81006a1bcf1bd": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KVHLFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "359bce742fa74cdc8602796981373aff": {
+      "stream_url": "https://wboi.streamguys1.com/wboifm.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "35fc64fabb704132bd4b18ef743b251b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WFNOBBCWS.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "3625a5e3105b496b9236b8dd6c6bfaa4": {
+      "stream_url": "https://stream.wmnf.org:4443/wmnf_hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 170,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "37735a69c04e430ebc7a4016785ee1ad": {
+      "stream_url": "https://cms.stream.publicradio.org/cms.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "3883ccabb8574cbf9e03c1a4ae2e9263": {
+      "stream_url": "https://amber.streamguys1.com:5545/live",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "39c33aefd81f4eb39e189f3946c463f8": {
+      "stream_url": "https://dal-wku-stream-2.neighborhoodca.com/xstream",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "3cecb3068caf484098a0e780dd49d8a7": {
+      "stream_url": "https://wfyi-iad.streamguys1.com/wfyi-hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "3d07c03fb0f645b8a9d26e9e6fd47a7a": {
+      "stream_url": "https://kunr.streamguys1.com/kncj",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "400ba972905346dda8d2cf2c31ba1ab8": {
+      "stream_url": "https://vprclassical.streamguys1.com/vprclassical128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "44adbffc36594665a3c1023109d1db47": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WNEDFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4776b03067c84c81b3e1c4e1ca7b1266": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/hd2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4845e6714d3f4410ae366954eb90d31a": {
+      "stream_url": "https://wncw-live-a.edge.audiocdn.com/6286_56k.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "48bbf18a64eb49aaba0da6300e0fc713": {
+      "stream_url": "https://vpr.streamguys1.com/vpr64.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4903d5f458824437ae3d38a037829b23": {
+      "stream_url": "https://kbbi.streamguys1.com/xstream",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4936cbfa73bc4e1bb0953c74821811e7": {
+      "stream_url": "https://dal-wku-stream-1.neighborhoodca.com/stream",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4af28a8c6b944e2f90a3766dfacf0e5d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WOUBAM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4ba5b3dadd9a42cfb3c60e1f34921695": {
+      "stream_url": "https://10gb1.tulix.tv/WLVR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4ce93d27f3084aa69324eb658b07decc": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WQCSFM_HD3_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf712f0e98465e99293bcc196a2dae": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMPNHD3_56_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf712f19b4413b80330354e9ed3769": {
+      "stream_url": "https://wuky.streamguys1.com/TheBreak",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf712f20a847138e81faf780f3eb41": {
+      "stream_url": "https://wuky.streamguys1.com/wuky",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713000354d86bd124529c1c1f01f": {
+      "stream_url": "https://ais-sa15.cdnstream1.com/4550_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713102934c6da8c4f8964c59d4f8": {
+      "stream_url": "https://hls.kansaspublicradio.org/kpr1/kpr_1_hls.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713110c243cb85bdd689887d3a2b": {
+      "stream_url": "https://hls.houstonpublicmedia.org/classical/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713115394435a8938fa6aceb2a1b": {
+      "stream_url": "https://hls.houstonpublicmedia.org/thevibe/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7131196a40d9844d35adb6e93bd3": {
+      "stream_url": "https://hls.houstonpublicmedia.org/hpmnews/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71311f844f5bbdc239574305da97": {
+      "stream_url": "https://ice7.securenetsystems.net/KCSM2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf71320cd2401eb6d6f1d7aef16a0e": {
+      "stream_url": "https://wpr-ice.streamguys1.com/wpr-ideas-mp3-64",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf71322056413bb9b9bd1cccc7d737": {
+      "stream_url": "https://wpr-ice.streamguys1.com/wpr-music-mp3-96",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713320be4bb793c88b4bfbb53b94": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KWITFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf713400234b6a98bded95a006bef9": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCNDFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71340aa844b78431388de34fa6e7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCNDHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7134116241928a3e1b42a0475921": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCNDHD3_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713412b74909b119cbe28d5e0481": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WABE_HD2_CLASSICAL.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf713503bb4461bb34f8dc00a1d527": {
+      "stream_url": "https://wets-fm.streamguys1.com/live-1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 90,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7135064f4ea8b2aee6ef2b99e997": {
+      "stream_url": "https://wets-fm.streamguys1.com/live-2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713507aa4f3fb811bd6dd14180d8": {
+      "stream_url": "https://wets-fm.streamguys1.com/live-3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713517374aeea549cae46ed92e27": {
+      "stream_url": "https://whyy.streamguys1.com/whyy_npr_org",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf71351c55449b96d33cbf5b1868a1": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KAXEFMAAC.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713611314542b4280007519615d3": {
+      "stream_url": "https://boisestate.streamguys1.com/BSPRNEWS",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 32000,
+      "channels": 1
+    },
+    "4fcf713624ea4549806a9080f9252f7e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KNPRFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf7137177a49c39092e7ae2a8ebfb5": {
+      "stream_url": "https://alaskapublic-live.streamguys1.com/mp3-NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf713726504af09451e48debd7297c": {
+      "stream_url": "https://tektite.streamguys1.com:5025/klcc.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 80,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71380d8a43d2b44151cff2b09117": {
+      "stream_url": "https://stream.zeno.fm/e0czcdic3wiuv",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71381cbf41c7b0312cc8517117f0": {
+      "stream_url": "https://stream.zeno.fm/zhzveyzk97kvv",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713901774fd986f64cf5ae171afd": {
+      "stream_url": "https://stream.zeno.fm/zuackvt58ptuv",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71390b2d41b6811cadb819d7ac2f": {
+      "stream_url": "https://wmht.streamguys1.com/wext1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71390f2a4d95b439cae6a78476c2": {
+      "stream_url": "https://wmht.streamguys1.com/wmht1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713914b84dd08c209468aa7c665e": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/2557_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713925b646cd9285ba2ba589c7ee": {
+      "stream_url": "https://kuer.streamguys1.com/high_icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713a07514fd88bdeac6e50f54f0a": {
+      "stream_url": "https://kuer.streamguys1.com/kuer3high_icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713a14d148a8a07b6b2455571b1b": {
+      "stream_url": "https://kvlustream.lamar.edu:8443/stream",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf713b043d4fb2ad3428e1f9d05c2d": {
+      "stream_url": "https://amber.streamguys1.com:4372/wxpr2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713b08f04bf8a006d89e64d8495d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCVEHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf713b0b984349b156ca4d83fac103": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCVEFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf713c023040efa00f8bf882984636": {
+      "stream_url": "https://ipm.streamguys1.com/wfiu1-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713c05f643a5845fa1852fb2a7f4": {
+      "stream_url": "https://ipm.streamguys1.com/wfiu2-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713c0cc1451aaaf085a41d85c9aa": {
+      "stream_url": "https://icecast.will.illinois.edu/WILL-mp3-48",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf713c182b4b6095b9b13837299888": {
+      "stream_url": "https://knkx-live-a.edge.audiocdn.com/6285_128k?aw_0_1st.playerid=stationconnect",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713c24804135a15728f31849fe7b": {
+      "stream_url": "https://kunr.streamguys1.com/kunr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713d03ea47fc85731a707dd9d6d5": {
+      "stream_url": "https://nhpr.streamguys1.com/nhpr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713d0ebe4be3941d2d1a7add696e": {
+      "stream_url": "https://kazu.streamguys1.com/kazu.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713d12574ea1b6e0c181d35e11db": {
+      "stream_url": "https://kazu.streamguys1.com/classical.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713d171e48bcbdcd43348fae0358": {
+      "stream_url": "https://kcur.streamguys1.com/kcur-applemusic-hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf713d1db5458c9da54e038f7cfbc5": {
+      "stream_url": "https://kera-ice.streamguys1.com/keralive",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf713d203a4a0492ff8a248fefe7ff": {
+      "stream_url": "https://kera-ice.streamguys1.com/kxtlive128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713e001e4e9bb2e5f72c49588be1": {
+      "stream_url": "https://kjzz-hls.streamguys1.com/live/smil:kjzz.smil/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf713e03b44f2d827ea4894341124c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KOSUHD2AAC.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713e156a4d079f7b23aa482df659": {
+      "stream_url": "https://laist.streamguys1.com/kpcc/playlist.m3u8?aw_0_1st.playerId=npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 132,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713e1e73472fa756ea39634396bc": {
+      "stream_url": "https://ksmu.streamguys1.com/ksmu3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713f1253488a9f0f6e7eafa9fcdb": {
+      "stream_url": "https://streams.kut.org/4426/playlist.m3u8?aw_0_1st.playerid=kut-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713f157a400ea510541bfd337134": {
+      "stream_url": "https://streams.kut.org/4428/playlist.m3u8?aw_0_1st.playerid=kutx-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713f176a425d863a11d753967f76": {
+      "stream_url": "https://streams.kut.org/4429/playlist.m3u8?aw_0_1st.playerid=amx-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713f1a164729b01822ebf6cfa35d": {
+      "stream_url": "https://kwmu.streamguys1.com/kwmu1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf713f1f9440159e62c0d89db3f285": {
+      "stream_url": "https://kwmu.streamguys1.com/kwmu3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7140044745829c1d51accf723565": {
+      "stream_url": "https://streams.kcrw.com/news24_mp3?aw_0_1st.playerid=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7140060b48c1911e512a46af6236": {
+      "stream_url": "https://ais-sa1.streamon.fm/7180_32k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 37,
+      "sample_rate_hz": 16000,
+      "channels": 2
+    },
+    "4fcf71400ba44129a0a66eb7c1b45547": {
+      "stream_url": "https://wmfe-iad.streamguys1.com/wmfe",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf71400f34417e8653c19e7df2e015": {
+      "stream_url": "https://wmfe-iad.streamguys1.com/wmfe2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71401188482899ff114ae706adb2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WVPEFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7140160646198d09ddb2d5321329": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/wypr-2-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714017a84927a8a8a5a016b0394a": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/wypr-3-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf71401af9452a91e2a6bbddc013d7": {
+      "stream_url": "https://wfdd.streamguys1.com/wfdd1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71401f4349308c69a8cbcaec91a8": {
+      "stream_url": "https://wfdd.streamguys1.com/wfdd2",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf7140219f4c06ab3cd293caa17537": {
+      "stream_url": "https://wfdd.streamguys1.com/wfdd3",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf7141024c4183ad2691b92951f1df": {
+      "stream_url": "https://live.streamguys1.com:3181/hd1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71410533470588401c244aa8b813": {
+      "stream_url": "https://live.streamguys1.com:3181/hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714106dd48598c8a2fb99e88f4c3": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KCHOFM_64_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71410c2d40d3a267c6cadeb1d534": {
+      "stream_url": "https://lpm.streamguys1.com/wfpl-npr.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714112634308b16d0e6590bbe124": {
+      "stream_url": "https://lpm.streamguys1.com/wfpk-npr.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 132,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71411eb5469cbddfec74ea1afed9": {
+      "stream_url": "https://radioheartland.stream.publicradio.org/radioheartland.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714211174cf7a82cba19685314ba": {
+      "stream_url": "https://nis.stream.publicradio.org/nis.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714225f048d5999ee032db4ccba4": {
+      "stream_url": "https://current.stream.publicradio.org/current.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714307ce411e98f410b3a128c12d": {
+      "stream_url": "https://kvcr.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71431bca43fdaadb14715f38f4b1": {
+      "stream_url": "https://streaming.wusf.fm/wusf-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71431fb74663ba54ebaadbaf79d7": {
+      "stream_url": "https://streaming.floridaclassicalstation.fm/wsmr-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714322e74aeaac07ed0eaa688aec": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUOTFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714325df44678e840d60dc53d064": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUOTHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71440959424a8eadf4d79423fdef": {
+      "stream_url": "https://tektite.streamguys1.com:5145/wwnolive",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71440bf641b0ad0b93e189fd83fe": {
+      "stream_url": "https://tektite.streamguys1.com:5145/wwnoclassical",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71440d6646df86d04045d75538e7": {
+      "stream_url": "https://tektite.streamguys1.com:5145/wwnojazz",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714411d449d9975fb2c35f1bf61c": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/radio_player.mp3?aw_0_1st.playerid=OPB_NPROne",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71442279409fad59949233b8f49b": {
+      "stream_url": "https://peace.streamguys1.com:6095/kdlg",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7145020e4bd398c971c018a107c7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KHSUFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71450af94706b2e46675539d2cba": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KAJXFM.MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf71450f6541d9b5f4618e348fb3c4": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KACUFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714520a34e12bdfeba6d5c2c1c33": {
+      "stream_url": "https://kjzz.streamguys1.com/kbaq_mp3_128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7145255746e9ab3730e92c52dc21": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KGOUFM_64_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714610c64303a4fe7b21bdca1cee": {
+      "stream_url": "https://live.ideastream.org/wksu1.128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7146191f42e8acccbbe9bddb1afb": {
+      "stream_url": "https://live.ideastream.org/wksu4.128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71461b9a4ddfb97b3115df9cad20": {
+      "stream_url": "https://live.ideastream.org//wksu3.128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71461d0a4443ac288b01dc637734": {
+      "stream_url": "https://freshgrass.streamguys1.com/folkalley-128mp3-wksu",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71462167431989e5291c3bc26218": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUSDFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7147068e4bf6af553b4ebec18acf": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUSDHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714714954cd5a1afca77bfce90da": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCBUFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf714718914fd8a648a62c88f43a9d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCBUFM_CLASSICAL.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71471a22460b8c99eb9f58fac6ca": {
+      "stream_url": "https://wamu.cdnstream1.com/wamu.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714908eb49dbbb51209b1882cbb6": {
+      "stream_url": "https://azpm.streamguys1.com/kuaz128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf7149165b4469a2a7cbed911f3cd2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KETRFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf71491c664e688f898472f1da53ae": {
+      "stream_url": "https://wosu.streamguys1.com/NPR_128",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf7149213e46689d0ab703450b155f": {
+      "stream_url": "https://wosu.streamguys1.com/Classical_128",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714a06ce4909b7c9bac14a4e63fd": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUAL_HD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714a09364334815f9d61aaa269b7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUAL_HD3.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714a21d14323a373a3e9944815fc": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KVPRFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714a26414a50b31a3198463fc2cd": {
+      "stream_url": "https://war.streamguys1.com:7031/kuaf1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b023a4949a6bac47aee17716b": {
+      "stream_url": "https://war.streamguys1.com:7031/kuaf2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b03df4f8fa1b0292aca56f430": {
+      "stream_url": "https://war.streamguys1.com:7031/kuaf3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b056c45428d16c7a9b73c0c62": {
+      "stream_url": "https://tektite.streamguys1.com:5195/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b0fed46aabb40d8dccfd2b653": {
+      "stream_url": "https://ais-sa8.cdnstream1.com/3629_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714b14c947cd8cef23a6449a047b": {
+      "stream_url": "https://live.amperwave.net/direct/wncpr-wcqshd1mp3128-ibc4",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b18ab453dace011707e537fd3": {
+      "stream_url": "https://wdav-ice.streamguys1.com/live-mp3-tunein",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714b1cd545bb959fdf833e804956": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WEMUFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714b1fc6418e86578eac6a5e47e2": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/2558_128.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714b21b04be0aaefad2a6fdc7973": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/2556_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714b2366418aa2c03b148601ef7a": {
+      "stream_url": "https://wfae-ice.streamguys1.com/wfae1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf714c0557460fa5c1d6164ab527e7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WGLT_NI.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714d02774ab990ab770d3d09844d": {
+      "stream_url": "https://wgbh-live.streamguys1.com/wcrb_hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf714d0aab4838a4b3549ad87fe1fb": {
+      "stream_url": "https://wgbh-live.streamguys1.com/wcai_hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf714d1f10490e9cacea420f01bde3": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KPACFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714d23e64d939af6520e34439768": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTXIFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf714e00e94ec693a9e645b20c66b2": {
+      "stream_url": "https://my.clevr.media/r/radio/kwbu",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714e03bb4907aa621bf9d14b1856": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUOMFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf714e07dd4a4692e84cc18965c6fb": {
+      "stream_url": "https://wfyi-iad.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714e17684f22967552fff128408e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WGCUFM_SC?dist=NPR-APP",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf714f09394c28aacc5341120dc137": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WXXIAM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714f0ca641f2bb155a2fa45c71ee": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WXXIFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf714f24924d489afd446537558651": {
+      "stream_url": "https://wkar.streamguys1.com/wkarfm-mp3-NPR.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf715005e3489a87901de642335537": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WZNBFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71501114472ebe07ade4cf7bd6db": {
+      "stream_url": "https://wmuk.streamguys1.com/live2",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71501fed40a38998ea7960473a4a": {
+      "stream_url": "https://hls-live.wnyc.org/wnycfmapp-hls.aac/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf7150247746b988de842a0dfe0c72": {
+      "stream_url": "https://hls-live.wnyc.org/q248-hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf7151007341b7b570e4b15b3078c9": {
+      "stream_url": "https://hls-live.wnyc.org/wqxr48-hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf715104204c18b2469ede20e80435": {
+      "stream_url": "https://wpln.streamguys1.com/wplnfm.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf715108d0453d9c85548dd43fa321": {
+      "stream_url": "https://wpln.streamguys1.com/wfclfm.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf71510a4e44738ee570f2c921b722": {
+      "stream_url": "https://wpln.streamguys1.com/wplnam.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf715118864bbbb504f32d22a19868": {
+      "stream_url": "https://wyoming-public-ice.streamguys1.com/WPR128MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7152031542988296837ae0dd52ad": {
+      "stream_url": "https://wyoming-public-ice.streamguys1.com/JZZ128MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71520b084a46bce1a326b90e76fa": {
+      "stream_url": "https://wshu-iad.streamguys1.com/wshu-air",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7152115f441fa7192bac337f0e89": {
+      "stream_url": "https://wshu-iad.streamguys1.com/wshu-news",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71521b474d4896c932465b3d5430": {
+      "stream_url": "https://war.streamguys1.com:7785/wuis.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf715317fe44b794b610e14c4fb34e": {
+      "stream_url": "https://wxpn.xpn.org/xpnmp3hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715325bb4f5d9994db06baee16ad": {
+      "stream_url": "https://wvtf-ice2.streamguys1.com/wvtfmusic-mp3-64",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71540f114dd29dd3d0d1b45055d6": {
+      "stream_url": "https://ypr.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71541d8d4986b4df25af79688dfa": {
+      "stream_url": "https://wuwf.streamguys1.com/WUWFFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf715421644306941664694567310e": {
+      "stream_url": "https://wuwf.streamguys1.com/WUWFHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf71550542479996d3d03b77d371d3": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WSCLFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715508fe40cbba45327049392f5c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WSDLFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715515834d06a86fb304b324792a": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KPBX_FM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71551de645be98e43f989626ab56": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KSFC_FM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7156011840bbb1678f4daa780ce9": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/JAZZSTREAM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7156032c4c82a33c94c868ed4713": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KXJZ_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715607614dd78c143b86cf1bce22": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KXPR_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71560d524fd08e6a34685d3fbe6e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WNPRFM.mp3?ttag=website_mobile_app-ct_public-npr&dist=website_mobile_app-ct_public-npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf7156166a453991682ff335006aed": {
+      "stream_url": "https://stream1.cprnetwork.org/HLS/ngrp:CPRClassical_all/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf71561b024af39759655591e7fc55": {
+      "stream_url": "https://stream1.cprnetwork.org/HLS/ngrp:CPRNews_all/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf715620ac4d409ce441250528367c": {
+      "stream_url": "https://stream1.cprnetwork.org/HLS/ngrp:CPROpenAir_all/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf7157048740a08b7b3d7cd4e9539c": {
+      "stream_url": "https://khpr-ice.streamguys1.com/khpr2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7157089c41bc8214faadd43a30a1": {
+      "stream_url": "https://khpr-ice.streamguys1.com/kipo2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715717f84145bbf014a649cb7c4d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WICAFM.mp3?dist=IPRWebsite",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715723944a88a31d22b1da10f88d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTEPFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7158013749df96cd0b37e9686a81": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KANZFM_HPPR.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71580ee446d48188cf89d615621b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KANWFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715814a940c4adf8d8ee55e32b1e": {
+      "stream_url": "https://kasu.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715819a2486096ec7e83703bad35": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KAWCAM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715826a0423c8ffab082f4f2dd65": {
+      "stream_url": "https://das-sa43.cdnstream1.com/6062",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715908bd49b6b23a9df0362c5ee0": {
+      "stream_url": "https://das-sa43.cdnstream1.com/6063_128k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71590d934d6d95016f956394d396": {
+      "stream_url": "https://das-sa43.cdnstream1.com/6064_128k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7159241a4870ac5fd352889fe465": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KIOSFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf715a0137456d8319638188b0952d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KLREFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715a164a4a2bb776b12070fa5285": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KPUBFM_128_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715a1d0d411bab93167e3e723953": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTTZHD1.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715a1f8e4eb79064b0e10578e2ed": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTTZHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715a215649649bcd60a459a13bef": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KRVSFMAAC_SC",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715a2709485891fac14776d2eeed": {
+      "stream_url": "https://www.tundracast.stream:3040/mount3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf715b0d7b4fa2a581e072f2aa38eb": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUTCFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715b136842d5a311e6fc430f5c66": {
+      "stream_url": "https://ais-sa1.streamon.fm/7647_64k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 74,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf715b19d84e738e7198f238beeeb2": {
+      "stream_url": "https://ais-sa1.streamon.fm/7648_64k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "4fcf715b229a4ff79bc47599f6a234ca": {
+      "stream_url": "https://streams.radiomast.io/0cdf7725-83bf-4967-b6b7-f4e9bfe702ad",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715c0943492283acb61db1ffcdda": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/2442_128.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf715c14fd453387be896d57752d2b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KRNNFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf715c1cf549cca90197be99024935": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTOOFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf715c22cc4aad93993390da7eb305": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KXLLFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf715d00f540b287f70ddad0a4ee3c": {
+      "stream_url": "https://wvtf-ice2.streamguys1.com/radioiq-mp3-64",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf715e086d4cb9b6f8e5fbf3d5e83a": {
+      "stream_url": "https://music.wfuv.org/music-hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715e0dfd43509ad768027a084581": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WGTEFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715e19eb4064bd568e3d8bacfb5f": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WJCTFMAAC_SC?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf715f122e441280fddfb5117f402b": {
+      "stream_url": "https://ripr-ice.streamguys1.com/ripr-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 1
+    },
+    "4fcf715f179a48d499ad88097aa5c42d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KRWGFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf715f1aff45f280bbcead9c499fff": {
+      "stream_url": "https://ksut.streamguys1.com/kute",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf715f230349c9b569582530742349": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUARFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf716000614a74884af9a4a3ea5ea4": {
+      "stream_url": "https://ais-sa1.streamon.fm/7890_96k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 109,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "4fcf716007484eaf83f64a4342d2d9c3": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUNMFM_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71600cee415ba62d042a28350ad6": {
+      "stream_url": "https://utulsa.streamguys1.com/KWGSHD1-MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf716010f548c0b07f7d6537e5bb50": {
+      "stream_url": "https://utulsa.streamguys1.com/KWTUHD1-MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716105464458abcaa39a8bc27f7c": {
+      "stream_url": "https://ncpr-ice.streamguys1.com/ncpr-96k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7161150e4d21a94e079d05ddba40": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUCVFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71611f1543db9aec59a4246bd5d8": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUCVHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71621ab0472f881dfdb29edd81a5": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WBFOFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf7163063b424580b5eb772dfd9927": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCBEFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7163181149a7b51751a23c5cadc0": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WEKUFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716320cd48ebb637ae39068c103b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WEKUHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7164089a4bf1840888c5cf132470": {
+      "stream_url": "https://nepr.streamguys1.com/WFCR.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 320,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71640f4c4028a786fc688cb1c28c": {
+      "stream_url": "https://nepr.streamguys1.com/WFCR-HD.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 320,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71641162484abb204d06064be4a9": {
+      "stream_url": "https://streaming.wfit.org/wfit-fm",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71641edb4057ade2e191e1bacd25": {
+      "stream_url": "https://whqr.streamguys1.com/whqr_hd1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf7165035f483abfbed7b36da28ec7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WIUMFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf71650bae4c1fb677935f91950b5c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WKNOFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71650e33452684c002c5be28a03b": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WKNOHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71651ded4275bd90cea5c8d16748": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMKYFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf716520a84fa994d5a8bf21dfb6d7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMOTFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716524d44dda9e573770eeef57b8": {
+      "stream_url": "https://wncu.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71661f0549249e12d66aac4eef28": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WQCSFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf716621e94636b611effe1588775c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WQCSHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 11025,
+      "channels": 2
+    },
+    "4fcf7166268d4f1e87734cdf01a6bad2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRKFFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf7167072149d79cf30787888ac482": {
+      "stream_url": "https://wrti-live.streamguys1.com/classical-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71670e8640288e97d8a2e62b66b1": {
+      "stream_url": "https://wrti-live.streamguys1.com/jazz-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716711c84cd0b4694581902272db": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRVOFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "4fcf71671cbb4940b4947179a8b55454": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRVOHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "4fcf7167206045bba737c02d00dfbc12": {
+      "stream_url": "https://peridot.streamguys1.com:5235/wsiu-hd1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716725f54aaa9be139cdcaa0e26f": {
+      "stream_url": "https://crystalout.surfernetwork.com:8001/WVAS-FM_MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf7168039242f3833378d4295b0bfa": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WVIAFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf71680b7a4a0b838e349d18977e02": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WVIAHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf716818be482b8454d0bd1e2608d5": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/wypr-1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "4fcf71681cfd4f89afacf41aef5ed986": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WYSOFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716821a54d71a5062df0060ce0b5": {
+      "stream_url": "https://kpbs-classical.streamguys1.com/kpbs-classical.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716904ad46ea9e33790f9a437eac": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUFMFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "4fcf716919cb449d9ba016bbc0cb4243": {
+      "stream_url": "https://kalw-live.streamguys1.com/kalw",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf71691dad4981bb739d0e2c0bd41f": {
+      "stream_url": "https://marfapr-ice.streamguys1.com/krts-npr.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716a1e104dffb7fa66211fe2fc14": {
+      "stream_url": "https://stream.cinradio.org/wvxu.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716a260543a6bf0ba3f6ee774c62": {
+      "stream_url": "https://stream.cinradio.org/wguc",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 320,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf716b025e4953a43696cd3bc11900": {
+      "stream_url": "https://fm909.wbur.org/wbur_nprorg",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 24000,
+      "channels": 1
+    },
+    "4fdcb0a44b3a499b8db147ab10a44ea4": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTPDFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "514afff916f74e23895d84c43defa24f": {
+      "stream_url": "https://wkms.streamguys1.com/WKMS1-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "514afff921134b6286a6a96acb8ca453": {
+      "stream_url": "https://wkms.streamguys1.com/WKMSHD2-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "514afffb1a10483192fee5ed8c2888ba": {
+      "stream_url": "https://ais-sa8.cdnstream1.com/3630_128.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514afffc0ec94fa8af7ef195bf5e6808": {
+      "stream_url": "https://kdnk.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 100,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "514afffd028e455fb0f5b35301f9afc5": {
+      "stream_url": "https://streams.kqed.org/kqedradio.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "514afffd19864d369f1cc0ecda4d0374": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WGVUFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514afffe1e914f6db3adae375b7b5399": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCMUHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514afffe242841babd5345f14a7ffdcc": {
+      "stream_url": "https://wpsu-ice.streamguys1.com/wpsu1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514affff05a048f89d04d7222fe3fb67": {
+      "stream_url": "https://wpsu-ice.streamguys1.com/wpsu2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514affff08644e7dbfb5f846eb175b14": {
+      "stream_url": "https://wpsu-ice.streamguys1.com/wpsu3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "514b000018644eb9b299086d5966f749": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KAWCFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "514b00001bf8413e9324f8834227aaff": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KSTXFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 40,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "5186ec438e514a219f99e26e4f014871": {
+      "stream_url": "https://ice64.securenetsystems.net/WMOT",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "522918008c434a0eb87e50d48bd6fb39": {
+      "stream_url": "https://stream.wmnf.org:4443/wmnf_hd4",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 170,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "541bb3dd89894943a7713cae0e201769": {
+      "stream_url": "https://wwfm.streamguys1.com/live-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "544438e00ce149e38ebcf5f366ae59c4": {
+      "stream_url": "https://kuvo.streamguys1.com/kuvohd2-mp3-128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "54a25192942a44bb92951a4bc469151f": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KRVS_HD3AAC.aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 112,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "55ac3923aaa54e1e9b2b088c6657e5b4": {
+      "stream_url": "https://ice.wbjb.net/FMF-MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "5732de03148041a098f9b3a8b2e9e13d": {
+      "stream_url": "https://nwpb.streamguys1.com/nwprnews-mp3-128-icy",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "589e46aacd0a4f26acd439ac412bb6e7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KBUTFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "59c4cad91ebd4f4681a903383ef2f861": {
+      "stream_url": "https://nwpb.streamguys1.com/nwprkjem-mp3-128-icy",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "5a700462400e47b5a3f019834e6e3f4b": {
+      "stream_url": "https://hls-live.wnyc.org/operavore48-hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "5ac82372f6e0403f853192cd85049b87": {
+      "stream_url": "https://stream.cinradio.org/jazz",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "5bc54058466a4e31a173fbcd4ab9980e": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WUTCHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "5d0ba1c95d684b568e1d0ca1f0b579d0": {
+      "stream_url": "https://wskg.streamguys1.com/wsqx",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "61296509841446d8a8b67e5ff992b972": {
+      "stream_url": "https://live.ideastream.org/jazzneo.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "630970b1a9704dec8af518a53c6fd5a0": {
+      "stream_url": "https://war.streamguys1.com:7165/",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 32000,
+      "channels": 2
+    },
+    "66e301bf14af4c959e62acf9cfecf59d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WYSOHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "672afed1ecb5479d832e8f018e815866": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KETR_HD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "68e2a3a6817e43eca3380d765fd7d79b": {
+      "stream_url": "https://streaming.wfit.org/wfit-hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "6c70b632a2f247f0a7448bb983c41c06": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KDAQHD3.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 11025,
+      "channels": 2
+    },
+    "6d19b2ade98048d2adda1c9488e8e942": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WGCUFM_CLASSICAL_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "6d50eccb53124776a6ee02a86388fbab": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KANWHD2_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "6e34db70582d45ce9474d2044a761b16": {
+      "stream_url": "https://krculive.semo.edu:8443/mobile",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "72af9fd8b4a74f189f6354c293ec0fcc": {
+      "stream_url": "https://wvik.streamguys1.com/apris.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "733ea2b6d66b4829893e1baa12601d1f": {
+      "stream_url": "https://a13.asurahosting.com/listen/krps-fm/radio.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "75ec10c307fa448eb5cdb8f1e0033ea6": {
+      "stream_url": "https://ice42.securenetsystems.net/KENWFM2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 16000,
+      "channels": 2
+    },
+    "768dc224e35342a1836d83ca93aa5b25": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WRVOHD3_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 22050,
+      "channels": 1
+    },
+    "76e8e056fd58409c8e174bb855dc6881": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WOUBFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "77be6bcedfe14a76a7015810f54d8e78": {
+      "stream_url": "https://wuwf.streamguys1.com/WUWFHD3.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "78356e4bfedc4a8aaf259cf8d20067f7": {
+      "stream_url": "https://wblv.streamguys1.com/JFBL",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "788622cb1e364f38aadda712fa4d1a97": {
+      "stream_url": "https://war.streamguys1.com:7785/WUISRIS-2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "78ef28676da746aaaec888a929cea15d": {
+      "stream_url": "https://wfae-ice.streamguys1.com/wfae3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "78fa19a2696747beacd4597558082525": {
+      "stream_url": "https://boisestate.streamguys1.com/Jazz-aac-256k-icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "7976e6eb076647ac9a6d47e10a2ec951": {
+      "stream_url": "https://wfyi-live.streamguys1.com/wbaa-jazz",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "7a765c3b3bba47e89156ea536bd649a9": {
+      "stream_url": "https://wyms.streamguys1.com/rhythmLabRadio",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "7aef5055dd244894928f93f4a2c88c61": {
+      "stream_url": "https://rockthecradle.stream.publicradio.org/rockthecradle.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "7ea87b47445c42318fae5c7d0a5bd5ce": {
+      "stream_url": "https://wtmd-ice.streamguys1.com/wtmd.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "839aa5685a994bff90d04ab895d24cba": {
+      "stream_url": "https://ice24.securenetsystems.net/WSGE",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "844815615e9643ffb4ee70dfc3fe05fd": {
+      "stream_url": "https://edg-iad-wunc-ice.streamguys1.com/wunc-128-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "84a3ebbecebb47388188e89e70305744": {
+      "stream_url": "https://icecast.will.illinois.edu/WILLFM-48",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "868e29c4b5dc44c69e5c6d2be4d38622": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/D28PLUS5.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "86ee71fe9cf34a699f47fb5b5ece982c": {
+      "stream_url": "https://media.publicbroadcasting.net/kbut/newscast/newscast.wav",
+      "probed_on": "2026-07-28",
+      "codec": "pcm",
+      "bitrate_kbps": 3072,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "8831bbce4ade4d41831ec12ded4eb96e": {
+      "stream_url": "https://ktna.broadcasttool.stream/play",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "894d049c32784b06af94d539bcd82717": {
+      "stream_url": "https://amber.streamguys1.com:4625/kfsk",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "8e86978fdb9d4c74a79472bf2e21f7b3": {
+      "stream_url": "https://purplecurrent.stream.publicradio.org/purplecurrent.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "8ea52d144a9548caba537d949bcf52bf": {
+      "stream_url": "https://stream.kedm.org/listen.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "8f6c47370f39487f899b1b3353f06a73": {
+      "stream_url": "https://streams.radiomast.io/b118dabb-315c-4e9d-afb5-406896092df9",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "8fc215143ca4415c820687a6f1282eda": {
+      "stream_url": "https://khns.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "8fd731c3973e475eb0860af68b9e43a8": {
+      "stream_url": "https://wgbh-live.streamguys1.com/BSOConcert-8106",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "8fdf566d5d80469d923975e9847d0ebd": {
+      "stream_url": "https://peridot.streamguys1.com:7835/WUCF-HD2_QL",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "8ff6cc6599564b39a7b545e972fcd9bd": {
+      "stream_url": "https://stream.wmnf.org:4443/wmnf_high_quality",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "91bd33872862402bae4e716593ab8f06": {
+      "stream_url": "https://kuer.streamguys1.com/kuer2high_icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "95035d6b0068439998c2b1c30384f705": {
+      "stream_url": "https://icecast.will.illinois.edu/WILL-HD2-48",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "9555219984474b71b15cdff32b4831e1": {
+      "stream_url": "https://nwpb.streamguys1.com/nwprclassical-mp3-128-icy",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "9583de2aed384b6888dee753e943f482": {
+      "stream_url": "https://streams.kut.org/4427/playlist.m3u8?aw_0_1st.playerid=kuthd2-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "9717f4c310f84c5a85634a40dc5d971a": {
+      "stream_url": "https://news-stream.iowapublicradio.org/News.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "987c4343b3324caea5e8f52183e09719": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KNBAFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "99cffd6263b24ab7aa9e9404c07171d6": {
+      "stream_url": "https://streams.kcrw.com/e24_mp3?aw_0_1st.playerid=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "9af3dfb11cac4b6e82561506b679e975": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KTTZHD3.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 24,
+      "sample_rate_hz": 11025,
+      "channels": 2
+    },
+    "9ced0d2b3d0b440f85b0921a2a4243c7": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KVPR_CLASSICAL.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "9e7a6ef8731b43ffaa9f3014412b4b3c": {
+      "stream_url": "https://ice.wbjb.net/905-MP3-High",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "a0707f14ac4f436589f36420e9b8e0c8": {
+      "stream_url": "https://wskg.streamguys1.com/wskg",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "a2fa35a60c4441e9936aba1206de667c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KDAQHD4.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "a50fed422541470fa1ac5b372694bc78": {
+      "stream_url": "https://wkms.streamguys1.com/WKMSHD3-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "a543016fa7cc49b19afb430326fccba2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCMUFM_SC",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "a569d134b66847d09c7010f394cac48b": {
+      "stream_url": "https://kcbx-ice.streamguys1.com/hd2",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "a752201f1fa6413db8dbfa6b5a1fc923": {
+      "stream_url": "https://wgbh-live.streamguys1.com/holiday2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "a83e9f10c2b4433cbd747c4b72188138": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KMXTFMAAC_SC",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "a9461bd01781446390c78c524b98460d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WESMFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "aa3dae3b624b44c8be929e94a7b8fabe": {
+      "stream_url": "https://utulsa.streamguys1.com/KWGSHD3-MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 1
+    },
+    "ab52b531ae0b45aeb902916f17a98a24": {
+      "stream_url": "https://classical-stream.iowapublicradio.org/Classical.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ab88ad3bbfa14c73afdef015b2b57b1a": {
+      "stream_url": "https://wgbh-live.streamguys1.com/holiday1.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ae77f58ad68b47e8aac25d9466f7f158": {
+      "stream_url": "https://streams.kcrw.com/kcrw_mp3?aw_0_1st.playerid=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "b2ab095b04c345e8855e11e8bdffa209": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WNRNFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "b4d15c212f3c4c40b8e0ff7168fb4ce8": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/ALLTHISJAZZAAC.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "b97e1d7d305f49c98066563c646dcb71": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WSSBFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 11025,
+      "channels": 2
+    },
+    "bca3cd67d0504093a105dc46fec7cb4a": {
+      "stream_url": "https://hls-live.wnyc.org/qxr-special-hls.aac/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "bceb1a9a13c54a3ebcec05324a6496c5": {
+      "stream_url": "https://streams.krcc.org/krcc_hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "bf46160ed4a54a8da7c9acc4a3e6cdcf": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/MAINE_PUBLIC_CLASSICAL_HOLIDAY.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "bff1db8f56ae4289bb76438bf98de386": {
+      "stream_url": "https://ksut.streamguys1.com/ksut",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "c0094d74e3764fed8b2849d413d5a25e": {
+      "stream_url": "https://carbonsound.stream.publicradio.org/carbonsound.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "c0620ba3707b4a4c8e48a7f5fac8ee47": {
+      "stream_url": "https://ais-sa1.streamon.fm/7269_64k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 67,
+      "sample_rate_hz": 24000,
+      "channels": 2
+    },
+    "c08ea8b95cdc453c995d79f4e4095ff7": {
+      "stream_url": "https://streams.radiomast.io/268b6214-4f60-4898-85f6-51132c9fa4e0/hls.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 320,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "c416bd92f2cf458e827142694653b24d": {
+      "stream_url": "https://kuvo-ice.streamguys1.com/kuvo-mp3-128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "c4703b593b8f40fb9e75b6bc1f70ad08": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WQCPFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "c560cb3f3a0a459ab3478ceea3ad60d3": {
+      "stream_url": "https://radio2.wqln.org:8443/",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 100,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "c5c25b5a38fb491d9a42674cb014dce7": {
+      "stream_url": "https://streaming.radio.co/seac6e5991/listen",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 320,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "c7d1024c2bd4445a9c031a7e1d904f5a": {
+      "stream_url": "https://wyms.streamguys1.com/live?platform=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "c8a3e2a309cc424eabef7bd052fbd8e6": {
+      "stream_url": "https://kwmu.streamguys1.com/jazz-128",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "c9c1581ff8a84003bb669fc3723f4516": {
+      "stream_url": "https://live.amperwave.net/direct/publictv19-ktbgfmmp3-imc1",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "cb2304bbcf5643469a66a2e7ec50f36f": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WABE_HD3_NEWS.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "cc1823c2de5e47369c9f0fab66c96236": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WJCTHD3AAC_SC?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "cc519795ee7e4e7fbe4c5a1fa0d9c6bd": {
+      "stream_url": "https://s5.radio.co/s6e1313a0b/listen",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ce0d695e755d44609d542a3988e10c94": {
+      "stream_url": "https://wxpn.xpn.org/kidscornermp3hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ce5c0d797c8546a2a76057935d07c81e": {
+      "stream_url": "https://wgbh-live.streamguys1.com/holiday3.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "cf05c4c366c94fb2b374018259bdef55": {
+      "stream_url": "https://kedt.streamguys1.com/live-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "cf62699e638f4b8db90fa360284980a9": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WJCT_RRS.mp3?dist=NPR",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 48,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "d14eff93a72746b18f04e48e97843c1c": {
+      "stream_url": "https://wlvr.streamguys1.com/live-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "d24578ca29da4077b6a88f00d8025049": {
+      "stream_url": "https://wgbh-live.streamguys1.com/Bach-8108",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "d3d5298d988e4f25850e6768c1526aa2": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WBFO_THE_BRIDGE.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "d42e84aedf494602ab403ccc06c485ab": {
+      "stream_url": "https://ipr.streamguys1.com/mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "d493d213cbe54c98a0b7c6601a0e5a69": {
+      "stream_url": "https://gpb-geo.streamguys1.com/gpb/gpb-radio-mp3-npr-one",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "d57f8ebc31454678aa883928be1b5f3f": {
+      "stream_url": "https://war.streamguys1.com:7785/WUISRIS-3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "d6e5fc46dbec412ab5d9041e7fe6cb34": {
+      "stream_url": "https://mprnews2.stream.publicradio.org/mprnews2.mp3?srcid=npr",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "dc9512b1cd014f7abc458ebd693a0818": {
+      "stream_url": "https://kcur.streamguys1.com/classicalkc-applemusic-hls/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 99,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "dddc697d9c744bc796d65987b2c9f689": {
+      "stream_url": "https://gpb-geo.streamguys1.com/gpb/gpb-classical-mp3-npr-one",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "ddec879738b040398777bcf9d8738e25": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KPBZ_FM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "df8dd1c3d0954abb8382b95b245d5bc7": {
+      "stream_url": "https://wyoming-public-ice.streamguys1.com/WYS128MP3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e06c6da55d59488e8d36e34ae19572bf": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KANZFM_HPPR2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "e0dc2d614ebf45918a95ad0edccd3e62": {
+      "stream_url": "https://streams.kut.org/4430/playlist.m3u8?aw_0_1st.playerid=tmx-npr",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e0ee7190702b4702a11178784d35f73f": {
+      "stream_url": "https://wblv.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e1c3653c28be49a98ece2890f78f546f": {
+      "stream_url": "https://ais-sa1.streamon.fm/7647_48k.aac/playlist.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e4b1a6a19c6a400b992d2d3eee5234ff": {
+      "stream_url": "https://wyms.streamguys1.com/414music_aac",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "e4b4408e996b4a67b7991b407dffd417": {
+      "stream_url": "https://wuga-ice.streamguys1.com/live-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e5accd1de8f34071b98c7e6b59a30450": {
+      "stream_url": "https://kuer.streamguys1.com/kuer4high_icy",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e730800bbcba426daa3109ba8b1df677": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KYUKAM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 32,
+      "sample_rate_hz": 11025,
+      "channels": 2
+    },
+    "e794c123d86744dc83c8b1e843744094": {
+      "stream_url": "https://kclustream.callutheran.edu/kclump3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e7e7b56f6b76489fa112ff9986eb1cdd": {
+      "stream_url": "https://uprxstreamer.usu.edu:8020/",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "e9b4428366034826857faf8ee2d817de": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KDAQFM.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "ea5695f812ce46639d4d3d24febb44bf": {
+      "stream_url": "https://ipr.streamguys1.com/ipr2-mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ec27c0f19621454b9351e9c8edda798e": {
+      "stream_url": "https://wnin.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "ede1977d16e54fc2b1b68e7d50837ea3": {
+      "stream_url": "https://wmuk.streamguys1.com/live1",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ef0ce20b6eef4ffaaba6a650cce71e60": {
+      "stream_url": "https://wvpe-live.streamguys1.com/live",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "f1e1ff592bfd4bf3b71eb4c469df20d3": {
+      "stream_url": "https://wvik.streamguys1.com/hd2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "f2d79a4458604382ae95ceb21edb82e0": {
+      "stream_url": "https://wkar.streamguys1.com/wkarnewstalk-mp3-NPR.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "f4e675abff824a28a061a5df563a221c": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WABEFM_HD1.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 64,
+      "sample_rate_hz": 22050,
+      "channels": 2
+    },
+    "f5720b72a5864515adc60901a72e1db5": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WIUMHD2.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "f8f42434441740d3afbf623043aa3dfb": {
+      "stream_url": "https://nhpr.streamguys1.com/classical",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "fc40ae9b48144d5ca48ada7a306869e9": {
+      "stream_url": "https://audio-mp3.ibiblio.org/concierto",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "fc6ad7c6eb4c4b81a138147f55447166": {
+      "stream_url": "https://kamu.streamguys1.com/hd2-192",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st1011": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/SOUND_SHIFT.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st1014": {
+      "stream_url": "https://az13.yesstreaming.net:8540/radio.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st1029": {
+      "stream_url": "https://az13.yesstreaming.net:8630/radio.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st810": {
+      "stream_url": "https://ais-sa3.cdnstream1.com/10576_128k.mp3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 56,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st813": {
+      "stream_url": "https://wfyi-live.streamguys1.com/wbaa-news",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st818": {
+      "stream_url": "https://whcp.broadcasttool.stream/wfhw",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 185,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st975": {
+      "stream_url": "https://wgbh-live.streamguys1.com/crb-dream",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 192,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "st985": {
+      "stream_url": "https://wuky.streamguys1.com/UniverseCity",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st986": {
+      "stream_url": "https://wuky.streamguys1.com/GenreFree",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st987": {
+      "stream_url": "https://wuky.streamguys1.com/PopRocks",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st988": {
+      "stream_url": "https://wuky.streamguys1.com/WildcatCountry",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    },
+    "st989": {
+      "stream_url": "https://streams.radiomast.io/d834f708-f3bc-45ab-b42f-840d7b221a3c/hls.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 256,
+      "sample_rate_hz": 48000,
+      "channels": 2
+    }
+  }
+}

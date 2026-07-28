@@ -21,6 +21,7 @@ use super::{
 mod npr_stations_generated;
 
 pub use npr_stations_generated::{
+    NPR_STATION_QUALITY_LAST_PROBE_ATTEMPT_DATE, NPR_STATION_QUALITY_SERVICE_COUNT,
     NPR_STATION_QUERY_COUNT, NPR_STATION_SERVICE_COUNT, NPR_STATION_SNAPSHOT_DATE, NPR_STATIONS,
 };
 
@@ -62,6 +63,8 @@ pub enum RadioCodec {
     Mp3,
     /// Opus interactive audio codec.
     Opus,
+    /// Uncompressed pulse-code modulation, including signed-integer PCM.
+    Pcm,
     /// Vorbis audio carried in an Ogg container.
     Vorbis,
 }
@@ -787,6 +790,10 @@ pub struct RadioStationPreset {
     /// Audio codec advertised for this stream, when known.
     pub codec: Option<RadioCodec>,
     /// Nominal stream bitrate in kilobits per second, when known.
+    ///
+    /// Missing or content-dependent rates remain [`None`]. Uncompressed PCM
+    /// throughput is valid only when the stream itself carries PCM; it is not a
+    /// substitute for a compressed stream's encoded network bitrate.
     pub bitrate_kbps: Option<u16>,
     /// Advertised or probed sample rate, when trustworthy.
     pub sample_rate_hz: Option<u32>,
@@ -875,7 +882,7 @@ pub const STATIONS: &[RadioStationPreset] = &[
         stream: "https://secure.live-streams.nl/flac.ogg",
         summary: "Dance, house, club classics, trance, and melodic techno.",
         codec: Some(RadioCodec::Flac),
-        bitrate_kbps: Some(1_411),
+        bitrate_kbps: None,
         sample_rate_hz: Some(44_100),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
@@ -902,7 +909,7 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Format-free Dutch music and community programmes.",
         codec: Some(RadioCodec::Flac),
         bitrate_kbps: None,
-        sample_rate_hz: None,
+        sample_rate_hz: Some(48_000),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
@@ -927,7 +934,7 @@ pub const STATIONS: &[RadioStationPreset] = &[
         stream: "https://mscp4.live-streams.nl:8142/flac.ogg",
         summary: "Hits and album tracks from the 1960s, 1970s, and 1980s.",
         codec: Some(RadioCodec::Flac),
-        bitrate_kbps: Some(1_411),
+        bitrate_kbps: None,
         sample_rate_hz: Some(44_100),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
@@ -980,8 +987,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Russian funk radio with jokes",
         codec: Some(RadioCodec::Mp3),
         bitrate_kbps: Some(256),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: Some(RadioNowPlayingEndpoint {
             url: "http://www.4duk.ru/4duk/whatsPlaying.action",
@@ -1574,8 +1581,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Listener-powered eclectic music from Seattle.",
         codec: Some(RadioCodec::Aac),
         bitrate_kbps: Some(160),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
@@ -1626,8 +1633,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Listener-supported eclectic music.",
         codec: Some(RadioCodec::Aac),
         bitrate_kbps: Some(320),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
@@ -1730,8 +1737,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "J-Pop, J-Rock, and anime soundtracks.",
         codec: Some(RadioCodec::Mp3),
         bitrate_kbps: Some(192),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
         stream_kind: RadioStreamKind::M3u,
         now_playing: None,
     },
@@ -1743,8 +1750,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Anime songs and related Japanese music.",
         codec: Some(RadioCodec::Mp3),
         bitrate_kbps: Some(320),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
@@ -1821,8 +1828,8 @@ pub const STATIONS: &[RadioStationPreset] = &[
         summary: "Eclectic music from Radio France.",
         codec: Some(RadioCodec::Aac),
         bitrate_kbps: Some(192),
-        sample_rate_hz: None,
-        channels: None,
+        sample_rate_hz: Some(48_000),
+        channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
@@ -1942,6 +1949,56 @@ mod tests {
     }
 
     #[test]
+    fn curated_presets_keep_complete_static_quality_shape() {
+        for station in STATIONS {
+            assert!(
+                station.codec.is_some(),
+                "{} must declare its verified codec",
+                station.id
+            );
+            assert!(
+                station.sample_rate_hz.is_some(),
+                "{} must declare its verified sample rate",
+                station.id
+            );
+            assert!(
+                station.channels.is_some(),
+                "{} must declare its verified channel count",
+                station.id
+            );
+        }
+    }
+
+    #[test]
+    fn curated_presets_limit_missing_bitrates_to_reviewed_allowlist() {
+        let mut missing_bitrate_ids = STATIONS
+            .iter()
+            .filter(|station| station.bitrate_kbps.is_none())
+            .map(|station| station.id)
+            .collect::<Vec<_>>();
+        missing_bitrate_ids.sort_unstable();
+
+        assert_eq!(
+            missing_bitrate_ids,
+            [
+                "1zwolle-flac",
+                "intense-radio-flac",
+                "kalx-berkeley-flac",
+                "listen-moe",
+                "openbroadcast-flac",
+                "punkrockers-radio-flac",
+                "pure-classix-radio-flac",
+                "radio-bergeijk-flac",
+                "radio-calico-flac",
+                "radio-campus-grenoble-flac",
+                "rlocale-radio-flac",
+                "sector-radio-progressive-flac",
+            ],
+            "a missing nominal bitrate needs explicit review"
+        );
+    }
+
+    #[test]
     fn all_homepages_and_streams_are_http_urls() {
         for station in all_stations() {
             let homepage = station
@@ -1969,10 +2026,18 @@ mod tests {
     fn generated_npr_snapshot_has_stable_reviewed_shape() {
         assert_eq!(NPR_STATION_SNAPSHOT_DATE, "2026-07-28");
         assert_eq!(NPR_STATION_QUERY_COUNT, 56);
-        assert_eq!(NPR_STATION_SERVICE_COUNT, 519);
+        assert_eq!(NPR_STATION_SERVICE_COUNT, 518);
+        assert_eq!(
+            NPR_STATION_QUALITY_LAST_PROBE_ATTEMPT_DATE,
+            Some("2026-07-28")
+        );
+        assert_eq!(NPR_STATION_QUALITY_SERVICE_COUNT, 499);
         assert_eq!(NPR_STATIONS.len(), NPR_STATION_SERVICE_COUNT);
         assert_eq!(station_count(), STATIONS.len() + NPR_STATION_SERVICE_COUNT);
 
+        let mut missing_bitrates = 0_usize;
+        let mut missing_sample_rates = 0_usize;
+        let mut missing_channels = 0_usize;
         for station in NPR_STATIONS {
             assert!(station.id.starts_with("npr-"));
             assert!(station.stream.starts_with("https://"));
@@ -1980,6 +2045,13 @@ mod tests {
             let stream_path = stream.path().to_ascii_lowercase();
             assert!(!stream_path.ends_with(".pls"));
             assert!(!stream_path.ends_with(".m3u"));
+            assert!(
+                !stream
+                    .host_str()
+                    .is_some_and(|host| host.ends_with(".live.streamtheworld.com")),
+                "rotating StreamTheWorld edge escaped canonicalization: {}",
+                station.stream
+            );
             for (key, _) in stream.query_pairs() {
                 assert!(
                     !matches!(
@@ -2002,13 +2074,47 @@ mod tests {
                     station.stream
                 );
             }
-            assert_eq!(station.bitrate_kbps, None);
-            assert_eq!(station.sample_rate_hz, None);
-            assert_eq!(station.channels, None);
+            assert!(station.codec.is_some());
+            missing_bitrates += usize::from(station.bitrate_kbps.is_none());
+            missing_sample_rates += usize::from(station.sample_rate_hz.is_none());
+            missing_channels += usize::from(station.channels.is_none());
+            assert!(
+                station
+                    .bitrate_kbps
+                    .is_none_or(|bitrate| (1..=10_000).contains(&bitrate))
+            );
+            assert!(
+                station
+                    .sample_rate_hz
+                    .is_none_or(|rate| (8_000..=384_000).contains(&rate))
+            );
+            assert!(
+                station
+                    .channels
+                    .is_none_or(|channels| (1..=32).contains(&channels))
+            );
             assert_eq!(
                 station.now_playing.map(|endpoint| endpoint.format),
                 Some(RadioNowPlayingFormat::NprStationProgramJson)
             );
+        }
+        assert_eq!(missing_bitrates, 29);
+        assert_eq!(missing_sample_rates, 19);
+        assert_eq!(missing_channels, 19);
+    }
+
+    #[test]
+    fn generated_npr_pcm_newscasts_preserve_the_probed_codec() {
+        for id in [
+            "npr-2ebca61667b545b99a791bd8a4f5bade",
+            "npr-86ee71fe9cf34a699f47fb5b5ece982c",
+        ] {
+            let station = station_by_id(id).unwrap_or_else(|| panic!("missing PCM fixture: {id}"));
+            assert_eq!(station.codec, Some(RadioCodec::Pcm));
+            assert_eq!(station.bitrate_kbps, Some(3_072));
+            assert_eq!(station.sample_rate_hz, Some(48_000));
+            assert_eq!(station.channels, Some(2));
+            assert!(station.stream.ends_with(".wav"));
         }
     }
 
@@ -2083,6 +2189,8 @@ mod tests {
         assert_eq!(four_duk.stream, "http://radio.4duk.ru/4duk256.mp3");
         assert_eq!(four_duk.summary, "Russian funk radio with jokes");
         assert_eq!(four_duk.bitrate_kbps, Some(256));
+        assert_eq!(four_duk.sample_rate_hz, Some(44_100));
+        assert_eq!(four_duk.channels, Some(2));
         assert_eq!(
             four_duk
                 .now_playing
@@ -2113,7 +2221,7 @@ mod tests {
                 "intense-radio-flac",
                 "https://www.intenseradio.net/",
                 "https://secure.live-streams.nl/flac.ogg",
-                Some(1_411),
+                None,
                 Some(44_100),
             ),
             (
@@ -2128,7 +2236,7 @@ mod tests {
                 "https://www.radiobergeijk.nl/",
                 "https://stream.radiobergeijk.nl/listen/radio_bergeijk/flac",
                 None,
-                None,
+                Some(48_000),
             ),
             (
                 "punkrockers-radio-flac",
@@ -2141,7 +2249,7 @@ mod tests {
                 "pure-classix-radio-flac",
                 "https://www.pureclassix.com/",
                 "https://mscp4.live-streams.nl:8142/flac.ogg",
-                Some(1_411),
+                None,
                 Some(44_100),
             ),
             (
@@ -2506,6 +2614,26 @@ mod tests {
                     .stream,
                 stream
             );
+        }
+    }
+
+    #[test]
+    fn newly_probed_presets_keep_sample_rates_and_channel_counts() {
+        let expected = [
+            ("radio-bergeijk-flac", 48_000),
+            ("4duk-radio", 44_100),
+            ("kexp", 44_100),
+            ("radio-paradise-main-mix", 44_100),
+            ("animeradio-de", 44_100),
+            ("anison-fm", 44_100),
+            ("fip", 48_000),
+        ];
+
+        for (id, sample_rate_hz) in expected {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing probed station: {id}"));
+            assert_eq!(station.sample_rate_hz, Some(sample_rate_hz));
+            assert_eq!(station.channels, Some(2));
         }
     }
 
@@ -3038,6 +3166,11 @@ mod tests {
             assert_eq!(station.stream, stream);
             assert_eq!(station.codec, Some(codec));
             assert_eq!(station.bitrate_kbps, bitrate);
+            assert_eq!(
+                station.sample_rate_hz,
+                Some(if id == "listen-moe" { 48_000 } else { 44_100 })
+            );
+            assert_eq!(station.channels, Some(2));
             assert_eq!(station.stream_kind, stream_kind);
             assert_eq!(station.now_playing, None);
         }

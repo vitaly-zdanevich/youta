@@ -11901,7 +11901,7 @@ mod tests {
             rows: vec![RowView {
                 media_id: Some(media_id.clone()),
                 title: "Sector Radio — Progressive".to_owned(),
-                subtitle: "FLAC · 44.1 kHz".to_owned(),
+                subtitle: "FLAC · variable bitrate · 44.1 kHz".to_owned(),
                 source: "Radio".to_owned(),
                 watched_percent: 42,
                 hide_watched_marker: true,
@@ -11915,7 +11915,7 @@ mod tests {
                 channel_webpage_url: Some(
                     url::Url::parse("https://sectorradio.com/").expect("station URL"),
                 ),
-                description: "Lossless progressive electronic music.\n\nQuality: FLAC · bitrate unknown · 44.1 kHz\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
+                description: "Lossless progressive electronic music.\n\nQuality: FLAC · variable bitrate · 44.1 kHz\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
                 length: "must not render".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
@@ -11933,7 +11933,7 @@ mod tests {
         assert!(rendered.contains("▶ Sector Radio — Progressive"));
         assert!(!rendered.contains("▶ ● Sector Radio"));
         assert!(!rendered.contains("42%"));
-        assert!(rendered.contains("FLAC · 44.1 kHz"));
+        assert!(rendered.contains("FLAC · variable bitrate · 44.1 kHz"));
         assert!(!rendered.contains("stereo"));
         assert!(rendered.contains("[O] xdg-open · https://sectorradio.com/"));
         assert!(!rendered.contains("External links"));

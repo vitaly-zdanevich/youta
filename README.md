@@ -171,11 +171,12 @@ resolver:
   [BBC Sounds station directory](https://www.bbc.co.uk/sounds/stations) to the
   Radio tab. On each explicit Play action, Youta reads the public station page,
   asks BBC Media Selector for the highest HTTPS HLS or DASH audio profile
-  offered to the current region, and passes that action-scoped manifest
-  directly to `mpv`. Playback tokens and manifests stay in RAM and are not
-  reused for a later Play action or persisted. BBC podcast feeds remain
-  importable through RSS/OPML. The `bbc-radio` feature enables the shared
-  `radio` feature.
+  offered to the current region, derives quality from that current manifest,
+  and passes the action-scoped manifest directly to `mpv`. The last resolved
+  quality label for each station is cached in RAM so it remains visible during
+  the process. Signed playback tokens and manifests are not reused for a later
+  Play action or persisted. BBC podcast feeds remain importable through
+  RSS/OPML. The `bbc-radio` feature enables the shared `radio` feature.
 - **SoundCloud** accepts direct URLs through `yt-dlp`. Rich search and
   subscriptions use the official API only when users provide their own
   application credentials; the API uses OAuth 2.1. See the [SoundCloud API
@@ -238,19 +239,36 @@ The station catalogue is maintained in the
 [generated NPR snapshot](src/providers/npr_stations_generated.rs), rather than
 duplicated in this README. It covers public-service, regional, talk, music,
 ambient, classical, soundtrack, game-music, meditation, and lossless FLAC
-streams. Each preset records only quality data supported by a reviewed source
-or a live probe.
+streams. Curated presets hardcode only codec, stream-reported or directly
+probed bitrate, sample rate, and channel fields verified from a reviewed source
+or bounded maintenance probe. Missing fields remain unknown. FLAC has no fixed
+encoded bitrate, so a verified FLAC stream without a trustworthy numeric rate
+is shown as `variable bitrate`; Opus and Vorbis remain unknown unless their rate
+mode is explicitly verified.
 
 The NPR snapshot is generated from NPR's official
 [station finder](https://www.npr.org/stations), includes primary and additional
 services, and deduplicates inherited transmitters by stream GUID. NPR publishes
 no bitrate, sample-rate, or channel fields in that directory, so Youta does not
-invent them. The unpaginated API has no complete-enumeration contract; the
-checked-in count describes a dated state-and-territory snapshot rather than a
-permanent total. Short-lived signed stream URLs are omitted, while static
-PLS/M3U entry points are resolved during generation. Regenerate and review the
-snapshot with
-`cargo run --locked --example update_npr_stations --features radio`; see NPR's
+invent them. Verified NPR quality is populated only by the generator's explicit,
+bounded [`ffprobe`](https://ffmpeg.org/ffprobe.html) maintenance mode and stored
+in the checked-in
+[quality sidecar](src/providers/npr_station_quality_generated.json). Normal
+startup and playback never launch `ffprobe` to discover station quality.
+
+The unpaginated NPR API has no complete-enumeration contract; the checked-in
+count describes a dated state-and-territory snapshot rather than a permanent
+total. Short-lived signed stream URLs are omitted, while static PLS/M3U entry
+points are resolved during generation. Regenerate the snapshot, probe quality,
+and review both generated files with:
+
+```sh
+cargo run --locked --example update_npr_stations --features radio -- \
+	--probe-quality --probe-date "$(date -u +%F)"
+```
+
+A regeneration without `--probe-quality` reuses matching verified sidecar
+records and performs no stream-quality probes. See NPR's
 [Terms of Use](https://www.npr.org/about-npr/179876898/terms-of-use).
 
 When a station explicitly publishes a suitable 128 kbps AAC alternative, the
