@@ -29,9 +29,10 @@ resume_rewind_seconds = 30
 # YOUTA_PLAYBACK__AUTOPLAY has higher precedence.
 autoplay = false
 
-# Resolve only the currently selected YouTube video's audio after a 200 ms
-# selection debounce. The bounded worker keeps signed media URLs and HTTP
-# headers in RAM only; normal canonical YouTube playback remains the fallback.
+# Resolve the selected YouTube video's audio after a 200 ms selection debounce.
+# During the final 30 seconds of playback, the same bounded worker may prepare
+# one known next queue/autoplay item. Signed media URLs and HTTP headers stay in
+# RAM only; normal canonical YouTube playback remains the fallback.
 # YOUTA_PLAYBACK__YOUTUBE_PREWARM has higher precedence.
 youtube_prewarm = true
 

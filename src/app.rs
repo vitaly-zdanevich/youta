@@ -2079,12 +2079,27 @@ struct ScheduledChannelWikidata {
 
 #[cfg(feature = "yt-dlp")]
 const YOUTUBE_PREWARM_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Remaining playback window in which one guaranteed next `YouTube` item may
+/// be resolved without letting its short-lived signed URL age through a long
+/// current video.
+#[cfg(feature = "yt-dlp")]
+const YOUTUBE_NEXT_PREWARM_LEAD: Duration = Duration::from_secs(30);
 #[cfg(feature = "yt-dlp")]
 const YOUTUBE_PREWARM_TTL: Duration = Duration::from_secs(90);
 #[cfg(feature = "yt-dlp")]
 const YOUTUBE_PREWARM_EXPIRY_MARGIN_SECONDS: u64 = 30;
 #[cfg(feature = "yt-dlp")]
 const YOUTUBE_PREWARM_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Controller reason for retaining the sole speculative `YouTube` resolution.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YouTubePrewarmIntent {
+    /// A video explicitly selected in a `YouTube` result pane.
+    Selection,
+    /// The exact queue or autoplay item that will follow current playback.
+    ImminentNext,
+}
 
 /// Selected video waiting for the short debounce before extractor work.
 #[cfg(feature = "yt-dlp")]
@@ -2094,6 +2109,7 @@ struct ScheduledYouTubePrewarm {
     media_id: MediaId,
     source_url: url::Url,
     due_at: Instant,
+    intent: YouTubePrewarmIntent,
 }
 
 /// One cancellable request owned by the dedicated resolver worker.
@@ -2103,6 +2119,7 @@ struct YouTubePrewarmJob {
     media_id: MediaId,
     request: YouTubePrewarmRequest,
     cancellation: YouTubePrewarmCancellation,
+    intent: YouTubePrewarmIntent,
 }
 
 /// Bounded command accepted by the resolver worker.
@@ -2120,6 +2137,7 @@ struct YouTubePrewarmCompletion {
     media_id: MediaId,
     completed_at: Instant,
     result: YouTubePrewarmResult,
+    intent: YouTubePrewarmIntent,
 }
 
 /// Request currently running or waiting in the one-element worker queue.
@@ -2129,6 +2147,7 @@ struct ActiveYouTubePrewarm {
     generation: u64,
     media_id: MediaId,
     cancellation: YouTubePrewarmCancellation,
+    intent: YouTubePrewarmIntent,
 }
 
 /// Fresh RAM-only direct stream eligible for one playback attempt.
@@ -2138,6 +2157,7 @@ struct ReadyYouTubePrewarm {
     media_id: MediaId,
     completed_at: Instant,
     audio: PrewarmedYouTubeAudio,
+    intent: YouTubePrewarmIntent,
 }
 
 /// Selection identity retained while page one refreshes in the background.
@@ -4388,6 +4408,72 @@ impl AppController {
         })
     }
 
+    /// Cancels speculative work only when it belongs to automatic look-ahead.
+    ///
+    /// Selected-row work must survive ordinary playback ticks before the
+    /// current item enters the near-EOF window.
+    #[cfg(feature = "yt-dlp")]
+    fn cancel_imminent_next_youtube_prewarm(&mut self) {
+        let owns_imminent_next = self
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .is_some_and(|scheduled| scheduled.intent == YouTubePrewarmIntent::ImminentNext)
+            || self
+                .active_youtube_prewarm
+                .as_ref()
+                .is_some_and(|active| active.intent == YouTubePrewarmIntent::ImminentNext)
+            || self
+                .ready_youtube_prewarm
+                .as_ref()
+                .is_some_and(|ready| ready.intent == YouTubePrewarmIntent::ImminentNext);
+        if owns_imminent_next {
+            self.cancel_youtube_prewarm();
+        }
+    }
+
+    /// Schedules one exact candidate through the shared latest-only resolver.
+    #[cfg(feature = "yt-dlp")]
+    fn schedule_youtube_prewarm(
+        &mut self,
+        media_id: MediaId,
+        intent: YouTubePrewarmIntent,
+        now: Instant,
+    ) {
+        if self.ready_youtube_prewarm.as_ref().is_some_and(|ready| {
+            ready.media_id == media_id && Self::youtube_prewarm_is_fresh(ready, now)
+        }) || self
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .is_some_and(|scheduled| scheduled.media_id == media_id)
+            || self
+                .active_youtube_prewarm
+                .as_ref()
+                .is_some_and(|active| active.media_id == media_id)
+        {
+            return;
+        }
+        if self
+            .youtube_prewarm_failure
+            .as_ref()
+            .is_some_and(|(failed, retry_at)| failed == &media_id && now < *retry_at)
+        {
+            self.cancel_imminent_next_youtube_prewarm();
+            return;
+        }
+
+        self.cancel_youtube_prewarm();
+        let generation = self.youtube_prewarm_generation;
+        let source_url = url::Url::parse(&youtube_video_url(&media_id.external_id))
+            .expect("a validated YouTube video ID always forms a valid URL");
+        self.scheduled_youtube_prewarm = Some(ScheduledYouTubePrewarm {
+            generation,
+            media_id,
+            source_url,
+            due_at: now + YOUTUBE_PREWARM_DEBOUNCE,
+            intent,
+        });
+    }
+
     /// Replaces speculative work with one debounced eligible `YouTube` video.
     #[cfg(feature = "yt-dlp")]
     fn update_youtube_prewarm_for_selection(&mut self, selected: Option<&SearchItem>) {
@@ -4410,38 +4496,85 @@ impl AppController {
             self.cancel_youtube_prewarm();
             return;
         }
-        let now = Instant::now();
-        if self.ready_youtube_prewarm.as_ref().is_some_and(|ready| {
-            ready.media_id == media_id && Self::youtube_prewarm_is_fresh(ready, now)
-        }) || self
-            .scheduled_youtube_prewarm
+        self.schedule_youtube_prewarm(media_id, YouTubePrewarmIntent::Selection, Instant::now());
+    }
+
+    /// Returns the exact queue or same-source item that will play after EOF.
+    ///
+    /// An explicit queue entry always wins, including a non-YouTube entry
+    /// which deliberately blocks look-ahead to a later autoplay item.
+    #[cfg(feature = "yt-dlp")]
+    fn imminent_next_queue_item(&self) -> Option<QueueItem> {
+        let queued = if self.playback_queue.repeat_one {
+            self.playback_queue.current()
+        } else {
+            self.playback_queue
+                .current_index
+                .and_then(|index| self.playback_queue.items.get(index.saturating_add(1)))
+        };
+        if let Some(queued) = queued {
+            return (queued.media.id.source == SourceKind::YouTube
+                && queued.media.kind != MediaKind::LiveStream
+                && queued.media.duration_seconds != Some(0)
+                && validate_youtube_video_id(&queued.media.id.external_id).is_ok())
+            .then(|| queued.clone());
+        }
+        if !self.config.playback.autoplay {
+            return None;
+        }
+        let origin = self
+            .queued_autoplay_resume_origin
             .as_ref()
-            .is_some_and(|scheduled| scheduled.media_id == media_id)
-            || self
-                .active_youtube_prewarm
-                .as_ref()
-                .is_some_and(|active| active.media_id == media_id)
-        {
+            .or(self.current_autoplay_origin.as_ref())?;
+        match self.next_autoplay_step(origin) {
+            AutoplayStep::Play { item, .. }
+                if item.media.id.source == SourceKind::YouTube
+                    && item.media.kind != MediaKind::LiveStream
+                    && item.media.duration_seconds != Some(0)
+                    && validate_youtube_video_id(&item.media.id.external_id).is_ok() =>
+            {
+                Some(*item)
+            }
+            AutoplayStep::Play { .. } | AutoplayStep::SourceChanged | AutoplayStep::Exhausted => {
+                None
+            }
+            #[cfg(feature = "tracker-music")]
+            AutoplayStep::PrepareTracker { .. } => None,
+        }
+    }
+
+    /// Prepares one guaranteed next `YouTube` item only near a known EOF.
+    ///
+    /// Deferring extraction avoids aging signed URLs during long media and
+    /// avoids running Python beside playback when no automatic transition is
+    /// expected. The shared worker still permits at most one active resolver.
+    #[cfg(feature = "yt-dlp")]
+    fn update_youtube_prewarm_for_imminent_next(&mut self, now: Instant) {
+        let eligible_window = self.config.playback.youtube_prewarm
+            && (self.playback_factory.is_some() || self.player.is_some())
+            && self.playback_phase == PlaybackPhase::Playing
+            && self.current_media.is_some()
+            && !self.view.playback.live
+            && !self.view.playback.paused
+            && !self.view.playback.buffering
+            && self
+                .view
+                .playback
+                .duration
+                .filter(|duration| !duration.is_zero())
+                .is_some_and(|duration| {
+                    duration.saturating_sub(self.view.playback.position)
+                        <= YOUTUBE_NEXT_PREWARM_LEAD
+                });
+        if !eligible_window {
+            self.cancel_imminent_next_youtube_prewarm();
             return;
         }
-        if self
-            .youtube_prewarm_failure
-            .as_ref()
-            .is_some_and(|(failed, retry_at)| failed == &media_id && now < *retry_at)
-        {
-            self.cancel_youtube_prewarm();
+        let Some(next) = self.imminent_next_queue_item() else {
+            self.cancel_imminent_next_youtube_prewarm();
             return;
-        }
-        self.cancel_youtube_prewarm();
-        let generation = self.youtube_prewarm_generation;
-        let source_url = url::Url::parse(&youtube_video_url(&video.video_id))
-            .expect("a validated YouTube video ID always forms a valid URL");
-        self.scheduled_youtube_prewarm = Some(ScheduledYouTubePrewarm {
-            generation,
-            media_id,
-            source_url,
-            due_at: now + YOUTUBE_PREWARM_DEBOUNCE,
-        });
+        };
+        self.schedule_youtube_prewarm(next.media.id, YouTubePrewarmIntent::ImminentNext, now);
     }
 
     /// Dispatches the stable selected video without blocking the terminal.
@@ -4474,6 +4607,7 @@ impl AppController {
             media_id: scheduled.media_id.clone(),
             request: YouTubePrewarmRequest::new(scheduled.generation, scheduled.source_url),
             cancellation: cancellation.clone(),
+            intent: scheduled.intent,
         });
         let Some(sender) = self.youtube_prewarm_requests.as_ref() else {
             return;
@@ -4484,6 +4618,7 @@ impl AppController {
                     generation: scheduled.generation,
                     media_id: scheduled.media_id,
                     cancellation,
+                    intent: scheduled.intent,
                 });
             }
             Err(
@@ -4527,6 +4662,7 @@ impl AppController {
                         media_id: completion.media_id,
                         completed_at: completion.completed_at,
                         audio,
+                        intent: completion.intent,
                     };
                     if Self::youtube_prewarm_is_fresh(&ready, Instant::now()) {
                         self.ready_youtube_prewarm = Some(ready);
@@ -12090,10 +12226,11 @@ impl AppController {
     /// A speculative direct stream may fail for any reason before audible
     /// playback begins and falls back to the canonical watch URL. This remains
     /// true when `mpv` emitted [`PlaybackEvent::MediaLoaded`] before discovering
-    /// that the resolved payload cannot be demuxed. Only an HTTP 403 from a
-    /// still-loading canonical attempt enables the slower checked-format route.
-    /// Once [`PlaybackEvent::PlaybackStarted`] arrives, no automatic
-    /// replacement is attempted.
+    /// that the resolved payload cannot be demuxed. A canonical pre-start HTTP
+    /// 403 or unusable-format result enables the slower checked-format route,
+    /// including when `file-loaded` preceded the failure. Once
+    /// [`PlaybackEvent::PlaybackStarted`] arrives, no automatic replacement is
+    /// attempted.
     fn retry_youtube_load(&mut self, end: &PlaybackEnd) -> bool {
         if !matches!(
             end.reason,
@@ -12111,8 +12248,11 @@ impl AppController {
                 PlaybackLoadKind::YouTubeCanonical
             }
             PlaybackLoadKind::YouTubeCanonical
-                if self.playback_phase == PlaybackPhase::Loading
-                    && playback_end_reports_http_403(end) =>
+                if matches!(
+                    self.playback_phase,
+                    PlaybackPhase::Loading | PlaybackPhase::Loaded
+                ) && (playback_end_reports_http_403(end)
+                    || playback_end_reports_unsupported_format(end)) =>
             {
                 PlaybackLoadKind::YouTubeChecked
             }
@@ -17214,6 +17354,8 @@ impl UiController for AppController {
         #[cfg(feature = "yt-dlp")]
         self.poll_download();
         self.update_player();
+        #[cfg(feature = "yt-dlp")]
+        self.update_youtube_prewarm_for_imminent_next(Instant::now());
         #[cfg(feature = "radio")]
         self.request_due_radio_now_playing(now);
         if self.session_dirty && self.last_session_save.elapsed() >= Duration::from_secs(30) {
@@ -17298,6 +17440,7 @@ fn youtube_prewarm_worker(
             media_id: job.media_id,
             completed_at: Instant::now(),
             result,
+            intent: job.intent,
         };
         loop {
             match responses.try_send(completion) {
@@ -22281,6 +22424,7 @@ fn playback_end_reports_unsupported_format(end: &PlaybackEnd) -> bool {
         message.contains("unrecognized file format")
             || message.contains("unsupported format")
             || message.contains("no audio or video streams selected")
+            || message.contains("no video or audio streams selected")
     })
 }
 
@@ -34571,6 +34715,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn youtube_loaded_unusable_format_retries_checked_once_without_looping() {
+        for media_error in [
+            "unrecognized file format",
+            "No video or audio streams selected.",
+        ] {
+            let failure = PlaybackEnd {
+                reason: PlaybackEndReason::Error,
+                error: Some("canonical stream failed".to_owned()),
+                file_error: Some(media_error.to_owned()),
+                diagnostic: None,
+            };
+            let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+                [],
+                [
+                    PlaybackEvent::MediaLoaded,
+                    PlaybackEvent::Ended(failure.clone()),
+                ],
+            );
+            controller.diagnostic_helpers_cache = Some(Vec::new());
+            controller.play_queue_item(fixture_youtube_item("fixture video"), false);
+
+            controller.update_player();
+
+            assert!(
+                controller.view.error_popup.is_none(),
+                "{media_error} should use the one checked-format retry"
+            );
+            assert_eq!(controller.playback_phase, PlaybackPhase::Loading);
+            assert_eq!(
+                controller.playback_load_kind,
+                PlaybackLoadKind::YouTubeChecked
+            );
+            {
+                let state = state.lock().expect("mock state");
+                assert_eq!(state.played.len(), 2);
+                assert!(!state.played[0].verify_remote_format);
+                assert!(state.played[1].verify_remote_format);
+            }
+
+            events
+                .lock()
+                .expect("mock events")
+                .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::Ended(failure)]);
+            controller.update_player();
+
+            assert_eq!(
+                state.lock().expect("mock state").played.len(),
+                2,
+                "the checked-format attempt must remain terminal"
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .error_popup
+                    .as_ref()
+                    .map(|popup| popup.title.as_str()),
+                Some("Playback failed")
+            );
+        }
+    }
+
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn youtube_prewarm_debounce_keeps_not_yet_due_selection_scheduled() {
@@ -34600,6 +34806,196 @@ mod tests {
 
     #[cfg(feature = "yt-dlp")]
     #[test]
+    fn imminent_next_youtube_prewarm_requires_a_stable_near_eof_window() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        let first = subscription_video_summary();
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(60),
+            duration: Some(Duration::from_secs(120)),
+            paused: false,
+            buffering: false,
+            ..PlaybackStatus::default()
+        };
+        let now = Instant::now();
+
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        assert!(
+            controller.scheduled_youtube_prewarm.is_none(),
+            "autoplay-off playback without a queued item must do no speculative work"
+        );
+
+        let mut queued = first;
+        queued.video_id = "aqz-KE-bpKQ".to_owned();
+        queued.title = "Explicit next video".to_owned();
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&queued, None));
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        assert!(
+            controller.scheduled_youtube_prewarm.is_none(),
+            "an item outside the lead window must not be resolved"
+        );
+
+        controller.view.playback.position = Duration::from_secs(91);
+        controller.view.playback.paused = true;
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        assert!(controller.scheduled_youtube_prewarm.is_none());
+        controller.view.playback.paused = false;
+        controller.view.playback.buffering = true;
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        assert!(controller.scheduled_youtube_prewarm.is_none());
+
+        controller.view.playback.buffering = false;
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        let scheduled = controller
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .expect("the explicit next YouTube item should be prepared near EOF");
+        assert_eq!(
+            scheduled.media_id,
+            MediaId::new(SourceKind::YouTube, "aqz-KE-bpKQ")
+        );
+        assert_eq!(scheduled.intent, YouTubePrewarmIntent::ImminentNext);
+        let generation = scheduled.generation;
+        let due_at = scheduled.due_at;
+
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        let scheduled = controller
+            .scheduled_youtube_prewarm
+            .as_ref()
+            .expect("the same candidate remains scheduled");
+        assert_eq!(scheduled.generation, generation);
+        assert_eq!(scheduled.due_at, due_at);
+
+        controller.view.playback.position = Duration::from_secs(10);
+        controller.update_youtube_prewarm_for_imminent_next(now);
+        assert!(
+            controller.scheduled_youtube_prewarm.is_none(),
+            "seeking away from EOF must cancel automatic look-ahead"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn imminent_next_youtube_prewarm_prioritizes_queue_then_autoplay() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut automatic = first.clone();
+        automatic.video_id = "aqz-KE-bpKQ".to_owned();
+        automatic.title = "Automatic next video".to_owned();
+        let mut explicit = first.clone();
+        explicit.video_id = "queued00001".to_owned();
+        explicit.title = "Explicit next video".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(automatic),
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&explicit, None));
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(100),
+            duration: Some(Duration::from_secs(120)),
+            paused: false,
+            buffering: false,
+            ..PlaybackStatus::default()
+        };
+
+        controller.update_youtube_prewarm_for_imminent_next(Instant::now());
+        assert_eq!(
+            controller
+                .scheduled_youtube_prewarm
+                .as_ref()
+                .map(|scheduled| scheduled.media_id.external_id.as_str()),
+            Some("queued00001")
+        );
+
+        controller.cancel_youtube_prewarm();
+        let current = controller
+            .playback_queue
+            .current_index
+            .expect("active queue index");
+        controller.playback_queue.items.truncate(current + 1);
+        controller.update_youtube_prewarm_for_imminent_next(Instant::now());
+        assert_eq!(
+            controller
+                .scheduled_youtube_prewarm
+                .as_ref()
+                .map(|scheduled| scheduled.media_id.external_id.as_str()),
+            Some("aqz-KE-bpKQ")
+        );
+
+        controller.cancel_youtube_prewarm();
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit-local"));
+        controller.update_youtube_prewarm_for_imminent_next(Instant::now());
+        assert!(
+            controller.scheduled_youtube_prewarm.is_none(),
+            "a non-YouTube queued item must block look-ahead to later autoplay"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn imminent_next_youtube_prewarm_is_consumed_when_queue_advances() {
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle([], []);
+        let first = subscription_video_summary();
+        let mut next = first.clone();
+        next.video_id = "aqz-KE-bpKQ".to_owned();
+        next.title = "Prepared next video".to_owned();
+        let next_media_id = MediaId::new(SourceKind::YouTube, &next.video_id);
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&next, None));
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback.position = Duration::from_secs(120);
+        controller.view.playback.duration = Some(Duration::from_secs(120));
+        controller.view.playback.paused = false;
+        controller.ready_youtube_prewarm = Some(ReadyYouTubePrewarm {
+            media_id: next_media_id.clone(),
+            completed_at: Instant::now(),
+            audio: PrewarmedYouTubeAudio::for_test(
+                url::Url::parse("https://signed.example/next-audio?token=secret")
+                    .expect("fixture signed URL"),
+                None,
+            ),
+            intent: YouTubePrewarmIntent::ImminentNext,
+        });
+
+        controller.handle_playback_end(
+            PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            },
+            Duration::ZERO,
+        );
+
+        assert_eq!(controller.current_media.as_ref(), Some(&next_media_id));
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 2);
+        assert!(state.played[1].bypass_ytdl);
+        assert_eq!(
+            state.played[1].location,
+            "https://signed.example/next-audio?token=secret"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
     fn youtube_prewarm_is_one_shot_and_rejects_stale_or_expiring_streams() {
         let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
@@ -34615,6 +35011,7 @@ mod tests {
             media_id: media_id.clone(),
             completed_at: Instant::now(),
             audio: fixture_audio(None),
+            intent: YouTubePrewarmIntent::Selection,
         });
         assert!(
             controller.take_ready_youtube_prewarm(&media_id).is_some(),
@@ -34631,6 +35028,7 @@ mod tests {
                 .checked_sub(YOUTUBE_PREWARM_TTL + Duration::from_millis(1))
                 .expect("fixture instant"),
             audio: fixture_audio(None),
+            intent: YouTubePrewarmIntent::Selection,
         });
         assert!(
             controller.take_ready_youtube_prewarm(&media_id).is_none(),
@@ -34644,6 +35042,7 @@ mod tests {
             audio: fixture_audio(Some(
                 now_unix.saturating_add(YOUTUBE_PREWARM_EXPIRY_MARGIN_SECONDS),
             )),
+            intent: YouTubePrewarmIntent::Selection,
         });
         assert!(
             controller.take_ready_youtube_prewarm(&media_id).is_none(),
@@ -34661,6 +35060,7 @@ mod tests {
             generation: 7,
             media_id: media_id.clone(),
             cancellation: YouTubePrewarmCancellation::new(),
+            intent: YouTubePrewarmIntent::Selection,
         });
         let (responses, response_receiver) = bounded(1);
         controller.youtube_prewarm_responses = Some(response_receiver);
@@ -34676,6 +35076,7 @@ mod tests {
                         None,
                     )),
                 ),
+                intent: YouTubePrewarmIntent::Selection,
             })
             .expect("fixture response");
 
@@ -34702,6 +35103,7 @@ mod tests {
                     .expect("fixture signed URL"),
                 None,
             ),
+            intent: YouTubePrewarmIntent::Selection,
         });
         let origin = AutoplayOrigin::YouTube {
             generation: 7,

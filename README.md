@@ -74,12 +74,15 @@ Youta prepares the selected YouTube video's audio by default so `Enter` can
 start playback without first waiting for a complete foreground resolution.
 Selection must remain unchanged for 200 ms before one bounded worker invokes
 `yt-dlp`; moving through the result list therefore cancels stale work instead
-of resolving every row. Short-lived signed media URLs and their HTTP headers
-remain in RAM only, are never written to session state, history, or
-configuration, and are redacted from debug and diagnostic output. If the
-prepared URL is absent, expired, or fails before audible playback begins,
-Youta falls back to the video's canonical YouTube URL and the normal
-`yt-dlp`/`mpv` path.
+of resolving every row. During playback, the same worker prepares exactly one
+known next YouTube queue or autoplay item during the final 30 seconds. This
+late look-ahead avoids aging signed URLs during long videos and performs no
+work when autoplay is disabled and the queue has no next item. Short-lived
+signed media URLs and their HTTP headers remain in RAM only, are never written
+to session state, history, or configuration, and are redacted from debug and
+diagnostic output. If the prepared URL is absent, expired, or fails before
+audible playback begins, Youta falls back to the video's canonical YouTube URL
+and the normal `yt-dlp`/`mpv` path.
 Disable this with
 `playback.youtube_prewarm = false`, `[y] Prepare selected YouTube audio` in
 Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.

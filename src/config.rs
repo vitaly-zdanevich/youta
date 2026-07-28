@@ -41,7 +41,7 @@ pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTIS
 /// Environment variable that overrides automatic same-source queue continuation.
 pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
 
-/// Environment variable that overrides selected-video `YouTube` prewarming.
+/// Environment variable that overrides selected and imminent-next `YouTube` prewarming.
 pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
 
 /// Environment variable that overrides lazy Local-folder size measurement.
@@ -654,7 +654,7 @@ pub struct PlaybackConfig {
     pub resume_rewind_seconds: u64,
     /// Continue with the next playable entry from the active source list.
     pub autoplay: bool,
-    /// Resolve the stable selected `YouTube` video briefly in RAM before Play.
+    /// Resolve a selected or imminent-next `YouTube` video briefly in RAM.
     pub youtube_prewarm: bool,
     /// Hide and skip chapters whose normalized title is exactly `Реклама`.
     pub skip_advertisement_chapters: bool,
