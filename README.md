@@ -288,9 +288,10 @@ still matter; Youta does not choose a 64 or 48 kbps AAC alternative merely
 because it uses AAC.
 
 Details shows only quality attributes known for that preset, the readable
-playback endpoint, and a summary. `[O] xdg-open · <URL>` is the sole station
-website row and opens the homepage rather than the audio endpoint. The same
-stable station identity is used for playlists, History replay, private station
+playback endpoint, and a summary. `[O] xdg-open · <URL>` on Linux—or
+`[O] open · <URL>` on macOS—is the sole station website row and opens the
+homepage rather than the audio endpoint. The same stable station identity is
+used for playlists, History replay, private station
 notes, and the now-playing click target; transient redirects are never
 persisted. `[B]` cycles name, high-to-low bitrate, and low-to-high bitrate order
 while the selected station remains stable across ordering changes and
@@ -754,10 +755,11 @@ and single-label hosts; redirects are not followed. These gates avoid stray
 escape sequences and reduce network traffic, decoding work, memory use, heat,
 and battery consumption.
 
-On that confirmed physical console, Youta also hides external `xdg-open`
-controls and ignores their hotkeys because no graphical session is attached.
-URLs remain visible and selectable as text. Pseudo-terminals and SSH sessions
-retain the controls because their opener may be configured on the host.
+On that confirmed physical console, Youta also hides external-opener controls
+and ignores their hotkeys because no graphical session is attached. URLs remain
+visible and selectable as text. Pseudo-terminals and SSH sessions retain the
+controls because their opener may be configured on the host. Linux uses
+`xdg-open`; macOS uses its native `open` command.
 
 Configure the runtime policy in `~/.config/youta/config.toml`:
 
@@ -867,11 +869,12 @@ inside the Subscriptions screen is not implemented yet.
 YouTube subscriptions are currently local-only channel subscriptions. Choosing
 `Subscribe (locally)` while a video is selected adds its channel to Youta's
 OPML-backed source list; it does not subscribe the signed-in YouTube account.
-OAuth-based synchronization remains roadmap work. In Details,
-`[O] xdg-open channel` opens the selected YouTube channel's webpage, while
-lowercase `[o] xdg-open video` opens the selected video's webpage. Youta waits
-for the system opener's exit status before reporting success; a missing browser
-association or headless-session failure is shown as a diagnostic instead.
+OAuth-based synchronization remains roadmap work. In Details, uppercase
+`[O]` opens the selected YouTube channel's webpage, while lowercase `[o]`
+opens the selected video's webpage. Their labels identify the platform helper:
+`xdg-open` on Linux and `open` on macOS. Youta waits for the system opener's
+exit status before reporting success; a missing browser association or
+headless-session failure is shown as a diagnostic instead.
 
 Selecting a YouTube channel lazily loads its description, subscriber count,
 joined date, public video count, aggregate public views, and country when those

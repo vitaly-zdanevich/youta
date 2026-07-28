@@ -40,6 +40,7 @@ use crate::domain::{Chapter, MediaId, MediaKind};
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
+use crate::report_actions::system_url_opener_name;
 use crate::terminal_environment::TerminalAttachment;
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
@@ -1729,7 +1730,7 @@ fn create_thumbnail_renderer(_settings: &UiSettings) -> Option<Box<dyn Thumbnail
     None
 }
 
-/// Captures the bounded terminal facts used to decide whether `xdg-open`
+/// Captures the bounded terminal facts used to decide whether external-opener
 /// controls apply. The result does not depend on terminal-image support.
 fn current_terminal_attachment() -> TerminalAttachment {
     let term = std::env::var("TERM").ok();
@@ -3663,13 +3664,14 @@ fn render_information_panel(
                 | InformationPanelKind::Radio
         ))
     .then(|| {
+        let opener_name = system_url_opener_name();
         let action_text = match kind {
-            InformationPanelKind::Podcast => "xdg-open podcast".to_owned(),
+            InformationPanelKind::Podcast => format!("{opener_name} podcast"),
             InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
-                || "xdg-open station website".to_owned(),
-                |url| format!("xdg-open · {url}"),
+                || format!("{opener_name} station website"),
+                |url| format!("{opener_name} · {url}"),
             ),
-            _ => "xdg-open video".to_owned(),
+            _ => format!("{opener_name} video"),
         };
         let label = button(
             if kind == InformationPanelKind::Radio {
@@ -3689,7 +3691,11 @@ fn render_information_panel(
         .then_some(details.channel_webpage_url.as_ref())
         .flatten()
         .map(|url| {
-            let label = button("O", &format!("xdg-open channel · {url}"), show_hotkeys);
+            let label = button(
+                "O",
+                &format!("{} channel · {url}", system_url_opener_name()),
+                show_hotkeys,
+            );
             let line_index = lines.len();
             lines.push(Line::styled(label.clone(), theme.accent));
             (line_index, label, UiAction::OpenChannelInBrowser)
@@ -10757,7 +10763,7 @@ mod tests {
             1,
             "the channel title already visible in the source row must not repeat"
         );
-        assert!(rendered.contains("[O] xdg-open"));
+        assert!(rendered.contains(&format!("[O] {}", system_url_opener_name())));
         assert!(rendered.contains("[a] Add RSS feed"));
         assert!(!rendered.contains("Refresh videos"));
         assert!(hit_map.subscription_source_rows.width > 0);
@@ -11988,8 +11994,11 @@ mod tests {
             "the selected source is already visible in the left panel"
         );
         assert!(rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains("[o] xdg-open video"));
-        assert!(rendered.contains("[O] xdg-open channel · https://www.youtube.com/@fixture"));
+        assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
+        assert!(rendered.contains(&format!(
+            "[O] {} channel · https://www.youtube.com/@fixture",
+            system_url_opener_name()
+        )));
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -12009,7 +12018,7 @@ mod tests {
             .detail_buttons
             .iter()
             .find(|(action, _)| action == &UiAction::OpenInBrowser)
-            .expect("xdg-open video hit target");
+            .expect("external video opener hit target");
         let open_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: open_area.x,
@@ -12024,7 +12033,7 @@ mod tests {
             .detail_buttons
             .iter()
             .find(|(action, _)| action == &UiAction::OpenChannelInBrowser)
-            .expect("xdg-open channel hit target");
+            .expect("external channel opener hit target");
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -12107,7 +12116,7 @@ mod tests {
             .expect("draw physical-console details");
         let rendered = rendered_text(&terminal);
 
-        assert!(!rendered.contains("xdg-open"));
+        assert!(!rendered.contains(system_url_opener_name()));
         assert!(
             hit_map
                 .detail_buttons
@@ -12244,8 +12253,8 @@ mod tests {
             .expect("draw PTY details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("[o] xdg-open video"));
-        assert!(rendered.contains("[O] xdg-open channel"));
+        assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
+        assert!(rendered.contains(&format!("[O] {} channel", system_url_opener_name())));
         assert!(
             hit_map
                 .detail_buttons
@@ -12302,7 +12311,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("stopped at 0:42"));
-        assert!(!rendered.contains("xdg-open video"));
+        assert!(!rendered.contains(&format!("{} video", system_url_opener_name())));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
@@ -12359,7 +12368,10 @@ mod tests {
         assert!(!rendered.contains("42%"));
         assert!(rendered.contains("FLAC · variable bitrate · 44.1 kHz"));
         assert!(!rendered.contains("stereo"));
-        assert!(rendered.contains("[O] xdg-open · https://sectorradio.com/"));
+        assert!(rendered.contains(&format!(
+            "[O] {} · https://sectorradio.com/",
+            system_url_opener_name()
+        )));
         assert!(!rendered.contains("External links"));
         assert!(!rendered.contains("Station website"));
         assert!(!rendered.contains("[B] Sort:"));
@@ -12510,9 +12522,9 @@ mod tests {
             .expect("draw Apple episode details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("[o] xdg-open podcast"));
+        assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(rendered.contains("Length: 42:05"));
-        assert!(!rendered.contains("xdg-open video"));
+        assert!(!rendered.contains(&format!("{} video", system_url_opener_name())));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(
@@ -12533,7 +12545,7 @@ mod tests {
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw Apple show details");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("[o] xdg-open podcast"));
+        assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
@@ -12685,9 +12697,9 @@ mod tests {
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(rendered.contains("Select Details text"));
         assert!(!rendered.contains("[t] Select Details text"));
-        assert!(rendered.contains("xdg-open video"));
-        assert!(!rendered.contains("[o] xdg-open video"));
-        assert!(!rendered.contains("[O] xdg-open"));
+        assert!(rendered.contains(&format!("{} video", system_url_opener_name())));
+        assert!(!rendered.contains(&format!("[o] {} video", system_url_opener_name())));
+        assert!(!rendered.contains(&format!("[O] {}", system_url_opener_name())));
         assert_eq!(hit_map.detail_buttons.len(), 3);
         assert!(
             hit_map
@@ -16769,9 +16781,10 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
-        assert!(
-            rendered.contains("[O] xdg-open channel · https://www.youtube.com/channel/UCfixture")
-        );
+        assert!(rendered.contains(&format!(
+            "[O] {} channel · https://www.youtube.com/channel/UCfixture",
+            system_url_opener_name()
+        )));
         assert!(!rendered.contains("Load channel info"));
         assert!(rendered.contains("Full channel description"));
         assert!(rendered.contains("Douglas Adams (Q42)"));

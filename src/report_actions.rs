@@ -34,6 +34,19 @@ const SHORT_ISSUE_BODY: &str =
 const PROCESS_OBSERVATION_TIME: Duration = Duration::from_millis(100);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Returns the native URL-opening command for the compiled operating system.
+///
+/// Linux and other freedesktop-oriented Unix systems use `xdg-open`; macOS
+/// ships `/usr/bin/open` instead.
+#[must_use]
+pub(crate) const fn system_url_opener_name() -> &'static str {
+    url_opener_name_for_platform(cfg!(target_os = "macos"))
+}
+
+const fn url_opener_name_for_platform(macos: bool) -> &'static str {
+    if macos { "open" } else { "xdg-open" }
+}
+
 /// A command and its input, planned without starting a process.
 ///
 /// Keeping standard input separate from arguments makes plans safe to inspect
@@ -250,8 +263,8 @@ pub struct ReportActionTools {
     pub github_cli: Option<PathBuf>,
     /// Clipboard helper appropriate for the active graphical session.
     pub clipboard: Option<ClipboardHelper>,
-    /// `xdg-open` executable used by the browser fallback.
-    pub xdg_open: Option<PathBuf>,
+    /// Native operating-system URL opener used by the browser fallback.
+    pub url_opener: Option<PathBuf>,
 }
 
 impl ReportActionTools {
@@ -276,7 +289,7 @@ fn nonempty_environment_variable(name: &str) -> bool {
 
 fn discover_tools(path: &OsStr, wayland: bool, x11: bool, macos: bool) -> ReportActionTools {
     let github_cli = find_executable(path, "gh");
-    let xdg_open = find_executable(path, "xdg-open");
+    let url_opener = find_executable(path, url_opener_name_for_platform(macos));
     let clipboard = if wayland {
         find_executable(path, "wl-copy").map(ClipboardHelper::WlCopy)
     } else {
@@ -302,7 +315,7 @@ fn discover_tools(path: &OsStr, wayland: bool, x11: bool, macos: bool) -> Report
     ReportActionTools {
         github_cli,
         clipboard,
-        xdg_open,
+        url_opener,
     }
 }
 
@@ -343,7 +356,7 @@ fn is_executable(path: &Path) -> bool {
 pub enum ReportActionError {
     /// The GitHub CLI was not discovered on a safe `PATH` entry.
     GitHubCliUnavailable,
-    /// `xdg-open` was not discovered on a safe `PATH` entry.
+    /// The native URL opener was not discovered on a safe `PATH` entry.
     UrlOpenerUnavailable,
     /// A direct helper process could not be started or supplied with input.
     ProcessIo {
@@ -386,9 +399,9 @@ impl fmt::Display for ReportActionError {
             Self::GitHubCliUnavailable => {
                 formatter.write_str("GitHub CLI was not found on an absolute PATH entry")
             }
-            Self::UrlOpenerUnavailable => {
-                formatter.write_str("xdg-open was not found on an absolute PATH entry")
-            }
+            Self::UrlOpenerUnavailable => formatter.write_str(
+                "the operating-system URL opener was not found on an absolute PATH entry",
+            ),
             Self::ProcessIo { helper, source } => {
                 write!(formatter, "cannot run {helper}: {source}")
             }
@@ -542,9 +555,10 @@ impl<R: ReportActionRunner> ReportActions<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error when copying fails, `xdg-open` is unavailable, or the
-    /// browser helper does not promptly confirm a successful exit. An opener
-    /// error states which clipboard transport already succeeded.
+    /// Returns an error when copying fails, the native URL opener is
+    /// unavailable, or the browser helper does not promptly confirm a
+    /// successful exit. An opener error states which clipboard transport
+    /// already succeeded.
     pub fn copy_and_open_github_issue(
         &self,
         title: &str,
@@ -562,11 +576,11 @@ impl<R: ReportActionRunner> ReportActions<R> {
     }
 
     fn open_issue_page(&self, title: &str) -> Result<(), ReportActionError> {
-        let Some(xdg_open) = &self.tools.xdg_open else {
+        let Some(url_opener) = &self.tools.url_opener else {
             return Err(ReportActionError::UrlOpenerUnavailable);
         };
-        let plan = issue_page_plan(xdg_open, title);
-        self.execute_successfully(&plan, "xdg-open")
+        let plan = issue_page_plan(url_opener, title);
+        self.execute_successfully(&plan, system_url_opener_name())
     }
 
     fn execute_successfully(
@@ -610,9 +624,9 @@ fn github_cli_plan(executable: &Path, title: &str, report: &str) -> CommandPlan 
 fn issue_page_plan(executable: &Path, title: &str) -> CommandPlan {
     CommandPlan {
         executable: executable.to_owned(),
-        // Unlike many command-line tools, `xdg-open` does not accept `--` as
-        // an end-of-options marker. The bounded URL always starts with HTTPS,
-        // so it is safe and valid as the command's sole target argument.
+        // `xdg-open` does not accept the conventional `--` separator, while
+        // macOS `open` does not require it for an HTTPS URL. The bounded URL
+        // always starts with HTTPS, so it is safe as the sole target argument.
         arguments: vec![short_issue_url(title).into()],
         standard_input: None,
         observation_time: PROCESS_OBSERVATION_TIME,
@@ -763,7 +777,7 @@ mod tests {
         ReportActionTools {
             github_cli: Some(PathBuf::from("/usr/bin/gh")),
             clipboard: Some(ClipboardHelper::WlCopy(PathBuf::from("/usr/bin/wl-copy"))),
-            xdg_open: Some(PathBuf::from("/usr/bin/xdg-open")),
+            url_opener: Some(PathBuf::from("/usr/bin").join(system_url_opener_name())),
         }
     }
 
@@ -921,7 +935,7 @@ mod tests {
             ReportActionTools {
                 github_cli: None,
                 clipboard: None,
-                xdg_open: None,
+                url_opener: None,
             },
         );
 
@@ -964,7 +978,10 @@ mod tests {
         let plans = actions.runner.plans.borrow();
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].executable, Path::new("/usr/bin/wl-copy"));
-        assert_eq!(plans[1].executable, Path::new("/usr/bin/xdg-open"));
+        assert_eq!(
+            plans[1].executable,
+            Path::new("/usr/bin").join(system_url_opener_name())
+        );
         assert_eq!(plans[1].arguments.len(), 1);
         let url = plans[1].arguments[0].to_string_lossy();
         assert!(url.starts_with(NEW_ISSUE_URL));
@@ -995,7 +1012,10 @@ mod tests {
                 .starts_with(NEW_ISSUE_URL)
         );
         assert!(error.to_string().contains("report was copied with wl-copy"));
-        assert!(error.to_string().contains("xdg-open exited with status 3"));
+        assert!(error.to_string().contains(&format!(
+            "{} exited with status 3",
+            system_url_opener_name()
+        )));
     }
 
     #[test]
@@ -1012,7 +1032,10 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("report was copied with wl-copy"));
-        assert!(message.contains("xdg-open did not report a successful exit promptly"));
+        assert!(message.contains(&format!(
+            "{} did not report a successful exit promptly",
+            system_url_opener_name()
+        )));
         assert!(!message.contains("private report"));
         assert!(!message.contains(NEW_ISSUE_URL));
     }
@@ -1160,7 +1183,9 @@ mod tests {
     #[test]
     fn helper_selection_respects_session_and_priority() {
         let directory = tempfile::tempdir().expect("temporary PATH");
-        for name in ["gh", "xdg-open", "wl-copy", "xclip", "xsel", "pbcopy"] {
+        for name in [
+            "gh", "open", "xdg-open", "wl-copy", "xclip", "xsel", "pbcopy",
+        ] {
             make_executable(&directory.path().join(name));
         }
         let path = env::join_paths([directory.path()]).expect("valid PATH");
@@ -1175,7 +1200,20 @@ mod tests {
         let macos = discover_tools(&path, false, false, true);
         assert!(matches!(macos.clipboard, Some(ClipboardHelper::Pbcopy(_))));
         assert!(wayland.github_cli.is_some());
-        assert!(wayland.xdg_open.is_some());
+        assert_eq!(
+            wayland.url_opener.as_deref(),
+            Some(directory.path().join("xdg-open").as_path())
+        );
+        assert_eq!(
+            macos.url_opener.as_deref(),
+            Some(directory.path().join("open").as_path())
+        );
+    }
+
+    #[test]
+    fn url_opener_name_matches_linux_and_macos_platform_conventions() {
+        assert_eq!(url_opener_name_for_platform(false), "xdg-open");
+        assert_eq!(url_opener_name_for_platform(true), "open");
     }
 
     #[test]

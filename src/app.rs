@@ -124,7 +124,7 @@ use crate::providers::{
     VideoOrientation, VideoSummary, invidious_youtube_provider, official_youtube_provider,
     validate_youtube_video_id,
 };
-use crate::report_actions::SystemReportActions;
+use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
 use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
@@ -2175,7 +2175,7 @@ struct ActiveDescriptionVideo {
     start_seconds: Option<u64>,
 }
 
-/// URL-free result returned by one asynchronous `xdg-open` task.
+/// URL-free result returned by one asynchronous system-opener task.
 ///
 /// The selected target is intentionally absent so it cannot enter diagnostics,
 /// debug output, or long-lived controller state.
@@ -16284,14 +16284,15 @@ impl AppController {
                 "Wait for an earlier system-opener request to finish".to_owned();
             return;
         }
+        let opener_name = system_url_opener_name();
         match spawn_url_opener_task(
-            PathBuf::from("xdg-open"),
+            PathBuf::from(opener_name),
             url.to_owned(),
             self.url_open_result_sender.clone(),
         ) {
             Ok(()) => {
                 self.url_open_pending = self.url_open_pending.saturating_add(1);
-                self.view.status_line = "Opening selected webpage with xdg-open…".to_owned();
+                self.view.status_line = format!("Opening selected webpage with {opener_name}…");
             }
             Err(error) => self.show_error("Cannot start webpage opener", &error),
         }
@@ -16303,7 +16304,8 @@ impl AppController {
             match self.url_open_results.try_recv() {
                 Ok(UrlOpenCompletion::Succeeded) => {
                     self.url_open_pending = self.url_open_pending.saturating_sub(1);
-                    self.view.status_line = "Opened selected webpage with xdg-open".to_owned();
+                    self.view.status_line =
+                        format!("Opened selected webpage with {}", system_url_opener_name());
                 }
                 Ok(UrlOpenCompletion::Failed(error)) => {
                     self.url_open_pending = self.url_open_pending.saturating_sub(1);
@@ -17152,8 +17154,9 @@ impl Drop for AppController {
 
 /// Builds one system-opener command without a synthetic option separator.
 ///
-/// `xdg-open` accepts exactly one target argument; unlike many command-line
-/// tools, it does not recognize `--` as an option terminator.
+/// The target is supplied as exactly one argument. `xdg-open` does not
+/// recognize the conventional `--` separator, and macOS `open` does not need
+/// it for the validated HTTPS targets accepted by the controller.
 fn url_opener_command(executable: &Path, target: &str) -> Command {
     let mut command = Command::new(executable);
     command
@@ -17174,6 +17177,7 @@ fn spawn_url_opener_task(
     target: String,
     results: Sender<UrlOpenCompletion>,
 ) -> std::io::Result<()> {
+    let opener_name = system_url_opener_name();
     thread::Builder::new()
         .name("youta-url-opener".to_owned())
         .spawn(move || {
@@ -17181,15 +17185,15 @@ fn spawn_url_opener_task(
                 Ok(mut child) => match child.wait() {
                     Ok(status) if status.success() => UrlOpenCompletion::Succeeded,
                     Ok(status) => UrlOpenCompletion::Failed(status.code().map_or_else(
-                        || "xdg-open was terminated before reporting an exit status".to_owned(),
-                        |code| format!("xdg-open exited with status {code}"),
+                        || format!("{opener_name} was terminated before reporting an exit status"),
+                        |code| format!("{opener_name} exited with status {code}"),
                     )),
                     Err(error) => UrlOpenCompletion::Failed(format!(
-                        "could not wait for xdg-open to finish: {error}"
+                        "could not wait for {opener_name} to finish: {error}"
                     )),
                 },
                 Err(error) => {
-                    UrlOpenCompletion::Failed(format!("could not start xdg-open: {error}"))
+                    UrlOpenCompletion::Failed(format!("could not start {opener_name}: {error}"))
                 }
             };
             let _ = results.send(completion);
@@ -23854,9 +23858,9 @@ mod tests {
     }
 
     #[test]
-    fn xdg_open_receives_exactly_one_target_without_option_separator() {
+    fn system_url_opener_receives_exactly_one_target_without_option_separator() {
         let command = url_opener_command(
-            Path::new("xdg-open"),
+            Path::new(system_url_opener_name()),
             "https://www.youtube.com/channel/UCfixture",
         );
         let arguments = command
@@ -23867,17 +23871,17 @@ mod tests {
         assert_eq!(
             arguments,
             ["https://www.youtube.com/channel/UCfixture"],
-            "`xdg-open` rejects the conventional synthetic `--` argument"
+            "the native URL opener receives no synthetic option separator"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn xdg_open_task_reports_nonzero_exit_instead_of_false_success() {
+    fn system_url_opener_task_reports_nonzero_exit_instead_of_false_success() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = tempfile::tempdir().expect("temporary opener directory");
-        let opener = temporary.path().join("xdg-open");
+        let opener = temporary.path().join(system_url_opener_name());
         std::fs::write(&opener, "#!/bin/sh\nexit 23\n").expect("opener fixture");
         std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))
             .expect("executable opener fixture");
@@ -23894,7 +23898,10 @@ mod tests {
             receiver
                 .recv_timeout(Duration::from_secs(2))
                 .expect("opener completion"),
-            UrlOpenCompletion::Failed("xdg-open exited with status 23".to_owned())
+            UrlOpenCompletion::Failed(format!(
+                "{} exited with status 23",
+                system_url_opener_name()
+            ))
         );
     }
 
