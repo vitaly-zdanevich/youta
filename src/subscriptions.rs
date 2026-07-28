@@ -124,6 +124,22 @@ impl SubscriptionTree {
         title: impl Into<String>,
         channel_id: &str,
     ) -> bool {
+        self.subscribe_youtube_channel_with_website(title, channel_id, None)
+    }
+
+    /// Adds a portable `YouTube` subscription with a preferred public website.
+    ///
+    /// A provider-supplied handle or legacy custom-channel URL is retained in
+    /// OPML when it is a safe YouTube channel URL. Invalid or mismatched URLs
+    /// fall back to the stable `/channel/<id>` address.
+    ///
+    /// Returns `true` when a new subscription was added.
+    pub fn subscribe_youtube_channel_with_website(
+        &mut self,
+        title: impl Into<String>,
+        channel_id: &str,
+        preferred_website_url: Option<&Url>,
+    ) -> bool {
         if channel_id.is_empty() || self.contains_youtube_channel(channel_id) {
             return false;
         }
@@ -134,15 +150,19 @@ impl SubscriptionTree {
         feed_url
             .query_pairs_mut()
             .append_pair("channel_id", channel_id);
-        let Ok(mut website_url) = Url::parse("https://www.youtube.com") else {
+        let website_url = preferred_website_url
+            .filter(|url| safe_youtube_channel_website_url(url, channel_id))
+            .cloned()
+            .or_else(|| {
+                let mut website_url = Url::parse("https://www.youtube.com").ok()?;
+                let mut segments = website_url.path_segments_mut().ok()?;
+                segments.extend(["channel", channel_id]);
+                drop(segments);
+                Some(website_url)
+            });
+        let Some(website_url) = website_url else {
             return false;
         };
-        {
-            let Ok(mut segments) = website_url.path_segments_mut() else {
-                return false;
-            };
-            segments.extend(["channel", channel_id]);
-        }
 
         let mut subscription = Subscription::new(title, feed_url);
         subscription.website_url = Some(website_url);
@@ -316,6 +336,33 @@ fn valid_youtube_channel_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Validates a provider-supplied public website before writing it to OPML.
+fn safe_youtube_channel_website_url(url: &Url, channel_id: &str) -> bool {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("youtube.com")
+                || host.eq_ignore_ascii_case("www.youtube.com")
+                || host.eq_ignore_ascii_case("m.youtube.com")
+        })
+    {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments.collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["channel", candidate] => *candidate == channel_id,
+        [handle] => handle.starts_with('@') && handle.len() > 1,
+        [namespace @ ("c" | "user"), name] => !namespace.is_empty() && !name.is_empty(),
+        _ => false,
+    }
 }
 
 /// One outline in a subscription tree.
@@ -787,6 +834,45 @@ mod tests {
         assert!(!restored.unsubscribe_youtube_channel("UCfixture"));
         assert!(!restored.contains_youtube_channel("UCfixture"));
         assert_eq!(restored.subscription_count(), 0);
+    }
+
+    #[test]
+    fn youtube_subscription_preserves_safe_preferred_channel_website() {
+        let mut tree = SubscriptionTree::default();
+        let handle = parse("https://www.youtube.com/@fixture");
+
+        assert!(tree.subscribe_youtube_channel_with_website(
+            "Fixture channel",
+            "UCfixture",
+            Some(&handle),
+        ));
+        let xml = tree.to_opml().expect("serialize preferred channel URL");
+        assert!(xml.contains("htmlUrl=\"https://www.youtube.com/@fixture\""));
+
+        let restored = SubscriptionTree::from_opml(&xml).expect("restore preferred channel URL");
+        let flattened = restored.flattened_subscriptions();
+        let [FlattenedSubscription { subscription, .. }] = flattened.as_slice() else {
+            panic!("expected one restored subscription");
+        };
+        assert_eq!(subscription.website_url.as_ref(), Some(&handle));
+    }
+
+    #[test]
+    fn youtube_subscription_rejects_unsafe_or_mismatched_preferred_website() {
+        for website in [
+            parse("https://evil.example/@fixture"),
+            parse("https://www.youtube.com/channel/UCdifferent"),
+        ] {
+            let mut tree = SubscriptionTree::default();
+            assert!(tree.subscribe_youtube_channel_with_website(
+                "Fixture channel",
+                "UCfixture",
+                Some(&website),
+            ));
+            let xml = tree.to_opml().expect("serialize fallback channel URL");
+            assert!(xml.contains("https://www.youtube.com/channel/UCfixture"));
+            assert!(!xml.contains(website.as_str()));
+        }
     }
 
     #[test]

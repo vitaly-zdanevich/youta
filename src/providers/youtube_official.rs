@@ -1174,7 +1174,7 @@ fn channel_summary_from_search(channel_id: String, snippet: RawSnippet) -> Chann
         .as_deref()
         .and_then(parse_rfc3339_epoch);
     ChannelSummary {
-        webpage_url: youtube_channel_url(&channel_id),
+        webpage_url: youtube_channel_url_with_custom(&channel_id, snippet.custom_url.as_deref()),
         channel_id,
         name: snippet.title,
         description: snippet.description,
@@ -1199,7 +1199,7 @@ fn channel_summary_from_resource(raw: RawChannelResource) -> Result<ChannelSumma
         .as_deref()
         .and_then(parse_rfc3339_epoch);
     Ok(ChannelSummary {
-        webpage_url: youtube_channel_url(&raw.id),
+        webpage_url: youtube_channel_url_with_custom(&raw.id, raw.snippet.custom_url.as_deref()),
         channel_id: raw.id,
         name: raw.snippet.title,
         description: raw.snippet.description,
@@ -1296,6 +1296,65 @@ fn youtube_channel_url(channel_id: &str) -> Option<Url> {
         .pop_if_empty()
         .push(channel_id);
     Some(url)
+}
+
+/// Returns the safest public YouTube channel URL exposed by an API response.
+///
+/// Official channel resources may expose a human-readable `customUrl`. Only
+/// channel-path shapes used by YouTube are accepted; malformed values fall
+/// back to the stable channel-ID URL.
+fn youtube_channel_url_with_custom(channel_id: &str, custom_url: Option<&str>) -> Option<Url> {
+    custom_url
+        .and_then(youtube_custom_channel_url)
+        .or_else(|| youtube_channel_url(channel_id))
+}
+
+/// Converts an official `snippet.customUrl` value into a public YouTube URL.
+fn youtube_custom_channel_url(custom_url: &str) -> Option<Url> {
+    let path = custom_url.trim().trim_start_matches('/');
+    if path.is_empty()
+        || path.len() > 256
+        || path
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || path.contains(['\\', '?', '#'])
+    {
+        return None;
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    let valid_shape = match segments.as_slice() {
+        [handle] => handle
+            .strip_prefix('@')
+            .is_some_and(valid_youtube_channel_alias),
+        ["c" | "user", name] => valid_youtube_channel_alias(name),
+        _ => false,
+    };
+    if !valid_shape {
+        return None;
+    }
+
+    let mut url = Url::parse("https://www.youtube.com/").ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(segments);
+    Some(url)
+}
+
+/// Checks a human-readable YouTube channel path segment without guessing routes.
+///
+/// The official API can return Unicode handles and legacy custom names, so the
+/// check retains Unicode while excluding URL delimiters, traversal markers,
+/// control characters, and unreasonably large response values.
+fn valid_youtube_channel_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && !matches!(alias, "." | "..")
+        && !alias.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+        })
 }
 
 fn convert_thumbnails(raw: BTreeMap<String, RawThumbnail>) -> Vec<Thumbnail> {
@@ -1510,6 +1569,8 @@ struct RawSnippet {
     description: String,
     #[serde(default)]
     channel_title: String,
+    #[serde(default)]
+    custom_url: Option<String>,
     #[serde(default)]
     country: Option<String>,
     #[serde(default)]
@@ -1770,6 +1831,7 @@ mod tests {
             "snippet": {
                 "title": "Enriched channel",
                 "description": "Full channel description",
+                "customUrl": "@enriched",
                 "publishedAt": "2014-04-24T10:11:12Z",
                 "country": "UA",
                 "thumbnails": {
@@ -2107,7 +2169,7 @@ mod tests {
         assert_eq!(channel.thumbnails.len(), 1);
         assert_eq!(
             channel.webpage_url.as_ref().map(Url::as_str),
-            Some("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw")
+            Some("https://www.youtube.com/@enriched")
         );
 
         assert_eq!(requests.len(), 1);
@@ -2125,6 +2187,58 @@ mod tests {
             4,
             "exact lookup must not add search parameters"
         );
+    }
+
+    #[test]
+    fn official_custom_channel_url_accepts_only_channel_route_shapes() {
+        for (custom_url, expected) in [
+            ("@fixture", "https://www.youtube.com/@fixture"),
+            (
+                "/@ქართული",
+                "https://www.youtube.com/@%E1%83%A5%E1%83%90%E1%83%A0%E1%83%97%E1%83%A3%E1%83%9A%E1%83%98",
+            ),
+            (
+                "c/Fixture-Channel",
+                "https://www.youtube.com/c/Fixture-Channel",
+            ),
+            (
+                "user/fixture_name",
+                "https://www.youtube.com/user/fixture_name",
+            ),
+        ] {
+            assert_eq!(
+                youtube_custom_channel_url(custom_url)
+                    .as_ref()
+                    .map(Url::as_str),
+                Some(expected),
+                "{custom_url:?} should remain a human-readable channel route"
+            );
+        }
+
+        for custom_url in [
+            "https://evil.example/@fixture",
+            "../@fixture",
+            "@fixture?redirect=1",
+            "watch",
+            "redirect",
+            "@",
+            "@fixture/shorts",
+            "channel/UCdifferent",
+            "c/../watch",
+            "user/name#fragment",
+            "@fixture%2Fwatch",
+        ] {
+            assert!(
+                youtube_custom_channel_url(custom_url).is_none(),
+                "{custom_url:?} must not become a channel page"
+            );
+            assert_eq!(
+                youtube_channel_url_with_custom(CHANNEL_ID, Some(custom_url))
+                    .as_ref()
+                    .map(Url::as_str),
+                Some("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw")
+            );
+        }
     }
 
     #[test]

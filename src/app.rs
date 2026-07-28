@@ -10611,6 +10611,7 @@ impl AppController {
         } else {
             details.channel_name.clone()
         };
+        let channel_webpage_url = details.channel_webpage_url.clone();
         let now_subscribed = !details.channel_subscribed;
 
         // Reload on each explicit mutation so external OPML edits are retained
@@ -10625,7 +10626,11 @@ impl AppController {
         let persisted_subscribed = candidate.contains_youtube_channel(&channel_id);
         if persisted_subscribed != now_subscribed {
             let changed = if now_subscribed {
-                candidate.subscribe_youtube_channel(channel_name.clone(), &channel_id)
+                candidate.subscribe_youtube_channel_with_website(
+                    channel_name.clone(),
+                    &channel_id,
+                    channel_webpage_url.as_ref(),
+                )
             } else {
                 candidate.unsubscribe_youtube_channel(&channel_id)
             };
@@ -20470,7 +20475,10 @@ fn youtube_channel_webpage_url(channel_id: &str, preferred: Option<url::Url>) ->
 /// Checks that a preferred URL is an exact credential-free YouTube channel page.
 fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
     if url.scheme() != "https"
-        || !matches!(url.host_str(), Some("youtube.com" | "www.youtube.com"))
+        || !matches!(
+            url.host_str(),
+            Some("youtube.com" | "www.youtube.com" | "m.youtube.com")
+        )
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -20486,16 +20494,29 @@ fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
     match segments.as_slice() {
         [handle] => handle
             .strip_prefix('@')
-            .is_some_and(|handle| !handle.is_empty() && handle.len() <= 128),
+            .is_some_and(valid_youtube_channel_webpage_alias),
         ["channel", candidate] => {
             canonical_youtube_channel_url(candidate).is_some()
                 && (channel_id.is_empty() || *candidate == channel_id)
         }
-        ["c" | "user", legacy_name] => !legacy_name.is_empty() && legacy_name.len() <= 128,
+        ["c" | "user", legacy_name] => valid_youtube_channel_webpage_alias(legacy_name),
         _ => false,
     }
 }
 
+/// Checks a provider-supplied human channel path without accepting other routes.
+fn valid_youtube_channel_webpage_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && !matches!(alias, "." | "..")
+        && !alias.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+        })
+}
+
+/// Returns the validated item URL shared by Search browser and copy actions.
 fn search_item_url(item: &SearchItem) -> Option<String> {
     match item {
         SearchItem::Video(video) => Some(
@@ -20505,11 +20526,10 @@ fn search_item_url(item: &SearchItem) -> Option<String> {
                 .map(ToString::to_string)
                 .unwrap_or_else(|| youtube_video_url(&video.video_id)),
         ),
-        SearchItem::Channel(channel) => channel
-            .webpage_url
-            .clone()
-            .or_else(|| canonical_youtube_channel_url(&channel.channel_id))
-            .map(|url| url.to_string()),
+        SearchItem::Channel(channel) => {
+            youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone())
+                .map(|url| url.to_string())
+        }
     }
 }
 
@@ -24754,6 +24774,65 @@ mod tests {
     }
 
     #[test]
+    fn search_channel_open_url_never_exposes_an_unvalidated_provider_route() {
+        for unsafe_url in [
+            "https://www.youtube.com/watch?v=fixture",
+            "https://www.youtube.com/redirect",
+            "https://www.youtube.com/@",
+            "https://www.youtube.com/@fixture%2Fwatch",
+            "https://www.youtube.com/c/../watch",
+            "https://www.youtube.com/user/fixture/shorts",
+            "https://youtube.com@example.org/@fixture",
+            "javascript:alert(1)",
+        ] {
+            let item = SearchItem::Channel(ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture".to_owned(),
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                created_at: None,
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: Some(
+                    url::Url::parse(unsafe_url).expect("unsafe fixture must still parse as a URL"),
+                ),
+            });
+
+            assert_eq!(
+                search_item_url(&item).as_deref(),
+                Some("https://www.youtube.com/channel/UCfixture"),
+                "{unsafe_url:?} must fall back to the stable channel ID"
+            );
+        }
+    }
+
+    #[test]
+    fn search_channel_open_url_retains_valid_human_readable_routes() {
+        for safe_url in [
+            "https://www.youtube.com/@fixture",
+            "https://www.youtube.com/c/FixtureChannel",
+            "https://www.youtube.com/user/fixture",
+        ] {
+            let item = SearchItem::Channel(ChannelSummary {
+                channel_id: "UCfixture".to_owned(),
+                name: "Fixture".to_owned(),
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                created_at: None,
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: Some(
+                    url::Url::parse(safe_url).expect("safe fixture must parse as a URL"),
+                ),
+            });
+
+            assert_eq!(search_item_url(&item).as_deref(), Some(safe_url));
+        }
+    }
+
+    #[test]
     fn multilingual_description_timecodes_feed_details_and_queue_chapters() {
         let mut video = subscription_video_summary();
         video.duration_seconds = Some(4_000);
@@ -25045,6 +25124,13 @@ mod tests {
             &SearchItem::Video(video),
             &controller.subscription_tree,
         ));
+        controller
+            .view
+            .details
+            .as_mut()
+            .expect("video details")
+            .channel_webpage_url =
+            Some(url::Url::parse("https://www.youtube.com/@fixture").expect("fixture handle"));
         controller.refresh_youtube_rows();
 
         controller.dispatch(UiAction::ToggleSubscription);
@@ -25076,7 +25162,7 @@ mod tests {
         );
         assert_eq!(
             subscription.website_url.as_ref().map(url::Url::as_str),
-            Some("https://www.youtube.com/channel/UCfixture")
+            Some("https://www.youtube.com/@fixture")
         );
 
         let restored = AppController::new(

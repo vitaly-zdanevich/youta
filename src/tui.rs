@@ -3518,6 +3518,28 @@ enum InformationPanelKind {
     Generic,
 }
 
+/// Returns a real YouTube `@handle` carried by a safe channel URL.
+///
+/// Display names are handled separately so UI text can never be converted
+/// into a guessed channel address.
+fn youtube_channel_handle(url: Option<&url::Url>) -> Option<&str> {
+    let url = url?;
+    if url.scheme() != "https"
+        || !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("youtube.com")
+                || host.eq_ignore_ascii_case("www.youtube.com")
+                || host.eq_ignore_ascii_case("m.youtube.com")
+        })
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let handle = segments.next()?;
+    (segments.next().is_none() && handle.starts_with('@') && handle.len() > 1).then_some(handle)
+}
+
 fn render_information_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3720,15 +3742,44 @@ fn render_information_panel(
         && kind != InformationPanelKind::Radio)
         .then_some(details.channel_webpage_url.as_ref())
         .flatten()
-        .map(|url| {
+        .map(|_| {
+            let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
+                .or_else(|| {
+                    (!details.channel_name.trim().is_empty()).then_some(details.channel_name.trim())
+                })
+                .or_else(|| (!details.title.trim().is_empty()).then_some(details.title.trim()))
+                .unwrap_or("channel");
             let label = button(
                 "O",
-                &format!("{} channel · {url}", system_url_opener_name()),
+                &format!("{} channel · {channel_label}", system_url_opener_name()),
                 show_hotkeys,
             );
+            let label_width = terminal_text_width(&label);
+            if let Some((line_index, text_label, _)) = text_selection_button.as_ref() {
+                let text_width = terminal_text_width(text_label);
+                if label_width <= inner.width
+                    && text_width.saturating_add(label_width).saturating_add(1) <= inner.width
+                {
+                    let column = inner.width.saturating_sub(label_width);
+                    let gap = column.saturating_sub(text_width);
+                    lines[*line_index] = Line::from(vec![
+                        Span::styled(
+                            text_label.clone(),
+                            if view.text_selection_mode {
+                                theme.selected
+                            } else {
+                                theme.accent
+                            },
+                        ),
+                        Span::raw(" ".repeat(usize::from(gap))),
+                        Span::styled(label.clone(), theme.accent),
+                    ]);
+                    return (*line_index, column, label, UiAction::OpenChannelInBrowser);
+                }
+            }
             let line_index = lines.len();
             lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, label, UiAction::OpenChannelInBrowser)
+            (line_index, 0, label, UiAction::OpenChannelInBrowser)
         });
     let rename_button = (cfg!(feature = "local-rename")
         && kind == InformationPanelKind::Local
@@ -3871,7 +3922,7 @@ fn render_information_panel(
         let open_button_row = open_button.as_ref().map(|(line_index, _, _)| *line_index);
         let open_channel_button_row = open_channel_button
             .as_ref()
-            .map(|(line_index, _, _)| *line_index);
+            .map(|(line_index, _, _, _)| *line_index);
         let rename_button_row = rename_button.as_ref().map(|(line_index, _, _)| *line_index);
         let move_button_row = move_button.as_ref().map(|(line_index, _, _)| *line_index);
         let trash_button_row = trash_button.as_ref().map(|(line_index, _, _)| *line_index);
@@ -3914,7 +3965,6 @@ fn render_information_panel(
         .chain(private_note_button)
         .chain(subscription_button)
         .chain(open_button)
-        .chain(open_channel_button)
         .chain(rename_button)
         .chain(move_button)
         .chain(trash_button)
@@ -3928,6 +3978,24 @@ fn render_information_panel(
                 action,
                 Rect::new(
                     inner.x,
+                    inner.y.saturating_add(
+                        u16::try_from(line_index).unwrap_or(metadata_height.saturating_sub(1)),
+                    ),
+                    width,
+                    1,
+                ),
+            ));
+        }
+    }
+    if let Some((line_index, column, label, action)) = open_channel_button
+        && line_index < usize::from(metadata_height)
+    {
+        let width = terminal_text_width(&label).min(inner.width.saturating_sub(column));
+        if width > 0 {
+            hit_map.detail_buttons.push((
+                action,
+                Rect::new(
+                    inner.x.saturating_add(column),
                     inner.y.saturating_add(
                         u16::try_from(line_index).unwrap_or(metadata_height.saturating_sub(1)),
                     ),
@@ -12037,7 +12105,7 @@ mod tests {
         assert!(rendered.contains("[s] Subscribe (locally)"));
         assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
         assert!(rendered.contains(&format!(
-            "[O] {} channel · https://www.youtube.com/@fixture",
+            "[O] {} channel · @fixture",
             system_url_opener_name()
         )));
         let (_, subscribe_area) = hit_map
@@ -12075,6 +12143,23 @@ mod tests {
             .iter()
             .find(|(action, _)| action == &UiAction::OpenChannelInBrowser)
             .expect("external channel opener hit target");
+        let (_, text_selection_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
+            .expect("text selection hit target");
+        assert_eq!(
+            open_channel_area.y, text_selection_area.y,
+            "the channel opener should share the first control row when it fits"
+        );
+        assert_eq!(
+            open_channel_area.x.saturating_add(open_channel_area.width),
+            hit_map
+                .details_panel
+                .x
+                .saturating_add(hit_map.details_panel.width),
+            "the channel opener should be right-aligned"
+        );
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -16836,7 +16921,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains(&format!(
-            "[O] {} channel · https://www.youtube.com/channel/UCfixture",
+            "[O] {} channel · Mock channel",
             system_url_opener_name()
         )));
         assert!(!rendered.contains("Load channel info"));
