@@ -76,6 +76,9 @@ thumbnails = 'auto'
 
 # Maximum artwork height in terminal rows. Youta reduces it when the Details
 # panel is shorter so metadata, links, and description text retain space.
+# YouTube thumbnails use the full Details-pane width when their description
+# occupies fewer than 15 wrapped rows or the terminal window itself reports a
+# height of at least 1080 pixels.
 thumbnail_height = 20
 
 # Warm the persistent cache for all currently loaded global Search results in

@@ -1760,6 +1760,113 @@ fn current_terminal_attachment() -> TerminalAttachment {
     }
 }
 
+/// Cell-grid and pixel dimensions reported for the current terminal window.
+///
+/// These values come from the terminal device attached to Youta, not from a
+/// desktop monitor or compositor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalWindowMetrics {
+    columns: u16,
+    rows: u16,
+    width_pixels: u16,
+    height_pixels: u16,
+}
+
+impl TerminalWindowMetrics {
+    /// Rejects incomplete terminal reports because they cannot preserve an
+    /// image aspect ratio reliably.
+    fn new(columns: u16, rows: u16, width_pixels: u16, height_pixels: u16) -> Option<Self> {
+        (columns > 0 && rows > 0 && width_pixels > 0 && height_pixels > 0).then_some(Self {
+            columns,
+            rows,
+            width_pixels,
+            height_pixels,
+        })
+    }
+}
+
+/// Reads the current terminal window's grid and pixel dimensions.
+///
+/// Some PTYs and Windows terminals report zero pixel dimensions. Returning
+/// `None` keeps Youta's configured thumbnail height in those environments.
+fn current_terminal_window_metrics() -> Option<TerminalWindowMetrics> {
+    let window = crossterm::terminal::window_size().ok()?;
+    TerminalWindowMetrics::new(window.columns, window.rows, window.width, window.height)
+}
+
+/// Number of wrapped description rows below which YouTube artwork expands.
+const SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT: usize = 15;
+
+/// Reports whether one YouTube description is short at its rendered width.
+///
+/// The Details scrollbar owns one column whenever the pane is wider than one
+/// cell, so this uses the same text width as the description renderer. Injected
+/// video-link actions are included because they also occupy rendered cells.
+fn youtube_description_is_short(details: &DetailView, pane_width: u16) -> bool {
+    if details.source != "YouTube" {
+        return false;
+    }
+    let description_width = pane_width.saturating_sub(1).max(1);
+    let rendered_lines = wrap_description_source(
+        &details.description,
+        usize::from(description_width),
+        &details.video_links,
+    );
+    rendered_lines.len() < SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT
+}
+
+/// Chooses a YouTube thumbnail height for one right-hand terminal pane.
+///
+/// At 1080 terminal-window pixels and above, or when a YouTube description
+/// occupies fewer than 15 rendered rows, the returned row count maps the pane's
+/// complete cell width to a 16:9 pixel rectangle. A short description can use
+/// the same 10×20 fallback cell geometry as the image backend when a terminal
+/// omits pixel dimensions; the 1080-pixel rule itself requires a complete
+/// window report.
+fn youtube_thumbnail_height(
+    configured_height: u16,
+    pane_width: u16,
+    youtube_video: bool,
+    short_description: bool,
+    terminal_window: Option<TerminalWindowMetrics>,
+) -> u16 {
+    const LARGE_TERMINAL_HEIGHT_PIXELS: u16 = 1080;
+    const FALLBACK_CELL_PIXELS: (u16, u16) = (10, 20);
+
+    if !youtube_video || pane_width == 0 {
+        return configured_height;
+    }
+    let (numerator, denominator) = match terminal_window {
+        Some(window)
+            if short_description || window.height_pixels >= LARGE_TERMINAL_HEIGHT_PIXELS =>
+        {
+            (
+                u64::from(pane_width)
+                    .saturating_mul(u64::from(window.width_pixels))
+                    .saturating_mul(9)
+                    .saturating_mul(u64::from(window.rows)),
+                u64::from(window.columns)
+                    .saturating_mul(16)
+                    .saturating_mul(u64::from(window.height_pixels)),
+            )
+        }
+        None if short_description => (
+            u64::from(pane_width)
+                .saturating_mul(u64::from(FALLBACK_CELL_PIXELS.0))
+                .saturating_mul(9),
+            u64::from(FALLBACK_CELL_PIXELS.1).saturating_mul(16),
+        ),
+        Some(_) | None => return configured_height,
+    };
+    let height = numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or_default();
+    u16::try_from(height)
+        .unwrap_or(u16::MAX)
+        .max(MIN_THUMBNAIL_HEIGHT)
+}
+
 /// Runs Youta in the current terminal until the controller requests shutdown.
 pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Result<()> {
     if !io::stdout().is_terminal() {
@@ -3479,6 +3586,50 @@ fn render_details(
     hit_map: &mut HitMap,
     thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
+    let terminal_window = thumbnail_renderer
+        .as_ref()
+        .is_some_and(|renderer| renderer.is_enabled())
+        .then(current_terminal_window_metrics)
+        .flatten();
+    render_details_with_terminal_window(
+        frame,
+        area,
+        view,
+        show_hotkeys,
+        thumbnail_height,
+        terminal_window,
+        theme,
+        hit_map,
+        thumbnail_renderer,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the testable details renderer keeps terminal-window metrics explicit"
+)]
+fn render_details_with_terminal_window(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    configured_thumbnail_height: u16,
+    terminal_window: Option<TerminalWindowMetrics>,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
+) {
+    let youtube_details = view
+        .details
+        .as_ref()
+        .filter(|details| details.source == "YouTube");
+    let thumbnail_height = youtube_thumbnail_height(
+        configured_thumbnail_height,
+        area.width,
+        youtube_details.is_some(),
+        youtube_details.is_some_and(|details| youtube_description_is_short(details, area.width)),
+        terminal_window,
+    );
     render_information_panel(
         frame,
         area,
@@ -13034,7 +13185,7 @@ mod tests {
             details: Some(DetailView {
                 title: "Thumbnail fixture".to_owned(),
                 source: "YouTube".to_owned(),
-                description: "Description remains below the image.".to_owned(),
+                description: vec!["Description remains below the image."; 15].join("\n"),
                 thumbnail_url: Some(thumbnail_url.clone()),
                 ..DetailView::default()
             }),
@@ -13440,7 +13591,7 @@ mod tests {
             details: Some(DetailView {
                 title: "Configured thumbnail fixture".to_owned(),
                 source: "YouTube".to_owned(),
-                description: "Description remains below the image.".to_owned(),
+                description: vec!["Description remains below the image."; 15].join("\n"),
                 thumbnail_url: Some(
                     url::Url::parse("https://images.example/configured.jpg")
                         .expect("fixture thumbnail URL"),
@@ -13468,6 +13619,143 @@ mod tests {
         assert_eq!(thumbnails.synchronized.len(), 1);
         assert_eq!(thumbnails.synchronized[0].1.height, 7);
         assert!(rendered_text(&terminal).contains("Description remains below"));
+    }
+
+    #[test]
+    fn youtube_thumbnails_expand_at_1080_terminal_window_pixels() {
+        let description = "x".repeat(63 * SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT);
+        for (height_pixels, expected_height) in [(1079, 7), (1080, 32)] {
+            let backend = TestBackend::new(120, 60);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let view = ViewModel {
+                details: Some(DetailView {
+                    title: "Adaptive YouTube thumbnail".to_owned(),
+                    source: "YouTube".to_owned(),
+                    description: description.clone(),
+                    thumbnail_url: Some(
+                        url::Url::parse("https://images.example/adaptive.jpg")
+                            .expect("fixture thumbnail URL"),
+                    ),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let terminal_window = TerminalWindowMetrics::new(120, 60, 1920, height_pixels)
+                .expect("complete fixture window metrics");
+            let mut hit_map = HitMap::default();
+            let mut thumbnails = MockThumbnailRenderer {
+                enabled: true,
+                ..MockThumbnailRenderer::default()
+            };
+            let theme = Theme::new(false);
+            let details_area = Rect::new(56, 2, 64, 50);
+
+            terminal
+                .draw(|frame| {
+                    render_details_with_terminal_window(
+                        frame,
+                        details_area,
+                        &view,
+                        true,
+                        7,
+                        Some(terminal_window),
+                        &theme,
+                        &mut hit_map,
+                        Some(&mut thumbnails),
+                    );
+                })
+                .expect("draw adaptive thumbnail");
+
+            let [(_, thumbnail_area)] = thumbnails.synchronized.as_slice() else {
+                panic!("expected one synchronized thumbnail");
+            };
+            assert_eq!(thumbnail_area.width, details_area.width);
+            assert_eq!(
+                thumbnail_area.height, expected_height,
+                "terminal-window threshold {height_pixels}"
+            );
+        }
+
+        assert_eq!(
+            youtube_thumbnail_height(
+                7,
+                64,
+                false,
+                true,
+                TerminalWindowMetrics::new(120, 60, 1920, 1080),
+            ),
+            7,
+            "non-YouTube artwork must retain the configured height"
+        );
+    }
+
+    #[test]
+    fn short_youtube_descriptions_expand_thumbnails_below_1080_pixels() {
+        let details_area = Rect::new(56, 2, 64, 60);
+        let rendered_description_width = usize::from(details_area.width.saturating_sub(1));
+        for (source, wrapped_lines, expected_height) in
+            [("YouTube", 14, 56), ("YouTube", 15, 7), ("PeerTube", 14, 7)]
+        {
+            let backend = TestBackend::new(120, 70);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let details = DetailView {
+                title: "Short-description thumbnail".to_owned(),
+                source: source.to_owned(),
+                description: "x".repeat(rendered_description_width * wrapped_lines),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/short-description.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            };
+            assert_eq!(
+                youtube_description_is_short(&details, details_area.width),
+                source == "YouTube" && wrapped_lines < SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT,
+                "{source} description with {wrapped_lines} wrapped lines"
+            );
+            let view = ViewModel {
+                details: Some(details),
+                ..ViewModel::default()
+            };
+            let terminal_window = TerminalWindowMetrics::new(120, 70, 1920, 720)
+                .expect("complete fixture window metrics");
+            let mut hit_map = HitMap::default();
+            let mut thumbnails = MockThumbnailRenderer {
+                enabled: true,
+                ..MockThumbnailRenderer::default()
+            };
+            let theme = Theme::new(false);
+
+            terminal
+                .draw(|frame| {
+                    render_details_with_terminal_window(
+                        frame,
+                        details_area,
+                        &view,
+                        true,
+                        7,
+                        Some(terminal_window),
+                        &theme,
+                        &mut hit_map,
+                        Some(&mut thumbnails),
+                    );
+                })
+                .expect("draw short-description thumbnail");
+
+            let [(_, thumbnail_area)] = thumbnails.synchronized.as_slice() else {
+                panic!("expected one synchronized thumbnail");
+            };
+            assert_eq!(thumbnail_area.width, details_area.width);
+            assert_eq!(
+                thumbnail_area.height, expected_height,
+                "{source} description with {wrapped_lines} wrapped lines"
+            );
+        }
+        assert_eq!(
+            youtube_thumbnail_height(7, details_area.width, true, true, None),
+            18,
+            "short descriptions should use the image backend's fallback cell geometry"
+        );
     }
 
     #[test]

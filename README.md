@@ -774,7 +774,12 @@ prefetch_search_thumbnails = true
 and rendering, and `on` attempts supported terminal artwork but still falls
 back without fetching when no supported protocol is available. Thumbnail
 height defaults to 20 rows and is reduced automatically when the Details panel
-needs space for metadata, links, or description text.
+needs space for metadata, links, or description text. YouTube video thumbnails
+instead expand to the full Details-pane width at their 16:9 aspect ratio when
+the description occupies fewer than 15 wrapped rows or the terminal window
+itself is at least 1080 pixels tall. Youta reads the attached terminal window's
+pixel dimensions, so a small window on a 1080p monitor does not trigger the
+height-based layout.
 `prefetch_search_thumbnails = false` disables background warming for global
 YouTube and YouTube Music search results; the equivalent environment override
 is `YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Previously learned channel
