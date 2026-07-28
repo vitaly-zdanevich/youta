@@ -39,6 +39,8 @@ use crate::config::{
     SubscriptionsLayout, YOUTUBE_PREWARM_ENV, YouTubeBackend, YouTubeProviderSetting,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
+#[cfg(feature = "radio")]
+use crate::domain::RADIO_FAVORITES_PLAYLIST_ID;
 #[cfg(feature = "bandcamp")]
 use crate::domain::{BandcampReleaseKind, BandcampSearchSummary};
 use crate::domain::{
@@ -2345,6 +2347,9 @@ pub struct AppController {
     /// Stable selected station identity independent of sorting and filtering.
     #[cfg(feature = "radio")]
     radio_selected_station_id: Option<String>,
+    /// Favorite station identities hydrated once and updated with each toggle.
+    #[cfg(feature = "radio")]
+    radio_favorite_station_ids: HashSet<String>,
     /// Accepted Radio filter retained independently from provider searches.
     radio_filter_query: String,
     /// Radio query and selection captured when `/` starts live editing.
@@ -2955,6 +2960,21 @@ impl AppController {
         #[cfg(not(feature = "radio"))]
         let radio_selected = radio_selected_row;
         let radio_filter_query = saved.radio_filter_text.clone();
+        #[cfg(feature = "radio")]
+        let (radio_favorite_station_ids, radio_favorites_restore_error) =
+            match store.playlist(RADIO_FAVORITES_PLAYLIST_ID) {
+                Ok(Some(playlist)) => (
+                    playlist
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.media.id.source == SourceKind::Radio)
+                        .map(|entry| entry.media.id.external_id)
+                        .collect::<HashSet<_>>(),
+                    None,
+                ),
+                Ok(None) => (HashSet::new(), None),
+                Err(error) => (HashSet::new(), Some(error)),
+            };
         if view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
@@ -3008,6 +3028,8 @@ impl AppController {
             radio_selected,
             #[cfg(feature = "radio")]
             radio_selected_station_id,
+            #[cfg(feature = "radio")]
+            radio_favorite_station_ids,
             radio_filter_query,
             #[cfg(feature = "radio")]
             radio_filter_edit_snapshot: None,
@@ -3292,6 +3314,10 @@ impl AppController {
                 "Could not restore the previous Apple Podcasts search",
                 &error,
             );
+        }
+        #[cfg(feature = "radio")]
+        if let Some(error) = radio_favorites_restore_error {
+            controller.show_error("Could not restore favorite Radio stations", &error);
         }
         if let Some(error) = provider_thread_error {
             controller.show_error("Could not start the provider worker", &error);
@@ -12638,6 +12664,7 @@ impl AppController {
                 source: "Radio".to_owned(),
                 hide_watched_marker: true,
                 compact: true,
+                radio_favorite: self.radio_favorite_station_ids.contains(station.id),
                 ..RowView::default()
             })
             .collect();
@@ -12755,10 +12782,12 @@ impl AppController {
     /// Filters Radio presets using the same effective quality rendered in rows.
     #[cfg(feature = "radio")]
     fn filtered_radio_stations(&self, sort: RadioSort, query: &str) -> Vec<RadioStationPreset> {
-        self.sorted_radio_stations(sort)
+        let stations = self
+            .sorted_radio_stations(sort)
             .into_iter()
             .filter(|station| self.radio_station_matches_filter(station, query))
-            .collect()
+            .collect();
+        pin_radio_favorite_stations(stations, &self.radio_favorite_station_ids)
     }
 
     /// Starts one BBC Sounds manifest lookup while retaining only its stable page.
@@ -12903,6 +12932,7 @@ impl AppController {
             source: "Radio".to_owned(),
             channel_webpage_url: station.homepage_url().ok(),
             description,
+            radio_favorite: self.radio_favorite_station_ids.contains(station.id),
             ..DetailView::default()
         });
     }
@@ -16140,6 +16170,46 @@ impl AppController {
             .clone_into(&mut self.view.status_line);
     }
 
+    /// Toggles the selected built-in station in restart-safe Radio favorites.
+    fn toggle_selected_radio_favorite(&mut self) {
+        if self.view.screen != Screen::Radio {
+            self.view.status_line = "Radio favorites apply only to Radio".to_owned();
+            return;
+        }
+        #[cfg(not(feature = "radio"))]
+        {
+            self.view.status_line = "This build omits Radio support".to_owned();
+        }
+        #[cfg(feature = "radio")]
+        {
+            let snapshot = match self.selected_playlist_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(message) => {
+                    self.view.status_line = message;
+                    return;
+                }
+            };
+            if let Err(message) = self.ensure_playlist_mutation_ready(&snapshot) {
+                self.view.status_line = message;
+                return;
+            }
+            let station_id = snapshot.id.external_id.clone();
+            match self.store.toggle_radio_favorite(&snapshot, unix_time()) {
+                Ok(PlaylistToggleOutcome::Added) => {
+                    self.radio_favorite_station_ids.insert(station_id);
+                    self.populate_radio();
+                    self.view.status_line = "Radio station added to favorites".to_owned();
+                }
+                Ok(PlaylistToggleOutcome::Removed) => {
+                    self.radio_favorite_station_ids.remove(&station_id);
+                    self.populate_radio();
+                    self.view.status_line = "Radio station removed from favorites".to_owned();
+                }
+                Err(error) => self.show_error("Could not update Radio favorites", &error),
+            }
+        }
+    }
+
     fn submit_preferences(&mut self) {
         let Some(preferences) = self.view.preferences_popup.as_ref() else {
             return;
@@ -16879,6 +16949,7 @@ impl UiController for AppController {
             UiAction::ToggleAutoplay => self.toggle_autoplay(),
             UiAction::ToggleLocalSizeSort => self.toggle_local_size_sort(),
             UiAction::CycleRadioSort => self.cycle_radio_sort(),
+            UiAction::ToggleRadioFavorite => self.toggle_selected_radio_favorite(),
             UiAction::ToggleWaveform => {
                 self.view.right_panel_mode =
                     if self.view.right_panel_mode == RightPanelMode::Waveform {
@@ -19826,6 +19897,7 @@ fn row_from_search_item(
                 vertical: video.orientation == VideoOrientation::Vertical,
                 hide_watched_marker: false,
                 compact: false,
+                radio_favorite: false,
                 local_marked: false,
             }
         }
@@ -20842,6 +20914,19 @@ fn sorted_radio_stations_by(
         }
     });
     stations
+}
+
+/// Stably pins favorite stations before the already sorted and filtered rest.
+#[cfg(feature = "radio")]
+fn pin_radio_favorite_stations(
+    stations: Vec<RadioStationPreset>,
+    favorite_ids: &HashSet<String>,
+) -> Vec<RadioStationPreset> {
+    let (mut favorites, others): (Vec<_>, Vec<_>) = stations
+        .into_iter()
+        .partition(|station| favorite_ids.contains(station.id));
+    favorites.extend(others);
+    favorites
 }
 
 /// Returns sorted Radio presets whose stable metadata contains every query term.
@@ -35298,6 +35383,95 @@ mod tests {
                 "generated NPR station metadata must match {query:?}"
             );
         }
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_favorites_pin_without_reordering_either_partition() {
+        let stations = sorted_radio_stations(RadioSort::Name);
+        assert!(stations.len() >= 4);
+        let favorites = HashSet::from([stations[1].id.to_owned(), stations[3].id.to_owned()]);
+
+        let pinned = pin_radio_favorite_stations(stations.clone(), &favorites);
+
+        let expected_favorites = stations
+            .iter()
+            .filter(|station| favorites.contains(station.id))
+            .map(|station| station.id)
+            .collect::<Vec<_>>();
+        let expected_others = stations
+            .iter()
+            .filter(|station| !favorites.contains(station.id))
+            .map(|station| station.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pinned
+                .iter()
+                .take(expected_favorites.len())
+                .map(|station| station.id)
+                .collect::<Vec<_>>(),
+            expected_favorites
+        );
+        assert_eq!(
+            pinned
+                .iter()
+                .skip(expected_favorites.len())
+                .map(|station| station.id)
+                .collect::<Vec<_>>(),
+            expected_others
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_favorite_action_persists_and_rehydrates_starred_rows() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("file state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.show_screen(Screen::Radio);
+        let station_id = controller
+            .selected_radio_station()
+            .expect("selected station")
+            .id
+            .to_owned();
+
+        controller.dispatch(UiAction::ToggleRadioFavorite);
+
+        assert_eq!(
+            controller.view.rows[0]
+                .media_id
+                .as_ref()
+                .expect("favorite identity")
+                .external_id,
+            station_id
+        );
+        assert!(
+            controller.view.rows[0].radio_favorite,
+            "{}",
+            controller.view.status_line
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.radio_favorite)
+        );
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopen file state");
+        let mut restored = AppController::new(config, store, None, None);
+        restored.show_screen(Screen::Radio);
+        assert_eq!(
+            restored.view.rows[0]
+                .media_id
+                .as_ref()
+                .expect("restored favorite identity")
+                .external_id,
+            station_id
+        );
+        assert!(restored.view.rows[0].radio_favorite);
     }
 
     #[cfg(feature = "radio")]

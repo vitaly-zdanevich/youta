@@ -428,7 +428,7 @@ fn youtube_music_keyless_search_returns_playable_tracks_before_timeout() {
     }));
 }
 
-/// Decodes public playlist and FLAC radio streams, then parses station metadata.
+/// Decodes public regional, playlist, and FLAC streams, then parses station metadata.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 #[test]
 #[ignore = "requires public radio streams, metadata endpoints, mpv, and ffprobe"]
@@ -505,6 +505,13 @@ fn radio_stream_and_passive_metadata_are_usable() {
         "public M3U Radio audio or ICY metadata did not become active; last position: \
          {position:?}; stream title: {stream_title:?}; backend diagnostic: {}",
         backend_diagnostic.as_deref().unwrap_or("none")
+    );
+
+    let palitra = station_by_id("radio-palitra").expect("Radio Palitra live fixture");
+    assert_eq!(
+        probe_live_audio_codec("radio-palitra", palitra.stream),
+        "mp3",
+        "Radio Palitra's official stream no longer serves MP3 audio"
     );
 
     for station_id in [

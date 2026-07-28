@@ -22,8 +22,8 @@ use crate::domain::{
     BandcampReleaseKind, BandcampSearchSummary, Bookmark, CommentTarget, HistoryEntry, MediaId,
     MediaItem, MediaKind, PlaybackProgress, Playlist, PlaylistEntry, PlaylistId,
     PlaylistMediaSnapshot, PlaylistMembership, PlaylistSummary, PodcastShowSummary, PrivateComment,
-    SessionState, SourceKind, TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink,
-    remote_url_has_non_public_host,
+    RADIO_FAVORITES_PLAYLIST_ID, RADIO_FAVORITES_PLAYLIST_NAME, SessionState, SourceKind,
+    TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink, remote_url_has_non_public_host,
 };
 #[cfg(all(
     any(feature = "local-rename", feature = "local-move"),
@@ -666,6 +666,11 @@ impl SqliteStateStore {
     ) -> Result<PlaylistCreateOutcome, PersistenceError> {
         let (name, name_key, description) =
             validated_playlist_fields(name, description, created_at)?;
+        if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_playlist(
+                "the case-insensitive `Favorite radio stations` name is reserved for Radio favorites",
+            ));
+        }
         let transaction = self.connection.unchecked_transaction()?;
         if name_key == TODO_PLAYLIST_NAME {
             if let Some(summary) = playlist_summary_by_id(&transaction, TODO_PLAYLIST_ID)? {
@@ -732,6 +737,11 @@ impl SqliteStateStore {
     ) -> Result<PlaylistCreateOutcome, PersistenceError> {
         let (name, name_key, description) =
             validated_playlist_fields(name, description, created_at)?;
+        if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_playlist(
+                "the case-insensitive `Favorite radio stations` name is reserved for Radio favorites",
+            ));
+        }
         let snapshot_json = encoded_playlist_snapshot(media)?;
         let transaction = self.connection.unchecked_transaction()?;
         if name_key == TODO_PLAYLIST_NAME {
@@ -805,9 +815,19 @@ impl SqliteStateStore {
         validate_playlist_id(playlist_id)?;
         let (name, name_key, description) =
             validated_playlist_fields(name, description, updated_at)?;
+        if playlist_id == RADIO_FAVORITES_PLAYLIST_ID {
+            return Err(invalid_playlist(
+                "the hidden Radio favorites playlist cannot be edited",
+            ));
+        }
         if playlist_id != TODO_PLAYLIST_ID && name_key == TODO_PLAYLIST_NAME {
             return Err(invalid_playlist(
                 "the case-insensitive `todo` name is reserved for the built-in todo playlist",
+            ));
+        }
+        if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_playlist(
+                "the case-insensitive `Favorite radio stations` name is reserved for Radio favorites",
             ));
         }
         let transaction = self.connection.unchecked_transaction()?;
@@ -959,12 +979,13 @@ impl SqliteStateStore {
                 field: "playlist membership limit",
             }
         })?;
-        let ids = statement
+        let mut ids = statement
             .query_map(
                 params![media_id.source.as_str(), media_id.external_id, limit],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<Result<Vec<_>, _>>()?;
+        ids.retain(|playlist_id| !is_hidden_builtin_playlist_id(playlist_id));
         if ids.len() > MAX_PLAYLISTS {
             return Err(invalid_playlist(format!(
                 "media membership exceeds the {MAX_PLAYLISTS}-playlist limit"
@@ -1004,7 +1025,7 @@ impl SqliteStateStore {
                 field: "playlist membership limit",
             }
         })?;
-        let memberships = statement
+        let mut memberships = statement
             .query_map(
                 params![media_id.source.as_str(), media_id.external_id, limit],
                 |row| {
@@ -1015,6 +1036,7 @@ impl SqliteStateStore {
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
+        memberships.retain(|membership| !is_hidden_builtin_playlist_id(&membership.playlist_id));
         if memberships.len() > MAX_PLAYLISTS {
             return Err(invalid_playlist(format!(
                 "media membership exceeds the {MAX_PLAYLISTS}-playlist limit"
@@ -1188,6 +1210,60 @@ impl SqliteStateStore {
     /// Returns an error for an invalid media identity or failed query.
     pub fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
         self.playlist_contains(TODO_PLAYLIST_ID, media_id)
+    }
+
+    /// Atomically toggles a station in the hidden Radio favorites playlist.
+    ///
+    /// The playlist is created only when the operation adds its first station.
+    /// Its entries use normal playlist snapshots so file persistence stays
+    /// human-readable and optional `SQLite` persistence requires no migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-Radio snapshots, invalid bounded data, a full
+    /// store or playlist, an invalid timestamp, or a failed transaction.
+    pub fn toggle_radio_favorite(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        validate_radio_favorite_snapshot(media)?;
+        let snapshot_json = encoded_playlist_snapshot(media)?;
+        validate_playlist_timestamp(updated_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if playlist_contains_connection(&transaction, RADIO_FAVORITES_PLAYLIST_ID, &media.id)? {
+            remove_playlist_entry_in_transaction(
+                &transaction,
+                RADIO_FAVORITES_PLAYLIST_ID,
+                &media.id,
+                updated_at,
+            )?;
+            transaction.commit()?;
+            return Ok(PlaylistToggleOutcome::Removed);
+        }
+        ensure_radio_favorites_playlist(&transaction, updated_at)?;
+        let outcome = add_playlist_entry_in_transaction(
+            &transaction,
+            RADIO_FAVORITES_PLAYLIST_ID,
+            media,
+            &snapshot_json,
+            updated_at,
+        )?;
+        debug_assert_eq!(outcome, PlaylistAddOutcome::Added);
+        transaction.commit()?;
+        Ok(PlaylistToggleOutcome::Added)
+    }
+
+    /// Returns whether a station belongs to the hidden Radio favorites playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid media identity or failed query.
+    pub fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        if media_id.source != SourceKind::Radio {
+            return Ok(false);
+        }
+        self.playlist_contains(RADIO_FAVORITES_PLAYLIST_ID, media_id)
     }
 
     /// Saves one periodic playback checkpoint in a single transaction.
@@ -3127,6 +3203,14 @@ pub trait StateBackend {
     ) -> Result<PlaylistToggleOutcome, PersistenceError>;
     /// Tests built-in todo membership.
     fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError>;
+    /// Toggles a Radio station in the hidden persistent favorites playlist.
+    fn toggle_radio_favorite(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError>;
+    /// Tests membership in the hidden persistent Radio favorites playlist.
+    fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError>;
     /// Saves a bounded periodic playback checkpoint.
     ///
     /// File persistence atomically replaces only its small runtime checkpoint
@@ -3525,6 +3609,18 @@ impl StateBackend for SqliteStateStore {
 
     fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
         SqliteStateStore::todo_contains(self, media_id)
+    }
+
+    fn toggle_radio_favorite(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        SqliteStateStore::toggle_radio_favorite(self, media, updated_at)
+    }
+
+    fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        SqliteStateStore::radio_favorite_contains(self, media_id)
     }
 
     fn checkpoint_playback(
@@ -4039,6 +4135,14 @@ fn playlist_name_key(name: &str) -> String {
     name.chars().flat_map(char::to_lowercase).collect()
 }
 
+fn is_radio_favorites_name_key(name_key: &str) -> bool {
+    name_key == playlist_name_key(RADIO_FAVORITES_PLAYLIST_NAME)
+}
+
+fn is_hidden_builtin_playlist_id(playlist_id: &str) -> bool {
+    playlist_id == RADIO_FAVORITES_PLAYLIST_ID
+}
+
 fn validated_playlist_fields<'a>(
     name: &'a str,
     description: Option<&'a str>,
@@ -4103,6 +4207,15 @@ fn validate_playlist_media_id(media_id: &MediaId) -> Result<(), PersistenceError
         )));
     }
     Ok(())
+}
+
+fn validate_radio_favorite_snapshot(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
+    if media.id.source != SourceKind::Radio || media.kind != MediaKind::LiveStream {
+        return Err(invalid_playlist(
+            "Radio favorites accept only live Radio station snapshots",
+        ));
+    }
+    validate_playlist_snapshot(media)
 }
 
 fn validate_playlist_snapshot(media: &PlaylistMediaSnapshot) -> Result<(), PersistenceError> {
@@ -4171,9 +4284,11 @@ fn validate_playlist_webpage(media: &PlaylistMediaSnapshot) -> Result<(), Persis
         }
         return Ok(());
     }
-    if url.scheme() != "https" || url.host_str().is_none() || remote_url_has_non_public_host(url) {
+    let public_scheme =
+        url.scheme() == "https" || (media.id.source == SourceKind::Radio && url.scheme() == "http");
+    if !public_scheme || url.host_str().is_none() || remote_url_has_non_public_host(url) {
         return Err(invalid_playlist(
-            "remote playlist webpages must use a public absolute HTTPS URL",
+            "remote playlist webpages must use public absolute HTTPS, except curated Radio pages may use public HTTP",
         ));
     }
     Ok(())
@@ -4467,6 +4582,33 @@ fn ensure_todo_playlist(
 }
 
 #[cfg(feature = "sqlite-state")]
+fn ensure_radio_favorites_playlist(
+    connection: &Connection,
+    created_at: i64,
+) -> Result<bool, PersistenceError> {
+    if playlist_summary_by_id(connection, RADIO_FAVORITES_PLAYLIST_ID)?.is_some() {
+        return Ok(false);
+    }
+    let name_key = playlist_name_key(RADIO_FAVORITES_PLAYLIST_NAME);
+    if let Some(owner) = playlist_summary_by_name_key(connection, &name_key)? {
+        return Err(invalid_playlist(format!(
+            "reserved Radio favorites name is unexpectedly owned by `{}`",
+            owner.id
+        )));
+    }
+    ensure_playlist_capacity(connection)?;
+    insert_playlist(
+        connection,
+        RADIO_FAVORITES_PLAYLIST_ID,
+        RADIO_FAVORITES_PLAYLIST_NAME,
+        &name_key,
+        None,
+        created_at,
+    )?;
+    Ok(true)
+}
+
+#[cfg(feature = "sqlite-state")]
 fn playlist_summary_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistSummary> {
     let count: i64 = row.get(3)?;
     let entry_count = usize::try_from(count).map_err(|error| {
@@ -4546,14 +4688,18 @@ fn playlist_summaries(connection: &Connection) -> Result<Vec<PlaylistSummary>, P
 		SELECT p.id, p.name, p.description, COUNT(e.id)
 		FROM playlists AS p
 		LEFT JOIN playlist_entries AS e ON e.playlist_id = p.id
+		WHERE p.id != ?1
 		GROUP BY p.id, p.name, p.description, p.name_key
 		ORDER BY p.name_key, p.id
-		LIMIT ?1
+		LIMIT ?2
 		",
     )?;
     let limit = i64::try_from(MAX_PLAYLISTS.saturating_add(1)).expect("playlist bound fits SQLite");
     let summaries = statement
-        .query_map([limit], playlist_summary_from_row)?
+        .query_map(
+            params![RADIO_FAVORITES_PLAYLIST_ID, limit],
+            playlist_summary_from_row,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     if summaries.len() > MAX_PLAYLISTS {
         return Err(invalid_playlist(format!(
@@ -6997,6 +7143,21 @@ mod tests {
         }
     }
 
+    fn radio_playlist_media(station_id: &str) -> PlaylistMediaSnapshot {
+        let webpage_url =
+            Url::parse("http://radio.example/").expect("valid Radio fixture homepage");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::Radio, station_id),
+            kind: MediaKind::LiveStream,
+            title: "Fixture Radio".to_owned(),
+            creator: None,
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: None,
+            duration_seconds: None,
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
     fn local_playlist_media(path: &Path, artwork: Option<&Path>) -> PlaylistMediaSnapshot {
         PlaylistMediaSnapshot {
@@ -7493,6 +7654,57 @@ mod tests {
             reopened
                 .todo_contains(&id("dQw4w9WgXcQ"))
                 .expect("todo membership")
+        );
+    }
+
+    #[test]
+    fn radio_favorites_are_hidden_and_toggle_without_a_schema_change() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let station = radio_playlist_media("fixture-radio");
+
+        assert_eq!(
+            store
+                .toggle_radio_favorite(&station, 1)
+                .expect("favorite station"),
+            PlaylistToggleOutcome::Added
+        );
+        assert!(
+            store
+                .radio_favorite_contains(&station.id)
+                .expect("favorite membership")
+        );
+        assert!(store.playlists().expect("visible playlists").is_empty());
+        assert!(
+            store
+                .playlist_memberships(&station.id)
+                .expect("visible membership IDs")
+                .is_empty()
+        );
+        assert!(
+            store
+                .playlist_memberships_with_names(&station.id)
+                .expect("visible membership names")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .playlist(RADIO_FAVORITES_PLAYLIST_ID)
+                .expect("hidden playlist")
+                .expect("created hidden playlist")
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .toggle_radio_favorite(&station, 2)
+                .expect("unfavorite station"),
+            PlaylistToggleOutcome::Removed
+        );
+        assert!(
+            !store
+                .radio_favorite_contains(&station.id)
+                .expect("removed favorite")
         );
     }
 

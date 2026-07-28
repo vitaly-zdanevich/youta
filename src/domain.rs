@@ -910,6 +910,15 @@ pub const TODO_PLAYLIST_ID: &str = "builtin:todo";
 /// Initial display name of Youta's built-in Watch Later-style playlist.
 pub const TODO_PLAYLIST_NAME: &str = "todo";
 
+/// Stable identity of the hidden playlist that persists favorite Radio stations.
+///
+/// The playlist remains outside the normal playlist UI because Radio exposes a
+/// dedicated favorite action and catalogue ordering for these entries.
+pub const RADIO_FAVORITES_PLAYLIST_ID: &str = "builtin:radio-favorites";
+
+/// Human-readable file-state label for the hidden Radio favorites playlist.
+pub const RADIO_FAVORITES_PLAYLIST_NAME: &str = "Favorite radio stations";
+
 /// A user-selected lossless cut within an item.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Segment {

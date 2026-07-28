@@ -395,6 +395,8 @@ pub struct RowView {
     pub hide_watched_marker: bool,
     /// Omit generic source and marker padding on a source-specific screen.
     pub compact: bool,
+    /// Whether a Radio station is pinned by the persistent favorites action.
+    pub radio_favorite: bool,
     /// Whether this Local row belongs to the current explicit move batch.
     pub local_marked: bool,
 }
@@ -444,6 +446,8 @@ pub struct DetailView {
     pub published: String,
     /// Provider-reported license.
     pub license: String,
+    /// Whether the selected Radio station is stored in persistent favorites.
+    pub radio_favorite: bool,
     /// Local playlists that currently contain this media item.
     ///
     /// The controller supplies display names in stable presentation order.
@@ -1305,6 +1309,8 @@ pub enum UiAction {
     ToggleLocalSizeSort,
     /// Cycle Radio stations through name and known-bitrate orderings.
     CycleRadioSort,
+    /// Toggle the selected Radio station in persistent favorites.
+    ToggleRadioFavorite,
     /// Toggle between details and waveform.
     ToggleWaveform,
     /// Show information about the playing channel.
@@ -3085,6 +3091,9 @@ fn render_row_list(
                 if playing {
                     spans.push(Span::styled("▶ ", row_style));
                 }
+                if row.radio_favorite {
+                    spans.push(Span::styled("★ ", favorite_style));
+                }
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
@@ -3582,6 +3591,27 @@ fn render_information_panel(
         ));
         (line_index, label, UiAction::ToggleTextSelectionMode)
     });
+    let radio_favorite_button = (kind == InformationPanelKind::Radio).then(|| {
+        let label = button(
+            "f",
+            if details.radio_favorite {
+                "Unfavorite"
+            } else {
+                "Favorite"
+            },
+            show_hotkeys,
+        );
+        let line_index = lines.len();
+        lines.push(Line::styled(
+            label.clone(),
+            if details.radio_favorite {
+                theme.selected
+            } else {
+                theme.accent
+            },
+        ));
+        (line_index, label, UiAction::ToggleRadioFavorite)
+    });
     let details_playlist_item = view
         .playlist_item
         .as_ref()
@@ -3822,6 +3852,9 @@ fn render_information_panel(
         let selection_button_row = text_selection_button
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
+        let radio_favorite_button_row = radio_favorite_button
+            .as_ref()
+            .map(|(line_index, _, _)| *line_index);
         let subscription_button_row = subscription_button
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
@@ -3844,6 +3877,7 @@ fn render_information_panel(
         let trash_button_row = trash_button.as_ref().map(|(line_index, _, _)| *line_index);
         for line_index in 0..usize::from(metadata_height) {
             if selection_button_row == Some(line_index)
+                || radio_favorite_button_row == Some(line_index)
                 || subscription_button_row == Some(line_index)
                 || todo_button_row == Some(line_index)
                 || playlist_button_row == Some(line_index)
@@ -3873,6 +3907,7 @@ fn render_information_panel(
     }
     for (line_index, label, action) in text_selection_button
         .into_iter()
+        .chain(radio_favorite_button)
         .chain(todo_button)
         .chain(playlist_button)
         .chain(edit_playlist_button)
@@ -7593,6 +7628,7 @@ fn key_action_with_page_rows_unfiltered(
             Some(UiAction::ToggleLocalSizeSort)
         }
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
+        KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
         KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         #[cfg(feature = "local-rename")]
         KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
@@ -12344,6 +12380,7 @@ mod tests {
                 watched_percent: 42,
                 hide_watched_marker: true,
                 compact: true,
+                radio_favorite: true,
                 ..RowView::default()
             }],
             playing_media_id: Some(media_id),
@@ -12357,6 +12394,7 @@ mod tests {
                 length: "must not render".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
+                radio_favorite: true,
                 ..DetailView::default()
             }),
             ..ViewModel::default()
@@ -12368,7 +12406,8 @@ mod tests {
             .expect("draw Radio details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("▶ Sector Radio — Progressive"));
+        assert!(rendered.contains("▶ ★ Sector Radio — Progressive"));
+        assert!(rendered.contains("[f] Unfavorite"));
         assert!(!rendered.contains("▶ ● Sector Radio"));
         assert!(!rendered.contains("42%"));
         assert!(rendered.contains("FLAC · variable bitrate · 44.1 kHz"));
@@ -12389,6 +12428,12 @@ mod tests {
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenInBrowser)
         );
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::ToggleRadioFavorite)
+        );
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
@@ -12402,6 +12447,10 @@ mod tests {
                 &view
             ),
             Some(UiAction::CycleRadioSort)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleRadioFavorite)
         );
         assert!(
             hit_map

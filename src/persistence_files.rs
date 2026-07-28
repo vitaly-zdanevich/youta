@@ -1137,9 +1137,19 @@ impl StateBackend for FileStateStore {
         validate_playlist_id(playlist_id)?;
         let (name, name_key, description) =
             validated_playlist_fields(name, description, updated_at)?;
+        if playlist_id == RADIO_FAVORITES_PLAYLIST_ID {
+            return Err(invalid_playlist(
+                "the hidden Radio favorites playlist cannot be edited",
+            ));
+        }
         if playlist_id != TODO_PLAYLIST_ID && name_key == TODO_PLAYLIST_NAME {
             return Err(invalid_playlist(
                 "the case-insensitive `todo` name is reserved for the built-in todo playlist",
+            ));
+        }
+        if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_playlist(
+                "the case-insensitive `Favorite radio stations` name is reserved for Radio favorites",
             ));
         }
         let mut documents = self.lock()?;
@@ -1179,6 +1189,7 @@ impl StateBackend for FileStateStore {
             .playlists
             .playlists
             .iter()
+            .filter(|playlist| !is_hidden_builtin_playlist_id(&playlist.id))
             .map(summary_from_record)
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
@@ -1228,6 +1239,7 @@ impl StateBackend for FileStateStore {
             .playlists
             .iter()
             .filter(|playlist| contains_whole_media(playlist, media_id))
+            .filter(|playlist| !is_hidden_builtin_playlist_id(&playlist.id))
             .map(|playlist| playlist.id.clone())
             .collect::<Vec<_>>();
         ids.sort();
@@ -1245,6 +1257,7 @@ impl StateBackend for FileStateStore {
             .playlists
             .iter()
             .filter(|playlist| contains_whole_media(playlist, media_id))
+            .filter(|playlist| !is_hidden_builtin_playlist_id(&playlist.id))
             .map(|playlist| PlaylistMembership {
                 playlist_id: playlist.id.clone(),
                 playlist_name: playlist.name.clone(),
@@ -1335,6 +1348,32 @@ impl StateBackend for FileStateStore {
 
     fn todo_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
         self.playlist_contains(TODO_PLAYLIST_ID, media_id)
+    }
+
+    fn toggle_radio_favorite(
+        &self,
+        media: &PlaylistMediaSnapshot,
+        updated_at: i64,
+    ) -> Result<PlaylistToggleOutcome, PersistenceError> {
+        validate_radio_favorite_snapshot(media)?;
+        if self.radio_favorite_contains(&media.id)? {
+            self.remove_playlist_entry(RADIO_FAVORITES_PLAYLIST_ID, &media.id, updated_at)?;
+            return Ok(PlaylistToggleOutcome::Removed);
+        }
+        self.ensure_radio_favorites(updated_at)?;
+        self.mutate_playlist_entry(
+            RADIO_FAVORITES_PLAYLIST_ID,
+            media,
+            updated_at,
+            EntryMutation::Add,
+        )
+    }
+
+    fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
+        if media_id.source != SourceKind::Radio {
+            return Ok(false);
+        }
+        self.playlist_contains(RADIO_FAVORITES_PLAYLIST_ID, media_id)
     }
 
     fn checkpoint_playback(
@@ -2618,6 +2657,11 @@ impl FileStateStore {
     ) -> Result<PlaylistCreateOutcome, PersistenceError> {
         let (name, name_key, description) =
             validated_playlist_fields(name, description, created_at)?;
+        if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_playlist(
+                "the case-insensitive `Favorite radio stations` name is reserved for Radio favorites",
+            ));
+        }
         if let Some(media) = first_media {
             let _ = encoded_playlist_snapshot(media)?;
         }
@@ -2706,6 +2750,47 @@ impl FileStateStore {
         next.playlists.push(PlaylistRecord {
             id: TODO_PLAYLIST_ID.to_owned(),
             name: TODO_PLAYLIST_NAME.to_owned(),
+            description: None,
+            created_at,
+            updated_at: created_at,
+            entries: Vec::new(),
+        });
+        next.canonicalize();
+        self.persist_playlists(&next)?;
+        documents.playlists = next;
+        Ok(())
+    }
+
+    fn ensure_radio_favorites(&self, created_at: i64) -> Result<(), PersistenceError> {
+        let mut documents = self.lock()?;
+        if documents
+            .playlists
+            .playlists
+            .iter()
+            .any(|playlist| playlist.id == RADIO_FAVORITES_PLAYLIST_ID)
+        {
+            return Ok(());
+        }
+        if documents.playlists.playlists.len() >= MAX_PLAYLISTS {
+            return Err(invalid_playlist(
+                "playlist count has reached its fixed limit",
+            ));
+        }
+        let name_key = playlist_name_key(RADIO_FAVORITES_PLAYLIST_NAME);
+        if documents
+            .playlists
+            .playlists
+            .iter()
+            .any(|playlist| playlist_name_key(&playlist.name) == name_key)
+        {
+            return Err(invalid_playlist(
+                "the reserved Radio favorites name belongs to another playlist",
+            ));
+        }
+        let mut next = documents.playlists.clone();
+        next.playlists.push(PlaylistRecord {
+            id: RADIO_FAVORITES_PLAYLIST_ID.to_owned(),
+            name: RADIO_FAVORITES_PLAYLIST_NAME.to_owned(),
             description: None,
             created_at,
             updated_at: created_at,
@@ -3109,6 +3194,23 @@ fn validate_playlists_document(document: &PlaylistsDocument) -> Result<(), Persi
             return Err(invalid_file_document(
                 "playlists",
                 "the todo name is reserved for the built-in playlist",
+            ));
+        }
+        if record.id == RADIO_FAVORITES_PLAYLIST_ID {
+            if !is_radio_favorites_name_key(&name_key) {
+                return Err(invalid_file_document(
+                    "playlists",
+                    "the built-in Radio favorites ID must retain the Radio favorites name",
+                ));
+            }
+            for entry in &record.entries {
+                validate_radio_favorite_snapshot(&entry.media)
+                    .map_err(|error| invalid_file_document("playlists", error.to_string()))?;
+            }
+        } else if is_radio_favorites_name_key(&name_key) {
+            return Err(invalid_file_document(
+                "playlists",
+                "the Radio favorites name is reserved for the built-in Radio favorites playlist",
             ));
         }
         validate_playlist_timestamp(record.created_at)
@@ -3718,6 +3820,21 @@ mod tests {
 
     use super::*;
 
+    fn radio_favorite_fixture() -> PlaylistMediaSnapshot {
+        let webpage_url =
+            url::Url::parse("https://radio.example/").expect("valid fixture homepage");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::Radio, "fixture-radio"),
+            kind: MediaKind::LiveStream,
+            title: "Fixture Radio".to_owned(),
+            creator: None,
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: None,
+            duration_seconds: None,
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
     fn inode(path: &Path) -> u64 {
         fs::metadata(path).expect("document metadata").ino()
     }
@@ -3728,6 +3845,121 @@ mod tests {
             encoded.push('\n');
         }
         encoded.into_bytes()
+    }
+
+    fn assert_human_edited_playlists_are_rejected(
+        document: &PlaylistsDocument,
+        expected_reason: &str,
+    ) {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        {
+            let _store = FileStateStore::open(&config).expect("initialize file state");
+        }
+        let playlists = FilePaths::from_config(&config).playlists;
+        fs::write(&playlists, canonical_bytes(document)).expect("write human-edited playlist TOML");
+
+        let error = FileStateStore::open(&config)
+            .err()
+            .expect("invalid human-edited playlist state must fail open");
+        assert!(matches!(
+            error,
+            PersistenceError::InvalidFileDocument {
+                document: "playlists",
+                ref reason,
+            } if reason.contains(expected_reason)
+        ));
+    }
+
+    #[test]
+    fn radio_favorite_survives_file_restart_but_stays_out_of_playlist_ui_queries() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let fixture = radio_favorite_fixture();
+        {
+            let store = FileStateStore::open(&config).expect("file state");
+            assert_eq!(
+                store
+                    .toggle_radio_favorite(&fixture, 1)
+                    .expect("favorite station"),
+                PlaylistToggleOutcome::Added
+            );
+            assert!(store.playlists().expect("visible playlists").is_empty());
+        }
+
+        let store = FileStateStore::open(&config).expect("reopen file state");
+        assert!(
+            store
+                .radio_favorite_contains(&fixture.id)
+                .expect("restored favorite")
+        );
+        let encoded =
+            fs::read_to_string(config.state_dir().join("playlists.toml")).expect("playlist TOML");
+        assert!(encoded.contains(RADIO_FAVORITES_PLAYLIST_NAME));
+        assert!(encoded.contains("fixture-radio"));
+    }
+
+    #[test]
+    fn human_edited_radio_favorites_require_the_reserved_id_and_name_pair() {
+        let record = |id: &str, name: &str| PlaylistRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            entries: Vec::new(),
+        };
+
+        assert_human_edited_playlists_are_rejected(
+            &PlaylistsDocument {
+                format_version: FILE_FORMAT_VERSION,
+                next_local_id: 1,
+                playlists: vec![record(
+                    RADIO_FAVORITES_PLAYLIST_ID,
+                    "A different hidden name",
+                )],
+            },
+            "Radio favorites ID must retain the Radio favorites name",
+        );
+        assert_human_edited_playlists_are_rejected(
+            &PlaylistsDocument {
+                format_version: FILE_FORMAT_VERSION,
+                next_local_id: 2,
+                playlists: vec![record("local:1", RADIO_FAVORITES_PLAYLIST_NAME)],
+            },
+            "Radio favorites name is reserved",
+        );
+    }
+
+    #[test]
+    fn human_edited_radio_favorites_reject_non_radio_playlist_entries() {
+        let mut non_radio = radio_favorite_fixture();
+        non_radio.id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        non_radio.kind = MediaKind::Video;
+        non_radio.webpage_url =
+            url::Url::parse("https://www.youtube.com/watch?v=abcdefghijk").expect("YouTube URL");
+        non_radio.replay_locator = non_radio.webpage_url.to_string();
+        let document = PlaylistsDocument {
+            format_version: FILE_FORMAT_VERSION,
+            next_local_id: 1,
+            playlists: vec![PlaylistRecord {
+                id: RADIO_FAVORITES_PLAYLIST_ID.to_owned(),
+                name: RADIO_FAVORITES_PLAYLIST_NAME.to_owned(),
+                description: None,
+                created_at: 1,
+                updated_at: 1,
+                entries: vec![PlaylistEntry {
+                    media: non_radio,
+                    segment: None,
+                    added_at: 1,
+                }],
+            }],
+        };
+
+        assert_human_edited_playlists_are_rejected(
+            &document,
+            "Radio favorites accept only live Radio station snapshots",
+        );
     }
 
     fn assert_regenerable_documents_are_empty(store: &FileStateStore, paths: &FilePaths) {
