@@ -1141,9 +1141,13 @@ YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-defaul
 YOUTA_RUN_LIVE_BBC_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features bbc-radio,backend-mpv -- --ignored --exact bbc_sounds_resolution_and_audio_are_usable --nocapture
 ```
 
-The Gentoo ebuild in `packaging/gentoo/` maps provider choices to USE flags and
-consumes the release vendor archive. GitHub Actions use Node 24-based action
-majors and set the maximum requested job timeout to 360 minutes.
+The Gentoo ebuild is maintained as
+[`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
+in the
+[`vitaly-zdanevich-overlay`](https://github.com/vitaly-zdanevich/gentoo-overlay).
+It maps provider choices to USE flags and consumes the release vendor archive.
+GitHub Actions use Node 24-based action majors and set the maximum requested job
+timeout to 360 minutes.
 
 To produce the same artifacts locally:
 

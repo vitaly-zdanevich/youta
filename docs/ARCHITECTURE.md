@@ -853,5 +853,7 @@ adds the same backend with vendored SQLite.
 Tagged releases are produced natively on amd64 and arm64. The release also
 contains a `cargo vendor` archive and matching Cargo source configuration so
 Gentoo and other external/offline builders use the exact locked dependency
-graph. The Gentoo ebuild still prefers system executables such as `mpv`,
-`yt-dlp`, and FFmpeg rather than bundling them.
+graph. The Gentoo ebuild is maintained as
+[`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
+in the separate personal overlay. It still prefers system executables such as
+`mpv`, `yt-dlp`, and FFmpeg rather than bundling them.
