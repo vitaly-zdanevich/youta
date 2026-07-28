@@ -31,12 +31,14 @@ const STREAMTHEWORLD_REDIRECT_BASE: &str =
 const SNAPSHOT_DATE: &str = "2026-07-28";
 const DEFAULT_OUTPUT: &str = "src/providers/npr_stations_generated.rs";
 const DEFAULT_QUALITY_CACHE: &str = "src/providers/npr_station_quality_generated.json";
-const QUALITY_CACHE_FORMAT_VERSION: u8 = 1;
+const QUALITY_CACHE_FORMAT_VERSION: u8 = 2;
+const LEGACY_QUALITY_CACHE_FORMAT_VERSION: u8 = 1;
 const QUALITY_PROBE_WORKERS: usize = 4;
 const QUALITY_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const QUALITY_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_QUALITY_PROBE_JSON_BYTES: usize = 64 * 1024;
 const MAX_QUALITY_CACHE_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_UNPLAYABLE_REASON_BYTES: usize = 512;
 const MAX_RADIO_BITRATE_KBPS: u16 = 10_000;
 const MIN_RADIO_SAMPLE_RATE_HZ: u32 = 8_000;
 const MAX_RADIO_SAMPLE_RATE_HZ: u32 = 384_000;
@@ -256,12 +258,25 @@ impl CachedQuality {
     }
 }
 
+/// Reviewed evidence that one exact NPR service URL cannot be played.
+///
+/// These records are deliberately maintained by a human after testing the
+/// advertised alternatives. A failed metadata probe alone never creates one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CachedUnplayableService {
+    stream_url: String,
+    checked_on: String,
+    reason: String,
+}
+
 /// Deterministically sorted sidecar retained across generator runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct QualityCache {
     format_version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_probe_attempt_on: Option<String>,
+    #[serde(default)]
+    unplayable_services: BTreeMap<String, CachedUnplayableService>,
     #[serde(default)]
     services: BTreeMap<String, CachedQuality>,
 }
@@ -271,6 +286,7 @@ impl Default for QualityCache {
         Self {
             format_version: QUALITY_CACHE_FORMAT_VERSION,
             last_probe_attempt_on: None,
+            unplayable_services: BTreeMap::new(),
             services: BTreeMap::new(),
         }
     }
@@ -430,22 +446,22 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
         fetch_responses()?
     };
     let mut services = collect_services(responses);
-    resolve_static_playlists(&mut services)?;
     let mut quality_cache = read_quality_cache(&options.quality_cache)?;
+    resolve_static_playlists(&mut services, &quality_cache)?;
     if options.probe_quality {
         let probe_date = options
             .probe_date
             .as_deref()
             .expect("argument validation requires an explicit probe date");
         quality_cache =
-            probe_service_quality(&services, &quality_cache, &options.ffprobe, probe_date);
+            probe_service_quality(&mut services, &quality_cache, &options.ffprobe, probe_date);
         write_quality_cache(&options.quality_cache, &quality_cache)?;
     }
     let rendered = render_module(&services, &quality_cache);
     atomic_write(&options.output, rendered.as_bytes())?;
     println!(
-        "wrote {} distinct NPR services to {}",
-        services.len(),
+        "wrote {} playable NPR services to {}",
+        playable_service_count(&services, &quality_cache),
         options.output.display()
     );
     Ok(())
@@ -470,7 +486,12 @@ fn read_quality_cache(path: &Path) -> Result<QualityCache, Box<dyn Error>> {
     }
     let mut cache: QualityCache =
         serde_json::from_slice(&payload).map_err(|error| format!("{}: {error}", path.display()))?;
-    if cache.format_version != QUALITY_CACHE_FORMAT_VERSION {
+    if ![
+        LEGACY_QUALITY_CACHE_FORMAT_VERSION,
+        QUALITY_CACHE_FORMAT_VERSION,
+    ]
+    .contains(&cache.format_version)
+    {
         return Err(format!(
             "{} has unsupported quality-cache format version {}",
             path.display(),
@@ -478,12 +499,41 @@ fn read_quality_cache(path: &Path) -> Result<QualityCache, Box<dyn Error>> {
         )
         .into());
     }
+    if cache.format_version == LEGACY_QUALITY_CACHE_FORMAT_VERSION
+        && !cache.unplayable_services.is_empty()
+    {
+        return Err(format!(
+            "{} declares unplayable services in legacy quality-cache format",
+            path.display()
+        )
+        .into());
+    }
+    cache.format_version = QUALITY_CACHE_FORMAT_VERSION;
     for (guid, quality) in &mut cache.services {
         quality.stream_url = normalize_stable_https_url(&quality.stream_url)
             .ok_or_else(|| format!("quality-cache service {guid} has an invalid stream URL"))?;
     }
+    for (guid, unplayable) in &mut cache.unplayable_services {
+        unplayable.stream_url =
+            normalize_stable_https_url(&unplayable.stream_url).ok_or_else(|| {
+                format!("quality-cache unplayable service {guid} has an invalid stream URL")
+            })?;
+    }
     for (guid, quality) in &cache.services {
         validate_cached_quality(guid, quality)?;
+    }
+    for (guid, unplayable) in &cache.unplayable_services {
+        validate_cached_unplayable(guid, unplayable)?;
+        if cache
+            .services
+            .get(guid)
+            .is_some_and(|quality| quality.stream_url == unplayable.stream_url)
+        {
+            return Err(format!(
+                "quality-cache service {guid} is both playable and unplayable at the same URL"
+            )
+            .into());
+        }
     }
     Ok(cache)
 }
@@ -498,8 +548,8 @@ fn validate_cached_quality(guid: &str, quality: &CachedQuality) -> Result<(), Bo
     {
         return Err(format!("quality-cache service {guid} has an unstable stream URL").into());
     }
-    if quality.probed_on.trim().is_empty() {
-        return Err(format!("quality-cache service {guid} has no probe date").into());
+    if !valid_iso_date(&quality.probed_on) {
+        return Err(format!("quality-cache service {guid} has an invalid probe date").into());
     }
     if quality
         .bitrate_kbps
@@ -520,6 +570,39 @@ fn validate_cached_quality(guid: &str, quality: &CachedQuality) -> Result<(), Bo
     }
     if !quality.has_quality() {
         return Err(format!("quality-cache service {guid} contains no quality facts").into());
+    }
+    Ok(())
+}
+
+/// Rejects malformed reviewed exclusions before they can hide a station.
+fn validate_cached_unplayable(
+    guid: &str,
+    unplayable: &CachedUnplayableService,
+) -> Result<(), Box<dyn Error>> {
+    if guid.trim().is_empty() {
+        return Err("quality-cache unplayable service GUID must not be empty".into());
+    }
+    if normalize_stable_https_url(&unplayable.stream_url).as_deref()
+        != Some(unplayable.stream_url.as_str())
+    {
+        return Err(
+            format!("quality-cache unplayable service {guid} has an unstable stream URL").into(),
+        );
+    }
+    if !valid_iso_date(&unplayable.checked_on) {
+        return Err(
+            format!("quality-cache unplayable service {guid} has an invalid check date").into(),
+        );
+    }
+    if unplayable.reason.is_empty()
+        || unplayable.reason.trim() != unplayable.reason
+        || unplayable.reason.len() > MAX_UNPLAYABLE_REASON_BYTES
+        || unplayable.reason.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "quality-cache unplayable service {guid} has an invalid bounded reason"
+        )
+        .into());
     }
     Ok(())
 }
@@ -550,7 +633,7 @@ fn atomic_write(path: &Path, payload: &[u8]) -> Result<(), Box<dyn Error>> {
 
 /// Probes every selected stream with fixed parallelism while retaining old facts.
 fn probe_service_quality(
-    services: &BTreeMap<String, ServiceGroup>,
+    services: &mut BTreeMap<String, ServiceGroup>,
     existing: &QualityCache,
     ffprobe: &Path,
     probe_date: &str,
@@ -563,22 +646,32 @@ fn probe_service_quality(
                 .map(|quality| (guid.clone(), quality))
         })
         .collect();
+    let retained_unplayable = existing
+        .unplayable_services
+        .iter()
+        .filter(|(guid, _)| services.contains_key(*guid))
+        .map(|(guid, unplayable)| (guid.clone(), unplayable.clone()))
+        .collect();
     if services.is_empty() {
         return QualityCache {
             format_version: QUALITY_CACHE_FORMAT_VERSION,
             last_probe_attempt_on: Some(probe_date.to_owned()),
             services: retained,
+            unplayable_services: retained_unplayable,
         };
     }
 
     let tasks = services
         .iter()
         .map(|(guid, group)| {
-            (
-                guid.clone(),
-                group.selected.audio.url.clone(),
-                group.selected.audio.stream_kind,
-            )
+            let mut alternatives = group.selected.audio_alternatives.clone();
+            alternatives.sort_by(|left, right| {
+                left.rank
+                    .cmp(&right.rank)
+                    .then_with(|| left.url.cmp(&right.url))
+            });
+            alternatives.dedup_by(|left, right| left.url == right.url);
+            (guid.clone(), alternatives)
         })
         .collect::<VecDeque<_>>();
     let task_count = tasks.len();
@@ -591,11 +684,11 @@ fn probe_service_quality(
             scope.spawn(move || {
                 loop {
                     let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                    let Some((guid, stream_url, stream_kind)) = task else {
+                    let Some((guid, alternatives)) = task else {
                         break;
                     };
-                    let result = probe_stream_quality(ffprobe, &stream_url, stream_kind);
-                    if sender.send((guid, stream_url, result)).is_err() {
+                    let result = probe_audio_alternatives(ffprobe, &alternatives);
+                    if sender.send((guid, result)).is_err() {
                         break;
                     }
                 }
@@ -605,14 +698,24 @@ fn probe_service_quality(
     drop(sender);
 
     let mut quality = retained;
+    let mut unplayable_services = retained_unplayable;
     let mut fresh = 0_usize;
     let mut failed = 0_usize;
-    for (guid, stream_url, result) in receiver {
+    for (guid, result) in receiver {
         match result {
-            Ok(probed) => {
-                let replacement = CachedQuality::from_probe(&stream_url, probe_date, probed);
+            Ok((selected, probed)) => {
+                let replacement = CachedQuality::from_probe(&selected.url, probe_date, probed);
                 if replacement.has_quality() {
-                    quality.insert(guid, replacement);
+                    quality.insert(guid.clone(), replacement);
+                    if unplayable_services
+                        .get(&guid)
+                        .is_some_and(|unplayable| unplayable.stream_url == selected.url)
+                    {
+                        unplayable_services.remove(&guid);
+                    }
+                    if let Some(group) = services.get_mut(&guid) {
+                        group.selected.audio = selected;
+                    }
                     fresh = fresh.saturating_add(1);
                 }
             }
@@ -630,6 +733,26 @@ fn probe_service_quality(
         format_version: QUALITY_CACHE_FORMAT_VERSION,
         last_probe_attempt_on: Some(probe_date.to_owned()),
         services: quality,
+        unplayable_services,
+    }
+}
+
+/// Probes ranked alternatives until one yields validated audio facts.
+fn probe_audio_alternatives(
+    ffprobe: &Path,
+    alternatives: &[AudioChoice],
+) -> Result<(AudioChoice, ProbedQuality), String> {
+    let mut failures = Vec::new();
+    for alternative in alternatives {
+        match probe_stream_quality(ffprobe, &alternative.url, alternative.stream_kind) {
+            Ok(quality) => return Ok((alternative.clone(), quality)),
+            Err(error) => failures.push(format!("{}: {error}", alternative.url)),
+        }
+    }
+    if failures.is_empty() {
+        Err("service has no resolved audio alternatives".to_owned())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -643,6 +766,18 @@ fn matching_cached_quality<'a>(
         .services
         .get(guid)
         .filter(|quality| quality.stream_url == stream_url && quality.has_quality())
+}
+
+/// Returns a reviewed exclusion only for the service's exact current URL.
+fn matching_unplayable_service<'a>(
+    cache: &'a QualityCache,
+    guid: &str,
+    stream_url: &str,
+) -> Option<&'a CachedUnplayableService> {
+    cache
+        .unplayable_services
+        .get(guid)
+        .filter(|unplayable| unplayable.stream_url == stream_url)
 }
 
 /// Runs one shell-free, time-bounded `ffprobe` stream inspection.
@@ -695,11 +830,7 @@ fn probe_stream_quality_with_timeout(
     // descendant retaining stdout from blocking cleanup after the child exits.
     let (output_sender, output_receiver) = mpsc::sync_channel(1);
     let _output_reader = thread::spawn(move || {
-        let mut payload = Vec::new();
-        let result = stdout
-            .take(u64::try_from(MAX_QUALITY_PROBE_JSON_BYTES + 1).unwrap_or(u64::MAX))
-            .read_to_end(&mut payload)
-            .map(|_| payload);
+        let result = read_bounded_and_drain(stdout, MAX_QUALITY_PROBE_JSON_BYTES);
         let _ = output_sender.send(result);
     });
     let deadline = Instant::now()
@@ -742,6 +873,26 @@ fn probe_stream_quality_with_timeout(
         })?
         .map_err(|error| format!("could not read {} output: {error}", ffprobe.display()))?;
     parse_ffprobe_quality(&payload, stream_kind)
+}
+
+/// Retains at most `limit + 1` bytes while draining the reader through EOF.
+///
+/// The extra retained byte lets the parser report an oversize payload. Draining
+/// the remainder keeps a producer from receiving `SIGPIPE` or blocking on a
+/// full pipe, while the caller's channel deadline still bounds an inherited
+/// file descriptor that never reaches EOF.
+fn read_bounded_and_drain(
+    mut reader: impl std::io::Read,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let retained_limit = limit.saturating_add(1);
+    let mut payload = Vec::new();
+    reader
+        .by_ref()
+        .take(u64::try_from(retained_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut payload)?;
+    std::io::copy(&mut reader, &mut std::io::sink())?;
+    Ok(payload)
 }
 
 /// Parses and bounds the audio-stream JSON requested by the probe command.
@@ -883,6 +1034,7 @@ fn fetch_responses() -> Result<Vec<StationResponse>, Box<dyn Error>> {
 
 fn resolve_static_playlists(
     services: &mut BTreeMap<String, ServiceGroup>,
+    quality_cache: &QualityCache,
 ) -> Result<(), Box<dyn Error>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
@@ -891,19 +1043,28 @@ fn resolve_static_playlists(
         .into();
     let mut excluded = Vec::new();
     for (guid, group) in services.iter_mut() {
-        let mut selected = None;
+        let mut resolved_choices = Vec::new();
         let mut failures = Vec::new();
         for alternative in &group.selected.audio_alternatives {
             match resolve_audio_choice(&agent, alternative) {
-                Ok(resolved) => {
-                    selected = Some(resolved);
-                    break;
-                }
+                Ok(resolved) => resolved_choices.push(resolved),
                 Err(error) => failures.push(error),
             }
         }
+        resolved_choices.sort_by(|left, right| {
+            left.rank
+                .cmp(&right.rank)
+                .then_with(|| left.url.cmp(&right.url))
+        });
+        resolved_choices.dedup_by(|left, right| left.url == right.url);
+        let selected = resolved_choices
+            .iter()
+            .find(|choice| matching_cached_quality(quality_cache, guid, &choice.url).is_some())
+            .or_else(|| resolved_choices.first())
+            .cloned();
         if let Some(selected) = selected {
             group.selected.audio = selected;
+            group.selected.audio_alternatives = resolved_choices;
         } else {
             eprintln!(
                 "excluding NPR service {guid}; no stable playable HTTPS choice: {}",
@@ -1275,11 +1436,27 @@ fn render_module(
 ) -> String {
     let mut output = String::new();
     render_module_header(&mut output, services, quality_cache);
-    for group in services.values() {
+    for (guid, group) in services {
+        if matching_unplayable_service(quality_cache, guid, &group.selected.audio.url).is_some() {
+            continue;
+        }
         render_station(&mut output, group, quality_cache);
     }
     output.push_str("];\n");
     output
+}
+
+/// Counts services not suppressed by a reviewed exact-URL exclusion.
+fn playable_service_count(
+    services: &BTreeMap<String, ServiceGroup>,
+    quality_cache: &QualityCache,
+) -> usize {
+    services
+        .iter()
+        .filter(|(guid, group)| {
+            matching_unplayable_service(quality_cache, guid, &group.selected.audio.url).is_none()
+        })
+        .count()
 }
 
 /// Writes generated module documentation, imports, provenance, and constants.
@@ -1288,10 +1465,12 @@ fn render_module_header(
     services: &BTreeMap<String, ServiceGroup>,
     quality_cache: &QualityCache,
 ) {
+    let playable_service_count = playable_service_count(services, quality_cache);
     let applied_quality_count = services
         .iter()
         .filter(|(guid, group)| {
-            matching_cached_quality(quality_cache, guid, &group.selected.audio.url).is_some()
+            matching_unplayable_service(quality_cache, guid, &group.selected.audio.url).is_none()
+                && matching_cached_quality(quality_cache, guid, &group.selected.audio.url).is_some()
         })
         .count();
     let quality_probe_attempt_date = quality_cache
@@ -1329,7 +1508,7 @@ fn render_module_header(
         output,
         "/// Distinct NPR stream GUIDs with a stable usable HTTPS audio URL.\npub const \
          NPR_STATION_SERVICE_COUNT: usize = {};\n",
-        services.len()
+        playable_service_count
     )
     .unwrap();
     writeln!(
@@ -1356,9 +1535,9 @@ fn render_module_header(
 /// Writes one station preset with quality matching its exact selected URL.
 fn render_station(output: &mut String, group: &ServiceGroup, quality_cache: &QualityCache) {
     let station = &group.selected;
-    let name = display_name(station);
-    let summary = summary(group);
     let quality = matching_cached_quality(quality_cache, &station.guid, &station.audio.url);
+    let name = display_name(station, quality);
+    let summary = summary(group);
     let codec = match quality
         .and_then(|quality| quality.codec)
         .or(station.audio.codec)
@@ -1405,13 +1584,68 @@ fn format_optional_number(value: Option<impl std::fmt::Display>) -> String {
     value.map_or_else(|| "None".to_owned(), |value| format!("Some({value})"))
 }
 
-fn display_name(station: &ServiceCandidate) -> String {
-    let title = station.title.trim();
-    if contains_case_insensitive(title, &station.brand_name) {
-        title.to_owned()
+fn display_name(station: &ServiceCandidate, quality: Option<&CachedQuality>) -> String {
+    let title = normalize_stale_codec_suffix(station.title.trim(), quality);
+    if contains_case_insensitive(&title, &station.brand_name) {
+        title
     } else {
         format!("{} — {title}", station.brand_name)
     }
+}
+
+/// Corrects a terminal `(<bitrate>k <codec>)` label when exact cached facts disagree.
+///
+/// NPR occasionally keeps a title describing its preferred URL after the
+/// generator selects a working alternative. Other parenthetical title text is
+/// intentionally left untouched.
+fn normalize_stale_codec_suffix(title: &str, quality: Option<&CachedQuality>) -> String {
+    let Some(quality) = quality else {
+        return title.to_owned();
+    };
+    let Some(actual_codec) = quality.codec else {
+        return title.to_owned();
+    };
+    let Some(without_closing) = title.strip_suffix(')') else {
+        return title.to_owned();
+    };
+    let Some((prefix, suffix)) = without_closing.rsplit_once(" (") else {
+        return title.to_owned();
+    };
+    let mut parts = suffix.split_whitespace();
+    let (Some(rate), Some(claimed_codec), None) = (parts.next(), parts.next(), parts.next()) else {
+        return title.to_owned();
+    };
+    let Some(rate_digits) = rate
+        .strip_suffix('k')
+        .or_else(|| rate.strip_suffix('K'))
+        .filter(|digits| !digits.is_empty() && digits.chars().all(|value| value.is_ascii_digit()))
+    else {
+        return title.to_owned();
+    };
+    let claimed_codec = match claimed_codec.to_ascii_lowercase().as_str() {
+        "aac" => Codec::Aac,
+        "flac" => Codec::Flac,
+        "mp3" => Codec::Mp3,
+        "opus" => Codec::Opus,
+        "pcm" => Codec::Pcm,
+        "vorbis" => Codec::Vorbis,
+        _ => return title.to_owned(),
+    };
+    if claimed_codec == actual_codec {
+        return title.to_owned();
+    }
+    let actual_codec = match actual_codec {
+        Codec::Aac => "aac",
+        Codec::Flac => "flac",
+        Codec::Mp3 => "mp3",
+        Codec::Opus => "opus",
+        Codec::Pcm => "pcm",
+        Codec::Vorbis => "vorbis",
+    };
+    let actual_rate = quality
+        .bitrate_kbps
+        .map_or(rate_digits.to_owned(), |value| value.to_string());
+    format!("{prefix} ({actual_rate}k {actual_codec})")
 }
 
 fn summary(group: &ServiceGroup) -> String {
@@ -1454,6 +1688,68 @@ fn valid_web_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Installs one closed mock helper inode through an atomic rename.
+    ///
+    /// Executing the final path can therefore never race a writable file
+    /// descriptor from script creation, avoiding intermittent `ETXTBSY`.
+    #[cfg(unix)]
+    fn install_mock_ffprobe(path: &Path, script: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let staging = path.with_extension("staging");
+        let mut staged_file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staging)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to create staged mock ffprobe {}: {error}",
+                    staging.display()
+                )
+            });
+        staged_file
+            .write_all(script.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to write staged mock ffprobe {}: {error}",
+                    staging.display()
+                )
+            });
+        staged_file.sync_all().unwrap_or_else(|error| {
+            panic!(
+                "failed to sync staged mock ffprobe {}: {error}",
+                staging.display()
+            )
+        });
+        drop(staged_file);
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap_or_else(|error| {
+            panic!(
+                "failed to make staged mock ffprobe executable {}: {error}",
+                staging.display()
+            )
+        });
+        fs::rename(&staging, path).unwrap_or_else(|error| {
+            panic!(
+                "failed to install mock ffprobe {} as {}: {error}",
+                staging.display(),
+                path.display()
+            )
+        });
+    }
+
+    #[cfg(unix)]
+    static MOCK_FFPROBE_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes executable fixture creation and use on filesystems that
+    /// transiently reject parallel execution of newly written inodes.
+    #[cfg(unix)]
+    fn lock_mock_ffprobe_fixture() -> std::sync::MutexGuard<'static, ()> {
+        MOCK_FFPROBE_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     const MOCK_RESPONSE: &str = r#"{
       "items": [
@@ -1736,6 +2032,7 @@ mod tests {
                 "primary-guid".to_owned(),
                 CachedQuality::from_probe(&station.selected.audio.url, "2026-07-28", quality),
             )]),
+            unplayable_services: BTreeMap::new(),
         };
         let mut rendered = String::new();
         render_station(&mut rendered, station, &cache);
@@ -1835,35 +2132,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_output_reader_retains_marker_and_drains_the_remainder() {
+        let source = vec![b'x'; (MAX_QUALITY_PROBE_JSON_BYTES * 2) + 17];
+        let mut reader = std::io::Cursor::new(source);
+
+        let payload = read_bounded_and_drain(&mut reader, MAX_QUALITY_PROBE_JSON_BYTES).unwrap();
+
+        assert_eq!(payload.len(), MAX_QUALITY_PROBE_JSON_BYTES + 1);
+        assert_eq!(
+            reader.position(),
+            u64::try_from((MAX_QUALITY_PROBE_JSON_BYTES * 2) + 17).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn oversized_helper_output_is_drained_without_filling_the_child_pipe() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+        let _fixture_guard = lock_mock_ffprobe_fixture();
         let directory = tempfile::tempdir().unwrap();
         let helper = directory.path().join("mock-ffprobe");
-        fs::write(
+        install_mock_ffprobe(
             &helper,
-            "#!/bin/sh\ndd if=/dev/zero bs=65537 count=1 2>/dev/null\n",
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+            "#!/bin/sh\ndd if=/dev/zero bs=65536 count=64 2>/dev/null\n",
+        );
 
         let error = probe_stream_quality(&helper, "https://example.test/live", StreamKind::Direct)
             .expect_err("oversize");
 
-        assert!(error.contains("exceeds"));
+        assert!(error.contains("exceeds"), "unexpected probe error: {error}");
     }
 
     #[cfg(unix)]
     #[test]
     fn probe_timeout_kills_the_direct_helper_without_blocking_cleanup() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+        let _fixture_guard = lock_mock_ffprobe_fixture();
         let directory = tempfile::tempdir().unwrap();
         let helper = directory.path().join("mock-ffprobe");
-        fs::write(&helper, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        install_mock_ffprobe(&helper, "#!/bin/sh\nwhile :; do :; done\n");
 
         let started = Instant::now();
         let error = probe_stream_quality_with_timeout(
@@ -1874,25 +2180,25 @@ mod tests {
         )
         .expect_err("timeout");
 
-        assert!(error.contains("timed out"));
+        assert!(
+            error.contains("timed out"),
+            "unexpected probe error: {error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
     #[test]
     fn inherited_stdout_cannot_outlive_the_probe_deadline() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+        let _fixture_guard = lock_mock_ffprobe_fixture();
         let directory = tempfile::tempdir().unwrap();
         let helper = directory.path().join("mock-ffprobe");
-        fs::write(
+        install_mock_ffprobe(
             &helper,
             "#!/bin/sh\n\
              sleep 1 &\n\
              printf '%s' '{\"streams\":[{\"codec_name\":\"mp3\",\"bit_rate\":\"128000\"}]}'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let started = Instant::now();
         let error = probe_stream_quality_with_timeout(
@@ -1903,7 +2209,10 @@ mod tests {
         )
         .expect_err("inherited stdout");
 
-        assert!(error.contains("output did not close before deadline"));
+        assert!(
+            error.contains("output did not close before deadline"),
+            "unexpected probe error: {error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -1925,6 +2234,7 @@ mod tests {
                     channels: Some(2),
                 },
             )]),
+            unplayable_services: BTreeMap::new(),
         };
 
         let rendered = render_module(&services, &cache);
@@ -1943,6 +2253,100 @@ mod tests {
         let rendered = render_module(&services, &changed);
         assert!(rendered.contains("NPR_STATION_QUALITY_SERVICE_COUNT: usize = 0"));
         assert!(!rendered.contains("bitrate_kbps: Some(24)"));
+    }
+
+    #[test]
+    fn reviewed_unplayable_service_is_excluded_only_for_its_exact_current_url() {
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let services = collect_services(vec![response]);
+        let mut cache = QualityCache {
+            unplayable_services: BTreeMap::from([(
+                "primary-guid".to_owned(),
+                CachedUnplayableService {
+                    stream_url: "https://example.test/live.mp3".to_owned(),
+                    checked_on: "2026-07-29".to_owned(),
+                    reason: "HTTP 404 after checking every advertised alternative".to_owned(),
+                },
+            )]),
+            ..QualityCache::default()
+        };
+
+        let rendered = render_module(&services, &cache);
+        assert!(rendered.contains("NPR_STATION_SERVICE_COUNT: usize = 1"));
+        assert!(!rendered.contains("\"npr-primary-guid\""));
+        assert!(rendered.contains("\"npr-music-guid\""));
+
+        cache
+            .unplayable_services
+            .get_mut("primary-guid")
+            .unwrap()
+            .stream_url = "https://example.test/retired.mp3".to_owned();
+        let rendered = render_module(&services, &cache);
+        assert!(rendered.contains("NPR_STATION_SERVICE_COUNT: usize = 2"));
+        assert!(rendered.contains("\"npr-primary-guid\""));
+    }
+
+    #[test]
+    fn cached_quality_selects_a_playable_alternative_over_the_preferred_url() {
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let mut services = collect_services(vec![response]);
+        let cache = QualityCache {
+            services: BTreeMap::from([(
+                "primary-guid".to_owned(),
+                CachedQuality {
+                    stream_url: "https://example.test/live.aac".to_owned(),
+                    probed_on: "2026-07-29".to_owned(),
+                    codec: Some(Codec::Aac),
+                    bitrate_kbps: Some(64),
+                    sample_rate_hz: Some(44_100),
+                    channels: Some(2),
+                },
+            )]),
+            ..QualityCache::default()
+        };
+
+        resolve_static_playlists(&mut services, &cache).unwrap();
+
+        let station = &services["primary-guid"].selected;
+        assert_eq!(station.audio.url, "https://example.test/live.aac");
+        assert_eq!(station.audio_alternatives.len(), 2);
+        let rendered = render_module(&services, &cache);
+        assert!(rendered.contains("\"https://example.test/live.aac\""));
+        assert!(rendered.contains("bitrate_kbps: Some(64)"));
+    }
+
+    #[test]
+    fn cached_fallback_codec_corrects_only_a_terminal_quality_suffix() {
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let mut services = collect_services(vec![response]);
+        let station = &mut services.get_mut("primary-guid").unwrap().selected;
+        station.brand_name = "KRCU Public Radio".to_owned();
+        station.title = "KRCU (128k aac)".to_owned();
+        let quality = CachedQuality {
+            stream_url: station.audio.url.clone(),
+            probed_on: "2026-07-29".to_owned(),
+            codec: Some(Codec::Mp3),
+            bitrate_kbps: Some(128),
+            sample_rate_hz: Some(44_100),
+            channels: Some(2),
+        };
+        let cache = QualityCache {
+            services: BTreeMap::from([("primary-guid".to_owned(), quality.clone())]),
+            ..QualityCache::default()
+        };
+
+        let rendered = render_module(&services, &cache);
+
+        assert!(rendered.contains("name: \"KRCU Public Radio — KRCU (128k mp3)\""));
+        assert!(!rendered.contains("KRCU (128k aac)"));
+        assert_eq!(
+            normalize_stale_codec_suffix("KRCU (Classical aac)", Some(&quality)),
+            "KRCU (Classical aac)"
+        );
+        assert_eq!(
+            normalize_stale_codec_suffix("KRCU (128k AAC) extra", Some(&quality)),
+            "KRCU (128k AAC) extra"
+        );
     }
 
     #[test]
@@ -1967,7 +2371,7 @@ mod tests {
     #[test]
     fn unavailable_probe_helper_retains_matching_cache_and_marks_the_attempt_date() {
         let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
-        let services = collect_services(vec![response]);
+        let mut services = collect_services(vec![response]);
         let existing = QualityCache {
             format_version: QUALITY_CACHE_FORMAT_VERSION,
             last_probe_attempt_on: Some("2026-07-27".to_owned()),
@@ -1982,10 +2386,11 @@ mod tests {
                     channels: Some(2),
                 },
             )]),
+            unplayable_services: BTreeMap::new(),
         };
         let missing = Path::new("/definitely/missing/youta-test-ffprobe");
 
-        let retained = probe_service_quality(&services, &existing, missing, "2026-07-29");
+        let retained = probe_service_quality(&mut services, &existing, missing, "2026-07-29");
 
         assert_eq!(
             retained.last_probe_attempt_on.as_deref(),
@@ -1994,15 +2399,122 @@ mod tests {
         assert_eq!(retained.services.len(), 1);
         assert_eq!(retained.services["primary-guid"].probed_on, "2026-07-27");
         assert_eq!(retained.services["primary-guid"].bitrate_kbps, Some(128));
+        assert!(retained.unplayable_services.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_probe_uses_a_ranked_fallback_but_keeps_the_dead_url_exclusion() {
+        let _fixture_guard = lock_mock_ffprobe_fixture();
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let mut services = collect_services(vec![response]);
+        services.retain(|guid, _| guid == "primary-guid");
+        let existing = QualityCache {
+            unplayable_services: BTreeMap::from([(
+                "primary-guid".to_owned(),
+                CachedUnplayableService {
+                    stream_url: "https://example.test/live.mp3".to_owned(),
+                    checked_on: "2026-07-28".to_owned(),
+                    reason: "Preferred URL returned HTTP 404 during a reviewed check".to_owned(),
+                },
+            )]),
+            ..QualityCache::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("mock-ffprobe");
+        install_mock_ffprobe(
+            &helper,
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+               [ \"$argument\" = 'https://example.test/live.mp3' ] && exit 9\n\
+             done\n\
+             printf '%s' \
+             '{\"streams\":[{\"codec_name\":\"aac\",\"bit_rate\":\"64000\",\
+             \"sample_rate\":\"44100\",\"channels\":2}]}'\n",
+        );
+
+        let refreshed = probe_service_quality(&mut services, &existing, &helper, "2026-07-29");
+
+        assert_eq!(
+            services["primary-guid"].selected.audio.url,
+            "https://example.test/live.aac"
+        );
+        assert_eq!(
+            refreshed.services["primary-guid"].stream_url,
+            "https://example.test/live.aac"
+        );
+        assert_eq!(refreshed.services["primary-guid"].bitrate_kbps, Some(64));
+        assert_eq!(refreshed.unplayable_services, existing.unplayable_services);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_probe_clears_an_exclusion_for_that_exact_url() {
+        let _fixture_guard = lock_mock_ffprobe_fixture();
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let mut services = collect_services(vec![response]);
+        services.retain(|guid, _| guid == "primary-guid");
+        let existing = QualityCache {
+            unplayable_services: BTreeMap::from([(
+                "primary-guid".to_owned(),
+                CachedUnplayableService {
+                    stream_url: "https://example.test/live.mp3".to_owned(),
+                    checked_on: "2026-07-28".to_owned(),
+                    reason: "Previously failed a reviewed playback check".to_owned(),
+                },
+            )]),
+            ..QualityCache::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("mock-ffprobe");
+        install_mock_ffprobe(
+            &helper,
+            "#!/bin/sh\n\
+             printf '%s' \
+             '{\"streams\":[{\"codec_name\":\"mp3\",\"bit_rate\":\"128000\",\
+             \"sample_rate\":\"44100\",\"channels\":2}]}'\n",
+        );
+
+        let refreshed = probe_service_quality(&mut services, &existing, &helper, "2026-07-29");
+
+        assert_eq!(
+            refreshed.services["primary-guid"].stream_url,
+            "https://example.test/live.mp3"
+        );
+        assert!(!refreshed.unplayable_services.contains_key("primary-guid"));
+    }
+
+    #[test]
+    fn failed_probe_preserves_a_reviewed_exclusion_without_creating_new_ones() {
+        let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let mut services = collect_services(vec![response]);
+        services.retain(|guid, _| guid == "primary-guid");
+        let existing = QualityCache {
+            unplayable_services: BTreeMap::from([(
+                "primary-guid".to_owned(),
+                CachedUnplayableService {
+                    stream_url: "https://example.test/live.mp3".to_owned(),
+                    checked_on: "2026-07-28".to_owned(),
+                    reason: "All advertised alternatives failed a reviewed playback check"
+                        .to_owned(),
+                },
+            )]),
+            ..QualityCache::default()
+        };
+        let missing = Path::new("/definitely/missing/youta-test-ffprobe");
+
+        let retained = probe_service_quality(&mut services, &existing, missing, "2026-07-29");
+
+        assert_eq!(retained.unplayable_services, existing.unplayable_services);
+        assert_eq!(retained.unplayable_services.len(), 1);
     }
 
     #[cfg(unix)]
     #[test]
     fn individual_probe_failure_retains_matching_verified_quality() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+        let _fixture_guard = lock_mock_ffprobe_fixture();
         let response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
-        let services = collect_services(vec![response]);
+        let mut services = collect_services(vec![response]);
         let existing = QualityCache {
             format_version: QUALITY_CACHE_FORMAT_VERSION,
             last_probe_attempt_on: Some("2026-07-27".to_owned()),
@@ -2017,17 +2529,16 @@ mod tests {
                     channels: Some(2),
                 },
             )]),
+            unplayable_services: BTreeMap::new(),
         };
         let directory = tempfile::tempdir().unwrap();
         let helper = directory.path().join("mock-ffprobe");
-        fs::write(
+        install_mock_ffprobe(
             &helper,
             "#!/bin/sh\n[ \"$1\" = '-version' ] && exit 0\nexit 9\n",
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
-        let retained = probe_service_quality(&services, &existing, &helper, "2026-07-29");
+        let retained = probe_service_quality(&mut services, &existing, &helper, "2026-07-29");
 
         assert_eq!(
             retained.last_probe_attempt_on.as_deref(),
@@ -2065,15 +2576,93 @@ mod tests {
                     },
                 ),
             ]),
+            unplayable_services: BTreeMap::from([
+                (
+                    "z-unplayable".to_owned(),
+                    CachedUnplayableService {
+                        stream_url: "https://example.test/z-dead".to_owned(),
+                        checked_on: "2026-07-28".to_owned(),
+                        reason: "HTTP 404 after checking every advertised alternative".to_owned(),
+                    },
+                ),
+                (
+                    "a-unplayable".to_owned(),
+                    CachedUnplayableService {
+                        stream_url: "https://example.test/a-dead".to_owned(),
+                        checked_on: "2026-07-27".to_owned(),
+                        reason: "Hostname does not resolve".to_owned(),
+                    },
+                ),
+            ]),
         };
 
         write_quality_cache(&path, &cache).unwrap();
         let payload = fs::read_to_string(&path).unwrap();
+        assert!(
+            payload.find("\"unplayable_services\"").unwrap()
+                < payload.find("\"services\"").unwrap()
+        );
         assert!(payload.find("\"a-guid\"").unwrap() < payload.find("\"z-guid\"").unwrap());
+        assert!(
+            payload.find("\"a-unplayable\"").unwrap() < payload.find("\"z-unplayable\"").unwrap()
+        );
         assert_eq!(read_quality_cache(&path).unwrap(), cache);
 
         fs::write(&path, vec![b' '; MAX_QUALITY_CACHE_JSON_BYTES + 1]).unwrap();
         assert!(read_quality_cache(&path).is_err());
+    }
+
+    #[test]
+    fn unplayable_sidecar_records_require_stable_dated_bounded_evidence() {
+        let valid = CachedUnplayableService {
+            stream_url: "https://example.test/dead".to_owned(),
+            checked_on: "2026-07-29".to_owned(),
+            reason: "HTTP 404 after checking every advertised alternative".to_owned(),
+        };
+        assert!(validate_cached_unplayable("dead-guid", &valid).is_ok());
+
+        let mut malformed = valid.clone();
+        malformed.checked_on = "2026-02-29".to_owned();
+        assert!(validate_cached_unplayable("dead-guid", &malformed).is_err());
+
+        let mut malformed = valid.clone();
+        malformed.reason = format!("x\n{}", "x".repeat(MAX_UNPLAYABLE_REASON_BYTES));
+        assert!(validate_cached_unplayable("dead-guid", &malformed).is_err());
+
+        let mut malformed = valid;
+        malformed.stream_url = "https://example.test/dead?token=transient".to_owned();
+        assert!(validate_cached_unplayable("dead-guid", &malformed).is_err());
+        assert!(validate_cached_unplayable("", &malformed).is_err());
+    }
+
+    #[test]
+    fn quality_sidecar_rejects_conflicting_playable_and_unplayable_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quality.json");
+        fs::write(
+            &path,
+            br#"{
+              "format_version": 2,
+              "services": {
+                "primary-guid": {
+                  "stream_url": "https://example.test/live.mp3",
+                  "probed_on": "2026-07-28",
+                  "codec": "mp3"
+                }
+              },
+              "unplayable_services": {
+                "primary-guid": {
+                  "stream_url": "https://example.test/live.mp3",
+                  "checked_on": "2026-07-29",
+                  "reason": "HTTP 404"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let error = read_quality_cache(&path).unwrap_err().to_string();
+        assert!(error.contains("both playable and unplayable"));
     }
 
     #[test]
@@ -2100,6 +2689,8 @@ mod tests {
                       WQCSFM_SC?dist=NPR"
             .replace(char::is_whitespace, "");
 
+        assert_eq!(cache.format_version, QUALITY_CACHE_FORMAT_VERSION);
+        assert!(cache.unplayable_services.is_empty());
         assert_eq!(cache.services["primary-guid"].stream_url, stable);
         assert!(matching_cached_quality(&cache, "primary-guid", &stable).is_some());
     }

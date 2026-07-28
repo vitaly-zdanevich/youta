@@ -259,8 +259,16 @@ startup and playback never launch `ffprobe` to discover station quality.
 The unpaginated NPR API has no complete-enumeration contract; the checked-in
 count describes a dated state-and-territory snapshot rather than a permanent
 total. Short-lived signed stream URLs are omitted, while static PLS/M3U entry
-points are resolved during generation. Regenerate the snapshot, probe quality,
-and review both generated files with:
+points are resolved during generation. The maintenance probe tries each stable
+advertised alternative before treating a service as unresolved. A failed
+quality probe alone never removes a station.
+
+Exact stream URLs that repeatedly fail both metadata and playback checks can be
+recorded with a review date and reason in the quality sidecar. Normal generation
+omits only that exact service URL. If NPR replaces the URL, the station
+automatically returns for verification; a later successful explicit probe also
+clears the exclusion. Regenerate the snapshot, probe quality, and review both
+generated files with:
 
 ```sh
 cargo run --locked --example update_npr_stations --features radio -- \

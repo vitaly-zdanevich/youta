@@ -2026,12 +2026,12 @@ mod tests {
     fn generated_npr_snapshot_has_stable_reviewed_shape() {
         assert_eq!(NPR_STATION_SNAPSHOT_DATE, "2026-07-28");
         assert_eq!(NPR_STATION_QUERY_COUNT, 56);
-        assert_eq!(NPR_STATION_SERVICE_COUNT, 518);
+        assert_eq!(NPR_STATION_SERVICE_COUNT, 504);
         assert_eq!(
             NPR_STATION_QUALITY_LAST_PROBE_ATTEMPT_DATE,
             Some("2026-07-28")
         );
-        assert_eq!(NPR_STATION_QUALITY_SERVICE_COUNT, 499);
+        assert_eq!(NPR_STATION_QUALITY_SERVICE_COUNT, 504);
         assert_eq!(NPR_STATIONS.len(), NPR_STATION_SERVICE_COUNT);
         assert_eq!(station_count(), STATIONS.len() + NPR_STATION_SERVICE_COUNT);
 
@@ -2098,9 +2098,47 @@ mod tests {
                 Some(RadioNowPlayingFormat::NprStationProgramJson)
             );
         }
-        assert_eq!(missing_bitrates, 29);
-        assert_eq!(missing_sample_rates, 19);
-        assert_eq!(missing_channels, 19);
+        assert_eq!(missing_bitrates, 10);
+        assert_eq!(missing_sample_rates, 0);
+        assert_eq!(missing_channels, 0);
+    }
+
+    #[test]
+    fn generated_npr_snapshot_excludes_reviewed_unplayable_streams() {
+        for id in [
+            "npr-14d17493cc9d4529a25dbb7aace6075d",
+            "npr-2113007873564808a9ebe6b9b703eb42",
+            "npr-4fcf714e1b31499ba249d5ce3faa34fa",
+            "npr-4fcf714e22754c91a1441615606ceda0",
+            "npr-4fcf714f01814ee78fc17c5596caad37",
+            "npr-4fcf714f04b8459ba00637f0c14eed2e",
+            "npr-4fcf716517e64b56885f1ca4e61fb8f1",
+            "npr-4fcf716611404e448141cf689bd5d18c",
+            "npr-5b6ece581b8341108971883b6738740b",
+            "npr-afc1acf2aacc4189a12d5f695903939b",
+            "npr-b0395e7932b1497d99bc82d82031dcbc",
+            "npr-e8e0fbe1d75a4f7bbbb6178d1f053def",
+            "npr-f460ff220d5b46b5894720a2cbe6b7e1",
+            "npr-st820",
+        ] {
+            assert!(
+                station_by_id(id).is_none(),
+                "reviewed unplayable NPR stream escaped exclusion: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_npr_snapshot_uses_a_playable_advertised_alternative() {
+        let station = station_by_id("npr-ee0022d106e54ea1a8ece1cb5243c41c")
+            .expect("KRCU's verified alternative should remain available");
+
+        assert_eq!(station.name, "KRCU Public Radio — KRCU (128k mp3)");
+        assert_eq!(station.stream, "https://krculive.semo.edu:8443/128k");
+        assert_eq!(station.codec, Some(RadioCodec::Mp3));
+        assert_eq!(station.bitrate_kbps, Some(128));
+        assert_eq!(station.sample_rate_hz, Some(44_100));
+        assert_eq!(station.channels, Some(2));
     }
 
     #[test]

@@ -1,6 +1,83 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "last_probe_attempt_on": "2026-07-28",
+  "unplayable_services": {
+    "14d17493cc9d4529a25dbb7aace6075d": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WAERHD3.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    },
+    "2113007873564808a9ebe6b9b703eb42": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WCSUFM_SC",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    },
+    "4fcf714e1b31499ba249d5ce3faa34fa": {
+      "stream_url": "https://stationwhro.whro.org/128.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "hostname did not resolve in repeated ffprobe and mpv checks"
+    },
+    "4fcf714e22754c91a1441615606ceda0": {
+      "stream_url": "https://stationwhrv.whro.org/128.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "hostname did not resolve in repeated ffprobe and mpv checks"
+    },
+    "4fcf714f01814ee78fc17c5596caad37": {
+      "stream_url": "https://stationaltradio.whro.org/128.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "hostname did not resolve in repeated ffprobe and mpv checks"
+    },
+    "4fcf714f04b8459ba00637f0c14eed2e": {
+      "stream_url": "https://stationwfos.whro.org/128.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "hostname did not resolve in repeated ffprobe and mpv checks"
+    },
+    "4fcf716517e64b56885f1ca4e61fb8f1": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WLIWFM.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 403 in repeated ffprobe and mpv checks"
+    },
+    "4fcf716611404e448141cf689bd5d18c": {
+      "stream_url": "https://nepr.streamguys1.com/WNNZ.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    },
+    "5b6ece581b8341108971883b6738740b": {
+      "stream_url": "https://s2.radio.co/sd4fccca83/listen",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 403 station configuration missing in repeated playback checks"
+    },
+    "afc1acf2aacc4189a12d5f695903939b": {
+      "stream_url": "https://streamdb5web.securenetsystems.net/cirruscontent/WVUB&",
+      "checked_on": "2026-07-28",
+      "reason": "endpoint returned HTML instead of audio in repeated playback checks"
+    },
+    "b0395e7932b1497d99bc82d82031dcbc": {
+      "stream_url": "https://streema.com/radios/KWSO",
+      "checked_on": "2026-07-28",
+      "reason": "endpoint returned a webpage instead of the station audio"
+    },
+    "e8e0fbe1d75a4f7bbbb6178d1f053def": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WVASHD3.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    },
+    "ee0022d106e54ea1a8ece1cb5243c41c": {
+      "stream_url": "https://krculive.semo.edu:8009/live",
+      "checked_on": "2026-07-28",
+      "reason": "connection timed out in repeated ffprobe and mpv checks"
+    },
+    "f460ff220d5b46b5894720a2cbe6b7e1": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KUNMFM_2.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    },
+    "st820": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/WMOT_HD2.mp3",
+      "checked_on": "2026-07-28",
+      "reason": "HTTP 404 in repeated ffprobe and mpv checks"
+    }
+  },
   "services": {
     "00b035ccf998440088d2a5d6e39f05c1": {
       "stream_url": "https://icecast.will.illinois.edu/WILL-Classical",
@@ -1295,6 +1372,14 @@
       "probed_on": "2026-07-28",
       "codec": "aac",
       "bitrate_kbps": 64,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "4fcf713e08b749a68a56af73664a8f22": {
+      "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KOSUFM_NEWS_ADP.m3u8",
+      "probed_on": "2026-07-28",
+      "codec": "aac",
+      "bitrate_kbps": 256,
       "sample_rate_hz": 44100,
       "channels": 2
     },
@@ -3291,6 +3376,14 @@
       "sample_rate_hz": 44100,
       "channels": 2
     },
+    "96ac9884680e4e01866ba9cdc72ac308": {
+      "stream_url": "https://mp3stream.wfsu.org:8443/915hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
     "9717f4c310f84c5a85634a40dc5d971a": {
       "stream_url": "https://news-stream.iowapublicradio.org/News.mp3",
       "probed_on": "2026-07-28",
@@ -3666,8 +3759,24 @@
       "sample_rate_hz": 48000,
       "channels": 2
     },
+    "d5712305268b44c79b92ce9c9bc681a4": {
+      "stream_url": "https://mp3stream.wfsu.org:8443/891hi",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
     "d57f8ebc31454678aa883928be1b5f3f": {
       "stream_url": "https://war.streamguys1.com:7785/WUISRIS-3",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "d5ccf8ec4d4e4a0c82c359f7bf9dcf90": {
+      "stream_url": "https://mp3stream.wfsu.org:8443/889hi",
       "probed_on": "2026-07-28",
       "codec": "mp3",
       "bitrate_kbps": 96,
@@ -3821,6 +3930,14 @@
       "probed_on": "2026-07-28",
       "codec": "aac",
       "bitrate_kbps": 96,
+      "sample_rate_hz": 44100,
+      "channels": 2
+    },
+    "ee0022d106e54ea1a8ece1cb5243c41c": {
+      "stream_url": "https://krculive.semo.edu:8443/128k",
+      "probed_on": "2026-07-28",
+      "codec": "mp3",
+      "bitrate_kbps": 128,
       "sample_rate_hz": 44100,
       "channels": 2
     },
