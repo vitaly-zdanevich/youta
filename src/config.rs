@@ -47,6 +47,9 @@ pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
 /// Environment variable that overrides lazy Local-folder size measurement.
 pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 
+/// Environment variable that overrides artwork on a physical Linux TTY.
+pub const TTY_IMAGES_ENV: &str = "YOUTA_UI__SHOW_IMAGES_IN_TTY";
+
 /// Environment variable that overrides the preferred Bandcamp audio format.
 pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
 
@@ -479,15 +482,15 @@ impl Config {
     /// Persists the preferences currently exposed by the in-app editor.
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, selected
-    /// YouTube-video prewarming, and lazy Local-folder size preference are
-    /// written together so confirming the popup cannot save only part of the
-    /// draft.
+    /// YouTube-video prewarming, lazy Local-folder size preference, and
+    /// physical-TTY image preference are written together so confirming the
+    /// popup cannot save only part of the draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
     /// [`YOUTUBE_PREWARM_ENV`] and
-    /// [`LOCAL_FOLDER_SIZES_ENV`] retain precedence and therefore prevent this
-    /// writer from storing a shadowed draft.
+    /// [`LOCAL_FOLDER_SIZES_ENV`] and [`TTY_IMAGES_ENV`] retain precedence and
+    /// therefore prevent this writer from storing a shadowed draft.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the playback preference.
@@ -504,13 +507,18 @@ impl Config {
         skip_advertisement_chapters: bool,
         youtube_prewarm: bool,
         show_local_folder_sizes: bool,
+        show_images_in_tty: bool,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
-        ] {
+            TTY_IMAGES_ENV,
+        ]
+        .into_iter()
+        .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
+        {
             if std::env::var_os(variable).is_some() {
                 return Err(ConfigError::Invalid(format!(
                     "{variable} overrides config.toml; change or remove it before saving these preferences"
@@ -534,6 +542,10 @@ impl Config {
                 })?;
             ui["subscriptions_layout"] = value(layout.as_config_value());
             ui["show_local_folder_sizes"] = value(show_local_folder_sizes);
+            #[cfg(feature = "images")]
+            {
+                ui["show_images_in_tty"] = value(show_images_in_tty);
+            }
         }
         {
             let playback = document
@@ -553,6 +565,12 @@ impl Config {
 
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
+        #[cfg(feature = "images")]
+        {
+            self.ui.show_images_in_tty = show_images_in_tty;
+        }
+        #[cfg(not(feature = "images"))]
+        let _ = show_images_in_tty;
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
         self.playback.youtube_prewarm = youtube_prewarm;
         Ok(())
@@ -761,6 +779,8 @@ pub struct UiConfig {
     pub theme: ThemeMode,
     /// Preferred thumbnail behavior.
     pub thumbnails: ThumbnailMode,
+    /// Render bounded half-block artwork on a confirmed physical Linux TTY.
+    pub show_images_in_tty: bool,
     /// Maximum thumbnail height in terminal rows.
     pub thumbnail_height: u16,
     /// Prefetch currently loaded Search-result thumbnails into the disk cache.
@@ -783,6 +803,7 @@ impl Default for UiConfig {
             show_button_hotkeys: true,
             theme: ThemeMode::Auto,
             thumbnails: ThumbnailMode::Auto,
+            show_images_in_tty: true,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
             show_local_folder_sizes: true,
@@ -1465,6 +1486,7 @@ mod tests {
         assert!(config.persistence.git_commit_on_change);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
         assert!(config.ui.prefetch_search_thumbnails);
+        assert!(config.ui.show_images_in_tty);
         assert!(config.ui.show_local_folder_sizes);
         assert_eq!(
             config.ui.subscriptions_layout,
@@ -1504,6 +1526,7 @@ auto_download = false
 theme = "light"
 thumbnail_height = 14
 prefetch_search_thumbnails = false
+show_images_in_tty = false
 show_local_folder_sizes = false
 subscriptions_layout = "split"
 
@@ -1524,6 +1547,7 @@ bandcamp_audio_format = "alac"
         assert_eq!(config.ui.theme, ThemeMode::Light);
         assert_eq!(config.ui.thumbnail_height, 14);
         assert!(!config.ui.prefetch_search_thumbnails);
+        assert!(!config.ui.show_images_in_tty);
         assert!(!config.ui.show_local_folder_sizes);
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert_eq!(
@@ -1531,6 +1555,22 @@ bandcamp_audio_format = "alac"
             BandcampAudioFormat::Alac
         );
         assert_eq!(config.config_dir(), directory.path());
+    }
+
+    #[test]
+    fn documented_config_example_remains_loadable() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            include_str!("../config.example.toml"),
+        )
+        .expect("write documented configuration");
+
+        let config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load documented configuration");
+
+        assert!(config.ui.show_images_in_tty);
+        assert_eq!(config.ui.thumbnails, ThumbnailMode::Auto);
     }
 
     #[test]
@@ -1545,6 +1585,7 @@ bandcamp_audio_format = "alac"
             assert!(config.ui.nyan_cat_seekbar);
             assert_eq!(config.ui.thumbnail_height, 16);
             assert!(!config.ui.prefetch_search_thumbnails);
+            assert!(!config.ui.show_images_in_tty);
             assert!(!config.ui.show_local_folder_sizes);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
             assert_eq!(
@@ -1585,6 +1626,7 @@ bandcamp_audio_format = "alac"
             .env("YOUTA_UI__NYAN_CAT_SEEKBAR", "true")
             .env("YOUTA_UI__THUMBNAIL_HEIGHT", "16")
             .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
+            .env(TTY_IMAGES_ENV, "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
@@ -1659,7 +1701,7 @@ youtube_api_key = "keep-this-existing-secret"
             .expect("load configuration");
 
         config
-            .save_tui_preferences(SubscriptionsLayout::Split, false, false, false)
+            .save_tui_preferences(SubscriptionsLayout::Split, false, false, false, false)
             .expect("save TUI preferences");
 
         let contents = fs::read_to_string(&path).expect("read updated configuration");
@@ -1671,8 +1713,16 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("skip_advertisement_chapters = false"));
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        #[cfg(feature = "images")]
+        assert!(contents.contains("show_images_in_tty = false"));
+        #[cfg(not(feature = "images"))]
+        assert!(!contents.contains("show_images_in_tty"));
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!config.ui.show_local_folder_sizes);
+        #[cfg(feature = "images")]
+        assert!(!config.ui.show_images_in_tty);
+        #[cfg(not(feature = "images"))]
+        assert!(config.ui.show_images_in_tty);
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
 
@@ -1680,6 +1730,10 @@ youtube_api_key = "keep-this-existing-secret"
             .expect("reload configuration");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        #[cfg(feature = "images")]
+        assert!(!reloaded.ui.show_images_in_tty);
+        #[cfg(not(feature = "images"))]
+        assert!(reloaded.ui.show_images_in_tty);
         assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
     }
@@ -1798,19 +1852,24 @@ youtube_api_key = "keep-this-existing-secret"
             let mut config =
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
             let error = config
-                .save_tui_preferences(SubscriptionsLayout::Split, false, true, true)
+                .save_tui_preferences(SubscriptionsLayout::Split, false, true, true, true)
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
             return;
         }
 
-        for (override_name, override_value) in [
+        let overrides = [
             (SUBSCRIPTIONS_LAYOUT_ENV, "split"),
             (SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false"),
             (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
-        ] {
+            (TTY_IMAGES_ENV, "false"),
+        ];
+        for (override_name, override_value) in overrides
+            .into_iter()
+            .filter(|(name, _)| cfg!(feature = "images") || *name != TTY_IMAGES_ENV)
+        {
             let directory = tempdir().expect("temporary directory");
             let output = Command::new(std::env::current_exe().expect("test executable"))
                 .args([

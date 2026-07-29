@@ -8,17 +8,20 @@ use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::cursor::{Hide, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
+#[cfg(test)]
+use ratatui::layout::Size;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -609,6 +612,8 @@ pub struct PreferencesPopupView {
     pub youtube_prewarm: bool,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
     pub show_local_folder_sizes: bool,
+    /// Draft physical-Linux-TTY artwork behavior saved only on confirmation.
+    pub show_images_in_tty: bool,
     /// Draft preferred Bandcamp playback encoding.
     pub bandcamp_audio_format: BandcampAudioFormat,
     /// Exact private TOML file updated by the save action.
@@ -776,7 +781,7 @@ impl Default for PlaylistPopupView {
     }
 }
 
-/// Explicit local-file mutation awaiting text input or confirmation.
+/// Explicit local or downloaded-file mutation awaiting input or confirmation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalFilePopupView {
     /// Same-directory rename with an editable basename.
@@ -1100,6 +1105,8 @@ pub struct ViewModel {
     pub radio_sort: RadioSort,
     /// Whether recursive Local-folder sizes and size ordering are available.
     pub local_folder_sizes_enabled: bool,
+    /// Whether a physical Linux TTY may render half-block artwork.
+    pub show_images_in_tty: bool,
     /// Selected playable item for which quick and general playlist actions apply.
     pub playlist_item: Option<PlaylistItemView>,
     /// Whether the selected Playlists-screen row can open the shared editor.
@@ -1116,6 +1123,11 @@ pub struct ViewModel {
     pub help_open: bool,
     /// Whether this terminal attachment can launch a graphical external opener.
     pub external_opener_available: bool,
+    /// Whether output is attached directly to a Linux virtual console.
+    ///
+    /// Linux consoles simulate italic and dim text by changing palette colors,
+    /// so renderers use this flag to avoid unstable text styling.
+    pub physical_linux_console: bool,
     /// Scrollable diagnostic popup, when a recoverable error is being reported.
     pub error_popup: Option<ErrorPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
@@ -1130,7 +1142,7 @@ pub struct ViewModel {
     pub private_note_popup: Option<PrivateNotePopupView>,
     /// Whether the current selection resolves to a note-capable exact target.
     pub private_note_available: bool,
-    /// Explicit rename or move-to-Trash confirmation for a local file.
+    /// Explicit rename, move, or recoverable Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
     /// Active or most recently completed supervised download.
     pub download: Option<DownloadView>,
@@ -1175,6 +1187,7 @@ impl Default for ViewModel {
             local_size_sort: LocalSizeSort::Off,
             radio_sort: RadioSort::Name,
             local_folder_sizes_enabled: true,
+            show_images_in_tty: true,
             playlist_item: None,
             playlist_edit_available: false,
             playlist_back_available: false,
@@ -1183,6 +1196,7 @@ impl Default for ViewModel {
             status_line: "Press / to search or ? for help".to_owned(),
             help_open: false,
             external_opener_available: true,
+            physical_linux_console: false,
             error_popup: None,
             youtube_setup_popup: None,
             rss_subscription_popup: None,
@@ -1228,7 +1242,7 @@ pub enum DetailsScroll {
 pub enum UiAction {
     /// Exit Youta after saving state.
     Quit,
-    /// Record whether this terminal attachment can launch graphical URLs.
+    /// Record graphical-opener and physical-Linux-console capabilities.
     SetExternalOpenerAvailable(bool),
     /// Open or close the help overlay.
     ToggleHelp,
@@ -1458,6 +1472,8 @@ pub enum UiAction {
     ToggleYouTubePrewarm,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
     ToggleLocalFolderSizes,
+    /// Toggle half-block artwork on a physical Linux TTY in the draft.
+    ToggleTtyImages,
     /// Cycle the preferred Bandcamp playback encoding in the draft.
     CycleBandcampAudioFormat,
     /// Persist the draft preference and close the editor.
@@ -1534,6 +1550,13 @@ pub trait UiController {
 }
 
 trait ThumbnailRenderer {
+    /// Applies the current physical-TTY artwork preference.
+    ///
+    /// Renderers for graphical terminals and no-image builds ignore this
+    /// policy because it only governs the Linux-console half-block fallback.
+    fn set_tty_images_enabled(&mut self, _enabled: bool) -> bool {
+        false
+    }
     fn poll(&mut self) -> bool;
     fn is_enabled(&self) -> bool;
     fn is_pending(&self) -> bool {
@@ -1548,6 +1571,13 @@ trait ThumbnailRenderer {
     /// never exposes an image-expansion hit target where no image is visible.
     fn has_rendered_artwork(&self) -> bool {
         false
+    }
+    /// Returns the ready artwork area prepared by the background worker.
+    ///
+    /// `None` retains the full requested area for loading and failure
+    /// placeholders, whose text deliberately owns the complete area.
+    fn prepared_artwork_area(&self, _available: Rect) -> Option<Rect> {
+        None
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
     /// Synchronizes a selected local video with its midpoint-frame target.
@@ -1573,6 +1603,11 @@ trait ThumbnailRenderer {
 #[cfg(feature = "images")]
 struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
+    mode: ThumbnailMode,
+    cache_directory: Option<PathBuf>,
+    tty_images_enabled: bool,
+    tty_image_policy_applies: bool,
+    suspended_tty_manager: Option<ThumbnailManager>,
     clear_before_ready: bool,
     followup_frame_pending: bool,
     visible_source: Option<url::Url>,
@@ -1583,9 +1618,36 @@ struct TerminalThumbnailRenderer {
 #[cfg(feature = "images")]
 impl TerminalThumbnailRenderer {
     /// Wraps the asynchronous manager with terminal-frame transition state.
+    #[cfg(test)]
     fn new(manager: ThumbnailManager) -> Self {
+        let tty_image_policy_applies = matches!(
+            manager.capability(),
+            ThumbnailCapability::Supported(ThumbnailProtocol::Halfblocks)
+        );
+        Self::new_with_runtime_policy(
+            manager,
+            ThumbnailMode::Auto,
+            None,
+            true,
+            tty_image_policy_applies,
+        )
+    }
+
+    /// Wraps a manager with the configuration needed for live TTY toggling.
+    fn new_with_runtime_policy(
+        manager: ThumbnailManager,
+        mode: ThumbnailMode,
+        cache_directory: Option<PathBuf>,
+        tty_images_enabled: bool,
+        tty_image_policy_applies: bool,
+    ) -> Self {
         Self {
             manager,
+            mode,
+            cache_directory,
+            tty_images_enabled,
+            tty_image_policy_applies,
+            suspended_tty_manager: None,
             clear_before_ready: false,
             followup_frame_pending: false,
             visible_source: None,
@@ -1597,6 +1659,36 @@ impl TerminalThumbnailRenderer {
 
 #[cfg(feature = "images")]
 impl ThumbnailRenderer for TerminalThumbnailRenderer {
+    fn set_tty_images_enabled(&mut self, enabled: bool) -> bool {
+        if !self.tty_image_policy_applies || self.tty_images_enabled == enabled {
+            return false;
+        }
+        self.tty_images_enabled = enabled;
+        if enabled {
+            self.manager = self.suspended_tty_manager.take().unwrap_or_else(|| {
+                self.cache_directory.as_ref().map_or_else(
+                    || ThumbnailManager::from_current_terminal_with_tty_images(self.mode, true),
+                    |cache_directory| {
+                        ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
+                            self.mode,
+                            cache_directory.clone(),
+                            true,
+                        )
+                    },
+                )
+            });
+        } else {
+            let disabled = ThumbnailManager::from_current_terminal(ThumbnailMode::Off);
+            self.suspended_tty_manager = Some(std::mem::replace(&mut self.manager, disabled));
+        }
+        self.clear_before_ready = false;
+        self.followup_frame_pending = false;
+        self.visible_source = None;
+        self.prefetched_visible_source = None;
+        self.prefetch_sources.clear();
+        true
+    }
+
     fn poll(&mut self) -> bool {
         let changed = self.manager.poll();
         if changed {
@@ -1622,6 +1714,17 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.manager.state() == &ThumbnailState::Ready
             && !self.clear_before_ready
             && self.manager.protocol().is_some()
+    }
+
+    fn prepared_artwork_area(&self, available: Rect) -> Option<Rect> {
+        self.manager.render_size().map(|render_size| {
+            Rect::new(
+                available.x,
+                available.y,
+                render_size.width.min(available.width),
+                render_size.height.min(available.height),
+            )
+        })
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -1739,6 +1842,10 @@ fn quantize_linux_console_thumbnail(buffer: &mut ratatui::buffer::Buffer, area: 
             };
             cell.fg = nearest_ansi16_color(cell.fg);
             cell.bg = nearest_ansi16_color(cell.bg);
+            // Half-block pixels do not carry text semantics. Removing any
+            // modifier left in a reused cell prevents the Linux console from
+            // simulating italic, bold, or dim attributes by changing colors.
+            cell.modifier = Modifier::empty();
         }
     }
 }
@@ -1786,21 +1893,41 @@ fn nearest_ansi16_color(color: Color) -> Color {
     clippy::unnecessary_wraps,
     reason = "the no-thumbnails build returns None through the same interface"
 )]
-fn create_thumbnail_renderer(settings: &UiSettings) -> Option<Box<dyn ThumbnailRenderer>> {
+fn create_thumbnail_renderer(
+    settings: &UiSettings,
+    show_images_in_tty: bool,
+) -> Option<Box<dyn ThumbnailRenderer>> {
     let manager = settings.thumbnail_cache_dir.as_ref().map_or_else(
-        || ThumbnailManager::from_current_terminal(settings.thumbnails),
+        || {
+            ThumbnailManager::from_current_terminal_with_tty_images(
+                settings.thumbnails,
+                show_images_in_tty,
+            )
+        },
         |cache_dir| {
-            ThumbnailManager::from_current_terminal_with_cache(
+            ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
                 settings.thumbnails,
                 cache_dir.clone(),
+                show_images_in_tty,
             )
         },
     );
-    Some(Box::new(TerminalThumbnailRenderer::new(manager)))
+    Some(Box::new(
+        TerminalThumbnailRenderer::new_with_runtime_policy(
+            manager,
+            settings.thumbnails,
+            settings.thumbnail_cache_dir.clone(),
+            show_images_in_tty,
+            current_terminal_attachment().is_physical_linux_virtual_console(),
+        ),
+    ))
 }
 
 #[cfg(not(feature = "images"))]
-fn create_thumbnail_renderer(_settings: &UiSettings) -> Option<Box<dyn ThumbnailRenderer>> {
+fn create_thumbnail_renderer(
+    _settings: &UiSettings,
+    _show_images_in_tty: bool,
+) -> Option<Box<dyn ThumbnailRenderer>> {
     None
 }
 
@@ -1949,12 +2076,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     ));
     let mut session = TerminalSession::enter()?;
     let mut input = TerminalInput::new();
-    let mut thumbnail_renderer = create_thumbnail_renderer(settings);
+    let mut thumbnail_renderer =
+        create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
     let mut hit_map = HitMap::default();
     let mut virtual_cursor = VirtualCursor::default();
     loop {
         let mut renderer = thumbnail_renderer.take();
         if let Some(renderer) = renderer.as_mut() {
+            synchronize_tty_image_preference(controller.view(), renderer.as_mut());
             renderer.poll();
             session.terminal.draw(|frame| {
                 render_frame(
@@ -2005,6 +2134,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                     VirtualCursorKey::Consumed => {}
                 },
                 Event::Mouse(mouse) => {
+                    virtual_cursor.follow_mouse(&mouse);
                     if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
                         controller.dispatch(action);
                     }
@@ -2017,6 +2147,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         thumbnail_renderer = renderer;
     }
     Ok(())
+}
+
+/// Applies the controller's live physical-TTY artwork preference.
+fn synchronize_tty_image_preference(
+    view: &ViewModel,
+    renderer: &mut dyn ThumbnailRenderer,
+) -> bool {
+    renderer.set_tty_images_enabled(view.show_images_in_tty)
 }
 
 /// Input source that opportunistically adds GPM without changing PTY behavior.
@@ -2074,6 +2212,22 @@ struct VirtualCursor {
 }
 
 impl VirtualCursor {
+    /// Moves an active keyboard pointer to the latest physical mouse cell.
+    ///
+    /// This lets GPM drive the same visible square on a Linux virtual console
+    /// without making ordinary terminal mouse movement activate the fallback.
+    fn follow_mouse(&mut self, mouse: &MouseEvent) {
+        if !self.active || self.bounds.is_empty() {
+            return;
+        }
+        self.column = mouse
+            .column
+            .clamp(self.bounds.x, self.bounds.right().saturating_sub(1));
+        self.row = mouse
+            .row
+            .clamp(self.bounds.y, self.bounds.bottom().saturating_sub(1));
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> VirtualCursorKey {
         if key.code == KeyCode::F(8) {
             if key.kind == KeyEventKind::Press {
@@ -2308,11 +2462,17 @@ impl TerminalSession {
 }
 
 /// Writes the escape commands that initialize Youta's terminal session.
+///
+/// Clearing after requesting the alternate screen preserves a terminal
+/// emulator's primary buffer while also giving Linux virtual consoles, which
+/// may ignore the alternate-screen request, a clean full-screen canvas.
 fn write_terminal_startup(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(
         writer,
         SetTitle("Youta"),
         EnterAlternateScreen,
+        ClearTerminal(ClearType::All),
+        MoveTo(0, 0),
         EnableMouseCapture,
         Hide
     )
@@ -2679,7 +2839,7 @@ fn render_frame(
     hit_map: &mut HitMap,
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
-    let theme = Theme::new(settings.funny_mode);
+    let theme = Theme::for_terminal(settings.funny_mode, view.physical_linux_console);
     frame.render_widget(Block::default().style(theme.base), frame.area());
 
     let chapter_label_rows = chapter_label_row_count(
@@ -3153,6 +3313,7 @@ fn render_body(
         true,
         view.selected,
         view.playing_media_id.as_ref(),
+        !view.physical_linux_console,
         theme.heading,
         theme,
     );
@@ -3203,6 +3364,7 @@ fn render_row_list(
     show_source: bool,
     selected_index: usize,
     playing_media_id: Option<&MediaId>,
+    allow_started_title_italics: bool,
     heading_style: Style,
     theme: &Theme,
 ) -> (Rect, usize) {
@@ -3245,7 +3407,7 @@ fn render_row_list(
             } else {
                 row_style
             };
-            if has_playback_progress && playback_started {
+            if has_playback_progress && playback_started && allow_started_title_italics {
                 title_style = title_style.add_modifier(Modifier::ITALIC);
             }
             let marker = if row.subscribed { "◆" } else { " " };
@@ -3406,6 +3568,7 @@ fn render_subscriptions_body(
                 false,
                 subscriptions.selected_item,
                 view.playing_media_id.as_ref(),
+                !view.physical_linux_console,
                 theme.heading,
                 theme,
             );
@@ -3546,6 +3709,7 @@ fn render_subscriptions_body(
                     false,
                     subscriptions.selected_item,
                     view.playing_media_id.as_ref(),
+                    !view.physical_linux_console,
                     item_heading,
                     theme,
                 );
@@ -3587,6 +3751,7 @@ fn render_subscription_source_list(
         true,
         view.subscriptions.selected_source,
         view.playing_media_id.as_ref(),
+        !view.physical_linux_console,
         heading_style,
         theme,
     );
@@ -4358,19 +4523,33 @@ fn render_information_panel(
             && (visible_thumbnail_url.is_some() || visible_local_video.is_some())
             && rendered_thumbnail_height >= MIN_THUMBNAIL_HEIGHT
         {
-            let thumbnail_area =
+            let available_thumbnail_area =
                 Rect::new(inner.x, cursor_y, inner.width, rendered_thumbnail_height);
             if let Some(local_video) = visible_local_video {
-                renderer.synchronize_local_video(local_video, thumbnail_area);
+                renderer.synchronize_local_video(local_video, available_thumbnail_area);
             } else {
-                renderer.synchronize(visible_thumbnail_url, thumbnail_area);
+                renderer.synchronize(visible_thumbnail_url, available_thumbnail_area);
             }
+            // The worker aspect-fits and encodes ready artwork for this exact
+            // area. Rendering into that same rectangle prevents
+            // `ratatui-image` from repeating resize/encode work on the TUI
+            // thread. Loading and failure placeholders retain the requested
+            // area. Expanded artwork still reserves every remaining row so it
+            // continues to hide the following Details text.
+            let thumbnail_area = renderer
+                .prepared_artwork_area(available_thumbnail_area)
+                .unwrap_or(available_thumbnail_area);
+            let reserved_thumbnail_height = if details.thumbnail_expanded {
+                available_thumbnail_area.height
+            } else {
+                thumbnail_area.height
+            };
             let artwork_rendered = renderer.has_rendered_artwork();
             renderer.render(frame, thumbnail_area, theme);
             if artwork_rendered {
                 hit_map.thumbnail_area = Some(thumbnail_area);
             }
-            cursor_y = cursor_y.saturating_add(rendered_thumbnail_height);
+            cursor_y = cursor_y.saturating_add(reserved_thumbnail_height);
             remaining_height = inner.bottom().saturating_sub(cursor_y);
         } else {
             renderer.clear();
@@ -5844,13 +6023,13 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  Subscriptions channel: R refresh videos     i description",
         "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
-        "  Linux /dev/ttyN: GPM mouse input is detected automatically.",
+        "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
         "",
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
         "  r repeat     A autoplay next item from the same source list",
-        "  w waveform     Alt+←/→ Details back/forward     Backspace Details back",
+        "  w waveform  Details: Alt+←/→ history  Alt+↑/↓ scroll  Backspace back",
         "",
         "Actions",
         "  Ctrl+n play next     a add to queue     d download     o video page",
@@ -5861,7 +6040,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  Alt+j/k select external link     Alt+Enter open selected link",
         "",
         "Mouse",
-        "  Click Details; wheel/PageUp/PageDown scroll.",
+        "  Click Details; wheel/PageUp/PageDown or Alt+↑/↓ scroll.",
         "  Press t, then drag visible Details text to copy it; t/Esc exits selection.",
         "  The result list, borders, buttons, scrollbar, and thumbnail are never selected.",
         "  Click tabs, rows, links, buttons, seek; wheel elsewhere selects rows.",
@@ -6996,7 +7175,7 @@ fn render_preferences_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(76, 76, frame.area());
+    let area = centered_rect(76, 88, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -7011,6 +7190,7 @@ fn render_preferences_popup(
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -7144,6 +7324,42 @@ fn render_preferences_popup(
         ),
     ));
 
+    let tty_images_label = if cfg!(feature = "images") {
+        format!(
+            "[i] Show images in TTY: {}",
+            if preferences.show_images_in_tty {
+                "on"
+            } else {
+                "off"
+            }
+        )
+    } else {
+        "[i] Show images in TTY: unavailable in this build".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(tty_images_label.clone())
+            .style(if !cfg!(feature = "images") {
+                theme.muted
+            } else if preferences.show_images_in_tty {
+                theme.selected
+            } else {
+                theme.base
+            })
+            .alignment(Alignment::Center),
+        sections[5],
+    );
+    if cfg!(feature = "images") {
+        hit_map.preferences_buttons.push((
+            UiAction::ToggleTtyImages,
+            Rect::new(
+                centered_line_x(sections[5], terminal_text_width(&tty_images_label)),
+                sections[5].y,
+                terminal_text_width(&tty_images_label).min(sections[5].width),
+                1,
+            ),
+        ));
+    }
+
     let bandcamp_format_label = if cfg!(feature = "bandcamp") {
         format!(
             "[b] Bandcamp audio: {}",
@@ -7160,22 +7376,22 @@ fn render_preferences_popup(
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[5],
+        sections[6],
     );
     if cfg!(feature = "bandcamp") {
         hit_map.preferences_buttons.push((
             UiAction::CycleBandcampAudioFormat,
             Rect::new(
-                centered_line_x(sections[5], terminal_text_width(&bandcamp_format_label)),
-                sections[5].y,
-                terminal_text_width(&bandcamp_format_label).min(sections[5].width),
+                centered_line_x(sections[6], terminal_text_width(&bandcamp_format_label)),
+                sections[6].y,
+                terminal_text_width(&bandcamp_format_label).min(sections[6].width),
                 1,
             ),
         ));
     }
 
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -7198,7 +7414,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[6],
+        sections[7],
     );
 
     let buttons = [
@@ -7214,15 +7430,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[7],
+        sections[8],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[7], total_width);
+    let mut x = centered_line_x(sections[8], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[7].y, width, 1)));
+            .push((action, Rect::new(x, sections[8].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -8042,6 +8258,7 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
             KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
+            KeyCode::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
             KeyCode::Char('b') if cfg!(feature = "bandcamp") => {
                 Some(UiAction::CycleBandcampAudioFormat)
             }
@@ -8153,7 +8370,7 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
         KeyCode::Char('/') => Some(UiAction::BeginSearch),
         KeyCode::Char('p') | KeyCode::F(7) => Some(UiAction::OpenPreferences),
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Tab if reverse_tab_modifiers(key.modifiers) => {
             Some(UiAction::ShowScreen(view.screen.previous()))
         }
         KeyCode::Tab => Some(UiAction::ShowScreen(view.screen.next())),
@@ -8297,6 +8514,21 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
         KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
         KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
+        KeyCode::Up
+            if alt
+                && view.details.is_some()
+                && view.right_panel_mode == RightPanelMode::Details =>
+        {
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
+        }
+        KeyCode::Down
+            if alt
+                && view.details.is_some()
+                && view.right_panel_mode == RightPanelMode::Details =>
+        {
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
+        }
+        KeyCode::Up | KeyCode::Down if alt => None,
         KeyCode::PageUp if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(-1)))
         }
@@ -8364,6 +8596,17 @@ fn key_action_with_page_rows_unfiltered(
         }
         _ => None,
     }
+}
+
+/// Recognizes reverse-tab modifier encodings produced by terminal keyboards.
+///
+/// Modern terminals normally report either [`KeyCode::BackTab`] or
+/// `Shift+Tab`. The default Linux virtual-console keymap emits Backtab as
+/// `Escape` followed by `Tab`, which Crossterm exposes as `Alt+Tab`. That
+/// encoding cannot be distinguished from a literal Alt+Tab, so both forms are
+/// intentionally accepted as the previous-screen shortcut.
+fn reverse_tab_modifiers(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
@@ -8907,6 +9150,20 @@ struct Theme {
 }
 
 impl Theme {
+    /// Builds a theme whose text styles are stable on the active terminal.
+    ///
+    /// A Linux virtual console has no dependable true-color or italic text,
+    /// so its vertical-video accent uses the closest named ANSI color. The
+    /// watched-state renderer separately suppresses italics while retaining
+    /// the explicit playback marker.
+    fn for_terminal(funny_mode: bool, physical_linux_console: bool) -> Self {
+        let mut theme = Self::new(funny_mode);
+        if physical_linux_console && !funny_mode {
+            theme.vertical_video = Style::default().fg(Color::LightMagenta);
+        }
+        theme
+    }
+
     fn new(funny_mode: bool) -> Self {
         if funny_mode {
             Self {
@@ -8970,11 +9227,19 @@ mod tests {
         pending: bool,
         immediate_redraw: bool,
         rendered_artwork: bool,
+        prepared_artwork_size: Option<Size>,
+        rendered_areas: Vec<Rect>,
         poll_results: VecDeque<bool>,
         poll_count: usize,
+        tty_image_preferences: Vec<bool>,
     }
 
     impl ThumbnailRenderer for MockThumbnailRenderer {
+        fn set_tty_images_enabled(&mut self, enabled: bool) -> bool {
+            self.tty_image_preferences.push(enabled);
+            true
+        }
+
         fn poll(&mut self) -> bool {
             self.poll_count = self.poll_count.saturating_add(1);
             let changed = self.poll_results.pop_front().unwrap_or(false);
@@ -8998,6 +9263,17 @@ mod tests {
 
         fn has_rendered_artwork(&self) -> bool {
             self.rendered_artwork
+        }
+
+        fn prepared_artwork_area(&self, available: Rect) -> Option<Rect> {
+            self.prepared_artwork_size.map(|size| {
+                Rect::new(
+                    available.x,
+                    available.y,
+                    size.width.min(available.width),
+                    size.height.min(available.height),
+                )
+            })
         }
 
         fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -9034,6 +9310,7 @@ mod tests {
         }
 
         fn render(&mut self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+            self.rendered_areas.push(area);
             frame.render_widget(
                 Paragraph::new("THUMBNAIL IMAGE")
                     .style(theme.accent)
@@ -9041,6 +9318,67 @@ mod tests {
                 area,
             );
         }
+    }
+
+    #[test]
+    fn view_model_applies_tty_image_preference_to_the_live_renderer() {
+        let mut renderer = MockThumbnailRenderer::default();
+        let hidden = ViewModel {
+            show_images_in_tty: false,
+            ..ViewModel::default()
+        };
+
+        assert!(synchronize_tty_image_preference(&hidden, &mut renderer));
+        assert_eq!(renderer.tty_image_preferences, [false]);
+
+        let visible = ViewModel::default();
+        assert!(synchronize_tty_image_preference(&visible, &mut renderer));
+        assert_eq!(renderer.tty_image_preferences, [false, true]);
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn live_tty_image_toggle_restores_the_suspended_halfblock_manager() {
+        use crate::thumbnails::tests as thumbnail_tests;
+
+        let directory = tempfile::tempdir().expect("temporary cache parent");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let manager = thumbnail_tests::halfblock_manager_for_tui(Some(cache_directory.clone()));
+        let mut renderer = TerminalThumbnailRenderer::new_with_runtime_policy(
+            manager,
+            ThumbnailMode::Auto,
+            Some(cache_directory.clone()),
+            true,
+            true,
+        );
+
+        assert_eq!(
+            renderer.manager.capability(),
+            ThumbnailCapability::Supported(ThumbnailProtocol::Halfblocks)
+        );
+        assert!(renderer.set_tty_images_enabled(false));
+        assert_eq!(renderer.manager.capability(), ThumbnailCapability::Disabled);
+        assert!(!renderer.is_enabled());
+        assert!(renderer.suspended_tty_manager.is_some());
+        assert!(!renderer.set_tty_images_enabled(false));
+
+        assert!(renderer.set_tty_images_enabled(true));
+        assert_eq!(
+            renderer.manager.capability(),
+            ThumbnailCapability::Supported(ThumbnailProtocol::Halfblocks)
+        );
+        assert!(renderer.is_enabled());
+        assert!(renderer.suspended_tty_manager.is_none());
+        assert_eq!(renderer.mode, ThumbnailMode::Auto);
+        assert_eq!(
+            renderer.cache_directory.as_deref(),
+            Some(cache_directory.as_path())
+        );
+        assert!(
+            !cache_directory.exists(),
+            "toggling an idle manager must neither initialize the cache nor perform network work"
+        );
+        assert!(!renderer.set_tty_images_enabled(true));
     }
 
     #[test]
@@ -9121,6 +9459,36 @@ mod tests {
         assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 
+    #[test]
+    fn active_virtual_cursor_follows_physical_mouse_cells_within_the_terminal() {
+        let mut cursor = VirtualCursor {
+            active: false,
+            column: 2,
+            row: 1,
+            bounds: Rect::new(1, 1, 6, 3),
+        };
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        cursor.follow_mouse(&moved);
+        assert_eq!((cursor.column, cursor.row), (2, 1));
+
+        cursor.active = true;
+        cursor.follow_mouse(&moved);
+        assert_eq!((cursor.column, cursor.row), (5, 2));
+
+        cursor.follow_mouse(&MouseEvent {
+            column: u16::MAX,
+            row: u16::MAX,
+            ..moved
+        });
+        assert_eq!((cursor.column, cursor.row), (6, 3));
+    }
+
     /// Collects the test backend's current cells for whole-frame assertions.
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
@@ -9172,6 +9540,22 @@ mod tests {
                 .windows(b"\x1b[?1049h".len())
                 .any(|window| window == b"\x1b[?1049h"),
             "startup must still enter the alternate screen: {output:?}"
+        );
+        let alternate_screen = output
+            .windows(b"\x1b[?1049h".len())
+            .position(|window| window == b"\x1b[?1049h")
+            .expect("alternate-screen command");
+        let clear_screen = output
+            .windows(b"\x1b[2J".len())
+            .position(|window| window == b"\x1b[2J")
+            .expect("clear-screen command");
+        let cursor_home = output
+            .windows(b"\x1b[1;1H".len())
+            .position(|window| window == b"\x1b[1;1H")
+            .expect("cursor-home command");
+        assert!(
+            alternate_screen < clear_screen && clear_screen < cursor_home,
+            "startup must clear the active UI buffer and move to its origin: {output:?}"
         );
         assert!(
             output
@@ -9704,6 +10088,11 @@ mod tests {
             Some(Color::LightMagenta),
             "the DOS theme keeps its brighter terminal-palette accent"
         );
+        assert_eq!(
+            Theme::for_terminal(false, true).vertical_video.fg,
+            Some(Color::LightMagenta),
+            "the physical Linux console must not receive a true-color text style"
+        );
     }
 
     #[test]
@@ -10041,8 +10430,9 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Youta help"));
-        assert!(rendered.contains("Alt+←/→ Details back/forward"));
-        assert!(rendered.contains("Backspace Details back"));
+        assert!(rendered.contains("Details: Alt+←/→ history"));
+        assert!(rendered.contains("Alt+↑/↓ scroll"));
+        assert!(rendered.contains("Backspace back"));
         if cfg!(feature = "local-browser") {
             assert!(rendered.contains("Local: Esc parent"));
             assert!(rendered.contains("PageUp/Down page"));
@@ -10058,7 +10448,7 @@ mod tests {
         assert!(!rendered.contains("M/F6 MOD/tracker music"));
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
-        assert!(rendered.contains("GPM mouse input is detected automatically"));
+        assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         for border in ['┌', '┐', '└', '┘'] {
             assert!(
                 rendered.contains(border),
@@ -10190,6 +10580,46 @@ mod tests {
                 &unfocused
             ),
             None
+        );
+    }
+
+    #[test]
+    fn alt_arrow_keys_scroll_visible_details_without_requiring_focus() {
+        let details = ViewModel {
+            details: Some(DetailView::default()),
+            right_panel_mode: RightPanelMode::Details,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &details),
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &details),
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &details),
+            Some(UiAction::ChangeVolume(5)),
+            "plain arrows must remain volume controls"
+        );
+
+        let no_details = ViewModel::default();
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &no_details),
+            None,
+            "Alt+Down must not change volume when Details is unavailable"
+        );
+
+        let channel = ViewModel {
+            details: Some(DetailView::default()),
+            right_panel_mode: RightPanelMode::Channel,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &channel),
+            None,
+            "the shortcut must not change volume while the description is hidden"
         );
     }
 
@@ -11058,6 +11488,20 @@ mod tests {
                 &ViewModel::default()
             ),
             Some(UiAction::ShowScreen(Screen::Subscriptions))
+        );
+    }
+
+    #[test]
+    fn linux_virtual_console_backtab_encoding_moves_to_previous_screen() {
+        let view = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT), &view),
+            Some(UiAction::ShowScreen(Screen::Subscriptions)),
+            "the Linux console's Escape+Tab Backtab encoding must move backward"
         );
     }
 
@@ -12027,6 +12471,7 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
+                show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 config_path: "/tmp/youta/config.toml".to_owned(),
@@ -12045,6 +12490,10 @@ mod tests {
         assert!(rendered.contains("[s] Split"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[f] Show Local folder sizes: on"));
+        #[cfg(feature = "images")]
+        assert!(rendered.contains("[i] Show images in TTY: on"));
+        #[cfg(not(feature = "images"))]
+        assert!(rendered.contains("[i] Show images in TTY: unavailable in this build"));
         #[cfg(feature = "bandcamp")]
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
@@ -12063,6 +12512,16 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleLocalFolderSizes)
+        );
+        #[cfg(feature = "images")]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleTtyImages)
+        );
+        #[cfg(not(feature = "images"))]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            None
         );
         #[cfg(feature = "bandcamp")]
         assert_eq!(
@@ -12130,6 +12589,35 @@ mod tests {
             ),
             Some(UiAction::ToggleLocalFolderSizes)
         );
+        #[cfg(feature = "images")]
+        {
+            let (_, tty_images_target) = hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(action, _)| action == &UiAction::ToggleTtyImages)
+                .expect("TTY-images target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: tty_images_target.x,
+                        row: tty_images_target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ToggleTtyImages)
+            );
+        }
+        #[cfg(not(feature = "images"))]
+        assert!(
+            hit_map
+                .preferences_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTtyImages),
+            "an unavailable preference must not expose a mouse hitbox"
+        );
         #[cfg(feature = "bandcamp")]
         {
             let (_, bandcamp_format_target) = hit_map
@@ -12161,6 +12649,7 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
+                show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 config_path: "/tmp/youta/config.toml".to_owned(),
@@ -14633,6 +15122,79 @@ mod tests {
     }
 
     #[test]
+    fn ready_fitted_artwork_places_following_details_on_the_next_row() {
+        let backend = TestBackend::new(120, 44);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                title: "Wide local image".to_owned(),
+                source: "Local image".to_owned(),
+                description: "Following Details text.".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("file:///tmp/youta-wide-image.jpg").expect("fixture image URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings {
+            thumbnail_height: 12,
+            ..UiSettings::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            // A 16:9 image fitted into the Local image screen's doubled
+            // 60×24-cell box at 10×20 pixels per cell occupies 17 rows.
+            prepared_artwork_size: Some(Size::new(60, 17)),
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw fitted local artwork");
+
+        let [(_, requested_area)] = thumbnails.synchronized.as_slice() else {
+            panic!("expected one synchronized thumbnail");
+        };
+        let [rendered_area] = thumbnails.rendered_areas.as_slice() else {
+            panic!("expected one rendered thumbnail");
+        };
+        let details_row = hit_map
+            .detail_text_rows
+            .iter()
+            .find(|row| row.cells.concat().contains("Following Details text."))
+            .expect("following Details row");
+
+        assert_eq!(requested_area.height, 24);
+        assert_eq!(rendered_area.height, 17);
+        assert_eq!(
+            details_row.y,
+            rendered_area.bottom(),
+            "aspect-ratio padding must not become empty rows before Details text"
+        );
+    }
+
+    #[test]
+    fn portrait_artwork_uses_the_worker_prepared_width_without_realignment() {
+        let available = Rect::new(61, 8, 60, 24);
+        let thumbnails = MockThumbnailRenderer {
+            prepared_artwork_size: Some(Size::new(27, 24)),
+            ..MockThumbnailRenderer::default()
+        };
+
+        assert_eq!(
+            thumbnails.prepared_artwork_area(available),
+            Some(Rect::new(available.x, available.y, 27, 24)),
+            "Fit padding previously placed portrait pixels at the area's left edge"
+        );
+    }
+
+    #[test]
     fn youtube_thumbnails_expand_at_1080_terminal_window_pixels() {
         let description = "x".repeat(63 * SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT);
         for (height_pixels, expected_height) in [(1079, 7), (1080, 32)] {
@@ -14868,6 +15430,7 @@ mod tests {
             let mut expanded = MockThumbnailRenderer {
                 enabled: true,
                 rendered_artwork: true,
+                prepared_artwork_size: Some(Size::new(normal_area.width, 3)),
                 ..MockThumbnailRenderer::default()
             };
             terminal
@@ -14881,13 +15444,23 @@ mod tests {
                     );
                 })
                 .expect("draw expanded artwork");
-            let expanded_area = expanded.synchronized[0].1;
+            let expanded_requested_area = expanded.synchronized[0].1;
+            let expanded_rendered_area = expanded.rendered_areas[0];
 
-            assert!(expanded_area.height > normal_area.height);
-            assert_eq!(expanded_area.x, hit_map.details_panel.x);
-            assert_eq!(expanded_area.width, hit_map.details_panel.width);
-            assert_eq!(expanded_area.bottom(), hit_map.details_panel.bottom());
-            assert_eq!(hit_map.thumbnail_area, Some(expanded_area));
+            assert!(expanded_requested_area.height > normal_area.height);
+            assert_eq!(expanded_requested_area.x, hit_map.details_panel.x);
+            assert_eq!(expanded_requested_area.width, hit_map.details_panel.width);
+            assert_eq!(
+                expanded_requested_area.bottom(),
+                hit_map.details_panel.bottom()
+            );
+            assert_eq!(expanded_rendered_area.width, expanded_requested_area.width);
+            assert_eq!(expanded_rendered_area.height, 3);
+            assert_eq!(hit_map.thumbnail_area, Some(expanded_rendered_area));
+            assert!(
+                !rendered_text(&terminal).contains("Hidden while artwork is expanded."),
+                "expanded artwork must reserve the full pane and hide following Details text"
+            );
             if width < 80 {
                 assert!(
                     hit_map.rows.bottom() <= hit_map.details_panel.y,
@@ -15016,19 +15589,23 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
         buffer[(0, 0)].fg = Color::Rgb(250, 80, 90);
         buffer[(0, 0)].bg = Color::Rgb(4, 7, 9);
+        buffer[(0, 0)].modifier = Modifier::BOLD | Modifier::ITALIC;
         buffer[(1, 0)].fg = Color::Indexed(42);
         buffer[(2, 0)].fg = Color::Rgb(255, 255, 255);
+        buffer[(2, 0)].modifier = Modifier::ITALIC;
 
         quantize_linux_console_thumbnail(&mut buffer, Rect::new(0, 0, 2, 1));
 
         assert_eq!(buffer[(0, 0)].fg, Color::LightRed);
         assert_eq!(buffer[(0, 0)].bg, Color::Black);
+        assert!(buffer[(0, 0)].modifier.is_empty());
         assert_eq!(buffer[(1, 0)].fg, Color::Indexed(42));
         assert_eq!(
             buffer[(2, 0)].fg,
             Color::Rgb(255, 255, 255),
             "cells outside the rendered thumbnail must remain untouched"
         );
+        assert!(buffer[(2, 0)].modifier.contains(Modifier::ITALIC));
     }
 
     #[cfg(feature = "images")]
@@ -18050,6 +18627,10 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("Move to trash?"));
         assert!(rendered.contains("Move “06 - 500 рублей.flac”"));
         assert!(rendered.contains("From: /home/listener/Music/06 - 500 рублей.flac"));
+        assert!(
+            rendered
+                .contains("Destination: recoverable system Trash (chosen by the operating system)")
+        );
         assert!(
             hit_map
                 .local_file_buttons

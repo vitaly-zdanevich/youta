@@ -36,7 +36,7 @@ use image::{
     DynamicImage, GrayAlphaImage, GrayImage, ImageFormat, ImageReader, Limits, RgbImage, RgbaImage,
 };
 use jpeg_decoder::{CodingProcess, Decoder as JpegDecoder, PixelFormat};
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, ResizeEncodeRender};
@@ -402,12 +402,14 @@ impl PreparedThumbnailKey {
 struct PreparedThumbnail {
     key: PreparedThumbnailKey,
     protocol: StatefulProtocol,
+    render_size: Size,
     decoded_bytes: usize,
 }
 
 /// One encoded protocol and the decoded source allocation it retains.
 struct EncodedThumbnail {
     protocol: StatefulProtocol,
+    render_size: Size,
     decoded_bytes: usize,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
 }
@@ -416,6 +418,7 @@ struct EncodedThumbnail {
 /// the ready result has been published.
 struct LoadedThumbnail {
     protocol: StatefulProtocol,
+    render_size: Size,
     decoded_bytes: usize,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
     deferred_local_frame: Option<DeferredLocalPreview>,
@@ -1666,6 +1669,7 @@ pub struct ThumbnailManager {
     current_generation: Arc<AtomicU64>,
     target: Option<ThumbnailTarget>,
     protocol: Option<StatefulProtocol>,
+    protocol_render_size: Option<Size>,
     protocol_decoded_bytes: usize,
     protocol_key: Option<PreparedThumbnailKey>,
     prepared: VecDeque<PreparedThumbnail>,
@@ -1689,7 +1693,25 @@ impl ThumbnailManager {
     /// screen and before reading terminal events.
     #[must_use]
     pub fn from_current_terminal(mode: ThumbnailMode) -> Self {
-        Self::from_terminal_info_with_cache(mode, &TerminalInfo::current(), None)
+        Self::from_current_terminal_with_tty_images(mode, true)
+    }
+
+    /// Detects the current terminal while applying the physical-TTY artwork
+    /// preference.
+    ///
+    /// Disabling TTY artwork affects only a confirmed local Linux virtual
+    /// console. Graphical terminal protocols continue to follow `mode`.
+    #[must_use]
+    pub fn from_current_terminal_with_tty_images(
+        mode: ThumbnailMode,
+        show_images_in_tty: bool,
+    ) -> Self {
+        Self::from_terminal_info_with_cache(
+            mode,
+            &TerminalInfo::current(),
+            None,
+            show_images_in_tty,
+        )
     }
 
     /// Detects the current terminal and lazily enables a persistent byte cache.
@@ -1698,20 +1720,43 @@ impl ThumbnailManager {
     /// visible artwork. Unsupported terminals never read or write the cache.
     #[must_use]
     pub fn from_current_terminal_with_cache(mode: ThumbnailMode, cache_directory: PathBuf) -> Self {
-        Self::from_terminal_info_with_cache(mode, &TerminalInfo::current(), Some(cache_directory))
+        Self::from_current_terminal_with_cache_and_tty_images(mode, cache_directory, true)
+    }
+
+    /// Detects the current terminal, applies the physical-TTY artwork
+    /// preference, and lazily enables a persistent byte cache.
+    ///
+    /// The cache remains untouched when `show_images_in_tty` disables artwork
+    /// on a confirmed physical Linux console.
+    #[must_use]
+    pub fn from_current_terminal_with_cache_and_tty_images(
+        mode: ThumbnailMode,
+        cache_directory: PathBuf,
+        show_images_in_tty: bool,
+    ) -> Self {
+        Self::from_terminal_info_with_cache(
+            mode,
+            &TerminalInfo::current(),
+            Some(cache_directory),
+            show_images_in_tty,
+        )
     }
 
     #[cfg(test)]
     fn from_terminal_info(mode: ThumbnailMode, terminal: &TerminalInfo) -> Self {
-        Self::from_terminal_info_with_cache(mode, terminal, None)
+        Self::from_terminal_info_with_cache(mode, terminal, None, true)
     }
 
     fn from_terminal_info_with_cache(
         mode: ThumbnailMode,
         terminal: &TerminalInfo,
         cache_directory: Option<PathBuf>,
+        show_images_in_tty: bool,
     ) -> Self {
         if mode == ThumbnailMode::Off {
+            return Self::inactive(ThumbnailCapability::Disabled);
+        }
+        if terminal.confirmed_linux_virtual_console() && !show_images_in_tty {
             return Self::inactive(ThumbnailCapability::Disabled);
         }
         if terminal.hard_unsupported() {
@@ -1744,6 +1789,7 @@ impl ThumbnailManager {
             current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
+            protocol_render_size: None,
             protocol_decoded_bytes: 0,
             protocol_key: None,
             prepared: VecDeque::new(),
@@ -1772,6 +1818,7 @@ impl ThumbnailManager {
             current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
+            protocol_render_size: None,
             protocol_decoded_bytes: 0,
             protocol_key: None,
             prepared: VecDeque::new(),
@@ -1838,6 +1885,7 @@ impl ThumbnailManager {
                 .store(self.generation, Ordering::Release);
             self.target = None;
             self.protocol = None;
+            self.protocol_render_size = None;
             self.protocol_decoded_bytes = 0;
             self.protocol_key = None;
             self.state = ThumbnailState::Failed(ThumbnailFailure::InvalidSource);
@@ -1868,6 +1916,7 @@ impl ThumbnailManager {
         if let Some(prepared) = self.take_prepared_thumbnail(&target) {
             self.protocol_key = Some(prepared.key);
             self.protocol = Some(prepared.protocol);
+            self.protocol_render_size = Some(prepared.render_size);
             self.protocol_decoded_bytes = prepared.decoded_bytes;
             self.state = ThumbnailState::Ready;
             return true;
@@ -2025,6 +2074,7 @@ impl ThumbnailManager {
         if self.result_receiver.is_none() {
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
+                self.protocol_render_size = None;
                 self.protocol_decoded_bytes = 0;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
                 return true;
@@ -2044,12 +2094,14 @@ impl ThumbnailManager {
                                 PreparedThumbnailKey::from_loaded(target, encoded.local_fingerprint)
                             });
                             self.protocol = Some(encoded.protocol);
+                            self.protocol_render_size = Some(encoded.render_size);
                             self.protocol_decoded_bytes = encoded.decoded_bytes;
                             self.state = ThumbnailState::Ready;
                         }
                         Err(error) => {
                             self.protocol_key = None;
                             self.protocol = None;
+                            self.protocol_render_size = None;
                             self.protocol_decoded_bytes = 0;
                             self.state = ThumbnailState::Failed(error);
                         }
@@ -2069,6 +2121,7 @@ impl ThumbnailManager {
             self.result_receiver = None;
             if self.state == ThumbnailState::Loading {
                 self.protocol = None;
+                self.protocol_render_size = None;
                 self.protocol_decoded_bytes = 0;
                 self.protocol_key = None;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
@@ -2087,6 +2140,17 @@ impl ThumbnailManager {
     /// Returns the encoded image state for a stateful `ratatui-image` widget.
     pub fn protocol_mut(&mut self) -> Option<&mut StatefulProtocol> {
         self.protocol.as_mut()
+    }
+
+    /// Returns the exact terminal-cell size encoded by the thumbnail worker.
+    ///
+    /// Rendering the ready protocol into this size avoids `ratatui-image`
+    /// performing a synchronous resize and encode on the TUI thread. The
+    /// manager's target continues to retain the caller's full available area
+    /// so prepared-image cache identity remains stable.
+    #[must_use]
+    pub const fn render_size(&self) -> Option<Size> {
+        self.protocol_render_size
     }
 
     /// Returns the safe user-facing state of the selected thumbnail.
@@ -2110,6 +2174,7 @@ impl ThumbnailManager {
             self.retain_current_protocol();
             self.target = None;
             self.protocol = None;
+            self.protocol_render_size = None;
             self.protocol_decoded_bytes = 0;
             self.protocol_key = None;
             self.generation = self.generation.wrapping_add(1);
@@ -2122,11 +2187,15 @@ impl ThumbnailManager {
 
     /// Moves the visible encoded image into the bounded recency cache.
     fn retain_current_protocol(&mut self) {
-        let (Some(key), Some(protocol)) = (self.protocol_key.take(), self.protocol.take()) else {
+        let (Some(key), Some(protocol), Some(render_size)) = (
+            self.protocol_key.take(),
+            self.protocol.take(),
+            self.protocol_render_size.take(),
+        ) else {
             return;
         };
         let decoded_bytes = std::mem::take(&mut self.protocol_decoded_bytes);
-        self.cache_prepared_protocol(key, protocol, decoded_bytes);
+        self.cache_prepared_protocol(key, protocol, render_size, decoded_bytes);
     }
 
     /// Inserts one prepared protocol while enforcing count and RAM bounds.
@@ -2134,6 +2203,7 @@ impl ThumbnailManager {
         &mut self,
         key: PreparedThumbnailKey,
         protocol: StatefulProtocol,
+        render_size: Size,
         decoded_bytes: usize,
     ) {
         let mut index = 0;
@@ -2156,6 +2226,7 @@ impl ThumbnailManager {
         self.prepared.push_front(PreparedThumbnail {
             key,
             protocol,
+            render_size,
             decoded_bytes,
         });
         self.prepared_decoded_bytes = self.prepared_decoded_bytes.saturating_add(decoded_bytes);
@@ -2521,6 +2592,7 @@ fn render_worker_request<T: ThumbnailTransport>(
     let (result, deferred_local_frame, deferred_local_preview) = match loaded {
         Ok(LoadedThumbnail {
             protocol,
+            render_size,
             decoded_bytes,
             local_fingerprint,
             deferred_local_frame,
@@ -2528,6 +2600,7 @@ fn render_worker_request<T: ThumbnailTransport>(
         }) => (
             Ok(EncodedThumbnail {
                 protocol,
+                render_size,
                 decoded_bytes,
                 local_fingerprint,
             }),
@@ -2654,6 +2727,7 @@ fn load_thumbnail(
     {
         return result.map(|encoded| LoadedThumbnail {
             protocol: encoded.protocol,
+            render_size: encoded.render_size,
             decoded_bytes: encoded.decoded_bytes,
             local_fingerprint: None,
             deferred_local_frame: None,
@@ -2668,6 +2742,7 @@ fn load_thumbnail(
     }
     encode_thumbnail(picker, target.area, image).map(|encoded| LoadedThumbnail {
         protocol: encoded.protocol,
+        render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: None,
         deferred_local_frame: None,
@@ -2702,6 +2777,7 @@ fn load_local_thumbnail(
             }
             return Ok(LoadedThumbnail {
                 protocol: encoded.protocol,
+                render_size: encoded.render_size,
                 decoded_bytes: encoded.decoded_bytes,
                 local_fingerprint: Some(fingerprint),
                 deferred_local_frame: None,
@@ -2726,6 +2802,7 @@ fn load_local_thumbnail(
     }
     Ok(LoadedThumbnail {
         protocol: encoded.protocol,
+        render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: Some(fingerprint.clone()),
         deferred_local_frame: None,
@@ -2771,6 +2848,7 @@ fn load_local_video_thumbnail(
             }
             return Ok(LoadedThumbnail {
                 protocol: encoded.protocol,
+                render_size: encoded.render_size,
                 decoded_bytes: encoded.decoded_bytes,
                 local_fingerprint: Some(fingerprint),
                 deferred_local_frame: None,
@@ -2839,6 +2917,7 @@ fn load_local_video_thumbnail(
     }
     Ok(LoadedThumbnail {
         protocol: encoded.protocol,
+        render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: Some(fingerprint.clone()),
         deferred_local_frame,
@@ -2920,7 +2999,7 @@ fn load_cached_thumbnail(
     Some(encode_thumbnail(picker, target.area, image))
 }
 
-/// Resizes and encodes a decoded image for one exact terminal-cell area.
+/// Aspect-fits and encodes a decoded image for its exact render area.
 fn encode_thumbnail(
     picker: &Picker,
     area: Rect,
@@ -2932,10 +3011,18 @@ fn encode_thumbnail(
     let image = prefit_thumbnail(image, local_preview_target(picker, area));
     let decoded_bytes = image.as_bytes().len();
     let mut protocol = picker.new_resize_protocol(image);
-    protocol.resize_encode(&Resize::Fit(None), area.into());
+    let render_size = protocol.size_for(Resize::Fit(None), area.into());
+    if render_size.width == 0 || render_size.height == 0 {
+        return Err(ThumbnailFailure::EncodingFailed);
+    }
+    // `StatefulImage` re-encodes synchronously whenever its render rectangle
+    // differs from the protocol's latest encoded size. Preparing the fitted
+    // size here lets the TUI render this protocol without doing image work.
+    protocol.resize_encode(&Resize::Fit(None), render_size);
     match protocol.last_encoding_result() {
         Some(Ok(())) => Ok(EncodedThumbnail {
             protocol,
+            render_size,
             decoded_bytes,
             local_fingerprint: None,
         }),
@@ -3476,6 +3563,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tty_image_preference_disables_only_confirmed_linux_console_artwork() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let console = TerminalInfo {
+            term: Some("linux".to_owned()),
+            kitty_window: false,
+            output_device: Some(PathBuf::from("/dev/tty2")),
+            font_size: None,
+            ..graphical_terminal()
+        };
+        let mut disabled = ThumbnailManager::from_terminal_info_with_cache(
+            ThumbnailMode::Auto,
+            &console,
+            Some(cache_directory.clone()),
+            false,
+        );
+        let source = Url::parse("https://images.example/unused.png").expect("fixture URL");
+
+        assert_eq!(disabled.capability(), ThumbnailCapability::Disabled);
+        assert_eq!(disabled.state(), &ThumbnailState::Disabled);
+        assert!(!disabled.is_enabled());
+        assert!(!disabled.synchronize(Some(&source), Rect::new(0, 0, 20, 8)));
+        assert!(!disabled.synchronize_prefetch(std::slice::from_ref(&source)));
+        assert!(
+            !cache_directory.exists(),
+            "disabled physical-TTY artwork must not initialize its cache"
+        );
+
+        let graphical = ThumbnailManager::from_terminal_info_with_cache(
+            ThumbnailMode::Auto,
+            &graphical_terminal(),
+            None,
+            false,
+        );
+        assert_eq!(
+            graphical.capability(),
+            ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
+            "the physical-TTY preference must not disable graphical terminals"
+        );
+    }
+
+    #[test]
     fn supported_manager_defers_its_worker_until_artwork_is_visible() {
         let manager =
             ThumbnailManager::from_terminal_info(ThumbnailMode::Auto, &graphical_terminal());
@@ -3501,6 +3630,7 @@ pub(crate) mod tests {
             ThumbnailMode::Auto,
             &terminal,
             Some(cache_directory.clone()),
+            true,
         );
         let source = Url::parse("https://images.example/unused.png").expect("fixture URL");
 
@@ -4138,6 +4268,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn worker_encodes_the_exact_fitted_area_used_for_ready_rendering() {
+        let picker = picker_for_protocol(ThumbnailProtocol::Halfblocks, FALLBACK_FONT_SIZE);
+        let requested_area = Rect::new(4, 5, 60, 24);
+        let mut encoded =
+            encode_thumbnail(&picker, requested_area, DynamicImage::new_rgb8(1_600, 900))
+                .expect("encode wide artwork fixture");
+
+        assert_eq!(encoded.render_size, Size::new(60, 17));
+        assert_eq!(
+            encoded
+                .protocol
+                .needs_resize(&Resize::Fit(None), encoded.render_size),
+            None,
+            "the worker result must already match the StatefulImage render area"
+        );
+
+        let render_area = Rect::new(
+            requested_area.x,
+            requested_area.y,
+            encoded.render_size.width,
+            encoded.render_size.height,
+        );
+        let mut buffer = ratatui::buffer::Buffer::empty(requested_area);
+        encoded
+            .protocol
+            .resize_encode_render(&Resize::Fit(None), render_area, &mut buffer);
+        assert!(
+            encoded.protocol.last_encoding_result().is_none(),
+            "rendering the worker-prepared area must not synchronously resize and encode"
+        );
+    }
+
+    #[test]
+    fn manager_keeps_requested_area_as_identity_and_exposes_worker_render_size() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let source = Url::parse("https://images.example/fitted-worker.png").expect("thumbnail URL");
+        let requested_area = Rect::new(7, 9, 60, 24);
+
+        assert!(manager.synchronize(Some(&source), requested_area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible request"),
+            source
+        );
+        replies
+            .send(Ok(fixture_thumbnail_png()))
+            .expect("landscape fixture response");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+
+        assert_eq!(
+            manager.target.as_ref().map(|target| target.area),
+            Some(requested_area),
+            "prepared-cache identity must retain the caller's requested area"
+        );
+        assert_eq!(
+            manager.render_size(),
+            Some(Size::new(32, 9)),
+            "the small source remains natural-size while fitting inside the target"
+        );
+    }
+
+    #[test]
     fn stale_worker_results_cannot_replace_the_current_selection() {
         let (request_sender, request_receiver) = bounded(1);
         let request_discarder = request_receiver.clone();
@@ -4149,6 +4342,7 @@ pub(crate) mod tests {
             current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
+            protocol_render_size: None,
             protocol_decoded_bytes: 0,
             protocol_key: None,
             prepared: VecDeque::new(),
@@ -4470,6 +4664,7 @@ pub(crate) mod tests {
             ThumbnailMode::Off,
             &graphical_terminal(),
             Some(cache_directory.clone()),
+            true,
         );
         assert!(!disabled.synchronize_prefetch(std::slice::from_ref(&source)));
         assert!(!cache_directory.exists());
@@ -4619,6 +4814,7 @@ pub(crate) mod tests {
                 .expect("release cold artwork request");
             assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         }
+        let expected_render_size = manager.render_size().expect("prepared render size");
 
         assert!(manager.synchronize(Some(&first), area));
         assert_eq!(
@@ -4627,6 +4823,11 @@ pub(crate) mod tests {
             "a revisited channel must not expose a loading frame"
         );
         assert!(manager.protocol().is_some());
+        assert_eq!(
+            manager.render_size(),
+            Some(expected_render_size),
+            "the prepared cache must restore the worker's exact encoded size"
+        );
         assert!(
             matches!(observed.try_recv(), Err(TryRecvError::Empty)),
             "encoded in-memory artwork must bypass the worker and transport"
@@ -4715,8 +4916,8 @@ pub(crate) mod tests {
         };
         let more_than_half = PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES / 2 + 1;
 
-        manager.cache_prepared_protocol(first.clone(), protocol(), more_than_half);
-        manager.cache_prepared_protocol(second.clone(), protocol(), more_than_half);
+        manager.cache_prepared_protocol(first.clone(), protocol(), area.into(), more_than_half);
+        manager.cache_prepared_protocol(second.clone(), protocol(), area.into(), more_than_half);
 
         assert_eq!(manager.prepared.len(), 1);
         assert_eq!(
@@ -4728,6 +4929,7 @@ pub(crate) mod tests {
         manager.cache_prepared_protocol(
             oversized.clone(),
             protocol(),
+            area.into(),
             PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES + 1,
         );
 
@@ -4861,6 +5063,7 @@ pub(crate) mod tests {
             current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
+            protocol_render_size: None,
             protocol_decoded_bytes: 0,
             protocol_key: None,
             prepared: VecDeque::new(),
@@ -5166,6 +5369,7 @@ pub(crate) mod tests {
                 area: Rect::new(0, 0, 20, 8),
             }),
             protocol: None,
+            protocol_render_size: None,
             protocol_decoded_bytes: 0,
             protocol_key: None,
             prepared: VecDeque::new(),
@@ -5549,6 +5753,23 @@ pub(crate) mod tests {
         manager_with_mock_transport_in_cache(None)
     }
 
+    /// Builds an idle half-block manager without consulting the host terminal.
+    pub(crate) fn halfblock_manager_for_tui(cache_directory: Option<PathBuf>) -> ThumbnailManager {
+        let terminal = TerminalInfo {
+            term: Some("linux".to_owned()),
+            kitty_window: false,
+            output_device: Some(PathBuf::from("/dev/tty2")),
+            font_size: None,
+            ..graphical_terminal()
+        };
+        ThumbnailManager::from_terminal_info_with_cache(
+            ThumbnailMode::Auto,
+            &terminal,
+            cache_directory,
+            true,
+        )
+    }
+
     fn manager_with_mock_transport_in_cache(cache_directory: Option<PathBuf>) -> MockManagerParts {
         manager_with_mock_transport_and_cache(cache_directory, Duration::ZERO)
     }
@@ -5585,6 +5806,7 @@ pub(crate) mod tests {
                 current_generation: Arc::new(AtomicU64::new(0)),
                 target: None,
                 protocol: None,
+                protocol_render_size: None,
                 protocol_decoded_bytes: 0,
                 protocol_key: None,
                 prepared: VecDeque::new(),
@@ -5642,6 +5864,7 @@ pub(crate) mod tests {
                 current_generation,
                 target: None,
                 protocol: None,
+                protocol_render_size: None,
                 protocol_decoded_bytes: 0,
                 protocol_key: None,
                 prepared: VecDeque::new(),
@@ -5713,6 +5936,7 @@ pub(crate) mod tests {
             ThumbnailMode::Auto,
             &graphical_terminal(),
             Some(cache_directory),
+            true,
         )
     }
 

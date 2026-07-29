@@ -717,9 +717,11 @@ context-sensitive help layer.
 On a real Linux `/dev/ttyN`, the optional `gpm` feature registers both standard
 input and `/dev/gpmctl` with one readiness poll. Native-endian GPM packets are
 decoded in safe Rust and converted into the same mouse-event path as terminal
-emulator reporting. PTYs never open GPM. Socket absence or disconnect is a
-silent capability loss, and the `F8` keyboard pointer continues to drive the
-rendered hit map without a daemon.
+emulator reporting. The client does not link `libgpm`, but physical input
+requires an installed and running GPM daemon. PTYs never open GPM. Socket
+absence or disconnect is a silent capability loss, and the `F8` pointer
+continues to drive the rendered hit map from the keyboard without a daemon;
+when GPM is available, physical motion moves that same visible square.
 
 Waveform rendering is a separate library-shaped module (**roadmap**). It
 produces a resolution-independent peak envelope cached by media fingerprint,

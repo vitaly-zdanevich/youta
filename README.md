@@ -750,16 +750,17 @@ the prepared result.
 
 A directly attached Linux virtual console (`TERM=linux`, with output resolved
 to `/dev/ttyN`) uses Unicode half-block cells as a conservative artwork
-fallback. This does not access `/dev/fb0` or draw outside the terminal; image
-quality is limited by the console font and palette. Serial terminals, SSH,
-`TERM=dumb`, a Linux-looking PTY, and terminals without a supported graphics
-protocol remain text-only and perform no thumbnail network work. Accepted
-remote images are limited to bounded JPEG, PNG, and WebP input before decoding,
-which prevents unbounded downloads and image allocations. Remote image fetches
-reject non-public literal and DNS-resolved addresses, `.local`, `.internal`,
-and single-label hosts; redirects are not followed. These gates avoid stray
-escape sequences and reduce network traffic, decoding work, memory use, heat,
-and battery consumption.
+fallback by default. The focused Preferences editor can disable this fallback
+without changing image support in graphical terminals. This does not access
+`/dev/fb0` or draw outside the terminal; image quality is limited by the
+console font and palette. Serial terminals, SSH, `TERM=dumb`, a Linux-looking
+PTY, and terminals without a supported graphics protocol remain text-only and
+perform no thumbnail network work. Accepted remote images are limited to
+bounded JPEG, PNG, and WebP input before decoding, which prevents unbounded
+downloads and image allocations. Remote image fetches reject non-public literal
+and DNS-resolved addresses, `.local`, `.internal`, and single-label hosts;
+redirects are not followed. These gates avoid stray escape sequences and reduce
+network traffic, decoding work, memory use, heat, and battery consumption.
 
 On that confirmed physical console, Youta also hides external-opener controls
 and ignores their hotkeys because no graphical session is attached. URLs remain
@@ -772,20 +773,24 @@ Configure the runtime policy in `~/.config/youta/config.toml`:
 ```toml
 [ui]
 thumbnails = 'auto' # auto, off, or on
+show_images_in_tty = true # physical Linux TTY half-block artwork
 thumbnail_height = 20 # maximum terminal rows; minimum 4
 prefetch_search_thumbnails = true
 ```
 
 `auto` uses conservative protocol detection, `off` disables thumbnail requests
 and rendering, and `on` attempts supported terminal artwork but still falls
-back without fetching when no supported protocol is available. Thumbnail
-height defaults to 20 rows and is reduced automatically when the Details panel
-needs space for metadata, links, or description text. YouTube video thumbnails
-instead expand to the full Details-pane width at their 16:9 aspect ratio when
-the description occupies fewer than 15 wrapped rows or the terminal window
-itself is at least 1080 pixels tall. Youta reads the attached terminal window's
-pixel dimensions, so a small window on a 1080p monitor does not trigger the
-height-based layout.
+back without fetching when no supported protocol is available.
+`show_images_in_tty = false` disables only the physical Linux-console
+half-block fallback; Kitty, iTerm2, and Sixel images remain governed by
+`thumbnails`. Its environment override is
+`YOUTA_UI__SHOW_IMAGES_IN_TTY=false`. Thumbnail height defaults to 20 rows and
+is reduced automatically when the Details panel needs space for metadata,
+links, or description text. YouTube video thumbnails instead expand to the
+full Details-pane width at their 16:9 aspect ratio when the description
+occupies fewer than 15 wrapped rows or the terminal window itself is at least
+1080 pixels tall. Youta reads the attached terminal window's pixel dimensions,
+so a small window on a 1080p monitor does not trigger the height-based layout.
 `prefetch_search_thumbnails = false` disables background warming for global
 YouTube and YouTube Music search results; the equivalent environment override
 is `YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Previously learned channel
@@ -807,15 +812,19 @@ directly to `/dev/ttyN`, it opportunistically connects to an already-running
 `/dev/gpmctl`. Move, press, release, drag, and wheel packets use the same
 hitboxes and actions as Crossterm mouse events. The client is safe Rust, waits
 for descriptor readiness instead of polling in a loop, and does not link
-`libgpm`; therefore enabling it adds no mandatory system library or daemon
-dependency. A missing or inaccessible socket falls back silently to keyboard
-input.
+`libgpm`; therefore enabling it adds no link-time system-library dependency.
+Physical mouse input still requires the GPM daemon to be installed and
+running. On Gentoo/OpenRC, start it with `rc-service gpm start` and enable it
+across restarts with `rc-update add gpm default`. A missing or inaccessible
+socket falls back silently to keyboard input.
 
 Youta does not open GPM from `/dev/pts/*`, so terminal emulators retain their
 normal mouse-capture behavior. `F8` provides a keyboard pointer on every
 terminal: arrow keys move its reversed cell cursor, `Enter` clicks the current
-cell, and `Esc` or `F8` exits. This remains available when GPM is not installed
-or not running. Minimal builds can omit the Linux-console client with
+cell, and `Esc` or `F8` exits. On a virtual console with GPM running, the
+physical mouse moves this same square while it is visible. Keyboard movement
+remains available when GPM is not installed or not running. Minimal builds can
+omit the Linux-console client with
 `--no-default-features` or by leaving `gpm` out of their feature list. See the
 [GPM protocol definitions](https://sources.debian.org/src/gpm/1.20.7-12/src/headers/gpm.h/)
 for the control-socket contract.

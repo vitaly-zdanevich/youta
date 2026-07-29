@@ -72,8 +72,13 @@ subscriptions_layout = 'drill-down'
 theme = 'auto'
 
 # One of: `auto`, `off`, or `on`. Runtime capability checks still suppress
-# graphics on a real TTY or when no supported image protocol is detected.
+# graphics when no supported image protocol is detected.
 thumbnails = 'auto'
+
+# Render ANSI-16 Unicode half-block artwork on a confirmed physical Linux
+# `/dev/ttyN`. This does not affect Kitty, iTerm2, or Sixel rendering in
+# graphical terminals. YOUTA_UI__SHOW_IMAGES_IN_TTY=false has higher precedence.
+show_images_in_tty = true
 
 # Maximum artwork height in terminal rows. Youta reduces it when the Details
 # panel is shorter so metadata, links, and description text retain space.

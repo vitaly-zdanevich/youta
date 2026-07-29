@@ -36,7 +36,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
-    SubscriptionsLayout, YOUTUBE_PREWARM_ENV, YouTubeBackend, YouTubeProviderSetting,
+    SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV, YouTubeBackend,
+    YouTubeProviderSetting,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 #[cfg(feature = "radio")]
@@ -2933,6 +2934,7 @@ impl AppController {
         view.skip_advertisement_chapters = config.playback.skip_advertisement_chapters;
         view.autoplay = config.playback.autoplay;
         view.local_folder_sizes_enabled = config.ui.show_local_folder_sizes;
+        view.show_images_in_tty = config.ui.show_images_in_tty;
         view.status_line = if youtube_provider_available {
             "Default search: YouTube videos only".to_owned()
         } else {
@@ -16685,9 +16687,11 @@ impl AppController {
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
+            TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
         ]
         .into_iter()
+        .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
         .filter(|variable| std::env::var_os(variable).is_some())
         .collect::<Vec<_>>()
         .join(", ");
@@ -16696,6 +16700,7 @@ impl AppController {
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
             youtube_prewarm: self.config.playback.youtube_prewarm,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
+            show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
@@ -16790,6 +16795,25 @@ impl AppController {
         preferences.show_local_folder_sizes = !preferences.show_local_folder_sizes;
         preferences.validation_error = None;
     }
+
+    /// Toggles the draft physical-TTY artwork preference.
+    #[cfg(feature = "images")]
+    fn toggle_draft_tty_images(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.show_images_in_tty = !preferences.show_images_in_tty;
+        preferences.validation_error = None;
+    }
+
+    /// Ignores image-only actions in text-only builds.
+    #[cfg(not(feature = "images"))]
+    fn toggle_draft_tty_images(&mut self) {}
 
     /// Advances the closed Bandcamp format set without accepting raw selectors.
     fn cycle_draft_bandcamp_audio_format(&mut self) {
@@ -16901,6 +16925,10 @@ impl AppController {
         let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
         let youtube_prewarm = preferences.youtube_prewarm;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
+        #[cfg(feature = "images")]
+        let show_images_in_tty = preferences.show_images_in_tty;
+        #[cfg(not(feature = "images"))]
+        let show_images_in_tty = self.config.ui.show_images_in_tty;
         let bandcamp_audio_format = preferences.bandcamp_audio_format;
         #[cfg(feature = "yt-dlp")]
         let youtube_prewarm_preference_changed =
@@ -16912,6 +16940,7 @@ impl AppController {
             skip_advertisement_chapters,
             youtube_prewarm,
             show_local_folder_sizes,
+            show_images_in_tty,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
@@ -16956,12 +16985,13 @@ impl AppController {
             }
             self.schedule_local_folder_sizes();
         }
+        self.view.show_images_in_tty = show_images_in_tty;
         self.view.preferences_popup = None;
         if self.view.screen == Screen::Subscriptions {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; Bandcamp audio {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; TTY images {}; Bandcamp audio {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
@@ -16969,6 +16999,11 @@ impl AppController {
                 "off"
             },
             if youtube_prewarm { "on" } else { "off" },
+            if cfg!(feature = "images") {
+                if show_images_in_tty { "on" } else { "off" }
+            } else {
+                "unavailable in this build"
+            },
             bandcamp_audio_format.label()
         );
     }
@@ -16995,7 +17030,8 @@ impl AppController {
             self.view.details_focused = true;
             self.view.right_panel_mode = RightPanelMode::Details;
             self.view.status_line =
-                "Details focused; use PageUp/PageDown or the mouse wheel to scroll".to_owned();
+                "Details focused; use Alt+Up/Down, PageUp/PageDown, or the mouse wheel to scroll"
+                    .to_owned();
         }
     }
 
@@ -17337,6 +17373,7 @@ impl UiController for AppController {
             }
             UiAction::SetExternalOpenerAvailable(available) => {
                 self.view.external_opener_available = available;
+                self.view.physical_linux_console = !available;
             }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
             UiAction::ShowScreen(screen) => self.show_screen(screen),
@@ -17787,6 +17824,7 @@ impl UiController for AppController {
             }
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
             UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
+            UiAction::ToggleTtyImages => self.toggle_draft_tty_images(),
             UiAction::CycleBandcampAudioFormat => {
                 self.cycle_draft_bandcamp_audio_format();
             }
@@ -29147,6 +29185,16 @@ mod tests {
         controller.dispatch(UiAction::ToggleYouTubePrewarm);
         controller.view.local_size_sort = LocalSizeSort::Ascending;
         controller.dispatch(UiAction::ToggleLocalFolderSizes);
+        controller.dispatch(UiAction::ToggleTtyImages);
+        #[cfg(not(feature = "images"))]
+        {
+            controller
+                .view
+                .preferences_popup
+                .as_mut()
+                .expect("preferences popup")
+                .show_images_in_tty = false;
+        }
         #[cfg(feature = "bandcamp")]
         controller.dispatch(UiAction::CycleBandcampAudioFormat);
         controller.dispatch(UiAction::SubmitPreferences);
@@ -29157,12 +29205,23 @@ mod tests {
             SubscriptionsLayout::Split
         );
         assert!(!controller.view.local_folder_sizes_enabled);
+        #[cfg(feature = "images")]
+        assert!(!controller.view.show_images_in_tty);
+        #[cfg(not(feature = "images"))]
+        assert!(
+            controller.view.show_images_in_tty,
+            "text-only builds must ignore even a forged image-preference draft"
+        );
         assert_eq!(controller.view.local_size_sort, LocalSizeSort::Off);
         let contents =
             std::fs::read_to_string(config.config_file()).expect("saved preferences file");
         assert!(contents.contains("[ui]"));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        #[cfg(feature = "images")]
+        assert!(contents.contains("show_images_in_tty = false"));
+        #[cfg(not(feature = "images"))]
+        assert!(!contents.contains("show_images_in_tty"));
         assert!(contents.contains("[playback]"));
         assert!(contents.contains("youtube_prewarm = false"));
         #[cfg(feature = "bandcamp")]
@@ -29171,6 +29230,10 @@ mod tests {
             Config::load_from_dir(config.config_dir()).expect("reload saved preferences");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        #[cfg(feature = "images")]
+        assert!(!reloaded.ui.show_images_in_tty);
+        #[cfg(not(feature = "images"))]
+        assert!(reloaded.ui.show_images_in_tty);
         assert!(!reloaded.playback.youtube_prewarm);
         #[cfg(feature = "bandcamp")]
         assert_eq!(
@@ -34299,6 +34362,7 @@ mod tests {
         });
         controller.show_diagnostic_report("Playback failed", "complete report");
         controller.dispatch(UiAction::SetExternalOpenerAvailable(false));
+        assert!(controller.view.physical_linux_console);
 
         controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
         assert!(
