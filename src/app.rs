@@ -1604,6 +1604,9 @@ const DOWNLOAD_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const DOWNLOAD_LINE_BYTES: usize = 8 * 1024;
 #[cfg(feature = "yt-dlp")]
 const DOWNLOAD_COMPLETED_PATHS: usize = 4;
+/// How long a successful download path remains visible after completion.
+#[cfg(feature = "yt-dlp")]
+const DOWNLOAD_COMPLETION_NOTICE_DURATION: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "yt-dlp")]
 #[derive(Clone, Debug)]
@@ -2749,6 +2752,9 @@ pub struct AppController {
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
     active_download: Option<ActiveDownload>,
+    /// Deadline for removing only a successful completed-path notice.
+    #[cfg(feature = "yt-dlp")]
+    download_completion_notice_deadline: Option<Instant>,
     report_actions: Box<dyn DiagnosticActionHandler>,
     diagnostic_helpers_cache: Option<Vec<ExternalHelper>>,
     /// URL-free completions from detached system-opener tasks.
@@ -3339,6 +3345,8 @@ impl AppController {
             download_launcher,
             #[cfg(feature = "yt-dlp")]
             active_download: None,
+            #[cfg(feature = "yt-dlp")]
+            download_completion_notice_deadline: None,
             report_actions: Box::new(SystemReportActions::new()),
             diagnostic_helpers_cache: None,
             url_open_results,
@@ -9987,6 +9995,10 @@ impl AppController {
                 "One download is already running; wait for it to finish".to_owned();
             return;
         }
+        clear_download_completion_notice(
+            &mut self.view,
+            &mut self.download_completion_notice_deadline,
+        );
         let item = match self.selected_queue_item() {
             Ok(item) => item,
             Err(error) => {
@@ -10054,8 +10066,14 @@ impl AppController {
             "Download support was disabled when this Youta binary was built".to_owned();
     }
 
+    /// Polls one active download and expires a completed-path notice at `now`.
     #[cfg(feature = "yt-dlp")]
-    fn poll_download(&mut self) {
+    fn poll_download_at(&mut self, now: Instant) {
+        expire_download_completion_notice(
+            &mut self.view,
+            &mut self.download_completion_notice_deadline,
+            now,
+        );
         let Some(active) = self.active_download.as_mut() else {
             return;
         };
@@ -10170,6 +10188,7 @@ impl AppController {
             active: false,
             completed_path: Some(completed_path.display().to_string()),
         });
+        self.download_completion_notice_deadline = Some(now + DOWNLOAD_COMPLETION_NOTICE_DURATION);
         if self.view.screen == Screen::Downloaded {
             self.populate_downloads();
             self.refresh_selected_playlist_state();
@@ -18129,7 +18148,7 @@ impl UiController for AppController {
             self.request_due_youtube_prewarm(now);
         }
         #[cfg(feature = "yt-dlp")]
-        self.poll_download();
+        self.poll_download_at(Instant::now());
         self.update_player();
         #[cfg(feature = "yt-dlp")]
         self.update_youtube_prewarm_for_imminent_next(Instant::now());
@@ -21766,6 +21785,35 @@ fn validate_completed_download_path(
         ));
     }
     Ok(candidate)
+}
+
+#[cfg(feature = "yt-dlp")]
+/// Clears a scheduled success notice without removing active or failed state.
+fn clear_download_completion_notice(view: &mut ViewModel, deadline: &mut Option<Instant>) {
+    *deadline = None;
+    if view
+        .download
+        .as_ref()
+        .is_some_and(|download| !download.active && download.completed_path.is_some())
+    {
+        view.download = None;
+    }
+}
+
+#[cfg(feature = "yt-dlp")]
+/// Removes a successful completed-path notice at or after its exact deadline.
+fn expire_download_completion_notice(
+    view: &mut ViewModel,
+    deadline: &mut Option<Instant>,
+    now: Instant,
+) {
+    let Some(expires_at) = *deadline else {
+        return;
+    };
+    if now < expires_at {
+        return;
+    }
+    clear_download_completion_notice(view, deadline);
 }
 
 #[cfg(feature = "yt-dlp")]
@@ -35318,8 +35366,13 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let (mut controller, requests, _) = controller_with_mock_download(config.clone(), process);
+        controller.download_completion_notice_deadline = Some(Instant::now());
 
         controller.dispatch(UiAction::Download);
+        assert!(
+            controller.download_completion_notice_deadline.is_none(),
+            "starting another download must cancel an old completion deadline"
+        );
         assert!(
             controller
                 .view
@@ -35345,7 +35398,8 @@ mod tests {
         );
 
         controller.dispatch(UiAction::ShowScreen(Screen::Downloaded));
-        controller.tick();
+        let completed_at = Instant::now();
+        controller.poll_download_at(completed_at);
 
         let download = controller
             .view
@@ -35367,6 +35421,20 @@ mod tests {
                 .iter()
                 .any(|row| row.title == "fixture [dQw4w9WgXcQ].opus")
         );
+        let deadline = completed_at + DOWNLOAD_COMPLETION_NOTICE_DURATION;
+        assert_eq!(
+            controller.download_completion_notice_deadline,
+            Some(deadline)
+        );
+        controller.poll_download_at(
+            deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("completion deadline has a preceding instant"),
+        );
+        assert!(controller.view.download.is_some());
+        controller.poll_download_at(deadline);
+        assert!(controller.view.download.is_none());
+        assert!(controller.download_completion_notice_deadline.is_none());
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -35388,6 +35456,18 @@ mod tests {
 
         assert_eq!(requests.lock().expect("download requests").len(), 1);
         assert!(controller.view.status_line.contains("already running"));
+        let stale_deadline = Instant::now();
+        controller.download_completion_notice_deadline = Some(stale_deadline);
+        controller.poll_download_at(stale_deadline);
+        assert!(
+            controller
+                .view
+                .download
+                .as_ref()
+                .is_some_and(|download| download.active),
+            "an expired completion deadline must not clear active progress"
+        );
+        assert!(controller.download_completion_notice_deadline.is_none());
         controller.shutdown();
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(controller.active_download.is_none());
@@ -35461,6 +35541,20 @@ mod tests {
                 .as_ref()
                 .is_some_and(|download| !download.active)
         );
+        let failed_download = controller.view.download.clone();
+        let error_popup = controller.view.error_popup.clone();
+        let stale_deadline = Instant::now();
+        controller.download_completion_notice_deadline = Some(stale_deadline);
+        controller.poll_download_at(stale_deadline);
+        assert_eq!(
+            controller.view.download, failed_download,
+            "an expired completion deadline must not clear failed state"
+        );
+        assert_eq!(
+            controller.view.error_popup, error_popup,
+            "download errors must remain until explicitly dismissed"
+        );
+        assert!(controller.download_completion_notice_deadline.is_none());
     }
 
     #[cfg(feature = "yt-dlp")]
