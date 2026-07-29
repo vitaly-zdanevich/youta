@@ -5047,8 +5047,7 @@ fn render_information_panel(
         let text_reserve = if details.thumbnail_expanded {
             0
         } else {
-            u16::from(!details.description.is_empty())
-                + u16::from(!details.links.is_empty()).saturating_mul(2)
+            u16::from(!details.description.is_empty()) + u16::from(!details.links.is_empty())
         };
         let preferred_thumbnail_height = if details.source == "Local image" {
             thumbnail_height.saturating_mul(2)
@@ -5104,23 +5103,11 @@ fn render_information_panel(
         } else {
             remaining_height.min(1)
         };
-        let desired_link_height = u16::try_from(details.links.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(1);
+        let desired_link_height = u16::try_from(details.links.len()).unwrap_or(u16::MAX);
         let link_height =
             desired_link_height.min(remaining_height.saturating_sub(description_reserve));
-        if link_height > 1 {
-            let heading_area = Rect::new(inner.x, cursor_y, inner.width, 1);
-            frame.render_widget(
-                Paragraph::new("External links").style(theme.heading),
-                heading_area,
-            );
-            if show_text_selection {
-                capture_selectable_details_row(frame, hit_map, heading_area);
-            }
-            cursor_y = cursor_y.saturating_add(1);
-
-            let visible_links = usize::from(link_height.saturating_sub(1));
+        if link_height > 0 {
+            let visible_links = usize::from(link_height);
             let selected_link = view
                 .selected_detail_link
                 .unwrap_or_default()
@@ -5136,14 +5123,8 @@ fn render_information_panel(
                 .take(visible_links)
             {
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
-                let selected =
-                    view.external_opener_available && view.selected_detail_link == Some(index);
-                let marker = if selected { "› " } else { "  " };
-                let mut clickable_width = terminal_text_width(marker);
-                let mut spans = vec![Span::styled(
-                    marker,
-                    if selected { theme.accent } else { theme.base },
-                )];
+                let mut clickable_width = 0_u16;
+                let mut spans = Vec::new();
                 if let Some(item_id) = link.wikidata_item_id.as_deref() {
                     let expanded = details.expanded_wikidata_item.as_deref() == Some(item_id);
                     let disclosure = button("W", if expanded { "▾" } else { "▸" }, show_hotkeys);
@@ -5159,7 +5140,7 @@ fn render_information_panel(
                         hit_map.detail_buttons.push((
                             UiAction::ToggleWikidataStatements(index),
                             Rect::new(
-                                link_area.x.saturating_add(terminal_text_width(marker)),
+                                link_area.x,
                                 link_area.y,
                                 disclosure_width.min(link_area.width),
                                 1,
@@ -5168,14 +5149,7 @@ fn render_information_panel(
                     }
                 }
                 spans.extend([
-                    Span::styled(
-                        &link.label,
-                        if selected {
-                            theme.base.add_modifier(Modifier::BOLD)
-                        } else {
-                            theme.base
-                        },
-                    ),
+                    Span::styled(&link.label, theme.base),
                     Span::styled(" — ", theme.muted),
                     Span::styled(&link.url, theme.muted),
                 ]);
@@ -19986,7 +19960,8 @@ prose 07:25 remains clickable but is not a chapter";
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(rendered.contains("External links"));
+        assert!(!rendered.contains("External links"));
+        assert!(!rendered.contains('›'));
         assert!(rendered.contains("Douglas Adams (Q42)"));
         assert!(rendered.contains("[W] ▸"));
         assert!(!rendered.contains('🧾'));
@@ -19998,6 +19973,16 @@ prose 07:25 remains clickable but is not a chapter";
             .iter()
             .find(|(action, _)| action == &UiAction::ToggleWikidataStatements(0))
             .expect("Wikidata disclosure hit target");
+        let (_, link_area) = hit_map.detail_links[0];
+        assert_eq!(
+            disclosure_area.x, link_area.x,
+            "removing the selection marker must also reclaim its hitbox columns"
+        );
+        let label_cell = &terminal.backend().buffer()
+            [(disclosure_area.right().saturating_add(1), disclosure_area.y)];
+        assert_eq!(label_cell.symbol(), "D");
+        assert_eq!(label_cell.fg, Color::Reset);
+        assert!(!label_cell.modifier.contains(Modifier::BOLD));
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -20060,7 +20045,7 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn external_link_mouse_target_excludes_heading_and_trailing_blank_cells() {
+    fn external_link_mouse_target_excludes_surrounding_blank_cells() {
         let backend = TestBackend::new(160, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
@@ -20082,6 +20067,11 @@ prose 07:25 remains clickable but is not a chapter";
 
         let (_, link_area) = hit_map.detail_links[0];
         assert_eq!(link_area.height, 1);
+        assert_eq!(
+            link_area.width,
+            terminal_text_width("Home — https://example.org/"),
+            "the removed marker must not leave invisible clickable columns"
+        );
         assert!(
             link_area.right() < hit_map.details_panel.right(),
             "a short link must not make blank trailing panel cells clickable"
@@ -20107,7 +20097,7 @@ prose 07:25 remains clickable but is not a chapter";
                 &view
             ),
             Some(UiAction::SetDetailsFocus(true)),
-            "the External links heading must not select the first link"
+            "the row before a link must not select it"
         );
         assert_eq!(
             mouse_action(
