@@ -1717,6 +1717,45 @@ pub const STATIONS: &[RadioStationPreset] = &[
         now_playing: None,
     },
     RadioStationPreset {
+        id: "rainwave-all",
+        name: "Rainwave — All",
+        homepage: "https://rainwave.cc/all/",
+        stream: "https://relay.rainwave.cc/all.mp3",
+        summary: "Video-game music, remixes, and covers.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(112),
+        sample_rate_hz: Some(32_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "rainwave-chill",
+        name: "Rainwave — Chill",
+        homepage: "https://rainwave.cc/chill/",
+        stream: "https://relay.rainwave.cc/chill.mp3",
+        summary: "Downtempo and ambient video-game music, remixes, and covers.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(112),
+        sample_rate_hz: Some(32_000),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "rpgn-game-music-radio",
+        name: "RPGN Game Music Radio",
+        homepage: "https://www.rpgamers.net/radio/",
+        stream: "https://listen.rpgamers.net/rpgn",
+        summary: "Listener-requested video-game music from 8-bit systems through current releases.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(22_050),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
         id: "animeradio-de",
         name: "AnimeRadio.de",
         homepage: "https://www.animeradio.de/",
@@ -1752,6 +1791,45 @@ pub const STATIONS: &[RadioStationPreset] = &[
         bitrate_kbps: None,
         sample_rate_hz: Some(48_000),
         channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "audiobook-radio",
+        name: "AudioBookRadio",
+        homepage: "https://audiobookradio.net/",
+        stream: "https://audiobookradio.out.airtime.pro/audiobookradio_a",
+        summary: "Spoken-word radio with audiobooks, poetry, short stories, plays, and classic radio drama.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(64),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relic-radio-on-the-air",
+        name: "Relic Radio On The Air",
+        homepage: "https://www.relicradio.com/otr/stream/",
+        stream: "http://s8.voscast.com:7372/",
+        summary: "Radio drama from the golden age of radio.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(48),
+        sample_rate_hz: Some(22_050),
+        channels: Some(1),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "mystery-play-internet-radio",
+        name: "Mystery Play Internet Radio",
+        homepage: "https://mpir-otr.com/",
+        stream: "http://s4.voscast.com:7080/stream.mp3",
+        summary: "Old-time mystery and radio-play programming.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(24),
+        sample_rate_hz: Some(22_050),
+        channels: Some(1),
         stream_kind: RadioStreamKind::Direct,
         now_playing: None,
     },
@@ -3132,6 +3210,89 @@ mod tests {
             assert_eq!(station.sample_rate_hz, Some(44_100));
             assert_eq!(station.channels, Some(2));
             assert_eq!(station.stream_kind, stream_kind);
+            assert_eq!(station.now_playing, None);
+        }
+    }
+
+    #[test]
+    fn requested_game_spoken_word_and_radio_drama_presets_keep_verified_metadata() {
+        let expected = [
+            (
+                "rainwave-all",
+                "Rainwave — All",
+                "https://rainwave.cc/all/",
+                "https://relay.rainwave.cc/all.mp3",
+                "Video-game music, remixes, and covers.",
+                112,
+                32_000,
+                2,
+            ),
+            (
+                "rainwave-chill",
+                "Rainwave — Chill",
+                "https://rainwave.cc/chill/",
+                "https://relay.rainwave.cc/chill.mp3",
+                "Downtempo and ambient video-game music, remixes, and covers.",
+                112,
+                32_000,
+                2,
+            ),
+            (
+                "rpgn-game-music-radio",
+                "RPGN Game Music Radio",
+                "https://www.rpgamers.net/radio/",
+                "https://listen.rpgamers.net/rpgn",
+                "Listener-requested video-game music from 8-bit systems through current releases.",
+                64,
+                22_050,
+                2,
+            ),
+            (
+                "audiobook-radio",
+                "AudioBookRadio",
+                "https://audiobookradio.net/",
+                "https://audiobookradio.out.airtime.pro/audiobookradio_a",
+                "Spoken-word radio with audiobooks, poetry, short stories, plays, and classic radio drama.",
+                64,
+                44_100,
+                2,
+            ),
+            (
+                "relic-radio-on-the-air",
+                "Relic Radio On The Air",
+                "https://www.relicradio.com/otr/stream/",
+                "http://s8.voscast.com:7372/",
+                "Radio drama from the golden age of radio.",
+                48,
+                22_050,
+                1,
+            ),
+            (
+                "mystery-play-internet-radio",
+                "Mystery Play Internet Radio",
+                "https://mpir-otr.com/",
+                "http://s4.voscast.com:7080/stream.mp3",
+                "Old-time mystery and radio-play programming.",
+                24,
+                22_050,
+                1,
+            ),
+        ];
+
+        for (id, name, homepage, stream, summary, bitrate_kbps, sample_rate_hz, channels) in
+            expected
+        {
+            let station =
+                station_by_id(id).unwrap_or_else(|| panic!("missing requested radio preset: {id}"));
+            assert_eq!(station.name, name);
+            assert_eq!(station.homepage, homepage);
+            assert_eq!(station.stream, stream);
+            assert_eq!(station.summary, summary);
+            assert_eq!(station.codec, Some(RadioCodec::Mp3));
+            assert_eq!(station.bitrate_kbps, Some(bitrate_kbps));
+            assert_eq!(station.sample_rate_hz, Some(sample_rate_hz));
+            assert_eq!(station.channels, Some(channels));
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
             assert_eq!(station.now_playing, None);
         }
     }
