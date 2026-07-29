@@ -7525,7 +7525,7 @@ fn render_private_note_popup(
                 .track_style(theme.muted)
                 .thumb_symbol("█")
                 .thumb_style(theme.accent);
-            let mut scrollbar_state = ScrollbarState::new(wrapped.lines.len())
+            let mut scrollbar_state = ScrollbarState::new(maximum_offset.saturating_add(1))
                 .position(offset)
                 .viewport_content_length(visible_lines);
             frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
@@ -12217,6 +12217,58 @@ mod tests {
                 .lines
                 .iter()
                 .all(|line| terminal_text_width(line) <= 2)
+        );
+    }
+
+    #[test]
+    fn private_note_final_wrapped_unicode_row_reaches_scrollbar_bottom() {
+        let wrapped_final_line = format!("{}尾", "界e\u{301}👩‍💻".repeat(24));
+        let body = (0..20)
+            .map(|index| format!("note line {index:02}"))
+            .chain(std::iter::once(wrapped_final_line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 32)).expect("private-note test terminal");
+        let view = ViewModel {
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Wrapped Unicode note".to_owned(),
+                cursor_byte: body.len(),
+                body,
+                follow_cursor: true,
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render final wrapped Unicode row");
+
+        assert_eq!(
+            hit_map.private_note_scroll_offset, hit_map.private_note_scroll_maximum,
+            "following the final cursor row must render the final viewport"
+        );
+        assert!(
+            hit_map.private_note_scroll_maximum > 0,
+            "the fixture must overflow the editor viewport"
+        );
+        let buffer = terminal.backend().buffer();
+        let scrollbar_bottom = (
+            hit_map.private_note_text_area.right(),
+            hit_map.private_note_text_area.bottom().saturating_sub(1),
+        );
+        assert_eq!(
+            buffer[scrollbar_bottom].symbol(),
+            "█",
+            "the scrollbar thumb must reach the final track cell"
+        );
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains('尾') && rendered.contains('▏'),
+            "the final Unicode content and insertion marker must remain visible"
         );
     }
 
