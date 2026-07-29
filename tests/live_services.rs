@@ -520,9 +520,9 @@ fn radio_stream_and_passive_metadata_are_usable() {
         "intense-radio-flac",
         "openbroadcast-flac",
         "radio-bergeijk-flac",
-        "95bfm-flac",
         "pure-classix-radio-flac",
         "radio-campus-grenoble-flac",
+        "radiosega",
         "rlocale-radio-flac",
         "1zwolle-flac",
     ] {
