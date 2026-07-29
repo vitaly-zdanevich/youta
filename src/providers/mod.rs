@@ -110,6 +110,13 @@ pub struct ChannelSubscriberCount {
     pub channel_id: String,
     /// Public subscriber count, when the channel exposes it.
     pub subscriber_count: Option<u64>,
+    /// Validated public channel page returned by the same metadata lookup.
+    ///
+    /// Providers should retain a human-readable handle or legacy alias when
+    /// their response associates it with `channel_id`. Callers must still
+    /// validate this URL before exposing it to an external opener.
+    #[serde(default)]
+    pub webpage_url: Option<Url>,
 }
 
 /// The kind of object to search for.

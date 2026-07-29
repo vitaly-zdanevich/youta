@@ -386,9 +386,11 @@ impl InvidiousProvider {
                 "channel response identifier does not match the requested channel".to_owned(),
             ));
         }
+        let webpage_url = youtube_channel_url_from_author(raw.author_url.as_deref(), requested_id);
         Ok(ChannelSubscriberCount {
             channel_id: raw.author_id,
             subscriber_count: raw.sub_count,
+            webpage_url,
         })
     }
 
@@ -547,10 +549,13 @@ fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) 
         return None;
     }
 
-    let segments = parsed
+    let mut segments = parsed
         .path_segments()?
         .map(decode_url_path_segment_once)
         .collect::<Option<Vec<_>>>()?;
+    if segments.last().is_some_and(String::is_empty) {
+        segments.pop();
+    }
     let safe = match segments.as_slice() {
         [namespace, channel_id] if namespace == "channel" => {
             channel_id == expected_id && valid_youtube_channel_route_id(channel_id)
@@ -1350,6 +1355,41 @@ mod tests {
     }
 
     #[test]
+    fn invidious_author_url_accepts_one_trailing_slash_but_rejects_extra_path() {
+        for (author_url, expected) in [
+            ("/@myChanName/", "https://www.youtube.com/@myChanName"),
+            (
+                "/channel/UCfixture/",
+                "https://www.youtube.com/channel/UCfixture",
+            ),
+            (
+                "/c/FixtureChannel/",
+                "https://www.youtube.com/c/FixtureChannel",
+            ),
+            ("/user/fixture/", "https://www.youtube.com/user/fixture"),
+        ] {
+            assert_eq!(
+                youtube_channel_url_from_author(Some(author_url), "UCfixture")
+                    .as_ref()
+                    .map(Url::as_str),
+                Some(expected)
+            );
+        }
+
+        for unsafe_route in [
+            "/@myChanName//",
+            "/@myChanName/videos",
+            "/channel/UCfixture//",
+            "/channel/UCfixture/videos",
+        ] {
+            assert!(
+                youtube_channel_url_from_author(Some(unsafe_route), "UCfixture").is_none(),
+                "{unsafe_route:?} must not become an official channel URL"
+            );
+        }
+    }
+
+    #[test]
     fn invidious_author_url_decodes_and_reencodes_unicode_handle_once() {
         let url = youtube_channel_url_from_author(Some("/@ქართული"), "UCfixture")
             .expect("Unicode handle should be accepted");
@@ -1389,6 +1429,10 @@ mod tests {
             ChannelSubscriberCount {
                 channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".to_owned(),
                 subscriber_count: Some(12_345),
+                webpage_url: Some(
+                    Url::parse("https://www.youtube.com/@example-channel")
+                        .expect("fixture channel handle"),
+                ),
             }
         );
     }

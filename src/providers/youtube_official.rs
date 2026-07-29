@@ -537,7 +537,7 @@ impl YouTubeOfficialProvider {
     fn fetch_channel_subscriber_counts(
         &self,
         ids: &[String],
-    ) -> Result<HashMap<String, Option<u64>>, ProviderError> {
+    ) -> Result<HashMap<String, ChannelSubscriberCount>, ProviderError> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -557,7 +557,7 @@ impl YouTubeOfficialProvider {
         let mut url = self.endpoint("channels")?;
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("part", "statistics");
+            query.append_pair("part", "snippet,statistics");
             query.append_pair("id", &ids.join(","));
             query.append_pair("maxResults", &ids.len().to_string());
         }
@@ -570,7 +570,20 @@ impl YouTubeOfficialProvider {
                 let count = (!item.statistics.hidden_subscriber_count)
                     .then_some(item.statistics.subscriber_count)
                     .flatten();
-                Ok((item.id, count))
+                let webpage_url = item
+                    .snippet
+                    .and_then(|snippet| snippet.custom_url)
+                    .as_deref()
+                    .and_then(youtube_custom_channel_url);
+                let channel_id = item.id;
+                Ok((
+                    channel_id.clone(),
+                    ChannelSubscriberCount {
+                        channel_id,
+                        subscriber_count: count,
+                        webpage_url,
+                    },
+                ))
             })
             .collect()
     }
@@ -737,9 +750,15 @@ impl Provider for YouTubeOfficialProvider {
         let counts = self.fetch_channel_subscriber_counts(channel_ids)?;
         Ok(channel_ids
             .iter()
-            .map(|channel_id| ChannelSubscriberCount {
-                channel_id: channel_id.clone(),
-                subscriber_count: counts.get(channel_id).copied().flatten(),
+            .map(|channel_id| {
+                counts
+                    .get(channel_id)
+                    .cloned()
+                    .unwrap_or_else(|| ChannelSubscriberCount {
+                        channel_id: channel_id.clone(),
+                        subscriber_count: None,
+                        webpage_url: None,
+                    })
             })
             .collect())
     }
@@ -1672,6 +1691,8 @@ struct RawChannelStatisticsListResponse {
 struct RawChannelStatisticsResource {
     id: String,
     #[serde(default)]
+    snippet: Option<RawSnippet>,
+    #[serde(default)]
     statistics: RawChannelStatistics,
 }
 
@@ -2500,6 +2521,9 @@ mod tests {
                     }},
                     {{
                         "id": "{CHANNEL_ID}",
+                        "snippet": {{
+                            "customUrl": "@example-channel"
+                        }},
                         "statistics": {{
                             "subscriberCount": "12345",
                             "hiddenSubscriberCount": false
@@ -2527,24 +2551,37 @@ mod tests {
                 ChannelSubscriberCount {
                     channel_id: CHANNEL_ID.to_owned(),
                     subscriber_count: Some(12_345),
+                    webpage_url: Some(
+                        Url::parse("https://www.youtube.com/@example-channel")
+                            .expect("fixture channel handle"),
+                    ),
                 },
                 ChannelSubscriberCount {
                     channel_id: HIDDEN_ID.to_owned(),
                     subscriber_count: None,
+                    webpage_url: None,
                 },
                 ChannelSubscriberCount {
                     channel_id: MISSING_ID.to_owned(),
                     subscriber_count: None,
+                    webpage_url: None,
                 },
                 ChannelSubscriberCount {
                     channel_id: CHANNEL_ID.to_owned(),
                     subscriber_count: Some(12_345),
+                    webpage_url: Some(
+                        Url::parse("https://www.youtube.com/@example-channel")
+                            .expect("fixture channel handle"),
+                    ),
                 },
             ]
         );
         assert_eq!(requests.len(), 1, "one channels.list batch is sufficient");
         let pairs = query_pairs(&requests[0]);
-        assert_eq!(pairs.get("part").map(String::as_str), Some("statistics"));
+        assert_eq!(
+            pairs.get("part").map(String::as_str),
+            Some("snippet,statistics")
+        );
         assert_eq!(pairs.get("maxResults").map(String::as_str), Some("4"));
         let requested_ids = format!("{CHANNEL_ID},{HIDDEN_ID},{MISSING_ID},{CHANNEL_ID}");
         assert_eq!(

@@ -114,6 +114,22 @@ impl SubscriptionTree {
                 .any(|node| node_contains_youtube_channel(node, channel_id))
     }
 
+    /// Returns the validated public website stored for a `YouTube` channel.
+    ///
+    /// The channel identifier must be established by the same OPML outline's
+    /// uploads feed or canonical channel URL. A handle is never derived from
+    /// the subscription title because display names and handles can differ.
+    #[must_use]
+    pub fn youtube_channel_website_url(&self, channel_id: &str) -> Option<Url> {
+        if channel_id.is_empty() {
+            return None;
+        }
+        self.items
+            .iter()
+            .find_map(|node| node_youtube_channel_website_url(node, channel_id))
+            .cloned()
+    }
+
     /// Adds a top-level portable subscription for a `YouTube` channel.
     ///
     /// The operation is idempotent: an imported subscription with the same
@@ -273,6 +289,28 @@ fn node_contains_youtube_channel(node: &SubscriptionNode, channel_id: &str) -> b
     }
 }
 
+/// Finds one safe website associated with an exact nested channel outline.
+fn node_youtube_channel_website_url<'a>(
+    node: &'a SubscriptionNode,
+    channel_id: &str,
+) -> Option<&'a Url> {
+    match node {
+        SubscriptionNode::Folder(folder) => folder
+            .children
+            .iter()
+            .find_map(|child| node_youtube_channel_website_url(child, channel_id)),
+        SubscriptionNode::Subscription(subscription)
+            if subscription_matches_youtube_channel(subscription, channel_id) =>
+        {
+            subscription
+                .website_url
+                .as_ref()
+                .filter(|url| safe_youtube_channel_website_url(url, channel_id))
+        }
+        SubscriptionNode::Subscription(_) => None,
+    }
+}
+
 fn remove_youtube_channel(nodes: &mut Vec<SubscriptionNode>, channel_id: &str) -> bool {
     let original_len = nodes.len();
     nodes.retain(|node| {
@@ -320,13 +358,15 @@ fn youtube_channel_id_from_url(url: &Url) -> Option<String> {
             return Some(channel_id);
         }
     }
-    let mut segments = url.path_segments()?;
-    if segments.next() != Some("channel") {
-        return None;
+    let mut segments = url.path_segments()?.collect::<Vec<_>>();
+    if segments.last().is_some_and(|segment| segment.is_empty()) {
+        segments.pop();
     }
-    let channel_id = segments.next()?;
-    (segments.next().is_none() && url.query().is_none() && url.fragment().is_none())
-        .then_some(channel_id)
+    let [namespace, channel_id] = segments.as_slice() else {
+        return None;
+    };
+    (namespace == &"channel" && url.query().is_none() && url.fragment().is_none())
+        .then_some(*channel_id)
         .filter(|candidate| valid_youtube_channel_id(candidate))
         .map(ToOwned::to_owned)
 }
@@ -355,13 +395,16 @@ fn safe_youtube_channel_website_url(url: &Url, channel_id: &str) -> bool {
     {
         return false;
     }
-    let Some(segments) = url.path_segments().and_then(|segments| {
+    let Some(mut segments) = url.path_segments().and_then(|segments| {
         segments
             .map(decode_url_path_segment_once)
             .collect::<Option<Vec<_>>>()
     }) else {
         return false;
     };
+    if segments.last().is_some_and(String::is_empty) {
+        segments.pop();
+    }
     match segments.as_slice() {
         [namespace, candidate] if namespace == "channel" => {
             candidate == channel_id && valid_youtube_channel_id(candidate)
@@ -885,6 +928,68 @@ mod tests {
             };
             assert_eq!(subscription.website_url.as_ref(), Some(&handle));
         }
+    }
+
+    #[test]
+    fn youtube_channel_routes_accept_one_trailing_slash_but_reject_extra_path() {
+        for safe_url in [
+            "https://www.youtube.com/@myChanName/",
+            "https://www.youtube.com/channel/UCfixture/",
+            "https://www.youtube.com/c/FixtureChannel/",
+            "https://www.youtube.com/user/fixture/",
+        ] {
+            assert!(
+                safe_youtube_channel_website_url(&parse(safe_url), "UCfixture"),
+                "{safe_url:?} should retain its conventional trailing slash"
+            );
+        }
+        assert_eq!(
+            youtube_channel_id_from_url(&parse("https://www.youtube.com/channel/UCfixture/"))
+                .as_deref(),
+            Some("UCfixture")
+        );
+
+        for unsafe_url in [
+            "https://www.youtube.com/@myChanName//",
+            "https://www.youtube.com/@myChanName/videos",
+            "https://www.youtube.com/channel/UCfixture//",
+            "https://www.youtube.com/channel/UCfixture/videos",
+        ] {
+            assert!(
+                !safe_youtube_channel_website_url(&parse(unsafe_url), "UCfixture"),
+                "{unsafe_url:?} must not pass the exact channel-route validator"
+            );
+        }
+        assert!(
+            youtube_channel_id_from_url(&parse("https://www.youtube.com/channel/UCfixture//"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn youtube_channel_website_lookup_uses_the_exact_nested_opml_handle() {
+        let handle = parse("https://www.youtube.com/@myChanName");
+        let tree = SubscriptionTree {
+            items: vec![SubscriptionNode::Folder(SubscriptionFolder {
+                title: "Imported".to_owned(),
+                children: vec![SubscriptionNode::Subscription(Subscription {
+                    title: "Display Name Is Not The Handle".to_owned(),
+                    url: parse(
+                        "https://www.youtube.com/feeds/videos.xml?channel_id=UCnestedfixture",
+                    ),
+                    website_url: Some(handle.clone()),
+                    description: None,
+                    kind: SubscriptionKind::YouTube,
+                })],
+            })],
+        };
+
+        assert_eq!(
+            tree.youtube_channel_website_url("UCnestedfixture"),
+            Some(handle)
+        );
+        assert_eq!(tree.youtube_channel_website_url("UCdifferent"), None);
+        assert_eq!(tree.youtube_channel_website_url(""), None);
     }
 
     #[test]
