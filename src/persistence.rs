@@ -6980,7 +6980,7 @@ mod tests {
 
     /// Builds one compact RSS episode from deterministic mock metadata.
     fn podcast_episode(feed_url: &str, episode_id: &str) -> SearchItem {
-        SearchItem::PodcastEpisode(PodcastEpisodeSummary {
+        SearchItem::PodcastEpisode(Box::new(PodcastEpisodeSummary {
             feed_url: Url::parse(feed_url).expect("valid fixture feed URL"),
             episode_id: episode_id.to_owned(),
             feed_title: "Fixture podcast".to_owned(),
@@ -7007,7 +7007,7 @@ mod tests {
             stream_url: None,
             stream_mime_type: Some("audio/mpeg".to_owned()),
             stream_byte_length: Some(1_024),
-        })
+        }))
     }
 
     #[cfg(any(feature = "local-rename", feature = "local-move"))]

@@ -6066,11 +6066,11 @@ impl AppController {
                             .episodes
                             .iter()
                             .map(|episode| {
-                                SearchItem::PodcastEpisode(podcast_episode_summary(
+                                SearchItem::PodcastEpisode(Box::new(podcast_episode_summary(
                                     &feed,
                                     episode,
                                     &requested_url,
-                                ))
+                                )))
                             })
                             .take(MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
                             .collect::<Vec<_>>();

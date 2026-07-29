@@ -564,7 +564,10 @@ pub enum SearchItem {
     /// A channel result.
     Channel(ChannelSummary),
     /// An RSS, Atom, or JSON Feed podcast episode.
-    PodcastEpisode(PodcastEpisodeSummary),
+    ///
+    /// The summary is boxed so this metadata-rich variant does not inflate
+    /// every compact video and channel result in a search page.
+    PodcastEpisode(Box<PodcastEpisodeSummary>),
 }
 
 /// A page of search results.
