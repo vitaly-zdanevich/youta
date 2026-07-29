@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "youta"
-version = "0.14.5"
+version = "0.14.6"
 dependencies = [
  "anyhow",
  "assert_cmd",

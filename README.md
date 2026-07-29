@@ -341,10 +341,10 @@ lookups are cached for 24 hours. Network and response errors are not
 negative-cache entries.
 
 Each matched entity appears once under External links as a collapsed
-`[W] 🧾▸` row. Activating that row lazily requests the entity's bounded,
+`[W] ▸` row. Activating that row lazily requests the entity's bounded,
 human-readable statements plus canonical Wikipedia article sitelinks and
 expands them in the scrollable Details pane. Statement values and Wikipedia
-rows retain validated clickable targets. Activating `[W] 🧾▾` collapses the
+rows retain validated clickable targets. Activating `[W] ▾` collapses the
 spoiler again. Entity data is not fetched for items the user never expands.
 
 This is exact-ID enrichment, not title, name, or arbitrary-URL matching.

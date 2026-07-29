@@ -5515,10 +5515,11 @@ impl AppController {
         let now = unix_time();
         match self.store.cached_wikidata(property_id, external_id) {
             Ok(Some(cached)) if cached.is_fresh_at(now) => {
-                if let Some(details) = self.view.details.as_mut() {
-                    apply_wikidata_links(details, &cached.items);
-                }
-                self.view.selected_detail_link = (!cached.items.is_empty()).then_some(0);
+                self.view.selected_detail_link = self
+                    .view
+                    .details
+                    .as_mut()
+                    .and_then(|details| apply_wikidata_links(details, &cached.items));
                 true
             }
             Ok(_) => false,
@@ -6726,10 +6727,11 @@ impl AppController {
                         if let Err(error) = self.store.put_cached_wikidata(&cached) {
                             self.show_error("Wikidata cache write failed", &error);
                         }
-                        if let Some(details) = self.view.details.as_mut() {
-                            apply_wikidata_links(details, &cached.items);
-                        }
-                        self.view.selected_detail_link = (!cached.items.is_empty()).then_some(0);
+                        self.view.selected_detail_link = self
+                            .view
+                            .details
+                            .as_mut()
+                            .and_then(|details| apply_wikidata_links(details, &cached.items));
                     }
                     Err(error) => {
                         if let Some(details) = self.view.details.as_mut() {
@@ -23155,9 +23157,14 @@ fn format_binary_size(bytes: u64, unit: u64, suffix: &str) -> String {
 }
 
 #[cfg(feature = "wikidata")]
-fn apply_wikidata_links(details: &mut DetailView, items: &[crate::domain::WikidataLink]) {
+/// Replaces Wikidata rows and returns the first inserted disclosure index.
+fn apply_wikidata_links(
+    details: &mut DetailView,
+    items: &[crate::domain::WikidataLink],
+) -> Option<usize> {
     details.wikidata.clear();
     details.links.retain(|link| link.wikidata_item_id.is_none());
+    let first_wikidata_index = (!items.is_empty()).then_some(details.links.len());
     details
         .links
         .extend(items.iter().map(|item| DetailLinkView {
@@ -23169,6 +23176,7 @@ fn apply_wikidata_links(details: &mut DetailView, items: &[crate::domain::Wikida
             url: item.url.to_string(),
             wikidata_item_id: Some(item.item_id.clone()),
         }));
+    first_wikidata_index
 }
 
 #[cfg(feature = "wikidata")]
@@ -28063,7 +28071,7 @@ mod tests {
         assert_eq!(canonical_wikidata_item_url("Q0"), None);
 
         let mut details = DetailView::default();
-        apply_wikidata_links(
+        let first_wikidata_index = apply_wikidata_links(
             &mut details,
             &[crate::domain::WikidataLink {
                 item_id: "Q212".to_owned(),
@@ -28072,6 +28080,7 @@ mod tests {
                 url: url::Url::parse("https://www.wikidata.org/wiki/Q212").expect("Wikidata URL"),
             }],
         );
+        assert_eq!(first_wikidata_index, Some(0));
         assert_eq!(details.links[0].label, "Q212");
 
         entity.truncated = true;
@@ -28203,8 +28212,15 @@ mod tests {
             ]
         );
 
-        let mut details = DetailView::default();
-        apply_wikidata_links(
+        let mut details = DetailView {
+            links: vec![DetailLinkView {
+                label: "Official website".to_owned(),
+                url: "https://example.com".to_owned(),
+                ..DetailLinkView::default()
+            }],
+            ..DetailView::default()
+        };
+        let first_wikidata_index = apply_wikidata_links(
             &mut details,
             &[crate::domain::WikidataLink {
                 item_id: "Q42".to_owned(),
@@ -28214,8 +28230,9 @@ mod tests {
                     .expect("Wikidata fixture"),
             }],
         );
-        assert_eq!(details.links.len(), 1);
-        assert_eq!(details.links[0].url, "https://www.wikidata.org/wiki/Q42");
+        assert_eq!(first_wikidata_index, Some(1));
+        assert_eq!(details.links.len(), 2);
+        assert_eq!(details.links[1].url, "https://www.wikidata.org/wiki/Q42");
     }
 
     #[cfg(feature = "wikidata")]

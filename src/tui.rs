@@ -4971,8 +4971,7 @@ fn render_information_panel(
                 )];
                 if let Some(item_id) = link.wikidata_item_id.as_deref() {
                     let expanded = details.expanded_wikidata_item.as_deref() == Some(item_id);
-                    let disclosure =
-                        button("W", if expanded { "🧾▾" } else { "🧾▸" }, show_hotkeys);
+                    let disclosure = button("W", if expanded { "▾" } else { "▸" }, show_hotkeys);
                     let disclosure_width = terminal_text_width(&disclosure);
                     spans.push(Span::styled(
                         disclosure,
@@ -8757,6 +8756,7 @@ fn key_action_with_page_rows_unfiltered(
         })
         .map_or(0, |entity| entity.media_controls.len());
     let details_line_scroll_available = details_accept_line_scroll(view);
+    let wikidata_link_index = keyboard_wikidata_link_index(view);
     match key.code {
         KeyCode::Char('q') => Some(UiAction::Quit),
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
@@ -8866,20 +8866,7 @@ fn key_action_with_page_rows_unfiltered(
         {
             Some(UiAction::OpenRssSubscriptionPopup)
         }
-        KeyCode::Char('W')
-            if view
-                .selected_detail_link
-                .and_then(|index| {
-                    view.details
-                        .as_ref()
-                        .and_then(|details| details.links.get(index))
-                })
-                .is_some_and(|link| link.wikidata_item_id.is_some()) =>
-        {
-            Some(UiAction::ToggleWikidataStatements(
-                view.selected_detail_link.unwrap_or_default(),
-            ))
-        }
+        KeyCode::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
         KeyCode::Char('R')
             if view.screen == Screen::Subscriptions
                 && (view.subscriptions.route == SubscriptionRoute::Items
@@ -9008,6 +8995,39 @@ fn key_action_with_page_rows_unfiltered(
 /// `Alt+d` scroll never falls through to the unrelated Download action.
 fn details_accept_line_scroll(view: &ViewModel) -> bool {
     view.details.is_some() && view.right_panel_mode == RightPanelMode::Details
+}
+
+/// Resolves the Wikidata disclosure owned by the global `W` shortcut.
+///
+/// An expanded item takes precedence so `W` always collapses the visible
+/// spoiler. Otherwise the explicitly selected Wikidata row wins, followed by
+/// the first Wikidata row when asynchronous enrichment has not selected one.
+fn keyboard_wikidata_link_index(view: &ViewModel) -> Option<usize> {
+    let details = view.details.as_ref()?;
+    let index_for_item = |item_id: &str| {
+        details
+            .links
+            .iter()
+            .position(|link| link.wikidata_item_id.as_deref() == Some(item_id))
+    };
+    details
+        .expanded_wikidata_item
+        .as_deref()
+        .and_then(index_for_item)
+        .or_else(|| {
+            view.selected_detail_link.filter(|index| {
+                details
+                    .links
+                    .get(*index)
+                    .is_some_and(|link| link.wikidata_item_id.is_some())
+            })
+        })
+        .or_else(|| {
+            details
+                .links
+                .iter()
+                .position(|link| link.wikidata_item_id.is_some())
+        })
 }
 
 /// Recognizes reverse-tab modifier encodings produced by terminal keyboards.
@@ -12297,6 +12317,62 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
             Some(UiAction::ActivateSelection)
+        );
+    }
+
+    #[test]
+    fn wikidata_shortcut_targets_a_disclosure_before_mouse_selection() {
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                links: vec![
+                    DetailLinkView {
+                        label: "Website".to_owned(),
+                        url: "https://example.com".to_owned(),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "First entity".to_owned(),
+                        url: "https://www.wikidata.org/wiki/Q1".to_owned(),
+                        wikidata_item_id: Some("Q1".to_owned()),
+                    },
+                    DetailLinkView {
+                        label: "Second entity".to_owned(),
+                        url: "https://www.wikidata.org/wiki/Q2".to_owned(),
+                        wikidata_item_id: Some("Q2".to_owned()),
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            selected_detail_link: Some(0),
+            ..ViewModel::default()
+        };
+        let shortcut = KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT);
+
+        assert_eq!(
+            key_action(shortcut, &view),
+            Some(UiAction::ToggleWikidataStatements(1)),
+            "a non-Wikidata selection must not disable the advertised shortcut"
+        );
+        view.selected_detail_link = None;
+        assert_eq!(
+            key_action(shortcut, &view),
+            Some(UiAction::ToggleWikidataStatements(1)),
+            "the collapsed disclosure must work before any external link is selected"
+        );
+        view.selected_detail_link = Some(2);
+        assert_eq!(
+            key_action(shortcut, &view),
+            Some(UiAction::ToggleWikidataStatements(2)),
+            "an explicitly selected Wikidata row must take precedence"
+        );
+        view.details
+            .as_mut()
+            .expect("fixture details")
+            .expanded_wikidata_item = Some("Q1".to_owned());
+        assert_eq!(
+            key_action(shortcut, &view),
+            Some(UiAction::ToggleWikidataStatements(1)),
+            "the visible spoiler must remain collapsible after selection moves"
         );
     }
 
@@ -19520,7 +19596,8 @@ prose 07:25 remains clickable but is not a chapter";
 
         assert!(rendered.contains("External links"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
-        assert!(rendered.contains("[W]"));
+        assert!(rendered.contains("[W] ▸"));
+        assert!(!rendered.contains('🧾'));
         assert!(!rendered.contains("instance of (P31)"));
         assert_eq!(hit_map.detail_links.len(), 1);
         assert_eq!(hit_map.detail_links[0].0, 0);
@@ -19562,6 +19639,8 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw expanded Wikidata properties");
         let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[W] ▾"));
+        assert!(!rendered.contains('🧾'));
         assert!(rendered.contains("instance of (P31): human (Q5)"));
         let (_, value_area) = hit_map
             .detail_buttons

@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.14.5`. Items marked **roadmap** are design decisions, not support
+present in `0.14.6`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -459,7 +459,7 @@ normalized-title matches. Ambiguous title matches are displayed as suggestions,
 not asserted links.
 
 A matching entity is represented by one collapsed External links row rather
-than duplicated in the channel/video metadata body. Activating its `[W] 🧾`
+than duplicated in the channel/video metadata body. Activating its `[W]`
 control starts a bounded `wbgetentities` claims-plus-sitelinks request and
 bounded label requests, then replaces the Details description body with a
 scrollable property spoiler. Only human-facing statements and canonical,
