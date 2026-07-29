@@ -816,7 +816,12 @@ for descriptor readiness instead of polling in a loop, and does not link
 Physical mouse input still requires the GPM daemon to be installed and
 running. On Gentoo/OpenRC, start it with `rc-service gpm start` and enable it
 across restarts with `rc-update add gpm default`. A missing or inaccessible
-socket falls back silently to keyboard input.
+socket retains keyboard input. Each F8 press retries the socket immediately;
+Youta performs no background reconnect probes. If an activation attempt fails,
+Youta briefly replaces the one-line hotkey footer with a notice. When a
+non-empty OpenRC runtime softlevel identifies the active init system, that
+notice begins with `rc-service gpm start`. Builds without the `gpm` feature
+instead say that GPM support is absent and never suggest starting a daemon.
 
 Youta does not open GPM from `/dev/pts/*`, so terminal emulators retain their
 normal mouse-capture behavior. `F8` provides a keyboard pointer on every

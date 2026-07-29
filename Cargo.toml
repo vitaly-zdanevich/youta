@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -85,7 +85,8 @@ tui = [
     "dep:unicode-segmentation",
 ]
 # Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
-# This links no system GPM library and silently falls back when no daemon runs.
+# This links no system GPM library; F8 retries a missing daemon and retains its
+# keyboard pointer when physical input is unavailable.
 gpm = ["tui", "dep:mio"]
 backend-mpv = []
 backend-native = []

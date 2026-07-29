@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.14.0`. Items marked **roadmap** are design decisions, not support
+present in `0.14.1`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -719,9 +719,13 @@ input and `/dev/gpmctl` with one readiness poll. Native-endian GPM packets are
 decoded in safe Rust and converted into the same mouse-event path as terminal
 emulator reporting. The client does not link `libgpm`, but physical input
 requires an installed and running GPM daemon. PTYs never open GPM. Socket
-absence or disconnect is a silent capability loss, and the `F8` pointer
-continues to drive the rendered hit map from the keyboard without a daemon;
-when GPM is available, physical motion moves that same visible square.
+absence or disconnect retains the keyboard-driven `F8` pointer. Each new F8
+press forces an immediate socket retry, while the event loop performs no
+background reconnect probes. A failed pointer activation produces a one-time
+transient footer notice. A non-empty `/run/openrc/softlevel` enables the
+actionable `rc-service gpm start` wording; other init systems and builds
+without GPM remain truthful without that command. When GPM is available,
+physical motion moves the same visible square.
 
 Waveform rendering is a separate library-shaped module (**roadmap**). It
 produces a resolution-independent peak envelope cached by media fingerprint,

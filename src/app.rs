@@ -180,6 +180,42 @@ const MAX_LIVE_SEEK_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// Keeps absolute seeks inside [`BufferedRange`]'s half-open upper boundary.
 const LIVE_SEEK_END_GUARD: Duration = Duration::from_millis(1);
 
+const GPM_UNAVAILABLE_STATUS: &str = "GPM mouse unavailable. F8 keyboard pointer remains active.";
+const GPM_UNAVAILABLE_OPENRC_STATUS: &str =
+    "Run rc-service gpm start. GPM mouse unavailable; F8 keyboard pointer remains active.";
+const GPM_NOT_COMPILED_STATUS: &str =
+    "This Youta build has no GPM support. F8 keyboard pointer remains active.";
+const GPM_NOTICE_DURATION: Duration = Duration::from_secs(6);
+
+/// Chooses a truthful physical-console pointer notice for this binary.
+///
+/// Starting a daemon is actionable only when the GPM adapter is compiled and
+/// non-empty OpenRC runtime state identifies the active init system.
+fn gpm_unavailable_status(gpm_supported: bool, openrc_managed: bool) -> &'static str {
+    if !gpm_supported {
+        GPM_NOT_COMPILED_STATUS
+    } else if openrc_managed {
+        GPM_UNAVAILABLE_OPENRC_STATUS
+    } else {
+        GPM_UNAVAILABLE_STATUS
+    }
+}
+
+/// Expires a footer notice at its monotonic deadline.
+///
+/// Keeping expiry in the controller makes the renderer a pure projection and
+/// ensures the ordinary one-line hotkey footer returns without user input.
+fn expire_transient_footer_notice(
+    view: &mut ViewModel,
+    deadline: &mut Option<Instant>,
+    now: Instant,
+) {
+    if deadline.is_some_and(|deadline| now >= deadline) {
+        view.transient_footer_notice = None;
+        *deadline = None;
+    }
+}
+
 /// Selects the newest contiguous cached interval containing live playback.
 ///
 /// The returned range uses backend timestamps for absolute seek commands. A
@@ -2752,6 +2788,8 @@ pub struct AppController {
     last_position_save: Instant,
     last_session_save: Instant,
     last_tick: Instant,
+    /// Deadline after which the normal one-line footer controls return.
+    transient_footer_notice_deadline: Option<Instant>,
     session_dirty: bool,
     unflushed_listen_time: Duration,
     diagnostic_only: bool,
@@ -3328,6 +3366,7 @@ impl AppController {
             last_position_save: Instant::now(),
             last_session_save: Instant::now(),
             last_tick: Instant::now(),
+            transient_footer_notice_deadline: None,
             session_dirty: false,
             unflushed_listen_time: Duration::ZERO,
             diagnostic_only: false,
@@ -17490,6 +17529,15 @@ impl UiController for AppController {
                 self.view.external_opener_available = available;
                 self.view.physical_linux_console = !available;
             }
+            UiAction::ReportGpmUnavailable {
+                gpm_supported,
+                openrc_managed,
+            } => {
+                let notice = gpm_unavailable_status(gpm_supported, openrc_managed).to_owned();
+                self.view.status_line.clone_from(&notice);
+                self.view.transient_footer_notice = Some(notice);
+                self.transient_footer_notice_deadline = Some(Instant::now() + GPM_NOTICE_DURATION);
+            }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
             UiAction::ShowScreen(screen) => self.show_screen(screen),
             UiAction::BeginSearch => self.begin_search_input(),
@@ -18009,6 +18057,11 @@ impl UiController for AppController {
     }
 
     fn tick(&mut self) {
+        expire_transient_footer_notice(
+            &mut self.view,
+            &mut self.transient_footer_notice_deadline,
+            Instant::now(),
+        );
         if self.diagnostic_only {
             return;
         }
@@ -34619,6 +34672,51 @@ mod tests {
                 title: "Youta error: Playback failed".to_owned(),
                 report: "complete report".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn unavailable_gpm_status_is_actionable_only_for_supported_openrc_builds() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.dispatch(UiAction::ReportGpmUnavailable {
+            gpm_supported: true,
+            openrc_managed: true,
+        });
+        assert_eq!(controller.view.status_line, GPM_UNAVAILABLE_OPENRC_STATUS);
+        assert_eq!(
+            controller.view.transient_footer_notice.as_deref(),
+            Some(GPM_UNAVAILABLE_OPENRC_STATUS)
+        );
+        assert!(controller.transient_footer_notice_deadline.is_some());
+
+        controller.dispatch(UiAction::ReportGpmUnavailable {
+            gpm_supported: true,
+            openrc_managed: false,
+        });
+        assert_eq!(controller.view.status_line, GPM_UNAVAILABLE_STATUS);
+        assert!(!controller.view.status_line.contains("rc-service"));
+
+        controller.dispatch(UiAction::ReportGpmUnavailable {
+            gpm_supported: false,
+            openrc_managed: true,
+        });
+        assert_eq!(controller.view.status_line, GPM_NOT_COMPILED_STATUS);
+        assert!(!controller.view.status_line.contains("rc-service"));
+        assert!(controller.view.error_popup.is_none());
+
+        controller.transient_footer_notice_deadline = Some(Instant::now());
+        expire_transient_footer_notice(
+            &mut controller.view,
+            &mut controller.transient_footer_notice_deadline,
+            Instant::now(),
+        );
+        assert!(controller.view.transient_footer_notice.is_none());
+        assert!(controller.transient_footer_notice_deadline.is_none());
+        assert_eq!(
+            controller.view.status_line, GPM_NOT_COMPILED_STATUS,
+            "expiry must restore controls without erasing normal status history"
         );
     }
 

@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+const OPENRC_SOFTLEVEL: &str = "/run/openrc/softlevel";
+
 /// Observable facts needed to confirm a directly attached Linux virtual console.
 ///
 /// A `TERM=linux` value alone is not authoritative: it can be copied through
@@ -60,6 +63,25 @@ pub(crate) fn is_linux_virtual_console(path: &Path) -> bool {
     })
 }
 
+/// Reports whether OpenRC manages the active Linux system.
+///
+/// OpenRC is not a persistent daemon, so process discovery cannot answer this
+/// reliably. Its non-empty runtime softlevel records the active boot state.
+pub(crate) fn openrc_manages_system() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return openrc_manages_system_with(|path| std::fs::read_to_string(path).ok());
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn openrc_manages_system_with(read_runtime_state: impl Fn(&Path) -> Option<String>) -> bool {
+    read_runtime_state(Path::new(OPENRC_SOFTLEVEL))
+        .is_some_and(|softlevel| !softlevel.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +131,19 @@ mod tests {
         };
         assert!(!ssh.is_physical_linux_virtual_console());
         assert!(ssh.external_opener_available());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openrc_detection_requires_nonempty_runtime_state() {
+        let runtime = Path::new(OPENRC_SOFTLEVEL);
+
+        assert!(openrc_manages_system_with(|path| {
+            (path == runtime).then(|| "default".to_owned())
+        }));
+        assert!(!openrc_manages_system_with(|_| None));
+        assert!(!openrc_manages_system_with(|path| {
+            (path == runtime).then(|| " \n".to_owned())
+        }));
     }
 }

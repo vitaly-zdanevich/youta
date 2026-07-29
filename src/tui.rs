@@ -3,7 +3,6 @@
 //! This module renders Youta's own controls. An external player backend never
 //! writes to the terminal and does not create a second user interface.
 
-use std::borrow::Cow;
 use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,7 +43,7 @@ use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
 use crate::report_actions::system_url_opener_name;
-use crate::terminal_environment::TerminalAttachment;
+use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::Peak;
@@ -1128,6 +1127,11 @@ pub struct ViewModel {
     pub repeating: bool,
     /// Status or error message.
     pub status_line: String,
+    /// One short-lived notice replacing the footer controls for one line.
+    ///
+    /// This is intentionally separate from [`Self::status_line`]: routine
+    /// status changes must not accidentally keep or replace a timed notice.
+    pub transient_footer_notice: Option<String>,
     /// Whether the help overlay is open.
     pub help_open: bool,
     /// Whether this terminal attachment can launch a graphical external opener.
@@ -1203,6 +1207,7 @@ impl Default for ViewModel {
             autoplay: false,
             repeating: false,
             status_line: "Press / to search or ? for help".to_owned(),
+            transient_footer_notice: None,
             help_open: false,
             external_opener_available: true,
             physical_linux_console: false,
@@ -1253,6 +1258,13 @@ pub enum UiAction {
     Quit,
     /// Record graphical-opener and physical-Linux-console capabilities.
     SetExternalOpenerAvailable(bool),
+    /// Report that F8 retained its keyboard pointer without physical GPM input.
+    ReportGpmUnavailable {
+        /// Whether this binary was compiled with the GPM input adapter.
+        gpm_supported: bool,
+        /// Whether OpenRC manages the system.
+        openrc_managed: bool,
+    },
     /// Open or close the help overlay.
     ToggleHelp,
     /// Switch to a top-level screen.
@@ -2084,8 +2096,11 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         ));
     }
 
+    let terminal_attachment = current_terminal_attachment();
+    let physical_linux_console = terminal_attachment.is_physical_linux_virtual_console();
+    let openrc_managed = physical_linux_console && openrc_manages_system();
     controller.dispatch(UiAction::SetExternalOpenerAvailable(
-        current_terminal_attachment().external_opener_available(),
+        terminal_attachment.external_opener_available(),
     ));
     let mut session = TerminalSession::enter()?;
     let mut input = TerminalInput::new();
@@ -2129,23 +2144,42 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         })?;
         if wait_outcome == WaitOutcome::TerminalEvent {
             match input.read()? {
-                Event::Key(key) => match virtual_cursor.handle_key(key) {
-                    VirtualCursorKey::PassThrough => {
-                        if let Some(action) = key_action_with_page_rows(
-                            key,
-                            controller.view(),
-                            visible_main_list_page_rows(&hit_map),
-                        ) {
-                            controller.dispatch(action);
+                Event::Key(key) => {
+                    let cursor_was_active = virtual_cursor.active;
+                    let f8_pressed = key.kind == KeyEventKind::Press && key.code == KeyCode::F(8);
+                    match virtual_cursor.handle_key(key) {
+                        VirtualCursorKey::PassThrough => {
+                            if let Some(action) = key_action_with_page_rows(
+                                key,
+                                controller.view(),
+                                visible_main_list_page_rows(&hit_map),
+                            ) {
+                                controller.dispatch(action);
+                            }
                         }
-                    }
-                    VirtualCursorKey::Click(mouse) => {
-                        if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
-                            controller.dispatch(action);
+                        VirtualCursorKey::Click(mouse) => {
+                            if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
+                                controller.dispatch(action);
+                            }
                         }
+                        VirtualCursorKey::Consumed => {}
                     }
-                    VirtualCursorKey::Consumed => {}
-                },
+                    input.retry_gpm_on_f8_press(f8_pressed, physical_linux_console);
+                    if let Some(notice) = virtual_cursor.take_gpm_unavailable_notice(
+                        cursor_was_active,
+                        ConsolePointerAvailability {
+                            physical_linux_console,
+                            gpm_supported: TerminalInput::gpm_supported(),
+                            gpm_connected: input.gpm_connected(),
+                            openrc_managed,
+                        },
+                    ) {
+                        controller.dispatch(UiAction::ReportGpmUnavailable {
+                            gpm_supported: notice.gpm_supported,
+                            openrc_managed: notice.openrc_managed,
+                        });
+                    }
+                }
                 Event::Mouse(mouse) => {
                     virtual_cursor.follow_mouse(&mouse);
                     if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
@@ -2189,8 +2223,8 @@ impl TerminalInput {
         if let Some(input) = self.linux_console.as_mut() {
             let Ok(ready) = input.poll(timeout) else {
                 // GPM is optional and may stop while Youta is running. Drop
-                // the failed socket and retain keyboard input without
-                // presenting an application error.
+                // the failed socket and retain keyboard input. The next F8
+                // press explicitly retries it.
                 self.linux_console = None;
                 return event::poll(Duration::ZERO);
             };
@@ -2206,6 +2240,64 @@ impl TerminalInput {
         }
         event::read()
     }
+
+    /// Reports whether this build includes the Linux GPM input adapter.
+    const fn gpm_supported() -> bool {
+        cfg!(all(feature = "gpm", target_os = "linux"))
+    }
+
+    /// Reports whether the live GPM control socket can currently supply input.
+    fn gpm_connected(&self) -> bool {
+        #[cfg(all(feature = "gpm", target_os = "linux"))]
+        {
+            return self.linux_console.is_some();
+        }
+        #[cfg(not(all(feature = "gpm", target_os = "linux")))]
+        false
+    }
+
+    /// Retries GPM only for an explicit F8 press on a physical console.
+    ///
+    /// Startup retains its existing opportunistic attempt. Restricting later
+    /// attempts to F8 avoids background filesystem or socket probes.
+    fn retry_gpm_on_f8_press(&mut self, f8_pressed: bool, physical_linux_console: bool) -> bool {
+        if !gpm_reconnect_needed(
+            f8_pressed,
+            ConsolePointerAvailability {
+                physical_linux_console,
+                gpm_supported: Self::gpm_supported(),
+                gpm_connected: self.gpm_connected(),
+                openrc_managed: false,
+            },
+        ) {
+            return false;
+        }
+        #[cfg(all(feature = "gpm", target_os = "linux"))]
+        {
+            return retry_optional_input_with(
+                &mut self.linux_console,
+                LinuxConsoleInput::try_current,
+            );
+        }
+        #[cfg(not(all(feature = "gpm", target_os = "linux")))]
+        false
+    }
+}
+
+/// Replaces a disconnected optional input through an injected factory.
+///
+/// An existing connection is retained without invoking the factory. The
+/// return value reports whether this call installed a new input.
+#[cfg(any(all(feature = "gpm", target_os = "linux"), test))]
+fn retry_optional_input_with<T>(
+    input: &mut Option<T>,
+    factory: impl FnOnce() -> Option<T>,
+) -> bool {
+    if input.is_some() {
+        return false;
+    }
+    *input = factory();
+    input.is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2215,6 +2307,36 @@ enum VirtualCursorKey {
     Click(MouseEvent),
 }
 
+/// Runtime facts governing the physical-console GPM fallback notice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ConsolePointerAvailability {
+    /// Whether Youta is attached directly to a Linux virtual console.
+    physical_linux_console: bool,
+    /// Whether this binary contains the GPM input adapter.
+    gpm_supported: bool,
+    /// Whether the live GPM socket is connected.
+    gpm_connected: bool,
+    /// Whether OpenRC manages this system.
+    openrc_managed: bool,
+}
+
+/// Returns whether an explicit F8 press can retry the GPM control socket.
+fn gpm_reconnect_needed(f8_pressed: bool, availability: ConsolePointerAvailability) -> bool {
+    f8_pressed
+        && availability.physical_linux_console
+        && availability.gpm_supported
+        && !availability.gpm_connected
+}
+
+/// Facts retained for one semantic unavailable-GPM controller action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpmUnavailableNotice {
+    /// Whether starting a daemon can make this compiled adapter connect.
+    gpm_supported: bool,
+    /// Whether `rc-service` is an applicable service command.
+    openrc_managed: bool,
+}
+
 /// Keyboard-controlled pointer used when no physical mouse input is available.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct VirtualCursor {
@@ -2222,6 +2344,7 @@ struct VirtualCursor {
     column: u16,
     row: u16,
     bounds: Rect,
+    gpm_unavailable_notice_shown: bool,
 }
 
 impl VirtualCursor {
@@ -2309,6 +2432,31 @@ impl VirtualCursor {
             }),
             _ => VirtualCursorKey::PassThrough,
         }
+    }
+
+    /// Returns one actionable notice when F8 activates the pointer without GPM.
+    ///
+    /// The notice is confined to a confirmed Linux virtual console and is
+    /// emitted once per Youta run. An OpenRC command is included only when the
+    /// active system exposes non-empty OpenRC runtime state.
+    fn take_gpm_unavailable_notice(
+        &mut self,
+        was_active: bool,
+        availability: ConsolePointerAvailability,
+    ) -> Option<GpmUnavailableNotice> {
+        if was_active
+            || !self.active
+            || self.gpm_unavailable_notice_shown
+            || !availability.physical_linux_console
+            || availability.gpm_connected
+        {
+            return None;
+        }
+        self.gpm_unavailable_notice_shown = true;
+        Some(GpmUnavailableNotice {
+            gpm_supported: availability.gpm_supported,
+            openrc_managed: availability.gpm_supported && availability.openrc_managed,
+        })
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -2910,7 +3058,7 @@ fn render_frame(
         render_download_bar(frame, sections[2], download, &theme);
     }
     render_seek_bar(frame, sections[3], view, settings, &theme, hit_map);
-    let status_line = animated_status_line(view);
+    let status_line = view.transient_footer_notice.as_deref().unwrap_or("");
     render_buttons(
         frame,
         sections[4],
@@ -3246,17 +3394,6 @@ fn search_panel_title(view: &ViewModel) -> String {
         format!(" {frame} {}", search_title.trim_start())
     } else {
         search_title
-    }
-}
-
-/// Adds one stable-width ASCII frame while accepted media is starting.
-fn animated_status_line(view: &ViewModel) -> Cow<'_, str> {
-    if view.playback_starting {
-        let frame = ASCII_ACTIVITY_FRAMES
-            [view.playback_start_animation_frame % ASCII_ACTIVITY_FRAMES.len()];
-        Cow::Owned(format!("{frame} {}", view.status_line))
-    } else {
-        Cow::Borrowed(&view.status_line)
     }
 }
 
@@ -5952,11 +6089,22 @@ fn render_buttons(
     _playlist_edit_available: bool,
     _playlist_back_available: bool,
     _local_size_sort: Option<LocalSizeSort>,
-    _status: &str,
+    status: &str,
     _playback_active: bool,
     subscription_refresh_available: bool,
     hit_map: &mut HitMap,
 ) {
+    hit_map.buttons.clear();
+    if !status.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::raw(status))
+                .alignment(Alignment::Left)
+                .style(theme.accent.add_modifier(Modifier::BOLD)),
+            area,
+        );
+        return;
+    }
+
     let mut full_buttons = vec![
         (
             button("/", "Search", settings.show_hotkeys),
@@ -6064,7 +6212,6 @@ fn render_buttons(
         .map(|(label, _)| label.as_str())
         .collect::<Vec<_>>()
         .join("  ");
-    hit_map.buttons.clear();
     let line_width = terminal_text_width(&controls);
     let mut button_x = centered_line_x(area, line_width);
     for (label, action) in &buttons {
@@ -9558,6 +9705,217 @@ mod tests {
         );
     }
 
+    fn activate_virtual_cursor_and_take_gpm_notice(
+        cursor: &mut VirtualCursor,
+        availability: ConsolePointerAvailability,
+    ) -> Option<GpmUnavailableNotice> {
+        let was_active = cursor.active;
+        assert_eq!(
+            cursor.handle_key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)),
+            VirtualCursorKey::Consumed
+        );
+        cursor.take_gpm_unavailable_notice(was_active, availability)
+    }
+
+    #[test]
+    fn terminal_input_reports_compiled_gpm_support_exactly() {
+        assert_eq!(
+            TerminalInput::gpm_supported(),
+            cfg!(all(feature = "gpm", target_os = "linux"))
+        );
+    }
+
+    #[test]
+    fn gpm_reconnect_requires_explicit_f8_supported_physical_console_disconnect() {
+        let disconnected_console = ConsolePointerAvailability {
+            physical_linux_console: true,
+            gpm_supported: true,
+            gpm_connected: false,
+            openrc_managed: false,
+        };
+        assert!(gpm_reconnect_needed(true, disconnected_console));
+        assert!(!gpm_reconnect_needed(false, disconnected_console));
+        assert!(!gpm_reconnect_needed(
+            true,
+            ConsolePointerAvailability {
+                gpm_connected: true,
+                ..disconnected_console
+            }
+        ));
+        assert!(!gpm_reconnect_needed(
+            true,
+            ConsolePointerAvailability {
+                physical_linux_console: false,
+                ..disconnected_console
+            }
+        ));
+        assert!(!gpm_reconnect_needed(
+            true,
+            ConsolePointerAvailability {
+                gpm_supported: false,
+                ..disconnected_console
+            }
+        ));
+    }
+
+    #[test]
+    fn optional_input_retry_factory_replaces_disconnect_and_retains_connection() {
+        let mut input: Option<&'static str> = None;
+        let mut factory_calls = 0;
+
+        assert!(!retry_optional_input_with(&mut input, || {
+            factory_calls += 1;
+            None
+        }));
+        assert!(input.is_none());
+        assert_eq!(factory_calls, 1);
+
+        assert!(retry_optional_input_with(&mut input, || {
+            factory_calls += 1;
+            Some("connected")
+        },));
+        assert_eq!(input, Some("connected"));
+        assert_eq!(factory_calls, 2);
+
+        assert!(!retry_optional_input_with(&mut input, || {
+            factory_calls += 1;
+            Some("forced connection")
+        }));
+        assert_eq!(
+            input,
+            Some("connected"),
+            "an existing GPM slot must not be replaced"
+        );
+        assert_eq!(
+            factory_calls, 2,
+            "the reconnect factory must not run while connected"
+        );
+    }
+
+    #[test]
+    fn f8_keeps_keyboard_pointer_silent_when_gpm_is_connected() {
+        let mut cursor = VirtualCursor::default();
+
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(
+                &mut cursor,
+                ConsolePointerAvailability {
+                    physical_linux_console: true,
+                    gpm_supported: true,
+                    gpm_connected: true,
+                    openrc_managed: true,
+                },
+            ),
+            None
+        );
+        assert!(cursor.active, "F8 must still activate the keyboard pointer");
+    }
+
+    #[test]
+    fn f8_reports_unavailable_gpm_as_openrc_managed() {
+        let mut cursor = VirtualCursor::default();
+
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(
+                &mut cursor,
+                ConsolePointerAvailability {
+                    physical_linux_console: true,
+                    gpm_supported: true,
+                    gpm_connected: false,
+                    openrc_managed: true,
+                },
+            ),
+            Some(GpmUnavailableNotice {
+                gpm_supported: true,
+                openrc_managed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn f8_reports_unavailable_gpm_without_an_unrelated_service_command() {
+        let mut cursor = VirtualCursor::default();
+
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(
+                &mut cursor,
+                ConsolePointerAvailability {
+                    physical_linux_console: true,
+                    gpm_supported: true,
+                    gpm_connected: false,
+                    openrc_managed: false,
+                },
+            ),
+            Some(GpmUnavailableNotice {
+                gpm_supported: true,
+                openrc_managed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn f8_reports_a_build_without_gpm_without_openrc_advice() {
+        let mut cursor = VirtualCursor::default();
+
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(
+                &mut cursor,
+                ConsolePointerAvailability {
+                    physical_linux_console: true,
+                    gpm_supported: false,
+                    gpm_connected: false,
+                    openrc_managed: true,
+                },
+            ),
+            Some(GpmUnavailableNotice {
+                gpm_supported: false,
+                openrc_managed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn f8_does_not_report_gpm_on_a_pty() {
+        let mut cursor = VirtualCursor::default();
+
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(
+                &mut cursor,
+                ConsolePointerAvailability {
+                    physical_linux_console: false,
+                    gpm_supported: true,
+                    gpm_connected: false,
+                    openrc_managed: true,
+                },
+            ),
+            None
+        );
+        assert!(cursor.active, "F8 must retain its normal PTY behavior");
+    }
+
+    #[test]
+    fn f8_reports_unavailable_gpm_only_once_per_run() {
+        let mut cursor = VirtualCursor::default();
+        let unavailable = ConsolePointerAvailability {
+            physical_linux_console: true,
+            gpm_supported: true,
+            gpm_connected: false,
+            openrc_managed: true,
+        };
+
+        assert!(activate_virtual_cursor_and_take_gpm_notice(&mut cursor, unavailable).is_some());
+        assert_eq!(
+            cursor.handle_key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)),
+            VirtualCursorKey::Consumed
+        );
+        assert!(!cursor.active);
+        assert_eq!(
+            activate_virtual_cursor_and_take_gpm_notice(&mut cursor, unavailable),
+            None
+        );
+        assert!(cursor.active);
+    }
+
     #[test]
     fn virtual_cursor_renders_a_reversed_square_over_an_empty_cell() {
         let backend = TestBackend::new(7, 3);
@@ -9567,6 +9925,7 @@ mod tests {
             column: 3,
             row: 1,
             bounds: Rect::new(0, 0, 7, 3),
+            ..VirtualCursor::default()
         };
 
         terminal
@@ -9586,6 +9945,7 @@ mod tests {
             column: 2,
             row: 1,
             bounds: Rect::new(1, 1, 6, 3),
+            ..VirtualCursor::default()
         };
         let moved = MouseEvent {
             kind: MouseEventKind::Moved,
@@ -9985,26 +10345,6 @@ mod tests {
                 "{screen:?} first row must remain visible"
             );
         }
-    }
-
-    #[test]
-    fn playback_start_status_cycles_ascii_frames_and_restores_plain_status() {
-        let mut view = ViewModel {
-            playback_starting: true,
-            status_line: "Loading Fixture audio…".to_owned(),
-            ..ViewModel::default()
-        };
-
-        for (frame, symbol) in ASCII_ACTIVITY_FRAMES.into_iter().enumerate() {
-            view.playback_start_animation_frame = frame;
-            assert_eq!(
-                animated_status_line(&view),
-                format!("{symbol} Loading Fixture audio…")
-            );
-        }
-
-        view.playback_starting = false;
-        assert_eq!(animated_status_line(&view), "Loading Fixture audio…");
     }
 
     #[test]
@@ -16323,6 +16663,105 @@ mod tests {
         assert!(hit_map.buttons.iter().all(|(action, _)| {
             !matches!(action, UiAction::TogglePause | UiAction::ActivateSelection)
         }));
+    }
+
+    #[test]
+    fn transient_openrc_notice_replaces_then_restores_the_one_line_footer() {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let notice = "Run rc-service gpm start. GPM mouse unavailable; F8 pointer remains active.";
+
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    Screen::Search,
+                    YouTubeSearchSort::Relevance,
+                    RadioSort::Name,
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
+                    false,
+                    Some(LocalSizeSort::Off),
+                    notice,
+                    false,
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("draw GPM notice");
+
+        assert!(
+            rendered_text(&terminal).contains("Run rc-service gpm start"),
+            "the actionable command must survive narrow footer clipping"
+        );
+        assert!(
+            hit_map.buttons.is_empty(),
+            "replaced controls must not leave invisible click targets"
+        );
+
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    Screen::Search,
+                    YouTubeSearchSort::Relevance,
+                    RadioSort::Name,
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
+                    false,
+                    Some(LocalSizeSort::Off),
+                    "",
+                    false,
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("restore footer controls");
+
+        let restored = rendered_text(&terminal);
+        assert!(!restored.contains("rc-service"));
+        assert!(restored.contains("[/] Search"));
+        assert!(!hit_map.buttons.is_empty());
+    }
+
+    #[test]
+    fn transient_footer_notice_never_inherits_playback_start_animation() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let view = ViewModel {
+            playback_starting: true,
+            playback_start_animation_frame: 0,
+            transient_footer_notice: Some("Run rc-service gpm start.".to_owned()),
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw direct footer notice");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let footer_y = area.bottom().saturating_sub(1);
+        let footer = (area.x..area.right())
+            .map(|x| buffer[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(footer.starts_with("Run rc-service gpm start."));
+        assert!(!footer.starts_with("| "));
+        assert!(hit_map.buttons.is_empty());
     }
 
     #[test]

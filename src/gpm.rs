@@ -69,8 +69,8 @@ impl LinuxConsoleInput {
     /// Connects only when the process is attached directly to `/dev/ttyN`.
     ///
     /// Missing sockets, inactive daemons, permissions, PTYs, and unsupported
-    /// descriptor layouts all return `None`; callers should silently retain
-    /// their normal terminal-keyboard input path.
+    /// descriptor layouts all return `None`; callers retain their normal
+    /// terminal-keyboard input path and may retry on an explicit F8 press.
     pub(crate) fn try_current() -> Option<Self> {
         let virtual_console = current_virtual_console()?;
         Self::connect(Path::new(GPM_CONTROL_SOCKET), virtual_console).ok()
