@@ -10366,6 +10366,46 @@ mod tests {
     }
 
     #[test]
+    fn physical_linux_console_keeps_started_titles_roman_and_color_stable() {
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            physical_linux_console: true,
+            rows: vec![RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "tty-started")),
+                title: "Started on a Linux console".to_owned(),
+                source: "YouTube".to_owned(),
+                playback_started: true,
+                ..RowView::default()
+            }],
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw physical-console playback state");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(4, 1)].symbol(), "◐");
+        assert!(
+            !buffer[(6, 1)].modifier.contains(Modifier::ITALIC),
+            "the Linux console simulates italic with color, so its state marker must carry progress"
+        );
+    }
+
+    #[test]
     fn main_panels_are_borderless_and_details_reclaim_the_generic_heading_row() {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
