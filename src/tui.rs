@@ -4470,7 +4470,10 @@ fn render_information_panel(
         );
     }
     if view.external_opener_available
-        && kind != InformationPanelKind::Radio
+        && matches!(
+            kind,
+            InformationPanelKind::Video | InformationPanelKind::Channel
+        )
         && details.channel_webpage_url.is_some()
     {
         let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
@@ -15048,6 +15051,9 @@ mod tests {
                 title: "Fixture episode".to_owned(),
                 source: "Apple Podcasts".to_owned(),
                 description: "Episode notes".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://podcasts.example/show").expect("podcast website"),
+                ),
                 length: "42:05".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
@@ -15065,6 +15071,7 @@ mod tests {
         assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(rendered.contains("Length: 42:05"));
         assert!(!rendered.contains(&format!("{} video", system_url_opener_name())));
+        assert!(!rendered.contains(&format!("{} channel", system_url_opener_name())));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(
@@ -15073,12 +15080,21 @@ mod tests {
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenInBrowser)
         );
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenChannelInBrowser)
+        );
 
         view.rows[0].title = "Fixture show".to_owned();
         view.details = Some(DetailView {
             title: "Fixture show".to_owned(),
             source: "Apple Podcasts".to_owned(),
             description: "Show notes".to_owned(),
+            channel_webpage_url: Some(
+                url::Url::parse("https://podcasts.example/show").expect("podcast website"),
+            ),
             ..DetailView::default()
         });
         terminal
