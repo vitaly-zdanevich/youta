@@ -39,7 +39,7 @@ use crate::config::{
     BandcampAudioFormat, DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout,
     ThumbnailMode,
 };
-use crate::domain::{Chapter, MediaId, MediaKind, decode_url_path_segment_once};
+use crate::domain::{Chapter, MediaId, MediaKind, SourceKind, decode_url_path_segment_once};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
@@ -1039,6 +1039,16 @@ pub struct DownloadView {
     pub completed_path: Option<String>,
 }
 
+/// A live Radio stream capture that remains private until it is finalized.
+///
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RadioRecordingView {
+    /// Stable curated-station identifier owning this capture.
+    pub station_id: String,
+    /// Human-readable station name shown beside the recording marker.
+    pub station_name: String,
+}
+
 /// Complete immutable view rendered for one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewModel {
@@ -1107,6 +1117,8 @@ pub struct ViewModel {
     /// Fresh provider metadata is preferred; the player may supply ICY
     /// metadata as a fallback without replacing the stable station title.
     pub radio_now_playing: Option<String>,
+    /// Active original-quality Radio capture, if one is being staged privately.
+    pub radio_recording: Option<RadioRecordingView>,
     /// Chapters inferred for the authoritative playing media.
     pub playback_chapters: Vec<Chapter>,
     /// Whether chapter labels include their timestamps.
@@ -1200,6 +1212,7 @@ impl Default for ViewModel {
             waveform: Vec::new(),
             playback: PlaybackStatus::default(),
             radio_now_playing: None,
+            radio_recording: None,
             playback_chapters: Vec::new(),
             show_chapter_timestamps: true,
             skip_advertisement_chapters: true,
@@ -1377,6 +1390,8 @@ pub enum UiAction {
     CycleRadioSort,
     /// Toggle the selected Radio station in persistent favorites.
     ToggleRadioFavorite,
+    /// Start or stop original-quality capture of the currently playing Radio station.
+    ToggleRadioRecording,
     /// Toggle between details and waveform.
     ToggleWaveform,
     /// Show information about the playing channel.
@@ -3686,6 +3701,9 @@ fn render_body(
         true,
         view.selected,
         view.playing_media_id.as_ref(),
+        view.radio_recording
+            .as_ref()
+            .map(|recording| recording.station_id.as_str()),
         !view.physical_linux_console,
         theme.heading,
         theme,
@@ -3738,6 +3756,7 @@ fn render_row_list(
     show_source: bool,
     selected_index: usize,
     playing_media_id: Option<&MediaId>,
+    recording_station_id: Option<&str>,
     allow_started_title_italics: bool,
     heading_style: Style,
     theme: &Theme,
@@ -3817,6 +3836,12 @@ fn render_row_list(
             } else {
                 theme.accent.add_modifier(Modifier::BOLD)
             };
+            let radio_recording = recording_station_id.is_some_and(|station_id| {
+                row.media_id.as_ref().is_some_and(|media_id| {
+                    media_id.source == SourceKind::Radio && media_id.external_id == station_id
+                })
+            });
+            let recording_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
             let watched_marker = if has_playback_progress {
                 watched_marker(row.watched_percent, playback_started)
             } else {
@@ -3829,6 +3854,9 @@ fn render_row_list(
                 }
                 if row.radio_favorite {
                     spans.push(Span::styled("★ ", favorite_style));
+                }
+                if radio_recording {
+                    spans.push(Span::styled("● ", recording_style));
                 }
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
@@ -3962,6 +3990,9 @@ fn render_subscriptions_body(
                 false,
                 subscriptions.selected_item,
                 view.playing_media_id.as_ref(),
+                view.radio_recording
+                    .as_ref()
+                    .map(|recording| recording.station_id.as_str()),
                 !view.physical_linux_console,
                 theme.heading,
                 theme,
@@ -4106,6 +4137,9 @@ fn render_subscriptions_body(
                     false,
                     subscriptions.selected_item,
                     view.playing_media_id.as_ref(),
+                    view.radio_recording
+                        .as_ref()
+                        .map(|recording| recording.station_id.as_str()),
                     !view.physical_linux_console,
                     item_heading,
                     theme,
@@ -4149,6 +4183,9 @@ fn render_subscription_source_list(
         true,
         view.subscriptions.selected_source,
         view.playing_media_id.as_ref(),
+        view.radio_recording
+            .as_ref()
+            .map(|recording| recording.station_id.as_str()),
         !view.physical_linux_console,
         heading_style,
         theme,
@@ -4647,6 +4684,25 @@ fn render_information_panel(
             label,
             theme.accent,
             UiAction::OpenInBrowser,
+        );
+    }
+    if kind == InformationPanelKind::Radio {
+        let active = view.radio_recording.is_some();
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button(
+                "r",
+                if active { "Stop recording" } else { "Record" },
+                show_hotkeys,
+            ),
+            if active {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                theme.accent
+            },
+            UiAction::ToggleRadioRecording,
         );
     }
     if cfg!(feature = "local-move") && kind == InformationPanelKind::Local && details.local_movable
@@ -5872,10 +5928,21 @@ fn render_seek_bar(
     };
     let live_seekable =
         view.playback.live && view.playback.live_seekable_range.is_some() && !duration.is_zero();
+    let recording_prefix = view
+        .radio_recording
+        .as_ref()
+        .is_some_and(|recording| {
+            view.playing_media_id.as_ref().is_some_and(|media_id| {
+                media_id.source == SourceKind::Radio && media_id.external_id == recording.station_id
+            })
+        })
+        .then_some("● REC  ")
+        .unwrap_or_default();
+    let recording_active = !recording_prefix.is_empty();
     let status_prefix = if view.playback.live {
         if live_seekable {
             format!(
-                "LIVE −{} / {} buffer  {}×  vol {}%{state_suffix}{title_spacing}",
+                "{recording_prefix}LIVE −{} / {} buffer  {}×  vol {}%{state_suffix}{title_spacing}",
                 format_duration(duration.saturating_sub(view.playback.position)),
                 format_duration(duration),
                 trim_speed(view.playback.speed),
@@ -5883,7 +5950,7 @@ fn render_seek_bar(
             )
         } else {
             format!(
-                "LIVE  {}×  vol {}%{state_suffix}{title_spacing}",
+                "{recording_prefix}LIVE  {}×  vol {}%{state_suffix}{title_spacing}",
                 trim_speed(view.playback.speed),
                 view.playback.volume,
             )
@@ -5932,6 +5999,7 @@ fn render_seek_bar(
             &label,
             title_offset,
             title_width,
+            recording_active,
             hit_map,
         );
         return;
@@ -5963,6 +6031,7 @@ fn render_seek_bar(
             &label,
             title_offset,
             title_width,
+            recording_active,
             hit_map,
         );
         hit_map.seek_bar = track_area;
@@ -5996,6 +6065,7 @@ fn render_seek_bar(
             &label,
             title_offset,
             title_width,
+            recording_active,
             hit_map,
         );
         hit_map.seek_bar = track_area;
@@ -6021,13 +6091,22 @@ fn render_seek_status(
     label: &str,
     title_offset: Option<u16>,
     title_width: u16,
+    recording_active: bool,
     hit_map: &mut HitMap,
 ) {
     let visible_label = truncate_terminal_text(label, usize::from(area.width));
-    frame.render_widget(
-        Paragraph::new(visible_label.clone()).alignment(Alignment::Center),
-        area,
-    );
+    let line = if recording_active && visible_label.starts_with("● REC  ") {
+        Line::from(vec![
+            Span::styled(
+                "● REC",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(visible_label["● REC".len()..].to_owned()),
+        ])
+    } else {
+        Line::raw(visible_label.clone())
+    };
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
     set_now_playing_target(area, &visible_label, title_offset, title_width, hit_map);
 }
 
@@ -8960,6 +9039,7 @@ fn key_action_with_page_rows_unfiltered(
         }
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
         KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
+        KeyCode::Char('r') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioRecording),
         KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         #[cfg(feature = "local-rename")]
         KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
@@ -11137,6 +11217,7 @@ mod tests {
                     true,
                     0,
                     None,
+                    None,
                     true,
                     Theme::new(false).heading,
                     &Theme::new(false),
@@ -11200,6 +11281,7 @@ mod tests {
                     &rows,
                     true,
                     0,
+                    None,
                     None,
                     true,
                     Theme::new(false).heading,
@@ -15153,6 +15235,10 @@ mod tests {
                 ..RowView::default()
             }],
             playing_media_id: Some(media_id),
+            radio_recording: Some(RadioRecordingView {
+                station_id: "sector-radio-progressive-flac".to_owned(),
+                station_name: "Sector Radio — Progressive".to_owned(),
+            }),
             details: Some(DetailView {
                 title: "Sector Radio — Progressive".to_owned(),
                 source: "Radio".to_owned(),
@@ -15175,8 +15261,14 @@ mod tests {
             .expect("draw Radio details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("▶ ★ Sector Radio — Progressive"));
+        assert!(rendered.contains("▶ ★ ● Sector Radio — Progressive"));
         assert!(rendered.contains("[f] Unfavorite"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::ToggleRadioRecording)
+        );
         assert!(!rendered.contains("▶ ● Sector Radio"));
         assert!(!rendered.contains("42%"));
         assert!(rendered.contains("FLAC · variable bitrate · 44.1 kHz"));
@@ -15220,6 +15312,10 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleRadioFavorite)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleRadioRecording)
         );
         assert!(
             hit_map

@@ -142,6 +142,8 @@ use crate::tui::DownloadView;
 #[cfg(feature = "local-move")]
 use crate::tui::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
+use crate::tui::RadioRecordingView;
+#[cfg(feature = "radio")]
 use crate::tui::RadioSort;
 use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
@@ -1152,6 +1154,7 @@ fn is_supported_media_path(path: &str) -> bool {
             | "mp3"
             | "ogg"
             | "oga"
+            | "mka"
             | "webm"
             | "mkv"
             | "mp4"
@@ -1167,6 +1170,222 @@ fn is_supported_media_path(path: &str) -> bool {
             | "mtm"
             | "669"
     )
+}
+
+/// Selects a libavformat filename extension compatible with an advertised Radio codec.
+///
+/// mpv implements `stream-record` through libavformat and selects its output
+/// container from the filename extension. A codec-matched extension lets mpv
+/// copy original encoded packets; forcing `.mka` can fail for otherwise
+/// playable streams. BBC uses its cached resolved-manifest codec when present;
+/// only genuinely unknown streams retain `.mka` as the general fallback, and
+/// mpv reports a clear backend error when it cannot mux that stream.
+#[cfg(feature = "radio")]
+fn radio_recording_extension(codec: Option<RadioCodec>, stream: &str) -> &'static str {
+    match codec {
+        Some(RadioCodec::Flac) => "flac",
+        Some(RadioCodec::Mp3) => "mp3",
+        Some(RadioCodec::Aac) => "aac",
+        Some(RadioCodec::Opus) => "opus",
+        Some(RadioCodec::Vorbis) => "ogg",
+        Some(RadioCodec::Pcm) => "wav",
+        None => radio_stream_extension(stream).unwrap_or("mka"),
+    }
+}
+
+/// Extracts a known audio-container extension from a trusted built-in stream URL.
+#[cfg(feature = "radio")]
+fn radio_stream_extension(stream: &str) -> Option<&'static str> {
+    let url = url::Url::parse(stream).ok()?;
+    let path = url.path();
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "flac" => Some("flac"),
+        "mp3" => Some("mp3"),
+        "aac" => Some("aac"),
+        "opus" => Some("opus"),
+        "ogg" | "oga" => Some("ogg"),
+        "wav" => Some("wav"),
+        "mka" => Some("mka"),
+        _ => None,
+    }
+}
+
+/// Converts the trusted codec label obtained from a BBC manifest into an output extension.
+#[cfg(feature = "bbc-radio")]
+fn radio_recording_extension_from_bbc_codec(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "flac" => Some("flac"),
+        "mp3" | "mpeg audio layer 3" => Some("mp3"),
+        "aac" | "aac-lc" | "he-aac" => Some("aac"),
+        "opus" => Some("opus"),
+        "vorbis" => Some("ogg"),
+        "pcm" | "pcm_s16le" | "pcm_s24le" => Some("wav"),
+        _ => None,
+    }
+}
+
+/// Creates a restricted runtime child and returns one unused extension-bearing path.
+#[cfg(feature = "radio")]
+fn prepare_radio_recording_staging_path(
+    config: &Config,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    config
+        .ensure_directories()
+        .map_err(|error| format!("cannot prepare Youta directories: {error}"))?;
+    let directory = config.runtime_dir().join("radio-recordings");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create private recording directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure private recording directory: {error}"))?;
+    }
+    let sequence = RADIO_RECORDING_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for retry in 0..1024_u32 {
+        let path = directory.join(format!(".radio-{timestamp}-{sequence}-{retry}.{extension}"));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(format!("cannot inspect private recording path: {error}"));
+            }
+        }
+    }
+    Err("could not reserve a private Radio recording path".to_owned())
+}
+
+/// Publishes a closed regular staging file without exposing an in-progress file in Downloaded.
+#[cfg(feature = "radio")]
+fn publish_radio_recording(
+    config: &Config,
+    recording: &ActiveRadioRecording,
+) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(&recording.staging_path)
+        .map_err(|error| format!("recording output is unavailable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("recording output is not a regular private file".to_owned());
+    }
+    if metadata.len() == 0 {
+        return Err("recording output is empty".to_owned());
+    }
+    let downloads = config.downloads_dir();
+    let station = sanitized_radio_recording_station_name(&recording.station_name);
+    let timestamp = recording.started_at.format("%Y-%m-%d %H-%M-%S");
+    let base = format!("{station} — {timestamp}");
+
+    for collision in 0..10_000_u32 {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!(" ({})", collision.saturating_add(1))
+        };
+        let destination = downloads.join(format!("{base}{suffix}.{}", recording.extension));
+        match publish_file_without_replacement(&recording.staging_path, &destination) {
+            Ok(()) => {
+                // The destination link is durable enough to discover only after
+                // the complete output has been closed. A stale private source is
+                // harmless and never appears in Downloaded.
+                let _ = std::fs::remove_file(&recording.staging_path);
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                return publish_radio_recording_via_download_staging(
+                    &recording.staging_path,
+                    &destination,
+                )
+                .map(|()| destination)
+                .map_err(|error| format!("cannot publish recording safely: {error}"));
+            }
+            Err(error) => return Err(format!("cannot publish recording safely: {error}")),
+        }
+    }
+    Err("too many existing recordings share this station and second".to_owned())
+}
+
+/// Links one complete file into its final name; hard links provide no-replace publication.
+#[cfg(feature = "radio")]
+fn publish_file_without_replacement(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    std::fs::File::open(destination)?.sync_all()
+}
+
+/// Copies across filesystems into a hidden Downloaded staging file before final publication.
+#[cfg(feature = "radio")]
+fn publish_radio_recording_via_download_staging(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("recording destination has no parent"))?;
+    let sequence = RADIO_RECORDING_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let staging = parent.join(format!(".youta-radio-recording-{sequence}.part"));
+    let result = (|| {
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        publish_file_without_replacement(&staging, destination)
+    })();
+    let _ = std::fs::remove_file(&staging);
+    if result.is_ok() {
+        // A successful cross-filesystem copy has made the complete public
+        // destination authoritative. The private source is no longer needed;
+        // cleanup remains best-effort because a complete Downloaded item must
+        // not be reported as failed solely due to a stale private runtime file.
+        remove_radio_recording_file(source);
+    }
+    result
+}
+
+/// Replaces path separators and control bytes while preserving a readable station label.
+#[cfg(feature = "radio")]
+fn sanitized_radio_recording_station_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\' | ':' | '\0') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "Radio station".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+/// Best-effort removal used only for unpublished private staging paths.
+#[cfg(feature = "radio")]
+fn remove_radio_recording_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 
 /// Returns the deliberately narrow search route for a screen.
@@ -2516,6 +2735,30 @@ const RADIO_NOW_PLAYING_FAILURE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(10 * 60),
 ];
 
+/// Monotonic suffix used with the wall-clock component of a private recording path.
+///
+/// The runtime directory is private, but two recording requests can still land
+/// in the same clock tick. Keeping this process-local counter avoids asking the
+/// playback backend to replace an earlier staging file.
+#[cfg(feature = "radio")]
+static RADIO_RECORDING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// One live radio capture that has not yet been published to Downloaded.
+///
+/// The path is deliberately controller-only: it identifies a private runtime
+/// file rather than a user-visible download. The station identity prevents a
+/// row selection change from redirecting an in-progress capture.
+#[cfg(feature = "radio")]
+#[derive(Clone, Debug)]
+struct ActiveRadioRecording {
+    station_id: String,
+    station_name: String,
+    staging_path: PathBuf,
+    /// Extension selected from the advertised encoded stream for mpv's muxer.
+    extension: &'static str,
+    started_at: DateTime<Local>,
+}
+
 /// Default application state used by the interactive terminal.
 pub struct AppController {
     config: Config,
@@ -2583,6 +2826,10 @@ pub struct AppController {
     /// Request owner rejecting completions after route changes.
     #[cfg(feature = "radio")]
     radio_now_playing_generation: u64,
+    /// Active private capture that will become a Downloaded item only after
+    /// the backend has stopped and finalization succeeds.
+    #[cfg(feature = "radio")]
+    active_radio_recording: Option<ActiveRadioRecording>,
     /// Monotonic owner rejecting BBC manifests for superseded play actions.
     #[cfg(feature = "bbc-radio")]
     bbc_playback_generation: u64,
@@ -3278,6 +3525,8 @@ impl AppController {
             pending_radio_now_playing: None,
             #[cfg(feature = "radio")]
             radio_now_playing_generation: 0,
+            #[cfg(feature = "radio")]
+            active_radio_recording: None,
             #[cfg(feature = "bbc-radio")]
             bbc_playback_generation: 0,
             #[cfg(feature = "bbc-radio")]
@@ -12469,6 +12718,15 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        #[cfg(feature = "radio")]
+        if self.active_radio_recording.is_some()
+            && self.current_media.as_ref() != Some(&item.media.id)
+        {
+            // mpv owns only one stream-record target. Finish the current
+            // capture before replacing the stream, rather than letting a
+            // backend transition silently leave a partial public file.
+            self.stop_active_radio_recording();
+        }
         if !queue_cursor_already_positioned {
             self.queued_autoplay_resume_origin = None;
             #[cfg(feature = "tracker-music")]
@@ -12864,6 +13122,8 @@ impl AppController {
                 Ok(Some(PlaybackEvent::ProcessExited { diagnostic })) => {
                     let message = diagnostic
                         .unwrap_or_else(|| "mpv exited without diagnostic output".to_owned());
+                    #[cfg(feature = "radio")]
+                    self.discard_active_radio_recording();
                     self.prepare_to_clear_playback(elapsed);
                     self.reset_playback_state();
                     if let Some(mut player) = self.player.take() {
@@ -12880,6 +13140,8 @@ impl AppController {
             }
         }
 
+        #[cfg(feature = "radio")]
+        self.disable_and_discard_active_radio_recording();
         self.prepare_to_clear_playback(elapsed);
         self.reset_playback_state();
         if let Some(mut player) = self.player.take() {
@@ -12893,6 +13155,8 @@ impl AppController {
     }
 
     fn handle_playback_end(&mut self, end: PlaybackEnd, elapsed: Duration) {
+        #[cfg(feature = "radio")]
+        self.discard_active_radio_recording();
         if self.retry_youtube_load(&end) {
             return;
         }
@@ -13122,6 +13386,8 @@ impl AppController {
     where
         E: std::error::Error + 'static,
     {
+        #[cfg(feature = "radio")]
+        self.disable_and_discard_active_radio_recording();
         self.prepare_to_clear_playback(elapsed);
         self.reset_playback_state();
         if let Some(mut player) = self.player.take() {
@@ -13641,6 +13907,217 @@ impl AppController {
             .and_then(|row| row.media_id.as_ref())
             .filter(|media_id| media_id.source == SourceKind::Radio)
             .and_then(|media_id| station_by_id(&media_id.external_id))
+    }
+
+    /// Starts or stops capture for the Radio row that is audibly playing.
+    ///
+    /// Recording is deliberately unavailable from every other screen and for
+    /// merely selected stations. `mpv` receives `stream-record`, so the
+    /// original encoded packets are copied instead of being decoded and
+    /// re-encoded by Youta.
+    #[cfg(feature = "radio")]
+    fn toggle_radio_recording(&mut self) {
+        if self.view.screen != Screen::Radio {
+            self.view.status_line = "Open Radio to control live recording".to_owned();
+            return;
+        }
+        if self.active_radio_recording.is_some() {
+            self.stop_active_radio_recording();
+            return;
+        }
+
+        let Some(playing) = self.view.playing_media_id.as_ref() else {
+            self.view.status_line = "Play a Radio station before recording".to_owned();
+            return;
+        };
+        if playing.source != SourceKind::Radio {
+            self.view.status_line =
+                "Only the currently playing Radio station can be recorded".to_owned();
+            return;
+        }
+        let Some(station) = self.selected_radio_station() else {
+            self.view.status_line =
+                "Select the currently playing Radio station to record it".to_owned();
+            return;
+        };
+        if station.id != playing.external_id {
+            self.view.status_line =
+                "Select the currently playing Radio station to control its recording".to_owned();
+            return;
+        }
+
+        self.start_radio_recording(station);
+    }
+
+    /// Starts one private stream-record capture after validating its exact live owner.
+    #[cfg(feature = "radio")]
+    fn start_radio_recording(&mut self, station: RadioStationPreset) {
+        let Some(player) = self.player.as_mut() else {
+            self.view.status_line = "Nothing is playing".to_owned();
+            return;
+        };
+        // mpv's `stream-record` delegates container selection to libavformat
+        // using this filename extension. Matching the advertised source codec
+        // preserves the original packets without demanding an incompatible
+        // Matroska mux for every station.
+        #[cfg(feature = "bbc-radio")]
+        let bbc_extension = (station.stream_kind == RadioStreamKind::BbcSounds)
+            .then(|| {
+                self.bbc_quality_cache
+                    .get(station.id)
+                    .and_then(|quality| radio_recording_extension_from_bbc_codec(&quality.codec))
+            })
+            .flatten();
+        #[cfg(not(feature = "bbc-radio"))]
+        let bbc_extension: Option<&'static str> = None;
+        let extension = bbc_extension
+            .unwrap_or_else(|| radio_recording_extension(station.codec, station.stream));
+        let staging_path = match prepare_radio_recording_staging_path(&self.config, extension) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_error_message("Cannot start Radio recording", error);
+                return;
+            }
+        };
+        if let Err(error) = player.command(PlayerCommand::SetStreamRecording(Some(
+            staging_path.clone(),
+        ))) {
+            // A failed property write may have reached mpv after it opened the
+            // output. Do not unlink until the uncertain backend is stopped.
+            self.shutdown_player_after_recording_stop_failure();
+            remove_radio_recording_file(&staging_path);
+            self.show_error("Cannot start Radio recording", &error);
+            return;
+        }
+        self.active_radio_recording = Some(ActiveRadioRecording {
+            station_id: station.id.to_owned(),
+            station_name: station.name.to_owned(),
+            staging_path,
+            extension,
+            started_at: Local::now(),
+        });
+        self.view.radio_recording =
+            self.active_radio_recording
+                .as_ref()
+                .map(|recording| RadioRecordingView {
+                    station_id: recording.station_id.clone(),
+                    station_name: recording.station_name.clone(),
+                });
+        self.view.status_line = format!("Recording {} in original stream quality", station.name);
+    }
+
+    /// Stops `stream-record` and publishes its complete result without replacing a file.
+    #[cfg(feature = "radio")]
+    fn stop_active_radio_recording(&mut self) {
+        let Some(recording) = self.active_radio_recording.take() else {
+            self.view.status_line = "No Radio recording is active".to_owned();
+            return;
+        };
+        let stop_result = self
+            .player
+            .as_mut()
+            .ok_or_else(|| "the playback backend is no longer available".to_owned())
+            .and_then(|player| {
+                player
+                    .command(PlayerCommand::SetStreamRecording(None))
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = stop_result {
+            // A rejected IPC command leaves the backend state unknown. Shut it
+            // down before unlinking so it cannot continue writing an unlinked
+            // private inode while a replacement item starts.
+            self.shutdown_player_after_recording_stop_failure();
+            remove_radio_recording_file(&recording.staging_path);
+            self.view.radio_recording = None;
+            self.show_error_message(
+                "Radio recording was discarded",
+                format!("could not stop the stream capture safely: {error}"),
+            );
+            return;
+        }
+        self.publish_stopped_radio_recording(recording);
+    }
+
+    /// Finalizes a recording whose backend has already been stopped during graceful shutdown.
+    #[cfg(feature = "radio")]
+    fn finalize_radio_recording_for_shutdown(&mut self) {
+        let Some(recording) = self.active_radio_recording.take() else {
+            return;
+        };
+        let stop_result = self
+            .player
+            .as_mut()
+            .ok_or_else(|| "the playback backend is no longer available".to_owned())
+            .and_then(|player| {
+                player
+                    .command(PlayerCommand::SetStreamRecording(None))
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = stop_result {
+            // Shutdown is already in progress; make the backend exit before
+            // removing the staging pathname for the same inode-safety reason.
+            self.shutdown_player_after_recording_stop_failure();
+            remove_radio_recording_file(&recording.staging_path);
+            self.view.radio_recording = None;
+            self.show_error_message(
+                "Radio recording was discarded during shutdown",
+                format!("could not stop the stream capture safely: {error}"),
+            );
+            return;
+        }
+        self.publish_stopped_radio_recording(recording);
+    }
+
+    /// Moves a fully closed private capture into Downloaded and refreshes that view when open.
+    #[cfg(feature = "radio")]
+    fn publish_stopped_radio_recording(&mut self, recording: ActiveRadioRecording) {
+        self.view.radio_recording = None;
+        match publish_radio_recording(&self.config, &recording) {
+            Ok(path) => {
+                self.view.status_line = format!("Radio recording saved: {}", path.display());
+                if self.view.screen == Screen::Downloaded {
+                    self.populate_downloads();
+                }
+            }
+            Err(error) => {
+                remove_radio_recording_file(&recording.staging_path);
+                self.show_error_message("Radio recording was discarded", error);
+            }
+        }
+    }
+
+    /// Stops an uncertain backend before discarding its private capture.
+    #[cfg(feature = "radio")]
+    fn shutdown_player_after_recording_stop_failure(&mut self) {
+        if let Some(mut player) = self.player.take() {
+            let _ = player.shutdown();
+        }
+        self.reset_playback_state();
+    }
+
+    /// Removes a capture only after a terminal backend event proves it stopped writing.
+    #[cfg(feature = "radio")]
+    fn discard_active_radio_recording(&mut self) {
+        if let Some(recording) = self.active_radio_recording.take() {
+            remove_radio_recording_file(&recording.staging_path);
+            self.view.radio_recording = None;
+            self.view.status_line =
+                "Radio recording was discarded because playback ended".to_owned();
+        }
+    }
+
+    /// Stops the backend before discarding a capture during an internal player failure.
+    #[cfg(feature = "radio")]
+    fn disable_and_discard_active_radio_recording(&mut self) {
+        let Some(recording) = self.active_radio_recording.take() else {
+            return;
+        };
+        if let Some(mut player) = self.player.take() {
+            let _ = player.command(PlayerCommand::SetStreamRecording(None));
+            let _ = player.shutdown();
+        }
+        remove_radio_recording_file(&recording.staging_path);
+        self.view.radio_recording = None;
     }
 
     /// Maps the visible filtered selection back to the complete sorted catalogue.
@@ -18098,6 +18575,8 @@ impl AppController {
         self.clear_search_activity();
         self.clear_playback_start_activity();
         self.shutdown_local_browse_worker();
+        #[cfg(feature = "radio")]
+        self.finalize_radio_recording_for_shutdown();
         self.view.playing_media_id = None;
         #[cfg(feature = "bandcamp")]
         self.shutdown_bandcamp_resolver();
@@ -18470,6 +18949,7 @@ impl UiController for AppController {
             UiAction::ToggleLocalSizeSort => self.toggle_local_size_sort(),
             UiAction::CycleRadioSort => self.cycle_radio_sort(),
             UiAction::ToggleRadioFavorite => self.toggle_selected_radio_favorite(),
+            UiAction::ToggleRadioRecording => self.toggle_radio_recording(),
             UiAction::ToggleWaveform => {
                 self.view.right_panel_mode =
                     if self.view.right_panel_mode == RightPanelMode::Waveform {
@@ -43397,5 +43877,342 @@ mod tests {
             .send(ProviderRequest::Shutdown)
             .expect("worker shutdown");
         worker.join().expect("worker thread");
+    }
+
+    #[cfg(feature = "radio")]
+    fn radio_recording_controller(
+        temporary: &tempfile::TempDir,
+    ) -> (
+        AppController,
+        Arc<Mutex<MockPlaybackState>>,
+        RadioStationPreset,
+    ) {
+        let (factory, state, _, _) = mock_playback_factory(
+            Vec::<crate::playback::PlaybackStatus>::new(),
+            Vec::<PlaybackEvent>::new(),
+        );
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        let station = station_by_id("radio-swiss-classic").expect("direct Radio fixture");
+        controller.show_screen(Screen::Radio);
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|id| id.external_id == station.id)
+            })
+            .expect("visible Radio fixture");
+        controller.play_queue_item(
+            queue_item_from_radio_station(&station).expect("Radio queue item"),
+            false,
+        );
+        controller.view.playing_media_id = Some(MediaId::new(SourceKind::Radio, station.id));
+        controller.playback_phase = PlaybackPhase::Playing;
+        (controller, state, station)
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_starts_only_for_the_playing_station_in_private_runtime() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let (mut controller, state, station) = radio_recording_controller(&temporary);
+
+        controller.dispatch(UiAction::ToggleRadioRecording);
+
+        let recording = controller
+            .active_radio_recording
+            .as_ref()
+            .expect("active capture");
+        assert_eq!(recording.station_id, station.id);
+        assert!(
+            recording
+                .staging_path
+                .starts_with(controller.config.runtime_dir())
+        );
+        assert!(
+            recording
+                .staging_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".radio-"))
+        );
+        assert_eq!(
+            recording.extension,
+            radio_recording_extension(station.codec, station.stream)
+        );
+        assert_eq!(
+            controller
+                .view
+                .radio_recording
+                .as_ref()
+                .map(|view| view.station_name.as_str()),
+            Some(station.name)
+        );
+        assert!(state.lock().expect("mock commands").commands.iter().any(
+            |command| matches!(command, PlayerCommand::SetStreamRecording(Some(path)) if path == &recording.staging_path)
+        ));
+        assert!(
+            !controller.config.downloads_dir().exists()
+                || std::fs::read_dir(controller.config.downloads_dir())
+                    .expect("downloads listing")
+                    .next()
+                    .is_none(),
+            "private staging must not be discoverable as a download"
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_stop_finalizes_and_downloaded_lists_only_the_final_file() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let (mut controller, state, station) = radio_recording_controller(&temporary);
+        controller.toggle_radio_recording();
+        let staging = controller
+            .active_radio_recording
+            .as_ref()
+            .unwrap()
+            .staging_path
+            .clone();
+        std::fs::write(&staging, b"encoded packets").expect("mock stream output");
+
+        controller.toggle_radio_recording();
+
+        assert!(controller.active_radio_recording.is_none());
+        assert!(controller.view.radio_recording.is_none());
+        let downloads = std::fs::read_dir(controller.config.downloads_dir())
+            .expect("downloads listing")
+            .map(|entry| entry.expect("download entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(downloads.len(), 1);
+        assert!(
+            downloads[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{} — ", station.name))
+        );
+        assert_eq!(
+            state.lock().expect("mock commands").commands.last(),
+            Some(&PlayerCommand::SetStreamRecording(None))
+        );
+        controller.show_screen(Screen::Downloaded);
+        assert_eq!(controller.view.rows.len(), 1);
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_collision_preserves_the_existing_download() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        config.ensure_directories().expect("Youta directories");
+        let started_at = Local::now();
+        let extension = "mp3";
+        let station_name = "Station / unsafe";
+        let staging = prepare_radio_recording_staging_path(&config, extension).expect("staging");
+        std::fs::write(&staging, b"new packets").expect("private output");
+        let recording = ActiveRadioRecording {
+            station_id: "fixture".to_owned(),
+            station_name: station_name.to_owned(),
+            staging_path: staging,
+            extension,
+            started_at,
+        };
+        let original = config.downloads_dir().join(format!(
+            "{} — {}.{}",
+            sanitized_radio_recording_station_name(station_name),
+            recording.started_at.format("%Y-%m-%d %H-%M-%S"),
+            extension
+        ));
+        std::fs::write(&original, b"existing recording").expect("existing download");
+
+        let published =
+            publish_radio_recording(&config, &recording).expect("collision-safe publish");
+
+        assert!(
+            published
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("(2).mp3")
+        );
+        assert_eq!(
+            std::fs::read(&original).expect("existing recording"),
+            b"existing recording"
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn cross_filesystem_recording_publish_removes_private_and_hidden_staging_files() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let source = temporary.path().join("private.aac");
+        let downloads = temporary.path().join("downloads");
+        std::fs::create_dir(&downloads).expect("download directory");
+        std::fs::write(&source, b"original encoded packets").expect("private recording");
+        let destination = downloads.join("Station — recording.aac");
+
+        publish_radio_recording_via_download_staging(&source, &destination)
+            .expect("cross-filesystem publication path");
+
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(&destination).expect("published recording"),
+            b"original encoded packets"
+        );
+        assert_eq!(
+            std::fs::read_dir(&downloads)
+                .expect("download directory listing")
+                .count(),
+            1,
+            "the hidden copy staging file must be removed"
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_uses_codec_or_safe_stream_extension_for_mpv_muxing() {
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Flac), "https://x/live"),
+            "flac"
+        );
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Mp3), "https://x/live"),
+            "mp3"
+        );
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Aac), "https://x/live"),
+            "aac"
+        );
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Opus), "https://x/live"),
+            "opus"
+        );
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Vorbis), "https://x/live"),
+            "ogg"
+        );
+        assert_eq!(
+            radio_recording_extension(Some(RadioCodec::Pcm), "https://x/live"),
+            "wav"
+        );
+        assert_eq!(
+            radio_recording_extension(None, "https://x/live/stream.mp3"),
+            "mp3"
+        );
+        assert_eq!(
+            radio_recording_extension(None, "https://x/live/playlist.m3u"),
+            "mka"
+        );
+    }
+
+    #[cfg(feature = "bbc-radio")]
+    #[test]
+    fn bbc_manifest_quality_uses_its_codec_before_the_unknown_mka_fallback() {
+        assert_eq!(radio_recording_extension_from_bbc_codec("AAC"), Some("aac"));
+        assert_eq!(radio_recording_extension_from_bbc_codec("MP3"), Some("mp3"));
+        assert_eq!(
+            radio_recording_extension_from_bbc_codec("Opus"),
+            Some("opus")
+        );
+        assert_eq!(
+            radio_recording_extension_from_bbc_codec("unpublished"),
+            None
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_rejects_wrong_screen_and_missing_live_station() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let (mut controller, state, _) = radio_recording_controller(&temporary);
+        controller.view.playing_media_id = None;
+        controller.toggle_radio_recording();
+        assert!(controller.active_radio_recording.is_none());
+        assert!(controller.view.status_line.contains("Play a Radio station"));
+
+        controller.view.playing_media_id = controller.current_media.clone();
+        controller.toggle_radio_recording();
+        controller.view.screen = Screen::Downloaded;
+        controller.toggle_radio_recording();
+        assert!(controller.active_radio_recording.is_some());
+        assert!(controller.view.status_line.contains("Open Radio"));
+        assert!(
+            state
+                .lock()
+                .expect("mock commands")
+                .commands
+                .iter()
+                .all(|command| !matches!(command, PlayerCommand::SetStreamRecording(None)))
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_recording_stops_after_the_radio_selection_moves() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let (mut controller, state, station) = radio_recording_controller(&temporary);
+        controller.toggle_radio_recording();
+        let staging = controller
+            .active_radio_recording
+            .as_ref()
+            .expect("active recording")
+            .staging_path
+            .clone();
+        std::fs::write(staging, b"encoded packets").expect("mock stream output");
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| {
+                row.media_id
+                    .as_ref()
+                    .is_some_and(|media| media.external_id != station.id)
+            })
+            .expect("another Radio row");
+
+        controller.toggle_radio_recording();
+
+        assert!(controller.active_radio_recording.is_none());
+        assert_eq!(
+            state.lock().expect("mock commands").commands.last(),
+            Some(&PlayerCommand::SetStreamRecording(None))
+        );
+        assert_eq!(
+            std::fs::read_dir(controller.config.downloads_dir())
+                .expect("download directory")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn shutdown_finalizes_an_active_radio_recording() {
+        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let (mut controller, state, _) = radio_recording_controller(&temporary);
+        controller.toggle_radio_recording();
+        let staging = controller
+            .active_radio_recording
+            .as_ref()
+            .unwrap()
+            .staging_path
+            .clone();
+        std::fs::write(staging, b"encoded packets").expect("mock stream output");
+
+        assert!(controller.shutdown());
+
+        assert_eq!(
+            state.lock().expect("mock commands").commands.last(),
+            Some(&PlayerCommand::SetStreamRecording(None))
+        );
+        assert_eq!(
+            std::fs::read_dir(controller.config.downloads_dir())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }

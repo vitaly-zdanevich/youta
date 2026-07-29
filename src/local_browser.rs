@@ -331,7 +331,9 @@ pub fn classify_local_file(path: &Path) -> Option<LocalEntryKind> {
     let extension = path.extension()?.to_str()?;
     if matches_ascii_case_insensitive(
         extension,
-        &["opus", "m4a", "aac", "flac", "wav", "mp3", "ogg", "oga"],
+        &[
+            "opus", "m4a", "aac", "flac", "wav", "mp3", "ogg", "oga", "mka",
+        ],
     ) {
         Some(LocalEntryKind::Audio)
     } else if matches_ascii_case_insensitive(

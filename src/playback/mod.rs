@@ -235,6 +235,11 @@ pub enum PlayerCommand {
     ChangeChapter(i32),
     /// Repeat the current item indefinitely.
     SetRepeat(bool),
+    /// Start recording a stream to this path, or stop and finalize recording.
+    ///
+    /// A [`Some`] path starts or redirects recording. [`None`] stops the
+    /// active recording and lets the backend finalize the output file.
+    SetStreamRecording(Option<PathBuf>),
     /// Stop the current item while keeping the backend available.
     Stop,
 }

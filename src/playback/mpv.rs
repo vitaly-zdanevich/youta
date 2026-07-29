@@ -540,6 +540,30 @@ mod unix {
         Ok(command)
     }
 
+    fn stream_recording_property_value(path: Option<PathBuf>) -> Result<Value> {
+        match path {
+            Some(path) => {
+                if path.as_os_str().is_empty() {
+                    return Err(PlaybackError::InvalidValue(
+                        "stream recording path cannot be empty".to_owned(),
+                    ));
+                }
+                // JSON IPC can transmit only Unicode strings. Rejecting an
+                // invalid path avoids lossy conversion to a different output
+                // filename.
+                let path = path.to_str().ok_or_else(|| {
+                    PlaybackError::InvalidValue(
+                        "stream recording path must be valid UTF-8".to_owned(),
+                    )
+                })?;
+                Ok(Value::String(path.to_owned()))
+            }
+            // mpv's `stream-record` option uses `no` to close the current
+            // output file and disable further stream recording.
+            None => Ok(Value::String("no".to_owned())),
+        }
+    }
+
     /// Validates extractor-provided fields and encodes mpv's comma-separated
     /// string-list syntax without exposing values in an error.
     fn mpv_http_header_fields(input: &PlaybackInput) -> Result<Option<String>> {
@@ -739,6 +763,9 @@ mod unix {
                 PlayerCommand::SetRepeat(enabled) => {
                     self.set_property("loop-file", json!(if enabled { "inf" } else { "no" }))?;
                 }
+                PlayerCommand::SetStreamRecording(path) => {
+                    self.set_property("stream-record", stream_recording_property_value(path)?)?;
+                }
                 PlayerCommand::Stop => {
                     self.send(&[json!("stop")])?;
                 }
@@ -912,7 +939,8 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use std::collections::BTreeMap;
-        use std::ffi::OsStr;
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
         use std::sync::mpsc;
 
         use super::*;
@@ -1072,6 +1100,75 @@ mod unix {
             )
         }
 
+        fn backend_with_command_recorder() -> (
+            MpvBackend,
+            mpsc::Receiver<Vec<Value>>,
+            thread::JoinHandle<()>,
+        ) {
+            let (client, server) = UnixStream::pair().expect("mock IPC pair");
+            let (command_sender, command_receiver) = mpsc::channel();
+            let server_thread = thread::spawn(move || {
+                let mut reader = BufReader::new(server);
+                loop {
+                    let mut request_line = String::new();
+                    if reader
+                        .read_line(&mut request_line)
+                        .expect("read mock command request")
+                        == 0
+                    {
+                        break;
+                    }
+                    let request: Value =
+                        serde_json::from_str(&request_line).expect("parse mock command request");
+                    let request_id = request
+                        .get("request_id")
+                        .and_then(Value::as_u64)
+                        .expect("request ID");
+                    let command = request
+                        .get("command")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .expect("command array");
+                    let should_quit = command.first().and_then(Value::as_str) == Some("quit");
+                    command_sender.send(command).expect("record mock command");
+                    serde_json::to_writer(
+                        reader.get_mut(),
+                        &json!({"request_id": request_id, "error": "success"}),
+                    )
+                    .expect("write mock command response");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .expect("mock command response newline");
+                    reader
+                        .get_mut()
+                        .flush()
+                        .expect("flush mock command response");
+                    if should_quit {
+                        break;
+                    }
+                }
+            });
+            let child = Command::new("sh")
+                .args(["-c", "sleep 60"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("long-lived mock mpv");
+            (
+                MpvBackend {
+                    child,
+                    ipc: MpvIpc::new(client),
+                    socket_path: PathBuf::from("/tmp/youta-unused-command-recorder.sock"),
+                    profile: PlaybackProfile::Balanced,
+                    process_exit_reported: false,
+                },
+                command_receiver,
+                server_thread,
+            )
+        }
+
         #[test]
         fn normal_loadfile_command_preserves_the_existing_three_arguments() {
             let input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
@@ -1082,6 +1179,62 @@ mod unix {
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
                     json!("replace"),
+                ]
+            );
+        }
+
+        #[test]
+        fn stream_recording_value_serializes_unicode_paths_and_stop_marker() {
+            assert_eq!(
+                stream_recording_property_value(Some(PathBuf::from(
+                    "/tmp/radio recordings/\u{65e5}\u{672c}\u{8a9e}.opus"
+                )))
+                .expect("Unicode recording path"),
+                json!("/tmp/radio recordings/\u{65e5}\u{672c}\u{8a9e}.opus")
+            );
+            assert_eq!(
+                stream_recording_property_value(None).expect("stop recording marker"),
+                json!("no")
+            );
+        }
+
+        #[test]
+        fn stream_recording_value_rejects_empty_and_non_unicode_paths() {
+            let empty = stream_recording_property_value(Some(PathBuf::new()))
+                .expect_err("empty recording path must be rejected");
+            assert!(matches!(empty, PlaybackError::InvalidValue(_)));
+
+            let non_unicode = PathBuf::from(OsString::from_vec(vec![b'/', 0xFF]));
+            let non_unicode = stream_recording_property_value(Some(non_unicode))
+                .expect_err("non-Unicode recording path must be rejected");
+            assert!(matches!(non_unicode, PlaybackError::InvalidValue(_)));
+        }
+
+        #[test]
+        fn stream_recording_command_dispatches_start_and_stop_property_updates() {
+            let (mut backend, command_receiver, server_thread) = backend_with_command_recorder();
+
+            backend
+                .command(PlayerCommand::SetStreamRecording(Some(PathBuf::from(
+                    "/tmp/station recording.opus",
+                ))))
+                .expect("start stream recording");
+            backend
+                .command(PlayerCommand::SetStreamRecording(None))
+                .expect("stop stream recording");
+            backend.shutdown().expect("shut down mock backend");
+            server_thread.join().expect("mock command server");
+
+            assert_eq!(
+                command_receiver.into_iter().collect::<Vec<_>>(),
+                vec![
+                    vec![
+                        json!("set_property"),
+                        json!("stream-record"),
+                        json!("/tmp/station recording.opus"),
+                    ],
+                    vec![json!("set_property"), json!("stream-record"), json!("no")],
+                    vec![json!("quit")],
                 ]
             );
         }
