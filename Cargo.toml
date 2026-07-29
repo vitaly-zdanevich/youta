@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"

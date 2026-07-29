@@ -1102,6 +1102,8 @@ pub struct ViewModel {
     pub search_editing: bool,
     /// Current search query.
     pub search_query: String,
+    /// UTF-8 byte position of the search editor's insertion cursor.
+    pub search_cursor_byte: usize,
     /// Canonical folder displayed by the Local screen.
     pub local_path: String,
     /// Whether the default YouTube search targets videos or channels.
@@ -1235,6 +1237,7 @@ impl Default for ViewModel {
             screen: Screen::Search,
             search_editing: false,
             search_query: String::new(),
+            search_cursor_byte: 0,
             local_path: String::new(),
             search_kind: SearchKind::Videos,
             youtube_search_sort: YouTubeSearchSort::Relevance,
@@ -1342,9 +1345,11 @@ pub enum UiAction {
     BeginSearch,
     /// Cancel search-query editing.
     CancelSearch,
-    /// Add one character to the query.
+    /// Insert one character at the query cursor.
     AppendSearch(char),
-    /// Remove the last query character.
+    /// Move the query insertion cursor by one displayed grapheme.
+    MoveSearchCursor(i8),
+    /// Remove the query grapheme immediately before the insertion cursor.
     DeleteSearchCharacter,
     /// Delete the Vim-style word before the search cursor.
     DeleteSearchWord,
@@ -3609,14 +3614,27 @@ fn search_panel_title(view: &ViewModel) -> String {
         }
     }
     let search_title = if view.search_editing {
+        let mut query = view.search_query.clone();
+        let requested = view.search_cursor_byte.min(query.len());
+        let cursor = if requested == query.len() {
+            requested
+        } else {
+            query
+                .grapheme_indices(true)
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= requested)
+                .last()
+                .unwrap_or_default()
+        };
+        query.insert(cursor, '▏');
         format!(
-            " {}: {}▏ ",
+            " {}: {} ",
             if view.screen == Screen::Radio {
                 "Filter"
             } else {
                 "Search"
             },
-            view.search_query
+            query
         )
     } else if view.screen == Screen::Radio {
         format!(" Filter: {} ", view.search_query.trim())
@@ -9207,6 +9225,8 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Esc => Some(UiAction::CancelSearch),
             KeyCode::Enter => Some(UiAction::SubmitSearch),
             KeyCode::Backspace => Some(UiAction::DeleteSearchCharacter),
+            KeyCode::Left => Some(UiAction::MoveSearchCursor(-1)),
+            KeyCode::Right => Some(UiAction::MoveSearchCursor(1)),
             KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
                 Some(UiAction::DeleteSearchWord)
             }
@@ -10990,6 +11010,7 @@ mod tests {
             " Filter: fixture query ",
             "Radio must expose its accepted local filter without repeating the tab name"
         );
+        view.search_cursor_byte = view.search_query.len();
         view.search_editing = true;
         assert_eq!(
             search_panel_title(&view),
@@ -11012,6 +11033,38 @@ mod tests {
                 "{screen:?} must rely on its active tab label despite stale search state"
             );
         }
+    }
+
+    #[test]
+    fn youtube_search_editor_renders_and_moves_its_cursor_without_seeking() {
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            search_editing: true,
+            search_query: "alpha omega".to_owned(),
+            search_cursor_byte: "alpha ".len(),
+            playback: PlaybackStatus {
+                idle: false,
+                duration: Some(Duration::from_secs(120)),
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        assert_eq!(search_panel_title(&view), " Search: alpha ▏omega ");
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveSearchCursor(-1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveSearchCursor(1))
+        );
+
+        view.search_query = "A👩‍💻B".to_owned();
+        view.search_cursor_byte = "A👩".len();
+        assert!(
+            search_panel_title(&view).contains("A▏👩‍💻B"),
+            "a synthetic non-boundary cursor must clamp before the complete UTF-8 scalar"
+        );
     }
 
     #[test]

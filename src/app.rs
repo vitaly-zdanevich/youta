@@ -278,7 +278,7 @@ fn one_line_excerpt(value: &str, maximum_characters: usize) -> String {
     excerpt
 }
 
-/// Clamps an editable basename cursor to a preceding grapheme boundary.
+/// Clamps an editable text cursor to a preceding grapheme boundary.
 fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
     let requested = requested.min(value.len());
     if requested == value.len() {
@@ -4182,29 +4182,61 @@ impl AppController {
                 selected_station_id,
             });
         }
+        self.view.search_cursor_byte = self.view.search_query.len();
         self.view.search_editing = true;
     }
 
-    /// Appends one character and applies a Radio filter without waiting for Enter.
+    /// Inserts one character and applies a Radio filter without waiting for Enter.
     fn append_search_input(&mut self, character: char) {
         if character.is_control() {
             return;
         }
-        self.view.search_query.push(character);
+        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        self.view.search_query.insert(cursor, character);
+        self.view.search_cursor_byte = cursor.saturating_add(character.len_utf8());
         self.refresh_live_radio_filter();
     }
 
-    /// Removes one Unicode scalar and immediately broadens a Radio filter.
+    /// Removes one grapheme before the cursor and immediately broadens a Radio filter.
     fn delete_search_input_character(&mut self) {
-        self.view.search_query.pop();
+        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        let Some((start, _)) = self.view.search_query[..cursor]
+            .grapheme_indices(true)
+            .next_back()
+        else {
+            self.view.search_cursor_byte = cursor;
+            return;
+        };
+        self.view.search_query.replace_range(start..cursor, "");
+        self.view.search_cursor_byte = start;
         self.refresh_live_radio_filter();
     }
 
     /// Deletes one Vim-style word and reapplies any live Radio filter.
     fn delete_search_input_word(&mut self) {
-        let mut cursor = self.view.search_query.len();
-        delete_previous_editor_word(&mut self.view.search_query, &mut cursor);
-        self.refresh_live_radio_filter();
+        let mut cursor = self.view.search_cursor_byte;
+        if delete_previous_editor_word(&mut self.view.search_query, &mut cursor) {
+            self.view.search_cursor_byte = cursor;
+            self.refresh_live_radio_filter();
+        }
+    }
+
+    /// Moves the search insertion point by one complete displayed grapheme.
+    fn move_search_input_cursor(&mut self, direction: i8) {
+        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        self.view.search_cursor_byte = if direction < 0 {
+            self.view.search_query[..cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(index, _)| index)
+        } else if direction > 0 {
+            self.view.search_query[cursor..]
+                .graphemes(true)
+                .next()
+                .map_or(cursor, |grapheme| cursor.saturating_add(grapheme.len()))
+        } else {
+            cursor
+        };
     }
 
     /// Rebuilds the local Radio catalogue after one query mutation.
@@ -4225,6 +4257,7 @@ impl AppController {
         {
             self.radio_filter_query.clone_from(&snapshot.query);
             self.view.search_query = snapshot.query;
+            self.view.search_cursor_byte = self.view.search_query.len();
             self.radio_selected_station_id = snapshot.selected_station_id;
             self.populate_radio();
         }
@@ -4233,6 +4266,7 @@ impl AppController {
     /// Accepts Radio's already-applied local filter or submits a provider search.
     fn submit_search_input(&mut self) {
         self.view.search_editing = false;
+        self.view.search_cursor_byte = self.view.search_query.len();
         if self.view.screen == Screen::Radio {
             self.radio_filter_query.clone_from(&self.view.search_query);
             #[cfg(feature = "radio")]
@@ -18908,6 +18942,7 @@ impl UiController for AppController {
             UiAction::BeginSearch => self.begin_search_input(),
             UiAction::CancelSearch => self.cancel_search_input(),
             UiAction::AppendSearch(character) => self.append_search_input(character),
+            UiAction::MoveSearchCursor(direction) => self.move_search_input_cursor(direction),
             UiAction::DeleteSearchCharacter => self.delete_search_input_character(),
             UiAction::DeleteSearchWord => self.delete_search_input_word(),
             UiAction::SubmitSearch => self.submit_search_input(),
@@ -25480,8 +25515,13 @@ mod tests {
         let (mut controller, _) = controller_with_mock_statuses([]);
 
         controller.view.search_query = "ambient radio".to_owned();
+        controller.view.search_cursor_byte = controller.view.search_query.len();
         controller.dispatch(UiAction::DeleteSearchWord);
         assert_eq!(controller.view.search_query, "ambient ");
+        assert_eq!(
+            controller.view.search_cursor_byte,
+            controller.view.search_query.len()
+        );
 
         controller.view.youtube_setup_popup = Some(YouTubeSetupPopupView {
             selected_field: YouTubeSetupField::ApiKey,
@@ -41143,6 +41183,66 @@ mod tests {
             );
         }
         assert_eq!(controller.view.rows.len(), complete_count);
+    }
+
+    #[test]
+    fn search_editor_moves_and_mutates_complete_graphemes_in_the_middle() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.view.search_query = "A👩‍💻B".to_owned();
+        controller.dispatch(UiAction::BeginSearch);
+        assert_eq!(
+            controller.view.search_cursor_byte,
+            controller.view.search_query.len()
+        );
+
+        controller.dispatch(UiAction::MoveSearchCursor(-1));
+        assert_eq!(controller.view.search_cursor_byte, "A👩‍💻".len());
+        controller.dispatch(UiAction::MoveSearchCursor(-1));
+        assert_eq!(controller.view.search_cursor_byte, "A".len());
+
+        controller.dispatch(UiAction::AppendSearch('Z'));
+        assert_eq!(controller.view.search_query, "AZ👩‍💻B");
+        assert_eq!(controller.view.search_cursor_byte, "AZ".len());
+
+        controller.dispatch(UiAction::MoveSearchCursor(1));
+        assert_eq!(controller.view.search_cursor_byte, "AZ👩‍💻".len());
+        controller.dispatch(UiAction::DeleteSearchCharacter);
+        assert_eq!(controller.view.search_query, "AZB");
+        assert_eq!(controller.view.search_cursor_byte, "AZ".len());
+
+        controller.view.search_query = "alpha beta omega".to_owned();
+        controller.view.search_cursor_byte = "alpha beta".len();
+        controller.dispatch(UiAction::DeleteSearchWord);
+        assert_eq!(controller.view.search_query, "alpha  omega");
+        assert_eq!(controller.view.search_cursor_byte, "alpha ".len());
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
+    fn radio_filter_middle_edit_refreshes_rows_and_preserves_the_suffix() {
+        let config = Config::for_dir("/tmp/youta-radio-middle-filter-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "flc".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+
+        controller.dispatch(UiAction::MoveSearchCursor(-1));
+        controller.dispatch(UiAction::AppendSearch('a'));
+
+        assert_eq!(controller.view.search_query, "flac");
+        assert_eq!(controller.radio_filter_query, "flac");
+        assert!(!controller.view.rows.is_empty());
+        assert!(controller.view.rows.iter().all(|row| {
+            let station = row
+                .media_id
+                .as_ref()
+                .and_then(|media_id| station_by_id(&media_id.external_id))
+                .expect("filtered Radio row");
+            radio_station_matches_filter(&station, "flac")
+        }));
     }
 
     #[cfg(feature = "radio")]
