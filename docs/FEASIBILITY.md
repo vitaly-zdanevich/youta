@@ -37,7 +37,7 @@ exclusive `state/.lock` while it is open. Users should close Youta before
 editing human-readable state so in-memory data cannot overwrite a manual edit.
 
 Private notes are implemented as one 16 KiB UTF-8 note per exact
-provider-qualified media or source target. The `m` action opens a multiline
+provider-qualified media or source target. The `n` action opens a multiline
 Add/Edit/Delete popup for videos, tracks, podcast episodes, direct-source media,
 local files, channels, Bandcamp releases, subscriptions, and podcast shows.
 Downloaded, History, and playlist selections reuse the underlying media target
