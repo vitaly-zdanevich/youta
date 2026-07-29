@@ -305,6 +305,7 @@ impl FunkwhaleProvider {
             duration_seconds: track_duration(&raw.uploads),
             view_count: None,
             like_count: None,
+            comment_count: None,
             published_at,
             published_text: raw.creation_date,
             license: raw.license.filter(|value| !value.trim().is_empty()),
@@ -401,6 +402,7 @@ impl Provider for FunkwhaleProvider {
             search_filters: false,
             search_sorting: false,
             video_details: true,
+            video_comments: false,
             thumbnails: true,
         }
     }

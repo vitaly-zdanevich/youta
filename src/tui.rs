@@ -462,6 +462,8 @@ pub struct DetailView {
     pub likes: String,
     /// Public view count, formatted by the provider.
     pub views: String,
+    /// Public top-level comment count, formatted by the provider.
+    pub comments: String,
     /// Publication date.
     pub published: String,
     /// Provider-reported license.
@@ -973,6 +975,48 @@ pub struct ErrorPopupView {
     pub action_status: Option<String>,
 }
 
+/// One public top-level comment rendered in the selected-video popup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VideoCommentView {
+    /// Public author display name.
+    pub author_name: String,
+    /// Public like count attached to the comment.
+    pub like_count: u64,
+    /// Human-readable publication date, when exposed by the provider.
+    pub published: Option<String>,
+    /// Provider-supplied plain-text body.
+    pub text: String,
+}
+
+/// Explicit loading state for the bounded public-comments popup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VideoCommentsPopupState {
+    /// The provider worker is loading comments.
+    #[default]
+    Loading,
+    /// One or more comments are ready for display.
+    Ready,
+    /// The provider returned a successful empty result.
+    Empty,
+    /// The provider request failed without closing the popup.
+    Error(String),
+}
+
+/// Scrollable public comments for one exact selected YouTube video.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VideoCommentsPopupView {
+    /// Stable provider video identifier that owns this popup.
+    pub video_id: String,
+    /// Human-readable selected video title.
+    pub video_title: String,
+    /// Explicit request/result state.
+    pub state: VideoCommentsPopupState,
+    /// At most ten bounded public top-level comments.
+    pub comments: Vec<VideoCommentView>,
+    /// Zero-based wrapped-line offset at the top of the viewport.
+    pub scroll_offset: usize,
+}
+
 /// Editable setup shown when a YouTube search needs provider credentials.
 ///
 /// The API key remains in controller-owned memory while the popup is open.
@@ -1161,6 +1205,10 @@ pub struct ViewModel {
     pub physical_linux_console: bool,
     /// Scrollable diagnostic popup, when a recoverable error is being reported.
     pub error_popup: Option<ErrorPopupView>,
+    /// Whether the selected YouTube video supports loading public comments.
+    pub video_comments_available: bool,
+    /// Scrollable bounded public-comments popup.
+    pub video_comments_popup: Option<VideoCommentsPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
@@ -1231,6 +1279,8 @@ impl Default for ViewModel {
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
+            video_comments_available: false,
+            video_comments_popup: None,
             youtube_setup_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
@@ -1466,6 +1516,12 @@ pub enum UiAction {
     OpenEqualizer,
     /// Close the diagnostic error popup without changing the underlying screen.
     DismissErrorPopup,
+    /// Open public top-level comments for the selected YouTube video.
+    OpenVideoComments,
+    /// Set the exact wrapped-line offset in the public-comments popup.
+    SetVideoCommentsScroll(usize),
+    /// Close the public-comments popup without changing Details.
+    DismissVideoComments,
     /// Scroll the diagnostic report.
     ScrollErrorPopup(ErrorPopupScroll),
     /// Copy the complete diagnostic report.
@@ -2300,6 +2356,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                                 key,
                                 controller.view(),
                                 visible_main_list_page_rows(&hit_map),
+                                Some(&hit_map),
                             ) {
                                 controller.dispatch(action);
                             }
@@ -2854,6 +2911,16 @@ struct HitMap {
     buttons: Vec<(UiAction, Rect)>,
     now_playing: Option<Rect>,
     error_buttons: Vec<(UiAction, Rect)>,
+    /// Buttons rendered inside the public-comments popup.
+    video_comments_buttons: Vec<(UiAction, Rect)>,
+    /// Wrapped text viewport inside the public-comments popup.
+    video_comments_text_area: Rect,
+    /// Actual first wrapped comment line rendered in the viewport.
+    video_comments_scroll_offset: usize,
+    /// Largest wrapped-line offset that changes the comments viewport.
+    video_comments_scroll_maximum: usize,
+    /// Number of wrapped comment lines visible on one page.
+    video_comments_page_lines: usize,
     youtube_setup_fields: Vec<(YouTubeSetupField, Rect)>,
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
     rss_subscription_field: Option<Rect>,
@@ -3207,6 +3274,7 @@ fn render_frame(
         || view.playlist_popup.is_some()
         || view.private_note_popup.is_some()
         || view.local_file_popup.is_some()
+        || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
     if thumbnail_is_obscured {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
@@ -3304,6 +3372,14 @@ fn render_frame(
         render_private_note_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.error_buttons.clear();
+    hit_map.video_comments_buttons.clear();
+    hit_map.video_comments_text_area = Rect::default();
+    hit_map.video_comments_scroll_offset = 0;
+    hit_map.video_comments_scroll_maximum = 0;
+    hit_map.video_comments_page_lines = 0;
+    if let Some(popup) = view.video_comments_popup.as_ref() {
+        render_video_comments_popup(frame, popup, &theme, hit_map);
+    }
     if let Some(error) = view.error_popup.as_ref() {
         render_error_popup(
             frame,
@@ -4584,7 +4660,7 @@ fn render_information_panel(
     } else {
         Vec::new()
     };
-    let mut right_buttons = Vec::with_capacity(3);
+    let mut right_buttons = Vec::with_capacity(4);
     if show_text_selection {
         let label = button(
             if view.text_selection_mode {
@@ -4610,6 +4686,23 @@ fn render_information_panel(
                 theme.accent
             },
             UiAction::ToggleTextSelectionMode,
+        );
+    }
+    if show_text_selection
+        && kind == InformationPanelKind::Video
+        && view.video_comments_available
+        && details
+            .media_id
+            .as_ref()
+            .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("F6", "Comments", show_hotkeys),
+            theme.accent,
+            UiAction::OpenVideoComments,
         );
     }
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
@@ -4837,8 +4930,9 @@ fn render_information_panel(
             let mut spans = Vec::new();
             for (name, value) in [
                 ("Length", details.length.as_str()),
-                ("Likes", details.likes.as_str()),
                 ("Views", details.views.as_str()),
+                ("Likes", details.likes.as_str()),
+                ("Comments", details.comments.as_str()),
             ] {
                 let value = value.trim();
                 if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
@@ -6783,6 +6877,167 @@ fn render_error_popup(
     }
 }
 
+/// Renders one bounded, resize-aware public-comments popup.
+fn render_video_comments_popup(
+    frame: &mut Frame<'_>,
+    popup: &VideoCommentsPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(84, 82, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" YouTube comments ", theme), area);
+
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(popup.video_title.as_str())
+            .style(theme.heading)
+            .wrap(Wrap { trim: true }),
+        sections[0],
+    );
+
+    let content_area = sections[1];
+    let (text_area, scrollbar_area) = if content_area.width > 1 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(content_area);
+        (columns[0], columns[1])
+    } else {
+        (content_area, Rect::default())
+    };
+    let mut content = Vec::new();
+    match &popup.state {
+        VideoCommentsPopupState::Loading => {
+            content.push(Line::styled("Loading top comments…", theme.muted));
+        }
+        VideoCommentsPopupState::Empty => {
+            content.push(Line::styled("No public comments.", theme.muted));
+        }
+        VideoCommentsPopupState::Error(error) => {
+            let message = format!("Could not load comments: {error}");
+            content.extend(
+                wrap_text_lines(&message, text_area.width)
+                    .into_iter()
+                    .map(|line| Line::styled(line, theme.accent)),
+            );
+        }
+        VideoCommentsPopupState::Ready => {
+            for (index, comment) in popup.comments.iter().enumerate() {
+                if index > 0 {
+                    content.push(Line::raw(""));
+                }
+                let mut header = vec![
+                    Span::styled(comment.author_name.clone(), theme.heading),
+                    Span::styled(" · ", theme.muted),
+                    Span::raw(format!(
+                        "{} {}",
+                        format_count(comment.like_count),
+                        if comment.like_count == 1 {
+                            "like"
+                        } else {
+                            "likes"
+                        }
+                    )),
+                ];
+                if let Some(published) = comment.published.as_deref() {
+                    header.push(Span::styled(" · ", theme.muted));
+                    header.push(Span::raw(published.to_owned()));
+                }
+                content.push(Line::from(header));
+                content.extend(
+                    wrap_text_lines(&comment.text, text_area.width)
+                        .into_iter()
+                        .map(Line::raw),
+                );
+            }
+        }
+    }
+    if content.is_empty() {
+        content.push(Line::raw(""));
+    }
+    let content_len = content.len();
+    let visible_lines = usize::from(text_area.height);
+    let maximum_offset = content_len.saturating_sub(visible_lines);
+    let offset = popup.scroll_offset.min(maximum_offset);
+    hit_map.video_comments_text_area = text_area;
+    hit_map.video_comments_scroll_offset = offset;
+    hit_map.video_comments_scroll_maximum = maximum_offset;
+    hit_map.video_comments_page_lines = visible_lines.max(1);
+    let visible = content
+        .into_iter()
+        .skip(offset)
+        .take(visible_lines)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible).style(theme.base), text_area);
+    if maximum_offset > 0 && scrollbar_area.width > 0 && scrollbar_area.height > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.muted)
+            .thumb_symbol("█")
+            .thumb_style(theme.accent);
+        let mut state = ScrollbarState::new(maximum_offset.saturating_add(visible_lines))
+            .position(offset)
+            .viewport_content_length(visible_lines);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+    }
+
+    let first = if visible_lines == 0 {
+        0
+    } else {
+        offset.saturating_add(1)
+    };
+    let last = offset.saturating_add(visible_lines).min(content_len);
+    let position = match popup.state {
+        VideoCommentsPopupState::Ready => format!(
+            "{} comment{} · lines {first}–{last}",
+            popup.comments.len(),
+            if popup.comments.len() == 1 { "" } else { "s" }
+        ),
+        VideoCommentsPopupState::Loading => "Loading…".to_owned(),
+        VideoCommentsPopupState::Empty => "0 comments".to_owned(),
+        VideoCommentsPopupState::Error(_) => "Request failed".to_owned(),
+    };
+    frame.render_widget(
+        Paragraph::new(position)
+            .alignment(Alignment::Right)
+            .style(theme.muted),
+        sections[2],
+    );
+    let label = "[Esc] Close";
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[3],
+    );
+    let width = terminal_text_width(label).min(sections[3].width);
+    let x = sections[3]
+        .x
+        .saturating_add(sections[3].width.saturating_sub(width) / 2);
+    hit_map.video_comments_buttons.push((
+        UiAction::DismissVideoComments,
+        Rect::new(x, sections[3].y, width, 1),
+    ));
+}
+
 fn render_youtube_setup_popup(
     frame: &mut Frame<'_>,
     setup: &YouTubeSetupPopupView,
@@ -8650,7 +8905,7 @@ fn is_delete_previous_word_key(key: &KeyEvent) -> bool {
 
 #[cfg(test)]
 fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
-    key_action_with_page_rows(key, view, None)
+    key_action_with_page_rows(key, view, None, None)
 }
 
 /// Maps one key using the current rendered main-list page capacity.
@@ -8658,9 +8913,49 @@ fn key_action_with_page_rows(
     key: KeyEvent,
     view: &ViewModel,
     page_rows: Option<usize>,
+    hit_map: Option<&HitMap>,
 ) -> Option<UiAction> {
+    if view.error_popup.is_none()
+        && view.video_comments_popup.is_some()
+        && let Some(hit_map) = hit_map
+    {
+        return video_comments_key_action(
+            key,
+            hit_map.video_comments_scroll_offset,
+            hit_map.video_comments_scroll_maximum,
+            hit_map.video_comments_page_lines,
+        );
+    }
     key_action_with_page_rows_unfiltered(key, view, page_rows)
         .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps modal comments navigation to one resize-aware wrapped-line offset.
+fn video_comments_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    let page_lines = page_lines.max(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::F(6) => Some(UiAction::DismissVideoComments),
+        KeyCode::Up | KeyCode::Char('k') => {
+            Some(UiAction::SetVideoCommentsScroll(offset.saturating_sub(1)))
+        }
+        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetVideoCommentsScroll(
+            offset.saturating_add(1).min(maximum),
+        )),
+        KeyCode::PageUp => Some(UiAction::SetVideoCommentsScroll(
+            offset.saturating_sub(page_lines),
+        )),
+        KeyCode::PageDown => Some(UiAction::SetVideoCommentsScroll(
+            offset.saturating_add(page_lines).min(maximum),
+        )),
+        KeyCode::Home => Some(UiAction::SetVideoCommentsScroll(0)),
+        KeyCode::End => Some(UiAction::SetVideoCommentsScroll(maximum)),
+        _ => None,
+    }
 }
 
 /// Maps one key before applying terminal-capability policy.
@@ -8694,6 +8989,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
             _ => None,
         };
+    }
+    if let Some(popup) = view.video_comments_popup.as_ref() {
+        return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
     if let Some(popup) = view.private_note_popup.as_ref() {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -9143,6 +9441,17 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
         KeyCode::Char('j') => Some(UiAction::MoveSelection(1)),
         KeyCode::Char('k') => Some(UiAction::MoveSelection(-1)),
+        KeyCode::F(6)
+            if view.video_comments_available
+                && view.details.as_ref().is_some_and(|details| {
+                    details
+                        .media_id
+                        .as_ref()
+                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
+                }) =>
+        {
+            Some(UiAction::OpenVideoComments)
+        }
         KeyCode::Enter if alt && detail_link_count > 0 => {
             let selected = view
                 .selected_detail_link
@@ -9281,6 +9590,33 @@ fn mouse_action_unfiltered(
             }
             MouseEventKind::ScrollUp => {
                 Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
+            }
+            _ => None,
+        };
+    }
+    if view.video_comments_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .video_comments_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown
+                if contains(hit_map.video_comments_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetVideoCommentsScroll(
+                    hit_map
+                        .video_comments_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.video_comments_scroll_maximum),
+                ))
+            }
+            MouseEventKind::ScrollUp
+                if contains(hit_map.video_comments_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetVideoCommentsScroll(
+                    hit_map.video_comments_scroll_offset.saturating_sub(3),
+                ))
             }
             _ => None,
         };
@@ -11726,6 +12062,7 @@ mod tests {
                 KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
                 &local,
                 Some(7),
+                None,
             ),
             Some(UiAction::MoveSelection(-7))
         );
@@ -11734,6 +12071,7 @@ mod tests {
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                 &local,
                 Some(7),
+                None,
             ),
             Some(UiAction::MoveSelection(7))
         );
@@ -11741,6 +12079,7 @@ mod tests {
             key_action_with_page_rows(
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                 &local,
+                None,
                 None,
             ),
             None,
@@ -11756,6 +12095,7 @@ mod tests {
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                 &focused_local,
                 Some(7),
+                None,
             ),
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1))),
             "focused Details must retain PageDown before Local list paging"
@@ -20678,8 +21018,8 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn video_details_keep_length_likes_and_views() {
-        let backend = TestBackend::new(100, 18);
+    fn video_details_keep_public_counts_in_requested_order() {
+        let backend = TestBackend::new(160, 18);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             right_panel_mode: RightPanelMode::Details,
@@ -20688,6 +21028,7 @@ prose 07:25 remains clickable but is not a chapter";
                 length: "4:05".to_owned(),
                 likes: "13,045".to_owned(),
                 views: "887,263".to_owned(),
+                comments: "20".to_owned(),
                 ..DetailView::default()
             }),
             ..ViewModel::default()
@@ -20699,8 +21040,201 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw video details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains("Length: 4:05  Likes: 13,045  Views: 887,263"));
+        assert!(rendered.contains("Length: 4:05  Views: 887,263  Likes: 13,045  Comments: 20"));
         assert!(!rendered.contains("Load channel info"));
+    }
+
+    #[test]
+    fn comments_control_and_f6_require_supported_youtube_details() {
+        let youtube = ViewModel {
+            video_comments_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                title: "Fixture video".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &youtube),
+            Some(UiAction::OpenVideoComments)
+        );
+        let mut youtube_terminal =
+            Terminal::new(TestBackend::new(160, 18)).expect("YouTube terminal");
+        let mut youtube_hit_map = HitMap::default();
+        youtube_terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &youtube,
+                    &UiSettings::default(),
+                    &mut youtube_hit_map,
+                );
+            })
+            .expect("draw supported YouTube comments control");
+        assert!(rendered_text(&youtube_terminal).contains("[F6] Comments"));
+        assert!(
+            youtube_hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| { action == &UiAction::OpenVideoComments })
+        );
+
+        let local = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::Local, "/music/fixture.flac")),
+                ..youtube.details.clone().expect("YouTube details")
+            }),
+            ..youtube.clone()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &local),
+            None,
+            "provider capability alone must not expose comments for non-YouTube media"
+        );
+        let mut local_terminal = Terminal::new(TestBackend::new(160, 18)).expect("Local terminal");
+        let mut local_hit_map = HitMap::default();
+        local_terminal
+            .draw(|frame| render(frame, &local, &UiSettings::default(), &mut local_hit_map))
+            .expect("draw unsupported Local comments control");
+        assert!(!rendered_text(&local_terminal).contains("[F6] Comments"));
+        assert!(
+            local_hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenVideoComments)
+        );
+
+        let unsupported_youtube = ViewModel {
+            video_comments_available: false,
+            ..youtube
+        };
+        let mut unsupported_terminal =
+            Terminal::new(TestBackend::new(160, 18)).expect("unsupported YouTube terminal");
+        let mut unsupported_hit_map = HitMap::default();
+        unsupported_terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &unsupported_youtube,
+                    &UiSettings::default(),
+                    &mut unsupported_hit_map,
+                );
+            })
+            .expect("draw unsupported YouTube comments control");
+        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Comments"));
+        assert!(
+            unsupported_hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenVideoComments)
+        );
+    }
+
+    #[test]
+    fn comments_popup_scrolls_with_bounded_keyboard_mouse_and_close_controls() {
+        let comments = (0..10)
+            .map(|index| VideoCommentView {
+                author_name: format!("Author {index}"),
+                like_count: u64::try_from(index).expect("fixture index"),
+                published: Some("2026 July 30".to_owned()),
+                text: format!(
+                    "Comment {index} contains enough plain text to wrap across several terminal rows."
+                ),
+            })
+            .collect();
+        let view = ViewModel {
+            video_comments_popup: Some(VideoCommentsPopupView {
+                video_id: "dQw4w9WgXcQ".to_owned(),
+                video_title: "Fixture video".to_owned(),
+                state: VideoCommentsPopupState::Ready,
+                comments,
+                scroll_offset: usize::MAX,
+            }),
+            ..ViewModel::default()
+        };
+        let backend = TestBackend::new(72, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw comments popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("YouTube comments"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(hit_map.video_comments_scroll_maximum > 0);
+        assert_eq!(
+            hit_map.video_comments_scroll_offset, hit_map.video_comments_scroll_maximum,
+            "renderer must clamp an oversized restored offset"
+        );
+
+        assert_eq!(
+            video_comments_key_action(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                hit_map.video_comments_scroll_offset,
+                hit_map.video_comments_scroll_maximum,
+                hit_map.video_comments_page_lines,
+            ),
+            Some(UiAction::SetVideoCommentsScroll(
+                hit_map
+                    .video_comments_scroll_offset
+                    .saturating_sub(hit_map.video_comments_page_lines)
+            ))
+        );
+        assert_eq!(
+            video_comments_key_action(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                hit_map.video_comments_scroll_offset,
+                hit_map.video_comments_scroll_maximum,
+                hit_map.video_comments_page_lines,
+            ),
+            Some(UiAction::SetVideoCommentsScroll(0))
+        );
+        assert_eq!(
+            video_comments_key_action(
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                0,
+                hit_map.video_comments_scroll_maximum,
+                hit_map.video_comments_page_lines,
+            ),
+            Some(UiAction::SetVideoCommentsScroll(
+                hit_map.video_comments_scroll_maximum
+            ))
+        );
+
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: hit_map.video_comments_text_area.x,
+                    row: hit_map.video_comments_text_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetVideoCommentsScroll(
+                hit_map.video_comments_scroll_offset.saturating_sub(3)
+            ))
+        );
+        let close_area = hit_map
+            .video_comments_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::DismissVideoComments).then_some(*area))
+            .expect("comments close button");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: close_area.x,
+                    row: close_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::DismissVideoComments)
+        );
     }
 
     #[test]

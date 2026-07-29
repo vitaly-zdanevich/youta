@@ -150,6 +150,7 @@ impl JamendoTrack {
             duration_seconds: Some(self.duration_seconds),
             view_count: None,
             like_count: None,
+            comment_count: None,
             published_at,
             published_text: self.release_date,
             license: Some(self.license_ccurl),
@@ -345,6 +346,7 @@ impl Provider for JamendoProvider {
             search_filters: true,
             search_sorting: true,
             video_details: true,
+            video_comments: false,
             thumbnails: true,
         }
     }

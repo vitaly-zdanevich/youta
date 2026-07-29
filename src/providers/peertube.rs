@@ -323,6 +323,7 @@ impl PeerTubeProvider {
             duration_seconds: raw.duration,
             view_count: raw.views,
             like_count: raw.likes,
+            comment_count: None,
             published_at: raw.published_at.as_deref().and_then(parse_rfc3339_epoch),
             published_text: raw.published_at,
             license,
@@ -402,6 +403,7 @@ impl Provider for PeerTubeProvider {
             search_filters: true,
             search_sorting: true,
             video_details: true,
+            video_comments: false,
             thumbnails: true,
         }
     }

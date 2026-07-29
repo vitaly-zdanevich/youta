@@ -77,8 +77,124 @@ pub struct ProviderCapabilities {
     pub search_sorting: bool,
     /// The provider can load full video metadata after selection.
     pub video_details: bool,
+    /// The provider can load a bounded list of public top-level comments.
+    pub video_comments: bool,
     /// Search results or details can contain thumbnail URLs.
     pub thumbnails: bool,
+}
+
+/// Maximum number of public comments returned by one provider request.
+///
+/// Keeping this bound in the provider contract prevents a remote response from
+/// turning the comments popup into an unbounded allocation.
+pub const MAX_VIDEO_COMMENTS: usize = 10;
+
+/// Maximum encoded byte length of one public comment identifier.
+pub const MAX_VIDEO_COMMENT_ID_BYTES: usize = 256;
+
+/// Maximum Unicode scalar count of one public comment author name.
+pub const MAX_VIDEO_COMMENT_AUTHOR_CHARS: usize = 256;
+
+/// Maximum encoded byte length of one public comment author name.
+pub const MAX_VIDEO_COMMENT_AUTHOR_BYTES: usize = 1_024;
+
+/// Maximum Unicode scalar count of one public comment body.
+pub const MAX_VIDEO_COMMENT_TEXT_CHARS: usize = 10_000;
+
+/// Maximum encoded byte length of one public comment body.
+pub const MAX_VIDEO_COMMENT_TEXT_BYTES: usize = 40_000;
+
+/// Validates one remote public-comment author for terminal-safe rendering.
+///
+/// Display names are single-line UI labels, so every Unicode control
+/// character is rejected in addition to the documented size bounds.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::InvalidResponse`] for empty, oversized, or
+/// control-bearing display names.
+#[cfg(any(test, feature = "invidious", feature = "youtube-official"))]
+pub(crate) fn validate_video_comment_author(
+    provider: &str,
+    value: String,
+) -> Result<String, ProviderError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_VIDEO_COMMENT_AUTHOR_BYTES
+        || value.chars().count() > MAX_VIDEO_COMMENT_AUTHOR_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(ProviderError::InvalidResponse(format!(
+            "{provider} returned an invalid or oversized comment author name"
+        )));
+    }
+    Ok(value)
+}
+
+/// Normalizes and validates one remote public-comment body for terminal use.
+///
+/// CRLF and lone carriage returns become line feeds so multiline comments
+/// remain readable across provider APIs. Every other control character,
+/// including tabs, escape sequences, and NUL bytes, is rejected.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::InvalidResponse`] for empty, oversized, or
+/// terminal-unsafe comment bodies.
+#[cfg(any(test, feature = "invidious", feature = "youtube-official"))]
+pub(crate) fn normalize_video_comment_text(
+    provider: &str,
+    value: String,
+) -> Result<String, ProviderError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_VIDEO_COMMENT_TEXT_BYTES
+        || value.chars().count() > MAX_VIDEO_COMMENT_TEXT_CHARS
+    {
+        return Err(ProviderError::InvalidResponse(format!(
+            "{provider} returned invalid or oversized comment text"
+        )));
+    }
+    let value = if value.contains('\r') {
+        value.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        value
+    };
+    if value
+        .chars()
+        .any(|character| character != '\n' && character.is_control())
+    {
+        return Err(ProviderError::InvalidResponse(format!(
+            "{provider} returned invalid or oversized comment text"
+        )));
+    }
+    Ok(value)
+}
+
+/// One public top-level comment returned for a selected video.
+///
+/// Provider implementations must reject response values which exceed their
+/// documented field bounds rather than silently retaining arbitrarily large
+/// remote text. [`Provider::video_comments`] additionally guarantees that no
+/// response contains more than [`MAX_VIDEO_COMMENTS`] entries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VideoComment {
+    /// Stable opaque comment identifier in the provider's namespace, bounded
+    /// by [`MAX_VIDEO_COMMENT_ID_BYTES`].
+    pub comment_id: String,
+    /// Public author display name, bounded by
+    /// [`MAX_VIDEO_COMMENT_AUTHOR_CHARS`] and
+    /// [`MAX_VIDEO_COMMENT_AUTHOR_BYTES`].
+    pub author_name: String,
+    /// Credential-free HTTP(S) author page, when safely exposed.
+    pub author_channel_url: Option<Url>,
+    /// Provider-supplied plain-text comment body, bounded by
+    /// [`MAX_VIDEO_COMMENT_TEXT_CHARS`] and [`MAX_VIDEO_COMMENT_TEXT_BYTES`].
+    pub text: String,
+    /// Public like count attached to this comment.
+    pub like_count: u64,
+    /// Unix publication timestamp, when valid and exposed.
+    pub published_at: Option<i64>,
+    /// Unix last-update timestamp, when valid and exposed.
+    pub updated_at: Option<i64>,
 }
 
 /// How a provider can load subscriber statistics for video search rows.
@@ -605,6 +721,9 @@ pub struct VideoDetails {
     pub view_count: Option<u64>,
     /// Like count, when exposed.
     pub like_count: Option<u64>,
+    /// Public top-level comment count, when exposed.
+    #[serde(default)]
+    pub comment_count: Option<u64>,
     /// Unix publication timestamp, when exposed.
     pub published_at: Option<i64>,
     /// Human-readable publication age supplied by the provider.
@@ -699,8 +818,9 @@ pub enum YouTubeProviderConfigurationError {
 /// Implementations must be `Send + Sync`, but calls are not expected to be
 /// non-blocking. Never invoke [`Provider::search`] or
 /// [`Provider::channel_videos`], [`Provider::channel_details`],
-/// [`Provider::video_details`], or [`Provider::channel_subscriber_counts`] from
-/// the terminal rendering/event thread.
+/// [`Provider::video_details`], [`Provider::video_comments`], or
+/// [`Provider::channel_subscriber_counts`] from the terminal rendering/event
+/// thread.
 pub trait Provider: Send + Sync {
     /// Stable provider identifier used in configuration and diagnostics.
     fn id(&self) -> &'static str;
@@ -792,6 +912,21 @@ pub trait Provider: Send + Sync {
     /// Returns a [`ProviderError`] for an invalid identifier, transport
     /// failure, an unsuccessful status, or an invalid bounded response.
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError>;
+
+    /// Loads at most [`MAX_VIDEO_COMMENTS`] public top-level comments.
+    ///
+    /// Providers should use their service's relevance or "top comments"
+    /// ordering and return plain text. The default keeps providers without a
+    /// public-comments API source-compatible and explicitly unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] by default. Implementations can
+    /// also return a provider error for an invalid video identifier, transport
+    /// failure, an unsuccessful status, or malformed or oversized data.
+    fn video_comments(&self, _video_id: &str) -> Result<Vec<VideoComment>, ProviderError> {
+        Err(ProviderError::Unsupported)
+    }
 
     /// Loads public subscriber counts for the requested channel identifiers.
     ///
@@ -1246,6 +1381,66 @@ mod tests {
             MinimalProvider.full_channel_details("channel"),
             Err(ProviderError::Unsupported)
         ));
+    }
+
+    #[test]
+    fn public_video_comments_are_bounded_and_unsupported_by_default() {
+        assert_eq!(MAX_VIDEO_COMMENTS, 10);
+        assert!(!MinimalProvider.capabilities().video_comments);
+        assert!(matches!(
+            MinimalProvider.video_comments("video"),
+            Err(ProviderError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn public_video_comment_text_preserves_lines_but_rejects_terminal_controls() {
+        assert_eq!(
+            normalize_video_comment_text(
+                "Fixture",
+                "first line\r\nsecond line\rlast line".to_owned(),
+            )
+            .expect("portable multiline comment"),
+            "first line\nsecond line\nlast line"
+        );
+        for invalid in [
+            "tab\tinjected",
+            "escape\u{1b}[31mred",
+            "nul\0byte",
+            "backspace\u{8}text",
+        ] {
+            assert!(matches!(
+                normalize_video_comment_text("Fixture", invalid.to_owned()),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
+        assert!(matches!(
+            normalize_video_comment_text(
+                "Fixture",
+                "\r\n".repeat((MAX_VIDEO_COMMENT_TEXT_CHARS / 2) + 1),
+            ),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn public_video_comment_author_rejects_all_controls() {
+        assert_eq!(
+            validate_video_comment_author("Fixture", "Author name".to_owned())
+                .expect("plain author"),
+            "Author name"
+        );
+        for invalid in [
+            "Author\nName",
+            "Author\tName",
+            "Author\u{1b}[2J",
+            "Author\0",
+        ] {
+            assert!(matches!(
+                validate_video_comment_author("Fixture", invalid.to_owned()),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
     }
 
     #[test]

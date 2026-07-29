@@ -4,7 +4,9 @@
 //! playback concern so an Invidious instance can be combined with `yt-dlp` or a
 //! different playback backend. Channel uploads use the documented
 //! `/api/v1/channels/:id/videos` endpoint; a bounded cache maps its opaque
-//! continuation tokens to Youta's sequential page numbers.
+//! continuation tokens to Youta's sequential page numbers. Public top-level
+//! comments use one explicitly top-sorted, bounded `/api/v1/comments/:id`
+//! response.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,17 +20,24 @@ use crate::domain::decode_url_path_segment_once;
 
 use super::{
     ChannelDetails, ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary,
-    ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
-    ProviderCapabilities, ProviderError, SearchDate, SearchDuration, SearchFeature, SearchItem,
-    SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoOrientation,
-    VideoSummary, get_bounded_json, provider_agent, resolve_http_url, validate_base_url,
-    validate_youtube_video_id,
+    ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT,
+    MAX_VIDEO_COMMENT_ID_BYTES, MAX_VIDEO_COMMENTS, Provider, ProviderCapabilities, ProviderError,
+    SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
+    SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
+    get_bounded_json, normalize_video_comment_text, provider_agent, resolve_http_url,
+    validate_base_url, validate_video_comment_author, validate_youtube_video_id,
 };
 
 const MAX_CONFIGURED_JSON_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTINUATION_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_CACHED_CHANNELS: usize = 32;
 const MAX_TOKENS_PER_CHANNEL: usize = 32;
+/// Maximum number of comments accepted from one Invidious API page.
+///
+/// Invidious has no result-count parameter for this endpoint and commonly
+/// returns more than Youta displays. This separate page bound permits the
+/// documented response while preventing an unexpectedly large JSON array.
+const MAX_INVIDIOUS_COMMENT_PAGE: usize = 100;
 
 /// Blocking client for a configurable Invidious instance.
 ///
@@ -144,6 +153,20 @@ impl InvidiousProvider {
         url.path_segments_mut()
             .map_err(|()| ProviderError::InvalidBaseUrl("URL cannot contain API paths".to_owned()))?
             .push(video_id);
+        Ok(url)
+    }
+
+    /// Builds the documented top-level `YouTube` comments endpoint.
+    fn build_video_comments_url(&self, video_id: &str) -> Result<Url, ProviderError> {
+        validate_youtube_video_id(video_id)?;
+        let mut url = self.endpoint("api/v1/comments/")?;
+        url.path_segments_mut()
+            .map_err(|()| ProviderError::InvalidBaseUrl("URL cannot contain API paths".to_owned()))?
+            .pop_if_empty()
+            .push(video_id);
+        url.query_pairs_mut()
+            .append_pair("sort_by", "top")
+            .append_pair("source", "youtube");
         Ok(url)
     }
 
@@ -455,6 +478,7 @@ impl InvidiousProvider {
             duration_seconds: raw.length_seconds,
             view_count: raw.view_count,
             like_count: raw.like_count,
+            comment_count: raw.comment_count,
             published_at: raw.published,
             published_text: nonempty(raw.published_text),
             license: nonempty(raw.license),
@@ -467,6 +491,34 @@ impl InvidiousProvider {
             webpage_url,
             stream_url: None,
         })
+    }
+
+    /// Converts one bounded Invidious top-comments page.
+    fn convert_video_comments(
+        raw: RawVideoCommentsPage,
+        requested_id: &str,
+    ) -> Result<Vec<VideoComment>, ProviderError> {
+        validate_youtube_video_id(&raw.video_id).map_err(|_| {
+            ProviderError::InvalidResponse(
+                "comment response contains an invalid videoId".to_owned(),
+            )
+        })?;
+        if raw.video_id != requested_id {
+            return Err(ProviderError::InvalidResponse(
+                "comment response identifier does not match the requested video".to_owned(),
+            ));
+        }
+        if raw.comments.len() > MAX_INVIDIOUS_COMMENT_PAGE {
+            return Err(ProviderError::InvalidResponse(format!(
+                "Invidious returned more than {MAX_INVIDIOUS_COMMENT_PAGE} comments in one page"
+            )));
+        }
+
+        raw.comments
+            .into_iter()
+            .take(MAX_VIDEO_COMMENTS)
+            .map(convert_video_comment)
+            .collect()
     }
 
     fn convert_thumbnails(&self, raw: Vec<RawThumbnail>) -> Vec<Thumbnail> {
@@ -519,10 +571,10 @@ fn youtube_channel_url(channel_id: &str) -> Option<Url> {
     Some(url)
 }
 
-/// Resolves an Invidious `authorUrl` to a safe public YouTube channel URL.
+/// Resolves an Invidious `authorUrl` to a safe public `YouTube` channel URL.
 ///
 /// Invidious commonly returns relative paths. Absolute values are accepted
-/// only for HTTPS YouTube hosts, and `/channel/…` paths must match the channel
+/// only for HTTPS `YouTube` hosts, and `/channel/…` paths must match the channel
 /// identifier carried by the same response.
 fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) -> Option<Url> {
     let raw = author_url?.trim();
@@ -580,7 +632,7 @@ fn youtube_channel_url_from_author(author_url: Option<&str>, expected_id: &str) 
     Some(url)
 }
 
-/// Checks a decoded stable YouTube channel identifier before URL rebuilding.
+/// Checks a decoded stable `YouTube` channel identifier before URL rebuilding.
 fn valid_youtube_channel_route_id(channel_id: &str) -> bool {
     !channel_id.is_empty()
         && channel_id.len() <= 128
@@ -589,7 +641,7 @@ fn valid_youtube_channel_route_id(channel_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Checks one decoded YouTube handle or legacy channel-name segment.
+/// Checks one decoded `YouTube` handle or legacy channel-name segment.
 fn valid_youtube_channel_route_alias(alias: &str) -> bool {
     !alias.is_empty()
         && alias.len() <= 128
@@ -618,6 +670,7 @@ impl Provider for InvidiousProvider {
             search_filters: true,
             search_sorting: true,
             video_details: true,
+            video_comments: true,
             thumbnails: true,
         }
     }
@@ -661,6 +714,12 @@ impl Provider for InvidiousProvider {
         let url = self.build_video_url(video_id)?;
         let raw: RawVideoDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
         self.convert_video_details(raw)
+    }
+
+    fn video_comments(&self, video_id: &str) -> Result<Vec<VideoComment>, ProviderError> {
+        let url = self.build_video_comments_url(video_id)?;
+        let raw: RawVideoCommentsPage = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        Self::convert_video_comments(raw, video_id)
     }
 
     fn channel_subscriber_counts(
@@ -739,6 +798,48 @@ fn require_nonempty(value: &str, field: &str) -> Result<(), ProviderError> {
         return Err(ProviderError::InvalidResponse(format!(
             "{field} cannot be empty"
         )));
+    }
+    Ok(())
+}
+
+/// Converts one documented Invidious comment into the shared bounded DTO.
+fn convert_video_comment(raw: RawVideoComment) -> Result<VideoComment, ProviderError> {
+    validate_video_comment_id(&raw.comment_id)?;
+    validate_resource_id(&raw.author_id, "comment authorId")?;
+    let published_at = match raw.published {
+        Some(timestamp) if timestamp < 0 => {
+            return Err(ProviderError::InvalidResponse(
+                "Invidious returned an invalid comment publication timestamp".to_owned(),
+            ));
+        }
+        timestamp => timestamp,
+    };
+
+    Ok(VideoComment {
+        comment_id: raw.comment_id,
+        author_name: validate_video_comment_author("Invidious", raw.author)?,
+        author_channel_url: youtube_channel_url_from_author(
+            raw.author_url.as_deref(),
+            &raw.author_id,
+        ),
+        text: normalize_video_comment_text("Invidious", raw.content)?,
+        like_count: raw.like_count.unwrap_or(0),
+        published_at,
+        updated_at: None,
+    })
+}
+
+/// Validates an opaque comment identifier without interpreting it.
+fn validate_video_comment_id(comment_id: &str) -> Result<(), ProviderError> {
+    if comment_id.is_empty()
+        || comment_id.len() > MAX_VIDEO_COMMENT_ID_BYTES
+        || comment_id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(ProviderError::InvalidResponse(
+            "Invidious returned an invalid comment ID".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -890,6 +991,30 @@ struct RawChannelDetails {
     description: String,
 }
 
+/// One documented Invidious top-level comment page.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawVideoCommentsPage {
+    video_id: String,
+    comments: Vec<RawVideoComment>,
+}
+
+/// Public fields used from one documented Invidious comment object.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawVideoComment {
+    author: String,
+    author_id: String,
+    #[serde(default)]
+    author_url: Option<String>,
+    content: String,
+    comment_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    published: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    like_count: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawVideoDetails {
@@ -911,6 +1036,8 @@ struct RawVideoDetails {
     view_count: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     like_count: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    comment_count: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     length_seconds: Option<u64>,
     #[serde(default)]
@@ -1105,6 +1232,7 @@ mod tests {
 		"keywords": ["music", "example"],
 		"viewCount": 1000,
 		"likeCount": "50",
+		"commentCount": "20",
 		"author": "Example channel",
 		"authorId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
 		"lengthSeconds": 212,
@@ -1117,6 +1245,34 @@ mod tests {
 			{"size": "360x640"}
 		],
 		"formatStreams": [{"size": "720x1280"}]
+	}"#;
+
+    const COMMENTS_FIXTURE: &str = r#"{
+		"commentCount": 20,
+		"videoId": "dQw4w9WgXcQ",
+		"comments": [
+			{
+				"author": "First author",
+				"authorId": "UC_first_author",
+				"authorUrl": "/channel/UC_first_author",
+				"content": "First line\r\nSecond line & plain text",
+				"contentHtml": "ignored",
+				"published": "1709528767",
+				"publishedText": "2 years ago",
+				"likeCount": "42",
+				"commentId": "Ugz-comment-one"
+			},
+			{
+				"author": "Second author",
+				"authorId": "UC_second_author",
+				"authorUrl": "javascript:alert(1)",
+				"content": "Another public comment",
+				"published": 1709618828,
+				"likeCount": 0,
+				"commentId": "Ugz-comment-two"
+			}
+		],
+		"continuation": "ignored-bounded-page-token"
 	}"#;
 
     const CHANNEL_DETAILS_FIXTURE: &str = r#"{
@@ -1622,6 +1778,7 @@ mod tests {
             .expect("fixture should convert");
 
         assert_eq!(details.like_count, Some(50));
+        assert_eq!(details.comment_count, Some(20));
         assert_eq!(details.published_at, Some(1_700_000_000));
         assert_eq!(details.rating, Some(4.75));
         assert_eq!(
@@ -1630,6 +1787,202 @@ mod tests {
         );
         assert_eq!(details.keywords, ["music", "example"]);
         assert_eq!(details.orientation, VideoOrientation::Vertical);
+    }
+
+    #[test]
+    fn comments_request_uses_top_youtube_source_and_maps_bounded_plain_text() {
+        let server = MockServer::spawn(vec![json_response("200 OK", COMMENTS_FIXTURE)]);
+        let base_url = server
+            .base_url
+            .join("prefix/")
+            .expect("mock prefix should join");
+        let provider = InvidiousProvider::with_options(
+            base_url,
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider should construct");
+
+        let comments = provider
+            .video_comments("dQw4w9WgXcQ")
+            .expect("mock top comments should parse");
+        let requests = server.finish();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].comment_id, "Ugz-comment-one");
+        assert_eq!(comments[0].author_name, "First author");
+        assert_eq!(
+            comments[0].author_channel_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/channel/UC_first_author")
+        );
+        assert_eq!(
+            comments[0].text, "First line\nSecond line & plain text",
+            "transport line endings must become stable plain text"
+        );
+        assert_eq!(comments[0].like_count, 42);
+        assert_eq!(comments[0].published_at, Some(1_709_528_767));
+        assert_eq!(comments[0].updated_at, None);
+        assert_eq!(
+            comments[1].author_channel_url, None,
+            "unsafe author URLs must not reach the public DTO"
+        );
+
+        assert_eq!(requests.len(), 1);
+        let request = Url::parse(&format!("http://mock.test{}", requests[0]))
+            .expect("captured comments request should parse");
+        assert_eq!(request.path(), "/prefix/api/v1/comments/dQw4w9WgXcQ");
+        let query = request
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("sort_by").map(AsRef::as_ref), Some("top"));
+        assert_eq!(query.get("source").map(AsRef::as_ref), Some("youtube"));
+        assert_eq!(query.len(), 2);
+    }
+
+    #[test]
+    fn comments_return_only_the_shared_top_comment_limit() {
+        let comments = (0..(MAX_VIDEO_COMMENTS + 2))
+            .map(|index| {
+                serde_json::json!({
+                    "author": format!("Author {index}"),
+                    "authorId": format!("UC_author_{index}"),
+                    "authorUrl": format!("/channel/UC_author_{index}"),
+                    "content": format!("Comment {index}"),
+                    "commentId": format!("Ugz-comment-{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw: RawVideoCommentsPage = serde_json::from_value(serde_json::json!({
+            "videoId": "dQw4w9WgXcQ",
+            "comments": comments
+        }))
+        .expect("bounded page fixture should deserialize");
+
+        let comments = InvidiousProvider::convert_video_comments(raw, "dQw4w9WgXcQ")
+            .expect("a normal Invidious page should be truncated to the shared limit");
+        assert_eq!(comments.len(), MAX_VIDEO_COMMENTS);
+        assert_eq!(comments[9].comment_id, "Ugz-comment-9");
+    }
+
+    #[test]
+    fn comments_reject_invalid_identifiers_pages_and_text_fields() {
+        assert!(matches!(
+            provider().video_comments("../not-a-video"),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        let make_page = |comment: Value| {
+            serde_json::from_value::<RawVideoCommentsPage>(serde_json::json!({
+                "videoId": "dQw4w9WgXcQ",
+                "comments": [comment]
+            }))
+            .expect("comment fixture should deserialize")
+        };
+        let valid_comment = serde_json::json!({
+            "author": "Fixture author",
+            "authorId": "UC_fixture_author",
+            "authorUrl": "/channel/UC_fixture_author",
+            "content": "Fixture comment",
+            "commentId": "Ugz-fixture-comment"
+        });
+        for malformed in [
+            {
+                let mut value = valid_comment.clone();
+                value["commentId"] = Value::String("invalid comment id".to_owned());
+                value
+            },
+            {
+                let mut value = valid_comment.clone();
+                value["author"] = Value::String("Unsafe\u{0007} author".to_owned());
+                value
+            },
+            {
+                let mut value = valid_comment.clone();
+                value["content"] = Value::String("Unsafe\u{0000} comment".to_owned());
+                value
+            },
+            {
+                let mut value = valid_comment.clone();
+                value["authorId"] = Value::String("../channel".to_owned());
+                value
+            },
+            {
+                let mut value = valid_comment.clone();
+                value["author"] =
+                    Value::String("a".repeat(crate::providers::MAX_VIDEO_COMMENT_AUTHOR_BYTES + 1));
+                value
+            },
+            {
+                let mut value = valid_comment.clone();
+                value["content"] =
+                    Value::String("x".repeat(crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES + 1));
+                value
+            },
+        ] {
+            let error =
+                InvidiousProvider::convert_video_comments(make_page(malformed), "dQw4w9WgXcQ")
+                    .expect_err("unsafe remote comment fields must fail");
+            assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        }
+
+        let mismatched: RawVideoCommentsPage =
+            serde_json::from_str(&COMMENTS_FIXTURE.replace("dQw4w9WgXcQ", "aaaaaaaaaaa"))
+                .expect("mismatched response should deserialize");
+        assert!(matches!(
+            InvidiousProvider::convert_video_comments(mismatched, "dQw4w9WgXcQ"),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("does not match")
+        ));
+
+        let page = RawVideoCommentsPage {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            comments: (0..=MAX_INVIDIOUS_COMMENT_PAGE)
+                .map(|index| RawVideoComment {
+                    author: "Author".to_owned(),
+                    author_id: "UC_fixture".to_owned(),
+                    author_url: None,
+                    content: "Comment".to_owned(),
+                    comment_id: format!("Ugz-{index}"),
+                    published: None,
+                    like_count: None,
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            InvidiousProvider::convert_video_comments(page, "dQw4w9WgXcQ"),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("more than 100")
+        ));
+    }
+
+    #[test]
+    fn comments_enforce_configured_response_and_encoded_field_bounds() {
+        let server = MockServer::spawn(vec![json_response("200 OK", COMMENTS_FIXTURE)]);
+        let bounded_provider =
+            InvidiousProvider::with_options(server.base_url.clone(), Duration::from_secs(2), 64)
+                .expect("small bounded provider should construct");
+        let error = bounded_provider
+            .video_comments("dQw4w9WgXcQ")
+            .expect_err("comments must respect the configured JSON response limit");
+        server.finish();
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge { limit: 64 }
+        ));
+
+        let oversized_id = "x".repeat(MAX_VIDEO_COMMENT_ID_BYTES + 1);
+        let raw: RawVideoCommentsPage = serde_json::from_value(serde_json::json!({
+            "videoId": "dQw4w9WgXcQ",
+            "comments": [{
+                "author": "Author",
+                "authorId": "UC_fixture",
+                "content": "Comment",
+                "commentId": oversized_id
+            }]
+        }))
+        .expect("oversized field fixture should deserialize");
+        assert!(matches!(
+            InvidiousProvider::convert_video_comments(raw, "dQw4w9WgXcQ"),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("comment ID")
+        ));
     }
 
     #[test]
@@ -1686,6 +2039,7 @@ mod tests {
         assert!(capabilities.video_search);
         assert!(capabilities.channel_search);
         assert!(capabilities.video_details);
+        assert!(capabilities.video_comments);
         assert!(capabilities.pagination);
     }
 

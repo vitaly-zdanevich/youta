@@ -91,6 +91,8 @@ use crate::playback::{
     BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent,
     PlaybackInput, PlaybackStatus, PlayerCommand, Result as PlaybackResult,
 };
+#[cfg(test)]
+use crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES;
 #[cfg(feature = "apple-podcasts")]
 use crate::providers::apple_podcasts::{
     ApplePodcastEpisodeMetadata, ApplePodcastMetadata, ApplePodcastsResolver,
@@ -129,10 +131,10 @@ use crate::providers::youtube_music::{
 };
 use crate::providers::{
     ChannelDetails, ChannelExternalLinkKind, ChannelStatisticsMode, ChannelSubscriberCount,
-    ChannelSummary, ChannelVideosRequest, PodcastEpisodeSummary, Provider, SearchFeature,
-    SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort, SearchTarget,
-    Thumbnail, VideoDetails, VideoOrientation, VideoSummary, invidious_youtube_provider,
-    official_youtube_provider, validate_youtube_video_id,
+    ChannelSummary, ChannelVideosRequest, MAX_VIDEO_COMMENTS, PodcastEpisodeSummary, Provider,
+    SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort,
+    SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
+    invidious_youtube_provider, official_youtube_provider, validate_youtube_video_id,
 };
 use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
@@ -155,8 +157,8 @@ use crate::tui::{
     PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
     PrivateNotePopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
     SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
-    ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
+    VideoCommentView, VideoCommentsPopupState, VideoCommentsPopupView, ViewModel,
+    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::tui::{
@@ -1455,6 +1457,10 @@ enum ProviderRequest {
         generation: u64,
         video_id: String,
     },
+    VideoComments {
+        generation: u64,
+        video_id: String,
+    },
     ChannelDetails {
         generation: u64,
         provider_generation: u64,
@@ -1731,6 +1737,11 @@ enum ProviderResponse {
     Details {
         generation: u64,
         result: Result<VideoDetails, String>,
+    },
+    VideoComments {
+        generation: u64,
+        video_id: String,
+        result: Result<Vec<VideoComment>, String>,
     },
     ChannelDetails {
         generation: u64,
@@ -2387,6 +2398,10 @@ const CHANNEL_DETAILS_DEBOUNCE: Duration = Duration::from_millis(500);
 const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
 /// Maximum full YouTube video-detail records retained by the process.
 const MAX_CACHED_YOUTUBE_VIDEO_DETAILS: usize = 64;
+/// Maximum selected-video comment result sets retained for one process.
+const MAX_CACHED_YOUTUBE_VIDEO_COMMENTS: usize = 64;
+/// Conservative owned-heap budget for process-local YouTube comment results.
+const MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES: usize = 4 * 1024 * 1024;
 /// Approximate heap budget for process-local YouTube video details.
 const MAX_CACHED_YOUTUBE_VIDEO_DETAILS_BYTES: usize = 8 * 1024 * 1024;
 /// Provider channel metadata remains fresh for seven days, but stale artwork
@@ -3012,6 +3027,18 @@ pub struct AppController {
     youtube_video_details_cache_order: VecDeque<String>,
     /// Conservative owned-heap estimate for full YouTube video details.
     youtube_video_details_cache_bytes: usize,
+    /// Whether the active YouTube provider can load public top-level comments.
+    youtube_video_comments_supported: bool,
+    /// Process-local positive and empty comment results keyed by video ID.
+    youtube_video_comments_cache: HashMap<String, Vec<VideoComment>>,
+    /// Least-recently-used order bounding selected-video comment results.
+    youtube_video_comments_cache_order: VecDeque<String>,
+    /// Conservative owned-heap estimate for cached YouTube comment results.
+    youtube_video_comments_cache_bytes: usize,
+    /// Monotonic owner rejecting comments for an older selection or popup.
+    youtube_video_comments_generation: u64,
+    /// Exact in-flight comments request owned by the visible popup.
+    pending_youtube_video_comments: Option<(u64, String)>,
     /// Channel identifiers currently owned by the provider worker.
     pending_channel_details: HashSet<String>,
     /// Selection generation rejecting metadata for a different visible source.
@@ -3166,6 +3193,9 @@ impl AppController {
             .map_or(ChannelStatisticsMode::Unsupported, |provider| {
                 provider.channel_statistics_mode()
             });
+        let youtube_video_comments_supported = youtube_provider
+            .as_ref()
+            .is_some_and(|provider| provider.capabilities().video_comments);
         let (subscription_tree, subscription_load_error) = match subscriptions::load(&config) {
             Ok(tree) => (tree, None),
             Err(error) => (SubscriptionTree::default(), Some(error)),
@@ -3319,6 +3349,7 @@ impl AppController {
         view.autoplay = config.playback.autoplay;
         view.local_folder_sizes_enabled = config.ui.show_local_folder_sizes;
         view.show_images_in_tty = config.ui.show_images_in_tty;
+        view.video_comments_available = youtube_video_comments_supported;
         view.status_line = if youtube_provider_available {
             "Default search: YouTube videos only".to_owned()
         } else {
@@ -3640,6 +3671,12 @@ impl AppController {
             youtube_video_details_cache: HashMap::new(),
             youtube_video_details_cache_order: VecDeque::new(),
             youtube_video_details_cache_bytes: 0,
+            youtube_video_comments_supported,
+            youtube_video_comments_cache: HashMap::new(),
+            youtube_video_comments_cache_order: VecDeque::new(),
+            youtube_video_comments_cache_bytes: 0,
+            youtube_video_comments_generation: 0,
+            pending_youtube_video_comments: None,
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
             scheduled_channel_details: None,
@@ -4085,6 +4122,7 @@ impl AppController {
         };
 
         let channel_statistics_mode = provider.channel_statistics_mode();
+        let video_comments_supported = provider.capabilities().video_comments;
         if let Err(error) = self.config.save_youtube_provider(setting) {
             self.set_youtube_setup_error(error.to_string());
             self.show_error("Could not save YouTube provider configuration", &error);
@@ -4108,6 +4146,12 @@ impl AppController {
         self.youtube_video_details_cache.clear();
         self.youtube_video_details_cache_order.clear();
         self.youtube_video_details_cache_bytes = 0;
+        self.youtube_video_comments_supported = video_comments_supported;
+        self.view.video_comments_available = video_comments_supported;
+        self.youtube_video_comments_cache.clear();
+        self.youtube_video_comments_cache_order.clear();
+        self.youtube_video_comments_cache_bytes = 0;
+        self.invalidate_youtube_video_comments_popup();
         self.pending_channel_details.clear();
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
@@ -5198,6 +5242,7 @@ impl AppController {
     }
 
     fn request_selected_details(&mut self) {
+        self.invalidate_youtube_video_comments_popup();
         self.clear_detail_navigation_history();
         self.previous_detail = None;
         self.view.details_scroll = 0;
@@ -5663,6 +5708,143 @@ impl AppController {
             .retain(|cached| cached != video_id);
         self.youtube_video_details_cache_order
             .push_back(video_id.to_owned());
+    }
+
+    /// Returns cached comments and promotes both positive and empty results.
+    fn cached_youtube_video_comments(&mut self, video_id: &str) -> Option<Vec<VideoComment>> {
+        let comments = self.youtube_video_comments_cache.get(video_id).cloned();
+        if comments.is_some() {
+            self.youtube_video_comments_cache_order
+                .retain(|cached| cached != video_id);
+            self.youtube_video_comments_cache_order
+                .push_back(video_id.to_owned());
+        }
+        comments
+    }
+
+    /// Inserts one successful bounded comment response into the process LRU.
+    fn cache_youtube_video_comments(&mut self, video_id: String, mut comments: Vec<VideoComment>) {
+        comments.truncate(MAX_VIDEO_COMMENTS);
+        let bytes = youtube_video_comments_estimated_heap_bytes(
+            video_id.capacity(),
+            comments.capacity(),
+            &comments,
+        );
+        if bytes > MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES {
+            return;
+        }
+
+        if let Some((replaced_id, replaced_comments)) =
+            self.youtube_video_comments_cache.remove_entry(&video_id)
+        {
+            self.youtube_video_comments_cache_bytes = self
+                .youtube_video_comments_cache_bytes
+                .saturating_sub(youtube_video_comments_estimated_heap_bytes(
+                    replaced_id.capacity(),
+                    replaced_comments.capacity(),
+                    &replaced_comments,
+                ));
+            self.youtube_video_comments_cache_order
+                .retain(|cached| cached != &video_id);
+        }
+
+        while self.youtube_video_comments_cache.len() >= MAX_CACHED_YOUTUBE_VIDEO_COMMENTS
+            || self
+                .youtube_video_comments_cache_bytes
+                .saturating_add(bytes)
+                > MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES
+        {
+            let Some(oldest) = self.youtube_video_comments_cache_order.pop_front() else {
+                break;
+            };
+            if let Some((evicted_id, evicted_comments)) =
+                self.youtube_video_comments_cache.remove_entry(&oldest)
+            {
+                self.youtube_video_comments_cache_bytes = self
+                    .youtube_video_comments_cache_bytes
+                    .saturating_sub(youtube_video_comments_estimated_heap_bytes(
+                        evicted_id.capacity(),
+                        evicted_comments.capacity(),
+                        &evicted_comments,
+                    ));
+            }
+        }
+        if self
+            .youtube_video_comments_cache_bytes
+            .saturating_add(bytes)
+            > MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES
+        {
+            return;
+        }
+
+        self.youtube_video_comments_cache
+            .insert(video_id.clone(), comments);
+        self.youtube_video_comments_cache_bytes = self
+            .youtube_video_comments_cache_bytes
+            .saturating_add(bytes);
+        self.youtube_video_comments_cache_order.push_back(video_id);
+    }
+
+    /// Invalidates one popup owner so a late provider response cannot reopen it.
+    fn invalidate_youtube_video_comments_popup(&mut self) {
+        self.youtube_video_comments_generation =
+            self.youtube_video_comments_generation.wrapping_add(1);
+        self.pending_youtube_video_comments = None;
+        self.view.video_comments_popup = None;
+    }
+
+    /// Opens cached comments or starts one worker-owned selected-video request.
+    fn open_youtube_video_comments(&mut self) {
+        if !self.youtube_video_comments_supported {
+            self.view.status_line =
+                "The active YouTube provider does not support public comments".to_owned();
+            return;
+        }
+        let Some(details) = self.view.details.as_ref() else {
+            self.view.status_line = "No YouTube video is selected".to_owned();
+            return;
+        };
+        let Some(media_id) = details
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::YouTube)
+        else {
+            self.view.status_line = "No YouTube video is selected".to_owned();
+            return;
+        };
+        let video_id = media_id.external_id.clone();
+        let video_title = details.title.clone();
+        self.youtube_video_comments_generation =
+            self.youtube_video_comments_generation.wrapping_add(1);
+        let generation = self.youtube_video_comments_generation;
+        if let Some(comments) = self.cached_youtube_video_comments(&video_id) {
+            self.view.video_comments_popup =
+                Some(video_comments_popup(video_id, video_title, comments));
+            self.pending_youtube_video_comments = None;
+            return;
+        }
+
+        self.view.video_comments_popup = Some(VideoCommentsPopupView {
+            video_id: video_id.clone(),
+            video_title,
+            state: VideoCommentsPopupState::Loading,
+            comments: Vec::new(),
+            scroll_offset: 0,
+        });
+        let request = ProviderRequest::VideoComments {
+            generation,
+            video_id: video_id.clone(),
+        };
+        if self
+            .provider_requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(request).is_ok())
+        {
+            self.pending_youtube_video_comments = Some((generation, video_id));
+        } else if let Some(popup) = self.view.video_comments_popup.as_mut() {
+            popup.state =
+                VideoCommentsPopupState::Error("the provider worker is unavailable".to_owned());
+        }
     }
 
     /// Applies provider metadata only to a matching visible Channel panel.
@@ -6972,6 +7154,43 @@ impl AppController {
                     }
                 }
                 self.refresh_selected_playlist_state();
+            }
+            ProviderResponse::VideoComments {
+                generation,
+                video_id,
+                result,
+            } => {
+                if !matches!(
+                    self.pending_youtube_video_comments.as_ref(),
+                    Some((pending_generation, pending_video_id))
+                        if *pending_generation == generation && pending_video_id == &video_id
+                ) {
+                    return;
+                }
+                self.pending_youtube_video_comments = None;
+                let Some(video_title) = self
+                    .view
+                    .video_comments_popup
+                    .as_ref()
+                    .filter(|popup| popup.video_id == video_id)
+                    .map(|popup| popup.video_title.clone())
+                else {
+                    return;
+                };
+                match result {
+                    Ok(comments) => {
+                        self.cache_youtube_video_comments(video_id.clone(), comments.clone());
+                        self.view.video_comments_popup =
+                            Some(video_comments_popup(video_id, video_title, comments));
+                    }
+                    Err(error) => {
+                        if let Some(popup) = self.view.video_comments_popup.as_mut() {
+                            popup.state = VideoCommentsPopupState::Error(error);
+                            popup.comments.clear();
+                            popup.scroll_offset = 0;
+                        }
+                    }
+                }
             }
             ProviderResponse::Apple { generation, result } => {
                 if self.finish_playlist_replay(generation, &SourceKind::ApplePodcasts, &result) {
@@ -11923,6 +12142,7 @@ impl AppController {
 
     /// Restores one move-only Details location and invalidates stale responses.
     fn restore_detail_navigation_snapshot(&mut self, snapshot: DetailNavigationSnapshot) {
+        self.invalidate_youtube_video_comments_popup();
         self.details_generation = self.details_generation.wrapping_add(1);
         #[cfg(feature = "wikidata")]
         self.invalidate_wikidata_lookup();
@@ -11983,6 +12203,7 @@ impl AppController {
 
     /// Opens a description-linked `YouTube` video in the existing Details pane.
     fn activate_description_video(&mut self, video_id: String, start_seconds: Option<u64>) {
+        self.invalidate_youtube_video_comments_popup();
         if let Err(error) = validate_youtube_video_id(&video_id) {
             self.show_error_message("Cannot open description video", error.to_string());
             return;
@@ -19069,6 +19290,13 @@ impl UiController for AppController {
                     self.view.quitting = true;
                 }
             }
+            UiAction::OpenVideoComments => self.open_youtube_video_comments(),
+            UiAction::SetVideoCommentsScroll(offset) => {
+                if let Some(popup) = self.view.video_comments_popup.as_mut() {
+                    popup.scroll_offset = offset;
+                }
+            }
+            UiAction::DismissVideoComments => self.invalidate_youtube_video_comments_popup(),
             UiAction::ScrollErrorPopup(movement) => self.scroll_error_popup(movement),
             UiAction::CopyErrorReport => self.copy_error_report(),
             UiAction::FillGitHubIssue => self.fill_github_issue(),
@@ -20212,6 +20440,29 @@ fn provider_worker(
                 );
                 if responses
                     .send(ProviderResponse::Details { generation, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ProviderRequest::VideoComments {
+                generation,
+                video_id,
+            } => {
+                let result = provider.as_ref().map_or_else(
+                    || Err("YouTube provider is not configured".to_owned()),
+                    |provider| {
+                        provider
+                            .video_comments(&video_id)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if responses
+                    .send(ProviderResponse::VideoComments {
+                        generation,
+                        video_id,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -22783,6 +23034,38 @@ fn youtube_video_details_estimated_heap_bytes(details: &VideoDetails) -> usize {
         .saturating_add(thumbnails)
 }
 
+/// Conservatively estimates owned heap retained by one comments-cache entry.
+///
+/// Both copies of the video ID (map key and LRU key), vector capacity, string
+/// capacities, and URL text are counted. The fixed 64-entry ceiling bounds
+/// collection bucket overhead which is not directly exposed by `std`.
+fn youtube_video_comments_estimated_heap_bytes(
+    video_id_capacity: usize,
+    comments_capacity: usize,
+    comments: &[VideoComment],
+) -> usize {
+    let video_id_bytes = std::mem::size_of::<String>()
+        .saturating_add(video_id_capacity)
+        .saturating_mul(2);
+    let comments_storage = std::mem::size_of::<Vec<VideoComment>>()
+        .saturating_add(comments_capacity.saturating_mul(std::mem::size_of::<VideoComment>()));
+    comments.iter().fold(
+        video_id_bytes.saturating_add(comments_storage),
+        |bytes, comment| {
+            bytes
+                .saturating_add(comment.comment_id.capacity())
+                .saturating_add(comment.author_name.capacity())
+                .saturating_add(comment.text.capacity())
+                .saturating_add(
+                    comment
+                        .author_channel_url
+                        .as_ref()
+                        .map_or(0, |url| url.as_str().len()),
+                )
+        },
+    )
+}
+
 fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTree) -> DetailView {
     DetailView {
         title: channel.name.clone(),
@@ -22828,6 +23111,9 @@ fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> 
             .map_or_else(|| "unknown".to_owned(), format_count),
         views: video
             .view_count
+            .map_or_else(|| "unknown".to_owned(), format_count),
+        comments: video
+            .comment_count
             .map_or_else(|| "unknown".to_owned(), format_count),
         published: video
             .published_text
@@ -24622,6 +24908,38 @@ fn format_unix_utc_date(timestamp: i64) -> String {
     format_civil_date(year, month, day).unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Converts one bounded provider result into the renderer-owned popup model.
+fn video_comments_popup(
+    video_id: String,
+    video_title: String,
+    comments: Vec<VideoComment>,
+) -> VideoCommentsPopupView {
+    let comments = comments
+        .into_iter()
+        .take(MAX_VIDEO_COMMENTS)
+        .map(|comment| VideoCommentView {
+            author_name: comment.author_name,
+            like_count: comment.like_count,
+            published: comment
+                .published_at
+                .map(format_unix_utc_date)
+                .filter(|published| published != "unknown"),
+            text: comment.text,
+        })
+        .collect::<Vec<_>>();
+    VideoCommentsPopupView {
+        video_id,
+        video_title,
+        state: if comments.is_empty() {
+            VideoCommentsPopupState::Empty
+        } else {
+            VideoCommentsPopupState::Ready
+        },
+        comments,
+        scroll_offset: 0,
+    }
+}
+
 /// Formats one publication timestamp in the user's local calendar.
 ///
 /// Relative labels are computed from injected `today`, which keeps date
@@ -25280,6 +25598,7 @@ mod tests {
             duration_seconds: Some(42),
             view_count: Some(7),
             like_count: Some(3),
+            comment_count: None,
             published_at: Some(1_729_003_672),
             published_text: None,
             license: Some("Standard YouTube License".to_owned()),
@@ -25292,6 +25611,37 @@ mod tests {
             webpage_url: None,
             stream_url: None,
         }
+    }
+
+    /// Returns one bounded, network-free public-comment fixture.
+    fn youtube_video_comment_fixture() -> VideoComment {
+        VideoComment {
+            comment_id: "comment-fixture-1".to_owned(),
+            author_name: "Fixture author".to_owned(),
+            author_channel_url: Some(
+                url::Url::parse("https://www.youtube.com/@fixture-author")
+                    .expect("fixture author URL"),
+            ),
+            text: "Fixture comment body.".to_owned(),
+            like_count: 12,
+            published_at: Some(1_729_003_672),
+            updated_at: None,
+        }
+    }
+
+    /// Builds a selected YouTube video with a captured provider request lane.
+    fn controller_with_youtube_video_comments()
+    -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (request_sender, requests) = unbounded();
+        controller.provider_requests = Some(request_sender);
+        controller.youtube_video_comments_supported = true;
+        controller.view.video_comments_available = true;
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        (temporary, controller, requests)
     }
 
     /// Selects one deterministic playable YouTube row without starting a
@@ -27903,6 +28253,7 @@ mod tests {
             duration_seconds: Some(42),
             view_count: Some(887_263),
             like_count: Some(13_045),
+            comment_count: Some(20),
             published_at: Some(1_729_003_672),
             published_text: None,
             license: Some("Creative Commons Attribution".to_owned()),
@@ -27918,6 +28269,7 @@ mod tests {
         let rendered = detail_from_video(&details, &SubscriptionTree::default());
         assert_eq!(rendered.likes, "13,045");
         assert_eq!(rendered.views, "887,263");
+        assert_eq!(rendered.comments, "20");
         assert_eq!(rendered.published, "2024 October 15");
         assert_eq!(rendered.license, "Creative Commons Attribution");
         assert_eq!(rendered.channel_name, "Channel");
@@ -27927,6 +28279,317 @@ mod tests {
             Some("https://www.youtube.com/channel/UCfixture")
         );
         assert!(!rendered.channel_subscribed);
+    }
+
+    #[test]
+    fn youtube_video_comments_load_succeed_and_reopen_from_ram_cache() {
+        let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+
+        controller.dispatch(UiAction::OpenVideoComments);
+
+        assert!(matches!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(VideoCommentsPopupState::Loading)
+        ));
+        let (generation, video_id) = match requests
+            .try_recv()
+            .expect("one selected-video comments request")
+        {
+            ProviderRequest::VideoComments {
+                generation,
+                video_id,
+            } => (generation, video_id),
+            _ => panic!("unexpected provider request"),
+        };
+        assert_eq!(video_id, "dQw4w9WgXcQ");
+
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation,
+            video_id: video_id.clone(),
+            result: Ok(vec![youtube_video_comment_fixture()]),
+        });
+
+        let popup = controller
+            .view
+            .video_comments_popup
+            .as_ref()
+            .expect("successful comments popup");
+        assert_eq!(popup.state, VideoCommentsPopupState::Ready);
+        assert_eq!(popup.comments.len(), 1);
+        assert_eq!(popup.comments[0].author_name, "Fixture author");
+        assert_eq!(popup.comments[0].like_count, 12);
+        assert_eq!(
+            popup.comments[0].published.as_deref(),
+            Some("2024 October 15")
+        );
+        assert_eq!(popup.comments[0].text, "Fixture comment body.");
+        assert!(controller.pending_youtube_video_comments.is_none());
+
+        controller.dispatch(UiAction::DismissVideoComments);
+        controller.dispatch(UiAction::OpenVideoComments);
+
+        assert_eq!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(&VideoCommentsPopupState::Ready)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "reopening a positive cached result must not contact the provider"
+        );
+    }
+
+    #[test]
+    fn youtube_video_comments_cache_empty_results_without_refetching() {
+        let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+        controller.dispatch(UiAction::OpenVideoComments);
+        let (generation, video_id) = match requests
+            .try_recv()
+            .expect("one selected-video comments request")
+        {
+            ProviderRequest::VideoComments {
+                generation,
+                video_id,
+            } => (generation, video_id),
+            _ => panic!("unexpected provider request"),
+        };
+
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation,
+            video_id,
+            result: Ok(Vec::new()),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(&VideoCommentsPopupState::Empty)
+        );
+        assert_eq!(controller.youtube_video_comments_cache.len(), 1);
+        assert!(
+            controller.youtube_video_comments_cache_bytes > 0,
+            "a negative cache entry still owns its map and LRU keys"
+        );
+        controller.dispatch(UiAction::DismissVideoComments);
+        controller.dispatch(UiAction::OpenVideoComments);
+        assert_eq!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(&VideoCommentsPopupState::Empty)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "reopening a cached empty result must not contact the provider"
+        );
+    }
+
+    #[test]
+    fn youtube_video_comments_cache_enforces_count_and_heap_bounds() {
+        let config = Config::for_dir("/tmp/youta-video-comments-cache-bounds-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for index in 0..=MAX_CACHED_YOUTUBE_VIDEO_COMMENTS {
+            controller.cache_youtube_video_comments(
+                format!("video-{index:05}"),
+                vec![youtube_video_comment_fixture()],
+            );
+        }
+        assert_eq!(
+            controller.youtube_video_comments_cache.len(),
+            MAX_CACHED_YOUTUBE_VIDEO_COMMENTS
+        );
+        assert!(
+            !controller
+                .youtube_video_comments_cache
+                .contains_key("video-00000")
+        );
+        assert!(
+            controller.youtube_video_comments_cache_bytes
+                <= MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES
+        );
+
+        let config = Config::for_dir("/tmp/youta-video-comments-cache-byte-bounds-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let comments = (0..MAX_VIDEO_COMMENTS)
+            .map(|index| {
+                let mut comment = youtube_video_comment_fixture();
+                comment.comment_id = format!("large-comment-{index}");
+                comment.text = "x".repeat(MAX_VIDEO_COMMENT_TEXT_BYTES - 1);
+                comment
+            })
+            .collect::<Vec<_>>();
+        for index in 0..16 {
+            controller.cache_youtube_video_comments(format!("large-{index:05}"), comments.clone());
+        }
+        assert!(
+            controller.youtube_video_comments_cache.len() < MAX_CACHED_YOUTUBE_VIDEO_COMMENTS,
+            "the heap budget must evict entries before the count limit"
+        );
+        assert!(
+            !controller
+                .youtube_video_comments_cache
+                .contains_key("large-00000")
+        );
+        assert!(
+            controller.youtube_video_comments_cache_bytes
+                <= MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES
+        );
+    }
+
+    #[test]
+    fn youtube_video_comments_cache_rejects_oversized_replacement_transactionally() {
+        let config = Config::for_dir("/tmp/youta-video-comments-cache-oversized-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let video_id = "dQw4w9WgXcQ".to_owned();
+        let original = youtube_video_comment_fixture();
+        controller.cache_youtube_video_comments(video_id.clone(), vec![original.clone()]);
+        let original_bytes = controller.youtube_video_comments_cache_bytes;
+        let original_order = controller.youtube_video_comments_cache_order.clone();
+
+        let mut oversized = youtube_video_comment_fixture();
+        oversized.text = "x".repeat(MAX_CACHED_YOUTUBE_VIDEO_COMMENTS_BYTES + 1);
+        controller.cache_youtube_video_comments(video_id.clone(), vec![oversized]);
+
+        assert_eq!(
+            controller.youtube_video_comments_cache.get(&video_id),
+            Some(&vec![original]),
+            "a rejected replacement must preserve the prior positive cache entry"
+        );
+        assert_eq!(
+            controller.youtube_video_comments_cache_bytes, original_bytes,
+            "a rejected replacement must not corrupt byte accounting"
+        );
+        assert_eq!(
+            controller.youtube_video_comments_cache_order, original_order,
+            "a rejected replacement must not corrupt LRU order"
+        );
+    }
+
+    #[test]
+    fn youtube_video_comments_reject_stale_responses_and_keep_errors_retryable() {
+        let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+        controller.dispatch(UiAction::OpenVideoComments);
+        let (generation, video_id) = match requests
+            .try_recv()
+            .expect("one selected-video comments request")
+        {
+            ProviderRequest::VideoComments {
+                generation,
+                video_id,
+            } => (generation, video_id),
+            _ => panic!("unexpected provider request"),
+        };
+
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation: generation.wrapping_add(1),
+            video_id: video_id.clone(),
+            result: Ok(vec![youtube_video_comment_fixture()]),
+        });
+        assert!(matches!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(VideoCommentsPopupState::Loading)
+        ));
+        assert_eq!(
+            controller.pending_youtube_video_comments,
+            Some((generation, video_id.clone()))
+        );
+        assert!(
+            !controller
+                .youtube_video_comments_cache
+                .contains_key(&video_id),
+            "a stale success must not enter the cache"
+        );
+
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation,
+            video_id: video_id.clone(),
+            result: Err("fixture quota failure".to_owned()),
+        });
+        assert!(matches!(
+            controller
+                .view
+                .video_comments_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(VideoCommentsPopupState::Error(error)) if error == "fixture quota failure"
+        ));
+        assert!(controller.pending_youtube_video_comments.is_none());
+
+        controller.dispatch(UiAction::DismissVideoComments);
+        controller.dispatch(UiAction::OpenVideoComments);
+        assert!(matches!(
+            requests.try_recv().expect("errors remain retryable"),
+            ProviderRequest::VideoComments {
+                video_id: retried_video_id,
+                ..
+            } if retried_video_id == video_id
+        ));
+    }
+
+    #[test]
+    fn youtube_video_comment_selection_change_dismisses_and_invalidates_popup() {
+        let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+        controller.dispatch(UiAction::OpenVideoComments);
+        let ProviderRequest::VideoComments {
+            generation,
+            video_id,
+        } = requests
+            .try_recv()
+            .expect("one selected-video comments request")
+        else {
+            panic!("unexpected provider request");
+        };
+        let previous_generation = controller.youtube_video_comments_generation;
+
+        let replacement = VideoSummary {
+            video_id: "abcdefghijk".to_owned(),
+            title: "Replacement fixture".to_owned(),
+            ..subscription_video_summary()
+        };
+        controller
+            .youtube_results
+            .push(SearchItem::Video(replacement));
+        controller.view.selected = 1;
+        controller.request_selected_details();
+
+        assert!(controller.view.video_comments_popup.is_none());
+        assert!(controller.pending_youtube_video_comments.is_none());
+        assert_ne!(
+            controller.youtube_video_comments_generation,
+            previous_generation
+        );
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation,
+            video_id: video_id.clone(),
+            result: Ok(vec![youtube_video_comment_fixture()]),
+        });
+        assert!(controller.view.video_comments_popup.is_none());
+        assert!(
+            !controller
+                .youtube_video_comments_cache
+                .contains_key(&video_id),
+            "a late response for the prior selection must remain discarded"
+        );
     }
 
     #[test]
@@ -36506,7 +37169,18 @@ mod tests {
         let mut controller = AppController::new(config, store, None, None);
         controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
         controller.cache_youtube_video_details(&subscription_video_details("Old provider"));
+        controller.cache_youtube_video_comments(
+            "dQw4w9WgXcQ".to_owned(),
+            vec![youtube_video_comment_fixture()],
+        );
+        controller.pending_youtube_video_comments = Some((4, "dQw4w9WgXcQ".to_owned()));
+        controller.view.video_comments_popup = Some(video_comments_popup(
+            "dQw4w9WgXcQ".to_owned(),
+            "Old provider".to_owned(),
+            vec![youtube_video_comment_fixture()],
+        ));
         assert_eq!(controller.youtube_video_details_cache.len(), 1);
+        assert_eq!(controller.youtube_video_comments_cache.len(), 1);
         controller.view.search_query = "API fixture".to_owned();
         controller.dispatch(UiAction::SubmitSearch);
         controller
@@ -36523,6 +37197,12 @@ mod tests {
         assert!(controller.youtube_video_details_cache.is_empty());
         assert!(controller.youtube_video_details_cache_order.is_empty());
         assert_eq!(controller.youtube_video_details_cache_bytes, 0);
+        assert!(controller.youtube_video_comments_cache.is_empty());
+        assert!(controller.youtube_video_comments_cache_order.is_empty());
+        assert_eq!(controller.youtube_video_comments_cache_bytes, 0);
+        assert!(controller.pending_youtube_video_comments.is_none());
+        assert!(controller.view.video_comments_popup.is_none());
+        assert!(!controller.view.video_comments_available);
         assert_eq!(
             controller.view.search_activity,
             Some(SearchActivity::YouTube)

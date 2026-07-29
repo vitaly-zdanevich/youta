@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.18.1`. Items marked **roadmap** are design decisions, not support
+present in `0.19.0`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals

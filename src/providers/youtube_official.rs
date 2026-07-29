@@ -19,11 +19,12 @@ use url::Url;
 
 use super::{
     ChannelDetails, ChannelStatisticsMode, ChannelSubscriberCount, ChannelSummary,
-    ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, Provider,
-    ProviderCapabilities, ProviderError, SearchDate, SearchDuration, SearchFeature, SearchItem,
-    SearchPage, SearchRequest, SearchSort, SearchTarget, Thumbnail, VideoDetails, VideoOrientation,
-    VideoSummary, parse_rfc3339_epoch, provider_agent, validate_base_url,
-    validate_youtube_video_id,
+    ChannelVideosRequest, DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT,
+    MAX_VIDEO_COMMENT_ID_BYTES, MAX_VIDEO_COMMENTS, Provider, ProviderCapabilities, ProviderError,
+    SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
+    SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
+    normalize_video_comment_text, parse_rfc3339_epoch, provider_agent, validate_base_url,
+    validate_video_comment_author, validate_youtube_video_id,
 };
 
 const API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
@@ -359,6 +360,31 @@ impl YouTubeOfficialProvider {
                 validate_response_video_id(&item.id)?;
                 Ok((item.id.clone(), item))
             })
+            .collect()
+    }
+
+    /// Fetches a single bounded page of relevant, public top-level comments.
+    fn fetch_video_comments(&self, video_id: &str) -> Result<Vec<VideoComment>, ProviderError> {
+        validate_youtube_video_id(video_id)?;
+        let mut url = self.endpoint("commentThreads")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("part", "snippet");
+            query.append_pair("videoId", video_id);
+            query.append_pair("maxResults", &MAX_VIDEO_COMMENTS.to_string());
+            query.append_pair("order", "relevance");
+            query.append_pair("textFormat", "plainText");
+        }
+        let response: RawCommentThreadListResponse = self.request_json(&url)?;
+        if response.items.len() > MAX_VIDEO_COMMENTS {
+            return Err(ProviderError::InvalidResponse(format!(
+                "YouTube returned more than {MAX_VIDEO_COMMENTS} comments"
+            )));
+        }
+        response
+            .items
+            .into_iter()
+            .map(video_comment_from_thread)
             .collect()
     }
 
@@ -702,6 +728,7 @@ impl Provider for YouTubeOfficialProvider {
             search_filters: true,
             search_sorting: true,
             video_details: true,
+            video_comments: true,
             thumbnails: true,
         }
     }
@@ -741,6 +768,10 @@ impl Provider for YouTubeOfficialProvider {
             ProviderError::InvalidResponse("YouTube video was not found or is private".to_owned())
         })?;
         video_details_from_resource(resource)
+    }
+
+    fn video_comments(&self, video_id: &str) -> Result<Vec<VideoComment>, ProviderError> {
+        self.fetch_video_comments(video_id)
     }
 
     fn channel_subscriber_counts(
@@ -1278,6 +1309,7 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         duration_seconds,
         view_count: raw.statistics.view_count,
         like_count: raw.statistics.like_count,
+        comment_count: raw.statistics.comment_count,
         published_at: raw
             .snippet
             .published_at
@@ -1293,6 +1325,59 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         thumbnails: convert_thumbnails(raw.snippet.thumbnails),
         stream_url: None,
     })
+}
+
+fn video_comment_from_thread(raw: RawCommentThread) -> Result<VideoComment, ProviderError> {
+    let comment = raw.snippet.top_level_comment;
+    validate_comment_id(&comment.id)?;
+    let author_name =
+        validate_video_comment_author("YouTube", comment.snippet.author_display_name)?;
+    let text = normalize_video_comment_text("YouTube", comment.snippet.text_display)?;
+    let published_at = parse_comment_timestamp(
+        comment.snippet.published_at.as_deref(),
+        "publication timestamp",
+    )?;
+    let updated_at =
+        parse_comment_timestamp(comment.snippet.updated_at.as_deref(), "update timestamp")?;
+    Ok(VideoComment {
+        comment_id: comment.id,
+        author_name,
+        author_channel_url: comment
+            .snippet
+            .author_channel_url
+            .as_deref()
+            .and_then(safe_remote_url),
+        text,
+        like_count: comment.snippet.like_count.unwrap_or(0),
+        published_at,
+        updated_at,
+    })
+}
+
+fn validate_comment_id(comment_id: &str) -> Result<(), ProviderError> {
+    if comment_id.is_empty()
+        || comment_id.len() > MAX_VIDEO_COMMENT_ID_BYTES
+        || comment_id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(ProviderError::InvalidResponse(
+            "YouTube returned an invalid comment ID".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_comment_timestamp(value: Option<&str>, field: &str) -> Result<Option<i64>, ProviderError> {
+    value
+        .map(|value| {
+            parse_rfc3339_epoch(value).ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "YouTube returned an invalid comment {field}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn map_license(value: &str) -> Option<String> {
@@ -1638,11 +1723,17 @@ struct RawContentDetails {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the fields intentionally mirror YouTube's statistics schema"
+)]
 struct RawVideoStatistics {
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     view_count: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     like_count: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    comment_count: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1722,6 +1813,44 @@ struct RawChannelStatistics {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawCommentThreadListResponse {
+    #[serde(default)]
+    items: Vec<RawCommentThread>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCommentThread {
+    snippet: RawCommentThreadSnippet,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommentThreadSnippet {
+    top_level_comment: RawComment,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawComment {
+    id: String,
+    snippet: RawCommentSnippet,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommentSnippet {
+    author_display_name: String,
+    #[serde(default)]
+    author_channel_url: Option<String>,
+    text_display: String,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    like_count: Option<u64>,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawErrorEnvelope {
     error: RawApiError,
 }
@@ -1772,6 +1901,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
+
+    use crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES;
 
     use super::*;
 
@@ -1827,9 +1958,46 @@ mod tests {
                 }
             },
             "contentDetails": {"duration": "P1DT2H3M4S"},
-            "statistics": {"viewCount": "123456", "likeCount": 789},
+            "statistics": {
+                "viewCount": "123456",
+                "likeCount": 789,
+                "commentCount": "20"
+            },
             "status": {"license": "creativeCommon"},
             "player": {"embedWidth": "1080", "embedHeight": 1920}
+        }]
+    }"#;
+
+    const COMMENT_THREADS: &str = r#"{
+        "items": [{
+            "id": "Ugz-thread-one",
+            "snippet": {
+                "topLevelComment": {
+                    "id": "Ugz-comment-one",
+                    "snippet": {
+                        "authorDisplayName": "First author",
+                        "authorChannelUrl": "https://www.youtube.com/@first-author",
+                        "textDisplay": "First line\nSecond line & plain text",
+                        "likeCount": "42",
+                        "publishedAt": "2024-03-04T05:06:07Z",
+                        "updatedAt": "2024-03-05T06:07:08Z"
+                    }
+                }
+            }
+        }, {
+            "id": "Ugz-thread-two",
+            "snippet": {
+                "topLevelComment": {
+                    "id": "Ugz-comment-two",
+                    "snippet": {
+                        "authorDisplayName": "Second author",
+                        "authorChannelUrl": "file:///etc/passwd",
+                        "textDisplay": "Another public comment",
+                        "likeCount": 3,
+                        "publishedAt": "2024-04-05T06:07:08Z"
+                    }
+                }
+            }
         }]
     }"#;
 
@@ -2626,6 +2794,7 @@ mod tests {
 
         assert_eq!(details.video_id, VIDEO_ID);
         assert_eq!(details.like_count, Some(789));
+        assert_eq!(details.comment_count, Some(20));
         assert_eq!(details.keywords, ["open", "music"]);
         assert_eq!(
             details.license.as_deref(),
@@ -2635,6 +2804,132 @@ mod tests {
         assert_eq!(details.orientation, VideoOrientation::Vertical);
         assert!(requests[0].contains("id=dQw4w9WgXcQ"));
         assert!(requests[0].contains(&format!("key={TEST_KEY}")));
+    }
+
+    #[test]
+    fn comments_request_returns_bounded_relevant_plain_text() {
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", COMMENT_THREADS)]);
+        let comments = provider
+            .video_comments(VIDEO_ID)
+            .expect("mock comments should succeed");
+        let requests = server.finish();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].comment_id, "Ugz-comment-one");
+        assert_eq!(comments[0].author_name, "First author");
+        assert_eq!(
+            comments[0].author_channel_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/@first-author")
+        );
+        assert_eq!(comments[0].text, "First line\nSecond line & plain text");
+        assert_eq!(comments[0].like_count, 42);
+        assert_eq!(comments[0].published_at, Some(1_709_528_767));
+        assert_eq!(comments[0].updated_at, Some(1_709_618_828));
+        assert_eq!(
+            comments[1].author_channel_url, None,
+            "unsafe author URLs must not reach the public DTO"
+        );
+        assert_eq!(comments[1].updated_at, None);
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("/commentThreads?"));
+        let pairs = query_pairs(&requests[0]);
+        assert_eq!(pairs.get("part").map(String::as_str), Some("snippet"));
+        assert_eq!(pairs.get("videoId").map(String::as_str), Some(VIDEO_ID));
+        assert_eq!(pairs.get("maxResults").map(String::as_str), Some("10"));
+        assert_eq!(pairs.get("order").map(String::as_str), Some("relevance"));
+        assert_eq!(
+            pairs.get("textFormat").map(String::as_str),
+            Some("plainText")
+        );
+        assert_eq!(pairs.get("key").map(String::as_str), Some(TEST_KEY));
+    }
+
+    #[test]
+    fn comments_reject_invalid_identifiers_and_remote_bounds() {
+        let provider =
+            YouTubeOfficialProvider::new(TEST_KEY).expect("test API key should be accepted");
+        assert!(matches!(
+            provider.video_comments("../not-a-video"),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        let item = r#"{
+            "snippet": {
+                "topLevelComment": {
+                    "id": "Ugz-comment",
+                    "snippet": {
+                        "authorDisplayName": "Author",
+                        "textDisplay": "Comment"
+                    }
+                }
+            }
+        }"#;
+        let oversized_page = format!(
+            r#"{{"items":[{}]}}"#,
+            [item; MAX_VIDEO_COMMENTS + 1].join(",")
+        );
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", &oversized_page)]);
+        let error = provider
+            .video_comments(VIDEO_ID)
+            .expect_err("an oversized comment page must fail");
+        server.finish();
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message) if message.contains("more than 10")
+        ));
+
+        let oversized_text = "x".repeat(MAX_VIDEO_COMMENT_TEXT_BYTES + 1);
+        let body = COMMENT_THREADS.replace("Another public comment", &oversized_text);
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+        let error = provider
+            .video_comments(VIDEO_ID)
+            .expect_err("oversized comment text must fail");
+        server.finish();
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message) if message.contains("comment text")
+        ));
+    }
+
+    #[test]
+    fn comments_reject_malformed_fields_instead_of_leaking_partial_data() {
+        for body in [
+            COMMENT_THREADS.replace("Ugz-comment-one", "invalid comment id"),
+            COMMENT_THREADS.replace("2024-03-04T05:06:07Z", "not-a-date"),
+            COMMENT_THREADS.replace("First author", " "),
+            COMMENT_THREADS.replace("First author", "Author\\u001b[2J"),
+            COMMENT_THREADS.replace("Another public comment", "tab\\tinjection"),
+            COMMENT_THREADS.replace("Another public comment", "nul\\u0000injection"),
+        ] {
+            let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+            let error = provider
+                .video_comments(VIDEO_ID)
+                .expect_err("malformed comment metadata must fail");
+            server.finish();
+            assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        }
+    }
+
+    #[test]
+    fn comments_normalize_portable_multiline_bodies() {
+        let body = COMMENT_THREADS.replace(
+            "First line\\nSecond line & plain text",
+            "First line\\r\\nSecond line\\rThird line",
+        );
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+
+        let comments = provider
+            .video_comments(VIDEO_ID)
+            .expect("portable line endings should remain multiline");
+        server.finish();
+
+        assert_eq!(
+            comments[0].text, "First line\nSecond line\nThird line",
+            "line normalization must not flatten the public comment"
+        );
     }
 
     #[test]
@@ -2893,6 +3188,7 @@ mod tests {
         assert!(capabilities.search_filters);
         assert!(capabilities.search_sorting);
         assert!(capabilities.video_details);
+        assert!(capabilities.video_comments);
         assert!(capabilities.thumbnails);
     }
 

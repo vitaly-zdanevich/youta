@@ -605,6 +605,9 @@ These are distinct integration modes:
   [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list)
   and
   [`channels.list`](https://developers.google.com/youtube/v3/docs/channels/list).
+  Selected videos expose the public comment count and a bounded, RAM-cached
+  popup containing up to ten relevance-ordered top-level comments through
+  [`commentThreads.list`](https://developers.google.com/youtube/v3/docs/commentThreads/list).
   Account actions such as subscribing or posting comments require OAuth; an
   API key alone cannot authorize them. The roadmap includes opt-in,
   bidirectional subscription sync between Youta's local OPML file and the
@@ -617,7 +620,10 @@ These are distinct integration modes:
 - Invidious is the keyless alternative when the user configures an instance.
   `providers.youtube_backend = 'auto'` prefers the official adapter when
   `providers.youtube_api_key` is set, then uses
-  `providers.invidious_base_url`.
+  `providers.invidious_base_url`. It provides the same selected-video comment
+  count and top-comments popup through the documented
+  [`videos/:id` and `comments/:id` endpoints](https://docs.invidious.io/api/)
+  without requiring an API key.
 - The separate **YouTube Music** tab searches the public
   `music.youtube.com` catalog through
   [yt-dlp](https://github.com/yt-dlp/yt-dlp), so discovery and playback do not
