@@ -141,6 +141,13 @@ a five-second, stderr-discarding `ffprobe` process for the selected path.
 Completed records enter a 128-entry process-local LRU, and rapid navigation
 never queues more than one metadata read at a time.
 
+When terminal images and local-video thumbnails are enabled, the selected
+finite local video gets one bounded midpoint-frame request after its duration
+is known. A cancellable FFmpeg worker extracts a size-limited JPEG without a
+shell. Replacement-sensitive source and fitted-preview keys let the existing
+private thumbnail cache reuse that frame across selection changes, terminal
+resizes, and restarts without trusting stale metadata for a replaced file.
+
 Apple Podcasts discovery is isolated from the YouTube routes. The tab uses a
 bounded, storefront-specific public catalogue search and persists only compact
 show summaries. Selecting a show does not resolve every result in advance;

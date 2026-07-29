@@ -15,9 +15,13 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "local-video-thumbnails")]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
+#[cfg(feature = "local-video-thumbnails")]
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "local-artwork")]
@@ -65,6 +69,17 @@ const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
 const LOCAL_PREVIEW_MAGIC: &[u8; 8] = b"YTPRV001";
 const LOCAL_PREVIEW_HEADER_BYTES: usize = LOCAL_PREVIEW_MAGIC.len() + 4 + 4 + 1;
+const LOCAL_VIDEO_FRAME_CACHE_KEY_VERSION: &[u8] = b"youta-local-video-frame-v1\0";
+const LOCAL_VIDEO_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-video-preview-v1\0";
+const LOCAL_VIDEO_EXTRACTION_PROFILE: &[u8] = b"mjpeg-q5-fit-1280-v1";
+#[cfg(feature = "local-video-thumbnails")]
+const LOCAL_VIDEO_FRAME_MAX_DIMENSION: u32 = 1_280;
+#[cfg(feature = "local-video-thumbnails")]
+const LOCAL_VIDEO_EXTRACT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(feature = "local-video-thumbnails")]
+const LOCAL_VIDEO_EXTRACT_POLL: Duration = Duration::from_millis(10);
+#[cfg(feature = "local-video-thumbnails")]
+const MAX_LOCAL_VIDEO_STDERR_BYTES: usize = 64 * 1024;
 #[cfg(feature = "local-artwork")]
 const MAX_LOCAL_ARTWORK_READ_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "local-artwork")]
@@ -128,6 +143,8 @@ pub enum ThumbnailFailure {
     UnsupportedFormat,
     /// The image was malformed or exceeded decode limits.
     InvalidImage,
+    /// FFmpeg could not extract a representative local-video frame.
+    LocalVideoFrameExtractionFailed,
     /// The terminal protocol encoder rejected the image.
     EncodingFailed,
     /// The background thumbnail worker stopped unexpectedly.
@@ -142,6 +159,7 @@ impl std::fmt::Display for ThumbnailFailure {
             Self::ResponseTooLarge => "thumbnail exceeds the 4 MiB download limit",
             Self::UnsupportedFormat => "thumbnail is not JPEG, PNG, or WebP",
             Self::InvalidImage => "thumbnail is invalid or exceeds decode limits",
+            Self::LocalVideoFrameExtractionFailed => "video frame extraction failed",
             Self::EncodingFailed => "terminal thumbnail encoding failed",
             Self::WorkerStopped => "thumbnail worker stopped",
         };
@@ -300,9 +318,14 @@ impl TerminalInfo {
     }
 }
 
+/// Millisecond offset used to extract one representative local-video frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalVideoMidpoint(u64);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ThumbnailTarget {
     source: Url,
+    local_video_midpoint: Option<LocalVideoMidpoint>,
     area: Rect,
 }
 
@@ -320,6 +343,7 @@ struct WorkerResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedThumbnailKey {
     source: Url,
+    local_video_midpoint: Option<LocalVideoMidpoint>,
     width: u16,
     height: u16,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
@@ -329,6 +353,7 @@ impl From<&ThumbnailTarget> for PreparedThumbnailKey {
     fn from(target: &ThumbnailTarget) -> Self {
         Self {
             source: target.source.clone(),
+            local_video_midpoint: target.local_video_midpoint,
             width: target.area.width,
             height: target.area.height,
             local_fingerprint: None,
@@ -363,7 +388,10 @@ impl PreparedThumbnailKey {
     }
 
     fn same_target(&self, other: &Self) -> bool {
-        self.source == other.source && self.width == other.width && self.height == other.height
+        self.source == other.source
+            && self.local_video_midpoint == other.local_video_midpoint
+            && self.width == other.width
+            && self.height == other.height
     }
 }
 
@@ -390,6 +418,7 @@ struct LoadedThumbnail {
     protocol: StatefulProtocol,
     decoded_bytes: usize,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
+    deferred_local_frame: Option<DeferredLocalPreview>,
     deferred_local_preview: Option<DeferredLocalPreview>,
 }
 
@@ -409,6 +438,170 @@ struct LocalPreviewTarget {
 
 trait ThumbnailTransport: Send + 'static {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
+}
+
+/// Cancellation token shared by one visible thumbnail request and its worker.
+#[derive(Clone)]
+struct RequestCancellation {
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl RequestCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) != self.generation
+    }
+}
+
+/// Extracts one bounded encoded frame without coupling the manager to FFmpeg.
+trait LocalVideoFrameExtractor: Send + 'static {
+    fn extract(
+        &mut self,
+        path: &Path,
+        midpoint: LocalVideoMidpoint,
+        cancellation: &RequestCancellation,
+    ) -> Result<Vec<u8>, ThumbnailFailure>;
+}
+
+/// Shell-free FFmpeg process used by the production local-video worker.
+struct FfmpegVideoFrameExtractor;
+
+#[cfg(not(feature = "local-video-thumbnails"))]
+impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
+    fn extract(
+        &mut self,
+        _path: &Path,
+        _midpoint: LocalVideoMidpoint,
+        _cancellation: &RequestCancellation,
+    ) -> Result<Vec<u8>, ThumbnailFailure> {
+        Err(ThumbnailFailure::LocalVideoFrameExtractionFailed)
+    }
+}
+
+#[cfg(feature = "local-video-thumbnails")]
+impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
+    fn extract(
+        &mut self,
+        path: &Path,
+        midpoint: LocalVideoMidpoint,
+        cancellation: &RequestCancellation,
+    ) -> Result<Vec<u8>, ThumbnailFailure> {
+        if cancellation.is_cancelled() {
+            return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+        }
+        let mut child = local_video_frame_command(path, midpoint)
+            .spawn()
+            .map_err(|_| ThumbnailFailure::LocalVideoFrameExtractionFailed)?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+        };
+        let stdout_reader =
+            thread::spawn(move || read_bounded_process_pipe(stdout, MAX_DOWNLOAD_BYTES));
+        let stderr_reader =
+            thread::spawn(move || read_bounded_process_pipe(stderr, MAX_LOCAL_VIDEO_STDERR_BYTES));
+        let deadline = Instant::now() + LOCAL_VIDEO_EXTRACT_TIMEOUT;
+
+        let status = loop {
+            if cancellation.is_cancelled() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(LOCAL_VIDEO_EXTRACT_POLL),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+                }
+            }
+        };
+
+        let bytes = stdout_reader
+            .join()
+            .map_err(|_| ThumbnailFailure::LocalVideoFrameExtractionFailed)?
+            .map_err(|_| ThumbnailFailure::LocalVideoFrameExtractionFailed)?;
+        // Diagnostics are intentionally discarded: local paths and helper
+        // arguments must never escape through user-facing thumbnail failures.
+        let _ = stderr_reader.join();
+        if cancellation.is_cancelled() {
+            return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+        }
+        if bytes.len() > MAX_DOWNLOAD_BYTES {
+            return Err(ThumbnailFailure::ResponseTooLarge);
+        }
+        if !status.success() || bytes.is_empty() {
+            return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Builds a shell-free, one-frame FFmpeg invocation with bounded output size.
+#[cfg(feature = "local-video-thumbnails")]
+fn local_video_frame_command(path: &Path, midpoint: LocalVideoMidpoint) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format_ffmpeg_timestamp(midpoint))
+        .arg("-i")
+        .arg(path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-an")
+        .arg("-sn")
+        .arg("-dn")
+        .arg("-vf")
+        .arg(format!(
+            "scale=w={LOCAL_VIDEO_FRAME_MAX_DIMENSION}:h={LOCAL_VIDEO_FRAME_MAX_DIMENSION}:\
+             force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,\
+             format=yuvj420p"
+        ))
+        .arg("-c:v")
+        .arg("mjpeg")
+        .arg("-q:v")
+        .arg("5")
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("pipe:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Formats a millisecond offset without locale-dependent decimal separators.
+#[cfg(feature = "local-video-thumbnails")]
+fn format_ffmpeg_timestamp(midpoint: LocalVideoMidpoint) -> String {
+    format!("{}.{:03}", midpoint.0 / 1_000, midpoint.0 % 1_000)
+}
+
+/// Reads at most `limit + 1` bytes so callers can detect and reject overflow.
+#[cfg(feature = "local-video-thumbnails")]
+fn read_bounded_process_pipe(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    reader
+        .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 struct HttpThumbnailTransport {
@@ -859,10 +1052,44 @@ impl LocalThumbnailFingerprint {
     fn preview_cache_key(&self, target: LocalPreviewTarget) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(LOCAL_PREVIEW_CACHE_KEY_VERSION);
-        hash_local_thumbnail_path(&mut digest, &self.canonical_path);
+        self.update_cache_digest(&mut digest);
+        digest.update(target.width.to_le_bytes());
+        digest.update(target.height.to_le_bytes());
+        digest.finalize().into()
+    }
+
+    /// Returns the source-frame cache key for one local-video midpoint.
+    fn video_frame_cache_key(&self, midpoint: LocalVideoMidpoint) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(LOCAL_VIDEO_FRAME_CACHE_KEY_VERSION);
+        self.update_cache_digest(&mut digest);
+        digest.update(midpoint.0.to_le_bytes());
+        digest.update(LOCAL_VIDEO_EXTRACTION_PROFILE);
+        digest.finalize().into()
+    }
+
+    /// Returns the fitted derivative key for one local-video midpoint and area.
+    fn video_preview_cache_key(
+        &self,
+        midpoint: LocalVideoMidpoint,
+        target: LocalPreviewTarget,
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(LOCAL_VIDEO_PREVIEW_CACHE_KEY_VERSION);
+        self.update_cache_digest(&mut digest);
+        digest.update(midpoint.0.to_le_bytes());
+        digest.update(LOCAL_VIDEO_EXTRACTION_PROFILE);
+        digest.update(target.width.to_le_bytes());
+        digest.update(target.height.to_le_bytes());
+        digest.finalize().into()
+    }
+
+    /// Adds replacement-sensitive filesystem identity to a private cache key.
+    fn update_cache_digest(&self, digest: &mut Sha256) {
+        hash_local_thumbnail_path(digest, &self.canonical_path);
         digest.update(self.length.to_le_bytes());
-        hash_local_thumbnail_system_time(&mut digest, self.modified);
-        hash_local_thumbnail_system_time(&mut digest, self.created);
+        hash_local_thumbnail_system_time(digest, self.modified);
+        hash_local_thumbnail_system_time(digest, self.created);
         #[cfg(unix)]
         {
             digest.update(self.device.to_le_bytes());
@@ -872,9 +1099,6 @@ impl LocalThumbnailFingerprint {
             digest.update(self.modified_seconds.to_le_bytes());
             digest.update(self.modified_nanoseconds.to_le_bytes());
         }
-        digest.update(target.width.to_le_bytes());
-        digest.update(target.height.to_le_bytes());
-        digest.finalize().into()
     }
 }
 
@@ -1439,6 +1663,7 @@ pub struct ThumbnailManager {
     capability: ThumbnailCapability,
     state: ThumbnailState,
     generation: u64,
+    current_generation: Arc<AtomicU64>,
     target: Option<ThumbnailTarget>,
     protocol: Option<StatefulProtocol>,
     protocol_decoded_bytes: usize,
@@ -1516,6 +1741,7 @@ impl ThumbnailManager {
             capability: ThumbnailCapability::Supported(protocol),
             state: ThumbnailState::Idle,
             generation: 0,
+            current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
@@ -1543,6 +1769,7 @@ impl ThumbnailManager {
             capability,
             state,
             generation: 0,
+            current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
@@ -1585,14 +1812,54 @@ impl ThumbnailManager {
         };
         let target = ThumbnailTarget {
             source: source.clone(),
+            local_video_midpoint: None,
             area,
         };
+        self.synchronize_target(target)
+    }
+
+    /// Synchronizes one local video with a lazily extracted midpoint frame.
+    ///
+    /// `midpoint_ms` is the caller-computed half-duration offset. The source
+    /// must be an absolute regular-file path; validation, extraction, image
+    /// decoding, and persistent-cache I/O all remain on the thumbnail worker.
+    /// Repeated calls with the same path, midpoint, and area do no work.
+    pub fn synchronize_local_video(&mut self, path: &Path, midpoint_ms: u64, area: Rect) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        if area.width == 0 || area.height == 0 {
+            return self.clear();
+        }
+        let Ok(source) = Url::from_file_path(path) else {
+            self.retain_current_protocol();
+            self.generation = self.generation.wrapping_add(1);
+            self.current_generation
+                .store(self.generation, Ordering::Release);
+            self.target = None;
+            self.protocol = None;
+            self.protocol_decoded_bytes = 0;
+            self.protocol_key = None;
+            self.state = ThumbnailState::Failed(ThumbnailFailure::InvalidSource);
+            return true;
+        };
+        self.synchronize_target(ThumbnailTarget {
+            source,
+            local_video_midpoint: Some(LocalVideoMidpoint(midpoint_ms)),
+            area,
+        })
+    }
+
+    /// Applies a normalized visible target to the bounded worker pipeline.
+    fn synchronize_target(&mut self, target: ThumbnailTarget) -> bool {
         if self.target.as_ref() == Some(&target) {
             return false;
         }
 
         self.retain_current_protocol();
         self.generation = self.generation.wrapping_add(1);
+        self.current_generation
+            .store(self.generation, Ordering::Release);
         self.target = Some(target.clone());
         if !is_safe_thumbnail_source(&target.source) {
             self.state = ThumbnailState::Failed(ThumbnailFailure::InvalidSource);
@@ -1689,6 +1956,7 @@ impl ThumbnailManager {
             request_receiver,
             result_sender,
             self.cache_directory.clone(),
+            Arc::clone(&self.current_generation),
         );
         if !spawned {
             return false;
@@ -1845,6 +2113,8 @@ impl ThumbnailManager {
             self.protocol_decoded_bytes = 0;
             self.protocol_key = None;
             self.generation = self.generation.wrapping_add(1);
+            self.current_generation
+                .store(self.generation, Ordering::Release);
             self.state = ThumbnailState::Idle;
         }
         changed
@@ -1927,26 +2197,55 @@ fn spawn_visible_worker(
     requests: Receiver<WorkerRequest>,
     results: Sender<WorkerResult>,
     cache_directory: Option<PathBuf>,
+    current_generation: Arc<AtomicU64>,
 ) -> bool {
-    spawn_visible_worker_with_transport(
+    spawn_visible_worker_with_transport_and_extractor(
         picker,
         requests,
         results,
         HttpThumbnailTransport {
             agent: thumbnail_agent(),
         },
+        FfmpegVideoFrameExtractor,
         cache_directory.map(ThumbnailCache::new),
         REQUEST_DEBOUNCE,
+        current_generation,
     )
 }
 
+#[cfg(test)]
 fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
     results: Sender<WorkerResult>,
+    transport: T,
+    cache: Option<ThumbnailCache>,
+    debounce: Duration,
+) -> bool {
+    spawn_visible_worker_with_transport_and_extractor(
+        picker,
+        requests,
+        results,
+        transport,
+        FfmpegVideoFrameExtractor,
+        cache,
+        debounce,
+        Arc::new(AtomicU64::new(0)),
+    )
+}
+
+fn spawn_visible_worker_with_transport_and_extractor<
+    T: ThumbnailTransport,
+    E: LocalVideoFrameExtractor,
+>(
+    picker: Picker,
+    requests: Receiver<WorkerRequest>,
+    results: Sender<WorkerResult>,
     mut transport: T,
+    mut extractor: E,
     mut cache: Option<ThumbnailCache>,
     debounce: Duration,
+    current_generation: Arc<AtomicU64>,
 ) -> bool {
     thread::Builder::new()
         .name("youta-thumbnail-visible".to_owned())
@@ -1966,9 +2265,11 @@ fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
                     &requests,
                     &results,
                     &mut transport,
+                    &mut extractor,
                     cache.as_mut(),
                     &picker,
                     debounce,
+                    &current_generation,
                 ) {
                     break;
                 }
@@ -2038,6 +2339,8 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
             let mut prefetch_cache_ready =
                 cache.as_ref().is_some_and(|cache| cache.prepare().is_ok());
             let mut prefetch_backlog = VecDeque::new();
+            let mut extractor = FfmpegVideoFrameExtractor;
+            let current_generation = Arc::new(AtomicU64::new(0));
             loop {
                 match latest_worker_request(&requests) {
                     WorkerInput::Item(request) => {
@@ -2046,9 +2349,11 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                             &requests,
                             &results,
                             &mut transport,
+                            &mut extractor,
                             cache.as_mut(),
                             &picker,
                             debounce,
+                            &current_generation,
                         ) {
                             break;
                         }
@@ -2077,9 +2382,11 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                                 &requests,
                                 &results,
                                 &mut transport,
+                                &mut extractor,
                                 cache.as_mut(),
                                 &picker,
                                 debounce,
+                                &current_generation,
                             ) {
                                 break;
                             }
@@ -2114,9 +2421,11 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                             &requests,
                             &results,
                             &mut transport,
+                            &mut extractor,
                             cache.as_mut(),
                             &picker,
                             debounce,
+                            &current_generation,
                         ) {
                             break;
                         }
@@ -2171,9 +2480,11 @@ fn render_worker_request<T: ThumbnailTransport>(
     requests: &Receiver<WorkerRequest>,
     results: &Sender<WorkerResult>,
     transport: &mut T,
+    extractor: &mut impl LocalVideoFrameExtractor,
     cache: Option<&mut ThumbnailCache>,
     picker: &Picker,
     debounce: Duration,
+    current_generation: &Arc<AtomicU64>,
 ) -> bool {
     let mut cache = cache;
     if matches!(request.target.source.scheme(), "http" | "https")
@@ -2195,12 +2506,24 @@ fn render_worker_request<T: ThumbnailTransport>(
     for newer in requests.try_iter() {
         request = newer;
     }
-    let loaded = load_thumbnail(transport, cache.as_deref_mut(), picker, &request.target);
-    let (result, deferred_local_preview) = match loaded {
+    let cancellation = RequestCancellation {
+        generation: request.generation,
+        current_generation: Arc::clone(current_generation),
+    };
+    let loaded = load_thumbnail(
+        transport,
+        extractor,
+        cache.as_deref_mut(),
+        picker,
+        &request.target,
+        &cancellation,
+    );
+    let (result, deferred_local_frame, deferred_local_preview) = match loaded {
         Ok(LoadedThumbnail {
             protocol,
             decoded_bytes,
             local_fingerprint,
+            deferred_local_frame,
             deferred_local_preview,
         }) => (
             Ok(EncodedThumbnail {
@@ -2208,9 +2531,10 @@ fn render_worker_request<T: ThumbnailTransport>(
                 decoded_bytes,
                 local_fingerprint,
             }),
+            deferred_local_frame,
             deferred_local_preview,
         ),
-        Err(error) => (Err(error), None),
+        Err(error) => (Err(error), None, None),
     };
     if results
         .send(WorkerResult {
@@ -2224,8 +2548,13 @@ fn render_worker_request<T: ThumbnailTransport>(
 
     // A cold local thumbnail becomes visible before the atomic cache write,
     // directory sync, and eviction scan can add latency.
-    if let (Some(cache), Some(preview)) = (cache, deferred_local_preview) {
-        persist_local_preview(cache, &preview);
+    if let Some(cache) = cache {
+        if let Some(frame) = deferred_local_frame {
+            persist_local_preview(cache, &frame);
+        }
+        if let Some(preview) = deferred_local_preview {
+            persist_local_preview(cache, &preview);
+        }
     }
     true
 }
@@ -2299,11 +2628,23 @@ fn mock_thumbnail_agent() -> ureq::Agent {
 
 fn load_thumbnail(
     transport: &mut impl ThumbnailTransport,
+    extractor: &mut impl LocalVideoFrameExtractor,
     mut cache: Option<&mut ThumbnailCache>,
     picker: &Picker,
     target: &ThumbnailTarget,
+    cancellation: &RequestCancellation,
 ) -> Result<LoadedThumbnail, ThumbnailFailure> {
     if target.source.scheme() == "file" {
+        if let Some(midpoint) = target.local_video_midpoint {
+            return load_local_video_thumbnail(
+                cache,
+                picker,
+                target,
+                midpoint,
+                extractor,
+                cancellation,
+            );
+        }
         return load_local_thumbnail(cache, picker, target);
     }
 
@@ -2315,6 +2656,7 @@ fn load_thumbnail(
             protocol: encoded.protocol,
             decoded_bytes: encoded.decoded_bytes,
             local_fingerprint: None,
+            deferred_local_frame: None,
             deferred_local_preview: None,
         });
     }
@@ -2328,6 +2670,7 @@ fn load_thumbnail(
         protocol: encoded.protocol,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: None,
+        deferred_local_frame: None,
         deferred_local_preview: None,
     })
 }
@@ -2361,6 +2704,7 @@ fn load_local_thumbnail(
                 protocol: encoded.protocol,
                 decoded_bytes: encoded.decoded_bytes,
                 local_fingerprint: Some(fingerprint),
+                deferred_local_frame: None,
                 deferred_local_preview: None,
             });
         }
@@ -2384,12 +2728,158 @@ fn load_local_thumbnail(
         protocol: encoded.protocol,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: Some(fingerprint.clone()),
+        deferred_local_frame: None,
         deferred_local_preview: record.map(|record| DeferredLocalPreview {
             cache_key,
             record,
             fingerprint,
         }),
     })
+}
+
+/// Loads a cached local-video derivative or extracts one bounded midpoint
+/// frame and derives the exact terminal-size preview from it.
+fn load_local_video_thumbnail(
+    mut cache: Option<&mut ThumbnailCache>,
+    picker: &Picker,
+    target: &ThumbnailTarget,
+    midpoint: LocalVideoMidpoint,
+    extractor: &mut impl LocalVideoFrameExtractor,
+    cancellation: &RequestCancellation,
+) -> Result<LoadedThumbnail, ThumbnailFailure> {
+    let path = target
+        .source
+        .to_file_path()
+        .map_err(|()| ThumbnailFailure::InvalidSource)?;
+    let fingerprint = LocalThumbnailFingerprint::capture(&path)?;
+    let preview_target = local_preview_target(picker, target.area);
+    let preview_cache_key = fingerprint.video_preview_cache_key(midpoint, preview_target);
+
+    if let Some(cache) = cache.as_deref_mut()
+        && let Some(bytes) = cache.read_key(&preview_cache_key).ok().flatten()
+    {
+        if let Some(image) = decode_local_preview_record(&bytes)
+            && fingerprint.is_current()
+            && !cancellation.is_cancelled()
+        {
+            let encoded = encode_thumbnail(picker, target.area, image)?;
+            if cancellation.is_cancelled() {
+                return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+            }
+            if !fingerprint.is_current() {
+                return Err(ThumbnailFailure::InvalidImage);
+            }
+            return Ok(LoadedThumbnail {
+                protocol: encoded.protocol,
+                decoded_bytes: encoded.decoded_bytes,
+                local_fingerprint: Some(fingerprint),
+                deferred_local_frame: None,
+                deferred_local_preview: None,
+            });
+        }
+        cache.remove_key(&preview_cache_key);
+    }
+
+    if cancellation.is_cancelled() {
+        return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+    }
+    let frame_cache_key = fingerprint.video_frame_cache_key(midpoint);
+    let cache_enabled = cache.is_some();
+    let mut deferred_local_frame = None;
+    let cached_frame = cache
+        .as_deref_mut()
+        .and_then(|cache| cache.read_key(&frame_cache_key).ok().flatten());
+    let frame = if let Some(bytes) = cached_frame {
+        match decode_thumbnail(&bytes) {
+            Ok(image) if fingerprint.is_current() && !cancellation.is_cancelled() => image,
+            _ => {
+                if let Some(cache) = cache.as_deref_mut() {
+                    cache.remove_key(&frame_cache_key);
+                }
+                extract_local_video_frame(
+                    extractor,
+                    &fingerprint,
+                    midpoint,
+                    cancellation,
+                    cache_enabled,
+                    frame_cache_key,
+                    &mut deferred_local_frame,
+                )?
+            }
+        }
+    } else {
+        extract_local_video_frame(
+            extractor,
+            &fingerprint,
+            midpoint,
+            cancellation,
+            cache_enabled,
+            frame_cache_key,
+            &mut deferred_local_frame,
+        )?
+    };
+
+    let image = prefit_thumbnail(frame, preview_target);
+    if cancellation.is_cancelled() {
+        return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+    }
+    if !fingerprint.is_current() {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+    let preview_record = cache
+        .is_some()
+        .then(|| encode_local_preview_record(&image))
+        .flatten();
+    let encoded = encode_thumbnail(picker, target.area, image)?;
+    if cancellation.is_cancelled() {
+        return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
+    }
+    if !fingerprint.is_current() {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+    Ok(LoadedThumbnail {
+        protocol: encoded.protocol,
+        decoded_bytes: encoded.decoded_bytes,
+        local_fingerprint: Some(fingerprint.clone()),
+        deferred_local_frame,
+        deferred_local_preview: preview_record.map(|record| DeferredLocalPreview {
+            cache_key: preview_cache_key,
+            record,
+            fingerprint,
+        }),
+    })
+}
+
+/// Extracts and validates a source frame before allowing any persistent write.
+fn extract_local_video_frame(
+    extractor: &mut impl LocalVideoFrameExtractor,
+    fingerprint: &LocalThumbnailFingerprint,
+    midpoint: LocalVideoMidpoint,
+    cancellation: &RequestCancellation,
+    cache_enabled: bool,
+    frame_cache_key: [u8; 32],
+    deferred: &mut Option<DeferredLocalPreview>,
+) -> Result<DynamicImage, ThumbnailFailure> {
+    let bytes = extractor.extract(&fingerprint.canonical_path, midpoint, cancellation)?;
+    if bytes.is_empty()
+        || bytes.len() > MAX_DOWNLOAD_BYTES
+        || cancellation.is_cancelled()
+        || !fingerprint.is_current()
+    {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+    let image = decode_thumbnail(&bytes)?;
+    if cancellation.is_cancelled() || !fingerprint.is_current() {
+        return Err(ThumbnailFailure::InvalidImage);
+    }
+    if cache_enabled {
+        *deferred = Some(DeferredLocalPreview {
+            cache_key: frame_cache_key,
+            record: bytes,
+            fingerprint: fingerprint.clone(),
+        });
+    }
+    Ok(image)
 }
 
 /// Persists one already-rendered local derivative only while its source still
@@ -2799,6 +3289,46 @@ pub(crate) mod tests {
             self.replies
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap_or(Err(ThumbnailFailure::WorkerStopped))
+        }
+    }
+
+    struct RejectingTransport;
+
+    impl ThumbnailTransport for RejectingTransport {
+        fn fetch(&mut self, _source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
+            Err(ThumbnailFailure::DownloadFailed)
+        }
+    }
+
+    struct MockVideoExtractor {
+        observed: Sender<(PathBuf, u64)>,
+        replies: Receiver<Result<Vec<u8>, ThumbnailFailure>>,
+        cancelled: Sender<PathBuf>,
+    }
+
+    impl LocalVideoFrameExtractor for MockVideoExtractor {
+        fn extract(
+            &mut self,
+            path: &Path,
+            midpoint: LocalVideoMidpoint,
+            cancellation: &RequestCancellation,
+        ) -> Result<Vec<u8>, ThumbnailFailure> {
+            self.observed
+                .send((path.to_path_buf(), midpoint.0))
+                .map_err(|_| ThumbnailFailure::WorkerStopped)?;
+            loop {
+                if cancellation.is_cancelled() {
+                    let _ = self.cancelled.send(path.to_path_buf());
+                    return Err(ThumbnailFailure::DownloadFailed);
+                }
+                match self.replies.recv_timeout(Duration::from_millis(5)) {
+                    Ok(reply) => return reply,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(ThumbnailFailure::WorkerStopped);
+                    }
+                }
+            }
         }
     }
 
@@ -3234,6 +3764,287 @@ pub(crate) mod tests {
         assert!(decode_local_preview_record(&repaired).is_some());
     }
 
+    #[cfg(feature = "local-video-thumbnails")]
+    #[test]
+    fn ffmpeg_midpoint_command_is_shell_free_and_extracts_one_bounded_frame() {
+        use std::ffi::{OsStr, OsString};
+
+        let path = Path::new("/tmp/a movie;not-a-command.MOV");
+        let command = local_video_frame_command(path, LocalVideoMidpoint(60_500));
+        let expected = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "60.500",
+            "-i",
+            "/tmp/a movie;not-a-command.MOV",
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            "scale=w=1280:h=1280:force_original_aspect_ratio=decrease:\
+             force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "5",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ]
+        .map(OsString::from);
+
+        assert_eq!(command.get_program(), OsStr::new("ffmpeg"));
+        assert_eq!(
+            command.get_args().map(OsStr::to_owned).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[cfg(all(feature = "local-video-thumbnails", unix))]
+    #[test]
+    fn ffmpeg_extracts_the_midpoint_frame_from_a_real_mov_fixture() {
+        let available = Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("real MOV fixture directory");
+        let movie = directory.path().join("two-colours.mov");
+        let status = Command::new("ffmpeg")
+            .arg("-nostdin")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("color=c=red:s=64x36:d=1:r=10")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("color=c=green:s=64x36:d=3:r=10")
+            .arg("-filter_complex")
+            .arg("[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p")
+            .arg("-c:v")
+            .arg("mpeg4")
+            .arg("-y")
+            .arg(&movie)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run FFmpeg MOV fixture encoder");
+        assert!(status.success(), "FFmpeg must encode the MOV fixture");
+
+        let generation = Arc::new(AtomicU64::new(7));
+        let cancellation = RequestCancellation {
+            generation: 7,
+            current_generation: generation,
+        };
+        let bytes = FfmpegVideoFrameExtractor
+            .extract(&movie, LocalVideoMidpoint(2_000), &cancellation)
+            .expect("extract real MOV midpoint");
+        let image = decode_thumbnail(&bytes)
+            .expect("decode extracted real MOV midpoint")
+            .to_rgb8();
+        let pixel = image.get_pixel(image.width() / 2, image.height() / 2);
+
+        assert!(
+            pixel[1] > pixel[0].saturating_mul(2) && pixel[1] > pixel[2].saturating_mul(2),
+            "the two-second midpoint must come from the green segment: {pixel:?}"
+        );
+    }
+
+    #[test]
+    fn mov_thumbnail_uses_the_typed_millisecond_midpoint() {
+        let directory = tempfile::tempdir().expect("MOV thumbnail directory");
+        let movie = directory.path().join("holiday.MOV");
+        fs::write(&movie, b"mock MOV container").expect("write mock MOV source");
+        let (mut manager, replies, observed, _cancelled) = manager_with_mock_video_extractor(None);
+        let area = Rect::new(0, 0, 40, 12);
+
+        assert!(manager.synchronize_local_video(&movie, 60_500, area));
+        assert_eq!(manager.state(), &ThumbnailState::Loading);
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("observe MOV extraction"),
+            (
+                fs::canonicalize(&movie).expect("canonical MOV path"),
+                60_500
+            )
+        );
+        replies
+            .send(Ok(fixture_jpeg()))
+            .expect("release MOV extraction");
+
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            manager
+                .target
+                .as_ref()
+                .and_then(|target| target.local_video_midpoint),
+            Some(LocalVideoMidpoint(60_500))
+        );
+    }
+
+    #[test]
+    fn local_video_source_frame_cache_survives_restart_and_area_change() {
+        let directory = tempfile::tempdir().expect("video frame cache directory");
+        let movie = directory.path().join("cached.mov");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        fs::write(&movie, b"stable mock MOV container").expect("write mock MOV source");
+        let midpoint = LocalVideoMidpoint(9_250);
+        let first_area = Rect::new(0, 0, 32, 9);
+        let second_area = Rect::new(0, 0, 48, 14);
+        let (mut first, replies, observed, _cancelled) =
+            manager_with_mock_video_extractor(Some(cache_directory.clone()));
+
+        assert!(first.synchronize_local_video(&movie, midpoint.0, first_area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("cold video extraction")
+                .1,
+            midpoint.0
+        );
+        replies
+            .send(Ok(fixture_jpeg()))
+            .expect("release cold extraction");
+        assert_eq!(wait_for_terminal_state(&mut first), ThumbnailState::Ready);
+        let frame_key = local_video_frame_cache_key(&movie, midpoint);
+        let first_preview_key = local_video_preview_cache_key(&movie, midpoint, first_area);
+        wait_for_local_video_frame(&cache_directory, &frame_key);
+        wait_for_local_preview(&cache_directory, &first_preview_key);
+        drop(first);
+
+        let (mut restarted, _replies, restarted_observed, _cancelled) =
+            manager_with_mock_video_extractor(Some(cache_directory.clone()));
+        assert!(restarted.synchronize_local_video(&movie, midpoint.0, second_area));
+        assert_eq!(
+            wait_for_terminal_state(&mut restarted),
+            ThumbnailState::Ready
+        );
+        assert!(
+            matches!(
+                restarted_observed.recv_timeout(Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "a restart with a new area must derive from the cached source frame"
+        );
+        let second_preview_key = local_video_preview_cache_key(&movie, midpoint, second_area);
+        assert_ne!(first_preview_key, second_preview_key);
+        wait_for_local_preview(&cache_directory, &second_preview_key);
+    }
+
+    #[test]
+    fn replacing_a_local_video_invalidates_its_source_frame_cache() {
+        let directory = tempfile::tempdir().expect("video replacement directory");
+        let movie = directory.path().join("replace.mov");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let area = Rect::new(0, 0, 32, 9);
+        let midpoint = LocalVideoMidpoint(3_000);
+        fs::write(&movie, b"first mock MOV container").expect("write first MOV identity");
+        let (mut first, replies, observed, _cancelled) =
+            manager_with_mock_video_extractor(Some(cache_directory.clone()));
+        assert!(first.synchronize_local_video(&movie, midpoint.0, area));
+        observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first extraction");
+        replies
+            .send(Ok(fixture_jpeg()))
+            .expect("release first extraction");
+        assert_eq!(wait_for_terminal_state(&mut first), ThumbnailState::Ready);
+        let first_frame_key = local_video_frame_cache_key(&movie, midpoint);
+        wait_for_local_video_frame(&cache_directory, &first_frame_key);
+        drop(first);
+
+        fs::write(
+            &movie,
+            b"replacement mock MOV container with a distinct length",
+        )
+        .expect("replace MOV identity");
+        let replacement_frame_key = local_video_frame_cache_key(&movie, midpoint);
+        assert_ne!(first_frame_key, replacement_frame_key);
+        let (mut replacement, replies, observed, _cancelled) =
+            manager_with_mock_video_extractor(Some(cache_directory.clone()));
+        assert!(replacement.synchronize_local_video(&movie, midpoint.0, area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement extraction")
+                .1,
+            midpoint.0
+        );
+        replies
+            .send(Ok(fixture_jpeg()))
+            .expect("release replacement extraction");
+        assert_eq!(
+            wait_for_terminal_state(&mut replacement),
+            ThumbnailState::Ready
+        );
+        wait_for_local_video_frame(&cache_directory, &replacement_frame_key);
+    }
+
+    #[test]
+    fn selecting_another_local_video_cancels_the_inflight_extractor() {
+        let directory = tempfile::tempdir().expect("video cancellation directory");
+        let first = directory.path().join("first.mov");
+        let second = directory.path().join("second.mov");
+        fs::write(&first, b"first mock MOV").expect("write first MOV");
+        fs::write(&second, b"second mock MOV").expect("write second MOV");
+        let (mut manager, replies, observed, cancelled) = manager_with_mock_video_extractor(None);
+        let area = Rect::new(0, 0, 40, 12);
+
+        assert!(manager.synchronize_local_video(&first, 1_000, area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("observe first extraction")
+                .0,
+            fs::canonicalize(&first).expect("canonical first MOV")
+        );
+        assert!(manager.synchronize_local_video(&second, 2_000, area));
+        assert_eq!(
+            cancelled
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first extraction cancellation"),
+            fs::canonicalize(&first).expect("canonical first MOV")
+        );
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("observe replacement extraction"),
+            (
+                fs::canonicalize(&second).expect("canonical second MOV"),
+                2_000
+            )
+        );
+        assert!(!manager.poll(), "the cancelled result must remain stale");
+        assert_eq!(manager.state(), &ThumbnailState::Loading);
+        replies
+            .send(Ok(fixture_jpeg()))
+            .expect("release replacement extraction");
+
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            manager.target.as_ref().map(|target| &target.source),
+            Some(&Url::from_file_path(&second).expect("second MOV URL"))
+        );
+    }
+
     #[test]
     fn oversized_local_png_and_webp_keep_the_generic_decode_limits() {
         let directory = tempfile::tempdir().expect("oversized local raster directory");
@@ -3273,6 +4084,7 @@ pub(crate) mod tests {
         let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
         let target = ThumbnailTarget {
             source: Url::from_file_path(&path).expect("benchmark file URL"),
+            local_video_midpoint: None,
             area: Rect::new(0, 0, 120, 40),
         };
 
@@ -3334,6 +4146,7 @@ pub(crate) mod tests {
             capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
             state: ThumbnailState::Idle,
             generation: 0,
+            current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
@@ -3880,12 +4693,14 @@ pub(crate) mod tests {
         };
         let first = PreparedThumbnailKey {
             source: Url::parse("https://images.example/first-budget.png").expect("first URL"),
+            local_video_midpoint: None,
             width: area.width,
             height: area.height,
             local_fingerprint: None,
         };
         let second = PreparedThumbnailKey {
             source: Url::parse("https://images.example/second-budget.png").expect("second URL"),
+            local_video_midpoint: None,
             width: area.width,
             height: area.height,
             local_fingerprint: None,
@@ -3893,6 +4708,7 @@ pub(crate) mod tests {
         let oversized = PreparedThumbnailKey {
             source: Url::parse("https://images.example/oversized-budget.png")
                 .expect("oversized URL"),
+            local_video_midpoint: None,
             width: area.width,
             height: area.height,
             local_fingerprint: None,
@@ -4042,6 +4858,7 @@ pub(crate) mod tests {
             capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
             state: ThumbnailState::Idle,
             generation: 0,
+            current_generation: Arc::new(AtomicU64::new(0)),
             target: None,
             protocol: None,
             protocol_decoded_bytes: 0,
@@ -4342,8 +5159,10 @@ pub(crate) mod tests {
             capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
             state: ThumbnailState::Loading,
             generation: 1,
+            current_generation: Arc::new(AtomicU64::new(1)),
             target: Some(ThumbnailTarget {
                 source,
+                local_video_midpoint: None,
                 area: Rect::new(0, 0, 20, 8),
             }),
             protocol: None,
@@ -4409,6 +5228,7 @@ pub(crate) mod tests {
             ThumbnailFailure::ResponseTooLarge,
             ThumbnailFailure::UnsupportedFormat,
             ThumbnailFailure::InvalidImage,
+            ThumbnailFailure::LocalVideoFrameExtractionFailed,
             ThumbnailFailure::EncodingFailed,
             ThumbnailFailure::WorkerStopped,
         ]
@@ -4762,6 +5582,7 @@ pub(crate) mod tests {
                 capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
                 state: ThumbnailState::Idle,
                 generation: 0,
+                current_generation: Arc::new(AtomicU64::new(0)),
                 target: None,
                 protocol: None,
                 protocol_decoded_bytes: 0,
@@ -4779,6 +5600,64 @@ pub(crate) mod tests {
             },
             reply_sender,
             observed_receiver,
+        )
+    }
+
+    type MockVideoManagerParts = (
+        ThumbnailManager,
+        Sender<Result<Vec<u8>, ThumbnailFailure>>,
+        Receiver<(PathBuf, u64)>,
+        Receiver<PathBuf>,
+    );
+
+    fn manager_with_mock_video_extractor(
+        cache_directory: Option<PathBuf>,
+    ) -> MockVideoManagerParts {
+        let (request_sender, request_receiver) = bounded(1);
+        let request_discarder = request_receiver.clone();
+        let (result_sender, result_receiver) = bounded(1);
+        let (observed_sender, observed_receiver) = bounded(4);
+        let (reply_sender, reply_receiver) = bounded(4);
+        let (cancelled_sender, cancelled_receiver) = bounded(4);
+        let current_generation = Arc::new(AtomicU64::new(0));
+        assert!(spawn_visible_worker_with_transport_and_extractor(
+            picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+            request_receiver,
+            result_sender,
+            RejectingTransport,
+            MockVideoExtractor {
+                observed: observed_sender,
+                replies: reply_receiver,
+                cancelled: cancelled_sender,
+            },
+            cache_directory.clone().map(ThumbnailCache::new),
+            Duration::ZERO,
+            Arc::clone(&current_generation),
+        ));
+        (
+            ThumbnailManager {
+                capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
+                state: ThumbnailState::Idle,
+                generation: 0,
+                current_generation,
+                target: None,
+                protocol: None,
+                protocol_decoded_bytes: 0,
+                protocol_key: None,
+                prepared: VecDeque::new(),
+                prepared_decoded_bytes: 0,
+                picker: None,
+                cache_directory,
+                request_sender: Some(request_sender),
+                request_discarder: Some(request_discarder),
+                prefetch_sender: None,
+                prefetch_discarder: None,
+                prefetch_sources: Vec::new(),
+                result_receiver: Some(result_receiver),
+            },
+            reply_sender,
+            observed_receiver,
+            cancelled_receiver,
         )
     }
 
@@ -4844,6 +5723,23 @@ pub(crate) mod tests {
             .preview_cache_key(local_preview_target(&picker, area))
     }
 
+    fn local_video_frame_cache_key(path: &Path, midpoint: LocalVideoMidpoint) -> [u8; 32] {
+        LocalThumbnailFingerprint::capture(path)
+            .expect("capture local video fixture")
+            .video_frame_cache_key(midpoint)
+    }
+
+    fn local_video_preview_cache_key(
+        path: &Path,
+        midpoint: LocalVideoMidpoint,
+        area: Rect,
+    ) -> [u8; 32] {
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        LocalThumbnailFingerprint::capture(path)
+            .expect("capture local video fixture")
+            .video_preview_cache_key(midpoint, local_preview_target(&picker, area))
+    }
+
     fn wait_for_local_preview(cache_directory: &Path, cache_key: &[u8]) {
         let cache = ThumbnailCache::new(cache_directory.to_path_buf());
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4858,6 +5754,25 @@ pub(crate) mod tests {
             assert!(
                 Instant::now() < deadline,
                 "local preview was not persisted before its test deadline"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_local_video_frame(cache_directory: &Path, cache_key: &[u8]) {
+        let cache = ThumbnailCache::new(cache_directory.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if cache
+                .read_key(cache_key)
+                .expect("read local video frame cache")
+                .is_some_and(|bytes| decode_thumbnail(&bytes).is_ok())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local video frame was not persisted before its test deadline"
             );
             thread::yield_now();
         }
@@ -4901,6 +5816,21 @@ pub(crate) mod tests {
             .write_to(&mut jpeg, ImageFormat::Jpeg)
             .expect("encode deterministic JPEG fixture");
         fs::write(path, jpeg.into_inner()).expect("write deterministic JPEG fixture");
+    }
+
+    fn fixture_jpeg() -> Vec<u8> {
+        let image = RgbImage::from_fn(64, 36, |x, y| {
+            image::Rgb([
+                u8::try_from(x.saturating_mul(3)).unwrap_or(u8::MAX),
+                u8::try_from(y.saturating_mul(5)).unwrap_or(u8::MAX),
+                127,
+            ])
+        });
+        let mut jpeg = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut jpeg, ImageFormat::Jpeg)
+            .expect("encode deterministic video-frame JPEG");
+        jpeg.into_inner()
     }
 
     /// Encodes a small PNG fixture for thumbnail worker tests.

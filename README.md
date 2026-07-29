@@ -47,7 +47,10 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   reselecting the folder just left, and `PageUp`/`PageDown` move by the visible
   Local page. Selecting media shows filename metadata immediately while
   tags and bounded `ffprobe` codec/container details load off the TUI thread;
-  completed records remain in a fixed-size RAM cache for fast revisits.
+  completed records remain in a fixed-size RAM cache for fast revisits. When
+  terminal images are enabled, selecting a finite local video lazily extracts
+  its midpoint frame through a bounded `ffmpeg` worker and reuses the persistent
+  thumbnail cache on later visits.
   A conservative display-only fallback repairs strong Windows-1251 text that
   legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
   are never rewritten.
