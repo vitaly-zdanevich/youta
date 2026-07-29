@@ -107,7 +107,7 @@ use crate::providers::bbc::{
     STATIONS as BBC_STATIONS, station_by_id as bbc_station_by_id,
     station_from_url as bbc_station_from_url,
 };
-#[cfg(feature = "bbc-radio")]
+#[cfg(any(feature = "bbc-radio", all(feature = "radio", test)))]
 use crate::providers::radio::RadioStreamKind;
 #[cfg(all(feature = "radio", test))]
 use crate::providers::radio::STATIONS as RADIO_STATIONS;
@@ -13947,6 +13947,13 @@ impl AppController {
         }
 
         self.start_radio_recording(station);
+    }
+
+    /// Reports the compile-time omission if a synthetic action reaches a
+    /// build without Radio.
+    #[cfg(not(feature = "radio"))]
+    fn toggle_radio_recording(&mut self) {
+        self.view.status_line = "This build omits the `radio` feature".to_owned();
     }
 
     /// Starts one private stream-record capture after validating its exact live owner.
@@ -39624,6 +39631,19 @@ mod tests {
                 .title
                 .as_deref()
                 .is_some_and(|title| { title.contains("clen=") || title.contains("ANDROID_VR") })
+        );
+    }
+
+    #[cfg(not(feature = "radio"))]
+    #[test]
+    fn omitted_radio_recording_action_reports_the_feature_boundary() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+
+        controller.dispatch(UiAction::ToggleRadioRecording);
+
+        assert_eq!(
+            controller.view.status_line,
+            "This build omits the `radio` feature"
         );
     }
 
