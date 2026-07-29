@@ -4891,22 +4891,22 @@ impl AppController {
 
     /// Seeds subscriber counts already present in channel-search results.
     fn cache_search_channel_subscriber_counts(&mut self) {
-        for item in &self.youtube_results {
-            if let SearchItem::Channel(channel) = item
-                && !channel.channel_id.is_empty()
-            {
-                self.channel_subscriber_cache
-                    .insert(channel.channel_id.clone(), channel.subscriber_count);
-                if let Some(webpage_url) = channel
-                    .webpage_url
-                    .as_ref()
-                    .filter(|url| is_youtube_channel_alias_webpage(url, &channel.channel_id))
-                    .cloned()
-                {
-                    self.channel_webpage_cache
-                        .insert(channel.channel_id.clone(), webpage_url);
-                }
-            }
+        let channels = self
+            .youtube_results
+            .iter()
+            .filter_map(|item| match item {
+                SearchItem::Channel(channel) if !channel.channel_id.is_empty() => Some((
+                    channel.channel_id.clone(),
+                    channel.subscriber_count,
+                    channel.webpage_url.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (channel_id, subscriber_count, webpage_url) in channels {
+            self.channel_subscriber_cache
+                .insert(channel_id.clone(), subscriber_count);
+            self.cache_channel_webpage_url(&channel_id, webpage_url);
         }
     }
 
@@ -4916,7 +4916,25 @@ impl AppController {
             webpage_url.filter(|url| is_youtube_channel_alias_webpage(url, channel_id))
         {
             self.channel_webpage_cache
-                .insert(channel_id.to_owned(), webpage_url);
+                .insert(channel_id.to_owned(), webpage_url.clone());
+            self.apply_channel_webpage_to_subscription_sources(channel_id, &webpage_url);
+        }
+    }
+
+    /// Replaces a subscribed channel's displayed URL after provider enrichment.
+    fn apply_channel_webpage_to_subscription_sources(
+        &mut self,
+        channel_id: &str,
+        webpage_url: &url::Url,
+    ) {
+        for (entry, row) in self
+            .subscription_entries
+            .iter()
+            .zip(&mut self.view.subscriptions.sources)
+        {
+            if entry.subscription.youtube_channel_id().as_deref() == Some(channel_id) {
+                row.subtitle = subscription_source_subtitle(entry, Some(webpage_url.clone()));
+            }
         }
     }
 
@@ -11001,11 +11019,8 @@ impl AppController {
                     entry.subscription.youtube_channel_id().as_deref() == Some(&channel_id)
                 }) {
                     self.view.screen = Screen::Subscriptions;
-                    self.view.subscriptions.sources = self
-                        .subscription_entries
-                        .iter()
-                        .map(subscription_source_row)
-                        .collect();
+                    self.rebuild_subscription_source_rows();
+                    self.restore_cached_subscription_source_metadata();
                     self.view.subscriptions.selected_source = source_index;
                     self.update_selected_subscription_source();
                     self.active_subscription_channel_id = Some(channel_id);
@@ -14169,12 +14184,8 @@ impl AppController {
             }
         }
         self.subscription_entries = self.subscription_tree.flattened_subscriptions();
-        self.view.subscriptions.sources = self
-            .subscription_entries
-            .iter()
-            .map(subscription_source_row)
-            .collect();
-        self.restore_cached_subscription_source_artwork();
+        self.rebuild_subscription_source_rows();
+        self.restore_cached_subscription_source_metadata();
         self.view.subscriptions.selected_source = self
             .view
             .subscriptions
@@ -14204,12 +14215,28 @@ impl AppController {
         self.refresh_selected_playlist_state();
     }
 
-    /// Restores known channel-artwork URLs for every subscription source.
+    /// Rebuilds source rows with process-local or portable channel webpages.
+    fn rebuild_subscription_source_rows(&mut self) {
+        self.view.subscriptions.sources = self
+            .subscription_entries
+            .iter()
+            .map(|entry| {
+                let webpage_url = entry
+                    .subscription
+                    .youtube_channel_id()
+                    .and_then(|channel_id| self.channel_webpage_cache.get(&channel_id).cloned());
+                subscription_source_row(entry, webpage_url)
+            })
+            .collect();
+    }
+
+    /// Restores known channel artwork and aliases for every subscription source.
     ///
-    /// Reading compact local SQLite rows here lets the thumbnail worker warm
-    /// image bytes before keyboard or mouse navigation selects another
-    /// channel. Provider requests remain lazy and independently debounced.
-    fn restore_cached_subscription_source_artwork(&mut self) {
+    /// Reading compact local state-cache records here lets the thumbnail worker
+    /// warm image bytes and render human-readable URLs before keyboard or mouse
+    /// navigation selects another channel. Provider requests remain lazy and
+    /// independently debounced.
+    fn restore_cached_subscription_source_metadata(&mut self) {
         let channel_rows = self
             .subscription_entries
             .iter()
@@ -14225,13 +14252,14 @@ impl AppController {
             let cached = match self.store.cached_channel_summary(&channel_id) {
                 Ok(cached) => cached,
                 Err(error) => {
-                    self.show_error("Could not read cached channel artwork", &error);
+                    self.show_error("Could not read cached channel metadata", &error);
                     return;
                 }
             };
             let Some(cached) = cached else {
                 continue;
             };
+            self.cache_channel_webpage_url(&channel_id, cached.summary.webpage_url.clone());
             if let Some(row) = self.view.subscriptions.sources.get_mut(index) {
                 row.thumbnail_url = preferred_thumbnail_url(&cached.summary.thumbnails);
             }
@@ -21407,14 +21435,34 @@ fn summary_from_details(video: &VideoDetails) -> VideoSummary {
     }
 }
 
-fn subscription_source_row(entry: &FlattenedSubscription) -> RowView {
+/// Builds a source-list row without changing its portable feed identity.
+fn subscription_source_row(
+    entry: &FlattenedSubscription,
+    preferred_youtube_webpage_url: Option<url::Url>,
+) -> RowView {
     RowView {
         title: format!("{}{}", "  ".repeat(entry.depth), entry.subscription.title),
-        subtitle: entry.subscription.url.to_string(),
+        subtitle: subscription_source_subtitle(entry, preferred_youtube_webpage_url),
         source: subscription_kind_label(entry.subscription.kind).to_owned(),
         subscribed: true,
         ..RowView::default()
     }
+}
+
+/// Formats a safe public channel route while retaining non-YouTube feed URLs.
+fn subscription_source_subtitle(
+    entry: &FlattenedSubscription,
+    preferred_youtube_webpage_url: Option<url::Url>,
+) -> String {
+    if entry.subscription.kind != SubscriptionKind::YouTube {
+        return entry.subscription.url.to_string();
+    }
+    let channel_id = entry.subscription.youtube_channel_id().unwrap_or_default();
+    let preferred_youtube_webpage_url = preferred_youtube_webpage_url
+        .or_else(|| entry.subscription.website_url.clone())
+        .or_else(|| Some(entry.subscription.url.clone()));
+    readable_youtube_channel_url(&channel_id, preferred_youtube_webpage_url)
+        .unwrap_or_else(|| "youtube.com".to_owned())
 }
 
 const fn subscription_kind_label(kind: SubscriptionKind) -> &'static str {
@@ -21463,6 +21511,13 @@ fn youtube_channel_webpage_url(channel_id: &str, preferred: Option<url::Url>) ->
     preferred
         .filter(|url| is_safe_youtube_channel_webpage(url, channel_id))
         .or_else(|| canonical_youtube_channel_url(channel_id))
+}
+
+/// Shortens a validated channel page to a stable, readable display URL.
+fn readable_youtube_channel_url(channel_id: &str, preferred: Option<url::Url>) -> Option<String> {
+    let webpage_url = youtube_channel_webpage_url(channel_id, preferred)?;
+    let path = decoded_youtube_channel_path_segments(&webpage_url)?;
+    Some(format!("youtube.com/{}", path.join("/")))
 }
 
 /// Checks that a preferred URL is an exact credential-free YouTube channel page.
@@ -26288,6 +26343,243 @@ mod tests {
                 "OPML must retain the true handle instead of deriving one from a display name"
             );
         }
+    }
+
+    #[test]
+    fn subscription_source_rows_shorten_opml_aliases_without_changing_feed_identity() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let handle =
+            url::Url::parse("https://www.youtube.com/@myChanName").expect("fixture channel handle");
+        let podcast_feed = "https://feeds.example.org/show.xml";
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel_with_website(
+            "Display Name Is Not The Handle",
+            "UCfixture",
+            Some(&handle),
+        ));
+        assert!(
+            subscriptions
+                .subscribe_rss_feed("Fixture podcast", podcast_feed)
+                .expect("valid podcast feed")
+        );
+        subscriptions::save(&config, &subscriptions).expect("save fixture subscriptions");
+        let youtube_feed = subscriptions.flattened_subscriptions()[0]
+            .subscription
+            .url
+            .clone();
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .sources
+                .iter()
+                .map(|row| row.subtitle.as_str())
+                .collect::<Vec<_>>(),
+            ["youtube.com/@myChanName", podcast_feed]
+        );
+        assert_eq!(
+            controller.subscription_entries[0].subscription.url, youtube_feed,
+            "row presentation must not replace the uploads-feed identity"
+        );
+        assert!(
+            !controller.view.subscriptions.sources[0]
+                .subtitle
+                .contains("feeds/videos.xml")
+        );
+    }
+
+    #[test]
+    fn subscription_source_rows_reject_unsafe_aliases_and_accept_legacy_routes() {
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        let entry = subscriptions
+            .flattened_subscriptions()
+            .into_iter()
+            .next()
+            .expect("fixture subscription");
+
+        for (webpage_url, expected) in [
+            ("https://www.youtube.com/@fixture", "youtube.com/@fixture"),
+            (
+                "https://m.youtube.com/c/FixtureChannel/",
+                "youtube.com/c/FixtureChannel",
+            ),
+            (
+                "https://youtube.com/user/fixture",
+                "youtube.com/user/fixture",
+            ),
+        ] {
+            let row = subscription_source_row(
+                &entry,
+                Some(url::Url::parse(webpage_url).expect("safe fixture webpage")),
+            );
+            assert_eq!(row.subtitle, expected);
+        }
+
+        for webpage_url in [
+            "https://www.youtube.com/watch?v=fixture",
+            "https://www.youtube.com/channel/UCother",
+            "https://youtube.com@example.org/@fixture",
+        ] {
+            let row = subscription_source_row(
+                &entry,
+                Some(url::Url::parse(webpage_url).expect("parseable unsafe fixture webpage")),
+            );
+            assert_eq!(
+                row.subtitle, "youtube.com/channel/UCfixture",
+                "{webpage_url:?} must not reach a subscription source row"
+            );
+        }
+
+        let handle_only_entry = FlattenedSubscription {
+            depth: 0,
+            subscription: subscriptions::Subscription::new(
+                "Portable handle-only channel",
+                url::Url::parse("https://www.youtube.com/@portableFixture")
+                    .expect("portable fixture handle"),
+            ),
+        };
+        assert_eq!(
+            subscription_source_row(&handle_only_entry, None).subtitle,
+            "youtube.com/@portableFixture",
+            "a safe primary OPML channel page must remain readable without a channel ID"
+        );
+    }
+
+    #[test]
+    fn subscription_source_row_restores_persisted_alias_before_provider_request() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let now = unix_time();
+        {
+            let store = StateStore::open(&config).expect("initial disk state");
+            store
+                .put_cached_channel_summary(&crate::persistence::CachedChannelSummary {
+                    summary: ChannelSummary {
+                        channel_id: "UCfixture".to_owned(),
+                        name: "Fixture channel".to_owned(),
+                        description: String::new(),
+                        subscriber_count: None,
+                        video_count: None,
+                        created_at: None,
+                        auto_generated: false,
+                        thumbnails: Vec::new(),
+                        webpage_url: Some(
+                            url::Url::parse("https://www.youtube.com/@cachedFixture")
+                                .expect("cached fixture alias"),
+                        ),
+                    },
+                    fetched_at: now,
+                    expires_at: now.saturating_add(60),
+                })
+                .expect("persist channel alias");
+        }
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+
+        assert_eq!(
+            controller.view.subscriptions.sources[0].subtitle,
+            "youtube.com/@cachedFixture"
+        );
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "persisted presentation must not wait for the debounced request"
+        );
+    }
+
+    #[test]
+    fn subscription_source_row_applies_provider_alias_enrichment() {
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.subscription_tree = subscriptions;
+        controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
+        controller.rebuild_subscription_source_rows();
+        let thumbnail_url =
+            url::Url::parse("https://yt3.ggpht.com/fixture=s800").expect("fixture thumbnail");
+        controller.view.subscriptions.sources[0].thumbnail_url = Some(thumbnail_url.clone());
+        assert_eq!(
+            controller.view.subscriptions.sources[0].subtitle,
+            "youtube.com/channel/UCfixture"
+        );
+
+        controller.handle_provider_response(ProviderResponse::ChannelSubscriberCounts {
+            provider_generation: controller.youtube_provider_generation,
+            requested_ids: vec!["UCfixture".to_owned()],
+            result: Ok(vec![ChannelSubscriberCount {
+                channel_id: "UCfixture".to_owned(),
+                subscriber_count: None,
+                webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@providerFixture")
+                        .expect("provider fixture alias"),
+                ),
+            }]),
+        });
+
+        assert_eq!(
+            controller.view.subscriptions.sources[0].subtitle,
+            "youtube.com/@providerFixture"
+        );
+        assert_eq!(
+            controller.view.subscriptions.sources[0]
+                .thumbnail_url
+                .as_ref(),
+            Some(&thumbnail_url),
+            "URL enrichment must not rebuild away cached artwork"
+        );
+    }
+
+    #[test]
+    fn subscription_source_row_applies_late_search_alias_enrichment() {
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.subscription_tree = subscriptions;
+        controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
+        controller.rebuild_subscription_source_rows();
+        let thumbnail_url =
+            url::Url::parse("https://yt3.ggpht.com/fixture=s800").expect("fixture thumbnail");
+        controller.view.subscriptions.sources[0].thumbnail_url = Some(thumbnail_url.clone());
+        controller.youtube_results = vec![SearchItem::Channel(ChannelSummary {
+            channel_id: "UCfixture".to_owned(),
+            name: "Fixture channel".to_owned(),
+            description: String::new(),
+            subscriber_count: Some(13_045),
+            video_count: None,
+            created_at: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: Some(
+                url::Url::parse("https://www.youtube.com/@searchFixture")
+                    .expect("search fixture alias"),
+            ),
+        })];
+
+        controller.cache_search_channel_subscriber_counts();
+
+        assert_eq!(
+            controller.view.subscriptions.sources[0].subtitle, "youtube.com/@searchFixture",
+            "late search metadata must enrich a currently visible subscription row"
+        );
+        assert_eq!(
+            controller.view.subscriptions.sources[0]
+                .thumbnail_url
+                .as_ref(),
+            Some(&thumbnail_url),
+            "search enrichment must not rebuild away cached artwork"
+        );
     }
 
     #[test]
@@ -35986,6 +36278,28 @@ mod tests {
                 .subscribe_youtube_channel("Fixture channel", "UCfixture")
         );
         controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
+        let now = unix_time();
+        controller
+            .store
+            .put_cached_channel_summary(&crate::persistence::CachedChannelSummary {
+                summary: ChannelSummary {
+                    channel_id: "UCfixture".to_owned(),
+                    name: "Fixture channel".to_owned(),
+                    description: String::new(),
+                    subscriber_count: None,
+                    video_count: None,
+                    created_at: None,
+                    auto_generated: false,
+                    thumbnails: Vec::new(),
+                    webpage_url: Some(
+                        url::Url::parse("https://www.youtube.com/c/FixtureChannel")
+                            .expect("fixture channel alias"),
+                    ),
+                },
+                fetched_at: now,
+                expires_at: now.saturating_add(60),
+            })
+            .expect("persist channel alias");
         controller.cache_subscription_video_page(
             "UCfixture",
             SearchPage {
@@ -36003,6 +36317,10 @@ mod tests {
         assert_eq!(
             controller.view.subscriptions.source_title,
             "Fixture channel"
+        );
+        assert_eq!(
+            controller.view.subscriptions.sources[0].subtitle, "youtube.com/c/FixtureChannel",
+            "the now-playing teleport must use the same readable source rows"
         );
         assert_eq!(controller.view.subscriptions.selected_item, 0);
 
