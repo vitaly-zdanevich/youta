@@ -802,6 +802,15 @@ pub enum LocalFilePopupView {
         /// Filesystem failure retained in the popup.
         error: Option<String>,
     },
+    /// Recoverable move-to-Trash confirmation for an offline download.
+    DownloadedTrash {
+        /// Exact display basename being removed from the downloads directory.
+        name: String,
+        /// Full source path passed to the system Trash backend after confirmation.
+        path: String,
+        /// Filesystem failure retained in the popup.
+        error: Option<String>,
+    },
     /// Destination browser for one or more explicitly selected Local entries.
     Move {
         /// Lossy display names of the source entries, bounded by the controller.
@@ -1496,6 +1505,10 @@ pub enum UiAction {
     RequestLocalTrash,
     /// Move the selected local entry to recoverable system Trash.
     ConfirmLocalTrash,
+    /// Ask for confirmation before moving the selected download to Trash.
+    RequestDownloadedTrash,
+    /// Move the selected download to recoverable system Trash.
+    ConfirmDownloadedTrash,
     /// Open the destination chooser for marked entries or the current row.
     BeginLocalMove,
     /// Extend the Local move batch and selection by one signed row.
@@ -2975,7 +2988,8 @@ fn render_frame(
 }
 
 fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadView, theme: &Theme) {
-    let ratio = if !download.active && download.completed_path.is_some() {
+    let completed = !download.active && download.completed_path.is_some();
+    let ratio = if completed {
         1.0
     } else {
         download
@@ -3022,7 +3036,11 @@ fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadVie
                     .borders(Borders::TOP)
                     .border_style(theme.border),
             )
-            .gauge_style(theme.progress)
+            .gauge_style(if completed {
+                Style::default().fg(Color::White).bg(Color::Green)
+            } else {
+                theme.progress
+            })
             .ratio(ratio)
             .label(label),
         area,
@@ -4099,6 +4117,16 @@ fn render_information_panel(
                 theme.accent
             },
             UiAction::ToggleTextSelectionMode,
+        );
+    }
+    if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("x", "Move to Trash", show_hotkeys),
+            theme.accent,
+            UiAction::RequestDownloadedTrash,
         );
     }
     if view.external_opener_available
@@ -7479,10 +7507,20 @@ fn render_local_file_popup(
             UiAction::SubmitLocalRename,
         ),
         LocalFilePopupView::Trash { name, path, error } => (
-            format!("Move “{name}” to recoverable system Trash?\nFrom: {path}"),
+            format!(
+                "Move “{name}” to recoverable system Trash?\nFrom: {path}\nDestination: recoverable system Trash (chosen by the operating system)"
+            ),
             error.as_deref(),
             "[Enter] Move to Trash",
             UiAction::ConfirmLocalTrash,
+        ),
+        LocalFilePopupView::DownloadedTrash { name, path, error } => (
+            format!(
+                "Move downloaded item “{name}” to recoverable system Trash?\nFrom: {path}\nDestination: recoverable system Trash (chosen by the operating system)"
+            ),
+            error.as_deref(),
+            "[Enter] Move to Trash",
+            UiAction::ConfirmDownloadedTrash,
         ),
         LocalFilePopupView::Move { .. } => unreachable!("handled above"),
     };
@@ -7492,7 +7530,7 @@ fn render_local_file_popup(
             centered_rect(66, 28, frame.area()),
             message,
         ),
-        LocalFilePopupView::Trash { .. } => {
+        LocalFilePopupView::Trash { .. } | LocalFilePopupView::DownloadedTrash { .. } => {
             let width = frame.area().width.saturating_sub(4).clamp(1, 96);
             let message_width = width.saturating_sub(6).max(1);
             let wrapped_message = wrap_text_lines(&message, message_width);
@@ -8216,6 +8254,9 @@ fn key_action_with_page_rows_unfiltered(
                 Some(UiAction::AppendLocalRenameCharacter(character))
             }
             (LocalFilePopupView::Trash { .. }, KeyCode::Enter) => Some(UiAction::ConfirmLocalTrash),
+            (LocalFilePopupView::DownloadedTrash { .. }, KeyCode::Enter) => {
+                Some(UiAction::ConfirmDownloadedTrash)
+            }
             (LocalFilePopupView::Move { .. }, KeyCode::Enter) => {
                 Some(UiAction::ActivateLocalMoveDestination)
             }
@@ -8449,6 +8490,15 @@ fn key_action_with_page_rows_unfiltered(
         }
         #[cfg(feature = "local-trash")]
         KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
+        #[cfg(feature = "local-trash")]
+        KeyCode::Char('x')
+            if view.screen == Screen::Downloaded
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ) =>
+        {
+            Some(UiAction::RequestDownloadedTrash)
+        }
         KeyCode::Char('i')
             if view.screen == Screen::Subscriptions
                 && view.subscriptions.layout == SubscriptionsLayout::Split
@@ -17735,6 +17785,39 @@ prose 07:25 remains clickable but is not a chapter";
             .collect::<String>();
         assert!(rendered.contains("Downloaded:"));
         assert!(rendered.contains("downloads/fixture.opus"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == Color::Green),
+            "only a validated completed download receives the dark-green background"
+        );
+
+        let active = DownloadView {
+            title: "Still downloading".to_owned(),
+            downloaded_bytes: 1,
+            total_bytes: Some(2),
+            active: true,
+            ..DownloadView::default()
+        };
+        let mut active_terminal =
+            Terminal::new(TestBackend::new(80, 2)).expect("active download terminal");
+        active_terminal
+            .draw(|frame| {
+                render_download_bar(frame, frame.area(), &active, &Theme::new(false));
+            })
+            .expect("draw active download");
+        assert!(
+            active_terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.bg != Color::Green),
+            "in-progress and failed downloads must not use the success background"
+        );
     }
 
     #[test]
@@ -18640,6 +18723,45 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn downloaded_trash_confirmation_exposes_destination_and_exact_action() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let path = "/home/listener/.config/youta/downloads/offline.opus";
+        let view = ViewModel {
+            screen: Screen::Downloaded,
+            local_file_popup: Some(LocalFilePopupView::DownloadedTrash {
+                name: "offline.opus".to_owned(),
+                path: path.to_owned(),
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw downloaded Trash confirmation");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("Move downloaded item “offline.opus”"));
+        assert!(rendered.contains(&format!("From: {path}")));
+        assert!(
+            rendered
+                .contains("Destination: recoverable system Trash (chosen by the operating system)")
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ConfirmDownloadedTrash)
+        );
+        assert!(
+            hit_map
+                .local_file_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::ConfirmDownloadedTrash)
+        );
+    }
+
+    #[test]
     fn trash_confirmation_wraps_a_long_path_on_a_narrow_terminal() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -19060,6 +19182,80 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             }
         }
+    }
+
+    #[cfg(feature = "local-trash")]
+    #[test]
+    fn downloaded_details_offer_right_aligned_recoverable_removal_after_select_mode() {
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Downloaded,
+            rows: vec![RowView {
+                title: "offline.opus".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                title: "offline.opus".to_owned(),
+                source: "Local download".to_owned(),
+                description: "Full path: /downloads/offline.opus".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Downloaded Details");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[x] Move to Trash"));
+        let select_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::ToggleTextSelectionMode).then_some(*area)
+            })
+            .expect("Select mode control");
+        let trash_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::RequestDownloadedTrash).then_some(*area)
+            })
+            .expect("Downloaded Trash control");
+        assert_eq!(trash_area.y, select_area.y.saturating_add(1));
+        assert_eq!(trash_area.right(), hit_map.details_panel.right());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &view),
+            Some(UiAction::RequestDownloadedTrash)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: trash_area.x,
+                    row: trash_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::RequestDownloadedTrash)
+        );
+
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &local
+            ),
+            Some(UiAction::RequestDownloadedTrash),
+            "the x shortcut must remain scoped to Downloaded"
+        );
     }
 
     #[test]

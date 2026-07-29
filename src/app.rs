@@ -8907,6 +8907,21 @@ impl AppController {
         Ok(path)
     }
 
+    /// Returns the selected download and its authoritative containing directory.
+    ///
+    /// The system-Trash operation performs a second canonical containment and
+    /// file-type validation immediately before mutation.
+    #[cfg(feature = "local-trash")]
+    fn selected_downloaded_trash_target(&self) -> Result<(PathBuf, PathBuf), String> {
+        if self.view.screen != Screen::Downloaded {
+            return Err("Open Downloaded before removing an offline item".to_owned());
+        }
+        Ok((
+            self.config.downloads_dir(),
+            self.selected_downloaded_path()?,
+        ))
+    }
+
     /// Returns the selected playable identity without opening media metadata.
     ///
     /// This cheap path is used while navigating so Details membership never
@@ -15786,6 +15801,31 @@ impl AppController {
         self.view.status_line = "This build omits the `local-trash` feature".to_owned();
     }
 
+    #[cfg(feature = "local-trash")]
+    fn request_downloaded_trash(&mut self) {
+        let (_, path) = match self.selected_downloaded_trash_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+        };
+        self.view.local_file_popup = Some(LocalFilePopupView::DownloadedTrash {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path: path.display().to_string(),
+            error: None,
+        });
+    }
+
+    #[cfg(not(feature = "local-trash"))]
+    fn request_downloaded_trash(&mut self) {
+        self.view.status_line = "This build omits the `local-trash` feature".to_owned();
+    }
+
     /// Removes a confirmed Trash target from the visible snapshot immediately.
     ///
     /// The following background refresh remains authoritative, while this
@@ -15857,6 +15897,60 @@ impl AppController {
         }
     }
 
+    #[cfg(feature = "local-trash")]
+    fn confirm_downloaded_trash(&mut self) {
+        let mut actions = crate::local_browser::SystemLocalFileActions;
+        self.confirm_downloaded_trash_with(&mut actions);
+    }
+
+    #[cfg(not(feature = "local-trash"))]
+    fn confirm_downloaded_trash(&mut self) {
+        if let Some(LocalFilePopupView::DownloadedTrash {
+            error: popup_error, ..
+        }) = self.view.local_file_popup.as_mut()
+        {
+            *popup_error = Some("this build omits the `local-trash` feature".to_owned());
+        }
+    }
+
+    /// Revalidates and moves the selected download through an injected backend.
+    ///
+    /// Injection keeps regression tests recoverable and deterministic without
+    /// writing to the developer's desktop Trash.
+    #[cfg(feature = "local-trash")]
+    fn confirm_downloaded_trash_with<A>(&mut self, actions: &mut A)
+    where
+        A: crate::local_browser::LocalFileActions + ?Sized,
+    {
+        let popup_path = match self.view.local_file_popup.as_ref() {
+            Some(LocalFilePopupView::DownloadedTrash { path, .. }) => PathBuf::from(path),
+            _ => {
+                self.view.local_file_popup = None;
+                self.view.status_line = "No downloaded item is awaiting removal".to_owned();
+                return;
+            }
+        };
+        let (directory, source) = match self.selected_downloaded_trash_target() {
+            Ok(target) if target.1 == popup_path => target,
+            Ok(_) | Err(_) => {
+                self.view.local_file_popup = None;
+                self.view.status_line =
+                    "The selected downloaded item is no longer available".to_owned();
+                return;
+            }
+        };
+        match crate::local_browser::trash_local_entry(actions, &directory, &source) {
+            Ok(()) => {
+                self.view.local_file_popup = None;
+                self.populate_downloads();
+                self.refresh_selected_playlist_state();
+                self.view.status_line =
+                    format!("Moved {} to recoverable system Trash", source.display());
+            }
+            Err(error) => self.show_downloaded_trash_error(&error),
+        }
+    }
+
     /// Keeps the confirmation context and exposes the complete Trash error chain.
     ///
     /// A single popup row cannot represent nested operating-system or desktop
@@ -15871,6 +15965,18 @@ impl AppController {
             *popup_error = Some(error.to_string());
         }
         self.show_error("Could not move local entry to Trash", error);
+    }
+
+    /// Keeps the download confirmation and exposes the complete Trash error chain.
+    #[cfg(feature = "local-trash")]
+    fn show_downloaded_trash_error(&mut self, error: &crate::local_browser::LocalBrowserError) {
+        if let Some(LocalFilePopupView::DownloadedTrash {
+            error: popup_error, ..
+        }) = self.view.local_file_popup.as_mut()
+        {
+            *popup_error = Some(error.to_string());
+        }
+        self.show_error("Could not move downloaded item to Trash", error);
     }
 
     /// Toggles the selected real Local entry and advances one signed row.
@@ -16631,6 +16737,10 @@ impl AppController {
 
     /// Closes a Local popup unless an approved move is already executing.
     fn dismiss_local_file_popup(&mut self) {
+        let downloaded_trash = matches!(
+            self.view.local_file_popup.as_ref(),
+            Some(LocalFilePopupView::DownloadedTrash { .. })
+        );
         #[cfg(feature = "local-move")]
         if self.local_move_execution_pending
             && matches!(
@@ -16651,7 +16761,12 @@ impl AppController {
             self.local_move_selection = None;
         }
         self.view.local_file_popup = None;
-        self.view.status_line = "Local file was not changed".to_owned();
+        self.view.status_line = if downloaded_trash {
+            "Downloaded item was not changed"
+        } else {
+            "Local file was not changed"
+        }
+        .to_owned();
     }
 
     #[cfg(not(feature = "local-move"))]
@@ -17847,6 +17962,8 @@ impl UiController for AppController {
             UiAction::SubmitLocalRename => self.submit_local_rename(),
             UiAction::RequestLocalTrash => self.request_local_trash(),
             UiAction::ConfirmLocalTrash => self.confirm_local_trash(),
+            UiAction::RequestDownloadedTrash => self.request_downloaded_trash(),
+            UiAction::ConfirmDownloadedTrash => self.confirm_downloaded_trash(),
             UiAction::BeginLocalMove => self.begin_local_move(),
             UiAction::ExtendLocalMoveSelection(direction) => {
                 self.extend_local_move_selection(direction);
@@ -23184,6 +23301,37 @@ mod tests {
 
     use super::*;
 
+    /// Deterministic recoverable-Trash backend scoped to temporary test files.
+    #[cfg(feature = "local-trash")]
+    #[derive(Default)]
+    struct MockDownloadedTrashActions {
+        moved: Vec<PathBuf>,
+        failure: Option<std::io::ErrorKind>,
+    }
+
+    #[cfg(feature = "local-trash")]
+    impl crate::local_browser::LocalFileActions for MockDownloadedTrashActions {
+        fn rename_file_no_replace(
+            &mut self,
+            _source: &Path,
+            _target: &Path,
+        ) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn move_file_to_trash(&mut self, path: &Path) -> std::io::Result<()> {
+            if let Some(kind) = self.failure {
+                return Err(std::io::Error::new(
+                    kind,
+                    "mock desktop Trash rejected the download",
+                ));
+            }
+            std::fs::remove_file(path)?;
+            self.moved.push(path.to_owned());
+            Ok(())
+        }
+    }
+
     /// Deterministic off-thread metadata fixture for local-video controller tests.
     struct FixedDurationLocalMediaLoader {
         expected_path: PathBuf,
@@ -24251,6 +24399,98 @@ mod tests {
         let playback = playback.lock().expect("mock playback");
         assert_eq!(playback.played.len(), 1);
         assert_eq!(playback.played[0].location, path.to_string_lossy());
+    }
+
+    #[cfg(feature = "local-trash")]
+    #[test]
+    fn downloaded_trash_confirmation_revalidates_removes_and_refreshes_rows() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let removed = config.downloads_dir().join("remove.opus");
+        let retained = config.downloads_dir().join("retain.opus");
+        let store = StateStore::open(&config).expect("disk state");
+        std::fs::write(&removed, b"remove fixture").expect("removed download fixture");
+        std::fs::write(&retained, b"retain fixture").expect("retained download fixture");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Downloaded);
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "remove.opus")
+            .expect("downloaded row");
+        controller.update_downloaded_detail();
+
+        controller.dispatch(UiAction::RequestDownloadedTrash);
+        assert!(matches!(
+            controller.view.local_file_popup.as_ref(),
+            Some(LocalFilePopupView::DownloadedTrash { path, error: None, .. })
+                if path == &removed.display().to_string()
+        ));
+        let mut actions = MockDownloadedTrashActions::default();
+        controller.confirm_downloaded_trash_with(&mut actions);
+
+        assert_eq!(actions.moved.as_slice(), std::slice::from_ref(&removed));
+        assert!(!removed.exists());
+        assert!(retained.exists());
+        assert!(controller.view.local_file_popup.is_none());
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "retain.opus");
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("to recoverable system Trash")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("retain.opus")
+        );
+    }
+
+    #[cfg(feature = "local-trash")]
+    #[test]
+    fn downloaded_trash_failure_retains_context_and_full_diagnostic() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let downloaded = config.downloads_dir().join("offline.opus");
+        let store = StateStore::open(&config).expect("disk state");
+        std::fs::write(&downloaded, b"download fixture").expect("download fixture");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        controller.show_screen(Screen::Downloaded);
+        controller.dispatch(UiAction::RequestDownloadedTrash);
+        let mut actions = MockDownloadedTrashActions {
+            failure: Some(std::io::ErrorKind::PermissionDenied),
+            ..MockDownloadedTrashActions::default()
+        };
+
+        controller.confirm_downloaded_trash_with(&mut actions);
+
+        assert!(downloaded.exists());
+        let Some(LocalFilePopupView::DownloadedTrash {
+            error: Some(summary),
+            ..
+        }) = controller.view.local_file_popup.as_ref()
+        else {
+            panic!("download confirmation must retain the backend failure");
+        };
+        assert!(summary.contains("mock desktop Trash rejected the download"));
+        let diagnostic = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("complete Trash diagnostic");
+        assert_eq!(diagnostic.title, "Could not move downloaded item to Trash");
+        assert!(
+            diagnostic
+                .report
+                .contains("mock desktop Trash rejected the download")
+        );
     }
 
     #[test]
