@@ -20,6 +20,7 @@ use crossterm::terminal::{
 };
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::CellDiffOption;
 #[cfg(test)]
 use ratatui::layout::Size;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -2820,6 +2821,8 @@ struct HitMap {
     subscription_item_first_index: usize,
     subscription_source_buttons: Vec<(UiAction, Rect)>,
     details_panel: Rect,
+    /// Last information-panel owner rendered into the terminal pane.
+    information_panel_identity: Option<InformationPanelIdentity>,
     /// Cells occupied by actual, ready artwork in the Details panel.
     thumbnail_area: Option<Rect>,
     /// Actual wrapped-line offset rendered in the Details description.
@@ -2867,6 +2870,34 @@ struct SelectableDetailsRow {
     x: u16,
     y: u16,
     cells: Vec<String>,
+}
+
+/// Stable owner and layout of the currently rendered information panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InformationPanelIdentity {
+    /// Physical pane requiring invalidation when it moves or resizes.
+    area: Rect,
+    /// Source-specific field layout rendered for the owner.
+    kind: InformationPanelKind,
+    /// Heading text distinguishing Details and source-only panels.
+    title: String,
+    /// Whether this panel includes selectable Details controls.
+    show_text_selection: bool,
+    /// Stable selected item represented by the panel.
+    owner: InformationPanelOwner,
+}
+
+/// Stable identity of the item that owns one information panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InformationPanelOwner {
+    /// No selected item currently owns the panel.
+    Empty,
+    /// Provider channel identity used by channel panels.
+    Channel(String),
+    /// Stable playable-media identity used by Details panels.
+    Media(MediaId),
+    /// Display metadata fallback for providers without a stable identifier.
+    Display { title: String, source: String },
 }
 
 #[cfg(test)]
@@ -3674,6 +3705,7 @@ fn render_body(
             );
         }
         RightPanelMode::Waveform => {
+            hit_map.information_panel_identity = None;
             if let Some(renderer) = thumbnail_renderer {
                 renderer.clear();
             }
@@ -4047,6 +4079,7 @@ fn render_subscriptions_body(
                     hit_map,
                 );
             } else {
+                hit_map.information_panel_identity = None;
                 if let Some(renderer) = thumbnail_renderer {
                     renderer.clear();
                 }
@@ -4387,6 +4420,50 @@ struct RightDetailButton {
     action: UiAction,
 }
 
+/// Builds the stable renderer identity used for terminal-cell invalidation.
+fn information_panel_identity(
+    area: Rect,
+    kind: InformationPanelKind,
+    title: &str,
+    show_text_selection: bool,
+    details: Option<&DetailView>,
+) -> InformationPanelIdentity {
+    let owner = details.map_or(InformationPanelOwner::Empty, |details| {
+        if kind == InformationPanelKind::Channel && !details.channel_id.is_empty() {
+            InformationPanelOwner::Channel(details.channel_id.clone())
+        } else if let Some(media_id) = details.media_id.as_ref() {
+            InformationPanelOwner::Media(media_id.clone())
+        } else {
+            InformationPanelOwner::Display {
+                title: details.title.clone(),
+                source: details.source.clone(),
+            }
+        }
+    });
+    InformationPanelIdentity {
+        area,
+        kind,
+        title: title.to_owned(),
+        show_text_selection,
+        owner,
+    }
+}
+
+/// Forces one owned pane to rewrite every terminal cell on its next flush.
+///
+/// A terminal may measure an emoji differently from Ratatui. In that case the
+/// physical trailing character can occupy a cell that Ratatui already models
+/// as blank, so an ordinary buffer clear produces no diff. `AlwaysUpdate`
+/// repairs that divergence without clearing or repainting the whole screen.
+fn invalidate_terminal_area(frame: &mut Frame<'_>, area: Rect) {
+    let area = area.intersection(frame.area());
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            frame.buffer_mut()[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
 /// Appends one clipped, right-aligned control and remembers its hit target.
 fn push_right_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -4426,6 +4503,17 @@ fn render_information_panel(
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
     hit_map.details_panel = area;
+    let identity = information_panel_identity(
+        area,
+        kind,
+        title,
+        show_text_selection,
+        view.details.as_ref(),
+    );
+    if hit_map.information_panel_identity.as_ref() != Some(&identity) {
+        invalidate_terminal_area(frame, area);
+        hit_map.information_panel_identity = Some(identity);
+    }
     let heading_style = if view.details_focused {
         theme
             .accent
@@ -20370,6 +20458,114 @@ prose 07:25 remains clickable but is not a chapter";
                 .detail_buttons
                 .iter()
                 .all(|(action, _)| action != &UiAction::ShowChannel)
+        );
+    }
+
+    #[test]
+    fn channel_panel_clears_trailing_cells_when_external_links_shrink() {
+        use ratatui::backend::Backend;
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            right_panel_mode: RightPanelMode::Channel,
+            details: Some(DetailView {
+                title: "First channel".to_owned(),
+                channel_id: "UCfirst".to_owned(),
+                description: concat!(
+                    "Long first-channel description\n",
+                    "🔴 contact contact contact semaha_help\n",
+                    "🔴 contact contact contact OGMz"
+                )
+                .to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw first channel");
+
+        // Some terminals measure the leading emoji differently from Ratatui.
+        // Model the resulting out-of-sync physical cells without changing
+        // Ratatui's previous-frame buffer.
+        let stale_cells = {
+            let buffer = terminal.backend().buffer();
+            ["semaha_help", "OGMz"].map(|ending| {
+                let final_symbol = &ending[ending.len() - 1..];
+                let (x, y) = (0..buffer.area.height)
+                    .find_map(|y| {
+                        let row = (0..buffer.area.width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>();
+                        row.contains(ending).then(|| {
+                            let x = (0..buffer.area.width)
+                                .rev()
+                                .find(|x| buffer[(*x, y)].symbol() == final_symbol)
+                                .expect("old line-ending cell");
+                            (x.saturating_add(1), y)
+                        })
+                    })
+                    .expect("old emoji-prefixed description line");
+                assert_eq!(buffer[(x, y)].symbol(), " ");
+                (x, y, final_symbol)
+            })
+        };
+        for (x, y, symbol) in stale_cells {
+            let mut cell = ratatui::buffer::Cell::default();
+            cell.set_symbol(symbol);
+            terminal
+                .backend_mut()
+                .draw(std::iter::once((x, y, &cell)))
+                .expect("inject terminal-width divergence");
+        }
+
+        view.details = Some(DetailView {
+            title: "Second channel".to_owned(),
+            channel_id: "UCsecond".to_owned(),
+            description: "Short description".to_owned(),
+            links: vec![
+                DetailLinkView {
+                    label: "X/Twitter".to_owned(),
+                    url: "https://x.co/x".to_owned(),
+                    ..DetailLinkView::default()
+                },
+                DetailLinkView {
+                    label: "TikTok".to_owned(),
+                    url: "https://t.co/z".to_owned(),
+                    ..DetailLinkView::default()
+                },
+            ],
+            ..DetailView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw second channel");
+
+        let buffer = terminal.backend().buffer();
+        for (x, y, _) in stale_cells {
+            assert_eq!(
+                buffer[(x, y)].symbol(),
+                " ",
+                "the shorter channel must clear cells left outside Ratatui's prior model"
+            );
+        }
+        assert!(!rendered_text(&terminal).contains("semaha_help"));
+        assert!(!rendered_text(&terminal).contains("OGMz"));
+
+        let unchanged_frame = terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("redraw unchanged second channel");
+        let panel = hit_map.details_panel;
+        assert!(
+            (panel.top()..panel.bottom()).all(|y| {
+                (panel.left()..panel.right()).all(|x| {
+                    unchanged_frame.buffer[(x, y)].diff_option != CellDiffOption::AlwaysUpdate
+                })
+            }),
+            "pane invalidation must not remain active after the owner-change frame"
         );
     }
 
