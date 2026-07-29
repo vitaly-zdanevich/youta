@@ -6258,7 +6258,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
-        "  F2 offline     F3 history",
+        "  F2 offline     F3 history     Backspace back",
         "  F4 playlists     F5 stats     p preferences",
         "  v video/channel search     N relevance/newest     C CC-only videos",
         "  j/k select     Enter open/play",
@@ -6273,8 +6273,8 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
-        "  r repeat     A autoplay next item from the same source list",
-        "  w waveform  Details: Alt+←/→ history  Alt+↑/↓ scroll  Backspace back",
+        "  r repeat     A autoplay next item from same source list   w waveform",
+        "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
         "",
         "Actions",
         "  Ctrl+n play next     a add to queue     d download     o video page",
@@ -8623,6 +8623,7 @@ fn key_action_with_page_rows_unfiltered(
                 .find(|entity| entity.item_id == item_id)
         })
         .map_or(0, |entity| entity.media_controls.len());
+    let details_line_scroll_available = details_accept_line_scroll(view);
     match key.code {
         KeyCode::Char('q') => Some(UiAction::Quit),
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
@@ -8781,21 +8782,20 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
         KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
         KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
-        KeyCode::Up
-            if alt
-                && view.details.is_some()
-                && view.right_panel_mode == RightPanelMode::Details =>
-        {
+        KeyCode::Up if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
         }
-        KeyCode::Down
-            if alt
-                && view.details.is_some()
-                && view.right_panel_mode == RightPanelMode::Details =>
-        {
+        KeyCode::Down if alt && details_line_scroll_available => {
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
+        }
+        KeyCode::Char('u') if alt && details_line_scroll_available => {
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
+        }
+        KeyCode::Char('d') if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
         }
         KeyCode::Up | KeyCode::Down if alt => None,
+        KeyCode::Char('u' | 'd') if alt => None,
         KeyCode::PageUp if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(-1)))
         }
@@ -8863,6 +8863,18 @@ fn key_action_with_page_rows_unfiltered(
         }
         _ => None,
     }
+}
+
+/// Reports whether line-scrolling shortcuts can target the visible Details pane.
+///
+/// The default Linux virtual-console keymap binds `Alt+Up` to its
+/// `KeyboardSignal` action and emits `Alt+Down` like plain `Down`, so neither
+/// chord reaches Crossterm as an Alt-modified arrow. [`key_action`] retains
+/// modifier-aware arrows for terminal emulators and also accepts `Alt+u/d` as
+/// virtual-console-safe aliases. Both paths use this predicate so a failed
+/// `Alt+d` scroll never falls through to the unrelated Download action.
+fn details_accept_line_scroll(view: &ViewModel) -> bool {
+    view.details.is_some() && view.right_panel_mode == RightPanelMode::Details
 }
 
 /// Recognizes reverse-tab modifier encodings produced by terminal keyboards.
@@ -11066,7 +11078,7 @@ mod tests {
 
         assert!(rendered.contains("Youta help"));
         assert!(rendered.contains("Details: Alt+←/→ history"));
-        assert!(rendered.contains("Alt+↑/↓ scroll"));
+        assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
         if cfg!(feature = "local-browser") {
             assert!(rendered.contains("Local: Esc parent"));
@@ -11238,6 +11250,11 @@ mod tests {
             Some(UiAction::ChangeVolume(5)),
             "plain arrows must remain volume controls"
         );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &details),
+            Some(UiAction::ChangeVolume(-5)),
+            "plain arrows must remain volume controls"
+        );
 
         let no_details = ViewModel::default();
         assert_eq!(
@@ -11256,6 +11273,54 @@ mod tests {
             None,
             "the shortcut must not change volume while the description is hidden"
         );
+    }
+
+    #[test]
+    fn alt_letter_tty_fallback_scrolls_details_without_falling_through() {
+        let details = ViewModel {
+            details: Some(DetailView::default()),
+            right_panel_mode: RightPanelMode::Details,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                &details
+            ),
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                &details
+            ),
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
+        );
+
+        for unavailable in [
+            ViewModel::default(),
+            ViewModel {
+                details: Some(DetailView::default()),
+                right_panel_mode: RightPanelMode::Channel,
+                ..ViewModel::default()
+            },
+        ] {
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                    &unavailable
+                ),
+                None
+            );
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                    &unavailable
+                ),
+                None,
+                "the Linux-TTY scroll fallback must not become Download"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.14.1`. Items marked **roadmap** are design decisions, not support
+present in `0.14.2`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -726,6 +726,14 @@ transient footer notice. A non-empty `/run/openrc/softlevel` enables the
 actionable `rc-service gpm start` wording; other init systems and builds
 without GPM remain truthful without that command. When GPM is available,
 physical motion moves the same visible square.
+
+Linux virtual-console keymaps translate keys before Crossterm can observe them.
+The standard map consumes `Alt+Up` as `KeyboardSignal` and emits `Alt+Down`
+without a distinguishable Alt modifier. Youta therefore retains
+modifier-aware `Alt+Up`/`Alt+Down` for terminal emulators and maps `Alt+u/d` to
+the same Details line scrolling as a no-focus, physical-console fallback. It
+does not mutate the system-wide keymap, delay a standalone Escape key, or run a
+timed input-normalization loop.
 
 Waveform rendering is a separate library-shaped module (**roadmap**). It
 produces a resolution-independent peak envelope cached by media fingerprint,

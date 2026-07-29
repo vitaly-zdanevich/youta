@@ -768,6 +768,15 @@ visible and selectable as text. Pseudo-terminals and SSH sessions retain the
 controls because their opener may be configured on the host. Linux uses
 `xdg-open`; macOS uses its native `open` command.
 
+The default Linux virtual-console keymap reserves `Alt+Up` for a kernel action
+and does not preserve the Alt modifier on `Alt+Down`. Terminal emulators keep
+the usual `Alt+Up`/`Alt+Down` Details scrolling; on `/dev/ttyN`, use `Alt+u`
+and `Alt+d` for the same line-by-line movement. During normal navigation, these
+aliases work whenever Details are visible and do not require moving keyboard
+focus into that pane.
+Youta does not alter the system-wide console keymap or add an escape-sequence
+timeout.
+
 Configure the runtime policy in `~/.config/youta/config.toml`:
 
 ```toml
