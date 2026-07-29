@@ -4700,7 +4700,7 @@ fn render_information_panel(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            button("F6", "Comments", show_hotkeys),
+            button("F6", "Ten comments", show_hotkeys),
             theme.accent,
             UiAction::OpenVideoComments,
         );
@@ -6901,7 +6901,6 @@ fn render_video_comments_popup(
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(1),
         ])
         .split(inner);
     frame.render_widget(
@@ -6999,42 +6998,20 @@ fn render_video_comments_popup(
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
 
-    let first = if visible_lines == 0 {
-        0
-    } else {
-        offset.saturating_add(1)
-    };
-    let last = offset.saturating_add(visible_lines).min(content_len);
-    let position = match popup.state {
-        VideoCommentsPopupState::Ready => format!(
-            "{} comment{} · lines {first}–{last}",
-            popup.comments.len(),
-            if popup.comments.len() == 1 { "" } else { "s" }
-        ),
-        VideoCommentsPopupState::Loading => "Loading…".to_owned(),
-        VideoCommentsPopupState::Empty => "0 comments".to_owned(),
-        VideoCommentsPopupState::Error(_) => "Request failed".to_owned(),
-    };
-    frame.render_widget(
-        Paragraph::new(position)
-            .alignment(Alignment::Right)
-            .style(theme.muted),
-        sections[2],
-    );
     let label = "[Esc] Close";
     frame.render_widget(
         Paragraph::new(label)
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[3],
+        sections[2],
     );
-    let width = terminal_text_width(label).min(sections[3].width);
-    let x = sections[3]
+    let width = terminal_text_width(label).min(sections[2].width);
+    let x = sections[2]
         .x
-        .saturating_add(sections[3].width.saturating_sub(width) / 2);
+        .saturating_add(sections[2].width.saturating_sub(width) / 2);
     hit_map.video_comments_buttons.push((
         UiAction::DismissVideoComments,
-        Rect::new(x, sections[3].y, width, 1),
+        Rect::new(x, sections[2].y, width, 1),
     ));
 }
 
@@ -21072,12 +21049,31 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw supported YouTube comments control");
-        assert!(rendered_text(&youtube_terminal).contains("[F6] Comments"));
-        assert!(
-            youtube_hit_map
-                .detail_buttons
-                .iter()
-                .any(|(action, _)| { action == &UiAction::OpenVideoComments })
+        assert!(rendered_text(&youtube_terminal).contains("[F6] Ten comments"));
+        let comments_target = youtube_hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| {
+                (action == &UiAction::OpenVideoComments).then_some(*target)
+            })
+            .expect("Ten comments hit target");
+        assert_eq!(
+            comments_target.width,
+            terminal_text_width("[F6] Ten comments"),
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: comments_target.x,
+                    row: comments_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &youtube_hit_map,
+                &youtube,
+            ),
+            Some(UiAction::OpenVideoComments),
+            "the renamed label must retain its exact mouse action"
         );
 
         let local = ViewModel {
@@ -21097,7 +21093,7 @@ prose 07:25 remains clickable but is not a chapter";
         local_terminal
             .draw(|frame| render(frame, &local, &UiSettings::default(), &mut local_hit_map))
             .expect("draw unsupported Local comments control");
-        assert!(!rendered_text(&local_terminal).contains("[F6] Comments"));
+        assert!(!rendered_text(&local_terminal).contains("[F6] Ten comments"));
         assert!(
             local_hit_map
                 .detail_buttons
@@ -21122,7 +21118,7 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw unsupported YouTube comments control");
-        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Comments"));
+        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Ten comments"));
         assert!(
             unsupported_hit_map
                 .detail_buttons
@@ -21162,6 +21158,14 @@ prose 07:25 remains clickable but is not a chapter";
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("YouTube comments"));
         assert!(rendered.contains("[Esc] Close"));
+        assert!(
+            !rendered.contains("10 comments"),
+            "the fixed popup limit is already advertised by the F6 control"
+        );
+        assert!(
+            !rendered.contains("Lines 1–") && !rendered.contains("lines 1–"),
+            "the scrollbar already communicates the visible comments viewport"
+        );
         assert!(hit_map.video_comments_scroll_maximum > 0);
         assert_eq!(
             hit_map.video_comments_scroll_offset, hit_map.video_comments_scroll_maximum,
