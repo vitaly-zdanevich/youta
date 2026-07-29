@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.14.2`. Items marked **roadmap** are design decisions, not support
+present in `0.14.3`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -734,6 +734,19 @@ modifier-aware `Alt+Up`/`Alt+Down` for terminal emulators and maps `Alt+u/d` to
 the same Details line scrolling as a no-focus, physical-console fallback. It
 does not mutate the system-wide keymap, delay a standalone Escape key, or run a
 timed input-normalization loop.
+
+Before a physical-console frame is diffed, bright, indexed, and RGB
+foregrounds are paired with an explicit bold modifier. A base ANSI foreground
+carrying logical bold is promoted to its bright counterpart. Linux VT
+otherwise changes intensity as a side effect of foreground sequences without
+resetting it on a color-only reset, while Crossterm tracks color and bold
+independently. Normalizing the complete frame keeps partial redraws from
+mixing gray and bright glyphs. Unsupported italic and dim modifiers are
+removed in the same console-only pass. When Crossterm suppresses color through
+`NO_COLOR`, the pass removes foreground and background colors while retaining
+explicit text modifiers, avoiding empty color sequences that Linux VT treats
+as an untracked style reset. Startup also resets terminal style before the
+first clear and draw.
 
 Waveform rendering is a separate library-shaped module (**roadmap**). It
 produces a resolution-independent peak envelope cached by media fingerprint,

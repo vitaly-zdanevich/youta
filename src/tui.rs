@@ -13,6 +13,7 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
+use crossterm::style::{Attribute, Colored, ResetColor, SetAttribute};
 use crossterm::terminal::{
     Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
     disable_raw_mode, enable_raw_mode,
@@ -1875,8 +1876,56 @@ fn quantize_linux_console_thumbnail(buffer: &mut ratatui::buffer::Buffer, area: 
     }
 }
 
+/// Makes every Linux-VT color transition explicit to Ratatui's modifier diff.
+///
+/// Linux virtual consoles implement bright foreground colors and indexed/RGB
+/// foregrounds by mutating the same intensity state as SGR bold. Resetting
+/// only the foreground color does not restore normal intensity, while
+/// Crossterm models color and bold as independent state. Representing bright
+/// colors as bright ANSI colors paired with [`Modifier::BOLD`] keeps both
+/// models in sync and prevents isolated cells from retaining gray or bright
+/// glyphs after a partial redraw. A base color carrying logical bold is
+/// promoted to its bright variant because Crossterm emits modifiers before
+/// colors and the later Linux-VT color sequence also changes intensity.
+fn normalize_linux_console_buffer(buffer: &mut ratatui::buffer::Buffer) {
+    normalize_linux_console_buffer_for_color_output(
+        buffer,
+        !Colored::ansi_color_disabled_memoized(),
+    );
+}
+
+/// Applies the Linux-console invariant for the active Crossterm color policy.
+fn normalize_linux_console_buffer_for_color_output(
+    buffer: &mut ratatui::buffer::Buffer,
+    color_output_enabled: bool,
+) {
+    for cell in &mut buffer.content {
+        cell.modifier.remove(Modifier::DIM | Modifier::ITALIC);
+        let (foreground, bright) = linux_console_foreground(
+            nearest_linux_console_ansi16_color(cell.fg),
+            cell.modifier.contains(Modifier::BOLD),
+        );
+        if bright {
+            cell.modifier.insert(Modifier::BOLD);
+        }
+        if !color_output_enabled {
+            cell.fg = Color::Reset;
+            cell.bg = Color::Reset;
+            continue;
+        }
+        cell.fg = foreground;
+        cell.bg = linux_console_background(nearest_linux_console_ansi16_color(cell.bg));
+    }
+}
+
+/// Reapplies console normalization after cursor overlays mutate the frame.
+fn normalize_physical_linux_console_frame(frame: &mut Frame<'_>, view: &ViewModel) {
+    if view.physical_linux_console {
+        normalize_linux_console_buffer(frame.buffer_mut());
+    }
+}
+
 /// Conventional RGB values of the Linux virtual console's named ANSI colors.
-#[cfg(feature = "images")]
 const LINUX_CONSOLE_ANSI16: [(Color, [u8; 3]); 16] = [
     (Color::Black, [0, 0, 0]),
     (Color::Red, [170, 0, 0]),
@@ -1896,21 +1945,97 @@ const LINUX_CONSOLE_ANSI16: [(Color, [u8; 3]); 16] = [
     (Color::White, [255, 255, 255]),
 ];
 
-/// Maps an RGB color to the nearest conventional Linux-console ANSI color.
-#[cfg(feature = "images")]
-fn nearest_ansi16_color(color: Color) -> Color {
-    let Color::Rgb(red, green, blue) = color else {
-        return color;
+/// Maps an indexed or RGB color to the nearest Linux-console ANSI color.
+fn nearest_linux_console_ansi16_color(color: Color) -> Color {
+    let rgb = match color {
+        Color::Rgb(red, green, blue) => [red, green, blue],
+        Color::Indexed(index) => linux_console_indexed_rgb(index),
+        _ => return color,
     };
     LINUX_CONSOLE_ANSI16
         .into_iter()
         .min_by_key(|(_, candidate)| {
-            let red_delta = i32::from(red) - i32::from(candidate[0]);
-            let green_delta = i32::from(green) - i32::from(candidate[1]);
-            let blue_delta = i32::from(blue) - i32::from(candidate[2]);
+            let red_delta = i32::from(rgb[0]) - i32::from(candidate[0]);
+            let green_delta = i32::from(rgb[1]) - i32::from(candidate[1]);
+            let blue_delta = i32::from(rgb[2]) - i32::from(candidate[2]);
             red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta
         })
         .map_or(Color::Reset, |(color, _)| color)
+}
+
+/// Reproduces the Linux VT's conversion of an indexed color to RGB.
+fn linux_console_indexed_rgb(index: u8) -> [u8; 3] {
+    if index < 8 {
+        return [
+            if index & 1 != 0 { 0xaa } else { 0x00 },
+            if index & 2 != 0 { 0xaa } else { 0x00 },
+            if index & 4 != 0 { 0xaa } else { 0x00 },
+        ];
+    }
+    if index < 16 {
+        return [
+            if index & 1 != 0 { 0xff } else { 0x55 },
+            if index & 2 != 0 { 0xff } else { 0x55 },
+            if index & 4 != 0 { 0xff } else { 0x55 },
+        ];
+    }
+    if index < 232 {
+        let mut cube = u16::from(index) - 16;
+        let blue = (cube % 6) * 255 / 6;
+        cube /= 6;
+        let green = (cube % 6) * 255 / 6;
+        let red = (cube / 6) * 255 / 6;
+        return [red as u8, green as u8, blue as u8];
+    }
+    let gray = u16::from(index) * 10 - 2312;
+    [gray as u8; 3]
+}
+
+/// Keeps foreground color and tracked Linux-VT intensity in agreement.
+fn linux_console_foreground(color: Color, bold: bool) -> (Color, bool) {
+    match color {
+        Color::DarkGray
+        | Color::LightRed
+        | Color::LightGreen
+        | Color::LightYellow
+        | Color::LightBlue
+        | Color::LightMagenta
+        | Color::LightCyan
+        | Color::White => (color, true),
+        Color::Black if bold => (Color::DarkGray, true),
+        Color::Red if bold => (Color::LightRed, true),
+        Color::Green if bold => (Color::LightGreen, true),
+        Color::Yellow if bold => (Color::LightYellow, true),
+        Color::Blue if bold => (Color::LightBlue, true),
+        Color::Magenta if bold => (Color::LightMagenta, true),
+        Color::Cyan if bold => (Color::LightCyan, true),
+        Color::Gray if bold => (Color::White, true),
+        color => (color, false),
+    }
+}
+
+/// Collapses unsupported bright backgrounds to their base Linux-VT hues.
+fn linux_console_background(color: Color) -> Color {
+    match color {
+        Color::DarkGray => Color::Black,
+        Color::LightRed => Color::Red,
+        Color::LightGreen => Color::Green,
+        Color::LightYellow => Color::Yellow,
+        Color::LightBlue => Color::Blue,
+        Color::LightMagenta => Color::Magenta,
+        Color::LightCyan => Color::Cyan,
+        Color::White => Color::Gray,
+        color => color,
+    }
+}
+
+/// Maps an RGB color to the nearest conventional Linux-console ANSI color.
+#[cfg(feature = "images")]
+fn nearest_ansi16_color(color: Color) -> Color {
+    if !matches!(color, Color::Rgb(..)) {
+        return color;
+    }
+    nearest_linux_console_ansi16_color(color)
 }
 
 #[cfg(feature = "images")]
@@ -2123,12 +2248,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 );
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 virtual_cursor.render(frame);
+                normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         } else {
             session.terminal.draw(|frame| {
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 virtual_cursor.render(frame);
+                normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         }
         if let Some(renderer) = renderer.as_deref_mut() {
@@ -2632,6 +2759,8 @@ fn write_terminal_startup(writer: &mut impl io::Write) -> io::Result<()> {
         writer,
         SetTitle("Youta"),
         EnterAlternateScreen,
+        SetAttribute(Attribute::Reset),
+        ResetColor,
         ClearTerminal(ClearType::All),
         MoveTo(0, 0),
         EnableMouseCapture,
@@ -2740,6 +2869,7 @@ struct SelectableDetailsRow {
 fn render(frame: &mut Frame<'_>, view: &ViewModel, settings: &UiSettings, hit_map: &mut HitMap) {
     render_frame(frame, view, settings, hit_map, None);
     render_local_rename_cursor(frame, view, true);
+    normalize_physical_linux_console_frame(frame, view);
 }
 
 /// Chooses a bounded chapter-label height without taking space from the
@@ -3132,6 +3262,9 @@ fn render_frame(
             &theme,
             hit_map,
         );
+    }
+    if view.physical_linux_console {
+        normalize_linux_console_buffer(frame.buffer_mut());
     }
 }
 
@@ -9487,6 +9620,8 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -9494,6 +9629,24 @@ mod tests {
     use crate::domain::SourceKind;
 
     use super::*;
+
+    /// Cloneable byte sink used to inspect Crossterm's emitted SGR ordering.
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     struct MockThumbnailRenderer {
@@ -10037,6 +10190,10 @@ mod tests {
             .windows(b"\x1b[?1049h".len())
             .position(|window| window == b"\x1b[?1049h")
             .expect("alternate-screen command");
+        let reset_style = output
+            .windows(b"\x1b[0m".len())
+            .position(|window| window == b"\x1b[0m")
+            .expect("startup style reset");
         let clear_screen = output
             .windows(b"\x1b[2J".len())
             .position(|window| window == b"\x1b[2J")
@@ -10046,8 +10203,10 @@ mod tests {
             .position(|window| window == b"\x1b[1;1H")
             .expect("cursor-home command");
         assert!(
-            alternate_screen < clear_screen && clear_screen < cursor_home,
-            "startup must clear the active UI buffer and move to its origin: {output:?}"
+            alternate_screen < reset_style
+                && reset_style < clear_screen
+                && clear_screen < cursor_home,
+            "startup must reset style, clear the active UI buffer, and move to its origin: {output:?}"
         );
         assert!(
             output
@@ -16306,6 +16465,153 @@ mod tests {
             "cells outside the rendered thumbnail must remain untouched"
         );
         assert!(buffer[(2, 0)].modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn linux_console_frame_tracks_bright_foreground_intensity_as_bold() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 5, 1));
+        buffer[(0, 0)].fg = Color::DarkGray;
+        buffer[(1, 0)].fg = Color::White;
+        buffer[(2, 0)].fg = Color::Indexed(42);
+        buffer[(3, 0)].bg = Color::LightGreen;
+        buffer[(3, 0)].modifier = Modifier::DIM | Modifier::ITALIC | Modifier::UNDERLINED;
+        buffer[(4, 0)].fg = Color::Red;
+        buffer[(4, 0)].modifier = Modifier::BOLD;
+
+        normalize_linux_console_buffer_for_color_output(&mut buffer, true);
+
+        assert_eq!(buffer[(0, 0)].fg, Color::DarkGray);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(1, 0)].fg, Color::White);
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(2, 0)].fg, Color::Green);
+        assert!(!buffer[(2, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(3, 0)].bg, Color::Green);
+        assert!(
+            !buffer[(3, 0)]
+                .modifier
+                .intersects(Modifier::DIM | Modifier::ITALIC)
+        );
+        assert!(buffer[(3, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(buffer[(4, 0)].fg, Color::LightRed);
+        assert!(buffer[(4, 0)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn linux_console_frame_removes_colors_when_crossterm_suppresses_them() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].fg = Color::DarkGray;
+        buffer[(0, 0)].bg = Color::LightBlue;
+        buffer[(1, 0)].fg = Color::Rgb(1, 2, 3);
+
+        normalize_linux_console_buffer_for_color_output(&mut buffer, false);
+
+        assert_eq!(buffer[(0, 0)].fg, Color::Reset);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(1, 0)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn linux_console_no_color_backend_keeps_intensity_transitions_tracked() {
+        use ratatui::backend::Backend;
+
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_symbol("L").set_fg(Color::DarkGray);
+        buffer[(1, 0)].set_symbol("о");
+        normalize_linux_console_buffer_for_color_output(&mut buffer, false);
+
+        let output = CapturedWriter::default();
+        let mut backend = CrosstermBackend::new(output.clone());
+        backend
+            .draw([(0, 0, &buffer[(0, 0)]), (1, 0, &buffer[(1, 0)])].into_iter())
+            .expect("write color-suppressed console cells");
+        let bytes = output
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let label = bytes
+            .iter()
+            .position(|byte| *byte == b'L')
+            .expect("bright label must be emitted");
+        let normal_intensity = bytes
+            .windows(b"\x1b[22m".len())
+            .position(|window| window == b"\x1b[22m")
+            .expect("plain text must reset label intensity");
+        let cyrillic = bytes
+            .windows("о".len())
+            .position(|window| window == "о".as_bytes())
+            .expect("plain Cyrillic cell must be emitted");
+
+        assert!(
+            !bytes
+                .windows(b"\x1b[;m".len())
+                .any(|window| window == b"\x1b[;m"),
+            "suppressed colors must not serialize as an untracked SGR reset"
+        );
+        assert!(label < normal_intensity && normal_intensity < cyrillic);
+    }
+
+    #[test]
+    fn linux_console_backend_resets_intensity_before_plain_cyrillic() {
+        use ratatui::backend::Backend;
+
+        const CHILD_MARKER: &str = "YOUTA_LINUX_CONSOLE_COLOR_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("locate current test executable"),
+            )
+            .args([
+                "--exact",
+                "tui::tests::linux_console_backend_resets_intensity_before_plain_cyrillic",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("NO_COLOR")
+            .status()
+            .expect("run isolated Crossterm color regression");
+            assert!(status.success(), "isolated color regression must pass");
+            return;
+        }
+
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_symbol("L").set_fg(Color::DarkGray);
+        buffer[(1, 0)].set_symbol("о");
+        normalize_linux_console_buffer_for_color_output(&mut buffer, true);
+
+        let output = CapturedWriter::default();
+        let mut backend = CrosstermBackend::new(output.clone());
+        backend
+            .draw([(0, 0, &buffer[(0, 0)]), (1, 0, &buffer[(1, 0)])].into_iter())
+            .expect("write normalized console cells");
+        let bytes = output
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bright_gray = bytes
+            .windows(b"38;5;8".len())
+            .position(|window| window == b"38;5;8")
+            .expect("bright gray must be emitted as an explicit indexed color");
+        let label = bytes
+            .iter()
+            .position(|byte| *byte == b'L')
+            .expect("bright label must be emitted");
+        let normal_intensity = bytes
+            .windows(b"\x1b[22m".len())
+            .position(|window| window == b"\x1b[22m")
+            .expect("plain text must reset the bright label's intensity");
+        let cyrillic = bytes
+            .windows("о".len())
+            .position(|window| window == "о".as_bytes())
+            .expect("plain Cyrillic cell must be emitted");
+
+        assert!(
+            bright_gray < label,
+            "explicit bright gray must precede the bright label"
+        );
+        assert!(
+            normal_intensity < cyrillic,
+            "normal intensity must precede the plain Cyrillic glyph"
+        );
     }
 
     #[cfg(feature = "images")]
