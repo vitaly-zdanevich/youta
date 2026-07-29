@@ -385,6 +385,12 @@ pub struct RowView {
     pub source: String,
     /// Local watched percentage.
     pub watched_percent: u8,
+    /// Whether accepted playback has started, including before one percent.
+    ///
+    /// This is persisted independently from the rounded percentage so a
+    /// successful zero-position start can render as partial without claiming
+    /// that one percent has already been heard.
+    pub playback_started: bool,
     /// Whether the source is locally subscribed.
     pub subscribed: bool,
     /// Preferred artwork URL available for selected rendering or prefetch.
@@ -399,6 +405,15 @@ pub struct RowView {
     pub radio_favorite: bool,
     /// Whether this Local row belongs to the current explicit move batch.
     pub local_marked: bool,
+}
+
+/// One selected local video frame rendered through the thumbnail worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalVideoThumbnailView {
+    /// Exact local video path; the worker revalidates its filesystem identity.
+    pub path: PathBuf,
+    /// Midpoint seek position in milliseconds.
+    pub midpoint_millis: u64,
 }
 
 /// Details for the selected media item.
@@ -473,6 +488,8 @@ pub struct DetailView {
     /// The URL is never rendered as text. Unsupported terminals omit the
     /// image without fetching it.
     pub thumbnail_url: Option<url::Url>,
+    /// Lazy midpoint-frame target for a selected local video.
+    pub local_video_thumbnail: Option<LocalVideoThumbnailView>,
     /// Whether artwork occupies all remaining rows in the Details panel.
     ///
     /// This interaction-only state is never persisted. Selecting another item
@@ -626,6 +643,10 @@ pub struct PrivateNotePopupView {
     pub body: String,
     /// UTF-8 byte offset at a grapheme boundary where edits are applied.
     pub cursor_byte: usize,
+    /// First wrapped visual line requested for the editor viewport.
+    pub scroll_offset: usize,
+    /// Whether rendering should keep the insertion cursor inside the viewport.
+    pub follow_cursor: bool,
     /// Whether a note existed when this editor opened.
     pub existing: bool,
     /// Whether Delete now awaits one explicit confirmation.
@@ -643,6 +664,8 @@ impl std::fmt::Debug for PrivateNotePopupView {
             .field("target_label", &self.target_label)
             .field("body", &"[REDACTED]")
             .field("cursor_byte", &self.cursor_byte)
+            .field("scroll_offset", &self.scroll_offset)
+            .field("follow_cursor", &self.follow_cursor)
             .field("existing", &self.existing)
             .field("confirming_delete", &self.confirming_delete)
             .field("storage_path", &self.storage_path)
@@ -1219,6 +1242,8 @@ pub enum UiAction {
     AppendSearch(char),
     /// Remove the last query character.
     DeleteSearchCharacter,
+    /// Delete the Vim-style word before the search cursor.
+    DeleteSearchWord,
     /// Submit the current query.
     SubmitSearch,
     /// Switch the default YouTube search between videos and channels.
@@ -1345,6 +1370,8 @@ pub enum UiAction {
     AppendPlaylistEditorCharacter(char),
     /// Remove the final character from the focused playlist editor field.
     DeletePlaylistEditorCharacter,
+    /// Delete the Vim-style word before the focused playlist editor cursor.
+    DeletePlaylistEditorWord,
     /// Create a playlist and add the selected playable item to it.
     CreatePlaylistAndAdd,
     /// Save display-name and optional-description changes to one stable playlist.
@@ -1367,6 +1394,10 @@ pub enum UiAction {
     InsertPrivateNoteNewline,
     /// Remove the grapheme immediately before the private-note cursor.
     DeletePrivateNoteCharacter,
+    /// Delete the Vim-style word immediately before the private-note cursor.
+    DeletePrivateNoteWord,
+    /// Set the first wrapped visual line shown by the private-note editor.
+    SetPrivateNoteScroll(usize),
     /// Move the private-note cursor without modifying its body.
     MovePrivateNoteCursor(PrivateNoteCursorMotion),
     /// Persist the private-note draft for its exact target.
@@ -1393,6 +1424,8 @@ pub enum UiAction {
     AppendYouTubeSetupCharacter(char),
     /// Remove the last character from the selected YouTube setup field.
     DeleteYouTubeSetupCharacter,
+    /// Delete the Vim-style word before the selected setup-field cursor.
+    DeleteYouTubeSetupWord,
     /// Open Google's official `YouTube` API-key setup guide.
     OpenYouTubeApiKeyGuide,
     /// Open Google Cloud's API Credentials page.
@@ -1409,6 +1442,8 @@ pub enum UiAction {
     AppendRssSubscriptionCharacter(char),
     /// Remove the last character from the draft RSS feed URL.
     DeleteRssSubscriptionCharacter,
+    /// Delete the Vim-style word before the draft RSS feed cursor.
+    DeleteRssSubscriptionWord,
     /// Validate and persist the draft RSS subscription.
     SubmitRssSubscription,
     /// Close the RSS subscription popup without saving.
@@ -1437,6 +1472,8 @@ pub enum UiAction {
     MoveLocalRenameCursor(i8),
     /// Remove the grapheme immediately before the local rename cursor.
     DeleteLocalRenameCharacter,
+    /// Delete the Vim-style word immediately before the rename cursor.
+    DeleteLocalRenameWord,
     /// Validate and execute the local rename.
     SubmitLocalRename,
     /// Ask for confirmation before moving the selected local entry to Trash.
@@ -1513,8 +1550,20 @@ trait ThumbnailRenderer {
         false
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
+    /// Synchronizes a selected local video with its midpoint-frame target.
+    fn synchronize_local_video(&mut self, _source: &LocalVideoThumbnailView, _area: Rect) -> bool {
+        false
+    }
     /// Replaces the cache-only backlog for artwork rows selected by the TUI.
     fn synchronize_prefetch(&mut self, _rows: &[RowView]) -> bool {
+        false
+    }
+    /// Temporarily hides artwork behind a modal without invalidating its work.
+    ///
+    /// Implementations retain the selected target, ready protocol, and
+    /// in-flight generation so closing a popup never starts the same load
+    /// again.
+    fn obscure(&mut self) -> bool {
         false
     }
     fn clear(&mut self) -> bool;
@@ -1585,6 +1634,18 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         changed
     }
 
+    fn synchronize_local_video(&mut self, source: &LocalVideoThumbnailView, area: Rect) -> bool {
+        self.visible_source = None;
+        let changed =
+            self.manager
+                .synchronize_local_video(&source.path, source.midpoint_millis, area);
+        if changed {
+            self.clear_before_ready = false;
+            self.followup_frame_pending = false;
+        }
+        changed
+    }
+
     fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
         let sources_unchanged = self
             .prefetch_sources
@@ -1602,6 +1663,13 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.prefetched_visible_source
             .clone_from(&self.visible_source);
         self.manager.synchronize_prefetch(&self.prefetch_sources)
+    }
+
+    fn obscure(&mut self) -> bool {
+        // The popup is rendered after the body and overwrites its terminal
+        // cells. Keeping the manager intact lets a ready or in-flight image
+        // resume on the first frame after the popup closes.
+        false
     }
 
     fn clear(&mut self) -> bool {
@@ -2326,6 +2394,12 @@ struct HitMap {
     playlist_popup_fields: Vec<(PlaylistEditorField, Rect)>,
     playlist_popup_buttons: Vec<(UiAction, Rect)>,
     private_note_buttons: Vec<(UiAction, Rect)>,
+    /// Visible wrapped-text cells inside the private-note editor.
+    private_note_text_area: Rect,
+    /// Actual first wrapped visual line rendered by the private-note editor.
+    private_note_scroll_offset: usize,
+    /// Largest wrapped-line offset that can change the private-note viewport.
+    private_note_scroll_maximum: usize,
     local_file_buttons: Vec<(UiAction, Rect)>,
     /// Visible destination rows inside the Local Move popup.
     local_move_rows: Rect,
@@ -2635,7 +2709,7 @@ fn render_frame(
         || view.error_popup.is_some();
     if thumbnail_is_obscured {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
-            renderer.clear();
+            renderer.obscure();
         }
         render_body(
             frame,
@@ -2722,6 +2796,9 @@ fn render_frame(
         render_playlist_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.private_note_buttons.clear();
+    hit_map.private_note_text_area = Rect::default();
+    hit_map.private_note_scroll_offset = 0;
+    hit_map.private_note_scroll_maximum = 0;
     if let Some(popup) = view.private_note_popup.as_ref() {
         render_private_note_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
@@ -3006,10 +3083,12 @@ fn animated_status_line(view: &ViewModel) -> Cow<'_, str> {
 }
 
 /// Returns the playback-progress marker displayed independently of subscription state.
-fn watched_marker(watched_percent: u8) -> &'static str {
+fn watched_marker(watched_percent: u8, playback_started: bool) -> &'static str {
+    if !playback_started {
+        return "●";
+    }
     match watched_percent {
-        0 => "●",
-        1..=90 => "◐",
+        0..=90 => "◐",
         _ => "○",
     }
 }
@@ -3154,7 +3233,9 @@ fn render_row_list(
             } else {
                 theme.base
             };
-            let title_style = if !selected && row.vertical {
+            let has_playback_progress = row.media_id.is_some() && !row.hide_watched_marker;
+            let playback_started = row.playback_started || row.watched_percent > 0;
+            let mut title_style = if !selected && row.vertical {
                 let style = theme.vertical_video;
                 if playing {
                     style.add_modifier(Modifier::BOLD)
@@ -3164,8 +3245,10 @@ fn render_row_list(
             } else {
                 row_style
             };
+            if has_playback_progress && playback_started {
+                title_style = title_style.add_modifier(Modifier::ITALIC);
+            }
             let marker = if row.subscribed { "◆" } else { " " };
-            let has_playback_progress = row.media_id.is_some() && !row.hide_watched_marker;
             let progress = if !has_playback_progress || row.watched_percent == 0 {
                 String::new()
             } else {
@@ -3183,7 +3266,7 @@ fn render_row_list(
             };
             let watched_style = if selected || playing {
                 row_style
-            } else if row.watched_percent == 0 {
+            } else if !playback_started {
                 theme.muted
             } else {
                 theme.accent
@@ -3199,7 +3282,7 @@ fn render_row_list(
                 theme.accent.add_modifier(Modifier::BOLD)
             };
             let watched_marker = if has_playback_progress {
-                watched_marker(row.watched_percent)
+                watched_marker(row.watched_percent, playback_started)
             } else {
                 " "
             };
@@ -3713,13 +3796,20 @@ fn youtube_channel_handle(url: Option<&url::Url>) -> Option<String> {
     {
         return None;
     }
-    let mut segments = url.path_segments()?;
-    let handle = decode_url_path_segment_once(segments.next()?)?;
-    (segments.next().is_none()
-        && handle
-            .strip_prefix('@')
-            .is_some_and(valid_youtube_channel_display_alias))
-    .then_some(handle)
+    let mut segments = url
+        .path_segments()?
+        .map(decode_url_path_segment_once)
+        .collect::<Option<Vec<_>>>()?;
+    if segments.last().is_some_and(String::is_empty) {
+        segments.pop();
+    }
+    let [handle] = segments.as_slice() else {
+        return None;
+    };
+    handle
+        .strip_prefix('@')
+        .is_some_and(valid_youtube_channel_display_alias)
+        .then(|| handle.clone())
 }
 
 /// Checks a decoded handle before presenting it as an actionable channel URL.
@@ -3732,6 +3822,42 @@ fn valid_youtube_channel_display_alias(alias: &str) -> bool {
                 || character.is_whitespace()
                 || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
         })
+}
+
+/// One control placed against the right edge of the information panel.
+struct RightDetailButton {
+    /// Zero-based metadata row containing the rendered label.
+    line_index: usize,
+    /// Terminal-cell offset from the panel's left edge.
+    column: u16,
+    /// Exact rendered label used to size the mouse target.
+    label: String,
+    /// Action dispatched by a click inside the label.
+    action: UiAction,
+}
+
+/// Appends one clipped, right-aligned control and remembers its hit target.
+fn push_right_detail_button<'a>(
+    lines: &mut Vec<Line<'a>>,
+    buttons: &mut Vec<RightDetailButton>,
+    panel_width: u16,
+    label: String,
+    style: Style,
+    action: UiAction,
+) {
+    let rendered_width = terminal_text_width(&label).min(panel_width);
+    let column = panel_width.saturating_sub(rendered_width);
+    let line_index = lines.len();
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(usize::from(column))),
+        Span::styled(label.clone(), style),
+    ]));
+    buttons.push(RightDetailButton {
+        line_index,
+        column,
+        label,
+        action,
+    });
 }
 
 fn render_information_panel(
@@ -3782,7 +3908,8 @@ fn render_information_panel(
     } else {
         Vec::new()
     };
-    let text_selection_button = show_text_selection.then(|| {
+    let mut right_buttons = Vec::with_capacity(3);
+    if show_text_selection {
         let label = button(
             if view.text_selection_mode {
                 "t/Esc"
@@ -3790,23 +3917,110 @@ fn render_information_panel(
                 "t"
             },
             if view.text_selection_mode {
-                "End text selection"
+                "Exit select mode"
             } else {
-                "Select Details text"
+                "Select mode"
             },
             show_hotkeys,
         );
-        let line_index = lines.len();
-        lines.push(Line::styled(
-            label.clone(),
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            label,
             if view.text_selection_mode {
                 theme.selected
             } else {
                 theme.accent
             },
-        ));
-        (line_index, label, UiAction::ToggleTextSelectionMode)
-    });
+            UiAction::ToggleTextSelectionMode,
+        );
+    }
+    if view.external_opener_available
+        && kind != InformationPanelKind::Radio
+        && details.channel_webpage_url.is_some()
+    {
+        let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
+            .or_else(|| {
+                (!details.channel_name.trim().is_empty())
+                    .then(|| details.channel_name.trim().to_owned())
+            })
+            .or_else(|| (!details.title.trim().is_empty()).then(|| details.title.trim().to_owned()))
+            .unwrap_or_else(|| "channel".to_owned());
+        let label = button(
+            "O",
+            &format!("{} channel · {channel_label}", system_url_opener_name()),
+            show_hotkeys,
+        );
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            label,
+            theme.accent,
+            UiAction::OpenChannelInBrowser,
+        );
+    }
+    if view.external_opener_available
+        && show_text_selection
+        && matches!(
+            kind,
+            InformationPanelKind::Video
+                | InformationPanelKind::Podcast
+                | InformationPanelKind::Radio
+        )
+    {
+        let opener_name = system_url_opener_name();
+        let action_text = match kind {
+            InformationPanelKind::Podcast => format!("{opener_name} podcast"),
+            InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
+                || format!("{opener_name} station website"),
+                |url| format!("{opener_name} · {url}"),
+            ),
+            _ => format!("{opener_name} video"),
+        };
+        let label = button(
+            if kind == InformationPanelKind::Radio {
+                "O"
+            } else {
+                "o"
+            },
+            &action_text,
+            show_hotkeys,
+        );
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            label,
+            theme.accent,
+            UiAction::OpenInBrowser,
+        );
+    }
+    if cfg!(feature = "local-move") && kind == InformationPanelKind::Local && details.local_movable
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("m", "Move", show_hotkeys),
+            theme.accent,
+            UiAction::BeginLocalMove,
+        );
+    }
+    if cfg!(feature = "local-trash")
+        && kind == InformationPanelKind::Local
+        && details.local_trashable
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("Delete", "Move to Trash", show_hotkeys),
+            theme.accent,
+            UiAction::RequestLocalTrash,
+        );
+    }
     let radio_favorite_button = (kind == InformationPanelKind::Radio).then(|| {
         let label = button(
             "f",
@@ -3901,83 +4115,6 @@ fn render_information_panel(
         lines.push(Line::styled(label.clone(), theme.accent));
         (line_index, label, UiAction::ToggleSubscription)
     });
-    let open_button = (view.external_opener_available
-        && show_text_selection
-        && matches!(
-            kind,
-            InformationPanelKind::Video
-                | InformationPanelKind::Podcast
-                | InformationPanelKind::Radio
-        ))
-    .then(|| {
-        let opener_name = system_url_opener_name();
-        let action_text = match kind {
-            InformationPanelKind::Podcast => format!("{opener_name} podcast"),
-            InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
-                || format!("{opener_name} station website"),
-                |url| format!("{opener_name} · {url}"),
-            ),
-            _ => format!("{opener_name} video"),
-        };
-        let label = button(
-            if kind == InformationPanelKind::Radio {
-                "O"
-            } else {
-                "o"
-            },
-            &action_text,
-            show_hotkeys,
-        );
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::OpenInBrowser)
-    });
-    let open_channel_button = (view.external_opener_available
-        && kind != InformationPanelKind::Radio)
-        .then_some(details.channel_webpage_url.as_ref())
-        .flatten()
-        .map(|_| {
-            let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
-                .or_else(|| {
-                    (!details.channel_name.trim().is_empty())
-                        .then(|| details.channel_name.trim().to_owned())
-                })
-                .or_else(|| {
-                    (!details.title.trim().is_empty()).then(|| details.title.trim().to_owned())
-                })
-                .unwrap_or_else(|| "channel".to_owned());
-            let label = button(
-                "O",
-                &format!("{} channel · {channel_label}", system_url_opener_name()),
-                show_hotkeys,
-            );
-            let label_width = terminal_text_width(&label);
-            if let Some((line_index, text_label, _)) = text_selection_button.as_ref() {
-                let text_width = terminal_text_width(text_label);
-                if label_width <= inner.width
-                    && text_width.saturating_add(label_width).saturating_add(1) <= inner.width
-                {
-                    let column = inner.width.saturating_sub(label_width);
-                    let gap = column.saturating_sub(text_width);
-                    lines[*line_index] = Line::from(vec![
-                        Span::styled(
-                            text_label.clone(),
-                            if view.text_selection_mode {
-                                theme.selected
-                            } else {
-                                theme.accent
-                            },
-                        ),
-                        Span::raw(" ".repeat(usize::from(gap))),
-                        Span::styled(label.clone(), theme.accent),
-                    ]);
-                    return (*line_index, column, label, UiAction::OpenChannelInBrowser);
-                }
-            }
-            let line_index = lines.len();
-            lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, 0, label, UiAction::OpenChannelInBrowser)
-        });
     let rename_button = (cfg!(feature = "local-rename")
         && kind == InformationPanelKind::Local
         && details.local_renamable)
@@ -3986,24 +4123,6 @@ fn render_information_panel(
             let line_index = lines.len();
             lines.push(Line::styled(label.clone(), theme.accent));
             (line_index, label, UiAction::BeginLocalRename)
-        });
-    let move_button = (cfg!(feature = "local-move")
-        && kind == InformationPanelKind::Local
-        && details.local_movable)
-        .then(|| {
-            let label = button("m", "Move", show_hotkeys);
-            let line_index = lines.len();
-            lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, label, UiAction::BeginLocalMove)
-        });
-    let trash_button = (cfg!(feature = "local-trash")
-        && kind == InformationPanelKind::Local
-        && details.local_trashable)
-        .then(|| {
-            let label = button("Delete", "Move to Trash", show_hotkeys);
-            let line_index = lines.len();
-            lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, label, UiAction::RequestLocalTrash)
         });
     match kind {
         InformationPanelKind::Video => {
@@ -4106,9 +4225,6 @@ fn render_information_panel(
     // mouse target remains stable even when a title or channel name is long.
     frame.render_widget(Paragraph::new(lines), metadata_area);
     if show_text_selection {
-        let selection_button_row = text_selection_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
         let radio_favorite_button_row = radio_favorite_button
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
@@ -4125,26 +4241,18 @@ fn render_information_panel(
         let private_note_button_row = private_note_button
             .as_ref()
             .map(|(line_index, _, _)| *line_index);
-        let open_button_row = open_button.as_ref().map(|(line_index, _, _)| *line_index);
-        let open_channel_button_row = open_channel_button
-            .as_ref()
-            .map(|(line_index, _, _, _)| *line_index);
         let rename_button_row = rename_button.as_ref().map(|(line_index, _, _)| *line_index);
-        let move_button_row = move_button.as_ref().map(|(line_index, _, _)| *line_index);
-        let trash_button_row = trash_button.as_ref().map(|(line_index, _, _)| *line_index);
         for line_index in 0..usize::from(metadata_height) {
-            if selection_button_row == Some(line_index)
+            if right_buttons
+                .iter()
+                .any(|button| button.line_index == line_index)
                 || radio_favorite_button_row == Some(line_index)
                 || subscription_button_row == Some(line_index)
                 || todo_button_row == Some(line_index)
                 || playlist_button_row == Some(line_index)
                 || edit_playlist_button_row == Some(line_index)
                 || private_note_button_row == Some(line_index)
-                || open_button_row == Some(line_index)
-                || open_channel_button_row == Some(line_index)
                 || rename_button_row == Some(line_index)
-                || move_button_row == Some(line_index)
-                || trash_button_row == Some(line_index)
             {
                 continue;
             }
@@ -4162,18 +4270,14 @@ fn render_information_panel(
             );
         }
     }
-    for (line_index, label, action) in text_selection_button
+    for (line_index, label, action) in radio_favorite_button
         .into_iter()
-        .chain(radio_favorite_button)
         .chain(todo_button)
         .chain(playlist_button)
         .chain(edit_playlist_button)
         .chain(private_note_button)
         .chain(subscription_button)
-        .chain(open_button)
         .chain(rename_button)
-        .chain(move_button)
-        .chain(trash_button)
     {
         if line_index >= usize::from(metadata_height) {
             continue;
@@ -4193,17 +4297,20 @@ fn render_information_panel(
             ));
         }
     }
-    if let Some((line_index, column, label, action)) = open_channel_button
-        && line_index < usize::from(metadata_height)
-    {
-        let width = terminal_text_width(&label).min(inner.width.saturating_sub(column));
+    for button in right_buttons {
+        if button.line_index >= usize::from(metadata_height) {
+            continue;
+        }
+        let width =
+            terminal_text_width(&button.label).min(inner.width.saturating_sub(button.column));
         if width > 0 {
             hit_map.detail_buttons.push((
-                action,
+                button.action,
                 Rect::new(
-                    inner.x.saturating_add(column),
+                    inner.x.saturating_add(button.column),
                     inner.y.saturating_add(
-                        u16::try_from(line_index).unwrap_or(metadata_height.saturating_sub(1)),
+                        u16::try_from(button.line_index)
+                            .unwrap_or(metadata_height.saturating_sub(1)),
                     ),
                     width,
                     1,
@@ -4225,6 +4332,7 @@ fn render_information_panel(
         .thumbnail_url
         .as_ref()
         .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
+    let visible_local_video = details.local_video_thumbnail.as_ref();
     let mut cursor_y = metadata_area.bottom();
     let mut remaining_height = inner.bottom().saturating_sub(cursor_y);
     if let Some(renderer) = thumbnail_renderer.as_mut() {
@@ -4247,12 +4355,16 @@ fn render_information_panel(
                 .min(preferred_thumbnail_height)
         };
         if renderer.is_enabled()
-            && visible_thumbnail_url.is_some()
+            && (visible_thumbnail_url.is_some() || visible_local_video.is_some())
             && rendered_thumbnail_height >= MIN_THUMBNAIL_HEIGHT
         {
             let thumbnail_area =
                 Rect::new(inner.x, cursor_y, inner.width, rendered_thumbnail_height);
-            renderer.synchronize(visible_thumbnail_url, thumbnail_area);
+            if let Some(local_video) = visible_local_video {
+                renderer.synchronize_local_video(local_video, thumbnail_area);
+            } else {
+                renderer.synchronize(visible_thumbnail_url, thumbnail_area);
+            }
             let artwork_rendered = renderer.has_rendered_artwork();
             renderer.render(frame, thumbnail_area, theme);
             if artwork_rendered {
@@ -6617,6 +6729,78 @@ fn render_playlist_popup_buttons<const N: usize>(
     }
 }
 
+/// Grapheme-safe visual lines and insertion-row position for one note draft.
+#[derive(Debug, PartialEq, Eq)]
+struct WrappedPrivateNote {
+    lines: Vec<String>,
+    cursor_row: usize,
+}
+
+/// Wraps a private note by terminal-cell width without splitting graphemes.
+///
+/// Explicit line breaks preserve empty lines. The visible insertion marker is
+/// included in the measured output so cursor following matches what the user
+/// sees at the right edge of a line.
+fn wrap_private_note(body: &str, requested_cursor: usize, width: u16) -> WrappedPrivateNote {
+    const CURSOR_MARKER: &str = "▏";
+
+    let width = usize::from(width.max(1));
+    let requested_cursor = requested_cursor.min(body.len());
+    let cursor = if requested_cursor == body.len() {
+        requested_cursor
+    } else {
+        body.grapheme_indices(true)
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= requested_cursor)
+            .last()
+            .unwrap_or_default()
+    };
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+    let mut cursor_row = 0_usize;
+    let mut cursor_inserted = false;
+
+    let push_line = |lines: &mut Vec<String>, line: &mut String, line_width: &mut usize| {
+        lines.push(std::mem::take(line));
+        *line_width = 0;
+    };
+    let push_grapheme =
+        |grapheme: &str, lines: &mut Vec<String>, line: &mut String, line_width: &mut usize| {
+            let grapheme_width = usize::from(terminal_text_width(grapheme));
+            if *line_width > 0 && line_width.saturating_add(grapheme_width) > width {
+                push_line(lines, line, line_width);
+            }
+            line.push_str(grapheme);
+            *line_width = line_width.saturating_add(grapheme_width);
+        };
+    let insert_cursor = |lines: &mut Vec<String>,
+                         line: &mut String,
+                         line_width: &mut usize,
+                         cursor_row: &mut usize| {
+        push_grapheme(CURSOR_MARKER, lines, line, line_width);
+        *cursor_row = lines.len();
+    };
+
+    for (index, grapheme) in body.grapheme_indices(true) {
+        if !cursor_inserted && index == cursor {
+            insert_cursor(&mut lines, &mut line, &mut line_width, &mut cursor_row);
+            cursor_inserted = true;
+        }
+        if grapheme == "\n" {
+            push_line(&mut lines, &mut line, &mut line_width);
+        } else {
+            push_grapheme(grapheme, &mut lines, &mut line, &mut line_width);
+        }
+    }
+    if !cursor_inserted {
+        insert_cursor(&mut lines, &mut line, &mut line_width, &mut cursor_row);
+    }
+    lines.push(line);
+
+    WrappedPrivateNote { lines, cursor_row }
+}
+
 fn render_private_note_popup(
     frame: &mut Frame<'_>,
     popup: &PrivateNotePopupView,
@@ -6634,12 +6818,13 @@ fn render_private_note_popup(
     if inner.is_empty() {
         return;
     }
+    let notice_height = if popup.confirming_delete { 2 } else { 1 };
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(notice_height),
             Constraint::Length(if popup.validation_error.is_some() {
                 2
             } else {
@@ -6659,32 +6844,82 @@ fn render_private_note_popup(
         sections[0],
     );
 
-    let mut cursor = popup.cursor_byte.min(popup.body.len());
-    while cursor > 0 && !popup.body.is_char_boundary(cursor) {
-        cursor -= 1;
+    let text_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.accent)
+        .title(format!(" Text · {} / 16384 bytes ", popup.body.len()));
+    let text_inner = text_block.inner(sections[1]);
+    frame.render_widget(text_block, sections[1]);
+    if text_inner.width > 0 && text_inner.height > 0 {
+        let visible_lines = usize::from(text_inner.height);
+        let initial = wrap_private_note(&popup.body, popup.cursor_byte, text_inner.width);
+        let overflow = initial.lines.len() > visible_lines;
+        let (text_area, scrollbar_area) = if overflow && text_inner.width > 1 {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(text_inner);
+            (columns[0], columns[1])
+        } else {
+            (text_inner, Rect::default())
+        };
+        let wrapped = if text_area.width == text_inner.width {
+            initial
+        } else {
+            wrap_private_note(&popup.body, popup.cursor_byte, text_area.width)
+        };
+        let maximum_offset = wrapped.lines.len().saturating_sub(visible_lines);
+        let mut offset = popup.scroll_offset.min(maximum_offset);
+        if popup.follow_cursor {
+            if wrapped.cursor_row < offset {
+                offset = wrapped.cursor_row;
+            } else if wrapped.cursor_row >= offset.saturating_add(visible_lines) {
+                offset = wrapped
+                    .cursor_row
+                    .saturating_add(1)
+                    .saturating_sub(visible_lines);
+            }
+        }
+        let visible = wrapped
+            .lines
+            .iter()
+            .skip(offset)
+            .take(visible_lines)
+            .cloned()
+            .map(Line::raw)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(visible).style(theme.base), text_area);
+        if wrapped.lines.len() > visible_lines
+            && scrollbar_area.width > 0
+            && scrollbar_area.height > 0
+        {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .track_style(theme.muted)
+                .thumb_symbol("█")
+                .thumb_style(theme.accent);
+            let mut scrollbar_state = ScrollbarState::new(wrapped.lines.len())
+                .position(offset)
+                .viewport_content_length(visible_lines);
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        }
+        hit_map.private_note_text_area = text_area;
+        hit_map.private_note_scroll_offset = offset;
+        hit_map.private_note_scroll_maximum = maximum_offset;
     }
-    let mut body = popup.body.clone();
-    body.insert_str(cursor, "▏");
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(theme.base)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme.accent)
-                    .title(format!(" Text · {} / 16384 bytes ", popup.body.len())),
-            ),
-        sections[1],
-    );
 
     let notice = if popup.confirming_delete {
-        "Delete this note permanently? Press Delete or Enter again to confirm."
+        format!(
+            "Delete this note permanently? Press Delete or Enter again to confirm.\nStored in: {}",
+            popup.storage_path
+        )
     } else {
-        "Enter inserts a new line. Ctrl+S saves. Esc closes without saving."
+        format!("Stored in: {}", popup.storage_path)
     };
     frame.render_widget(
-        Paragraph::new(format!("{notice}\nStored in: {}", popup.storage_path))
+        Paragraph::new(notice)
             .style(if popup.confirming_delete {
                 Style::default().fg(Color::Red)
             } else {
@@ -7593,6 +7828,13 @@ fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
     Some(usize::from((hit_map.rows.height / row_height).max(1)))
 }
 
+/// Returns whether one key is the editor-local Vim word-delete chord.
+fn is_delete_previous_word_key(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('w' | 'W'))
+}
+
 #[cfg(test)]
 fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
     key_action_with_page_rows(key, view, None)
@@ -7649,6 +7891,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Enter if popup.confirming_delete => Some(UiAction::RequestPrivateNoteDelete),
             KeyCode::Enter => Some(UiAction::InsertPrivateNoteNewline),
             KeyCode::Backspace => Some(UiAction::DeletePrivateNoteCharacter),
+            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                Some(UiAction::DeletePrivateNoteWord)
+            }
             KeyCode::Left => Some(UiAction::MovePrivateNoteCursor(
                 PrivateNoteCursorMotion::Left,
             )),
@@ -7711,6 +7956,9 @@ fn key_action_with_page_rows_unfiltered(
                     PlaylistEditorField::Description,
                 )),
                 KeyCode::Backspace => Some(UiAction::DeletePlaylistEditorCharacter),
+                KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                    Some(UiAction::DeletePlaylistEditorWord)
+                }
                 KeyCode::Char(character)
                     if !character.is_control()
                         && !key
@@ -7731,6 +7979,11 @@ fn key_action_with_page_rows_unfiltered(
             }
             (LocalFilePopupView::Rename { .. }, KeyCode::Backspace) => {
                 Some(UiAction::DeleteLocalRenameCharacter)
+            }
+            (LocalFilePopupView::Rename { .. }, KeyCode::Char('w' | 'W'))
+                if is_delete_previous_word_key(&key) =>
+            {
+                Some(UiAction::DeleteLocalRenameWord)
             }
             (LocalFilePopupView::Rename { .. }, KeyCode::Left) => {
                 Some(UiAction::MoveLocalRenameCursor(-1))
@@ -7767,6 +8020,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Esc => Some(UiAction::DismissRssSubscriptionPopup),
             KeyCode::Enter => Some(UiAction::SubmitRssSubscription),
             KeyCode::Backspace => Some(UiAction::DeleteRssSubscriptionCharacter),
+            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                Some(UiAction::DeleteRssSubscriptionWord)
+            }
             KeyCode::Char(character)
                 if !character.is_control()
                     && !key
@@ -7830,6 +8086,9 @@ fn key_action_with_page_rows_unfiltered(
                 Some(UiAction::SelectYouTubeSetupField(other_field))
             }
             KeyCode::Backspace => Some(UiAction::DeleteYouTubeSetupCharacter),
+            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                Some(UiAction::DeleteYouTubeSetupWord)
+            }
             KeyCode::Char(character)
                 if !character.is_control()
                     && !key
@@ -7856,6 +8115,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Esc => Some(UiAction::CancelSearch),
             KeyCode::Enter => Some(UiAction::SubmitSearch),
             KeyCode::Backspace => Some(UiAction::DeleteSearchCharacter),
+            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                Some(UiAction::DeleteSearchWord)
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -7865,6 +8127,9 @@ fn key_action_with_page_rows_unfiltered(
             }
             _ => None,
         };
+    }
+    if is_delete_previous_word_key(&key) {
+        return None;
     }
 
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -8141,6 +8406,23 @@ fn mouse_action_unfiltered(
                 .iter()
                 .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                 .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown
+                if contains(hit_map.private_note_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetPrivateNoteScroll(
+                    hit_map
+                        .private_note_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.private_note_scroll_maximum),
+                ))
+            }
+            MouseEventKind::ScrollUp
+                if contains(hit_map.private_note_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetPrivateNoteScroll(
+                    hit_map.private_note_scroll_offset.saturating_sub(3),
+                ))
+            }
             _ => None,
         };
     }
@@ -8681,7 +8963,9 @@ mod tests {
     struct MockThumbnailRenderer {
         enabled: bool,
         synchronized: Vec<(Option<url::Url>, Rect)>,
+        synchronized_local_videos: Vec<(LocalVideoThumbnailView, Rect)>,
         prefetch_batches: Vec<Vec<url::Url>>,
+        obscure_count: usize,
         clear_count: usize,
         pending: bool,
         immediate_redraw: bool,
@@ -8721,6 +9005,15 @@ mod tests {
             true
         }
 
+        fn synchronize_local_video(
+            &mut self,
+            source: &LocalVideoThumbnailView,
+            area: Rect,
+        ) -> bool {
+            self.synchronized_local_videos.push((source.clone(), area));
+            true
+        }
+
         fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
             self.prefetch_batches.push(
                 rows.iter()
@@ -8728,6 +9021,11 @@ mod tests {
                     .collect(),
             );
             true
+        }
+
+        fn obscure(&mut self) -> bool {
+            self.obscure_count = self.obscure_count.saturating_add(1);
+            false
         }
 
         fn clear(&mut self) -> bool {
@@ -9336,6 +9634,7 @@ mod tests {
                     title: "Playing vertical".to_owned(),
                     source: "YouTube".to_owned(),
                     vertical: true,
+                    watched_percent: 50,
                     ..RowView::default()
                 },
                 RowView {
@@ -9350,6 +9649,7 @@ mod tests {
                     title: "Selected vertical".to_owned(),
                     source: "YouTube".to_owned(),
                     vertical: true,
+                    watched_percent: 95,
                     ..RowView::default()
                 },
             ],
@@ -9378,14 +9678,17 @@ mod tests {
         assert_eq!(playing_title.symbol(), "P");
         assert_eq!(playing_title.fg, Color::Rgb(255, 105, 180));
         assert!(playing_title.modifier.contains(Modifier::BOLD));
+        assert!(playing_title.modifier.contains(Modifier::ITALIC));
         let idle_title = &buffer[(6, 3)];
         assert_eq!(idle_title.symbol(), "V");
         assert_eq!(idle_title.fg, Color::Rgb(255, 105, 180));
         assert!(!idle_title.modifier.contains(Modifier::BOLD));
+        assert!(!idle_title.modifier.contains(Modifier::ITALIC));
         let selected_title = &buffer[(6, 5)];
         assert_eq!(selected_title.symbol(), "S");
         assert_eq!(selected_title.fg, Color::Black);
         assert_eq!(selected_title.bg, Color::Cyan);
+        assert!(selected_title.modifier.contains(Modifier::ITALIC));
         assert_eq!(buffer[(0, 1)].symbol(), "▶");
     }
 
@@ -9475,6 +9778,14 @@ mod tests {
                     subscribed: true,
                     ..RowView::default()
                 },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::Radio, "live")),
+                    title: "Live item without watched state".to_owned(),
+                    source: "Radio".to_owned(),
+                    watched_percent: 50,
+                    hide_watched_marker: true,
+                    ..RowView::default()
+                },
             ],
             ..ViewModel::default()
         };
@@ -9535,6 +9846,31 @@ mod tests {
             " ",
             "a non-playable channel source has no watched-state marker"
         );
+        assert_eq!(
+            buffer[(4, 9)].symbol(),
+            " ",
+            "a live item suppresses watched-state presentation"
+        );
+        assert!(
+            !buffer[(6, 1)].modifier.contains(Modifier::ITALIC),
+            "unwatched titles remain roman"
+        );
+        assert!(
+            buffer[(6, 3)].modifier.contains(Modifier::ITALIC),
+            "partially watched titles are italic"
+        );
+        assert!(
+            buffer[(6, 5)].modifier.contains(Modifier::ITALIC),
+            "completed titles are italic"
+        );
+        assert!(
+            !buffer[(4, 3)].modifier.contains(Modifier::ITALIC),
+            "only the title, not its progress marker, is italic"
+        );
+        assert!(
+            !buffer[(6, 9)].modifier.contains(Modifier::ITALIC),
+            "suppressed live progress cannot italicize a title"
+        );
         assert!(
             rendered.contains(" 90%"),
             "exactly 90 percent remains partial and visible"
@@ -9542,6 +9878,51 @@ mod tests {
         assert!(
             rendered.contains(" 91%"),
             "completed rows retain their exact watched percentage"
+        );
+    }
+
+    #[test]
+    fn accepted_zero_position_start_is_partial_and_italic_without_zero_percent() {
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            rows: vec![RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "accepted-start")),
+                title: "Accepted at zero".to_owned(),
+                source: "YouTube".to_owned(),
+                playback_started: true,
+                ..RowView::default()
+            }],
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw accepted zero-position start");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert_eq!(buffer[(4, 1)].symbol(), "◐");
+        assert!(buffer[(6, 1)].modifier.contains(Modifier::ITALIC));
+        assert!(
+            !rendered.contains("   0%"),
+            "accepted playback must not fabricate a visible percentage"
         );
     }
 
@@ -9595,11 +9976,19 @@ mod tests {
         assert!(!rendered.contains("YouTube video search"));
         assert!(rendered.contains("Borderless result"));
         assert!(rendered.contains("Borderless details content"));
-        let first_detail_cell = &buffer[(hit_map.details_panel.x, hit_map.details_panel.y)];
+        let (_, select_mode_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
+            .expect("Select mode hit target");
         assert_eq!(
-            first_detail_cell.symbol(),
-            "[",
+            select_mode_area.y, hit_map.details_panel.y,
             "the first Details control must reclaim the removed generic heading row"
+        );
+        assert_eq!(
+            select_mode_area.right(),
+            hit_map.details_panel.right(),
+            "Select mode must remain right-aligned"
         );
         assert!(hit_map.detail_buttons.iter().any(|(action, target)| action
             == &UiAction::ToggleTextSelectionMode
@@ -9624,7 +10013,7 @@ mod tests {
             mouse_action(
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
-                    column: hit_map.details_panel.right().saturating_sub(2),
+                    column: hit_map.details_panel.x,
                     row: hit_map.details_panel.y,
                     modifiers: KeyModifiers::NONE,
                 },
@@ -10254,6 +10643,81 @@ mod tests {
     }
 
     #[test]
+    fn control_w_deletes_words_only_in_the_six_text_editors() {
+        let chord = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let editors = [
+            (
+                ViewModel {
+                    search_editing: true,
+                    ..ViewModel::default()
+                },
+                UiAction::DeleteSearchWord,
+            ),
+            (
+                ViewModel {
+                    youtube_setup_popup: Some(YouTubeSetupPopupView::default()),
+                    ..ViewModel::default()
+                },
+                UiAction::DeleteYouTubeSetupWord,
+            ),
+            (
+                ViewModel {
+                    rss_subscription_popup: Some(RssSubscriptionPopupView::default()),
+                    ..ViewModel::default()
+                },
+                UiAction::DeleteRssSubscriptionWord,
+            ),
+            (
+                ViewModel {
+                    playlist_popup: Some(PlaylistPopupView {
+                        mode: PlaylistPopupMode::Create,
+                        ..PlaylistPopupView::default()
+                    }),
+                    ..ViewModel::default()
+                },
+                UiAction::DeletePlaylistEditorWord,
+            ),
+            (
+                ViewModel {
+                    private_note_popup: Some(PrivateNotePopupView::default()),
+                    ..ViewModel::default()
+                },
+                UiAction::DeletePrivateNoteWord,
+            ),
+            (
+                ViewModel {
+                    local_file_popup: Some(LocalFilePopupView::Rename {
+                        value: "fixture.flac".to_owned(),
+                        cursor_byte: "fixture.flac".len(),
+                        error: None,
+                    }),
+                    ..ViewModel::default()
+                },
+                UiAction::DeleteLocalRenameWord,
+            ),
+        ];
+
+        for (view, expected) in editors {
+            assert_eq!(key_action(chord, &view), Some(expected));
+        }
+        assert_eq!(
+            key_action(chord, &ViewModel::default()),
+            None,
+            "Ctrl-W outside an editor must not toggle the waveform"
+        );
+
+        let chooser = ViewModel {
+            playlist_popup: Some(PlaylistPopupView::default()),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(chord, &chooser),
+            None,
+            "the playlist chooser is not a text editor"
+        );
+    }
+
+    #[test]
     fn private_note_popup_is_modal_multiline_and_redacted_from_debug() {
         let secret = "a private line\nanother private line";
         let mut view = ViewModel {
@@ -10341,6 +10805,8 @@ mod tests {
         assert!(rendered.contains("Private note"));
         assert!(rendered.contains("Line one"));
         assert!(rendered.contains("/tmp/youta/state/notes.toml"));
+        assert!(!rendered.contains("Enter inserts a new line"));
+        assert!(!rendered.contains("Esc closes without saving"));
         let save_area = hit_map
             .private_note_buttons
             .iter()
@@ -10359,6 +10825,95 @@ mod tests {
             ),
             Some(UiAction::SavePrivateNote)
         );
+    }
+
+    #[test]
+    fn private_note_wrapping_preserves_unicode_graphemes_and_empty_lines() {
+        let body = "界e\u{301}👩‍💻\n\n尾";
+        let wrapped = wrap_private_note(body, body.len(), 2);
+
+        assert_eq!(wrapped.lines, vec!["界", "e\u{301}", "👩‍💻", "", "尾", "▏"]);
+        assert_eq!(wrapped.cursor_row, wrapped.lines.len() - 1);
+        assert!(
+            wrapped
+                .lines
+                .iter()
+                .all(|line| terminal_text_width(line) <= 2)
+        );
+    }
+
+    #[test]
+    fn private_note_popup_follows_overflowing_cursor_and_wheel_scrolls_visible_text() {
+        let body = (0..40)
+            .map(|index| format!("note line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 32)).expect("private-note test terminal");
+        let view = ViewModel {
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Long fixture note".to_owned(),
+                cursor_byte: body.len(),
+                body,
+                follow_cursor: true,
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render overflowing note popup");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("note line 39"));
+        assert!(!rendered.contains("note line 00"));
+        assert!(rendered.contains('█'), "overflow should render a scrollbar");
+        assert!(hit_map.private_note_scroll_offset > 0);
+        assert!(hit_map.private_note_scroll_maximum >= hit_map.private_note_scroll_offset);
+
+        let text_area = hit_map.private_note_text_area;
+        let expected = hit_map.private_note_scroll_offset.saturating_sub(3);
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: text_area.x,
+                    row: text_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetPrivateNoteScroll(expected))
+        );
+    }
+
+    #[test]
+    fn private_note_delete_confirmation_keeps_prompt_and_storage_path() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 32)).expect("private-note test terminal");
+        let view = ViewModel {
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Fixture episode".to_owned(),
+                body: "A note".to_owned(),
+                cursor_byte: "A note".len(),
+                existing: true,
+                confirming_delete: true,
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("render note deletion confirmation");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Delete this note permanently?"));
+        assert!(rendered.contains("/tmp/youta/state/notes.toml"));
     }
 
     #[test]
@@ -11989,10 +12544,19 @@ mod tests {
             buffer.content().iter().any(|cell| cell.symbol() == "█"),
             "overflowing details must render a scrollbar thumb"
         );
+        let (_, select_mode_area) = hit_map
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
+            .expect("Select mode hit target");
         assert_eq!(
-            buffer[(hit_map.details_panel.x, hit_map.details_panel.y)].symbol(),
-            "[",
+            select_mode_area.y, hit_map.details_panel.y,
             "scrolling must not restore the removed generic Details heading"
+        );
+        assert_eq!(
+            select_mode_area.right(),
+            hit_map.details_panel.right(),
+            "Select mode must remain right-aligned while Details is scrolled"
         );
         assert!(hit_map.details_panel.width > 0);
         assert!(hit_map.details_panel.height > 0);
@@ -12456,16 +13020,35 @@ mod tests {
             .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
             .expect("text selection hit target");
         assert_eq!(
-            open_channel_area.y, text_selection_area.y,
-            "the channel opener should share the first control row when it fits"
+            open_channel_area.y,
+            text_selection_area.y.saturating_add(1),
+            "the channel opener should follow Select mode"
+        );
+        assert_eq!(
+            open_area.y,
+            open_channel_area.y.saturating_add(1),
+            "the video opener should follow the channel opener"
+        );
+        let expected_right = hit_map
+            .details_panel
+            .x
+            .saturating_add(hit_map.details_panel.width);
+        assert_eq!(
+            text_selection_area
+                .x
+                .saturating_add(text_selection_area.width),
+            expected_right,
+            "Select mode should be right-aligned"
         );
         assert_eq!(
             open_channel_area.x.saturating_add(open_channel_area.width),
-            hit_map
-                .details_panel
-                .x
-                .saturating_add(hit_map.details_panel.width),
+            expected_right,
             "the channel opener should be right-aligned"
+        );
+        assert_eq!(
+            open_area.x.saturating_add(open_area.width),
+            expected_right,
+            "the video opener should be right-aligned"
         );
         assert_eq!(
             mouse_action(
@@ -12507,6 +13090,93 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("[s] Unsubscribe (locally)"));
+    }
+
+    #[test]
+    fn channel_handle_display_accepts_one_trailing_slash_but_rejects_extra_path() {
+        let handle =
+            url::Url::parse("https://www.youtube.com/@myChanName/").expect("fixture handle");
+        assert_eq!(
+            youtube_channel_handle(Some(&handle)).as_deref(),
+            Some("@myChanName")
+        );
+
+        for unsafe_url in [
+            "https://www.youtube.com/@myChanName//",
+            "https://www.youtube.com/@myChanName/videos",
+        ] {
+            let url = url::Url::parse(unsafe_url).expect("unsafe fixture URL");
+            assert_eq!(
+                youtube_channel_handle(Some(&url)),
+                None,
+                "{unsafe_url:?} must not be displayed as an exact channel handle"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_details_keep_right_controls_clipped_separate_and_clickable() {
+        let backend = TestBackend::new(42, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Mock video".to_owned(),
+                source: "YouTube".to_owned(),
+                channel_name: "A channel name longer than the panel".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@myChanName")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render(frame, &view, &UiSettings::default(), &mut hit_map);
+            })
+            .expect("draw narrow details");
+
+        let placements = [
+            UiAction::ToggleTextSelectionMode,
+            UiAction::OpenChannelInBrowser,
+            UiAction::OpenInBrowser,
+        ]
+        .map(|expected| {
+            let (_, area) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .expect("right-side control");
+            assert!(area.width > 0);
+            assert!(area.x >= hit_map.details_panel.x);
+            assert!(
+                area.x.saturating_add(area.width)
+                    <= hit_map
+                        .details_panel
+                        .x
+                        .saturating_add(hit_map.details_panel.width)
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected)
+            );
+            *area
+        });
+        assert_eq!(placements[1].y, placements[0].y.saturating_add(1));
+        assert_eq!(placements[2].y, placements[1].y.saturating_add(1));
     }
 
     #[test]
@@ -13014,7 +13684,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw text-selection control");
-        assert!(rendered_text(&terminal).contains("[t] Select Details text"));
+        assert!(rendered_text(&terminal).contains("[t] Select mode"));
         let selection_area = hit_map
             .detail_buttons
             .iter()
@@ -13036,7 +13706,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw active text-selection mode");
-        assert!(rendered_text(&terminal).contains("[t/Esc] End text selection"));
+        assert!(rendered_text(&terminal).contains("[t/Esc] Exit select mode"));
         assert_eq!(
             mouse_action(click, &hit_map, &view),
             Some(UiAction::ToggleTextSelectionMode),
@@ -13141,8 +13811,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains("Select Details text"));
-        assert!(!rendered.contains("[t] Select Details text"));
+        assert!(rendered.contains("Select mode"));
+        assert!(!rendered.contains("[t] Select mode"));
         assert!(rendered.contains(&format!("{} video", system_url_opener_name())));
         assert!(!rendered.contains(&format!("[o] {} video", system_url_opener_name())));
         assert!(!rendered.contains(&format!("[O] {}", system_url_opener_name())));
@@ -13377,6 +14047,191 @@ mod tests {
             DEFAULT_THUMBNAIL_HEIGHT
         );
         assert_eq!(thumbnails.clear_count, 0);
+    }
+
+    #[test]
+    fn selected_local_mov_uses_its_midpoint_frame_instead_of_remote_artwork() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let midpoint = LocalVideoThumbnailView {
+            path: PathBuf::from("/tmp/youta-video-thumbnail-fixture.MOV"),
+            midpoint_millis: 60_500,
+        };
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Local MOV fixture".to_owned(),
+                source: "Local video (audio playback)".to_owned(),
+                description: "Full path: /tmp/youta-video-thumbnail-fixture.MOV".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/stale-artwork.jpg")
+                        .expect("stale artwork URL"),
+                ),
+                local_video_thumbnail: Some(midpoint.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw MOV midpoint frame");
+
+        assert!(
+            thumbnails.synchronized.is_empty(),
+            "a local video frame must take precedence over stale embedded artwork"
+        );
+        assert_eq!(thumbnails.synchronized_local_videos.len(), 1);
+        assert_eq!(thumbnails.synchronized_local_videos[0].0, midpoint);
+        assert_eq!(
+            thumbnails.synchronized_local_videos[0].1.height,
+            DEFAULT_THUMBNAIL_HEIGHT
+        );
+        assert_eq!(thumbnails.clear_count, 0);
+    }
+
+    #[test]
+    fn switching_from_local_video_to_audio_clears_the_stale_midpoint_frame() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Local MOV fixture".to_owned(),
+                source: "Local video (audio playback)".to_owned(),
+                local_video_thumbnail: Some(LocalVideoThumbnailView {
+                    path: PathBuf::from("/tmp/youta-video-thumbnail-fixture.mov"),
+                    midpoint_millis: 20_000,
+                }),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw local-video midpoint");
+        assert_eq!(thumbnails.synchronized_local_videos.len(), 1);
+        assert_eq!(thumbnails.clear_count, 0);
+
+        view.details = Some(DetailView {
+            title: "Local audio fixture".to_owned(),
+            source: "Local audio".to_owned(),
+            description: "Full path: /tmp/youta-audio-fixture.flac".to_owned(),
+            ..DetailView::default()
+        });
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw local audio without artwork");
+
+        assert_eq!(
+            thumbnails.clear_count, 1,
+            "the prior midpoint frame must be cleared when the next item has no image"
+        );
+        assert_eq!(thumbnails.synchronized_local_videos.len(), 1);
+        assert!(thumbnails.synchronized.is_empty());
+    }
+
+    #[test]
+    fn disabled_thumbnail_renderer_does_not_extract_a_local_video_frame() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Text-only MOV fixture".to_owned(),
+                source: "Local video (audio playback)".to_owned(),
+                local_video_thumbnail: Some(LocalVideoThumbnailView {
+                    path: PathBuf::from("/tmp/youta-video-thumbnail-fixture.mov"),
+                    midpoint_millis: 10_000,
+                }),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer::default();
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw text-only MOV Details");
+
+        assert!(thumbnails.synchronized_local_videos.is_empty());
+    }
+
+    #[test]
+    fn private_note_popup_obscures_thumbnail_without_clearing_cached_state() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let thumbnail_url = url::Url::parse("https://i.ytimg.com/vi/fixture/mqdefault.jpg")
+            .expect("fixture thumbnail URL");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Cached thumbnail fixture".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "Description remains available after editing.".to_owned(),
+                thumbnail_url: Some(thumbnail_url.clone()),
+                ..DetailView::default()
+            }),
+            private_note_popup: Some(PrivateNotePopupView {
+                target_label: "Cached thumbnail fixture".to_owned(),
+                storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+                ..PrivateNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw private-note popup");
+        assert_eq!(thumbnails.obscure_count, 1);
+        assert_eq!(thumbnails.clear_count, 0);
+        assert!(thumbnails.synchronized.is_empty());
+
+        view.private_note_popup = None;
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw immediately after closing private-note popup");
+
+        assert_eq!(thumbnails.obscure_count, 1);
+        assert_eq!(thumbnails.clear_count, 0);
+        assert_eq!(thumbnails.synchronized.len(), 1);
+        assert_eq!(thumbnails.synchronized[0].0.as_ref(), Some(&thumbnail_url));
+        assert!(rendered_text(&terminal).contains("THUMBNAIL IMAGE"));
     }
 
     #[test]
@@ -14317,6 +15172,89 @@ mod tests {
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("Loading thumbnail…"));
         assert!(rendered.contains("Thumbnail unavailable: thumbnail download failed"));
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn thumbnail_finishing_behind_note_popup_resumes_without_a_second_request() {
+        use std::time::{Duration, Instant};
+
+        use crossbeam_channel::TryRecvError;
+
+        use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let thumbnail_url =
+            url::Url::parse("https://images.example/note-cache.png").expect("thumbnail URL");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Private-note thumbnail fixture".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "The image must resume after the note closes.".to_owned(),
+                thumbnail_url: Some(thumbnail_url.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let mut thumbnails = TerminalThumbnailRenderer::new(manager);
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("start thumbnail request");
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("initial worker request"),
+            thumbnail_url
+        );
+
+        view.private_note_popup = Some(PrivateNotePopupView {
+            target_label: "Private-note thumbnail fixture".to_owned(),
+            storage_path: "/tmp/youta/state/notes.toml".to_owned(),
+            ..PrivateNotePopupView::default()
+        });
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("obscure in-flight thumbnail");
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
+
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .expect("finish thumbnail behind popup");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "thumbnail remained Loading behind the note popup"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
+
+        view.private_note_popup = None;
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                })
+                .expect("resume thumbnail after note popup");
+        }
+        assert!(!rendered_text(&terminal).contains("Loading thumbnail…"));
+        assert_eq!(
+            observed.try_recv(),
+            Err(TryRecvError::Empty),
+            "closing a note must not start another thumbnail worker"
+        );
     }
 
     #[cfg(feature = "images")]
@@ -17493,11 +18431,32 @@ prose 07:25 remains clickable but is not a chapter";
 
             if let Some(move_area) = move_area {
                 assert_eq!(move_area.width, terminal_text_width("[m] Move"));
-                if let Some(rename_area) = rename_area {
-                    assert!(rename_area.y < move_area.y);
-                }
+                let select_area = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, area)| {
+                        (action == &UiAction::ToggleTextSelectionMode).then_some(*area)
+                    })
+                    .expect("Select mode control");
+                assert_eq!(move_area.y, select_area.y.saturating_add(1));
+                assert_eq!(
+                    move_area.right(),
+                    hit_map.details_panel.right(),
+                    "Move must be right-aligned"
+                );
                 if let Some(trash_area) = trash_area {
-                    assert!(move_area.y < trash_area.y);
+                    assert_eq!(trash_area.y, move_area.y.saturating_add(1));
+                    assert_eq!(
+                        trash_area.right(),
+                        hit_map.details_panel.right(),
+                        "Move to Trash must be right-aligned"
+                    );
+                    if let Some(rename_area) = rename_area {
+                        assert!(
+                            rename_area.y > trash_area.y,
+                            "the left-aligned Rename control follows the reserved right column"
+                        );
+                    }
                 }
                 let click = |column| MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),

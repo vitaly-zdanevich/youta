@@ -140,12 +140,13 @@ use crate::tui::RadioSort;
 use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
     DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
-    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, MAX_DETAILS_SELECTION_BYTES,
-    PlaylistChoiceView, PlaylistEditorField, PlaylistItemView, PlaylistPopupMode,
-    PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView,
-    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
-    SubscriptionPane, SubscriptionRoute, UiAction, UiController, ViewModel,
-    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
+    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
+    MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView,
+    PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
+    PrivateNotePopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
+    SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
+    ViewModel, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
+    YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::tui::{
@@ -246,6 +247,77 @@ fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
 /// Clamps a private-note cursor to the preceding grapheme boundary.
 fn private_note_cursor_boundary(value: &str, requested: usize) -> usize {
     rename_cursor_boundary(value, requested)
+}
+
+/// Deletes the Vim-style word immediately before one UTF-8 editor cursor.
+///
+/// Trailing whitespace is removed before the preceding keyword or
+/// non-keyword run. Keyword graphemes begin with a Unicode alphanumeric
+/// character or underscore; punctuation and symbols form the other run.
+/// A cursor at the start of a non-first line removes only that newline, and no
+/// operation ever splits an extended grapheme cluster.
+fn delete_previous_editor_word(value: &mut String, cursor_byte: &mut usize) -> bool {
+    let cursor = rename_cursor_boundary(value, *cursor_byte);
+    *cursor_byte = cursor;
+    if cursor == 0 {
+        return false;
+    }
+
+    let line_start = value[..cursor]
+        .rfind('\n')
+        .map_or(0, |index| index.saturating_add(1));
+    if cursor == line_start {
+        value.replace_range(line_start.saturating_sub(1)..line_start, "");
+        *cursor_byte = line_start.saturating_sub(1);
+        return true;
+    }
+
+    let mut start = cursor;
+    while let Some((index, grapheme)) = value[line_start..start]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(index, grapheme)| (line_start.saturating_add(index), grapheme))
+    {
+        if !grapheme.chars().all(char::is_whitespace) {
+            break;
+        }
+        start = index;
+    }
+
+    if start > line_start {
+        let Some((_, last_grapheme)) = value[line_start..start].grapheme_indices(true).next_back()
+        else {
+            return false;
+        };
+        let keyword = editor_grapheme_is_keyword(last_grapheme);
+        while let Some((index, grapheme)) = value[line_start..start]
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(index, grapheme)| (line_start.saturating_add(index), grapheme))
+        {
+            if grapheme.chars().all(char::is_whitespace)
+                || editor_grapheme_is_keyword(grapheme) != keyword
+            {
+                break;
+            }
+            start = index;
+        }
+    }
+
+    if start == cursor {
+        return false;
+    }
+    value.replace_range(start..cursor, "");
+    *cursor_byte = start;
+    true
+}
+
+/// Classifies one complete editor grapheme using Vim's default word split.
+fn editor_grapheme_is_keyword(grapheme: &str) -> bool {
+    grapheme
+        .chars()
+        .next()
+        .is_some_and(|character| character == '_' || character.is_alphanumeric())
 }
 
 /// Moves one multiline note cursor while retaining its grapheme column.
@@ -2445,8 +2517,8 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
-    /// Watched percentages hydrated once for the current Local listing.
-    local_progress_cache: HashMap<MediaId, u8>,
+    /// Watched row states hydrated once for the current Local listing.
+    local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
     local_media_cache: HashMap<PathBuf, CachedLocalMediaItem>,
     /// Least-recently-used order for the bounded selected-file metadata cache.
@@ -2547,6 +2619,8 @@ pub struct AppController {
     youtube_channel_statistics_mode: ChannelStatisticsMode,
     youtube_provider_generation: u64,
     channel_subscriber_cache: HashMap<String, Option<u64>>,
+    /// Provider- or OPML-validated public channel pages retained for this process.
+    channel_webpage_cache: HashMap<String, url::Url>,
     pending_channel_subscribers: HashSet<String>,
     /// Compact positive and negative channel metadata cached for this process.
     channel_details_cache: HashMap<String, Option<ChannelSummary>>,
@@ -3163,6 +3237,7 @@ impl AppController {
             youtube_channel_statistics_mode,
             youtube_provider_generation: 0,
             channel_subscriber_cache: HashMap::new(),
+            channel_webpage_cache: HashMap::new(),
             pending_channel_subscribers: HashSet::new(),
             channel_details_cache: HashMap::new(),
             channel_profile_cache: HashMap::new(),
@@ -3543,6 +3618,21 @@ impl AppController {
         popup.validation_error = None;
     }
 
+    /// Deletes one Vim-style word from the selected YouTube setup field.
+    fn delete_youtube_setup_word(&mut self) {
+        let Some(popup) = self.view.youtube_setup_popup.as_mut() else {
+            return;
+        };
+        let value = match popup.selected_field {
+            YouTubeSetupField::ApiKey => &mut popup.api_key,
+            YouTubeSetupField::InvidiousUrl => &mut popup.invidious_url,
+        };
+        let mut cursor = value.len();
+        if delete_previous_editor_word(value, &mut cursor) {
+            popup.validation_error = None;
+        }
+    }
+
     fn set_youtube_setup_error(&mut self, error: impl Into<String>) {
         if let Some(popup) = self.view.youtube_setup_popup.as_mut() {
             popup.validation_error = Some(error.into());
@@ -3613,6 +3703,7 @@ impl AppController {
         self.youtube_channel_statistics_mode = channel_statistics_mode;
         self.youtube_provider_generation = self.youtube_provider_generation.wrapping_add(1);
         self.channel_subscriber_cache.clear();
+        self.channel_webpage_cache.clear();
         self.pending_channel_subscribers.clear();
         self.channel_details_cache.clear();
         self.channel_profile_cache.clear();
@@ -3665,6 +3756,13 @@ impl AppController {
     /// Removes one Unicode scalar and immediately broadens a Radio filter.
     fn delete_search_input_character(&mut self) {
         self.view.search_query.pop();
+        self.refresh_live_radio_filter();
+    }
+
+    /// Deletes one Vim-style word and reapplies any live Radio filter.
+    fn delete_search_input_word(&mut self) {
+        let mut cursor = self.view.search_query.len();
+        delete_previous_editor_word(&mut self.view.search_query, &mut cursor);
         self.refresh_live_radio_filter();
     }
 
@@ -3885,6 +3983,7 @@ impl AppController {
             source: direct.source.to_string(),
             ..RowView::default()
         }];
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
         self.view.selected = 0;
         self.view.details = Some(DetailView {
             media_id: Some(media_id),
@@ -4725,6 +4824,7 @@ impl AppController {
         if self.view.screen == Screen::YouTubeMusic {
             detail.source = "YouTube Music".to_owned();
         }
+        self.apply_cached_channel_webpage_to_detail(&mut detail);
         self.view.details = Some(detail);
         if let SearchItem::Video(video) = &selected
             && self.youtube_provider_available
@@ -4756,7 +4856,68 @@ impl AppController {
             {
                 self.channel_subscriber_cache
                     .insert(channel.channel_id.clone(), channel.subscriber_count);
+                if let Some(webpage_url) = channel
+                    .webpage_url
+                    .as_ref()
+                    .filter(|url| is_youtube_channel_alias_webpage(url, &channel.channel_id))
+                    .cloned()
+                {
+                    self.channel_webpage_cache
+                        .insert(channel.channel_id.clone(), webpage_url);
+                }
             }
+        }
+    }
+
+    /// Retains a provider alias without letting an ID fallback mask OPML data.
+    fn cache_channel_webpage_url(&mut self, channel_id: &str, webpage_url: Option<url::Url>) {
+        if let Some(webpage_url) =
+            webpage_url.filter(|url| is_youtube_channel_alias_webpage(url, channel_id))
+        {
+            self.channel_webpage_cache
+                .insert(channel_id.to_owned(), webpage_url);
+        }
+    }
+
+    /// Returns a validated public page known from provider RAM or portable OPML.
+    fn cached_channel_webpage_url(&self, channel_id: &str) -> Option<url::Url> {
+        self.channel_webpage_cache
+            .get(channel_id)
+            .cloned()
+            .or_else(|| {
+                self.subscription_tree
+                    .youtube_channel_website_url(channel_id)
+            })
+            .filter(|url| is_safe_youtube_channel_webpage(url, channel_id))
+    }
+
+    /// Replaces a synthesized channel-ID page only when an exact URL is known.
+    fn apply_cached_channel_webpage_to_detail(&self, detail: &mut DetailView) {
+        if let Some(webpage_url) = self.cached_channel_webpage_url(&detail.channel_id) {
+            detail.channel_webpage_url = Some(webpage_url);
+        }
+    }
+
+    /// Updates the visible Details pane after asynchronous channel enrichment.
+    fn apply_cached_channel_webpage_to_current_detail(&mut self) {
+        let Some(channel_id) = self
+            .view
+            .details
+            .as_ref()
+            .map(|detail| detail.channel_id.clone())
+        else {
+            return;
+        };
+        let Some(webpage_url) = self.cached_channel_webpage_url(&channel_id) else {
+            return;
+        };
+        if let Some(detail) = self
+            .view
+            .details
+            .as_mut()
+            .filter(|detail| detail.channel_id == channel_id)
+        {
+            detail.channel_webpage_url = Some(webpage_url);
         }
     }
 
@@ -5004,6 +5165,9 @@ impl AppController {
 
     /// Inserts one compact positive or negative entry into the bounded LRU.
     fn cache_channel_details(&mut self, channel_id: String, channel: Option<ChannelSummary>) {
+        if let Some(summary) = channel.as_ref() {
+            self.cache_channel_webpage_url(&channel_id, summary.webpage_url.clone());
+        }
         if !self.channel_details_cache.contains_key(&channel_id) {
             while self.channel_details_cache.len() >= MAX_CACHED_CHANNEL_DETAILS {
                 let Some(oldest) = self.channel_details_cache_order.pop_front() else {
@@ -5088,6 +5252,10 @@ impl AppController {
     /// Applies provider metadata only to a matching visible Channel panel.
     fn apply_channel_details_to_view(&mut self, channel: &ChannelSummary) {
         self.apply_channel_artwork_to_subscription_source(channel);
+        self.cache_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone());
+        let channel_webpage_url = self
+            .cached_channel_webpage_url(&channel.channel_id)
+            .or_else(|| channel.webpage_url.clone());
         let is_visible_subscription_source = self.view.screen == Screen::Subscriptions
             && self.visible_channel_id() == Some(channel.channel_id.as_str());
         let Some(details) = self
@@ -5111,7 +5279,7 @@ impl AppController {
         details.description.clone_from(&channel.description);
         details.thumbnail_url = preferred_thumbnail_url(&channel.thumbnails);
         details.channel_webpage_url =
-            youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone());
+            youtube_channel_webpage_url(&channel.channel_id, channel_webpage_url);
         details.channel_subscribed = self
             .subscription_tree
             .contains_youtube_channel(&channel.channel_id);
@@ -5905,11 +6073,19 @@ impl AppController {
                 match result {
                     Ok(counts) => {
                         for requested_id in requested_ids {
-                            let count = counts
+                            let metadata = counts
                                 .iter()
                                 .find(|count| count.channel_id == requested_id)
-                                .and_then(|count| count.subscriber_count);
-                            self.channel_subscriber_cache.insert(requested_id, count);
+                                .cloned();
+                            let subscriber_count = metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.subscriber_count);
+                            self.cache_channel_webpage_url(
+                                &requested_id,
+                                metadata.and_then(|metadata| metadata.webpage_url),
+                            );
+                            self.channel_subscriber_cache
+                                .insert(requested_id, subscriber_count);
                         }
                     }
                     Err(_) => {
@@ -5921,6 +6097,7 @@ impl AppController {
                         }
                     }
                 }
+                self.apply_cached_channel_webpage_to_current_detail();
                 self.refresh_youtube_rows();
                 let visible_subscription_channel = if self.view.screen == Screen::Subscriptions {
                     self.selected_subscription_channel_id()
@@ -6202,6 +6379,7 @@ impl AppController {
                             if !linked_matches && self.view.screen == Screen::YouTubeMusic {
                                 detail.source = "YouTube Music".to_owned();
                             }
+                            self.apply_cached_channel_webpage_to_detail(&mut detail);
                             detail.wikidata = wikidata;
                             detail.links = links;
                             preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
@@ -6251,7 +6429,7 @@ impl AppController {
                         if self.view.screen == Screen::ApplePodcasts
                             && self.apple_podcasts_route == ApplePodcastsRoute::Direct
                         {
-                            apply_resolved_direct_view(&mut self.view, &media);
+                            apply_resolved_direct_view(&self.store, &mut self.view, &media);
                         }
                         self.resolved_direct = Some(media);
                     }
@@ -6277,7 +6455,7 @@ impl AppController {
                 }
                 match result {
                     Ok(media) => {
-                        apply_resolved_direct_view(&mut self.view, &media);
+                        apply_resolved_direct_view(&self.store, &mut self.view, &media);
                         self.resolved_direct = Some(media);
                     }
                     Err(error) => {
@@ -6596,12 +6774,8 @@ impl AppController {
             .bandcamp_results
             .iter()
             .map(|release| {
-                let watched_percent = self
-                    .store
-                    .progress(&release.id)
-                    .ok()
-                    .flatten()
-                    .map_or(0, |progress| progress.watched_percent());
+                let progress = self.store.progress(&release.id).ok().flatten();
+                let playback = PlaybackRowState::from_progress(progress.as_ref());
                 let kind = match release.kind {
                     BandcampReleaseKind::Track => "track",
                     BandcampReleaseKind::Album => "album",
@@ -6614,7 +6788,8 @@ impl AppController {
                         .as_deref()
                         .map_or_else(|| kind.to_owned(), |artist| format!("{artist} · {kind}")),
                     source: "Bandcamp".to_owned(),
-                    watched_percent,
+                    watched_percent: playback.watched_percent,
+                    playback_started: playback.playback_started,
                     thumbnail_url: release.artwork_url.clone(),
                     compact: true,
                     ..RowView::default()
@@ -6746,7 +6921,7 @@ impl AppController {
             .filter(|media| media.source == SourceKind::ApplePodcasts)
             .cloned()
         {
-            apply_resolved_direct_view(&mut self.view, &media);
+            apply_resolved_direct_view(&self.store, &mut self.view, &media);
             self.view.selected = 0;
             return;
         }
@@ -6769,6 +6944,7 @@ impl AppController {
             compact: true,
             ..RowView::default()
         }];
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
         self.view.selected = 0;
         self.view.details = Some(DetailView {
             media_id: Some(media_id),
@@ -6804,12 +6980,8 @@ impl AppController {
             .map(|episode| {
                 let media_id =
                     MediaId::new(SourceKind::ApplePodcasts, episode.episode_id.to_string());
-                let watched_percent = self
-                    .store
-                    .progress(&media_id)
-                    .ok()
-                    .flatten()
-                    .map_or(0, |progress| progress.watched_percent());
+                let progress = self.store.progress(&media_id).ok().flatten();
+                let playback = PlaybackRowState::from_progress(progress.as_ref());
                 let mut metadata = Vec::with_capacity(3);
                 if let Some(published) = episode
                     .published_at
@@ -6832,7 +7004,8 @@ impl AppController {
                     title: episode.title.clone(),
                     subtitle: metadata.join(" · "),
                     source: "Apple Podcasts".to_owned(),
-                    watched_percent,
+                    watched_percent: playback.watched_percent,
+                    playback_started: playback.playback_started,
                     thumbnail_url: episode.artwork_url.clone(),
                     compact: true,
                     ..RowView::default()
@@ -6941,6 +7114,7 @@ impl AppController {
                 ..RowView::default()
             })
             .collect();
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
         self.view.selected = self
             .view
             .selected
@@ -6968,6 +7142,41 @@ impl AppController {
             self.local_media_cache_order.push_back(path.to_owned());
         }
         cached.map(|cached| cached.item)
+    }
+
+    /// Returns a midpoint target derived from current identity-bound metadata.
+    ///
+    /// The Boolean result asks the caller to schedule the asynchronous metadata
+    /// probe. Persisted History and playlist durations are deliberately ignored:
+    /// a file may have been replaced at the same path since either row was
+    /// written.
+    fn cached_local_video_thumbnail(
+        &mut self,
+        path: &Path,
+    ) -> (Option<LocalVideoThumbnailView>, bool) {
+        #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+        {
+            if crate::local_browser::classify_local_file(path)
+                != Some(crate::local_browser::LocalEntryKind::Video)
+            {
+                return (None, false);
+            }
+            let Ok(metadata) = std::fs::metadata(path) else {
+                return (None, false);
+            };
+            let Some(item) = self.cached_local_media_item(path, metadata.len()) else {
+                return (None, true);
+            };
+            (
+                local_video_thumbnail_view(&item.path, item.duration_seconds),
+                !item.technical_metadata_probed,
+            )
+        }
+        #[cfg(not(all(feature = "images", feature = "local-video-thumbnails")))]
+        {
+            let _ = path;
+            (None, false)
+        }
     }
 
     /// Inserts one complete selected-file record into the bounded RAM LRU.
@@ -7020,22 +7229,39 @@ impl AppController {
     fn selected_local_metadata_path(&self) -> Option<PathBuf> {
         match self.view.screen {
             Screen::Local => self.selected_local_regular_file(),
-            Screen::Search => self
+            Screen::Search | Screen::Downloaded => self
                 .view
                 .rows
                 .get(self.view.selected)
                 .and_then(|row| row.media_id.as_ref())
                 .filter(|media_id| media_id.source == SourceKind::Local)
                 .map(|media_id| PathBuf::from(&media_id.external_id)),
+            Screen::History => self
+                .history_entries
+                .get(self.view.selected)
+                .filter(|history| !history.local_removed)
+                .and_then(|history| history_replay_target(&history.entry).ok())
+                .and_then(|target| match target {
+                    HistoryReplayTarget::Local(path) => Some(path),
+                    HistoryReplayTarget::Remote(_) => None,
+                })
+                .filter(|path| path.is_file()),
+            Screen::Playlists => self
+                .active_playlist
+                .as_ref()
+                .and_then(|playlist| playlist.entries.get(self.view.selected))
+                .filter(|entry| {
+                    entry.media.id.source == SourceKind::Local
+                        && entry.media.kind == MediaKind::Video
+                })
+                .map(|entry| PathBuf::from(&entry.media.replay_locator))
+                .filter(|path| path.is_file()),
             Screen::YouTubeMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::Radio
             | Screen::Subscriptions
             | Screen::TrackerMusic
-            | Screen::Downloaded
-            | Screen::History
-            | Screen::Playlists
             | Screen::Statistics => None,
         }
     }
@@ -7059,15 +7285,15 @@ impl AppController {
                     match self.view.screen {
                         Screen::Local => self.update_local_browser_detail(),
                         Screen::Search => self.update_non_youtube_detail(),
+                        Screen::Downloaded => self.update_downloaded_detail(),
+                        Screen::History => self.update_history_detail(),
+                        Screen::Playlists => self.update_playlist_detail(),
                         Screen::YouTubeMusic
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
                         | Screen::Radio
                         | Screen::Subscriptions
                         | Screen::TrackerMusic
-                        | Screen::Downloaded
-                        | Screen::History
-                        | Screen::Playlists
                         | Screen::Statistics => {}
                     }
                 }
@@ -7093,15 +7319,15 @@ impl AppController {
             match self.view.screen {
                 Screen::Local => self.update_local_browser_detail(),
                 Screen::Search => self.update_non_youtube_detail(),
+                Screen::Downloaded => self.update_downloaded_detail(),
+                Screen::History => self.update_history_detail(),
+                Screen::Playlists => self.update_playlist_detail(),
                 Screen::YouTubeMusic
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
                 | Screen::Radio
                 | Screen::Subscriptions
                 | Screen::TrackerMusic
-                | Screen::Downloaded
-                | Screen::History
-                | Screen::Playlists
                 | Screen::Statistics => {}
             }
         }
@@ -7133,14 +7359,19 @@ impl AppController {
         let selected = if self.view.screen == Screen::Local {
             self.local_entry_index()
                 .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
-                .and_then(|entry| {
-                    if entry.is_directory() {
+                .and_then(|entry| match entry.kind {
+                    crate::local_browser::LocalEntryKind::Directory => {
                         Some((entry.path.clone(), LocalArtworkKind::FolderCover))
-                    } else if entry.kind.is_playable() {
-                        Some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
-                    } else {
-                        None
                     }
+                    crate::local_browser::LocalEntryKind::Audio
+                    | crate::local_browser::LocalEntryKind::TrackerModule => {
+                        Some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
+                    }
+                    crate::local_browser::LocalEntryKind::Video => {
+                        (!cfg!(feature = "local-video-thumbnails"))
+                            .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
+                    }
+                    crate::local_browser::LocalEntryKind::Image => None,
                 })
         } else {
             self.view
@@ -7148,11 +7379,12 @@ impl AppController {
                 .as_ref()
                 .and_then(|details| details.media_id.as_ref())
                 .filter(|media_id| media_id.source == SourceKind::Local)
-                .map(|media_id| {
-                    (
-                        PathBuf::from(&media_id.external_id),
-                        LocalArtworkKind::EmbeddedMedia,
-                    )
+                .and_then(|media_id| {
+                    let path = PathBuf::from(&media_id.external_id);
+                    (cfg!(not(feature = "local-video-thumbnails"))
+                        || crate::local_browser::classify_local_file(&path)
+                            != Some(crate::local_browser::LocalEntryKind::Video))
+                    .then_some((path, LocalArtworkKind::EmbeddedMedia))
                 })
         };
         let Some((path, kind)) = selected else {
@@ -7712,7 +7944,7 @@ impl AppController {
         self.rebuild_local_browser_rows();
     }
 
-    /// Hydrates watched percentages once for the accepted Local listing.
+    /// Hydrates watched row states once for the accepted Local listing.
     fn hydrate_local_progress_cache(&mut self) {
         self.local_progress_cache.clear();
         let Some(listing) = self.local_listing.as_ref() else {
@@ -7724,36 +7956,47 @@ impl AppController {
             .filter(|entry| entry.kind.is_playable())
             .map(|entry| MediaId::new(SourceKind::Local, entry.path.display().to_string()))
             .collect::<Vec<_>>();
-        self.local_progress_cache
-            .extend(progress_ids.iter().cloned().map(|media_id| (media_id, 0)));
+        self.local_progress_cache.extend(
+            progress_ids
+                .iter()
+                .cloned()
+                .map(|media_id| (media_id, PlaybackRowState::default())),
+        );
         let Ok(progress) = self.store.progress_for_media_ids(&progress_ids) else {
             return;
         };
-        self.local_progress_cache.extend(
-            progress
-                .into_iter()
-                .map(|(media_id, progress)| (media_id, progress.watched_percent())),
-        );
+        self.local_progress_cache
+            .extend(progress.into_iter().map(|(media_id, progress)| {
+                (media_id, PlaybackRowState::from_progress(Some(&progress)))
+            }));
     }
 
-    /// Updates one visible Local marker without rebuilding the directory or
-    /// rereading media metadata.
-    fn update_local_progress_view(&mut self, media_id: &MediaId, watched_percent: u8) {
-        if media_id.source != SourceKind::Local {
-            return;
-        }
-        let visible = self
-            .view
-            .rows
-            .iter()
-            .any(|row| row.media_id.as_ref() == Some(media_id));
-        if self.local_progress_cache.contains_key(media_id) || visible {
-            self.local_progress_cache
-                .insert(media_id.clone(), watched_percent);
+    /// Updates one visible progress marker without rebuilding its source list.
+    ///
+    /// Local rows additionally retain the state in their listing-scoped
+    /// RAM cache. Subscription videos use a separate row collection, so both
+    /// visible collections must follow the same durable checkpoint.
+    fn update_visible_progress_view(&mut self, media_id: &MediaId, state: PlaybackRowState) {
+        if media_id.source == SourceKind::Local {
+            let visible = self
+                .view
+                .rows
+                .iter()
+                .any(|row| row.media_id.as_ref() == Some(media_id));
+            if self.local_progress_cache.contains_key(media_id) || visible {
+                self.local_progress_cache.insert(media_id.clone(), state);
+            }
         }
         for row in &mut self.view.rows {
-            if row.media_id.as_ref() == Some(media_id) {
-                row.watched_percent = watched_percent;
+            if !row.hide_watched_marker && row.media_id.as_ref() == Some(media_id) {
+                row.watched_percent = state.watched_percent;
+                row.playback_started = state.playback_started;
+            }
+        }
+        for row in &mut self.view.subscriptions.items {
+            if !row.hide_watched_marker && row.media_id.as_ref() == Some(media_id) {
+                row.watched_percent = state.watched_percent;
+                row.playback_started = state.playback_started;
             }
         }
     }
@@ -7784,7 +8027,17 @@ impl AppController {
         let now = unix_time();
         let mut progress = PlaybackProgress::new(media_id.clone(), Some(duration), now);
         progress.record_position(self.view.playback.position.as_secs(), now);
-        self.update_local_progress_view(&media_id, progress.watched_percent());
+        if let Some(current) = self
+            .current_playback_progress
+            .as_ref()
+            .filter(|current| current.media_id == media_id)
+        {
+            progress.played_override = current.played_override;
+        }
+        self.update_visible_progress_view(
+            &media_id,
+            PlaybackRowState::from_progress(Some(&progress)),
+        );
     }
 
     /// Rebuilds the Local row model from listing-scoped RAM state.
@@ -7823,7 +8076,7 @@ impl AppController {
                 .kind
                 .is_playable()
                 .then(|| MediaId::new(SourceKind::Local, entry.path.display().to_string()));
-            let watched_percent = media_id
+            let playback = media_id
                 .as_ref()
                 .and_then(|id| self.local_progress_cache.get(id))
                 .copied()
@@ -7854,7 +8107,8 @@ impl AppController {
                 title: entry.display_name().into_owned(),
                 subtitle,
                 source: source.to_owned(),
-                watched_percent,
+                watched_percent: playback.watched_percent,
+                playback_started: playback.playback_started,
                 thumbnail_url: (entry.kind == LocalEntryKind::Image)
                     .then(|| url::Url::from_file_path(&entry.path).ok())
                     .flatten(),
@@ -7923,6 +8177,10 @@ impl AppController {
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
                 description: local_media_description(&item),
+                local_video_thumbnail: local_video_thumbnail_view(
+                    &item.path,
+                    item.duration_seconds,
+                ),
                 local_renamable: cfg!(feature = "local-rename"),
                 local_movable: cfg!(feature = "local-move"),
                 local_trashable: cfg!(feature = "local-trash"),
@@ -7982,6 +8240,7 @@ impl AppController {
                     ..RowView::default()
                 })
                 .collect();
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
         self.view.selected = self
             .view
             .selected
@@ -8158,6 +8417,10 @@ impl AppController {
                 license: "local file".to_owned(),
                 wikidata: "not applicable".to_owned(),
                 thumbnail_url: None,
+                local_video_thumbnail: local_video_thumbnail_view(
+                    &item.path,
+                    item.duration_seconds,
+                ),
                 ..DetailView::default()
             });
             #[cfg(all(feature = "local-artwork", feature = "images"))]
@@ -8189,6 +8452,22 @@ impl AppController {
     /// History must not index into stale Local-search or tracker-search arrays:
     /// those arrays can retain unrelated URLs after the user changes screens.
     fn update_history_detail(&mut self) {
+        let local_path = self
+            .history_entries
+            .get(self.view.selected)
+            .filter(|history| !history.local_removed)
+            .and_then(|history| {
+                let HistoryReplayTarget::Local(path) =
+                    history_replay_target(&history.entry).ok()?
+                else {
+                    return None;
+                };
+                path.is_file().then_some(path)
+            });
+        let (local_video_thumbnail, metadata_pending) = local_path
+            .as_deref()
+            .map(|path| self.cached_local_video_thumbnail(path))
+            .unwrap_or((None, false));
         let Some(row) = self.view.rows.get(self.view.selected).cloned() else {
             self.view.details = None;
             return;
@@ -8198,8 +8477,12 @@ impl AppController {
             title: row.title,
             source: row.source,
             description: row.subtitle,
+            local_video_thumbnail,
             ..DetailView::default()
         });
+        if metadata_pending && let Some(path) = local_path {
+            self.request_local_media_metadata(path);
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -9070,6 +9353,7 @@ impl AppController {
             target_label: selection.label,
             cursor_byte: body.len(),
             body,
+            follow_cursor: true,
             existing: is_existing,
             storage_path: storage_path.display().to_string(),
             ..PrivateNotePopupView::default()
@@ -9090,6 +9374,7 @@ impl AppController {
         let cursor = private_note_cursor_boundary(&popup.body, popup.cursor_byte);
         popup.body.insert(cursor, character);
         popup.cursor_byte = cursor.saturating_add(character.len_utf8());
+        popup.follow_cursor = true;
         popup.confirming_delete = false;
         popup.validation_error = None;
     }
@@ -9114,8 +9399,21 @@ impl AppController {
         };
         popup.body.replace_range(start..cursor, "");
         popup.cursor_byte = start;
+        popup.follow_cursor = true;
         popup.confirming_delete = false;
         popup.validation_error = None;
+    }
+
+    /// Deletes one Vim-style word before the private-note cursor.
+    fn delete_private_note_word(&mut self) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        if delete_previous_editor_word(&mut popup.body, &mut popup.cursor_byte) {
+            popup.follow_cursor = true;
+            popup.confirming_delete = false;
+            popup.validation_error = None;
+        }
     }
 
     /// Moves the private-note insertion point without splitting a grapheme.
@@ -9124,7 +9422,17 @@ impl AppController {
             return;
         };
         popup.cursor_byte = moved_private_note_cursor(&popup.body, popup.cursor_byte, motion);
+        popup.follow_cursor = true;
         popup.confirming_delete = false;
+    }
+
+    /// Scrolls the private-note viewport without forcing it back to the cursor.
+    fn set_private_note_scroll(&mut self, offset: usize) {
+        let Some(popup) = self.view.private_note_popup.as_mut() else {
+            return;
+        };
+        popup.scroll_offset = offset;
+        popup.follow_cursor = false;
     }
 
     /// Creates or edits the sole user-facing note for an exact target.
@@ -9447,6 +9755,21 @@ impl AppController {
             }
         }
         popup.validation_error = None;
+    }
+
+    /// Deletes one Vim-style word from the focused playlist editor field.
+    fn delete_playlist_editor_word(&mut self) {
+        let Some(popup) = self.view.playlist_popup.as_mut() else {
+            return;
+        };
+        let value = match popup.editor_field {
+            PlaylistEditorField::Name => &mut popup.editor_name,
+            PlaylistEditorField::Description => &mut popup.editor_description,
+        };
+        let mut cursor = value.len();
+        if delete_previous_editor_word(value, &mut cursor) {
+            popup.validation_error = None;
+        }
     }
 
     /// Creates a named playlist and adds the chooser item after validation.
@@ -10873,6 +11196,17 @@ impl AppController {
         self.view.status_line = "Enter an RSS or Atom podcast feed URL".to_owned();
     }
 
+    /// Deletes one Vim-style word from the draft RSS/Atom URL.
+    fn delete_rss_subscription_word(&mut self) {
+        let Some(popup) = self.view.rss_subscription_popup.as_mut() else {
+            return;
+        };
+        let mut cursor = popup.url.len();
+        if delete_previous_editor_word(&mut popup.url, &mut cursor) {
+            popup.validation_error = None;
+        }
+    }
+
     /// Persists one validated feed without overwriting external OPML edits.
     fn submit_rss_subscription(&mut self) {
         let Some(url) = self
@@ -12137,6 +12471,7 @@ impl AppController {
                         {
                             self.show_error("Playing, but history could not be saved", &error);
                         }
+                        self.checkpoint_playback_started();
                     }
                 }
                 Ok(Some(PlaybackEvent::Ended(end))) => {
@@ -12454,6 +12789,25 @@ impl AppController {
         Some(progress)
     }
 
+    /// Durably records that the backend accepted the current non-live item.
+    ///
+    /// A first start normally writes position zero. The existence of that
+    /// progress record survives restart and distinguishes an accepted start
+    /// from a failed load without fabricating a visible percentage.
+    fn checkpoint_playback_started(&mut self) {
+        let Some(progress) = self.current_playback_progress.clone() else {
+            return;
+        };
+        let state = PlaybackRowState::from_progress(Some(&progress));
+        self.update_visible_progress_view(&progress.media_id, state);
+        if let Err(error) = self
+            .store
+            .checkpoint_playback(&progress, &progress.media_id.source, 0)
+        {
+            self.show_error("Playing, but initial progress could not be saved", &error);
+        }
+    }
+
     /// Atomically replaces the small periodic playback recovery document.
     fn checkpoint_position(&mut self) -> bool {
         if self
@@ -12486,7 +12840,10 @@ impl AppController {
         {
             Ok(()) => {
                 self.unflushed_listen_time -= Duration::from_secs(listened_seconds);
-                self.update_local_progress_view(&progress.media_id, progress.watched_percent());
+                self.update_visible_progress_view(
+                    &progress.media_id,
+                    PlaybackRowState::from_progress(Some(&progress)),
+                );
                 true
             }
             Err(error) => {
@@ -12714,6 +13071,7 @@ impl AppController {
                         source: media.source.to_string(),
                         ..RowView::default()
                     }];
+                    hydrate_row_playback_progress(&self.store, &mut self.view.rows);
                 } else if let Some(direct) = &self.direct_item {
                     self.view.rows = vec![RowView {
                         media_id: Some(MediaId::new(direct.source.clone(), direct.url.to_string())),
@@ -12722,6 +13080,7 @@ impl AppController {
                         source: direct.source.to_string(),
                         ..RowView::default()
                     }];
+                    hydrate_row_playback_progress(&self.store, &mut self.view.rows);
                 } else {
                     self.refresh_youtube_rows();
                 }
@@ -13369,14 +13728,11 @@ impl AppController {
             .iter()
             .map(|entry| {
                 let live_stream = entry.media.kind == MediaKind::LiveStream;
-                let watched_percent = if live_stream {
-                    0
+                let playback = if live_stream {
+                    PlaybackRowState::default()
                 } else {
-                    self.store
-                        .progress(&entry.media.id)
-                        .ok()
-                        .flatten()
-                        .map_or(0, |progress| progress.watched_percent())
+                    let progress = self.store.progress(&entry.media.id).ok().flatten();
+                    PlaybackRowState::from_progress(progress.as_ref())
                 };
                 let mut metadata = Vec::with_capacity(3);
                 if live_stream {
@@ -13408,7 +13764,8 @@ impl AppController {
                     } else {
                         entry.media.id.source.to_string()
                     },
-                    watched_percent,
+                    watched_percent: playback.watched_percent,
+                    playback_started: playback.playback_started,
                     thumbnail_url: entry.media.thumbnail_url.clone(),
                     hide_watched_marker: live_stream,
                     compact: true,
@@ -13456,9 +13813,14 @@ impl AppController {
                 self.view.playlist_edit_available = true;
             }
             PlaylistsRoute::Entries { .. } => {
-                let Some((playlist, entry)) = self.active_playlist.as_ref().and_then(|playlist| {
-                    Some((playlist, playlist.entries.get(self.view.selected)?))
-                }) else {
+                let Some((playlist_name, entry)) =
+                    self.active_playlist.as_ref().and_then(|playlist| {
+                        Some((
+                            playlist.name.clone(),
+                            playlist.entries.get(self.view.selected)?.clone(),
+                        ))
+                    })
+                else {
                     self.view.details = None;
                     self.view.playlist_edit_available = false;
                     return;
@@ -13472,7 +13834,7 @@ impl AppController {
                 if !description.is_empty() {
                     description.push('\n');
                 }
-                description.push_str(&format!("Playlist: {}", playlist.name));
+                description.push_str(&format!("Playlist: {playlist_name}"));
                 let links = matches!(entry.media.webpage_url.scheme(), "http" | "https")
                     .then(|| DetailLinkView {
                         label: "Canonical media page".to_owned(),
@@ -13481,6 +13843,14 @@ impl AppController {
                     })
                     .into_iter()
                     .collect();
+                let local_video_path = (entry.media.id.source == SourceKind::Local
+                    && entry.media.kind == MediaKind::Video)
+                    .then(|| PathBuf::from(&entry.media.replay_locator))
+                    .filter(|path| path.is_file());
+                let (local_video_thumbnail, metadata_pending) = local_video_path
+                    .as_deref()
+                    .map(|path| self.cached_local_video_thumbnail(path))
+                    .unwrap_or((None, false));
                 self.view.details = Some(DetailView {
                     media_id: Some(entry.media.id.clone()),
                     title: entry.media.title.clone(),
@@ -13495,10 +13865,14 @@ impl AppController {
                         .map_or_else(String::new, format_seconds),
                     description,
                     thumbnail_url: entry.media.thumbnail_url.clone(),
+                    local_video_thumbnail,
                     links,
                     ..DetailView::default()
                 });
                 self.view.playlist_edit_available = false;
+                if metadata_pending && let Some(path) = local_video_path {
+                    self.request_local_media_metadata(path);
+                }
             }
         }
     }
@@ -13823,7 +14197,11 @@ impl AppController {
         let subscription = entry.subscription;
         let channel_id = subscription.youtube_channel_id().unwrap_or_default();
         let channel_webpage_url = (subscription.kind == SubscriptionKind::YouTube)
-            .then(|| youtube_channel_webpage_url(&channel_id, subscription.website_url.clone()))
+            .then(|| {
+                self.cached_channel_webpage_url(&channel_id).or_else(|| {
+                    youtube_channel_webpage_url(&channel_id, subscription.website_url.clone())
+                })
+            })
             .flatten();
         self.view.subscriptions.source_title = subscription.title.clone();
         let cached_subscribers = self
@@ -14426,6 +14804,7 @@ impl AppController {
                 ..RowView::default()
             });
         }
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
         self.view.status_line = format!("{} downloaded file(s)", self.view.rows.len());
         self.view.selected = self
             .view
@@ -14442,7 +14821,7 @@ impl AppController {
 
     /// Shows stable local metadata for the selected offline download.
     fn update_downloaded_detail(&mut self) {
-        let Some(row) = self.view.rows.get(self.view.selected) else {
+        let Some(row) = self.view.rows.get(self.view.selected).cloned() else {
             self.view.details = None;
             return;
         };
@@ -14456,13 +14835,42 @@ impl AppController {
             return;
         };
         let path = PathBuf::from(&media_id.external_id);
+        let local_video = crate::local_browser::classify_local_file(&path)
+            == Some(crate::local_browser::LocalEntryKind::Video);
+        let (description, length, local_video_thumbnail, metadata_pending) = if local_video {
+            let size_bytes = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            let item = self
+                .cached_local_media_item(&path, size_bytes)
+                .unwrap_or_else(|| local_media_item_stub(path.clone(), Some(size_bytes)));
+            (
+                local_media_description(&item),
+                item.duration_seconds
+                    .map_or_else(String::new, format_seconds),
+                local_video_thumbnail_view(&item.path, item.duration_seconds),
+                !item.technical_metadata_probed,
+            )
+        } else {
+            (
+                format!("Full path: {}", path.display()),
+                String::new(),
+                None,
+                false,
+            )
+        };
         self.view.details = Some(DetailView {
             media_id: Some(media_id),
-            title: row.title.clone(),
+            title: row.title,
             source: "Local download".to_owned(),
-            description: format!("Full path: {}", path.display()),
+            length,
+            description,
+            local_video_thumbnail,
             ..DetailView::default()
         });
+        if metadata_pending {
+            self.request_local_media_metadata(path);
+        }
         #[cfg(all(feature = "local-artwork", feature = "images"))]
         self.request_selected_local_artwork();
     }
@@ -14506,6 +14914,8 @@ impl AppController {
                             },
                             watched_percent: if live_radio {
                                 0
+                            } else if history.entry.finished {
+                                100
                             } else {
                                 history
                                     .entry
@@ -14517,11 +14927,13 @@ impl AppController {
                                             as u8
                                     })
                             },
+                            playback_started: !live_radio,
                             hide_watched_marker: live_radio,
                             ..RowView::default()
                         }
                     })
                     .collect();
+                hydrate_row_playback_progress(&self.store, &mut self.view.rows);
                 self.view.status_line = format!("{} history item(s)", self.view.rows.len());
                 self.update_history_detail();
             }
@@ -15212,6 +15624,21 @@ impl AppController {
                 .map_or(cursor, |(index, _)| index);
             value.drain(previous..cursor);
             *cursor_byte = previous;
+            *error = None;
+        }
+    }
+
+    /// Deletes one Vim-style word before the local-rename cursor.
+    fn delete_local_rename_word(&mut self) {
+        let Some(LocalFilePopupView::Rename {
+            value,
+            cursor_byte,
+            error,
+        }) = self.view.local_file_popup.as_mut()
+        else {
+            return;
+        };
+        if delete_previous_editor_word(value, cursor_byte) {
             *error = None;
         }
     }
@@ -16917,6 +17344,7 @@ impl UiController for AppController {
             UiAction::CancelSearch => self.cancel_search_input(),
             UiAction::AppendSearch(character) => self.append_search_input(character),
             UiAction::DeleteSearchCharacter => self.delete_search_input_character(),
+            UiAction::DeleteSearchWord => self.delete_search_input_word(),
             UiAction::SubmitSearch => self.submit_search_input(),
             UiAction::ToggleSearchKind => {
                 if self.view.screen != Screen::Search {
@@ -17066,7 +17494,7 @@ impl UiController for AppController {
                 if self.view.text_selection_mode {
                     self.view.text_selection_mode = false;
                     self.view.details_text_selection = None;
-                    self.view.status_line = "Details text selection ended".to_owned();
+                    self.view.status_line = "Select mode ended".to_owned();
                 } else if self.view.details.is_some()
                     && self.view.right_panel_mode == RightPanelMode::Details
                 {
@@ -17074,9 +17502,11 @@ impl UiController for AppController {
                     self.view.details_text_selection = None;
                     self.view.details_focused = true;
                     self.view.status_line =
-                        "Select Details text: drag to copy; press t or Esc to exit".to_owned();
+                        "Select mode: drag to select Details text; press t or Esc to exit"
+                            .to_owned();
                 } else {
-                    self.view.status_line = "No Details text is available to select".to_owned();
+                    self.view.status_line =
+                        "No Details text is available for Select mode".to_owned();
                 }
             }
             UiAction::BeginDetailsTextSelection(anchor) => {
@@ -17267,6 +17697,7 @@ impl UiController for AppController {
             UiAction::DeletePlaylistEditorCharacter => {
                 self.delete_playlist_editor_character();
             }
+            UiAction::DeletePlaylistEditorWord => self.delete_playlist_editor_word(),
             UiAction::CreatePlaylistAndAdd => self.create_playlist_and_add(),
             UiAction::UpdatePlaylist => self.update_selected_playlist(),
             UiAction::DismissPlaylistPopup => self.dismiss_playlist_popup(),
@@ -17277,6 +17708,8 @@ impl UiController for AppController {
             }
             UiAction::InsertPrivateNoteNewline => self.insert_private_note_newline(),
             UiAction::DeletePrivateNoteCharacter => self.delete_private_note_character(),
+            UiAction::DeletePrivateNoteWord => self.delete_private_note_word(),
+            UiAction::SetPrivateNoteScroll(offset) => self.set_private_note_scroll(offset),
             UiAction::MovePrivateNoteCursor(motion) => self.move_private_note_cursor(motion),
             UiAction::SavePrivateNote => self.save_private_note(),
             UiAction::RequestPrivateNoteDelete => self.request_private_note_delete(),
@@ -17307,6 +17740,7 @@ impl UiController for AppController {
             UiAction::DeleteYouTubeSetupCharacter => {
                 self.delete_youtube_setup_character();
             }
+            UiAction::DeleteYouTubeSetupWord => self.delete_youtube_setup_word(),
             UiAction::OpenYouTubeApiKeyGuide => {
                 self.open_external_url(YOUTUBE_API_KEY_GUIDE_URL);
             }
@@ -17338,6 +17772,7 @@ impl UiController for AppController {
                     popup.validation_error = None;
                 }
             }
+            UiAction::DeleteRssSubscriptionWord => self.delete_rss_subscription_word(),
             UiAction::SubmitRssSubscription => self.submit_rss_subscription(),
             UiAction::DismissRssSubscriptionPopup => {
                 self.view.rss_subscription_popup = None;
@@ -17370,6 +17805,7 @@ impl UiController for AppController {
             UiAction::DeleteLocalRenameCharacter => {
                 self.delete_local_rename_character();
             }
+            UiAction::DeleteLocalRenameWord => self.delete_local_rename_word(),
             UiAction::SubmitLocalRename => self.submit_local_rename(),
             UiAction::RequestLocalTrash => self.request_local_trash(),
             UiAction::ConfirmLocalTrash => self.confirm_local_trash(),
@@ -18975,7 +19411,11 @@ fn resolved_bbc_media(resolution: BbcLiveResolution) -> ResolvedDirectMedia {
     }
 }
 
-fn apply_resolved_direct_view(view: &mut ViewModel, media: &ResolvedDirectMedia) {
+fn apply_resolved_direct_view(
+    store: &StateStore,
+    view: &mut ViewModel,
+    media: &ResolvedDirectMedia,
+) {
     let source = direct_source_label(&media.source);
     let media_id = MediaId::new(media.source.clone(), media.external_id.clone());
     view.rows = vec![RowView {
@@ -18985,6 +19425,7 @@ fn apply_resolved_direct_view(view: &mut ViewModel, media: &ResolvedDirectMedia)
         source: source.to_owned(),
         ..RowView::default()
     }];
+    hydrate_row_playback_progress(store, &mut view.rows);
     view.details = Some(DetailView {
         media_id: Some(media_id),
         title: media.title.clone(),
@@ -20018,6 +20459,33 @@ fn local_media_subtitle(item: &LocalMediaItem) -> String {
     fields.join(" · ")
 }
 
+/// Builds a lazy midpoint-frame request for one finite local video.
+///
+/// Durations are stored as whole seconds, so multiplying by 500 yields the
+/// midpoint of the measured whole-second duration in milliseconds without
+/// floating-point rounding. Text-only builds and builds without local-video
+/// extraction keep Details unchanged.
+fn local_video_thumbnail_view(
+    path: &Path,
+    duration_seconds: Option<u64>,
+) -> Option<LocalVideoThumbnailView> {
+    #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+    {
+        let duration_seconds = duration_seconds.filter(|duration| *duration > 0)?;
+        (crate::local_browser::classify_local_file(path)
+            == Some(crate::local_browser::LocalEntryKind::Video))
+        .then(|| LocalVideoThumbnailView {
+            path: path.to_owned(),
+            midpoint_millis: duration_seconds.saturating_mul(500),
+        })
+    }
+    #[cfg(not(all(feature = "images", feature = "local-video-thumbnails")))]
+    {
+        let _ = (path, duration_seconds);
+        None
+    }
+}
+
 /// Formats human and technical metadata for one playable Local Details panel.
 fn local_media_description(item: &LocalMediaItem) -> String {
     let mut lines = vec![format!("Full path: {}", item.path.display())];
@@ -20112,6 +20580,67 @@ enum SearchRowContext {
     SubscriptionFeed,
 }
 
+/// Persisted playback state projected into one compact list row.
+///
+/// A stored progress row proves that the backend accepted playback even when
+/// its rounded percentage remains zero. An explicit played override maps to a
+/// completed row, while an explicit unplayed override clears both presentation
+/// fields so the user's choice remains authoritative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlaybackRowState {
+    watched_percent: u8,
+    playback_started: bool,
+}
+
+impl PlaybackRowState {
+    /// Projects one optional persistence record into watched-row state.
+    fn from_progress(progress: Option<&PlaybackProgress>) -> Self {
+        let Some(progress) = progress else {
+            return Self::default();
+        };
+        match progress.played_override {
+            Some(false) => Self::default(),
+            Some(true) => Self {
+                watched_percent: 100,
+                playback_started: true,
+            },
+            None => Self {
+                watched_percent: progress.watched_percent(),
+                playback_started: true,
+            },
+        }
+    }
+}
+
+/// Hydrates playable, non-live rows through one bounded persistence query.
+///
+/// Missing progress leaves a row's source-specific state untouched. The store
+/// chunks SQLite requests and overlays the human-readable backend's pending
+/// crash checkpoint, so callers neither issue one query per row nor lose the
+/// newest restart-safe position.
+fn hydrate_row_playback_progress(store: &StateStore, rows: &mut [RowView]) {
+    let media_ids = rows
+        .iter()
+        .filter(|row| !row.hide_watched_marker)
+        .filter_map(|row| row.media_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Ok(progress) = store.progress_for_media_ids(&media_ids) else {
+        return;
+    };
+    for row in rows {
+        let Some(media_id) = row.media_id.as_ref() else {
+            continue;
+        };
+        if let Some(progress) = progress.get(media_id) {
+            let state = PlaybackRowState::from_progress(Some(progress));
+            row.watched_percent = state.watched_percent;
+            row.playback_started = state.playback_started;
+        }
+    }
+}
+
 /// Converts one provider item into a compact row for its presentation context.
 fn row_from_search_item(
     item: &SearchItem,
@@ -20127,6 +20656,7 @@ fn row_from_search_item(
                 .progress(&MediaId::new(SourceKind::YouTube, &video.video_id))
                 .ok()
                 .flatten();
+            let playback = PlaybackRowState::from_progress(progress.as_ref());
             let subscriber_count = match context {
                 SearchRowContext::GlobalSearch => channel_subscribers
                     .get(&video.channel_id)
@@ -20143,7 +20673,8 @@ fn row_from_search_item(
                 } else {
                     "YouTube".to_owned()
                 },
-                watched_percent: progress.map_or(0, |value| value.watched_percent()),
+                watched_percent: playback.watched_percent,
+                playback_started: playback.playback_started,
                 subscribed: matches!(context, SearchRowContext::GlobalSearch)
                     && subscriptions.contains_youtube_channel(&video.channel_id),
                 thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
@@ -20294,7 +20825,10 @@ fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> De
                 source: "YouTube".to_owned(),
                 channel_name: video.channel_name.clone(),
                 channel_id: video.channel_id.clone(),
-                channel_webpage_url: canonical_youtube_channel_url(&video.channel_id),
+                channel_webpage_url: youtube_channel_webpage_url(
+                    &video.channel_id,
+                    subscriptions.youtube_channel_website_url(&video.channel_id),
+                ),
                 channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
                 length: video
                     .duration_seconds
@@ -20579,7 +21113,10 @@ fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> 
         source: "YouTube".to_owned(),
         channel_name: video.channel_name.clone(),
         channel_id: video.channel_id.clone(),
-        channel_webpage_url: canonical_youtube_channel_url(&video.channel_id),
+        channel_webpage_url: youtube_channel_webpage_url(
+            &video.channel_id,
+            subscriptions.youtube_channel_website_url(&video.channel_id),
+        ),
         channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
         channel_subscriber_count: None,
         length: video
@@ -20735,11 +21272,7 @@ fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
     {
         return false;
     }
-    let Some(segments) = url.path_segments().and_then(|segments| {
-        segments
-            .map(decode_url_path_segment_once)
-            .collect::<Option<Vec<_>>>()
-    }) else {
+    let Some(segments) = decoded_youtube_channel_path_segments(url) else {
         return false;
     };
     match segments.as_slice() {
@@ -20755,6 +21288,34 @@ fn is_safe_youtube_channel_webpage(url: &url::Url, channel_id: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Checks that a safe channel page carries a human-readable handle or alias.
+fn is_youtube_channel_alias_webpage(url: &url::Url, channel_id: &str) -> bool {
+    if !is_safe_youtube_channel_webpage(url, channel_id) {
+        return false;
+    }
+    decoded_youtube_channel_path_segments(url).is_some_and(|segments| {
+        matches!(
+            segments.as_slice(),
+            [handle] if handle.starts_with('@')
+        ) || matches!(
+            segments.as_slice(),
+            [namespace, _] if matches!(namespace.as_str(), "c" | "user")
+        )
+    })
+}
+
+/// Decodes an exact channel route while tolerating one conventional trailing slash.
+fn decoded_youtube_channel_path_segments(url: &url::Url) -> Option<Vec<String>> {
+    let mut segments = url
+        .path_segments()?
+        .map(decode_url_path_segment_once)
+        .collect::<Option<Vec<_>>>()?;
+    if segments.last().is_some_and(String::is_empty) {
+        segments.pop();
+    }
+    Some(segments)
 }
 
 /// Checks a provider-supplied human channel path without accepting other routes.
@@ -22585,6 +23146,185 @@ mod tests {
 
     use super::*;
 
+    /// Deterministic off-thread metadata fixture for local-video controller tests.
+    struct FixedDurationLocalMediaLoader {
+        expected_path: PathBuf,
+        duration_seconds: u64,
+    }
+
+    impl LocalMediaLoader for FixedDurationLocalMediaLoader {
+        fn load(&self, path: PathBuf) -> LocalMediaItem {
+            assert_eq!(path, self.expected_path);
+            let mut item = local_media_item_stub(path, None);
+            item.duration_seconds = Some(self.duration_seconds);
+            item.technical_metadata_probed = true;
+            item
+        }
+    }
+
+    /// Drains one short-lived local metadata worker within a bounded test wait.
+    fn await_local_metadata(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while controller.pending_local_media_metadata.is_some() && Instant::now() < deadline {
+            controller.drain_local_media_metadata_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            controller.pending_local_media_metadata.is_none(),
+            "local metadata worker did not complete before the test deadline"
+        );
+    }
+
+    #[test]
+    fn vim_word_delete_is_unicode_grapheme_safe_and_preserves_the_suffix() {
+        let cases = [
+            ("alpha beta", "alpha ", "alpha beta".len(), "alpha ".len()),
+            (
+                "alpha beta   ",
+                "alpha ",
+                "alpha beta   ".len(),
+                "alpha ".len(),
+            ),
+            (
+                "alpha...beta",
+                "alpha...",
+                "alpha...beta".len(),
+                "alpha...".len(),
+            ),
+            ("alpha...", "alpha", "alpha...".len(), "alpha".len()),
+            ("snake_case", "", "snake_case".len(), 0),
+            ("привет мир", "привет ", "привет мир".len(), "привет ".len()),
+            ("e\u{301}", "", "e\u{301}".len(), 0),
+            ("👩‍💻", "", "👩‍💻".len(), 0),
+            (
+                "alpha beta omega",
+                "alpha  omega",
+                "alpha beta".len(),
+                "alpha ".len(),
+            ),
+            ("one\ntwo", "onetwo", "one\n".len(), "one".len()),
+        ];
+
+        for (before, expected, cursor, expected_cursor) in cases {
+            let mut value = before.to_owned();
+            let mut cursor = cursor;
+            assert!(
+                delete_previous_editor_word(&mut value, &mut cursor),
+                "word deletion should mutate {before:?}"
+            );
+            assert_eq!(value, expected, "unexpected result for {before:?}");
+            assert_eq!(cursor, expected_cursor, "unexpected cursor for {before:?}");
+            assert!(value.is_char_boundary(cursor));
+            assert!(
+                cursor == 0
+                    || value
+                        .grapheme_indices(true)
+                        .any(|(index, _)| index == cursor)
+                    || cursor == value.len(),
+                "cursor must remain on a grapheme boundary for {before:?}"
+            );
+        }
+
+        let mut empty = String::new();
+        let mut cursor = usize::MAX;
+        assert!(!delete_previous_editor_word(&mut empty, &mut cursor));
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn editor_word_delete_actions_mutate_all_six_controller_owned_drafts() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+
+        controller.view.search_query = "ambient radio".to_owned();
+        controller.dispatch(UiAction::DeleteSearchWord);
+        assert_eq!(controller.view.search_query, "ambient ");
+
+        controller.view.youtube_setup_popup = Some(YouTubeSetupPopupView {
+            selected_field: YouTubeSetupField::ApiKey,
+            api_key: "secret token".to_owned(),
+            validation_error: Some("stale".to_owned()),
+            ..YouTubeSetupPopupView::default()
+        });
+        controller.dispatch(UiAction::DeleteYouTubeSetupWord);
+        let setup = controller
+            .view
+            .youtube_setup_popup
+            .as_ref()
+            .expect("YouTube setup editor");
+        assert_eq!(setup.api_key, "secret ");
+        assert_eq!(setup.validation_error, None);
+
+        controller.view.rss_subscription_popup = Some(RssSubscriptionPopupView {
+            url: "https://example.test/podcast feed".to_owned(),
+            validation_error: Some("stale".to_owned()),
+            config_path: "/tmp/subscriptions.opml".to_owned(),
+        });
+        controller.dispatch(UiAction::DeleteRssSubscriptionWord);
+        let rss = controller
+            .view
+            .rss_subscription_popup
+            .as_ref()
+            .expect("RSS editor");
+        assert_eq!(rss.url, "https://example.test/podcast ");
+        assert_eq!(rss.validation_error, None);
+
+        controller.view.playlist_popup = Some(PlaylistPopupView {
+            mode: PlaylistPopupMode::Create,
+            editor_field: PlaylistEditorField::Description,
+            editor_description: "quiet evening".to_owned(),
+            validation_error: Some("stale".to_owned()),
+            ..PlaylistPopupView::default()
+        });
+        controller.dispatch(UiAction::DeletePlaylistEditorWord);
+        let playlist = controller
+            .view
+            .playlist_popup
+            .as_ref()
+            .expect("playlist editor");
+        assert_eq!(playlist.editor_description, "quiet ");
+        assert_eq!(playlist.validation_error, None);
+
+        controller.view.private_note_popup = Some(PrivateNotePopupView {
+            body: "first line\nsecond word".to_owned(),
+            cursor_byte: "first line\nsecond word".len(),
+            scroll_offset: 7,
+            follow_cursor: false,
+            confirming_delete: true,
+            validation_error: Some("stale".to_owned()),
+            ..PrivateNotePopupView::default()
+        });
+        controller.dispatch(UiAction::DeletePrivateNoteWord);
+        let note = controller
+            .view
+            .private_note_popup
+            .as_ref()
+            .expect("private-note editor");
+        assert_eq!(note.body, "first line\nsecond ");
+        assert_eq!(note.cursor_byte, "first line\nsecond ".len());
+        assert_eq!(note.scroll_offset, 7);
+        assert!(note.follow_cursor);
+        assert!(!note.confirming_delete);
+        assert_eq!(note.validation_error, None);
+
+        controller.view.local_file_popup = Some(LocalFilePopupView::Rename {
+            value: "summer mix.flac".to_owned(),
+            cursor_byte: "summer mix".len(),
+            error: Some("stale".to_owned()),
+        });
+        controller.dispatch(UiAction::DeleteLocalRenameWord);
+        let Some(LocalFilePopupView::Rename {
+            value,
+            cursor_byte,
+            error,
+        }) = controller.view.local_file_popup.as_ref()
+        else {
+            panic!("local rename editor");
+        };
+        assert_eq!(value, "summer .flac");
+        assert_eq!(*cursor_byte, "summer ".len());
+        assert_eq!(*error, None);
+    }
+
     fn subscription_video_summary() -> VideoSummary {
         VideoSummary {
             video_id: "dQw4w9WgXcQ".to_owned(),
@@ -24135,6 +24875,81 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+    #[test]
+    fn local_mov_playlist_entry_waits_for_current_duration_before_thumbnail() {
+        let temporary = tempfile::tempdir().expect("temporary local playlist video");
+        let video = temporary.path().join("playlist.mov");
+        std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
+        let webpage_url = url::Url::from_file_path(&video).expect("absolute local file URL");
+        let snapshot = PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::Local, video.to_string_lossy()),
+            kind: MediaKind::Video,
+            title: "Playlist MOV".to_owned(),
+            creator: None,
+            webpage_url,
+            thumbnail_url: None,
+            duration_seconds: Some(121),
+            replay_locator: video.to_string_lossy().into_owned(),
+        };
+        let mut controller = controller_with_mock_statuses([]).0;
+        controller.local_media_loader = Arc::new(FixedDurationLocalMediaLoader {
+            expected_path: video.clone(),
+            duration_seconds: 42,
+        });
+        let PlaylistCreateOutcome::Created(created) = controller
+            .store
+            .create_playlist_with_entry("MOV previews", None, &snapshot, 1)
+            .expect("create MOV playlist")
+        else {
+            panic!("MOV playlist must be created");
+        };
+
+        controller.show_screen(Screen::Playlists);
+        controller.view.selected = controller
+            .playlist_summaries
+            .iter()
+            .position(|playlist| playlist.id == created.id)
+            .expect("created playlist summary");
+        controller.dispatch(UiAction::ActivateSelection);
+
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_video_thumbnail.is_none()),
+            "persisted playlist duration must not create a thumbnail before current metadata"
+        );
+        assert_eq!(
+            controller.pending_local_media_metadata.as_deref(),
+            Some(video.as_path())
+        );
+        await_local_metadata(&mut controller);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.local_video_thumbnail.as_ref()),
+            Some(&LocalVideoThumbnailView {
+                path: video.clone(),
+                midpoint_millis: 21_000,
+            }),
+            "the current file duration must replace the persisted playlist duration"
+        );
+        std::fs::remove_file(&video).expect("remove playlist MOV fixture");
+        controller.update_playlist_detail();
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_video_thumbnail.is_none()),
+            "removed playlist videos must not repeatedly start FFmpeg"
+        );
+    }
+
     #[cfg(feature = "local-browser")]
     #[test]
     fn asynchronous_local_listing_restores_playlist_actions_without_selection_movement() {
@@ -24411,6 +25226,19 @@ mod tests {
                 ..subscription_video_summary()
             }),
         ];
+        controller.view.details = Some(preliminary_detail(
+            &controller.youtube_results[0],
+            &controller.subscription_tree,
+        ));
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.channel_webpage_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/channel/UCfixture")
+        );
 
         controller.request_visible_channel_subscriber_counts();
         let requested_ids = match captured_requests
@@ -24429,10 +25257,15 @@ mod tests {
                 ChannelSubscriberCount {
                     channel_id: "UCfixture".to_owned(),
                     subscriber_count: Some(13_045),
+                    webpage_url: Some(
+                        url::Url::parse("https://www.youtube.com/@myChanName")
+                            .expect("fixture channel handle"),
+                    ),
                 },
                 ChannelSubscriberCount {
                     channel_id: "UCsecond".to_owned(),
                     subscriber_count: None,
+                    webpage_url: None,
                 },
             ]),
         });
@@ -24444,6 +25277,16 @@ mod tests {
             controller.channel_subscriber_cache.get("UCsecond"),
             Some(&None)
         );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.channel_webpage_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/@myChanName"),
+            "the selected video must adopt the exact provider handle"
+        );
         assert!(
             controller.view.rows[0]
                 .subtitle
@@ -24452,6 +25295,21 @@ mod tests {
         assert!(
             !controller.view.rows[1].subtitle.contains("subscribers"),
             "hidden counts must not produce placeholder text"
+        );
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(subscription_video_details("Provider detail title")),
+        });
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.channel_webpage_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/@myChanName"),
+            "asynchronous video details must retain the RAM-cached handle"
         );
 
         controller.request_visible_channel_subscriber_counts();
@@ -24509,6 +25367,84 @@ mod tests {
         controller.refresh_youtube_rows();
 
         assert_eq!(controller.view.rows[0].watched_percent, 95);
+        assert!(controller.view.rows[0].playback_started);
+    }
+
+    #[test]
+    fn zero_position_progress_and_explicit_overrides_restore_distinct_row_states() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            store
+                .upsert_progress(&PlaybackProgress::new(media_id.clone(), Some(100), 1))
+                .expect("accepted zero-position start");
+        }
+
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_results = vec![SearchItem::Video(subscription_video_summary())];
+        controller.refresh_youtube_rows();
+        assert_eq!(controller.view.rows[0].watched_percent, 0);
+        assert!(
+            controller.view.rows[0].playback_started,
+            "the persisted row itself distinguishes an accepted zero-position start"
+        );
+
+        let mut progress = controller
+            .store
+            .progress(&media_id)
+            .expect("saved progress")
+            .expect("zero-position row");
+        progress.set_played(false);
+        controller
+            .store
+            .upsert_progress(&progress)
+            .expect("explicit unplayed override");
+        controller.refresh_youtube_rows();
+        assert_eq!(controller.view.rows[0].watched_percent, 0);
+        assert!(
+            !controller.view.rows[0].playback_started,
+            "explicit unplayed must override the existence of progress"
+        );
+
+        progress.set_played(true);
+        controller
+            .store
+            .upsert_progress(&progress)
+            .expect("explicit played override");
+        controller.refresh_youtube_rows();
+        assert_eq!(controller.view.rows[0].watched_percent, 100);
+        assert!(controller.view.rows[0].playback_started);
+    }
+
+    #[test]
+    fn downloaded_rows_bulk_hydrate_partial_progress_after_restart() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let track = config.downloads_dir().join("restart fixture.opus");
+        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        {
+            let store = StateStore::open(&config).expect("disk state");
+            std::fs::write(&track, b"fixture").expect("downloaded media fixture");
+            let mut progress = PlaybackProgress::new(media_id.clone(), Some(100), 1);
+            progress.record_position(45, 2);
+            store.upsert_progress(&progress).expect("saved progress");
+        }
+
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.populate_downloads();
+
+        let row = controller
+            .view
+            .rows
+            .iter()
+            .find(|row| row.media_id.as_ref() == Some(&media_id))
+            .expect("rehydrated Downloaded row");
+        assert_eq!(row.watched_percent, 45);
+        assert!(row.playback_started);
     }
 
     #[test]
@@ -24998,6 +25934,58 @@ mod tests {
     }
 
     #[test]
+    fn video_details_reuse_the_exact_opml_handle_without_guessing_from_title() {
+        let handle =
+            url::Url::parse("https://www.youtube.com/@myChanName").expect("fixture channel handle");
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel_with_website(
+            "Display Name Is Not The Handle",
+            "UCfixture",
+            Some(&handle),
+        ));
+        let summary = subscription_video_summary();
+        let provider_details = subscription_video_details("Provider detail title");
+
+        for details in [
+            preliminary_detail(&SearchItem::Video(summary), &subscriptions),
+            detail_from_video(&provider_details, &subscriptions),
+        ] {
+            assert_eq!(details.channel_name, "Fixture channel");
+            assert_eq!(
+                details.channel_webpage_url.as_ref(),
+                Some(&handle),
+                "OPML must retain the true handle instead of deriving one from a display name"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_source_uses_the_known_ram_handle_before_refresh() {
+        let mut subscriptions = SubscriptionTree::default();
+        assert!(subscriptions.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.subscription_tree = subscriptions;
+        controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
+        controller.channel_webpage_cache.insert(
+            "UCfixture".to_owned(),
+            url::Url::parse("https://www.youtube.com/@fixture").expect("fixture handle"),
+        );
+
+        controller.update_selected_subscription_source();
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.channel_webpage_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://www.youtube.com/@fixture"),
+            "opening Subscriptions must not regress a cached handle to /channel/ID"
+        );
+    }
+
+    #[test]
     fn channel_webpage_rejects_unsafe_provider_urls_and_channel_ids() {
         let unsafe_provider_url =
             url::Url::parse("https://youtube.com@example.org/channel/UCfixture")
@@ -25086,6 +26074,47 @@ mod tests {
             });
 
             assert_eq!(search_item_url(&item).as_deref(), Some(safe_url));
+        }
+    }
+
+    #[test]
+    fn channel_webpage_accepts_one_trailing_slash_but_rejects_extra_path() {
+        for safe_url in [
+            "https://www.youtube.com/@myChanName/",
+            "https://www.youtube.com/channel/UCfixture/",
+            "https://www.youtube.com/c/FixtureChannel/",
+            "https://www.youtube.com/user/fixture/",
+        ] {
+            let preferred = url::Url::parse(safe_url).expect("safe fixture URL");
+            assert_eq!(
+                youtube_channel_webpage_url("UCfixture", Some(preferred))
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some(safe_url)
+            );
+        }
+        assert!(is_youtube_channel_alias_webpage(
+            &url::Url::parse("https://www.youtube.com/@myChanName/")
+                .expect("trailing-slash handle"),
+            "UCfixture"
+        ));
+
+        for unsafe_url in [
+            "https://www.youtube.com/@myChanName//",
+            "https://www.youtube.com/@myChanName/videos",
+            "https://www.youtube.com/channel/UCfixture//",
+            "https://www.youtube.com/channel/UCfixture/videos",
+        ] {
+            assert_eq!(
+                youtube_channel_webpage_url(
+                    "UCfixture",
+                    Some(url::Url::parse(unsafe_url).expect("unsafe fixture URL")),
+                )
+                .as_ref()
+                .map(url::Url::as_str),
+                Some("https://www.youtube.com/channel/UCfixture"),
+                "{unsafe_url:?} must fall back to the exact channel-ID route"
+            );
         }
     }
 
@@ -27365,6 +28394,7 @@ mod tests {
             result: Ok(vec![ChannelSubscriberCount {
                 channel_id: "UCfixture".to_owned(),
                 subscriber_count: Some(13_045),
+                webpage_url: None,
             }]),
         });
 
@@ -28664,8 +29694,20 @@ mod tests {
         let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
         let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
         let (mut controller, _state) = controller_with_mock_statuses([]);
-        controller.local_progress_cache.insert(source_id, 25);
-        controller.local_progress_cache.insert(target_id, 80);
+        controller.local_progress_cache.insert(
+            source_id,
+            PlaybackRowState {
+                watched_percent: 25,
+                playback_started: true,
+            },
+        );
+        controller.local_progress_cache.insert(
+            target_id,
+            PlaybackRowState {
+                watched_percent: 80,
+                playback_started: true,
+            },
+        );
         controller.local_move_selection = Some(LocalMoveSelection {
             source_directory,
             sources: vec![source.clone()],
@@ -28864,7 +29906,13 @@ mod tests {
         let old_id = MediaId::new(SourceKind::Local, source.display().to_string());
         controller.current_media = Some(old_id.clone());
         controller.view.playing_media_id = Some(old_id.clone());
-        controller.local_progress_cache.insert(old_id, 42);
+        controller.local_progress_cache.insert(
+            old_id,
+            PlaybackRowState {
+                watched_percent: 42,
+                playback_started: true,
+            },
+        );
         let (requests, captured) = unbounded();
         controller.local_browse_requests = Some(requests);
         controller.local_move_generation = 9;
@@ -28916,7 +29964,13 @@ mod tests {
         let target_id = MediaId::new(SourceKind::Local, target.display().to_string());
         assert_eq!(controller.current_media.as_ref(), Some(&target_id));
         assert_eq!(controller.view.playing_media_id.as_ref(), Some(&target_id));
-        assert_eq!(controller.local_progress_cache.get(&target_id), Some(&42));
+        assert_eq!(
+            controller.local_progress_cache.get(&target_id),
+            Some(&PlaybackRowState {
+                watched_percent: 42,
+                playback_started: true,
+            })
+        );
         assert!(
             controller
                 .take_local_move_mappings_for_persistence()
@@ -29739,10 +30793,11 @@ mod tests {
 
         assert_eq!(
             controller.local_progress_cache.get(&media_id),
-            Some(&0),
+            Some(&PlaybackRowState::default()),
             "first-time local media must still own a cache entry"
         );
         assert_eq!(controller.view.rows[row_index].watched_percent, 0);
+        assert!(!controller.view.rows[row_index].playback_started);
 
         controller.activate_local_browser_selection();
         controller.update_player();
@@ -29752,6 +30807,7 @@ mod tests {
             controller.view.rows[row_index].watched_percent, 0,
             "a status retained from replaced media must not advance the new file"
         );
+        assert!(!controller.view.rows[row_index].playback_started);
         events
             .lock()
             .expect("mock events")
@@ -29763,9 +30819,19 @@ mod tests {
             controller.view.rows[row_index].watched_percent, 0,
             "a temporarily unknown duration must not erase or invent progress"
         );
+        assert!(
+            controller.view.rows[row_index].playback_started,
+            "an accepted zero-position start must immediately become partial"
+        );
         controller.show_screen(Screen::Playlists);
         controller.update_player();
-        assert_eq!(controller.local_progress_cache.get(&media_id), Some(&45));
+        assert_eq!(
+            controller.local_progress_cache.get(&media_id),
+            Some(&PlaybackRowState {
+                watched_percent: 45,
+                playback_started: true,
+            })
+        );
         assert!(
             controller.view.rows.is_empty(),
             "another screen must not retain the Local browser rows"
@@ -29781,6 +30847,7 @@ mod tests {
             controller.view.rows[row_index].watched_percent, 45,
             "returning to Local must rebuild from the live RAM cache"
         );
+        assert!(controller.view.rows[row_index].playback_started);
 
         controller.persist_position();
         assert_eq!(
@@ -29804,7 +30871,13 @@ mod tests {
         controller.update_player();
 
         assert_eq!(controller.view.rows[row_index].watched_percent, 100);
-        assert_eq!(controller.local_progress_cache.get(&media_id), Some(&100));
+        assert_eq!(
+            controller.local_progress_cache.get(&media_id),
+            Some(&PlaybackRowState {
+                watched_percent: 100,
+                playback_started: true,
+            })
+        );
         assert_eq!(
             controller
                 .store
@@ -29828,6 +30901,7 @@ mod tests {
             .find(|row| row.media_id.as_ref() == Some(&media_id))
             .expect("local row rehydrated after a real database reopen");
         assert_eq!(rehydrated.watched_percent, 100);
+        assert!(rehydrated.playback_started);
     }
 
     #[cfg(all(feature = "local-artwork", feature = "images"))]
@@ -29930,6 +31004,151 @@ mod tests {
         assert!(!subtitle.contains("WEBM"));
     }
 
+    #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+    #[test]
+    fn local_video_thumbnail_uses_case_insensitive_mov_midpoint_only_for_finite_video() {
+        let mov = Path::new("/tmp/Youta Fixture.MOV");
+        assert_eq!(
+            local_video_thumbnail_view(mov, Some(121)),
+            Some(LocalVideoThumbnailView {
+                path: mov.to_owned(),
+                midpoint_millis: 60_500,
+            })
+        );
+        assert_eq!(local_video_thumbnail_view(mov, None), None);
+        assert_eq!(local_video_thumbnail_view(mov, Some(0)), None);
+        assert_eq!(
+            local_video_thumbnail_view(Path::new("/tmp/audio.flac"), Some(121)),
+            None
+        );
+    }
+
+    #[cfg(all(
+        feature = "images",
+        feature = "local-artwork",
+        feature = "local-video-thumbnails"
+    ))]
+    #[test]
+    fn local_mov_details_use_cached_metadata_without_requesting_audio_artwork() {
+        use crossbeam_channel::TryRecvError;
+
+        let fixture = tempfile::tempdir().expect("temporary MOV fixture");
+        let media_path = fixture.path().join("midpoint.MOV");
+        std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local listing");
+        let parent_offset = usize::from(listing.parent.is_some());
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.selected = parent_offset;
+        controller.local_listing = Some(listing);
+        let mut item = local_media_item_stub(media_path.clone(), Some(14));
+        item.duration_seconds = Some(121);
+        item.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(&media_path).expect("MOV identity"),
+            item,
+        );
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.refresh_local_browser_rows();
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.local_video_thumbnail.as_ref()),
+            Some(&LocalVideoThumbnailView {
+                path: media_path,
+                midpoint_millis: 60_500,
+            })
+        );
+        assert!(
+            matches!(captured.try_recv(), Err(TryRecvError::Empty)),
+            "video Details must not enqueue the embedded-audio artwork path"
+        );
+    }
+
+    #[cfg(all(
+        feature = "images",
+        feature = "local-artwork",
+        not(feature = "local-video-thumbnails")
+    ))]
+    #[test]
+    fn video_keeps_embedded_artwork_fallback_when_midpoint_extraction_is_omitted() {
+        let fixture = tempfile::tempdir().expect("temporary video-artwork fixture");
+        let media_path = fixture.path().join("fallback.mov");
+        std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local listing");
+        let parent_offset = usize::from(listing.parent.is_some());
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.selected = parent_offset;
+        controller.local_listing = Some(listing);
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.refresh_local_browser_rows();
+
+        let ProviderRequest::LocalArtwork { path, kind, .. } = captured
+            .try_recv()
+            .expect("fallback embedded-artwork request")
+        else {
+            panic!("expected embedded Local artwork request");
+        };
+        assert_eq!(path, media_path);
+        assert!(matches!(kind, LocalArtworkKind::EmbeddedMedia));
+    }
+
+    #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+    #[test]
+    fn downloaded_mov_details_reuse_cached_duration_for_midpoint_thumbnail() {
+        let fixture = tempfile::tempdir().expect("temporary downloaded MOV fixture");
+        let media_path = fixture.path().join("downloaded.mov");
+        std::fs::write(&media_path, b"mock downloaded MOV").expect("write MOV fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Downloaded;
+        controller.view.rows = vec![RowView {
+            media_id: Some(MediaId::new(
+                SourceKind::Local,
+                media_path.display().to_string(),
+            )),
+            title: "Downloaded MOV".to_owned(),
+            ..RowView::default()
+        }];
+        let mut item = local_media_item_stub(media_path.clone(), Some(19));
+        item.duration_seconds = Some(121);
+        item.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(&media_path).expect("downloaded MOV identity"),
+            item,
+        );
+
+        controller.update_downloaded_detail();
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.local_video_thumbnail.as_ref()),
+            Some(&LocalVideoThumbnailView {
+                path: media_path,
+                midpoint_millis: 60_500,
+            })
+        );
+        assert!(controller.pending_local_media_metadata.is_none());
+    }
+
     #[test]
     fn local_browser_metadata_loads_off_ui_thread_and_reuses_ram_cache() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29994,6 +31213,14 @@ mod tests {
 
         controller.refresh_local_browser_rows();
 
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_video_thumbnail.is_none()),
+            "a video thumbnail must wait for the asynchronous duration probe"
+        );
         assert_eq!(
             controller.pending_local_media_metadata.as_deref(),
             Some(media_path.as_path())
@@ -30019,6 +31246,19 @@ mod tests {
                 .is_some_and(|details| details
                     .description
                     .contains("Container: WebM\nCodec: Opus"))
+        );
+        #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.local_video_thumbnail.as_ref()),
+            Some(&LocalVideoThumbnailView {
+                path: media_path.clone(),
+                midpoint_millis: 21_000,
+            }),
+            "the completed duration probe must reveal the midpoint target"
         );
 
         controller.update_local_browser_detail();
@@ -33289,7 +34529,10 @@ mod tests {
         assert_eq!(controller.view.details_scroll, 17);
         assert_eq!(controller.view.selected_detail_link, Some(0));
         assert_eq!(controller.view.playback, playback);
-        assert!(controller.view.status_line.contains("drag to copy"));
+        assert_eq!(
+            controller.view.status_line,
+            "Select mode: drag to select Details text; press t or Esc to exit"
+        );
 
         controller.dispatch(UiAction::ToggleTextSelectionMode);
 
@@ -33298,7 +34541,7 @@ mod tests {
         assert_eq!(controller.view.details_scroll, 17);
         assert_eq!(controller.view.selected_detail_link, Some(0));
         assert_eq!(controller.view.playback, playback);
-        assert!(controller.view.status_line.contains("selection ended"));
+        assert_eq!(controller.view.status_line, "Select mode ended");
 
         controller.view.details = None;
         controller.dispatch(UiAction::ToggleTextSelectionMode);
@@ -33743,6 +34986,45 @@ mod tests {
     }
 
     #[test]
+    fn history_finished_without_duration_and_partial_rows_keep_played_state() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        for (title, position_seconds, duration_seconds, finished, last_played_at) in [
+            ("Finished without duration", 0, None, true, 30),
+            ("Partially listened", 25, Some(100), false, 20),
+            ("Never listened", 0, Some(100), false, 10),
+        ] {
+            controller
+                .store
+                .insert_history(&HistoryEntry {
+                    id: 0,
+                    media_id: MediaId::new(SourceKind::RemoteFiles, title),
+                    title: title.to_owned(),
+                    replay_locator: Some(format!("https://media.example/{last_played_at}.opus")),
+                    started_at: last_played_at,
+                    last_played_at,
+                    position_seconds,
+                    duration_seconds,
+                    finished,
+                })
+                .expect("history fixture");
+        }
+
+        controller.populate_history();
+        let watched = |title: &str| {
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == title)
+                .map(|row| row.watched_percent)
+                .expect("History row")
+        };
+        assert_eq!(watched("Finished without duration"), 100);
+        assert_eq!(watched("Partially listened"), 25);
+        assert_eq!(watched("Never listened"), 0);
+    }
+
+    #[test]
     fn history_details_never_reuse_a_stale_tracker_result() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
         let stale_url =
@@ -33786,6 +35068,61 @@ mod tests {
             Some(MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"))
         );
         assert!(!details.description.contains(stale_url.as_str()));
+    }
+
+    #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
+    #[test]
+    fn history_waits_for_current_local_mov_duration_before_thumbnail() {
+        let temporary = tempfile::tempdir().expect("temporary History video directory");
+        let video = temporary.path().join("history.MOV");
+        std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.local_media_loader = Arc::new(FixedDurationLocalMediaLoader {
+            expected_path: video.clone(),
+            duration_seconds: 42,
+        });
+        controller
+            .store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(SourceKind::Local, video.display().to_string()),
+                title: "History MOV".to_owned(),
+                replay_locator: Some(video.display().to_string()),
+                started_at: 1,
+                last_played_at: 2,
+                position_seconds: 10,
+                duration_seconds: Some(121),
+                finished: false,
+            })
+            .expect("History MOV fixture");
+
+        controller.show_screen(Screen::History);
+
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_video_thumbnail.is_none()),
+            "persisted History duration must not create a thumbnail before current metadata"
+        );
+        assert_eq!(
+            controller.pending_local_media_metadata.as_deref(),
+            Some(video.as_path())
+        );
+        await_local_metadata(&mut controller);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.local_video_thumbnail.as_ref()),
+            Some(&LocalVideoThumbnailView {
+                path: video,
+                midpoint_millis: 21_000,
+            }),
+            "the current file duration must replace the persisted History duration"
+        );
     }
 
     #[test]
@@ -37405,9 +38742,17 @@ mod tests {
         };
         let (mut controller, state, _, events) =
             controller_with_mock_lifecycle([active], [PlaybackEvent::MediaLoaded]);
-        controller.play_queue_item(fixture_direct_item("first"), false);
+        let item = fixture_direct_item("first");
+        let media_id = item.media.id.clone();
+        controller.view.rows = vec![RowView {
+            media_id: Some(media_id.clone()),
+            title: item.media.title.clone(),
+            ..RowView::default()
+        }];
+        controller.play_queue_item(item, false);
 
         assert!(controller.view.status_line.starts_with("Loading first"));
+        assert!(!controller.view.rows[0].playback_started);
         assert!(
             controller
                 .store
@@ -37424,6 +38769,14 @@ mod tests {
                 .expect("history")
                 .is_empty()
         );
+        assert_eq!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("progress before accepted start"),
+            None,
+            "loading alone must not create watched state"
+        );
 
         events
             .lock()
@@ -37433,6 +38786,18 @@ mod tests {
 
         assert_eq!(controller.playback_phase, PlaybackPhase::Playing);
         assert_eq!(controller.view.status_line, "Playing first");
+        assert_eq!(controller.view.rows[0].watched_percent, 0);
+        assert!(
+            controller.view.rows[0].playback_started,
+            "an accepted start must become partial before one percent"
+        );
+        let progress = controller
+            .store
+            .progress(&media_id)
+            .expect("persisted accepted start")
+            .expect("zero-position progress row");
+        assert_eq!(progress.position_seconds, 0);
+        assert_eq!(progress.watched_percent(), 0);
         assert_eq!(
             controller.store.history(false, 10).expect("history").len(),
             1
@@ -37441,6 +38806,63 @@ mod tests {
         assert_eq!(
             commands.get(0..2),
             Some([PlayerCommand::SetVolume(80), PlayerCommand::SetSpeed(1.0)].as_slice())
+        );
+    }
+
+    #[test]
+    fn durable_checkpoints_update_regular_and_subscription_rows_until_completion() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(45),
+            duration: Some(Duration::from_secs(100)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let mut item = fixture_direct_item("progress");
+        item.media.duration_seconds = Some(100);
+        let media_id = item.media.id.clone();
+        let row = RowView {
+            media_id: Some(media_id.clone()),
+            title: item.media.title.clone(),
+            ..RowView::default()
+        };
+        controller.view.rows = vec![row.clone()];
+        controller.view.subscriptions.items = vec![row];
+
+        controller.play_queue_item(item, false);
+        controller.update_player();
+        assert_eq!(controller.playback_phase, PlaybackPhase::Playing);
+        assert!(controller.checkpoint_position());
+        assert_eq!(controller.view.rows[0].watched_percent, 45);
+        assert_eq!(
+            controller.view.subscriptions.items[0].watched_percent, 45,
+            "split Subscription rows must follow the same durable checkpoint"
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(controller.view.rows[0].watched_percent, 100);
+        assert_eq!(controller.view.subscriptions.items[0].watched_percent, 100);
+        assert_eq!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("completed progress lookup")
+                .map(|progress| progress.watched_percent()),
+            Some(100)
         );
     }
 
@@ -37524,7 +38946,14 @@ mod tests {
             [PlaybackEvent::MediaLoaded, PlaybackEvent::Ended(failure)],
         );
         controller.diagnostic_helpers_cache = Some(Vec::new());
-        controller.play_queue_item(fixture_direct_item("silent"), false);
+        let item = fixture_direct_item("silent");
+        let media_id = item.media.id.clone();
+        controller.view.rows = vec![RowView {
+            media_id: Some(media_id.clone()),
+            title: item.media.title.clone(),
+            ..RowView::default()
+        }];
+        controller.play_queue_item(item, false);
         controller
             .playback_queue
             .push(fixture_direct_item("second"));
@@ -37573,6 +39002,18 @@ mod tests {
                 .history(false, 10)
                 .expect("history")
                 .is_empty()
+        );
+        assert!(
+            controller
+                .store
+                .progress(&media_id)
+                .expect("failed-start progress lookup")
+                .is_none(),
+            "a backend failure before audible playback must not mark the item listened"
+        );
+        assert_eq!(
+            controller.view.rows[0].watched_percent, 0,
+            "the visible unwatched marker must remain authoritative after a failed start"
         );
     }
 
