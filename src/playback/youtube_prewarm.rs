@@ -896,8 +896,11 @@ mod tests {
     /// Waits for Linux to publish a killed fixture process as gone or zombie.
     ///
     /// A successful process-group signal can precede the target's final
-    /// `/proc` state transition, especially on a loaded CI host. Keeping this
-    /// wait bounded still detects a descendant that escaped termination.
+    /// `/proc` state transition, especially on a loaded CI host. The process
+    /// can also disappear after `/proc/<pid>/stat` is opened, making its read
+    /// fail with `ESRCH` instead of `ENOENT`. Both mean the descendant is gone.
+    /// Keeping this wait bounded still detects a descendant that escaped
+    /// termination.
     #[cfg(target_os = "linux")]
     fn assert_process_terminated(pid: &str) {
         let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
@@ -917,7 +920,12 @@ mod tests {
                         "a surviving descendant must be terminated; observed /proc state {state}"
                     );
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(Errno::SRCH.raw_os_error()) =>
+                {
+                    return;
+                }
                 Err(error) => panic!("read descendant process state: {error}"),
             }
             thread::sleep(Duration::from_millis(5));
