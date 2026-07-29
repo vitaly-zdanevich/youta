@@ -9428,10 +9428,10 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::PageDown if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
         }
-        KeyCode::PageUp if view.screen == Screen::Local => page_rows
+        KeyCode::PageUp if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
             .filter(|rows| *rows > 0)
             .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX))),
-        KeyCode::PageDown if view.screen == Screen::Local => page_rows
+        KeyCode::PageDown if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
             .filter(|rows| *rows > 0)
             .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX))),
         KeyCode::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
@@ -12082,7 +12082,7 @@ mod tests {
     }
 
     #[test]
-    fn local_page_keys_use_the_current_visible_capacity_and_keep_details_precedence() {
+    fn local_and_radio_page_keys_use_visible_capacity_and_keep_details_precedence() {
         let local = ViewModel {
             screen: Screen::Local,
             ..ViewModel::default()
@@ -12129,6 +12129,41 @@ mod tests {
             ),
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1))),
             "focused Details must retain PageDown before Local list paging"
+        );
+
+        let radio = ViewModel {
+            screen: Screen::Radio,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                &radio,
+                Some(11),
+                None,
+            ),
+            Some(UiAction::MoveSelection(-11))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &radio,
+                Some(11),
+                None,
+            ),
+            Some(UiAction::MoveSelection(11))
+        );
+
+        let youtube = ViewModel::default();
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &youtube,
+                Some(11),
+                None,
+            ),
+            None,
+            "the focused fix must not assign new paging semantics to unrelated screens"
         );
     }
 

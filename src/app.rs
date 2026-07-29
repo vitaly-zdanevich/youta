@@ -41247,6 +41247,31 @@ mod tests {
 
     #[cfg(feature = "radio")]
     #[test]
+    fn radio_page_selection_clamps_at_both_catalogue_boundaries() {
+        let config = Config::for_dir("/tmp/youta-radio-page-selection-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        assert!(controller.view.rows.len() > 20);
+
+        controller.dispatch(UiAction::MoveSelection(-11));
+        assert_eq!(controller.view.selected, 0);
+        controller.dispatch(UiAction::MoveSelection(11));
+        assert_eq!(controller.view.selected, 11);
+        controller.dispatch(UiAction::MoveSelection(i32::MAX));
+        assert_eq!(
+            controller.view.selected,
+            controller.view.rows.len().saturating_sub(1)
+        );
+        controller.dispatch(UiAction::MoveSelection(11));
+        assert_eq!(
+            controller.view.selected,
+            controller.view.rows.len().saturating_sub(1)
+        );
+    }
+
+    #[cfg(feature = "radio")]
+    #[test]
     fn radio_filter_cancel_restores_query_selection_and_details() {
         let config = Config::for_dir("/tmp/youta-radio-filter-cancel-test");
         let store = StateStore::open_in_memory().expect("in-memory state");
