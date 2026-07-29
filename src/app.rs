@@ -13668,7 +13668,7 @@ impl AppController {
                 .bbc_quality_cache
                 .get(station.id)
                 .map(CachedBbcQuality::display)
-                .unwrap_or_else(|| "resolved on play · current region".to_owned());
+                .unwrap_or_default();
         }
 
         radio_station_quality(station, false)
@@ -13816,17 +13816,11 @@ impl AppController {
         };
         self.remember_selected_radio_station();
         let mut description = station.summary.to_owned();
-        description.push_str("\n\nQuality: ");
-        #[cfg(feature = "bbc-radio")]
-        if let Some(quality) = self.bbc_quality_cache.get(station.id) {
-            description.push_str(&quality.display());
-        } else if bbc_station_by_id(station.id).is_some() {
-            description.push_str("resolved on play for the current region");
-        } else {
-            description.push_str(&radio_station_quality(&station, true));
+        let quality = self.radio_station_row_summary(&station);
+        if !quality.is_empty() {
+            description.push_str("\n\nQuality: ");
+            description.push_str(&quality);
         }
-        #[cfg(not(feature = "bbc-radio"))]
-        description.push_str(&radio_station_quality(&station, true));
         description.push_str("\nStream: ");
         description.push_str(station.stream);
         let selected_metadata = self
@@ -39330,9 +39324,17 @@ mod tests {
                     .is_some_and(|media_id| media_id.external_id == "bbc_radio_three")
             })
             .expect("BBC Radio 3 row");
-        assert_eq!(
-            initial_row.subtitle, "resolved on play · current region",
-            "region-specific BBC quality must not be reported as unknown"
+        assert!(
+            initial_row.subtitle.is_empty(),
+            "unresolved region-specific BBC quality must remain absent"
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.description.contains("Quality:")),
+            "unresolved BBC details must omit the complete quality row"
         );
 
         controller.play_queue_item(item.clone(), false);
