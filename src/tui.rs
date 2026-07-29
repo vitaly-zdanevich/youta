@@ -44,6 +44,7 @@ use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
 use crate::report_actions::system_url_opener_name;
+use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
@@ -550,6 +551,8 @@ pub struct SubscriptionsView {
     pub loading: bool,
     /// Human-readable source name included in the item-list heading.
     pub source_title: String,
+    /// Provider family controlling source-specific headings and actions.
+    pub source_kind: SubscriptionKind,
     /// Public subscriber count for the selected source, when exposed.
     pub source_subscriber_count: Option<u64>,
     /// Human-readable channel creation date, when exposed.
@@ -569,6 +572,7 @@ impl Default for SubscriptionsView {
             description_expanded: false,
             loading: false,
             source_title: String::new(),
+            source_kind: SubscriptionKind::YouTube,
             source_subscriber_count: None,
             source_created: String::new(),
         }
@@ -3676,7 +3680,7 @@ fn render_body(
             render_waveform(frame, panes[1], view, theme);
         }
         RightPanelMode::Channel => {
-            render_channel(
+            render_subscription_source_details(
                 frame,
                 panes[1],
                 view,
@@ -3921,7 +3925,7 @@ fn render_subscriptions_body(
             ) = render_row_list(
                 frame,
                 list_sections[0],
-                &subscription_videos_heading(subscriptions),
+                &subscription_items_heading(subscriptions),
                 &subscriptions.items,
                 false,
                 subscriptions.selected_item,
@@ -3937,6 +3941,7 @@ fn render_subscriptions_body(
                 false,
                 subscriptions.loading,
                 view.search_animation_frame,
+                subscriptions.source_kind,
                 show_hotkeys,
                 theme,
                 hit_map,
@@ -4036,6 +4041,7 @@ fn render_subscriptions_body(
                     true,
                     subscriptions.loading,
                     view.search_animation_frame,
+                    subscriptions.source_kind,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -4055,7 +4061,7 @@ fn render_subscriptions_body(
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(panes[1]);
-                let heading = subscription_videos_heading(subscriptions);
+                let heading = subscription_items_heading(subscriptions);
                 (
                     hit_map.subscription_item_rows,
                     hit_map.subscription_item_first_index,
@@ -4078,6 +4084,7 @@ fn render_subscriptions_body(
                     false,
                     subscriptions.loading,
                     view.search_animation_frame,
+                    subscriptions.source_kind,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -4127,19 +4134,28 @@ fn render_subscription_source_list(
     rendered
 }
 
-/// Builds the shared `YouTube` source heading for both subscription layouts.
-fn subscription_videos_heading(subscriptions: &SubscriptionsView) -> String {
-    let mut heading = if subscriptions.source_title.is_empty() {
-        "YouTube".to_owned()
-    } else {
-        format!("{} · YouTube", subscriptions.source_title)
+/// Builds the source-aware item heading for both subscription layouts.
+fn subscription_items_heading(subscriptions: &SubscriptionsView) -> String {
+    let provider = match subscriptions.source_kind {
+        SubscriptionKind::YouTube => "YouTube",
+        SubscriptionKind::Rss => "RSS/Atom",
+        SubscriptionKind::Other => "Subscription",
     };
-    if let Some(count) = subscriptions.source_subscriber_count {
+    let mut heading = if subscriptions.source_title.is_empty() {
+        provider.to_owned()
+    } else {
+        format!("{} · {provider}", subscriptions.source_title)
+    };
+    if subscriptions.source_kind == SubscriptionKind::YouTube
+        && let Some(count) = subscriptions.source_subscriber_count
+    {
         heading.push_str(" · ");
         heading.push_str(&format_count(count));
         heading.push_str(" subscribers");
     }
-    if !subscriptions.source_created.is_empty() {
+    if subscriptions.source_kind == SubscriptionKind::YouTube
+        && !subscriptions.source_created.is_empty()
+    {
         heading.push_str(" · created ");
         heading.push_str(&subscriptions.source_created);
     }
@@ -4153,6 +4169,7 @@ fn render_subscription_item_buttons(
     description_expanded: bool,
     loading: bool,
     animation_frame: usize,
+    source_kind: SubscriptionKind,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
@@ -4162,9 +4179,9 @@ fn render_subscription_item_buttons(
     }
     let refresh_label = if loading {
         let frame = ASCII_ACTIVITY_FRAMES[animation_frame % ASCII_ACTIVITY_FRAMES.len()];
-        format!("Refresh videos {frame}")
+        format!("Refresh {} {frame}", subscription_item_noun(source_kind))
     } else {
-        "Refresh videos".to_owned()
+        format!("Refresh {}", subscription_item_noun(source_kind))
     };
     let refresh = (
         button("R", &refresh_label, show_hotkeys),
@@ -4175,9 +4192,12 @@ fn render_subscription_item_buttons(
             button(
                 if description_expanded { "i/Esc" } else { "i" },
                 if description_expanded {
-                    "Back to videos"
+                    match source_kind {
+                        SubscriptionKind::Rss => "Back to episodes",
+                        _ => "Back to videos",
+                    }
                 } else {
-                    "Description"
+                    "Details"
                 },
                 show_hotkeys,
             ),
@@ -4203,6 +4223,14 @@ fn render_subscription_item_buttons(
         frame.render_widget(Paragraph::new(label).style(theme.accent), target);
         hit_map.detail_buttons.push((action, target));
         x = x.saturating_add(width).saturating_add(2);
+    }
+}
+
+/// Returns the plural item noun used by one subscription source.
+const fn subscription_item_noun(source_kind: SubscriptionKind) -> &'static str {
+    match source_kind {
+        SubscriptionKind::Rss => "episodes",
+        _ => "videos",
     }
 }
 
@@ -5628,6 +5656,44 @@ fn render_channel(
         " Channel ",
         "No channel is selected.",
         InformationPanelKind::Channel,
+        false,
+        thumbnail_height,
+        thumbnail_renderer,
+    );
+}
+
+/// Renders source metadata using the semantics of the selected OPML entry.
+fn render_subscription_source_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    thumbnail_height: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
+) {
+    let (empty_message, kind) = match view.subscriptions.source_kind {
+        SubscriptionKind::YouTube => ("No channel is selected.", InformationPanelKind::Channel),
+        SubscriptionKind::Rss => (
+            "No podcast feed is selected.",
+            InformationPanelKind::Podcast,
+        ),
+        SubscriptionKind::Other => (
+            "No subscription source is selected.",
+            InformationPanelKind::Generic,
+        ),
+    };
+    render_information_panel(
+        frame,
+        area,
+        view,
+        show_hotkeys,
+        theme,
+        hit_map,
+        "",
+        empty_message,
+        kind,
         false,
         thumbnail_height,
         thumbnail_renderer,
@@ -13165,7 +13231,7 @@ mod tests {
             "the global footer must advertise refresh while a channel is open"
         );
         assert!(
-            !rendered.contains("[i] Description"),
+            !rendered.contains("[i] Details"),
             "drill-down already renders Details beside the video list"
         );
         assert_eq!(
@@ -13204,7 +13270,7 @@ mod tests {
             "split subscription rows keep the same compact marker spacing"
         );
         assert!(rendered.contains("[R] Refresh videos"));
-        assert!(rendered.contains("[i] Description"));
+        assert!(rendered.contains("[i] Details"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleSubscriptionDescription)
@@ -13268,7 +13334,81 @@ mod tests {
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Fixture channel · YouTube"));
         assert!(!rendered.contains("Fixture channel · YouTube · "));
-        assert!(rendered.contains("[i] Description"));
+        assert!(rendered.contains("[i] Details"));
+    }
+
+    #[test]
+    fn rss_subscription_rows_use_episode_labels_and_podcast_details() {
+        let backend = TestBackend::new(140, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let episode_id = MediaId::new(SourceKind::Rss, "rss-v1-fixture");
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            details: Some(DetailView {
+                media_id: Some(episode_id.clone()),
+                title: "Fixture RSS episode".to_owned(),
+                source: "RSS podcast".to_owned(),
+                description: "Fixture episode description".to_owned(),
+                length: "12:34".to_owned(),
+                ..DetailView::default()
+            }),
+            subscriptions: SubscriptionsView {
+                route: SubscriptionRoute::Items,
+                focus: SubscriptionPane::Items,
+                source_title: "Fixture RSS show".to_owned(),
+                source_kind: SubscriptionKind::Rss,
+                source_subscriber_count: Some(99_999),
+                items: vec![RowView {
+                    media_id: Some(episode_id),
+                    title: "Fixture RSS episode".to_owned(),
+                    subtitle: "2026 July 30 (today) · 12:34".to_owned(),
+                    source: "RSS podcast".to_owned(),
+                    compact: true,
+                    ..RowView::default()
+                }],
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw RSS episode route");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Fixture RSS show · RSS/Atom"));
+        assert!(rendered.contains("Fixture RSS episode"));
+        assert!(rendered.contains("[R] Refresh episodes"));
+        assert!(!rendered.contains("subscribers"));
+        assert!(!rendered.contains("Refresh videos"));
+
+        view.subscriptions.route = SubscriptionRoute::Sources;
+        view.subscriptions.focus = SubscriptionPane::Sources;
+        view.subscriptions.sources = vec![RowView {
+            title: "Portable fixture title".to_owned(),
+            subtitle: "https://podcasts.example/feed.xml".to_owned(),
+            source: "RSS podcast".to_owned(),
+            subscribed: true,
+            ..RowView::default()
+        }];
+        view.details = Some(DetailView {
+            title: "Fixture RSS show".to_owned(),
+            source: "RSS podcast".to_owned(),
+            description: "Authors: Fixture host\nEpisodes: 1".to_owned(),
+            links: vec![DetailLinkView {
+                label: "Podcast website".to_owned(),
+                url: "https://podcasts.example/show".to_owned(),
+                wikidata_item_id: None,
+            }],
+            ..DetailView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw RSS source route");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Authors: Fixture host"));
+        assert!(!rendered.contains("Subscribers:"));
+        assert!(!rendered.contains("xdg-open channel"));
     }
 
     #[test]

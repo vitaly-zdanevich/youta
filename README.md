@@ -896,9 +896,14 @@ At the Subscriptions source root, `[a] Add RSS feed` accepts an absolute
 HTTP(S) RSS or Atom URL without an embedded username or password. Youta removes
 the URL fragment and saves the subscription to the private portable OPML file
 shown in the popup. Query parameters are preserved because some private feeds
-use them for access; the popup redacts the draft URL from debug output. This
-currently saves and displays the source subscription only—RSS episode browsing
-inside the Subscriptions screen is not implemented yet.
+use them for access; the popup redacts the draft URL from debug output. Opening
+the saved source parses its RSS or Atom feed on an isolated worker, shows
+playable audio/video episodes, and starts the preferred media enclosure on
+`Enter`. A bounded snapshot is reused across restarts and refreshed in the
+background, so cached episodes remain visible while the network request runs.
+Feed artwork, publisher metadata, episode descriptions, dates, and durations
+are shown when the feed supplies them. Enclosure URLs are treated as transient
+playback data and are not written to the restart snapshot.
 
 YouTube subscriptions are currently local-only channel subscriptions. Choosing
 `Subscribe (locally)` while a video is selected adds its channel to Youta's
@@ -934,23 +939,24 @@ aliases when the terminal reports those combinations distinctly. Uppercase
 subscription-source root. Youta provides two layouts:
 
 - `drill-down` is the default for narrow terminals. Sources appear on the
-  left with channel information on the right. Press `Enter` to activate the
-  selected YouTube channel, render any restart snapshot, and refresh its videos
-  in the usual list-and-Details view; `Backspace` or `Esc` returns to the source
-  list. While inside the channel, `[R] Refresh videos` requests its first page
-  again.
-- `split` keeps sources on the left and the selected source's videos on the
-  right. Moving across sources uses only cached rows and makes no provider
-  request; press `Enter` to activate the source, loading it initially or
-  refreshing its cached first page, and move into its videos. The
-  `[i] Description` button expands the selected video's Details; `[i]` or
-  `Esc` returns to the video list. `[R] Refresh videos` is available after the
-  source has been opened.
+  left with channel or podcast information on the right. Press `Enter` to
+  activate the selected source, render any restart snapshot, and refresh its
+  videos or episodes in the usual list-and-Details view; `Backspace` or `Esc`
+  returns to the source list. `[R] Refresh videos` requests a YouTube channel's
+  first page again, while `[R] Refresh episodes` reloads an RSS or Atom feed.
+- `split` keeps sources on the left and the selected source's videos or
+  episodes on the right. Moving across sources uses only cached rows and makes
+  no provider request; press `Enter` to activate the source, loading it
+  initially or refreshing its cache, and move into its items. The `[i] Details`
+  button replaces the item list with the selected item's Details; `[i]` or
+  `Esc` returns to the item list. The source-aware `[R]` refresh action is
+  available after the source has been opened.
 
-Refresh deliberately bypasses the process-local channel-list cache so newly
-published videos can appear. The current rows remain visible while the request
-runs, and Youta restores the selected video by provider ID when it is still in
-the refreshed result; a refresh failure also leaves the existing rows intact.
+Refresh deliberately bypasses the process-local item cache so newly published
+videos or episodes can appear. The current rows remain visible while the
+request runs, and Youta restores the selected item by its stable source identity
+when it is still in the refreshed result; a refresh failure also leaves the
+existing rows intact.
 
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and

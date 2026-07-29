@@ -458,6 +458,48 @@ pub struct ChannelSummary {
     pub webpage_url: Option<Url>,
 }
 
+/// Compact RSS/Atom episode metadata suitable for subscription snapshots.
+///
+/// The direct enclosure is transient and cleared before a restart snapshot is
+/// persisted. Feed and episode pages, descriptive metadata, and the
+/// feed-scoped identifier remain sufficient for an immediate stale view while
+/// a fresh feed request resolves the current enclosure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PodcastEpisodeSummary {
+    /// Exact normalized feed URL that scopes the episode GUID.
+    pub feed_url: Url,
+    /// Stable feed-supplied or deterministically generated episode identifier.
+    pub episode_id: String,
+    /// Feed title displayed in source-neutral contexts.
+    pub feed_title: String,
+    /// Original publisher title.
+    pub title: String,
+    /// Publisher or episode authors in source order.
+    pub authors: Vec<String>,
+    /// Episode description.
+    pub description: String,
+    /// Episode language tag, when supplied.
+    pub language: Option<String>,
+    /// Publisher categories in source order.
+    pub categories: Vec<String>,
+    /// Duration in whole seconds, when supplied.
+    pub duration_seconds: Option<u64>,
+    /// Unix publication timestamp, when supplied.
+    pub published_at: Option<i64>,
+    /// Canonical episode page, when supplied.
+    pub webpage_url: Option<Url>,
+    /// Canonical feed publisher page, when supplied.
+    pub feed_webpage_url: Option<Url>,
+    /// Episode or feed artwork.
+    pub artwork_url: Option<Url>,
+    /// Current playable enclosure. Cleared in restart snapshots.
+    pub stream_url: Option<Url>,
+    /// Advertised MIME type for the selected enclosure.
+    pub stream_mime_type: Option<String>,
+    /// Advertised byte length for the selected enclosure.
+    pub stream_byte_length: Option<u64>,
+}
+
 /// Full public metadata loaded for one selected channel.
 ///
 /// The compact [`ChannelSummary`] remains stable for search results and old
@@ -521,6 +563,8 @@ pub enum SearchItem {
     Video(VideoSummary),
     /// A channel result.
     Channel(ChannelSummary),
+    /// An RSS, Atom, or JSON Feed podcast episode.
+    PodcastEpisode(PodcastEpisodeSummary),
 }
 
 /// A page of search results.

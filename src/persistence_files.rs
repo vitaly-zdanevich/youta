@@ -3809,6 +3809,7 @@ fn remap_search_item(
                 Ok(false)
             }
         }
+        SearchItem::PodcastEpisode(_) => Ok(false),
     }
 }
 

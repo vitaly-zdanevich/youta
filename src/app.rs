@@ -20,6 +20,7 @@ use std::sync::Mutex;
 #[cfg(any(
     feature = "apple-podcasts",
     feature = "bandcamp",
+    feature = "rss",
     feature = "youtube-music"
 ))]
 use std::sync::atomic::AtomicBool;
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-#[cfg(any(feature = "apple-podcasts", feature = "yt-dlp"))]
+#[cfg(any(feature = "apple-podcasts", feature = "rss", feature = "yt-dlp"))]
 use crossbeam_channel::{TrySendError, bounded};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -116,16 +117,20 @@ use crate::providers::radio::{
     RadioNowPlayingKind, RadioStationPreset, all_stations as curated_radio_stations,
     station_by_id as curated_radio_station_by_id, station_count as curated_radio_station_count,
 };
+#[cfg(feature = "rss")]
+use crate::providers::rss::{
+    PodcastEpisode, PodcastFeed, RssPodcastProvider, podcast_episode_external_id,
+};
 #[cfg(feature = "youtube-music")]
 use crate::providers::youtube_music::{
     YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
 };
 use crate::providers::{
     ChannelDetails, ChannelExternalLinkKind, ChannelStatisticsMode, ChannelSubscriberCount,
-    ChannelSummary, ChannelVideosRequest, Provider, SearchFeature, SearchItem, SearchPage,
-    SearchRequest, SearchSort as ProviderSearchSort, SearchTarget, Thumbnail, VideoDetails,
-    VideoOrientation, VideoSummary, invidious_youtube_provider, official_youtube_provider,
-    validate_youtube_video_id,
+    ChannelSummary, ChannelVideosRequest, PodcastEpisodeSummary, Provider, SearchFeature,
+    SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort, SearchTarget,
+    Thumbnail, VideoDetails, VideoOrientation, VideoSummary, invidious_youtube_provider,
+    official_youtube_provider, validate_youtube_video_id,
 };
 use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
@@ -1216,6 +1221,11 @@ enum ProviderRequest {
         country: String,
         collection_id: u64,
     },
+    #[cfg(feature = "rss")]
+    RssFeed {
+        generation: u64,
+        source_url: url::Url,
+    },
     ChannelVideos {
         generation: u64,
         request: ChannelVideosRequest,
@@ -1417,6 +1427,30 @@ enum YouTubeMusicProviderRequest {
     Search { generation: u64, query: String },
 }
 
+/// One latest-only podcast-feed request isolated from YouTube traffic.
+#[cfg(feature = "rss")]
+enum RssProviderRequest {
+    /// Fetches and normalizes one RSS, Atom, or JSON Feed document.
+    Fetch {
+        generation: u64,
+        source_url: url::Url,
+    },
+}
+
+/// Blocking RSS feed surface owned by its isolated worker.
+#[cfg(feature = "rss")]
+trait RssFeedClient: Send {
+    /// Fetches one bounded normalized podcast feed.
+    fn fetch(&self, source_url: &url::Url) -> Result<PodcastFeed, String>;
+}
+
+#[cfg(feature = "rss")]
+impl RssFeedClient for RssPodcastProvider {
+    fn fetch(&self, source_url: &url::Url) -> Result<PodcastFeed, String> {
+        RssPodcastProvider::fetch(self, source_url).map_err(|error| error.to_string())
+    }
+}
+
 /// Blocking YouTube Music search surface owned by its isolated worker.
 #[cfg(feature = "youtube-music")]
 trait YouTubeMusicSearchProvider: Send {
@@ -1461,6 +1495,12 @@ enum ProviderResponse {
         generation: u64,
         collection_id: u64,
         result: Result<ResolvedApplePodcastShow, String>,
+    },
+    #[cfg(feature = "rss")]
+    RssFeed {
+        generation: u64,
+        requested_url: url::Url,
+        result: Result<PodcastFeed, String>,
     },
     ChannelVideos {
         generation: u64,
@@ -2106,11 +2146,11 @@ enum BandcampResolutionOwner {
     Playlist(Box<PlaylistEntry>),
 }
 
-/// Maximum channel collections retained by the process-local LRU cache.
+/// Maximum subscription collections retained by the process-local LRU cache.
 const MAX_CACHED_SUBSCRIPTION_CHANNELS: usize = 24;
-/// Maximum playable summaries retained for one subscribed channel.
+/// Maximum playable summaries retained for one subscribed source.
 const MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL: usize = 250;
-/// Approximate heap budget shared by all process-local channel summaries.
+/// Approximate heap budget shared by all process-local subscription summaries.
 const MAX_CACHED_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 /// Description excerpt retained until the selected-video details request wins.
 const MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES: usize = 4 * 1024;
@@ -2289,6 +2329,44 @@ struct PendingSubscriptionRefresh {
     /// follows a disk-cache restore keeps usable cached rows visible and
     /// reports only a concise status.
     report_errors: bool,
+}
+
+/// Selection identity retained while one RSS feed refreshes in the background.
+#[cfg(feature = "rss")]
+#[derive(Debug)]
+struct PendingRssSubscriptionRefresh {
+    /// Exact normalized feed URL whose response may replace cached episodes.
+    source_url: String,
+    /// Feed-scoped episode identity reselected after a successful refresh.
+    selected_external_id: Option<String>,
+    /// Previous index used when the selected episode disappeared.
+    fallback_index: usize,
+    /// Whether a failed refresh should interrupt cached rows with a popup.
+    report_errors: bool,
+}
+
+/// Feed-level metadata retained separately from compact episode snapshots.
+#[cfg(feature = "rss")]
+#[derive(Clone, Debug)]
+struct CachedRssFeedInfo {
+    /// Publisher title, when supplied.
+    title: Option<String>,
+    /// Publisher description.
+    description: Option<String>,
+    /// Publisher authors in source order.
+    authors: Vec<String>,
+    /// Feed language tag.
+    language: Option<String>,
+    /// Publisher categories in source order.
+    categories: Vec<String>,
+    /// Last publisher update timestamp in RFC 3339 form.
+    updated_at: Option<String>,
+    /// Public publisher page.
+    webpage_url: Option<url::Url>,
+    /// Feed artwork.
+    artwork_url: Option<url::Url>,
+    /// Number of entries returned by the current feed.
+    episode_count: usize,
 }
 
 /// Maximum number of internal Details pages retained in either direction.
@@ -2636,10 +2714,19 @@ pub struct AppController {
     subscription_cache_order: VecDeque<String>,
     /// Channel whose cached rows and in-flight response own the item pane.
     active_subscription_channel_id: Option<String>,
+    /// RSS feed whose cached rows and in-flight response own the item pane.
+    #[cfg(feature = "rss")]
+    active_subscription_rss_url: Option<String>,
     /// Generation rejecting responses queued for an older source selection.
     subscription_generation: u64,
     /// Selection restored after an explicit page-one refresh completes.
     pending_subscription_refresh: Option<PendingSubscriptionRefresh>,
+    /// RSS refresh selection restored after one whole-feed replacement.
+    #[cfg(feature = "rss")]
+    pending_rss_subscription_refresh: Option<PendingRssSubscriptionRefresh>,
+    /// Process-local feed metadata keyed by exact normalized source URL.
+    #[cfg(feature = "rss")]
+    rss_feed_info_cache: HashMap<String, CachedRssFeedInfo>,
     next_youtube_page: Option<u32>,
     youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
@@ -2848,6 +2935,8 @@ impl AppController {
         #[cfg(feature = "bandcamp")]
         let bandcamp_search_client: Box<dyn BandcampSearchProvider> =
             Box::new(BandcampSearchClient::new());
+        #[cfg(feature = "rss")]
+        let rss_client: Box<dyn RssFeedClient> = Box::new(RssPodcastProvider::new());
         #[cfg(feature = "youtube-music")]
         let youtube_music_client: Box<dyn YouTubeMusicSearchProvider> =
             Box::new(YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
@@ -2869,6 +2958,8 @@ impl AppController {
                     apple_client,
                     #[cfg(feature = "bandcamp")]
                     bandcamp_search_client,
+                    #[cfg(feature = "rss")]
+                    rss_client,
                     #[cfg(feature = "youtube-music")]
                     youtube_music_client,
                     provider_storage_root,
@@ -3263,8 +3354,14 @@ impl AppController {
             subscription_video_cache: HashMap::new(),
             subscription_cache_order: VecDeque::new(),
             active_subscription_channel_id: None,
+            #[cfg(feature = "rss")]
+            active_subscription_rss_url: None,
             subscription_generation: 0,
             pending_subscription_refresh: None,
+            #[cfg(feature = "rss")]
+            pending_rss_subscription_refresh: None,
+            #[cfg(feature = "rss")]
+            rss_feed_info_cache: HashMap::new(),
             // Official YouTube pagination uses opaque tokens retained only by
             // the live provider. Restored rows remain instant and safe, while
             // a new explicit search rebuilds the continuation chain.
@@ -4993,6 +5090,7 @@ impl AppController {
         let channel_id = match selected {
             SearchItem::Video(video) => &video.channel_id,
             SearchItem::Channel(channel) => &channel.channel_id,
+            SearchItem::PodcastEpisode(_) => return,
         };
         if channel_id.is_empty() {
             return;
@@ -5419,6 +5517,24 @@ impl AppController {
         }
     }
 
+    /// Applies loaded podcast artwork without changing the portable OPML URL.
+    #[cfg(feature = "rss")]
+    fn apply_rss_artwork_to_subscription_source(
+        &mut self,
+        source_url: &str,
+        artwork_url: Option<url::Url>,
+    ) {
+        let Some(index) = self.subscription_entries.iter().position(|entry| {
+            entry.subscription.kind == SubscriptionKind::Rss
+                && entry.subscription.url.as_str() == source_url
+        }) else {
+            return;
+        };
+        if let Some(row) = self.view.subscriptions.sources.get_mut(index) {
+            row.thumbnail_url = artwork_url;
+        }
+    }
+
     #[cfg(feature = "wikidata")]
     fn request_selected_wikidata(&mut self, selected: &SearchItem) {
         use crate::providers::wikidata::WikidataExternalKind;
@@ -5434,6 +5550,12 @@ impl AppController {
                 self.invalidate_wikidata_lookup();
                 if let Some(details) = self.view.details.as_mut() {
                     details.wikidata = "channel ID unavailable".to_owned();
+                }
+            }
+            SearchItem::PodcastEpisode(_) => {
+                self.invalidate_wikidata_lookup();
+                if let Some(details) = self.view.details.as_mut() {
+                    details.wikidata.clear();
                 }
             }
         }
@@ -5918,6 +6040,125 @@ impl AppController {
                     }
                     Err(error) => {
                         self.show_error_message("Apple Podcasts episodes failed", error);
+                    }
+                }
+            }
+            #[cfg(feature = "rss")]
+            ProviderResponse::RssFeed {
+                generation,
+                requested_url,
+                result,
+            } => {
+                let source_url = requested_url.to_string();
+                if generation != self.subscription_generation
+                    || self.active_subscription_rss_url.as_deref() != Some(source_url.as_str())
+                {
+                    return;
+                }
+                self.view.subscriptions.loading = false;
+                let pending = self
+                    .pending_rss_subscription_refresh
+                    .take()
+                    .filter(|pending| pending.source_url == source_url);
+                match result {
+                    Ok(feed) => {
+                        let mut items = feed
+                            .episodes
+                            .iter()
+                            .map(|episode| {
+                                SearchItem::PodcastEpisode(podcast_episode_summary(
+                                    &feed,
+                                    episode,
+                                    &requested_url,
+                                ))
+                            })
+                            .take(MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
+                            .collect::<Vec<_>>();
+                        for item in &mut items {
+                            compact_subscription_item(item);
+                        }
+                        self.rss_feed_info_cache.insert(
+                            source_url.clone(),
+                            CachedRssFeedInfo {
+                                title: feed.title.clone(),
+                                description: feed.description.clone(),
+                                authors: feed.authors.clone(),
+                                language: feed.language.clone(),
+                                categories: feed.categories.clone(),
+                                updated_at: feed.updated_at.clone(),
+                                webpage_url: feed.webpage_url.clone(),
+                                artwork_url: feed.artwork_url.clone(),
+                                episode_count: feed.episodes.len(),
+                            },
+                        );
+                        self.apply_rss_artwork_to_subscription_source(
+                            &source_url,
+                            feed.artwork_url.clone(),
+                        );
+                        self.subscription_video_cache.insert(
+                            source_url.clone(),
+                            CachedSubscriptionVideos {
+                                items,
+                                next_page: None,
+                                consecutive_empty_pages: 0,
+                            },
+                        );
+                        self.touch_subscription_cache(&source_url);
+                        self.enforce_subscription_cache_byte_budget(&source_url);
+                        if let Err(error) = self.persist_rss_subscription_snapshot(&source_url) {
+                            self.show_error("Could not save cached podcast episodes", &error);
+                        }
+                        self.refresh_subscription_video_rows();
+                        if let Some(pending) = pending {
+                            let items = self
+                                .subscription_video_cache
+                                .get(&source_url)
+                                .map_or(&[][..], |cached| cached.items.as_slice());
+                            self.view.subscriptions.selected_item = pending
+                                .selected_external_id
+                                .as_deref()
+                                .and_then(|external_id| {
+                                    items.iter().position(|item| {
+                                        subscription_item_media_id(item).as_ref().is_some_and(
+                                            |media_id| media_id.external_id == external_id,
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|| {
+                                    pending.fallback_index.min(items.len().saturating_sub(1))
+                                });
+                        }
+                        if let Some(title) = feed.title.as_deref().filter(|title| !title.is_empty())
+                        {
+                            self.view.subscriptions.source_title = title.to_owned();
+                        }
+                        if self.view.subscriptions.focus == SubscriptionPane::Items
+                            || self.view.subscriptions.route == SubscriptionRoute::Items
+                        {
+                            self.update_selected_rss_episode_detail();
+                        } else {
+                            self.update_selected_subscription_source();
+                        }
+                        let count = self.view.subscriptions.items.len();
+                        self.view.status_line = format!(
+                            "{count} podcast episode{} loaded for {}",
+                            if count == 1 { "" } else { "s" },
+                            self.view.subscriptions.source_title
+                        );
+                        self.refresh_selected_playlist_state();
+                    }
+                    Err(error) => {
+                        let cached = self.subscription_video_cache.contains_key(&source_url);
+                        let report_errors =
+                            pending.as_ref().is_none_or(|pending| pending.report_errors);
+                        if report_errors || !cached {
+                            self.show_error_message("Podcast episodes failed", error);
+                        } else {
+                            self.view.status_line = format!(
+                                "Showing cached episodes for {}; background refresh failed",
+                                self.view.subscriptions.source_title
+                            );
+                        }
                     }
                 }
             }
@@ -8764,7 +9005,18 @@ impl AppController {
                     Ok(self.selected_video_queue_item(video, self.selected_start_override))
                 }
                 Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
-                None => Err("No subscription video is selected".to_owned()),
+                Some(SearchItem::PodcastEpisode(episode)) => {
+                    #[cfg(feature = "rss")]
+                    {
+                        queue_item_from_podcast_episode(episode)
+                    }
+                    #[cfg(not(feature = "rss"))]
+                    {
+                        let _ = episode;
+                        Err("This build omits RSS subscription support".to_owned())
+                    }
+                }
+                None => Err("No subscription item is selected".to_owned()),
             };
         }
         if !matches!(self.view.screen, Screen::Search | Screen::YouTubeMusic) {
@@ -8777,6 +9029,9 @@ impl AppController {
                 }
                 Some(SearchItem::Channel(_)) => {
                     Err("YouTube Music channels cannot be queued".to_owned())
+                }
+                Some(SearchItem::PodcastEpisode(_)) => {
+                    Err("Podcast episodes are not YouTube Music results".to_owned())
                 }
                 None => Err("No playable YouTube Music track is selected".to_owned()),
             };
@@ -8803,6 +9058,9 @@ impl AppController {
                 Ok(self.selected_video_queue_item(video, self.selected_start_override))
             }
             Some(SearchItem::Channel(_)) => Err("YouTube channels cannot be queued".to_owned()),
+            Some(SearchItem::PodcastEpisode(_)) => {
+                Err("Podcast episodes are not YouTube search results".to_owned())
+            }
             None => Err("No playable item is selected".to_owned()),
         }
     }
@@ -9012,6 +9270,10 @@ impl AppController {
                     MediaId::new(SourceKind::YouTube, &video.video_id),
                     video.title.clone(),
                 )),
+                SearchItem::PodcastEpisode(episode) => {
+                    subscription_item_media_id(self.selected_subscription_item()?)
+                        .map(|media_id| (media_id, episode.title.clone()))
+                }
                 SearchItem::Channel(_) => None,
             };
         }
@@ -9210,6 +9472,13 @@ impl AppController {
                             },
                             label: channel.name.clone(),
                         }),
+                        SearchItem::PodcastEpisode(episode) => subscription_item_media_id(
+                            self.selected_subscription_item()?,
+                        )
+                        .map(|media_id| PrivateNoteSelection {
+                            target: CommentTarget::Media { media_id },
+                            label: episode.title.clone(),
+                        }),
                     };
                 }
                 let subscription = &self
@@ -9376,6 +9645,7 @@ impl AppController {
                             },
                             label: channel.name.clone(),
                         }),
+                        SearchItem::PodcastEpisode(_) => None,
                     };
                 }
                 let details = self.view.details.as_ref()?;
@@ -10232,7 +10502,8 @@ impl AppController {
                     self.load_selected_subscription_videos();
                     if self.view.subscriptions.loading {
                         self.view.status_line = format!(
-                            "Loading videos for {}…",
+                            "Loading {} for {}…",
+                            subscription_item_kind_label(self.view.subscriptions.source_kind),
                             self.view.subscriptions.source_title
                         );
                     }
@@ -10244,10 +10515,16 @@ impl AppController {
                     self.load_selected_subscription_videos();
                     if self.view.subscriptions.items.is_empty() && !self.view.subscriptions.loading
                     {
-                        self.view.status_line =
-                            "This subscription has no loaded playable videos".to_owned();
+                        self.view.status_line = format!(
+                            "This subscription has no loaded playable {}",
+                            subscription_item_kind_label(self.view.subscriptions.source_kind)
+                        );
                     } else if !self.view.subscriptions.items.is_empty() {
-                        self.request_selected_details();
+                        if self.view.subscriptions.source_kind == SubscriptionKind::Rss {
+                            self.update_selected_rss_episode_detail();
+                        } else {
+                            self.request_selected_details();
+                        }
                     }
                     return;
                 }
@@ -10258,8 +10535,10 @@ impl AppController {
             {
                 self.load_next_subscription_page_if_needed();
                 if !self.view.subscriptions.loading {
-                    self.view.status_line =
-                        "This subscription has no loaded playable videos".to_owned();
+                    self.view.status_line = format!(
+                        "This subscription has no loaded playable {}",
+                        subscription_item_kind_label(self.view.subscriptions.source_kind)
+                    );
                 }
                 return;
             }
@@ -11142,6 +11421,11 @@ impl AppController {
                 channel.description,
                 youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url),
             ),
+            SearchItem::PodcastEpisode(_) => {
+                self.view.status_line =
+                    "Podcast episodes do not have YouTube channel information".to_owned();
+                return;
+            }
         };
         self.details_generation = self.details_generation.wrapping_add(1);
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
@@ -11601,7 +11885,10 @@ impl AppController {
                 self.view.subscriptions.description_expanded = false;
                 self.view.subscriptions.focus = SubscriptionPane::Items;
                 self.view.details_focused = false;
-                self.view.status_line = "Returned to subscription videos".to_owned();
+                self.view.status_line = format!(
+                    "Returned to subscription {}",
+                    subscription_item_kind_label(self.view.subscriptions.source_kind)
+                );
                 self.refresh_selected_playlist_state();
                 return;
             }
@@ -14219,6 +14506,11 @@ impl AppController {
         self.view.subscriptions.items.clear();
         self.view.subscriptions.selected_item = 0;
         self.active_subscription_channel_id = None;
+        #[cfg(feature = "rss")]
+        {
+            self.active_subscription_rss_url = None;
+            self.pending_rss_subscription_refresh = None;
+        }
         self.pending_subscription_refresh = None;
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
@@ -14300,6 +14592,7 @@ impl AppController {
             return;
         };
         let subscription = entry.subscription;
+        self.view.subscriptions.source_kind = subscription.kind;
         let channel_id = subscription.youtube_channel_id().unwrap_or_default();
         let channel_webpage_url = (subscription.kind == SubscriptionKind::YouTube)
             .then(|| {
@@ -14308,7 +14601,26 @@ impl AppController {
                 })
             })
             .flatten();
-        self.view.subscriptions.source_title = subscription.title.clone();
+        #[cfg(feature = "rss")]
+        let rss_info = (subscription.kind == SubscriptionKind::Rss)
+            .then(|| {
+                self.rss_feed_info_cache
+                    .get(subscription.url.as_str())
+                    .cloned()
+            })
+            .flatten();
+        #[cfg(not(feature = "rss"))]
+        let rss_info: Option<()> = None;
+        #[cfg(feature = "rss")]
+        let source_title = rss_info
+            .as_ref()
+            .and_then(|info| info.title.as_deref())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&subscription.title)
+            .to_owned();
+        #[cfg(not(feature = "rss"))]
+        let source_title = subscription.title.clone();
+        self.view.subscriptions.source_title = source_title.clone();
         let cached_subscribers = self
             .channel_subscriber_cache
             .get(&channel_id)
@@ -14316,22 +14628,59 @@ impl AppController {
             .flatten();
         self.view.subscriptions.source_subscriber_count = cached_subscribers;
         self.view.subscriptions.source_created.clear();
+        #[cfg(feature = "rss")]
+        let description = if let Some(info) = rss_info.as_ref() {
+            rss_feed_detail_text(info, subscription.description.as_deref())
+        } else {
+            subscription.description.clone().unwrap_or_else(|| {
+                if subscription.kind == SubscriptionKind::YouTube {
+                    "Loading channel description…".to_owned()
+                } else {
+                    "Press Enter to load episodes".to_owned()
+                }
+            })
+        };
+        #[cfg(not(feature = "rss"))]
+        let description = subscription.description.clone().unwrap_or_else(|| {
+            if subscription.kind == SubscriptionKind::YouTube {
+                "Loading channel description…".to_owned()
+            } else {
+                "Press Enter to load episodes".to_owned()
+            }
+        });
+        #[cfg(feature = "rss")]
+        let links = rss_info
+            .as_ref()
+            .and_then(|info| info.webpage_url.as_ref())
+            .map(|url| {
+                vec![DetailLinkView {
+                    label: "Podcast website".to_owned(),
+                    url: url.to_string(),
+                    wikidata_item_id: None,
+                }]
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "rss"))]
+        let links = Vec::new();
         self.view.details = Some(DetailView {
-            title: subscription.title.clone(),
+            title: source_title.clone(),
             source: subscription_kind_label(subscription.kind).to_owned(),
-            channel_name: subscription.title,
+            channel_name: source_title,
             channel_id: channel_id.clone(),
             channel_webpage_url,
             channel_subscribed: true,
             channel_subscriber_count: cached_subscribers,
-            description: subscription
-                .description
-                .unwrap_or_else(|| "Loading channel description…".to_owned()),
+            description,
+            #[cfg(feature = "rss")]
+            thumbnail_url: rss_info.as_ref().and_then(|info| info.artwork_url.clone()),
+            links,
             ..DetailView::default()
         });
         self.view.right_panel_mode = RightPanelMode::Channel;
         self.view.details_scroll = 0;
-        self.schedule_selected_subscription_channel_details(Instant::now());
+        if subscription.kind == SubscriptionKind::YouTube {
+            self.schedule_selected_subscription_channel_details(Instant::now());
+        }
     }
 
     fn select_subscription_source(&mut self, index: usize) {
@@ -14348,6 +14697,11 @@ impl AppController {
         self.view.subscriptions.items.clear();
         self.view.selected_detail_link = None;
         self.active_subscription_channel_id = None;
+        #[cfg(feature = "rss")]
+        {
+            self.active_subscription_rss_url = None;
+            self.pending_rss_subscription_refresh = None;
+        }
         self.pending_subscription_refresh = None;
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
@@ -14369,10 +14723,35 @@ impl AppController {
         else {
             return;
         };
+        #[cfg(feature = "rss")]
+        if entry.subscription.kind == SubscriptionKind::Rss {
+            let source_url = entry.subscription.url.to_string();
+            self.active_subscription_rss_url = Some(source_url.clone());
+            self.restore_rss_subscription_snapshot(&source_url);
+            if self.subscription_video_cache.contains_key(&source_url) {
+                self.touch_subscription_cache(&source_url);
+                self.refresh_subscription_video_rows();
+                self.view.status_line = format!(
+                    "{} cached episode{} for {}",
+                    self.view.subscriptions.items.len(),
+                    if self.view.subscriptions.items.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    self.view.subscriptions.source_title
+                );
+            } else {
+                self.view.status_line = format!(
+                    "Press Enter to load episodes for {}",
+                    self.view.subscriptions.source_title
+                );
+            }
+            return;
+        }
         if entry.subscription.kind != SubscriptionKind::YouTube {
             self.view.status_line =
-                "This source is retained in OPML; its episode list is not implemented yet"
-                    .to_owned();
+                "This subscription format has no episode provider in this build".to_owned();
             return;
         }
         let Some(channel_id) = entry.subscription.youtube_channel_id() else {
@@ -14413,7 +14792,7 @@ impl AppController {
             .selected_subscription_item()
             .and_then(|item| match item {
                 SearchItem::Video(video) => Some(video.video_id.clone()),
-                SearchItem::Channel(_) => None,
+                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
             });
         if let Some(pending) = self.pending_subscription_refresh.as_mut()
             && self.active_subscription_channel_id.as_deref() == Some(pending.channel_id.as_str())
@@ -14425,7 +14804,14 @@ impl AppController {
         }
         self.view.subscriptions.focus = SubscriptionPane::Items;
         self.view.right_panel_mode = RightPanelMode::Details;
-        self.request_selected_details();
+        if matches!(
+            self.selected_subscription_item(),
+            Some(SearchItem::PodcastEpisode(_))
+        ) {
+            self.update_selected_rss_episode_detail();
+        } else {
+            self.request_selected_details();
+        }
         self.load_next_subscription_page_if_needed();
         self.refresh_selected_playlist_state();
     }
@@ -14437,12 +14823,34 @@ impl AppController {
         else {
             return;
         };
+        #[cfg(feature = "rss")]
+        if entry.subscription.kind == SubscriptionKind::Rss {
+            let source_url = entry.subscription.url.to_string();
+            self.active_subscription_channel_id = None;
+            self.active_subscription_rss_url = Some(source_url.clone());
+            self.restore_rss_subscription_snapshot(&source_url);
+            if self.subscription_video_cache.contains_key(&source_url) {
+                self.touch_subscription_cache(&source_url);
+                self.refresh_subscription_video_rows();
+                if !self.view.subscriptions.items.is_empty()
+                    && (self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
+                        || self.view.subscriptions.focus == SubscriptionPane::Items)
+                {
+                    self.update_selected_rss_episode_detail();
+                }
+                self.refresh_selected_rss_subscription_with_feedback(false);
+                self.refresh_selected_playlist_state();
+                return;
+            }
+            self.request_rss_subscription(source_url);
+            self.refresh_selected_playlist_state();
+            return;
+        }
         if entry.subscription.kind != SubscriptionKind::YouTube {
             self.view.subscriptions.items.clear();
             self.active_subscription_channel_id = None;
             self.view.status_line =
-                "This source is retained in OPML; its episode list is not implemented yet"
-                    .to_owned();
+                "This subscription format has no episode provider in this build".to_owned();
             return;
         }
         let Some(channel_id) = entry.subscription.youtube_channel_id() else {
@@ -14469,6 +14877,158 @@ impl AppController {
         }
         self.request_subscription_videos(channel_id, 1);
         self.refresh_selected_playlist_state();
+    }
+
+    /// Hydrates one compact RSS episode snapshot before network refresh.
+    #[cfg(feature = "rss")]
+    fn restore_rss_subscription_snapshot(&mut self, source_url: &str) {
+        if self.subscription_video_cache.contains_key(source_url) {
+            return;
+        }
+        let snapshot = match self
+            .store
+            .cached_subscription_items(&SourceKind::Rss, source_url)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.show_error("Could not read cached podcast episodes", &error);
+                return;
+            }
+        };
+        let Some(mut snapshot) = snapshot else {
+            return;
+        };
+        snapshot
+            .items
+            .retain(|item| matches!(item, SearchItem::PodcastEpisode(_)));
+        for item in &mut snapshot.items {
+            if let SearchItem::PodcastEpisode(episode) = item {
+                episode.stream_url = None;
+            }
+        }
+        self.subscription_video_cache.insert(
+            source_url.to_owned(),
+            CachedSubscriptionVideos {
+                items: snapshot.items,
+                next_page: None,
+                consecutive_empty_pages: 0,
+            },
+        );
+        self.touch_subscription_cache(source_url);
+        self.enforce_subscription_cache_byte_budget(source_url);
+    }
+
+    /// Replaces the restart snapshot with current compact RSS episodes.
+    #[cfg(feature = "rss")]
+    fn persist_rss_subscription_snapshot(
+        &self,
+        source_url: &str,
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let mut items: Vec<SearchItem> = self
+            .subscription_video_cache
+            .get(source_url)
+            .map_or(&[][..], |cached| cached.items.as_slice())
+            .iter()
+            .filter(|item| matches!(item, SearchItem::PodcastEpisode(_)))
+            .take(MAX_SAVED_SUBSCRIPTION_ITEMS)
+            .cloned()
+            .collect();
+        for item in &mut items {
+            if let SearchItem::PodcastEpisode(episode) = item {
+                episode.stream_url = None;
+            }
+        }
+        self.store
+            .put_cached_subscription_items(&CachedSubscriptionItems {
+                source: SourceKind::Rss,
+                source_id: source_url.to_owned(),
+                items,
+                fetched_at: unix_time(),
+            })
+    }
+
+    /// Queues one guarded whole-feed request on the isolated RSS worker.
+    #[cfg(feature = "rss")]
+    fn request_rss_subscription(&mut self, source_url: String) {
+        if self.view.subscriptions.loading {
+            return;
+        }
+        let source = match url::Url::parse(&source_url) {
+            Ok(source) => source,
+            Err(error) => {
+                self.show_error_message("Podcast feed failed", error.to_string());
+                return;
+            }
+        };
+        self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        if !self.send_provider_request(
+            ProviderRequest::RssFeed {
+                generation: self.subscription_generation,
+                source_url: source,
+            },
+            "Could not load podcast episodes",
+        ) {
+            return;
+        }
+        self.view.subscriptions.loading = true;
+        self.view.status_line = format!(
+            "Loading episodes for {}…",
+            self.view.subscriptions.source_title
+        );
+    }
+
+    /// Reloads the active RSS source without blanking its cached rows.
+    #[cfg(feature = "rss")]
+    fn refresh_selected_rss_subscription_with_feedback(&mut self, report_errors: bool) {
+        if self.view.subscriptions.loading {
+            if report_errors {
+                self.view.status_line = "Podcast episodes are already loading".to_owned();
+            }
+            return;
+        }
+        let Some(source_url) = self.active_subscription_rss_url.clone() else {
+            if report_errors {
+                self.view.status_line =
+                    "Open a subscribed podcast before refreshing episodes".to_owned();
+            }
+            return;
+        };
+        let selected_external_id = self
+            .selected_subscription_item()
+            .and_then(subscription_item_media_id)
+            .map(|media_id| media_id.external_id);
+        self.pending_rss_subscription_refresh = Some(PendingRssSubscriptionRefresh {
+            source_url: source_url.clone(),
+            selected_external_id,
+            fallback_index: self.view.subscriptions.selected_item,
+            report_errors,
+        });
+        self.request_rss_subscription(source_url);
+        if self.view.subscriptions.loading {
+            self.view.status_line = format!(
+                "Refreshing episodes for {}…",
+                self.view.subscriptions.source_title
+            );
+        } else {
+            self.pending_rss_subscription_refresh = None;
+        }
+    }
+
+    /// Rebuilds Details directly from the selected RSS episode summary.
+    fn update_selected_rss_episode_detail(&mut self) {
+        #[cfg(feature = "rss")]
+        {
+            let Some(SearchItem::PodcastEpisode(episode)) =
+                self.selected_subscription_item().cloned()
+            else {
+                return;
+            };
+            let mut detail = detail_from_podcast_episode(&episode);
+            preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
+            self.view.details = Some(detail);
+            self.view.details_scroll = 0;
+            self.view.selected_detail_link = None;
+        }
     }
 
     /// Hydrates one compact first-page channel snapshot before network refresh.
@@ -14602,6 +15162,11 @@ impl AppController {
     /// is restored after replacement when the refreshed page still contains
     /// it. A second request is ignored until the first one completes.
     fn refresh_selected_subscription_videos(&mut self) {
+        #[cfg(feature = "rss")]
+        if self.active_subscription_rss_url.is_some() {
+            self.refresh_selected_rss_subscription_with_feedback(true);
+            return;
+        }
         self.refresh_selected_subscription_videos_with_feedback(true);
     }
 
@@ -14643,7 +15208,7 @@ impl AppController {
             .selected_subscription_item()
             .and_then(|item| match item {
                 SearchItem::Video(video) => Some(video.video_id.clone()),
-                SearchItem::Channel(_) => None,
+                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
             });
         self.pending_subscription_refresh = Some(PendingSubscriptionRefresh {
             channel_id: channel_id.clone(),
@@ -14799,10 +15364,19 @@ impl AppController {
 
     fn refresh_subscription_video_rows(&mut self) {
         let today = Local::now().date_naive();
+        let active_source_id = self.active_subscription_channel_id.as_deref().or_else(|| {
+            #[cfg(feature = "rss")]
+            {
+                self.active_subscription_rss_url.as_deref()
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                None
+            }
+        });
         let items = self
-            .active_subscription_channel_id
-            .as_deref()
-            .and_then(|channel_id| self.subscription_video_cache.get(channel_id))
+            .subscription_video_cache
+            .get(active_source_id.unwrap_or_default())
             .map_or(&[][..], |cached| cached.items.as_slice());
         self.view.subscriptions.items = items
             .iter()
@@ -14825,9 +15399,18 @@ impl AppController {
     }
 
     fn selected_subscription_item(&self) -> Option<&SearchItem> {
-        let channel_id = self.active_subscription_channel_id.as_deref()?;
+        let source_id = self.active_subscription_channel_id.as_deref().or_else(|| {
+            #[cfg(feature = "rss")]
+            {
+                self.active_subscription_rss_url.as_deref()
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                None
+            }
+        })?;
         self.subscription_video_cache
-            .get(channel_id)?
+            .get(source_id)?
             .items
             .get(self.view.subscriptions.selected_item)
     }
@@ -14848,6 +15431,7 @@ impl AppController {
                         && self.view.subscriptions.focus == SubscriptionPane::Items) =>
             {
                 self.selected_subscription_item()
+                    .filter(|item| !matches!(item, SearchItem::PodcastEpisode(_)))
             }
             _ => None,
         }
@@ -18531,6 +19115,7 @@ fn remap_local_autoplay_origin(origin: &mut AutoplayOrigin, mappings: &[LocalMov
 #[cfg(any(
     feature = "apple-podcasts",
     feature = "bandcamp",
+    feature = "rss",
     feature = "youtube-music"
 ))]
 fn replace_latest_provider_request<T>(
@@ -18545,6 +19130,36 @@ fn replace_latest_provider_request<T>(
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(returned)) => request = returned,
             Err(TrySendError::Disconnected(_)) => return Err(()),
+        }
+    }
+}
+
+/// Runs bounded podcast-feed fetches independently of YouTube traffic.
+#[cfg(feature = "rss")]
+fn rss_provider_worker(
+    requests: Receiver<RssProviderRequest>,
+    responses: Sender<ProviderResponse>,
+    stopping: Arc<AtomicBool>,
+    client: Box<dyn RssFeedClient>,
+) {
+    while let Ok(request) = requests.recv() {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let RssProviderRequest::Fetch {
+            generation,
+            source_url,
+        } = request;
+        let result = client.fetch(&source_url);
+        if responses
+            .send(ProviderResponse::RssFeed {
+                generation,
+                requested_url: source_url,
+                result,
+            })
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -18664,10 +19279,33 @@ fn provider_worker(
     jamendo_client_id: Option<String>,
     #[cfg(feature = "apple-podcasts")] apple_client: Box<dyn AppleProviderClient>,
     #[cfg(feature = "bandcamp")] bandcamp_search_client: Box<dyn BandcampSearchProvider>,
+    #[cfg(feature = "rss")] rss_client: Box<dyn RssFeedClient>,
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
     provider_storage_root: PathBuf,
 ) {
     let mut provider = provider;
+    #[cfg(feature = "rss")]
+    let (rss_requests, rss_pending, rss_stopping, rss_thread, rss_start_error) = {
+        let (rss_requests, rss_receiver) = bounded(1);
+        let rss_pending = rss_receiver.clone();
+        let rss_stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&rss_stopping);
+        let rss_responses = responses.clone();
+        match thread::Builder::new()
+            .name("youta-rss".to_owned())
+            .spawn(move || {
+                rss_provider_worker(rss_receiver, rss_responses, worker_stopping, rss_client);
+            }) {
+            Ok(handle) => (
+                Some(rss_requests),
+                Some(rss_pending),
+                rss_stopping,
+                Some(handle),
+                None,
+            ),
+            Err(error) => (None, None, rss_stopping, None, Some(error.to_string())),
+        }
+    };
     #[cfg(feature = "apple-podcasts")]
     let (apple_requests, apple_pending, apple_stopping, apple_thread, apple_start_error) = {
         let (apple_requests, apple_receiver) = bounded(1);
@@ -18983,6 +19621,41 @@ fn provider_worker(
                         .send(ProviderResponse::ApplePodcastEpisodes {
                             generation,
                             collection_id,
+                            result: Err(error),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "rss")]
+            ProviderRequest::RssFeed {
+                generation,
+                source_url,
+            } => {
+                let dispatch = rss_requests.as_ref().zip(rss_pending.as_ref()).map_or_else(
+                    || {
+                        Err(rss_start_error
+                            .clone()
+                            .unwrap_or_else(|| "RSS worker is unavailable".to_owned()))
+                    },
+                    |(sender, pending)| {
+                        replace_latest_provider_request(
+                            sender,
+                            pending,
+                            RssProviderRequest::Fetch {
+                                generation,
+                                source_url: source_url.clone(),
+                            },
+                        )
+                        .map_err(|()| "RSS worker stopped".to_owned())
+                    },
+                );
+                if let Err(error) = dispatch
+                    && responses
+                        .send(ProviderResponse::RssFeed {
+                            generation,
+                            requested_url: source_url,
                             result: Err(error),
                         })
                         .is_err()
@@ -19516,6 +20189,12 @@ fn provider_worker(
         drop(apple_requests);
         drop(apple_pending);
     }
+    #[cfg(feature = "rss")]
+    {
+        rss_stopping.store(true, AtomicOrdering::Release);
+        drop(rss_requests);
+        drop(rss_pending);
+    }
     #[cfg(feature = "bandcamp")]
     {
         bandcamp_search_stopping.store(true, AtomicOrdering::Release);
@@ -19530,6 +20209,10 @@ fn provider_worker(
     }
     #[cfg(feature = "apple-podcasts")]
     if let Some(handle) = apple_thread {
+        let _ = handle.join();
+    }
+    #[cfg(feature = "rss")]
+    if let Some(handle) = rss_thread {
         let _ = handle.join();
     }
     #[cfg(feature = "bandcamp")]
@@ -20953,6 +21636,70 @@ fn row_from_search_item(
             thumbnail_url: preferred_thumbnail_url(&channel.thumbnails),
             ..RowView::default()
         },
+        SearchItem::PodcastEpisode(episode) => {
+            #[cfg(feature = "rss")]
+            {
+                let media_id = MediaId::new(
+                    SourceKind::Rss,
+                    podcast_episode_external_id(&episode.feed_url, &episode.episode_id),
+                );
+                let progress = store.progress(&media_id).ok().flatten();
+                let playback = PlaybackRowState::from_progress(progress.as_ref());
+                let mut metadata = Vec::with_capacity(3);
+                if let Some(published) = episode.published_at {
+                    metadata.push(format_unix_local_date_relative(published, today));
+                }
+                if let Some(duration) = episode.duration_seconds.filter(|duration| *duration > 0) {
+                    metadata.push(format_seconds(duration));
+                }
+                if episode.stream_url.is_none() {
+                    metadata.push("enclosure refresh needed".to_owned());
+                }
+                RowView {
+                    media_id: Some(media_id),
+                    title: episode.title.clone(),
+                    subtitle: metadata.join(" · "),
+                    source: "RSS podcast".to_owned(),
+                    watched_percent: playback.watched_percent,
+                    playback_started: playback.playback_started,
+                    thumbnail_url: episode.artwork_url.clone(),
+                    compact: true,
+                    ..RowView::default()
+                }
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                RowView {
+                    title: episode.title.clone(),
+                    subtitle: "RSS support omitted".to_owned(),
+                    source: "RSS podcast".to_owned(),
+                    compact: true,
+                    ..RowView::default()
+                }
+            }
+        }
+    }
+}
+
+/// Returns the stable playable identity represented by a subscription item.
+fn subscription_item_media_id(item: &SearchItem) -> Option<MediaId> {
+    match item {
+        SearchItem::Video(video) => Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
+        SearchItem::PodcastEpisode(episode) => {
+            #[cfg(feature = "rss")]
+            {
+                Some(MediaId::new(
+                    SourceKind::Rss,
+                    podcast_episode_external_id(&episode.feed_url, &episode.episode_id),
+                ))
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                let _ = episode;
+                None
+            }
+        }
+        SearchItem::Channel(_) => None,
     }
 }
 
@@ -21108,6 +21855,71 @@ fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> De
             }
         }
         SearchItem::Channel(channel) => detail_from_channel(channel, subscriptions),
+        SearchItem::PodcastEpisode(episode) => {
+            #[cfg(feature = "rss")]
+            {
+                detail_from_podcast_episode(episode)
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                DetailView {
+                    title: episode.title.clone(),
+                    source: "RSS podcast".to_owned(),
+                    description: "This build omits RSS subscription support".to_owned(),
+                    ..DetailView::default()
+                }
+            }
+        }
+    }
+}
+
+/// Builds selected RSS episode details without issuing a YouTube metadata call.
+#[cfg(feature = "rss")]
+fn detail_from_podcast_episode(episode: &PodcastEpisodeSummary) -> DetailView {
+    let media_id = MediaId::new(
+        SourceKind::Rss,
+        podcast_episode_external_id(&episode.feed_url, &episode.episode_id),
+    );
+    let description = normalize_description_chapter_lines(&episode.description);
+    let mut metadata = Vec::new();
+    if !episode.authors.is_empty() {
+        metadata.push(format!("Authors: {}", episode.authors.join(", ")));
+    }
+    if let Some(language) = episode.language.as_deref() {
+        metadata.push(format!("Language: {language}"));
+    }
+    if !episode.categories.is_empty() {
+        metadata.push(format!("Categories: {}", episode.categories.join(", ")));
+    }
+    if let Some(mime) = episode.stream_mime_type.as_deref() {
+        metadata.push(format!("Enclosure: {mime}"));
+    }
+    if let Some(bytes) = episode.stream_byte_length {
+        metadata.push(format!("Size: {}", human_bytes(bytes)));
+    }
+    let description = if metadata.is_empty() {
+        description
+    } else if description.is_empty() {
+        metadata.join("\n")
+    } else {
+        format!("{}\n\n{}", metadata.join("\n"), description)
+    };
+    DetailView {
+        media_id: Some(media_id),
+        title: episode.title.clone(),
+        source: "RSS podcast".to_owned(),
+        channel_name: episode.feed_title.clone(),
+        length: episode
+            .duration_seconds
+            .map_or_else(String::new, format_seconds),
+        description: description.clone(),
+        timecodes: detail_timecodes(&description),
+        video_links: detail_video_links(&description),
+        published: episode
+            .published_at
+            .map_or_else(String::new, format_unix_utc_date),
+        thumbnail_url: episode.artwork_url.clone(),
+        ..DetailView::default()
     }
 }
 
@@ -21189,38 +22001,71 @@ fn compact_channel_summary(channel: &mut ChannelSummary) {
 
 /// Compacts provider list metadata before it enters the low-RAM channel cache.
 fn compact_subscription_item(item: &mut SearchItem) {
-    let SearchItem::Video(video) = item else {
-        return;
-    };
-    compact_cached_string(&mut video.video_id, 128);
-    compact_cached_string(&mut video.channel_id, 128);
-    compact_cached_string(&mut video.title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
-    compact_cached_string(&mut video.channel_name, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
-    compact_cached_string(
-        &mut video.description,
-        MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES,
-    );
-    if let Some(published) = video.published_text.as_mut() {
-        compact_cached_string(published, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
-    }
-    video
-        .webpage_url
-        .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
-    video
-        .stream_url
-        .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+    match item {
+        SearchItem::Video(video) => {
+            compact_cached_string(&mut video.video_id, 128);
+            compact_cached_string(&mut video.channel_id, 128);
+            compact_cached_string(&mut video.title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+            compact_cached_string(&mut video.channel_name, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+            compact_cached_string(
+                &mut video.description,
+                MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES,
+            );
+            if let Some(published) = video.published_text.as_mut() {
+                compact_cached_string(published, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            }
+            video
+                .webpage_url
+                .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            video
+                .stream_url
+                .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
 
-    let preferred_thumbnail = preferred_thumbnail_url(&video.thumbnails);
-    video.thumbnails.retain(|thumbnail| {
-        preferred_thumbnail.as_ref() == Some(&thumbnail.url)
-            && thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES
-    });
-    video.thumbnails.truncate(1);
-    video.thumbnails.shrink_to_fit();
-    if let Some(thumbnail) = video.thumbnails.first_mut()
-        && let Some(quality) = thumbnail.quality.as_mut()
-    {
-        compact_cached_string(quality, 128);
+            let preferred_thumbnail = preferred_thumbnail_url(&video.thumbnails);
+            video.thumbnails.retain(|thumbnail| {
+                preferred_thumbnail.as_ref() == Some(&thumbnail.url)
+                    && thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES
+            });
+            video.thumbnails.truncate(1);
+            video.thumbnails.shrink_to_fit();
+            if let Some(thumbnail) = video.thumbnails.first_mut()
+                && let Some(quality) = thumbnail.quality.as_mut()
+            {
+                compact_cached_string(quality, 128);
+            }
+        }
+        SearchItem::PodcastEpisode(episode) => {
+            compact_cached_string(&mut episode.episode_id, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            compact_cached_string(&mut episode.feed_title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+            compact_cached_string(&mut episode.title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+            compact_cached_string(
+                &mut episode.description,
+                MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES,
+            );
+            for author in &mut episode.authors {
+                compact_cached_string(author, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            }
+            episode.authors.truncate(16);
+            for category in &mut episode.categories {
+                compact_cached_string(category, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            }
+            episode.categories.truncate(32);
+            if let Some(language) = episode.language.as_mut() {
+                compact_cached_string(language, 128);
+            }
+            for url in [
+                &mut episode.webpage_url,
+                &mut episode.feed_webpage_url,
+                &mut episode.artwork_url,
+                &mut episode.stream_url,
+            ] {
+                url.take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
+            }
+            if let Some(mime) = episode.stream_mime_type.as_mut() {
+                compact_cached_string(mime, 256);
+            }
+        }
+        SearchItem::Channel(_) => {}
     }
 }
 
@@ -21283,6 +22128,50 @@ fn subscription_item_estimated_heap_bytes(item: &SearchItem) -> usize {
                         .webpage_url
                         .as_ref()
                         .map_or(0, |url| url.as_str().len()),
+                );
+            base.saturating_add(strings)
+        }
+        SearchItem::PodcastEpisode(episode) => {
+            let strings = episode
+                .feed_url
+                .as_str()
+                .len()
+                .saturating_add(episode.episode_id.capacity())
+                .saturating_add(episode.feed_title.capacity())
+                .saturating_add(episode.title.capacity())
+                .saturating_add(episode.description.capacity())
+                .saturating_add(
+                    episode
+                        .authors
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    episode
+                        .categories
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(episode.language.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    [
+                        episode.webpage_url.as_ref(),
+                        episode.feed_webpage_url.as_ref(),
+                        episode.artwork_url.as_ref(),
+                        episode.stream_url.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|url| url.as_str().len())
+                    .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    episode
+                        .stream_mime_type
+                        .as_ref()
+                        .map_or(0, String::capacity),
                 );
             base.saturating_add(strings)
         }
@@ -21470,6 +22359,47 @@ fn subscription_source_row(
     }
 }
 
+/// Formats one loaded podcast feed for the source Details pane.
+#[cfg(feature = "rss")]
+fn rss_feed_detail_text(info: &CachedRssFeedInfo, fallback_description: Option<&str>) -> String {
+    let mut metadata = Vec::with_capacity(5);
+    if !info.authors.is_empty() {
+        metadata.push(format!("Authors: {}", info.authors.join(", ")));
+    }
+    if let Some(language) = info
+        .language
+        .as_deref()
+        .filter(|language| !language.trim().is_empty())
+    {
+        metadata.push(format!("Language: {language}"));
+    }
+    if !info.categories.is_empty() {
+        metadata.push(format!("Categories: {}", info.categories.join(", ")));
+    }
+    if let Some(updated) = info
+        .updated_at
+        .as_deref()
+        .filter(|updated| !updated.trim().is_empty())
+    {
+        metadata.push(format!("Updated: {updated}"));
+    }
+    metadata.push(format!(
+        "Episodes: {}",
+        format_count(u64::try_from(info.episode_count).unwrap_or(u64::MAX))
+    ));
+    let description = info
+        .description
+        .as_deref()
+        .or(fallback_description)
+        .unwrap_or_default()
+        .trim();
+    if description.is_empty() {
+        metadata.join("\n")
+    } else {
+        format!("{}\n\n{description}", metadata.join("\n"))
+    }
+}
+
 /// Formats a safe public channel route while retaining non-YouTube feed URLs.
 fn subscription_source_subtitle(
     entry: &FlattenedSubscription,
@@ -21491,6 +22421,14 @@ const fn subscription_kind_label(kind: SubscriptionKind) -> &'static str {
         SubscriptionKind::YouTube => "YouTube channel",
         SubscriptionKind::Rss => "RSS podcast",
         SubscriptionKind::Other => "Subscription",
+    }
+}
+
+/// Returns the plural media noun used by source-specific subscription status.
+const fn subscription_item_kind_label(kind: SubscriptionKind) -> &'static str {
+    match kind {
+        SubscriptionKind::Rss => "episodes",
+        SubscriptionKind::YouTube | SubscriptionKind::Other => "videos",
     }
 }
 
@@ -21628,6 +22566,11 @@ fn search_item_url(item: &SearchItem) -> Option<String> {
             youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone())
                 .map(|url| url.to_string())
         }
+        SearchItem::PodcastEpisode(episode) => episode
+            .webpage_url
+            .as_ref()
+            .or(episode.feed_webpage_url.as_ref())
+            .map(ToString::to_string),
     }
 }
 
@@ -22862,6 +23805,87 @@ fn queue_item_from_apple_episode(
     })
 }
 
+/// Converts one normalized feed entry into a compact subscription summary.
+#[cfg(feature = "rss")]
+fn podcast_episode_summary(
+    feed: &PodcastFeed,
+    episode: &PodcastEpisode,
+    identity_scope: &url::Url,
+) -> PodcastEpisodeSummary {
+    let enclosure = episode.preferred_playable_enclosure();
+    PodcastEpisodeSummary {
+        feed_url: identity_scope.clone(),
+        episode_id: episode.id.clone(),
+        feed_title: feed
+            .title
+            .clone()
+            .unwrap_or_else(|| "RSS podcast".to_owned()),
+        title: episode
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled episode".to_owned()),
+        authors: episode.authors.clone(),
+        description: episode.description.clone().unwrap_or_default(),
+        language: episode.language.clone(),
+        categories: episode.categories.clone(),
+        duration_seconds: episode
+            .duration_seconds
+            .or_else(|| enclosure.and_then(|enclosure| enclosure.duration_seconds)),
+        published_at: episode
+            .published_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp()),
+        webpage_url: episode.webpage_url.clone(),
+        feed_webpage_url: feed.webpage_url.clone(),
+        artwork_url: episode
+            .artwork_url
+            .clone()
+            .or_else(|| feed.artwork_url.clone()),
+        stream_url: enclosure.map(|enclosure| enclosure.url.clone()),
+        stream_mime_type: enclosure.and_then(|enclosure| enclosure.mime_type.clone()),
+        stream_byte_length: enclosure.and_then(|enclosure| enclosure.byte_length),
+    }
+}
+
+/// Builds a directly playable queue entry for one cached podcast episode.
+#[cfg(feature = "rss")]
+fn queue_item_from_podcast_episode(episode: &PodcastEpisodeSummary) -> Result<QueueItem, String> {
+    let playback_url = episode.stream_url.clone().ok_or_else(|| {
+        "This podcast episode has no playable audio or video enclosure; refresh the feed if it was restored from disk"
+            .to_owned()
+    })?;
+    let webpage_url = episode
+        .webpage_url
+        .clone()
+        .or_else(|| episode.feed_webpage_url.clone())
+        .unwrap_or_else(|| playback_url.clone());
+    let description = episode.description.clone();
+    Ok(QueueItem {
+        media: MediaItem {
+            id: MediaId::new(
+                SourceKind::Rss,
+                podcast_episode_external_id(&episode.feed_url, &episode.episode_id),
+            ),
+            kind: MediaKind::PodcastEpisode,
+            title: episode.title.clone(),
+            creator: episode.authors.first().cloned(),
+            description: (!description.is_empty()).then(|| description.clone()),
+            webpage_url,
+            thumbnail_url: episode.artwork_url.clone(),
+            duration_seconds: episode.duration_seconds,
+            published_at: episode.published_at,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::Unknown,
+            chapters: description_chapters(&description, episode.duration_seconds),
+            captions: Vec::new(),
+        },
+        playback_location: playback_url.to_string(),
+        start_at_seconds: None,
+        added_at: unix_time(),
+    })
+}
+
 /// Returns a credential-free Apple episode page suitable for History replay.
 #[cfg(feature = "apple-podcasts")]
 fn canonical_apple_episode_url(
@@ -23075,7 +24099,7 @@ fn format_unix_local_date_relative(timestamp: i64, today: NaiveDate) -> String {
 ///
 /// Invalid provider text returns `None` so callers may retain the original
 /// value rather than silently hiding catalogue metadata.
-#[cfg(feature = "apple-podcasts")]
+#[cfg(any(feature = "apple-podcasts", feature = "rss"))]
 fn format_rfc3339_local_date_relative(value: &str, today: NaiveDate) -> Option<String> {
     let timestamp = DateTime::parse_from_rfc3339(value).ok()?.timestamp();
     let formatted = format_unix_local_date_relative(timestamp, today);
@@ -25000,7 +26024,9 @@ mod tests {
                 );
                 SearchItem::Video(video)
             }
-            SearchItem::Channel(_) => unreachable!("fixture is a video"),
+            SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => {
+                unreachable!("fixture is a video")
+            }
         };
 
         let snapshot = controller
@@ -27281,6 +28307,226 @@ mod tests {
             "https://podcasts.example/feed.xml"
         );
         assert_eq!(controller.view.subscriptions.sources.len(), 1);
+    }
+
+    /// Saves one deterministic RSS source for controller navigation tests.
+    #[cfg(feature = "rss")]
+    fn save_fixture_rss_subscription(config: &Config, feed_url: &url::Url) {
+        let mut tree = SubscriptionTree::default();
+        assert!(
+            tree.subscribe_rss_feed("Portable fixture title", feed_url.as_str())
+                .expect("valid fixture RSS source")
+        );
+        subscriptions::save(config, &tree).expect("save fixture RSS subscription");
+    }
+
+    /// Builds one normalized feed response without network access.
+    #[cfg(feature = "rss")]
+    fn fixture_rss_feed(feed_url: &url::Url, episode_ids: &[&str]) -> PodcastFeed {
+        PodcastFeed {
+            id: "fixture-feed".to_owned(),
+            source_url: feed_url.clone(),
+            title: Some("Fixture RSS show".to_owned()),
+            description: Some("A deterministic podcast feed.".to_owned()),
+            authors: vec!["Fixture publisher".to_owned()],
+            language: Some("en".to_owned()),
+            categories: vec!["Technology".to_owned()],
+            published_at: None,
+            updated_at: Some("2026-07-30T10:00:00Z".to_owned()),
+            webpage_url: Some(
+                url::Url::parse("https://podcasts.example/show")
+                    .expect("valid fixture podcast page"),
+            ),
+            artwork_url: Some(
+                url::Url::parse("https://podcasts.example/cover.jpg")
+                    .expect("valid fixture artwork URL"),
+            ),
+            episodes: episode_ids
+                .iter()
+                .enumerate()
+                .map(|(index, episode_id)| PodcastEpisode {
+                    id: (*episode_id).to_owned(),
+                    title: Some(format!("Fixture episode {}", index.saturating_add(1))),
+                    description: Some(format!("Episode {} description.", index.saturating_add(1))),
+                    authors: vec!["Fixture host".to_owned()],
+                    language: Some("en".to_owned()),
+                    categories: vec!["Testing".to_owned()],
+                    published_at: Some(format!(
+                        "2026-07-{}T10:00:00Z",
+                        30usize.saturating_sub(index)
+                    )),
+                    updated_at: None,
+                    webpage_url: Some(
+                        url::Url::parse(&format!(
+                            "https://podcasts.example/episodes/{}",
+                            index.saturating_add(1)
+                        ))
+                        .expect("valid fixture episode page"),
+                    ),
+                    artwork_url: None,
+                    duration_seconds: Some(
+                        60u64.saturating_mul(u64::try_from(index).unwrap_or_default() + 1),
+                    ),
+                    enclosures: vec![crate::providers::rss::PodcastEnclosure {
+                        url: url::Url::parse(&format!(
+                            "https://cdn.example/episodes/{}.opus?token=transient",
+                            index.saturating_add(1)
+                        ))
+                        .expect("valid fixture enclosure URL"),
+                        mime_type: Some("audio/ogg".to_owned()),
+                        byte_length: Some(4_096),
+                        duration_seconds: None,
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(feature = "rss")]
+    #[test]
+    fn rss_subscription_opens_plays_refreshes_and_restores_a_stale_snapshot() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let feed_url =
+            url::Url::parse("https://podcasts.example/feed.xml").expect("valid fixture feed URL");
+        save_fixture_rss_subscription(&config, &feed_url);
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        assert_eq!(
+            controller.view.subscriptions.source_kind,
+            SubscriptionKind::Rss
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.description.contains("Press Enter"))
+        );
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, requested_url) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("RSS feed request")
+        {
+            ProviderRequest::RssFeed {
+                generation,
+                source_url,
+            } => (generation, source_url),
+            _ => panic!("expected an RSS feed request"),
+        };
+        assert_eq!(requested_url, feed_url);
+        assert!(
+            controller.view.status_line.contains("Loading episodes"),
+            "RSS activation must not claim to load YouTube videos"
+        );
+
+        let initial_feed = fixture_rss_feed(&feed_url, &["episode-one", "episode-two"]);
+        controller.handle_provider_response(ProviderResponse::RssFeed {
+            generation,
+            requested_url: requested_url.clone(),
+            result: Ok(initial_feed.clone()),
+        });
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture episode 1", "Fixture episode 2"]
+        );
+        assert_eq!(
+            controller.view.subscriptions.source_title,
+            "Fixture RSS show"
+        );
+        let details = controller.view.details.as_ref().expect("episode details");
+        assert_eq!(details.source, "RSS podcast");
+        assert_eq!(details.title, "Fixture episode 1");
+        let queued = controller
+            .selected_queue_item()
+            .expect("fresh RSS enclosure is playable");
+        assert_eq!(queued.media.id.source, SourceKind::Rss);
+        assert_eq!(
+            queued.playback_location,
+            "https://cdn.example/episodes/1.opus?token=transient"
+        );
+        let persisted = controller
+            .store
+            .cached_subscription_items(&SourceKind::Rss, feed_url.as_str())
+            .expect("read RSS snapshot")
+            .expect("RSS snapshot");
+        assert!(matches!(
+            persisted.items.first(),
+            Some(SearchItem::PodcastEpisode(episode)) if episode.stream_url.is_none()
+        ));
+
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let refresh_generation = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("RSS refresh request")
+        {
+            ProviderRequest::RssFeed {
+                generation,
+                source_url,
+            } if source_url == feed_url => generation,
+            _ => panic!("expected an RSS refresh request"),
+        };
+        controller.handle_provider_response(ProviderResponse::RssFeed {
+            generation: refresh_generation,
+            requested_url: feed_url.clone(),
+            result: Ok(fixture_rss_feed(
+                &feed_url,
+                &["new-episode", "episode-one", "episode-two"],
+            )),
+        });
+        assert_eq!(
+            controller.view.subscriptions.selected_item, 2,
+            "refresh must preserve the selected feed-scoped episode identity"
+        );
+
+        controller.dispatch(UiAction::GoBack);
+        let source_details = controller.view.details.as_ref().expect("feed details");
+        assert!(
+            source_details
+                .description
+                .contains("Authors: Fixture publisher")
+        );
+        assert!(source_details.description.contains("Episodes: 3"));
+        assert_eq!(
+            source_details.links.first().map(|link| link.url.as_str()),
+            Some("https://podcasts.example/show")
+        );
+        drop(controller);
+
+        let store = StateStore::open(&config).expect("reopened disk state");
+        let mut restarted = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        restarted.provider_requests = Some(requests);
+        restarted.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        restarted.dispatch(UiAction::ActivateSelection);
+        assert_eq!(
+            restarted.view.subscriptions.items.len(),
+            3,
+            "the restart snapshot must render before the feed refresh completes"
+        );
+        assert!(
+            restarted
+                .selected_queue_item()
+                .expect_err("restart snapshots omit transient enclosures")
+                .contains("refresh the feed")
+        );
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background RSS refresh"),
+            ProviderRequest::RssFeed { source_url, .. } if source_url == feed_url
+        ));
     }
 
     fn receive_channel_request(
@@ -41927,6 +43173,8 @@ mod tests {
                 #[cfg(feature = "apple-podcasts")]
                 Box::new(SystemAppleProviderClient::new()),
                 Box::new(BlockingBandcampSearchProvider { state }),
+                #[cfg(feature = "rss")]
+                Box::new(RssPodcastProvider::new()),
                 #[cfg(feature = "youtube-music")]
                 Box::new(YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
                     executable: PathBuf::from("yt-dlp"),
@@ -42008,6 +43256,8 @@ mod tests {
                 Box::new(SystemAppleProviderClient::new()),
                 #[cfg(feature = "bandcamp")]
                 Box::new(BandcampSearchClient::new()),
+                #[cfg(feature = "rss")]
+                Box::new(RssPodcastProvider::new()),
                 Box::new(BlockingYouTubeMusicSearchProvider { state }),
                 storage_path,
             );
@@ -42077,6 +43327,8 @@ mod tests {
                 Box::new(SystemAppleProviderClient::new()),
                 #[cfg(feature = "bandcamp")]
                 Box::new(BandcampSearchClient::new()),
+                #[cfg(feature = "rss")]
+                Box::new(RssPodcastProvider::new()),
                 #[cfg(feature = "youtube-music")]
                 Box::new(YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
                     executable: PathBuf::from("yt-dlp"),

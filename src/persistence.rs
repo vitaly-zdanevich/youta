@@ -6595,13 +6595,15 @@ fn validate_cached_subscription_items(
             ),
         });
     }
-    if cached
-        .items
-        .iter()
-        .any(|item| !matches!(item, SearchItem::Video(_)))
-    {
+    if cached.items.iter().any(|item| {
+        !matches!(
+            (cached.source.clone(), item),
+            (_, SearchItem::Video(_)) | (SourceKind::Rss, SearchItem::PodcastEpisode(_))
+        )
+    }) {
         return Err(PersistenceError::InvalidSubscriptionSnapshot {
-            reason: "subscription snapshots may contain only playable items".to_owned(),
+            reason: "subscription snapshots may contain only videos or RSS podcast episodes"
+                .to_owned(),
         });
     }
     Ok(())
@@ -6886,7 +6888,9 @@ mod tests {
     use crate::domain::{
         MediaKind, MediaLicense, MediaStatistics, PanelFocus, Screen, SearchQuery,
     };
-    use crate::providers::{ChannelSummary, SearchSort, Thumbnail, VideoSummary};
+    use crate::providers::{
+        ChannelSummary, PodcastEpisodeSummary, SearchSort, Thumbnail, VideoSummary,
+    };
 
     fn id(value: &str) -> MediaId {
         MediaId::new(SourceKind::YouTube, value)
@@ -6971,6 +6975,38 @@ mod tests {
             thumbnails: Vec::new(),
             webpage_url: None,
             stream_url: None,
+        })
+    }
+
+    /// Builds one compact RSS episode from deterministic mock metadata.
+    fn podcast_episode(feed_url: &str, episode_id: &str) -> SearchItem {
+        SearchItem::PodcastEpisode(PodcastEpisodeSummary {
+            feed_url: Url::parse(feed_url).expect("valid fixture feed URL"),
+            episode_id: episode_id.to_owned(),
+            feed_title: "Fixture podcast".to_owned(),
+            title: format!("Fixture episode {episode_id}"),
+            authors: vec!["Fixture host".to_owned()],
+            description: "Mock RSS episode description".to_owned(),
+            language: Some("en".to_owned()),
+            categories: vec!["Technology".to_owned()],
+            duration_seconds: Some(180),
+            published_at: Some(1_704_067_200),
+            webpage_url: Some(
+                Url::parse(&format!(
+                    "https://podcasts.example.test/episodes/{episode_id}"
+                ))
+                .expect("valid fixture episode page"),
+            ),
+            feed_webpage_url: Some(
+                Url::parse("https://podcasts.example.test/").expect("valid fixture feed webpage"),
+            ),
+            artwork_url: Some(
+                Url::parse("https://podcasts.example.test/cover.jpg")
+                    .expect("valid fixture artwork URL"),
+            ),
+            stream_url: None,
+            stream_mime_type: Some("audio/mpeg".to_owned()),
+            stream_byte_length: Some(1_024),
         })
     }
 
@@ -10288,6 +10324,42 @@ mod tests {
     }
 
     #[test]
+    fn subscription_items_snapshot_accepts_only_source_compatible_rss_episodes() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let feed_url = "https://podcasts.example.test/feed.xml";
+        let rss = CachedSubscriptionItems {
+            source: SourceKind::Rss,
+            source_id: feed_url.to_owned(),
+            items: vec![
+                podcast_episode(feed_url, "episode-one"),
+                podcast_episode(feed_url, "episode-two"),
+            ],
+            fetched_at: 100,
+        };
+
+        store
+            .put_cached_subscription_items(&rss)
+            .expect("save RSS episode snapshot");
+        assert_eq!(
+            store
+                .cached_subscription_items(&SourceKind::Rss, feed_url)
+                .expect("restore RSS episode snapshot"),
+            Some(rss.clone())
+        );
+
+        let incompatible = CachedSubscriptionItems {
+            source: SourceKind::YouTube,
+            source_id: "UCfixture".to_owned(),
+            ..rss
+        };
+        assert!(matches!(
+            store.put_cached_subscription_items(&incompatible),
+            Err(PersistenceError::InvalidSubscriptionSnapshot { reason })
+                if reason.contains("RSS podcast episodes")
+        ));
+    }
+
+    #[test]
     fn subscription_items_snapshot_rejects_invalid_data_and_byte_fits_a_prefix() {
         let store = StateStore::open_in_memory().expect("open store");
         let excessive = CachedSubscriptionItems {
@@ -10476,7 +10548,9 @@ mod tests {
             .iter()
             .map(|item| match item {
                 SearchItem::Video(video) => video.orientation,
-                SearchItem::Channel(_) => unreachable!("video fixture"),
+                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => {
+                    unreachable!("video fixture")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(

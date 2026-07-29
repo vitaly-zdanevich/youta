@@ -355,6 +355,9 @@ fn run_search(config: &Config, query: &str, channels: bool) -> Result<()> {
                         .map_or_else(String::new, |url| url.to_string())
                 );
             }
+            SearchItem::PodcastEpisode(_) => {
+                bail!("the configured YouTube provider returned an RSS podcast episode");
+            }
         }
     }
     Ok(())

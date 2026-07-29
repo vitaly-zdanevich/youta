@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.14.8"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -136,7 +136,7 @@ local-artwork = ["local-metadata"]
 # Lazy midpoint-frame thumbnails for local video files. Rendering additionally
 # requires `images`; extraction uses the user's existing FFmpeg executable.
 local-video-thumbnails = ["local-browser"]
-rss = ["network", "dep:feed-rs"]
+rss = ["network", "dep:feed-rs", "dep:sha2"]
 invidious = ["network", "dep:percent-encoding"]
 peertube = ["network"]
 vimeo = ["yt-dlp"]

@@ -11,6 +11,7 @@ use std::time::Duration;
 use feed_rs::model::{Category, Entry, Feed, FeedType, Link, Person, Text};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use ureq::ResponseExt as _;
 use url::Url;
 
@@ -130,6 +131,32 @@ pub struct PodcastEpisode {
     pub enclosures: Vec<PodcastEnclosure>,
 }
 
+impl PodcastEpisode {
+    /// Returns the first enclosure that is plausibly playable as audio or video.
+    ///
+    /// Feed order is preserved because publishers commonly put their preferred
+    /// encoding first. Explicit audio/video MIME types win, followed by
+    /// established streaming/container MIME types and a conservative media
+    /// filename fallback. Metadata-only entries therefore remain visible
+    /// without sending an image or document attachment to the player.
+    #[must_use]
+    pub fn preferred_playable_enclosure(&self) -> Option<&PodcastEnclosure> {
+        self.enclosures
+            .iter()
+            .find(|enclosure| {
+                enclosure
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(is_probable_media_mime)
+            })
+            .or_else(|| {
+                self.enclosures
+                    .iter()
+                    .find(|enclosure| podcast_media_extension(enclosure.url.path()).is_some())
+            })
+    }
+}
+
 /// One normalized podcast media enclosure.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PodcastEnclosure {
@@ -141,6 +168,25 @@ pub struct PodcastEnclosure {
     pub byte_length: Option<u64>,
     /// Advertised duration in whole seconds.
     pub duration_seconds: Option<u64>,
+}
+
+/// Builds a feed-scoped, non-reversible media identifier for one episode.
+///
+/// Podcast GUIDs are scoped only by convention and can collide across feeds.
+/// The exact normalized feed URL is length-delimited before hashing so private
+/// query values and ambiguous concatenations never appear in persisted media
+/// identifiers. The version prefix leaves room for a future identity scheme.
+#[must_use]
+pub fn podcast_episode_external_id(feed_url: &Url, episode_id: &str) -> String {
+    let feed = feed_url.as_str().as_bytes();
+    let episode = episode_id.as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"youta-rss-episode-v1\0");
+    digest.update((feed.len() as u64).to_be_bytes());
+    digest.update(feed);
+    digest.update((episode.len() as u64).to_be_bytes());
+    digest.update(episode);
+    format!("rss-v1-{:x}", digest.finalize())
 }
 
 /// Blocking bounded podcast-feed client.
@@ -633,6 +679,30 @@ fn is_probable_media_mime(mime: &str) -> bool {
         .any(|candidate| mime.eq_ignore_ascii_case(candidate))
 }
 
+fn podcast_media_extension(path: &str) -> Option<&str> {
+    let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "aac"
+            | "flac"
+            | "m4a"
+            | "m4b"
+            | "m4v"
+            | "mka"
+            | "mkv"
+            | "mov"
+            | "mp3"
+            | "mp4"
+            | "oga"
+            | "ogg"
+            | "ogv"
+            | "opus"
+            | "wav"
+            | "webm"
+    )
+    .then_some(path.rsplit_once('.')?.1)
+}
+
 fn select_webpage(links: &[Link], base: &Url, allow_http: bool) -> Option<Url> {
     links
         .iter()
@@ -880,6 +950,106 @@ mod tests {
     }]
   }]
 }"#;
+
+    /// Builds one normalized mock episode with caller-controlled attachments.
+    fn mock_episode(enclosures: Vec<PodcastEnclosure>) -> PodcastEpisode {
+        PodcastEpisode {
+            id: "fixture-guid".to_owned(),
+            title: Some("Fixture episode".to_owned()),
+            description: Some("Fixture description".to_owned()),
+            authors: vec!["Fixture host".to_owned()],
+            language: Some("en".to_owned()),
+            categories: vec!["Testing".to_owned()],
+            published_at: Some("2024-01-01T00:00:00+00:00".to_owned()),
+            updated_at: None,
+            webpage_url: Some(
+                Url::parse("https://podcasts.example.test/episodes/fixture")
+                    .expect("valid fixture webpage URL"),
+            ),
+            artwork_url: Some(
+                Url::parse("https://podcasts.example.test/artwork/fixture.jpg")
+                    .expect("valid fixture artwork URL"),
+            ),
+            duration_seconds: Some(180),
+            enclosures,
+        }
+    }
+
+    /// Builds one normalized mock enclosure.
+    fn mock_enclosure(url: &str, mime_type: Option<&str>) -> PodcastEnclosure {
+        PodcastEnclosure {
+            url: Url::parse(url).expect("valid fixture enclosure URL"),
+            mime_type: mime_type.map(str::to_owned),
+            byte_length: Some(1_024),
+            duration_seconds: Some(180),
+        }
+    }
+
+    #[test]
+    fn preferred_playable_enclosure_prefers_media_mime_then_extension() {
+        let explicit_media = mock_episode(vec![
+            mock_enclosure(
+                "https://cdn.example.test/transcript.pdf",
+                Some("application/pdf"),
+            ),
+            mock_enclosure("https://cdn.example.test/fallback.opus", None),
+            mock_enclosure(
+                "https://cdn.example.test/publisher-choice.mp3",
+                Some("audio/mpeg"),
+            ),
+            mock_enclosure(
+                "https://cdn.example.test/later-choice.webm",
+                Some("video/webm"),
+            ),
+        ]);
+        assert_eq!(
+            explicit_media
+                .preferred_playable_enclosure()
+                .map(|enclosure| enclosure.url.as_str()),
+            Some("https://cdn.example.test/publisher-choice.mp3")
+        );
+
+        let extension_fallback = mock_episode(vec![
+            mock_enclosure(
+                "https://cdn.example.test/episode-cover.jpg",
+                Some("image/jpeg"),
+            ),
+            mock_enclosure("https://cdn.example.test/episode.m4a?download=1", None),
+        ]);
+        assert_eq!(
+            extension_fallback
+                .preferred_playable_enclosure()
+                .map(|enclosure| enclosure.url.as_str()),
+            Some("https://cdn.example.test/episode.m4a?download=1")
+        );
+
+        let metadata_only = mock_episode(vec![mock_enclosure(
+            "https://cdn.example.test/transcript.pdf",
+            Some("application/pdf"),
+        )]);
+        assert_eq!(metadata_only.preferred_playable_enclosure(), None);
+    }
+
+    #[test]
+    fn external_episode_ids_are_deterministic_and_feed_scoped() {
+        let first_feed = Url::parse("https://feeds.example.test/first.xml?token=private-fixture")
+            .expect("valid first fixture feed URL");
+        let second_feed = Url::parse("https://feeds.example.test/second.xml")
+            .expect("valid second fixture feed URL");
+        let shared_guid = "publisher-reused-guid";
+
+        let first = podcast_episode_external_id(&first_feed, shared_guid);
+        let repeated = podcast_episode_external_id(&first_feed, shared_guid);
+        let other_feed = podcast_episode_external_id(&second_feed, shared_guid);
+        let other_episode = podcast_episode_external_id(&first_feed, "another-guid");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_feed);
+        assert_ne!(first, other_episode);
+        assert!(first.starts_with("rss-v1-"));
+        assert!(!first.contains("private-fixture"));
+        assert!(!first.contains(shared_guid));
+    }
 
     #[test]
     fn rss_itunes_and_media_rss_are_normalized_and_deduplicated() {

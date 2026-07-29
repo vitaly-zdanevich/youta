@@ -495,7 +495,7 @@ fn sort_videos_by_upload_date(items: &mut [SearchItem]) {
     items.sort_by(|left, right| {
         let published = |item: &SearchItem| match item {
             SearchItem::Video(video) => video.published_at,
-            SearchItem::Channel(_) => None,
+            SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
         };
         match (published(left), published(right)) {
             (Some(left), Some(right)) => right.cmp(&left),
@@ -1235,6 +1235,7 @@ mod tests {
             .map(|item| match item {
                 SearchItem::Video(video) => video.title.as_str(),
                 SearchItem::Channel(_) => unreachable!("video fixture"),
+                SearchItem::PodcastEpisode(_) => unreachable!("video fixture"),
             })
             .collect::<Vec<_>>();
 

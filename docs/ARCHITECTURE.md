@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the intended boundaries of Youta and the foundation
-present in `0.14.8`. Items marked **roadmap** are design decisions, not support
+present in `0.15.0`. Items marked **roadmap** are design decisions, not support
 claims.
 
 ## Goals
@@ -243,9 +243,12 @@ HTTP(S) RSS or Atom URL, rejects embedded username/password credentials, strips
 its fragment, detects duplicates across the nested tree, and atomically saves
 the source in the private portable OPML file. Query parameters remain part of
 the stored URL because some private feeds require them; the popup's custom
-debug representation redacts both its draft and validation error. This path
-currently stores the subscription outline only. RSS episode browsing in the
-Subscriptions screen is not implemented.
+debug representation redacts both its draft and validation error. Activating
+the source sends one latest-only request to an isolated feed worker, normalizes
+playable audio/video enclosures, and shows the episodes in the shared
+Subscriptions item model. Direct enclosure URLs are runtime-only; restart
+snapshots retain compact public metadata and a feed-scoped hashed episode
+identity without exposing private feed URLs or GUIDs as media IDs.
 
 ## Source model
 
@@ -475,14 +478,16 @@ not authorization to mutate a YouTube account. Remote subscription sync
 therefore remains an OAuth-gated feature.
 
 The source root also exposes `[a] Add RSS feed`, whose validation and private
-OPML behavior are described above. RSS sources remain portable entries in this
-release; the channel-video list controller below is YouTube-specific and does
-not yet browse their episodes.
+OPML behavior are described above. RSS and Atom sources use the same
+Subscriptions navigation as YouTube channels, but their item heading,
+publisher metadata, refresh wording, and direct-enclosure playback remain
+source-specific.
 
 The TUI reducer owns two subscription layouts over the same state:
 
 - drill-down starts with sources and enters one source's list-and-Details view;
-- split retains the source list while showing the selected source's videos.
+- split retains the source list while showing the selected source's videos or
+  podcast episodes.
 
 Uppercase `S` resets either layout to the source root from any main screen;
 `Tab` and `Shift+Tab` cycle the enabled top-level screens. The
@@ -533,20 +538,22 @@ provider boundary.
 
 Moving across split-view sources performs no remote work. Arrow navigation may
 render an existing RAM or restart snapshot, but only `Enter` activates a source
-and starts its initial provider load or page-one refresh. The controller keeps
-a bounded least-recently-used RAM cache: at most 24 channels and 250 videos per
-channel under a shared approximate 8 MiB heap budget. Description excerpts and
+and starts its initial provider load or refresh. The controller keeps a bounded
+least-recently-used RAM cache: at most 24 sources and 250 items per source under
+a shared approximate 8 MiB heap budget. YouTube description excerpts and
 thumbnail sets are compacted before insertion. Approaching the end of visible
-rows requests the next page; bounded automatic continuation skips
-private/unavailable-only pages. Every response carries a subscription
-generation; a response for an older selection is ignored and cannot replace
-the newly selected channel's rows.
+YouTube rows requests the next page; bounded automatic continuation skips
+private/unavailable-only pages. RSS/Atom refreshes replace one bounded
+whole-feed result instead. Every response carries a subscription generation; a
+response for an older selection is ignored and cannot replace the newly
+selected source's rows.
 
-Successful YouTube page-one refreshes also replace a compact subscription-item
-snapshot in the selected cache backend. Each source retains at most 50
-provider-ordered items and 512 KiB of encoded item data; when the byte limit is
-reached, the longest whole-item prefix that fits is stored. The cache keeps the
-32 most recently refreshed sources. Later pages remain process-local.
+Successful YouTube page-one and RSS/Atom feed refreshes also replace a compact
+subscription-item snapshot in the selected cache backend. Each source retains
+at most 50 provider-ordered items and 512 KiB of encoded item data; when the
+byte limit is reached, the longest whole-item prefix that fits is stored. The
+cache keeps the 32 most recently refreshed sources. Later YouTube pages remain
+process-local.
 
 On activation after a restart, Youta restores the first-page snapshot into RAM
 and renders it before issuing the background page-one refresh. The successful
@@ -554,14 +561,16 @@ refresh replaces the visible and durable first page, reconciling both newly
 published and provider-deleted videos. Failed refreshes leave the restored rows
 and selection available. Direct `stream_url` values are removed before writing
 and again after reading because they may be short-lived, signed, or carry query
-secrets; the restart snapshot retains canonical video pages and compact public
-metadata instead.
+secrets; the restart snapshot retains canonical video pages or RSS episode
+metadata instead. A restored RSS episode is refreshed before playback because
+its enclosure may also be transient.
 
-Inside an activated channel, uppercase `R` explicitly refreshes page one. This
-request bypasses the RAM list cache but does not clear the rendered rows while
-it is in flight. A successful response restores selection by stable provider
-video ID, with the previous index as a fallback; a failed response leaves the
-old rows and selection available.
+Inside an activated source, uppercase `R` explicitly refreshes YouTube page one
+or the whole RSS/Atom feed. This request bypasses the RAM item cache but does
+not clear the rendered rows while it is in flight. A successful response
+restores selection by stable provider video or feed-scoped episode identity,
+with the previous index as a fallback; a failed response leaves the old rows
+and selection available.
 
 ## Playback
 
