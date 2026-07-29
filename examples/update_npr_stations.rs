@@ -1689,15 +1689,28 @@ fn valid_web_url(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const MOCK_FFPROBE_READY_ARGUMENT: &str = "--youta-fixture-ready";
+    #[cfg(unix)]
+    const MOCK_FFPROBE_READY_ATTEMPTS: usize = 100;
+
     /// Installs one closed mock helper inode through an atomic rename.
     ///
-    /// Executing the final path can therefore never race a writable file
-    /// descriptor from script creation, avoiding intermittent `ETXTBSY`.
+    /// The readiness probe also absorbs transient `ETXTBSY` responses from
+    /// instrumented CI filesystems before a test executes the final path.
     #[cfg(unix)]
     fn install_mock_ffprobe(path: &Path, script: &str) {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
+        let body = script
+            .strip_prefix("#!/bin/sh\n")
+            .expect("mock ffprobe fixture must be a POSIX shell script");
+        let published_script = format!(
+            "#!/bin/sh\n\
+             if [ \"${{1-}}\" = '{MOCK_FFPROBE_READY_ARGUMENT}' ]; then exit 0; fi\n\
+             {body}"
+        );
         let staging = path.with_extension("staging");
         let mut staged_file = fs::OpenOptions::new()
             .create_new(true)
@@ -1710,7 +1723,7 @@ mod tests {
                 )
             });
         staged_file
-            .write_all(script.as_bytes())
+            .write_all(published_script.as_bytes())
             .unwrap_or_else(|error| {
                 panic!(
                     "failed to write staged mock ffprobe {}: {error}",
@@ -1737,6 +1750,30 @@ mod tests {
                 path.display()
             )
         });
+        wait_for_mock_ffprobe(path);
+    }
+
+    /// Waits for an atomically published helper to become executable.
+    #[cfg(unix)]
+    fn wait_for_mock_ffprobe(path: &Path) {
+        let mut last_busy_error = None;
+        for _ in 0..MOCK_FFPROBE_READY_ATTEMPTS {
+            match Command::new(path).arg(MOCK_FFPROBE_READY_ARGUMENT).status() {
+                Ok(status) if status.success() => return,
+                Ok(status) => panic!("mock ffprobe readiness probe exited with {status}"),
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    last_busy_error = Some(error);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to launch mock ffprobe readiness probe: {error}"),
+            }
+        }
+        panic!(
+            "mock ffprobe stayed busy after publication: {}",
+            last_busy_error
+                .as_ref()
+                .map_or_else(|| "unknown error".to_owned(), ToString::to_string)
+        );
     }
 
     #[cfg(unix)]
@@ -2144,6 +2181,24 @@ mod tests {
             reader.position(),
             u64::try_from((MAX_QUALITY_PROBE_JSON_BYTES * 2) + 17).unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mock_ffprobe_readiness_retries_executable_file_busy() {
+        let _fixture_guard = lock_mock_ffprobe_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("mock-ffprobe");
+        install_mock_ffprobe(&helper, "#!/bin/sh\nexit 7\n");
+
+        let writer = fs::OpenOptions::new().write(true).open(&helper).unwrap();
+        let release_writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            drop(writer);
+        });
+
+        wait_for_mock_ffprobe(&helper);
+        release_writer.join().unwrap();
     }
 
     #[cfg(unix)]
