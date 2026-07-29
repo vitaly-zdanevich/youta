@@ -621,17 +621,16 @@ impl YouTubeOfficialProvider {
     ) -> Result<SearchPage, ProviderError> {
         let (url, key, published_after) = self.build_search_url(request, now_epoch)?;
         let response: RawSearchResponse = self.request_json(&url)?;
-        let next_page = self.remember_next_page(
-            &key,
-            request.page,
-            response.next_page_token.clone(),
-            published_after,
-        )?;
-
         let items = match request.target {
             SearchTarget::Videos => self.enrich_video_search(response.items)?,
             SearchTarget::Channels => self.enrich_channel_search(response.items)?,
         };
+        let next_page = self.remember_next_page(
+            &key,
+            request.page,
+            response.next_page_token,
+            published_after,
+        )?;
         Ok(SearchPage {
             page: request.page,
             items,
@@ -639,20 +638,54 @@ impl YouTubeOfficialProvider {
         })
     }
 
+    /// Enriches the usable rows from one bounded video-only search page.
+    ///
+    /// Although `search.list?type=video` documents `id.videoId` for every
+    /// result, an isolated non-video or malformed row is omitted when another
+    /// valid video survives. A genuinely empty upstream page remains valid,
+    /// while a nonempty page containing no usable videos is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidResponse`] when the upstream page
+    /// exceeds the requested result count, contains no usable video rows, or
+    /// its batch enrichment response is malformed.
     fn enrich_video_search(
         &self,
         raw_items: Vec<RawSearchItem>,
     ) -> Result<Vec<SearchItem>, ProviderError> {
+        if raw_items.len() > usize::from(RESULTS_PER_PAGE) {
+            return Err(ProviderError::InvalidResponse(format!(
+                "YouTube returned more than {RESULTS_PER_PAGE} video search results"
+            )));
+        }
+        let raw_item_count = raw_items.len();
         let mut ordered = Vec::with_capacity(raw_items.len());
+        let mut first_rejection = None;
         for (index, raw) in raw_items.into_iter().enumerate() {
-            let video_id = raw.id.video_id.ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "video search result {index} omitted its video ID"
-                ))
-            })?;
-            validate_response_video_id(&video_id)?;
-            validate_search_snippet(&raw.snippet, index)?;
-            ordered.push((video_id, raw.snippet));
+            let candidate = (|| {
+                let video_id = raw.id.video_id.ok_or_else(|| {
+                    ProviderError::InvalidResponse(format!(
+                        "video search result {index} omitted its video ID"
+                    ))
+                })?;
+                validate_response_video_id(&video_id)?;
+                validate_search_snippet(&raw.snippet, index)?;
+                Ok((video_id, raw.snippet))
+            })();
+            match candidate {
+                Ok(candidate) => ordered.push(candidate),
+                Err(error) => {
+                    first_rejection.get_or_insert(error);
+                }
+            }
+        }
+        if ordered.is_empty() && raw_item_count > 0 {
+            return Err(first_rejection.unwrap_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "YouTube returned no usable video search results".to_owned(),
+                )
+            }));
         }
         let ids = ordered.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
         let mut resources = self.fetch_video_resources(&ids)?;
@@ -2297,6 +2330,144 @@ mod tests {
         for request in &requests {
             assert!(request.contains(&format!("key={TEST_KEY}")));
         }
+    }
+
+    #[test]
+    fn video_search_accepts_a_genuinely_empty_page_without_enrichment() {
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", r#"{"items":[]}"#)]);
+
+        let page = provider
+            .search_at(
+                &SearchRequest::new("no matches", SearchTarget::Videos),
+                1_704_067_200,
+            )
+            .expect("an empty upstream page is a valid search result");
+        let requests = server.finish();
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_page, None);
+        assert_eq!(
+            requests.len(),
+            1,
+            "an empty page must not request video enrichment"
+        );
+    }
+
+    #[test]
+    fn video_search_skips_one_missing_video_id_and_keeps_valid_rows() {
+        let non_video = r#"{
+            "id": {
+                "kind": "youtube#channel",
+                "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+            },
+            "snippet": {
+                "title": "Unexpected channel row"
+            }
+        }"#;
+        let mixed_page =
+            SEARCH_VIDEO.replacen(r#""items": ["#, &format!(r#""items": [{non_video}, "#), 1);
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", &mixed_page),
+            json_response("200 OK", VIDEO_RESOURCE),
+        ]);
+
+        let page = provider
+            .search_at(
+                &SearchRequest::new("open music", SearchTarget::Videos),
+                1_704_067_200,
+            )
+            .expect("one malformed row must not hide valid videos");
+        let requests = server.finish();
+
+        let [SearchItem::Video(video)] = page.items.as_slice() else {
+            panic!("only the valid video row should survive");
+        };
+        assert_eq!(video.video_id, VIDEO_ID);
+        assert_eq!(video.title, "Enriched title");
+        assert_eq!(page.next_page, Some(2));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            query_pairs(&requests[1]).get("id").map(String::as_str),
+            Some(VIDEO_ID),
+            "batch enrichment must contain only surviving video IDs"
+        );
+    }
+
+    #[test]
+    fn video_search_rejects_an_all_malformed_page_without_caching_its_cursor() {
+        let malformed_page = r#"{
+            "nextPageToken": "must_not_survive",
+            "items": [{
+                "id": {
+                    "kind": "youtube#channel",
+                    "channelId": "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+                },
+                "snippet": {
+                    "title": "Unexpected channel row"
+                }
+            }]
+        }"#;
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", malformed_page)]);
+        let mut request = SearchRequest::new("broken page", SearchTarget::Videos);
+
+        let error = provider
+            .search_at(&request, 1_704_067_200)
+            .expect_err("a nonempty page without usable videos must fail");
+        let requests = server.finish();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message)
+                if message.contains("result 0 omitted its video ID")
+        ));
+        assert_eq!(
+            requests.len(),
+            1,
+            "an all-malformed page must not start batch enrichment"
+        );
+        request.page = 2;
+        assert!(matches!(
+            provider.search_at(&request, 1_704_067_200),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("page 1")
+        ));
+    }
+
+    #[test]
+    fn video_search_rejects_more_rows_than_requested_before_enrichment() {
+        let item = r#"{
+            "id": {"videoId": "dQw4w9WgXcQ"},
+            "snippet": {"title": "Bounded fixture"}
+        }"#;
+        let oversized_page = format!(
+            r#"{{"nextPageToken":"must_not_survive","items":[{}]}}"#,
+            vec![item; usize::from(RESULTS_PER_PAGE) + 1].join(",")
+        );
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", &oversized_page)]);
+        let mut request = SearchRequest::new("oversized page", SearchTarget::Videos);
+
+        let error = provider
+            .search_at(&request, 1_704_067_200)
+            .expect_err("the upstream page must honor requested maxResults");
+        let requests = server.finish();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message)
+                if message.contains("more than 25 video search results")
+        ));
+        assert_eq!(
+            requests.len(),
+            1,
+            "an oversized page must fail before batch enrichment"
+        );
+        request.page = 2;
+        assert!(matches!(
+            provider.search_at(&request, 1_704_067_200),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("page 1")
+        ));
     }
 
     #[test]
