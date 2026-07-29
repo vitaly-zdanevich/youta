@@ -13674,6 +13674,21 @@ impl AppController {
         radio_station_quality(station, false)
     }
 
+    /// Formats selected-station quality while omitting unresolved BBC data.
+    #[cfg(feature = "radio")]
+    fn radio_station_detail_quality(&self, station: &RadioStationPreset) -> String {
+        #[cfg(feature = "bbc-radio")]
+        if station.stream_kind == RadioStreamKind::BbcSounds {
+            return self
+                .bbc_quality_cache
+                .get(station.id)
+                .map(CachedBbcQuality::display)
+                .unwrap_or_default();
+        }
+
+        radio_station_quality(station, true)
+    }
+
     /// Returns the effective bitrate used by local Radio filtering and sorting.
     #[cfg(feature = "radio")]
     fn radio_station_bitrate(&self, station: &RadioStationPreset) -> Option<u32> {
@@ -13816,7 +13831,7 @@ impl AppController {
         };
         self.remember_selected_radio_station();
         let mut description = station.summary.to_owned();
-        let quality = self.radio_station_row_summary(&station);
+        let quality = self.radio_station_detail_quality(&station);
         if !quality.is_empty() {
             description.push_str("\n\nQuality: ");
             description.push_str(&quality);
@@ -39150,13 +39165,25 @@ mod tests {
                 .iter()
                 .all(|row| row.hide_watched_marker)
         );
-        assert!(
-            controller
-                .view
-                .rows
-                .iter()
-                .all(|row| !row.subtitle.trim().is_empty())
-        );
+        for row in &controller.view.rows {
+            let station_id = &row
+                .media_id
+                .as_ref()
+                .expect("Radio row identity")
+                .external_id;
+            let station = station_by_id(station_id).expect("catalogued Radio station");
+            if station.stream_kind == RadioStreamKind::BbcSounds {
+                assert!(
+                    row.subtitle.is_empty(),
+                    "unresolved BBC quality must not render a placeholder"
+                );
+            } else {
+                assert!(
+                    !row.subtitle.trim().is_empty(),
+                    "static station quality must remain visible"
+                );
+            }
+        }
         let sector_index = select_radio_station(&mut controller, "sector-radio-progressive-flac");
         assert_eq!(
             controller.view.rows[sector_index].subtitle,
