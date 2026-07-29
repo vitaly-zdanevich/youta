@@ -3271,6 +3271,56 @@ fn watched_marker(watched_percent: u8, playback_started: bool) -> &'static str {
     }
 }
 
+/// Returns the end of the first standalone duration field in row metadata.
+///
+/// Subtitles retain their source-specific text and ordering. This recognizes
+/// only canonical `M:SS` and `H:MM:SS` fields separated by ` · `, preventing
+/// dates, URLs, sample rates, and other colon-bearing metadata from becoming
+/// accidental progress anchors.
+fn subtitle_duration_field_end(subtitle: &str) -> Option<usize> {
+    const SEPARATOR: &str = " · ";
+
+    let mut field_start = 0;
+    for field in subtitle.split(SEPARATOR) {
+        let field_end = field_start + field.len();
+        if is_standalone_duration(field) {
+            return Some(field_end);
+        }
+        field_start = field_end.saturating_add(SEPARATOR.len());
+    }
+    None
+}
+
+/// Reports whether one complete metadata field is `M:SS` or `H:MM:SS`.
+fn is_standalone_duration(field: &str) -> bool {
+    let components = field.split(':').collect::<Vec<_>>();
+    match components.as_slice() {
+        [minutes, seconds] => {
+            numeric_component_under_sixty(minutes) && two_digit_component_under_sixty(seconds)
+        }
+        [hours, minutes, seconds] => {
+            !hours.is_empty()
+                && hours.bytes().all(|byte| byte.is_ascii_digit())
+                && two_digit_component_under_sixty(minutes)
+                && two_digit_component_under_sixty(seconds)
+        }
+        _ => false,
+    }
+}
+
+/// Validates a one- or two-digit numeric component in the range `0..60`.
+fn numeric_component_under_sixty(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= 2
+        && component.bytes().all(|byte| byte.is_ascii_digit())
+        && component.parse::<u8>().is_ok_and(|value| value < 60)
+}
+
+/// Validates a zero-padded two-digit numeric component in the range `0..60`.
+fn two_digit_component_under_sixty(component: &str) -> bool {
+    component.len() == 2 && numeric_component_under_sixty(component)
+}
+
 fn render_body(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3432,7 +3482,7 @@ fn render_row_list(
             let progress = if !has_playback_progress || row.watched_percent == 0 {
                 String::new()
             } else {
-                format!(" {:>3}%", row.watched_percent)
+                format!(" {}%", row.watched_percent)
             };
             let source_style = if selected || playing {
                 row_style
@@ -3507,10 +3557,12 @@ fn render_row_list(
                 spans
             };
             title_spans.push(Span::styled(&row.title, title_style));
-            title_spans.push(Span::styled(progress, secondary_style));
             if row_height == 1 && !row.subtitle.is_empty() {
                 title_spans.push(Span::styled(" · ", secondary_style));
                 title_spans.push(Span::styled(&row.subtitle, secondary_style));
+            }
+            if row_height == 1 && !progress.is_empty() {
+                title_spans.push(Span::styled(progress.clone(), secondary_style));
             }
             let line = Line::from(title_spans);
             if row_height == 1 {
@@ -3522,12 +3574,30 @@ fn render_row_list(
             }
             if !row.compact && show_source && !row.source.is_empty() {
                 subtitle_spans.push(Span::styled(&row.source, source_style));
-                if !row.subtitle.is_empty() {
+                if !row.subtitle.is_empty() || !progress.is_empty() {
                     subtitle_spans.push(Span::styled(" · ", row_style));
                 }
             }
             if !row.subtitle.is_empty() {
-                subtitle_spans.push(Span::styled(&row.subtitle, secondary_style));
+                if let Some(duration_end) = subtitle_duration_field_end(&row.subtitle)
+                    && !progress.is_empty()
+                {
+                    subtitle_spans
+                        .push(Span::styled(&row.subtitle[..duration_end], secondary_style));
+                    subtitle_spans.push(Span::styled(progress, secondary_style));
+                    subtitle_spans
+                        .push(Span::styled(&row.subtitle[duration_end..], secondary_style));
+                } else {
+                    subtitle_spans.push(Span::styled(&row.subtitle, secondary_style));
+                    if !progress.is_empty() {
+                        subtitle_spans.push(Span::styled(progress, secondary_style));
+                    }
+                }
+            } else if !progress.is_empty() {
+                subtitle_spans.push(Span::styled(
+                    progress.trim_start().to_owned(),
+                    secondary_style,
+                ));
             }
             let subtitle = Line::from(subtitle_spans);
             ListItem::new(vec![line, subtitle]).style(row_style)
@@ -10318,6 +10388,141 @@ mod tests {
             rendered.contains(" 91%"),
             "completed rows retain their exact watched percentage"
         );
+    }
+
+    #[test]
+    fn two_line_progress_follows_duration_without_using_title_width() {
+        let width = 80;
+        let backend = TestBackend::new(width, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let full_width_title = "T".repeat(usize::from(width.saturating_sub(6)));
+        let rows = vec![
+            RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "duration-last")),
+                title: full_width_title,
+                subtitle: "Channel · 12:34".to_owned(),
+                source: "YouTube".to_owned(),
+                watched_percent: 42,
+                ..RowView::default()
+            },
+            RowView {
+                media_id: Some(MediaId::new(SourceKind::Local, "duration-middle")),
+                title: "Local duration in the middle".to_owned(),
+                subtitle: "Artist · 3:21 · Opus".to_owned(),
+                source: "Local".to_owned(),
+                watched_percent: 57,
+                ..RowView::default()
+            },
+            RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "no-duration")),
+                title: "No duration".to_owned(),
+                subtitle: "Channel · date unavailable".to_owned(),
+                source: "YouTube".to_owned(),
+                watched_percent: 63,
+                ..RowView::default()
+            },
+            RowView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "zero-progress")),
+                title: "Zero progress".to_owned(),
+                subtitle: "Channel · 0:42".to_owned(),
+                source: "YouTube".to_owned(),
+                ..RowView::default()
+            },
+            RowView {
+                media_id: Some(MediaId::new(SourceKind::Radio, "hidden-progress")),
+                title: "Hidden progress".to_owned(),
+                subtitle: "Stream · 1:00".to_owned(),
+                source: "Radio".to_owned(),
+                watched_percent: 88,
+                hide_watched_marker: true,
+                ..RowView::default()
+            },
+        ];
+
+        terminal
+            .draw(|frame| {
+                render_row_list(
+                    frame,
+                    frame.area(),
+                    "",
+                    &rows,
+                    true,
+                    0,
+                    None,
+                    true,
+                    Theme::new(false).heading,
+                    &Theme::new(false),
+                );
+            })
+            .expect("draw two-line progress metadata");
+        let buffer = terminal.backend().buffer();
+        let line = |row| {
+            (0..width)
+                .map(|column| buffer[(column, row)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+
+        assert_eq!(
+            buffer[(width - 1, 0)].symbol(),
+            "T",
+            "progress must not consume the primary title line"
+        );
+        assert!(!line(0).contains('%'));
+        assert_eq!(
+            line(1),
+            "    YouTube · Channel · 12:34 42%",
+            "YouTube progress follows its duration-last metadata"
+        );
+        assert_eq!(
+            line(3),
+            "    Local · Artist · 3:21 57% · Opus",
+            "Local progress follows a duration without reordering later technical metadata"
+        );
+        assert_eq!(
+            line(5),
+            "    YouTube · Channel · date unavailable 63%",
+            "metadata without a duration receives progress at the end"
+        );
+        assert!(!line(7).contains('%'));
+        assert!(!line(9).contains('%'));
+    }
+
+    #[test]
+    fn compact_progress_stays_on_one_line_after_the_subtitle() {
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let rows = vec![RowView {
+            media_id: Some(MediaId::new(SourceKind::ApplePodcasts, "compact")),
+            title: "Compact episode".to_owned(),
+            subtitle: "Publisher · 4:03".to_owned(),
+            source: "Apple Podcasts".to_owned(),
+            watched_percent: 35,
+            compact: true,
+            ..RowView::default()
+        }];
+
+        terminal
+            .draw(|frame| {
+                render_row_list(
+                    frame,
+                    frame.area(),
+                    "",
+                    &rows,
+                    true,
+                    0,
+                    None,
+                    true,
+                    Theme::new(false).heading,
+                    &Theme::new(false),
+                );
+            })
+            .expect("draw compact progress metadata");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("◐ Compact episode · Publisher · 4:03 35%"));
+        assert!(!rendered.contains("Compact episode 35% · Publisher"));
     }
 
     #[test]
