@@ -33,6 +33,8 @@ pub mod modarchive;
 pub mod peertube;
 #[cfg(feature = "radio")]
 pub mod radio;
+#[cfg(all(feature = "radio", feature = "wikidata"))]
+pub mod radio_wikidata;
 #[cfg(feature = "rss")]
 pub mod rss;
 #[cfg(feature = "soundstream")]

@@ -117,6 +117,8 @@ use crate::providers::radio::{
     RadioNowPlayingKind, RadioStationPreset, all_stations as curated_radio_stations,
     station_by_id as curated_radio_station_by_id, station_count as curated_radio_station_count,
 };
+#[cfg(all(feature = "radio", feature = "wikidata"))]
+use crate::providers::radio_wikidata::wikidata_item_ids_for_station;
 #[cfg(feature = "rss")]
 use crate::providers::rss::{
     PodcastEpisode, PodcastFeed, RssPodcastProvider, podcast_episode_external_id,
@@ -14346,15 +14348,29 @@ impl AppController {
             description.push_str("\n\n");
             description.push_str(now_playing);
         }
-        self.view.details = Some(DetailView {
+        #[cfg(feature = "wikidata")]
+        let links = wikidata_item_ids_for_station(station.id)
+            .iter()
+            .map(|item_id| DetailLinkView {
+                label: format!("{} ({item_id})", station.name),
+                url: format!("https://www.wikidata.org/wiki/{item_id}"),
+                wikidata_item_id: Some((*item_id).to_owned()),
+            })
+            .collect();
+        #[cfg(not(feature = "wikidata"))]
+        let links = Vec::new();
+        let mut details = DetailView {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
             title: station.name.to_owned(),
             source: "Radio".to_owned(),
             channel_webpage_url: station.homepage_url().ok(),
             description,
             radio_favorite: self.radio_favorite_station_ids.contains(station.id),
+            links,
             ..DetailView::default()
-        });
+        };
+        preserve_same_media_wikidata_state(self.view.details.as_ref(), &mut details);
+        self.view.details = Some(details);
     }
 
     /// Selects at most one station whose passive metadata may be refreshed.
@@ -22440,6 +22456,46 @@ fn preserve_thumbnail_expansion(previous: Option<&DetailView>, next: &mut Detail
     if same_media || same_channel {
         next.thumbnail_expanded = previous.thumbnail_expanded;
     }
+}
+
+/// Carries a Wikidata disclosure across passive refreshes of the same media.
+///
+/// Radio now-playing metadata periodically rebuilds Details. Keeping only
+/// state owned by a QID that remains linked prevents those refreshes from
+/// collapsing an open spoiler, while a station change starts with clean
+/// interaction state.
+#[cfg(feature = "radio")]
+fn preserve_same_media_wikidata_state(previous: Option<&DetailView>, next: &mut DetailView) {
+    let Some(previous) = previous.filter(|previous| {
+        previous
+            .media_id
+            .as_ref()
+            .zip(next.media_id.as_ref())
+            .is_some_and(|(previous, next)| previous == next)
+    }) else {
+        return;
+    };
+    let remains_linked = |item_id: &str| {
+        next.links
+            .iter()
+            .any(|link| link.wikidata_item_id.as_deref() == Some(item_id))
+    };
+    next.expanded_wikidata_item = previous
+        .expanded_wikidata_item
+        .as_deref()
+        .filter(|item_id| remains_linked(item_id))
+        .map(ToOwned::to_owned);
+    next.loading_wikidata_item = previous
+        .loading_wikidata_item
+        .as_deref()
+        .filter(|item_id| remains_linked(item_id))
+        .map(ToOwned::to_owned);
+    next.wikidata_entities = previous
+        .wikidata_entities
+        .iter()
+        .filter(|entity| remains_linked(&entity.item_id))
+        .cloned()
+        .collect();
 }
 
 fn preferred_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
@@ -39704,6 +39760,112 @@ mod tests {
         assert!(details.length.is_empty());
         assert!(details.likes.is_empty());
         assert!(details.views.is_empty());
+    }
+
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[test]
+    fn radio_details_use_verified_qid_without_a_discovery_request() {
+        let config = Config::for_dir("/tmp/youta-radio-wikidata-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+
+        select_radio_station(&mut controller, "kexp");
+
+        let details = controller.view.details.as_ref().expect("KEXP details");
+        assert_eq!(
+            details.links,
+            [DetailLinkView {
+                label: "KEXP (Q761627)".to_owned(),
+                url: "https://www.wikidata.org/wiki/Q761627".to_owned(),
+                wikidata_item_id: Some("Q761627".to_owned()),
+            }]
+        );
+        controller.dispatch(UiAction::ToggleWikidataStatements(0));
+
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lazy Wikidata statement request"),
+            ProviderRequest::WikidataStatements { item_id } if item_id == "Q761627"
+        ));
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "a hardcoded station QID must not start Wikidata discovery"
+        );
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("expanded KEXP details");
+        assert_eq!(details.expanded_wikidata_item.as_deref(), Some("Q761627"));
+        assert_eq!(details.loading_wikidata_item.as_deref(), Some("Q761627"));
+    }
+
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[test]
+    fn passive_radio_refresh_preserves_only_same_station_wikidata_state() {
+        let config = Config::for_dir("/tmp/youta-radio-wikidata-refresh-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        select_radio_station(&mut controller, "france-musique");
+        controller.dispatch(UiAction::ToggleWikidataStatements(0));
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("explicit Wikidata request"),
+            ProviderRequest::WikidataStatements { item_id } if item_id == "Q19909"
+        ));
+        controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+            generation: 1,
+            station_id: "france-musique".to_owned(),
+        });
+
+        controller.handle_radio_now_playing(
+            1,
+            "france-musique".to_owned(),
+            Ok(RadioNowPlaying {
+                kind: RadioNowPlayingKind::OnAir,
+                title: Some("Fixture programme".to_owned()),
+                artist: None,
+                programme: Some("Fixture programme".to_owned()),
+                station_start_time: None,
+                duration: None,
+                refresh_after: Duration::from_secs(60),
+            }),
+        );
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("refreshed France Musique details");
+        assert_eq!(details.expanded_wikidata_item.as_deref(), Some("Q19909"));
+        assert_eq!(details.loading_wikidata_item.as_deref(), Some("Q19909"));
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "passive radio metadata must not start another Wikidata request"
+        );
+
+        select_radio_station(&mut controller, "fip");
+
+        let details = controller.view.details.as_ref().expect("FIP details");
+        assert_eq!(
+            details.media_id.as_ref().map(|id| id.external_id.as_str()),
+            Some("fip")
+        );
+        assert_eq!(
+            details.links[0].wikidata_item_id.as_deref(),
+            Some("Q961891")
+        );
+        assert!(details.expanded_wikidata_item.is_none());
+        assert!(details.loading_wikidata_item.is_none());
+        assert!(details.wikidata_entities.is_empty());
     }
 
     #[cfg(feature = "radio")]
