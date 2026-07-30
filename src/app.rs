@@ -49,8 +49,8 @@ use crate::audio_identification::{
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
-    SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV, YouTubeBackend,
-    YouTubeProviderSetting,
+    SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV,
+    YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
 };
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 #[cfg(feature = "radio")]
@@ -2996,6 +2996,8 @@ pub struct AppController {
     youtube_results: Vec<SearchItem>,
     /// Track summaries returned by the independent `YouTube Music` search.
     youtube_music_results: Vec<SearchItem>,
+    /// Current terminal-window width used only by automatic thumbnail sizing.
+    terminal_window_width_pixels: Option<u16>,
     /// Query retained independently for the `Apple Podcasts` tab.
     apple_podcasts_search_query: String,
     /// Lowercase storefront owning the retained Apple show results.
@@ -3880,6 +3882,7 @@ impl AppController {
             tracker_selected,
             youtube_results,
             youtube_music_results,
+            terminal_window_width_pixels: None,
             apple_podcasts_search_query,
             #[cfg(feature = "apple-podcasts")]
             apple_podcasts_storefront,
@@ -5706,7 +5709,11 @@ impl AppController {
             return;
         }
         self.details_generation = self.details_generation.wrapping_add(1);
-        let mut detail = preliminary_detail(&selected, &self.subscription_tree);
+        let mut detail = preliminary_detail_with_thumbnail_size(
+            &selected,
+            &self.subscription_tree,
+            self.effective_youtube_thumbnail_size(),
+        );
         if self.view.screen == Screen::YouTubeMusic {
             detail.source = "YouTube Music".to_owned();
         }
@@ -7566,7 +7573,11 @@ impl AppController {
                                 .as_ref()
                                 .map(|view| view.links.clone())
                                 .unwrap_or_default();
-                            let mut detail = detail_from_video(&details, &self.subscription_tree);
+                            let mut detail = detail_from_video_with_thumbnail_size(
+                                &details,
+                                &self.subscription_tree,
+                                self.effective_youtube_thumbnail_size(),
+                            );
                             if !linked_matches && self.view.screen == Screen::YouTubeMusic {
                                 detail.source = "YouTube Music".to_owned();
                             }
@@ -7966,19 +7977,152 @@ impl AppController {
         }
     }
 
+    /// Resolves the configured `YouTube` thumbnail choice for this terminal.
+    fn effective_youtube_thumbnail_size(&self) -> YouTubeThumbnailSize {
+        self.config
+            .ui
+            .youtube_thumbnail_size
+            .resolve(self.terminal_window_width_pixels)
+    }
+
+    /// Reprojects visible YouTube artwork without fetching another size.
+    fn refresh_youtube_thumbnail_projection(&mut self) {
+        match self.view.screen {
+            Screen::Search
+                if self.local_results.is_empty()
+                    && self.direct_item.is_none()
+                    && self.resolved_direct.is_none() =>
+            {
+                self.refresh_youtube_rows();
+            }
+            Screen::YouTubeMusic => self.refresh_youtube_music_rows(),
+            Screen::Subscriptions => self.refresh_subscription_video_rows(),
+            Screen::Playlists if self.active_playlist.is_some() => {
+                self.populate_playlist_entries();
+            }
+            _ => {}
+        }
+
+        let selected_size = self.effective_youtube_thumbnail_size();
+        let existing_thumbnail = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.thumbnail_url.clone());
+        let existing_dimensions = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.thumbnail_dimensions);
+        let video_id = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.media_id.as_ref())
+            .filter(|media_id| media_id.source == SourceKind::YouTube)
+            .map(|media_id| media_id.external_id.clone());
+        let (thumbnail, expanded_thumbnail_url) =
+            video_id.as_deref().map_or((None, None), |video_id| {
+                let cached = self
+                    .youtube_video_details_cache
+                    .get(video_id)
+                    .map(|details| details.thumbnails.as_slice());
+                let summary = self
+                    .youtube_results
+                    .iter()
+                    .chain(self.youtube_music_results.iter())
+                    .chain(
+                        self.subscription_video_cache
+                            .values()
+                            .flat_map(|cached| cached.items.iter()),
+                    )
+                    .find_map(|item| match item {
+                        SearchItem::Video(video) if video.video_id == video_id => {
+                            Some(video.thumbnails.as_slice())
+                        }
+                        SearchItem::Video(_)
+                        | SearchItem::Channel(_)
+                        | SearchItem::PodcastEpisode(_) => None,
+                    });
+                let projected = cached.into_iter().chain(summary).find_map(|thumbnails| {
+                    let thumbnail = youtube_thumbnail_for_size(thumbnails, selected_size)?.clone();
+                    Some((Some(thumbnail), largest_youtube_thumbnail_url(thumbnails)))
+                });
+                projected
+                    .or_else(|| {
+                        let stored = existing_thumbnail.as_ref()?;
+                        let exact_size = has_stable_youtube_thumbnail_filename(stored);
+                        let url = rewrite_persisted_youtube_thumbnail_url(stored, selected_size)?;
+                        let dimensions = if exact_size {
+                            selected_size.dimensions()
+                        } else {
+                            existing_dimensions
+                        };
+                        Some((
+                            Some(Thumbnail {
+                                url,
+                                quality: selected_size.quality().map(str::to_owned),
+                                width: dimensions.map(|(width, _)| width),
+                                height: dimensions.map(|(_, height)| height),
+                            }),
+                            None,
+                        ))
+                    })
+                    .unwrap_or((None, None))
+            });
+        if let Some(details) = self.view.details.as_mut()
+            && video_id.is_some()
+        {
+            details.thumbnail_url = thumbnail.as_ref().map(|thumbnail| thumbnail.url.clone());
+            details.expanded_thumbnail_url = expanded_thumbnail_url;
+            details.thumbnail_dimensions = thumbnail
+                .as_ref()
+                .and_then(|thumbnail| thumbnail.width.zip(thumbnail.height));
+            if details.expanded_thumbnail_url.is_none()
+                && details.thumbnail_url.is_none()
+                && details.local_video_thumbnail.is_none()
+                && !details
+                    .expanded_wikidata_item
+                    .as_deref()
+                    .and_then(|item_id| {
+                        details
+                            .wikidata_entities
+                            .iter()
+                            .find(|entity| entity.item_id == item_id)
+                    })
+                    .is_some_and(|entity| entity.image_url.is_some())
+            {
+                details.thumbnail_expanded = false;
+            }
+        }
+    }
+
+    /// Applies a resize only when it changes Automatic's exact API entry.
+    fn set_terminal_window_width_pixels(&mut self, width: Option<u16>) {
+        let previous = self.effective_youtube_thumbnail_size();
+        self.terminal_window_width_pixels = width;
+        if previous != self.effective_youtube_thumbnail_size()
+            && self.config.ui.youtube_thumbnail_size == YouTubeThumbnailSize::Automatic
+        {
+            self.refresh_youtube_thumbnail_projection();
+        }
+    }
+
     fn refresh_youtube_rows(&mut self) {
         let today = Local::now().date_naive();
+        let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
         self.view.rows = self
             .youtube_results
             .iter()
             .map(|item| {
-                row_from_search_item(
+                row_from_search_item_with_thumbnail_size(
                     item,
                     &self.store,
                     &self.subscription_tree,
                     &self.channel_subscriber_cache,
                     SearchRowContext::GlobalSearch,
                     today,
+                    youtube_thumbnail_size,
                 )
             })
             .collect();
@@ -7990,17 +8134,19 @@ impl AppController {
 
     fn refresh_youtube_music_rows(&mut self) {
         let today = Local::now().date_naive();
+        let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
         self.view.rows = self
             .youtube_music_results
             .iter()
             .map(|item| {
-                row_from_search_item(
+                row_from_search_item_with_thumbnail_size(
                     item,
                     &self.store,
                     &self.subscription_tree,
                     &self.channel_subscriber_cache,
                     SearchRowContext::YouTubeMusic,
                     today,
+                    youtube_thumbnail_size,
                 )
             })
             .collect();
@@ -9900,7 +10046,11 @@ impl AppController {
         video: &VideoSummary,
         start_at_seconds: Option<u64>,
     ) -> QueueItem {
-        let mut item = queue_item_from_video(video, start_at_seconds);
+        let mut item = queue_item_from_video_with_thumbnail_size(
+            video,
+            start_at_seconds,
+            self.effective_youtube_thumbnail_size(),
+        );
         let media_id = MediaId::new(SourceKind::YouTube, &video.video_id);
         if let Some(details) = self
             .view
@@ -12327,7 +12477,10 @@ impl AppController {
         self.view.details_focused = true;
         self.view.details_scroll = 0;
         self.view.selected_detail_link = None;
-        self.view.details = Some(detail_from_media_item(&item.media));
+        self.view.details = Some(detail_from_media_item(
+            &item.media,
+            self.effective_youtube_thumbnail_size(),
+        ));
         self.view.status_line = format!(
             "Showing queued details for {}; it is not in the current list",
             item.media.title
@@ -14434,7 +14587,11 @@ impl AppController {
                     .find_map(|(index, item)| match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
-                                item: Box::new(queue_item_from_video(video, None)),
+                                item: Box::new(queue_item_from_video_with_thumbnail_size(
+                                    video,
+                                    None,
+                                    self.effective_youtube_thumbnail_size(),
+                                )),
                                 origin: AutoplayOrigin::YouTube {
                                     generation: *generation,
                                     index,
@@ -14456,7 +14613,11 @@ impl AppController {
                     .find_map(|(index, item)| match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
-                                item: Box::new(queue_item_from_video(video, None)),
+                                item: Box::new(queue_item_from_video_with_thumbnail_size(
+                                    video,
+                                    None,
+                                    self.effective_youtube_thumbnail_size(),
+                                )),
                                 origin: AutoplayOrigin::YouTubeMusic {
                                     generation: *generation,
                                     index,
@@ -14479,7 +14640,11 @@ impl AppController {
                         .find_map(|(index, item)| match item {
                             SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                                 Some(AutoplayStep::Play {
-                                    item: Box::new(queue_item_from_video(video, None)),
+                                    item: Box::new(queue_item_from_video_with_thumbnail_size(
+                                        video,
+                                        None,
+                                        self.effective_youtube_thumbnail_size(),
+                                    )),
                                     origin: AutoplayOrigin::Subscription {
                                         channel_id: channel_id.clone(),
                                         index,
@@ -16590,6 +16755,7 @@ impl AppController {
         };
         let playlist_name = playlist.name.clone();
         let playlist_entry_count = playlist.entries.len();
+        let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
         self.view.rows = playlist
             .entries
             .iter()
@@ -16633,7 +16799,11 @@ impl AppController {
                     },
                     watched_percent: playback.watched_percent,
                     playback_started: playback.playback_started,
-                    thumbnail_url: entry.media.thumbnail_url.clone(),
+                    thumbnail_url: projected_persisted_thumbnail_url(
+                        &entry.media.id,
+                        entry.media.thumbnail_url.as_ref(),
+                        youtube_thumbnail_size,
+                    ),
                     hide_watched_marker: live_stream,
                     compact: true,
                     ..RowView::default()
@@ -16718,6 +16888,16 @@ impl AppController {
                     .as_deref()
                     .map(|path| self.cached_local_video_thumbnail(path))
                     .unwrap_or((None, false));
+                let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
+                let thumbnail_url = projected_persisted_thumbnail_url(
+                    &entry.media.id,
+                    entry.media.thumbnail_url.as_ref(),
+                    youtube_thumbnail_size,
+                );
+                let thumbnail_dimensions = (entry.media.id.source == SourceKind::YouTube
+                    && thumbnail_url.is_some())
+                .then(|| youtube_thumbnail_size.dimensions())
+                .flatten();
                 self.view.details = Some(DetailView {
                     media_id: Some(entry.media.id.clone()),
                     title: entry.media.title.clone(),
@@ -16731,7 +16911,8 @@ impl AppController {
                         .duration_seconds
                         .map_or_else(String::new, format_seconds),
                     description,
-                    thumbnail_url: entry.media.thumbnail_url.clone(),
+                    thumbnail_url,
+                    thumbnail_dimensions,
                     local_video_thumbnail,
                     links,
                     ..DetailView::default()
@@ -16853,13 +17034,18 @@ impl AppController {
             return;
         }
 
-        let item = match queue_item_from_playlist_entry(&entry) {
+        let mut item = match queue_item_from_playlist_entry(&entry) {
             Ok(item) => item,
             Err(error) => {
                 self.show_error_message("Playlist item is unavailable", error);
                 return;
             }
         };
+        item.media.thumbnail_url = projected_persisted_thumbnail_url(
+            &item.media.id,
+            item.media.thumbnail_url.as_ref(),
+            self.effective_youtube_thumbnail_size(),
+        );
         self.play_queue_item(item, false);
     }
 
@@ -17852,6 +18038,7 @@ impl AppController {
 
     fn refresh_subscription_video_rows(&mut self) {
         let today = Local::now().date_naive();
+        let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
         let active_source_id = self.active_subscription_channel_id.as_deref().or_else(|| {
             #[cfg(feature = "rss")]
             {
@@ -17869,13 +18056,14 @@ impl AppController {
         self.view.subscriptions.items = items
             .iter()
             .map(|item| {
-                row_from_search_item(
+                row_from_search_item_with_thumbnail_size(
                     item,
                     &self.store,
                     &self.subscription_tree,
                     &self.channel_subscriber_cache,
                     SearchRowContext::SubscriptionFeed,
                     today,
+                    youtube_thumbnail_size,
                 )
             })
             .collect();
@@ -19967,6 +20155,7 @@ impl AppController {
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
             YOUTUBE_PREWARM_ENV,
+            YOUTUBE_THUMBNAIL_SIZE_ENV,
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
@@ -19980,6 +20169,7 @@ impl AppController {
             subscriptions_layout: self.config.ui.subscriptions_layout,
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
             youtube_prewarm: self.config.playback.youtube_prewarm,
+            youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
@@ -20061,6 +20251,24 @@ impl AppController {
             return;
         }
         preferences.youtube_prewarm = !preferences.youtube_prewarm;
+        preferences.validation_error = None;
+    }
+
+    /// Advances the closed `YouTube` thumbnail-size set in Preferences.
+    fn cycle_draft_youtube_thumbnail_size(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if !cfg!(feature = "images") {
+            preferences.validation_error = Some("this build omits the `images` feature".to_owned());
+            return;
+        }
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.youtube_thumbnail_size = preferences.youtube_thumbnail_size.next();
         preferences.validation_error = None;
     }
 
@@ -20205,6 +20413,7 @@ impl AppController {
         let layout = preferences.subscriptions_layout;
         let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
         let youtube_prewarm = preferences.youtube_prewarm;
+        let youtube_thumbnail_size = preferences.youtube_thumbnail_size;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
         #[cfg(feature = "images")]
         let show_images_in_tty = preferences.show_images_in_tty;
@@ -20216,12 +20425,15 @@ impl AppController {
             self.config.playback.youtube_prewarm != youtube_prewarm;
         let local_folder_size_preference_changed =
             self.config.ui.show_local_folder_sizes != show_local_folder_sizes;
+        let youtube_thumbnail_preference_changed =
+            self.config.ui.youtube_thumbnail_size != youtube_thumbnail_size;
         if let Err(error) = self.config.save_tui_preferences(
             layout,
             skip_advertisement_chapters,
             youtube_prewarm,
             show_local_folder_sizes,
             show_images_in_tty,
+            youtube_thumbnail_size,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
@@ -20267,6 +20479,9 @@ impl AppController {
             self.schedule_local_folder_sizes();
         }
         self.view.show_images_in_tty = show_images_in_tty;
+        if youtube_thumbnail_preference_changed {
+            self.refresh_youtube_thumbnail_projection();
+        }
         self.view.preferences_popup = None;
         if self.view.screen == Screen::Subscriptions {
             self.populate_subscriptions();
@@ -20688,6 +20903,9 @@ impl UiController for AppController {
                 self.view.external_opener_available = available;
                 self.view.physical_linux_console = !available;
             }
+            UiAction::SetTerminalWindowWidthPixels(width) => {
+                self.set_terminal_window_width_pixels(width);
+            }
             UiAction::ReportGpmUnavailable {
                 gpm_supported,
                 openrc_managed,
@@ -20823,21 +21041,13 @@ impl UiController for AppController {
                 let Some(details) = self.view.details.as_mut() else {
                     return;
                 };
-                let has_visible_artwork = details.thumbnail_url.is_some()
-                    || details
-                        .expanded_wikidata_item
-                        .as_deref()
-                        .and_then(|item_id| {
-                            details
-                                .wikidata_entities
-                                .iter()
-                                .find(|entity| entity.item_id == item_id)
-                        })
-                        .is_some_and(|entity| entity.image_url.is_some());
-                if !has_visible_artwork {
+                if details.thumbnail_expanded {
+                    details.thumbnail_expanded = false;
+                } else if detail_has_expandable_artwork(details) {
+                    details.thumbnail_expanded = true;
+                } else {
                     return;
                 }
-                details.thumbnail_expanded = !details.thumbnail_expanded;
                 self.view.details_text_selection = None;
                 self.view.details_focused = true;
             }
@@ -21169,6 +21379,9 @@ impl UiController for AppController {
                 self.toggle_draft_skip_advertisement_chapters();
             }
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
+            UiAction::CycleYouTubeThumbnailSize => {
+                self.cycle_draft_youtube_thumbnail_size();
+            }
             UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
             UiAction::ToggleTtyImages => self.toggle_draft_tty_images(),
             UiAction::CycleBandcampAudioFormat => {
@@ -24240,13 +24453,14 @@ fn hydrate_row_playback_progress(store: &StateStore, rows: &mut [RowView]) {
 }
 
 /// Converts one provider item into a compact row for its presentation context.
-fn row_from_search_item(
+fn row_from_search_item_with_thumbnail_size(
     item: &SearchItem,
     store: &StateStore,
     subscriptions: &SubscriptionTree,
     channel_subscribers: &HashMap<String, Option<u64>>,
     context: SearchRowContext,
     today: NaiveDate,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
 ) -> RowView {
     match item {
         SearchItem::Video(video) => {
@@ -24275,7 +24489,11 @@ fn row_from_search_item(
                 playback_started: playback.playback_started,
                 subscribed: matches!(context, SearchRowContext::GlobalSearch)
                     && subscriptions.contains_youtube_channel(&video.channel_id),
-                thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
+                thumbnail_url: if matches!(context, SearchRowContext::YouTubeMusic) {
+                    preferred_thumbnail_url(&video.thumbnails)
+                } else {
+                    preferred_youtube_thumbnail_url(&video.thumbnails, youtube_thumbnail_size)
+                },
                 vertical: video.orientation == VideoOrientation::Vertical,
                 hide_watched_marker: false,
                 compact: false,
@@ -24366,6 +24584,27 @@ fn subscription_item_media_id(item: &SearchItem) -> Option<MediaId> {
 /// Global Search retains the channel identity and selected-only subscriber
 /// count. A subscription feed omits both because its heading already owns
 /// those facts.
+/// Builds a deterministic search row at the conservative automatic size.
+#[cfg(test)]
+fn row_from_search_item(
+    item: &SearchItem,
+    store: &StateStore,
+    subscriptions: &SubscriptionTree,
+    channel_subscribers: &HashMap<String, Option<u64>>,
+    context: SearchRowContext,
+    today: NaiveDate,
+) -> RowView {
+    row_from_search_item_with_thumbnail_size(
+        item,
+        store,
+        subscriptions,
+        channel_subscribers,
+        context,
+        today,
+        YouTubeThumbnailSize::Standard,
+    )
+}
+
 fn youtube_video_row_subtitle(
     video: &VideoSummary,
     subscriber_count: Option<u64>,
@@ -24477,10 +24716,19 @@ fn description_chapters(description: &str, duration_seconds: Option<u64>) -> Vec
         .collect()
 }
 
-fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> DetailView {
+fn preliminary_detail_with_thumbnail_size(
+    item: &SearchItem,
+    subscriptions: &SubscriptionTree,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> DetailView {
     match item {
         SearchItem::Video(video) => {
             let description = normalize_description_chapter_lines(&video.description);
+            let (thumbnail_url, thumbnail_dimensions) =
+                youtube_thumbnail_projection(&video.thumbnails, youtube_thumbnail_size);
+            let expanded_thumbnail_url = thumbnail_url
+                .as_ref()
+                .and_then(|_| largest_youtube_thumbnail_url(&video.thumbnails));
             DetailView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
                 title: video.title.clone(),
@@ -24508,7 +24756,9 @@ fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> De
                     .unwrap_or_else(|| "unknown".to_owned()),
                 license: "loading…".to_owned(),
                 wikidata: "not loaded".to_owned(),
-                thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
+                thumbnail_url,
+                expanded_thumbnail_url,
+                thumbnail_dimensions,
                 ..DetailView::default()
             }
         }
@@ -24529,6 +24779,12 @@ fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> De
             }
         }
     }
+}
+
+/// Builds deterministic preliminary test details at the conservative size.
+#[cfg(test)]
+fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> DetailView {
+    preliminary_detail_with_thumbnail_size(item, subscriptions, YouTubeThumbnailSize::Standard)
 }
 
 /// Builds selected RSS episode details without issuing a YouTube metadata call.
@@ -24599,9 +24855,26 @@ fn preserve_thumbnail_expansion(previous: Option<&DetailView>, next: &mut Detail
         && next.media_id.is_none()
         && !previous.channel_id.is_empty()
         && previous.channel_id == next.channel_id;
-    if same_media || same_channel {
+    if (same_media || same_channel) && detail_has_expandable_artwork(next) {
         next.thumbnail_expanded = previous.thumbnail_expanded;
     }
+}
+
+/// Reports whether Details currently owns artwork that can fill the terminal.
+fn detail_has_expandable_artwork(details: &DetailView) -> bool {
+    details.expanded_thumbnail_url.is_some()
+        || details.thumbnail_url.is_some()
+        || details.local_video_thumbnail.is_some()
+        || details
+            .expanded_wikidata_item
+            .as_deref()
+            .and_then(|item_id| {
+                details
+                    .wikidata_entities
+                    .iter()
+                    .find(|entity| entity.item_id == item_id)
+            })
+            .is_some_and(|entity| entity.image_url.is_some())
 }
 
 /// Carries a Wikidata disclosure across passive refreshes of the same media.
@@ -24672,6 +24945,89 @@ fn preferred_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
     selected.map(|thumbnail| thumbnail.url.clone())
 }
 
+/// Chooses the largest image that a YouTube provider explicitly advertised.
+///
+/// Providers normally include pixel dimensions. Stable YouTube quality names
+/// supply a fallback rank when an alternate provider omits those dimensions;
+/// ties keep the provider's last entry.
+fn largest_youtube_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
+    thumbnails
+        .iter()
+        .enumerate()
+        .filter_map(|(index, thumbnail)| {
+            let area = thumbnail
+                .width
+                .zip(thumbnail.height)
+                .and_then(|(width, height)| {
+                    let area = u64::from(width) * u64::from(height);
+                    (area > 0).then_some(area)
+                })
+                .or_else(|| {
+                    let quality = thumbnail.quality.as_deref()?.to_ascii_lowercase();
+                    match quality.as_str() {
+                        "default" => Some(120_u64 * 90),
+                        "medium" => Some(320_u64 * 180),
+                        "high" => Some(480_u64 * 360),
+                        "standard" => Some(640_u64 * 480),
+                        "maxres" => Some(1_280_u64 * 720),
+                        _ => None,
+                    }
+                })?;
+            Some(((area, index), thumbnail))
+        })
+        .max_by_key(|((area, index), _)| (*area, *index))
+        .map(|(_, thumbnail)| thumbnail.url.clone())
+}
+
+/// Chooses exactly one configured `YouTube` thumbnail size.
+///
+/// Quality names are preferred because providers can omit dimensions.
+/// Documented dimensions provide an interoperability fallback for providers
+/// that omit the API quality key. No other size is selected, preventing a row
+/// prefetch followed by a second Details download.
+fn preferred_youtube_thumbnail_url(
+    thumbnails: &[Thumbnail],
+    size: YouTubeThumbnailSize,
+) -> Option<url::Url> {
+    youtube_thumbnail_projection(thumbnails, size).0
+}
+
+/// Selects one exact YouTube thumbnail URL and its provider dimensions.
+fn youtube_thumbnail_projection(
+    thumbnails: &[Thumbnail],
+    size: YouTubeThumbnailSize,
+) -> (Option<url::Url>, Option<(u32, u32)>) {
+    let Some(thumbnail) = youtube_thumbnail_for_size(thumbnails, size) else {
+        return (None, None);
+    };
+    (
+        Some(thumbnail.url.clone()),
+        thumbnail.width.zip(thumbnail.height),
+    )
+}
+
+/// Finds exactly one configured `YouTube` thumbnail without fallback.
+fn youtube_thumbnail_for_size(
+    thumbnails: &[Thumbnail],
+    size: YouTubeThumbnailSize,
+) -> Option<&Thumbnail> {
+    let quality = size.quality()?;
+    thumbnails
+        .iter()
+        .find(|thumbnail| {
+            thumbnail
+                .quality
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(quality))
+        })
+        .or_else(|| {
+            let dimensions = size.dimensions()?;
+            thumbnails
+                .iter()
+                .find(|thumbnail| thumbnail.width.zip(thumbnail.height) == Some(dimensions))
+        })
+}
+
 /// Compacts selected-only channel metadata before process-local caching.
 fn compact_channel_summary(channel: &mut ChannelSummary) {
     compact_cached_string(&mut channel.channel_id, 128);
@@ -24719,18 +25075,24 @@ fn compact_subscription_item(item: &mut SearchItem) {
                 .stream_url
                 .take_if(|url| url.as_str().len() > MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
 
-            let preferred_thumbnail = preferred_thumbnail_url(&video.thumbnails);
-            video.thumbnails.retain(|thumbnail| {
-                preferred_thumbnail.as_ref() == Some(&thumbnail.url)
-                    && thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES
-            });
-            video.thumbnails.truncate(1);
-            video.thumbnails.shrink_to_fit();
-            if let Some(thumbnail) = video.thumbnails.first_mut()
-                && let Some(quality) = thumbnail.quality.as_mut()
-            {
-                compact_cached_string(quality, 128);
+            let mut selectable_thumbnails = [
+                YouTubeThumbnailSize::Default,
+                YouTubeThumbnailSize::Medium,
+                YouTubeThumbnailSize::High,
+                YouTubeThumbnailSize::Standard,
+                YouTubeThumbnailSize::Maxres,
+            ]
+            .into_iter()
+            .filter_map(|size| youtube_thumbnail_for_size(&video.thumbnails, size).cloned())
+            .filter(|thumbnail| thumbnail.url.as_str().len() <= MAX_CACHED_SUBSCRIPTION_FIELD_BYTES)
+            .collect::<Vec<_>>();
+            for thumbnail in &mut selectable_thumbnails {
+                if let Some(quality) = thumbnail.quality.as_mut() {
+                    compact_cached_string(quality, 128);
+                }
             }
+            selectable_thumbnails.shrink_to_fit();
+            video.thumbnails = selectable_thumbnails;
         }
         SearchItem::PodcastEpisode(episode) => {
             compact_cached_string(&mut episode.episode_id, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
@@ -24981,8 +25343,17 @@ fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTre
     }
 }
 
-fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> DetailView {
+fn detail_from_video_with_thumbnail_size(
+    video: &VideoDetails,
+    subscriptions: &SubscriptionTree,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> DetailView {
     let description = normalize_description_chapter_lines(&video.description);
+    let (thumbnail_url, thumbnail_dimensions) =
+        youtube_thumbnail_projection(&video.thumbnails, youtube_thumbnail_size);
+    let expanded_thumbnail_url = thumbnail_url
+        .as_ref()
+        .and_then(|_| largest_youtube_thumbnail_url(&video.thumbnails));
     DetailView {
         media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
         title: video.title.clone(),
@@ -25020,14 +25391,33 @@ fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> 
             .clone()
             .unwrap_or_else(|| "unknown".to_owned()),
         wikidata: "not loaded (lazy)".to_owned(),
-        thumbnail_url: preferred_thumbnail_url(&video.thumbnails),
+        thumbnail_url,
+        expanded_thumbnail_url,
+        thumbnail_dimensions,
         links: Vec::new(),
         ..DetailView::default()
     }
 }
 
-fn detail_from_media_item(media: &MediaItem) -> DetailView {
+/// Builds deterministic complete test details at the conservative size.
+#[cfg(test)]
+fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> DetailView {
+    detail_from_video_with_thumbnail_size(video, subscriptions, YouTubeThumbnailSize::Standard)
+}
+
+fn detail_from_media_item(
+    media: &MediaItem,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> DetailView {
     let description = media.description.clone().unwrap_or_default();
+    let thumbnail_url = projected_persisted_thumbnail_url(
+        &media.id,
+        media.thumbnail_url.as_ref(),
+        youtube_thumbnail_size,
+    );
+    let thumbnail_dimensions = (media.id.source == SourceKind::YouTube && thumbnail_url.is_some())
+        .then(|| youtube_thumbnail_size.dimensions())
+        .flatten();
     DetailView {
         media_id: Some(media.id.clone()),
         title: media.title.clone(),
@@ -25054,7 +25444,8 @@ fn detail_from_media_item(media: &MediaItem) -> DetailView {
             MediaLicense::CreativeCommons(label) => label.clone(),
             _ => String::new(),
         },
-        thumbnail_url: media.thumbnail_url.clone(),
+        thumbnail_url,
+        thumbnail_dimensions,
         ..DetailView::default()
     }
 }
@@ -25403,6 +25794,74 @@ fn youtube_video_url(video_id: &str) -> String {
     format!("https://www.youtube.com/watch?v={video_id}")
 }
 
+/// Returns YouTube's stable filename for one exact thumbnail-size choice.
+fn youtube_thumbnail_filename(size: YouTubeThumbnailSize) -> Option<&'static str> {
+    match size {
+        YouTubeThumbnailSize::Automatic | YouTubeThumbnailSize::Disabled => return None,
+        YouTubeThumbnailSize::Default => "default.jpg",
+        YouTubeThumbnailSize::Medium => "mqdefault.jpg",
+        YouTubeThumbnailSize::High => "hqdefault.jpg",
+        YouTubeThumbnailSize::Standard => "sddefault.jpg",
+        YouTubeThumbnailSize::Maxres => "maxresdefault.jpg",
+    }
+    .into()
+}
+
+/// Reports whether a stored URL ends in one of YouTube's stable size names.
+fn has_stable_youtube_thumbnail_filename(url: &url::Url) -> bool {
+    const KNOWN_FILENAMES: [&str; 5] = [
+        "default.jpg",
+        "mqdefault.jpg",
+        "hqdefault.jpg",
+        "sddefault.jpg",
+        "maxresdefault.jpg",
+    ];
+    url.path_segments()
+        .and_then(Iterator::last)
+        .is_some_and(|filename| KNOWN_FILENAMES.contains(&filename))
+}
+
+/// Rewrites a recognized YouTube thumbnail filename without changing its host.
+///
+/// Invidious and other providers can proxy YouTube artwork. Keeping the
+/// provider's scheme, authority, query, and fragment avoids bypassing that
+/// configured privacy boundary. Unknown URL shapes remain unchanged.
+fn rewrite_persisted_youtube_thumbnail_url(
+    stored: &url::Url,
+    size: YouTubeThumbnailSize,
+) -> Option<url::Url> {
+    if size == YouTubeThumbnailSize::Disabled {
+        return None;
+    }
+    let Some(filename) = youtube_thumbnail_filename(size) else {
+        return Some(stored.clone());
+    };
+    if !has_stable_youtube_thumbnail_filename(stored) {
+        return Some(stored.clone());
+    }
+    let mut projected = stored.clone();
+    let Ok(mut segments) = projected.path_segments_mut() else {
+        return Some(stored.clone());
+    };
+    segments.pop();
+    segments.push(filename);
+    drop(segments);
+    Some(projected)
+}
+
+/// Applies the YouTube-only size policy while preserving other source artwork.
+fn projected_persisted_thumbnail_url(
+    media_id: &MediaId,
+    stored: Option<&url::Url>,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> Option<url::Url> {
+    if media_id.source == SourceKind::YouTube {
+        rewrite_persisted_youtube_thumbnail_url(stored?, youtube_thumbnail_size)
+    } else {
+        stored.cloned()
+    }
+}
+
 #[cfg(feature = "yt-dlp")]
 fn configured_download_format(value: &str) -> Result<DownloadFormat, String> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -25543,7 +26002,11 @@ fn append_download_diagnostics(message: String, diagnostics: &str) -> String {
     }
 }
 
-fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) -> QueueItem {
+fn queue_item_from_video_with_thumbnail_size(
+    video: &VideoSummary,
+    start_at_seconds: Option<u64>,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> QueueItem {
     let canonical_playback_url = url::Url::parse(&youtube_video_url(&video.video_id))
         .expect("a validated YouTube video ID always forms a valid URL");
     let webpage_url = video
@@ -25566,10 +26029,10 @@ fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) ->
             creator: (!video.channel_name.is_empty()).then(|| video.channel_name.clone()),
             description: (!video.description.is_empty()).then(|| video.description.clone()),
             webpage_url,
-            thumbnail_url: video
-                .thumbnails
-                .first()
-                .map(|thumbnail| thumbnail.url.clone()),
+            thumbnail_url: preferred_youtube_thumbnail_url(
+                &video.thumbnails,
+                youtube_thumbnail_size,
+            ),
             duration_seconds: video.duration_seconds,
             published_at: video.published_at,
             statistics: MediaStatistics {
@@ -25584,6 +26047,16 @@ fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) ->
         start_at_seconds,
         added_at: unix_time(),
     }
+}
+
+/// Builds deterministic test fixtures at the conservative automatic size.
+#[cfg(test)]
+fn queue_item_from_video(video: &VideoSummary, start_at_seconds: Option<u64>) -> QueueItem {
+    queue_item_from_video_with_thumbnail_size(
+        video,
+        start_at_seconds,
+        YouTubeThumbnailSize::Automatic.resolve(None),
+    )
 }
 
 /// Builds a live queue item while keeping the station page separate from audio.
@@ -28781,6 +29254,42 @@ mod tests {
         ));
         assert!(controller.view.playlist_back_available);
         assert_eq!(controller.view.rows[0].title, "Fixture video");
+        assert_eq!(
+            controller.view.rows[0]
+                .thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            None,
+            "a playlist snapshot without provider artwork must not synthesize a CDN request"
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_dimensions),
+            None,
+            "absent artwork must not reserve a phantom preview aspect"
+        );
+        controller.config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::Disabled;
+        controller.refresh_youtube_thumbnail_projection();
+        assert!(controller.view.rows[0].thumbnail_url.is_none());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.thumbnail_url.is_none())
+        );
+        controller.config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::Medium;
+        controller.refresh_youtube_thumbnail_projection();
+        assert_eq!(
+            controller.view.rows[0]
+                .thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            None
+        );
         assert_eq!(
             controller.current_url().as_deref(),
             Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -34337,6 +34846,8 @@ mod tests {
         );
         controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
         controller.dispatch(UiAction::ToggleYouTubePrewarm);
+        #[cfg(feature = "images")]
+        controller.dispatch(UiAction::CycleYouTubeThumbnailSize);
         controller.view.local_size_sort = LocalSizeSort::Ascending;
         controller.dispatch(UiAction::ToggleLocalFolderSizes);
         controller.dispatch(UiAction::ToggleTtyImages);
@@ -34373,6 +34884,8 @@ mod tests {
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("show_local_folder_sizes = false"));
         #[cfg(feature = "images")]
+        assert!(contents.contains("youtube_thumbnail_size = \"disabled\""));
+        #[cfg(feature = "images")]
         assert!(contents.contains("show_images_in_tty = false"));
         #[cfg(not(feature = "images"))]
         assert!(!contents.contains("show_images_in_tty"));
@@ -34385,6 +34898,11 @@ mod tests {
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
         #[cfg(feature = "images")]
+        assert_eq!(
+            reloaded.ui.youtube_thumbnail_size,
+            YouTubeThumbnailSize::Disabled
+        );
+        #[cfg(feature = "images")]
         assert!(!reloaded.ui.show_images_in_tty);
         #[cfg(not(feature = "images"))]
         assert!(reloaded.ui.show_images_in_tty);
@@ -34393,6 +34911,133 @@ mod tests {
         assert_eq!(
             reloaded.providers.bandcamp_audio_format,
             BandcampAudioFormat::Flac
+        );
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn preferences_cycle_the_complete_closed_youtube_thumbnail_size_set() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.dispatch(UiAction::OpenPreferences);
+
+        for expected in YouTubeThumbnailSize::ALL
+            .iter()
+            .copied()
+            .skip(1)
+            .chain(std::iter::once(YouTubeThumbnailSize::Automatic))
+        {
+            controller.dispatch(UiAction::CycleYouTubeThumbnailSize);
+            assert_eq!(
+                controller
+                    .view
+                    .preferences_popup
+                    .as_ref()
+                    .expect("open preferences")
+                    .youtube_thumbnail_size,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_youtube_thumbnail_projection_changes_only_above_1920_pixels() {
+        let thumbnail = |quality: &str, width, height| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(quality.to_owned()),
+            width: Some(width),
+            height: Some(height),
+        };
+        let thumbnails = vec![
+            thumbnail("standard", 640, 480),
+            thumbnail("maxres", 1_280, 720),
+        ];
+        let config = Config::for_dir("/tmp/youta-thumbnail-width-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut summary = subscription_video_summary();
+        summary.thumbnails.clone_from(&thumbnails);
+        controller.youtube_results = vec![SearchItem::Video(summary.clone())];
+        controller.view.details = Some(preliminary_detail_with_thumbnail_size(
+            &SearchItem::Video(summary),
+            &controller.subscription_tree,
+            YouTubeThumbnailSize::Standard,
+        ));
+        controller.refresh_youtube_rows();
+
+        for width in [None, Some(1_920)] {
+            controller.dispatch(UiAction::SetTerminalWindowWidthPixels(width));
+            assert_eq!(
+                controller.view.rows[0]
+                    .thumbnail_url
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some("https://images.example/standard.jpg")
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.thumbnail_url.as_ref())
+                    .map(url::Url::as_str),
+                Some("https://images.example/standard.jpg")
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.expanded_thumbnail_url.as_ref())
+                    .map(url::Url::as_str),
+                Some("https://images.example/maxres.jpg"),
+                "the click target must stay at the largest advertised size"
+            );
+        }
+
+        controller.dispatch(UiAction::SetTerminalWindowWidthPixels(Some(1_921)));
+        assert_eq!(
+            controller.view.rows[0]
+                .thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://images.example/maxres.jpg")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://images.example/maxres.jpg")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.expanded_thumbnail_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://images.example/maxres.jpg")
+        );
+        controller
+            .view
+            .details
+            .as_mut()
+            .expect("fixture details")
+            .thumbnail_expanded = true;
+        controller.config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::Disabled;
+        controller.refresh_youtube_thumbnail_projection();
+        let details = controller.view.details.as_ref().expect("fixture details");
+        assert!(details.thumbnail_url.is_none());
+        assert!(details.expanded_thumbnail_url.is_none());
+        assert!(
+            !details.thumbnail_expanded,
+            "disabling YouTube images must close a stale fullscreen overlay"
         );
     }
 
@@ -40104,7 +40749,7 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_selection_avoids_downloading_an_unnecessary_maximum_resolution_image() {
+    fn youtube_thumbnail_size_is_strict_and_shared_by_every_video_projection() {
         let thumbnail = |name: &str, width, height| Thumbnail {
             url: url::Url::parse(&format!("https://images.example/{name}.jpg"))
                 .expect("fixture thumbnail URL"),
@@ -40113,55 +40758,290 @@ mod tests {
             height,
         };
         let candidates = [
-            thumbnail("small", Some(320), Some(180)),
+            thumbnail("default", Some(120), Some(90)),
+            thumbnail("medium", Some(320), Some(180)),
+            thumbnail("high", Some(480), Some(360)),
+            thumbnail("standard", Some(640), Some(480)),
             thumbnail("maxres", Some(1_280), Some(720)),
-            thumbnail("medium", Some(640), Some(360)),
+        ];
+        let expected = [
+            (YouTubeThumbnailSize::Default, "default"),
+            (YouTubeThumbnailSize::Medium, "medium"),
+            (YouTubeThumbnailSize::High, "high"),
+            (YouTubeThumbnailSize::Standard, "standard"),
+            (YouTubeThumbnailSize::Maxres, "maxres"),
+        ];
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let subscriptions = SubscriptionTree::default();
+        let subscribers = HashMap::new();
+        let mut summary = subscription_video_summary();
+        summary.thumbnails = candidates.to_vec();
+        let mut video = subscription_video_details("Wide artwork fixture");
+        video.thumbnails = candidates.to_vec();
+
+        for (size, name) in expected {
+            let expected_url = format!("https://images.example/{name}.jpg");
+            let row = row_from_search_item_with_thumbnail_size(
+                &SearchItem::Video(summary.clone()),
+                &store,
+                &subscriptions,
+                &subscribers,
+                SearchRowContext::GlobalSearch,
+                NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
+                size,
+            );
+            let preliminary = preliminary_detail_with_thumbnail_size(
+                &SearchItem::Video(summary.clone()),
+                &subscriptions,
+                size,
+            );
+            let complete = detail_from_video_with_thumbnail_size(&video, &subscriptions, size);
+            let queued = queue_item_from_video_with_thumbnail_size(&summary, None, size);
+            assert_eq!(preliminary.thumbnail_dimensions, size.dimensions());
+            assert_eq!(complete.thumbnail_dimensions, size.dimensions());
+            assert_eq!(
+                preliminary
+                    .expanded_thumbnail_url
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some("https://images.example/maxres.jpg"),
+                "preliminary Details must retain the largest advertised image for expansion"
+            );
+            assert_eq!(
+                complete
+                    .expanded_thumbnail_url
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some("https://images.example/maxres.jpg"),
+                "complete Details must retain the largest advertised image for expansion"
+            );
+            for projected in [
+                row.thumbnail_url.as_ref(),
+                preliminary.thumbnail_url.as_ref(),
+                complete.thumbnail_url.as_ref(),
+                queued.media.thumbnail_url.as_ref(),
+            ] {
+                assert_eq!(
+                    projected.map(url::Url::as_str),
+                    Some(expected_url.as_str()),
+                    "rows, Details, and queue metadata must use the same configured entry"
+                );
+            }
+        }
+
+        for size in [
+            YouTubeThumbnailSize::Disabled,
+            YouTubeThumbnailSize::Automatic,
+        ] {
+            assert_eq!(preferred_youtube_thumbnail_url(&candidates, size), None);
+        }
+        let disabled = preliminary_detail_with_thumbnail_size(
+            &SearchItem::Video(summary.clone()),
+            &subscriptions,
+            YouTubeThumbnailSize::Disabled,
+        );
+        assert!(
+            disabled.expanded_thumbnail_url.is_none(),
+            "a disabled YouTube image cannot expose or prefetch an expansion target"
+        );
+        assert_eq!(
+            preferred_youtube_thumbnail_url(&candidates[..3], YouTubeThumbnailSize::Maxres),
+            None,
+            "an unavailable explicit entry must not fall back"
+        );
+        let mut unavailable_summary = summary.clone();
+        unavailable_summary.thumbnails = candidates[..3].to_vec();
+        let unavailable = preliminary_detail_with_thumbnail_size(
+            &SearchItem::Video(unavailable_summary),
+            &subscriptions,
+            YouTubeThumbnailSize::Maxres,
+        );
+        assert!(
+            unavailable.expanded_thumbnail_url.is_none(),
+            "an unavailable strict preview must not expose an invisible expansion target"
+        );
+
+        let mut cached = SearchItem::Video(summary);
+        compact_subscription_item(&mut cached);
+        let SearchItem::Video(cached) = cached else {
+            panic!("the compacted fixture remains a video");
+        };
+        assert_eq!(
+            cached.thumbnails.len(),
+            expected.len(),
+            "RAM subscription caching must retain one metadata entry per selectable size"
+        );
+        for (size, name) in expected {
+            let expected_url = format!("https://images.example/{name}.jpg");
+            assert_eq!(
+                preferred_youtube_thumbnail_url(&cached.thumbnails, size)
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some(expected_url.as_str()),
+                "switching Preferences must reuse cached metadata without a size fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_music_artwork_is_independent_from_youtube_video_size() {
+        let artwork =
+            url::Url::parse("https://images.example/music-artwork.jpg").expect("fixture artwork");
+        let mut item = subscription_video_summary();
+        item.thumbnails = vec![Thumbnail {
+            url: artwork.clone(),
+            quality: Some("YouTube Music search".to_owned()),
+            width: None,
+            height: None,
+        }];
+        let row = row_from_search_item_with_thumbnail_size(
+            &SearchItem::Video(item),
+            &StateStore::open_in_memory().expect("in-memory state"),
+            &SubscriptionTree::default(),
+            &HashMap::new(),
+            SearchRowContext::YouTubeMusic,
+            NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
+            YouTubeThumbnailSize::Disabled,
+        );
+
+        assert_eq!(
+            row.thumbnail_url.as_ref(),
+            Some(&artwork),
+            "the YouTube video-size preference must not suppress YouTube Music artwork"
+        );
+    }
+
+    #[test]
+    fn largest_youtube_thumbnail_uses_quality_when_dimensions_are_absent() {
+        let thumbnail = |quality: &str| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(quality.to_owned()),
+            width: None,
+            height: None,
+        };
+        let candidates = [
+            thumbnail("high"),
+            thumbnail("maxres"),
+            thumbnail("standard"),
         ];
 
         assert_eq!(
-            preferred_thumbnail_url(&candidates)
+            largest_youtube_thumbnail_url(&candidates)
                 .as_ref()
                 .map(url::Url::as_str),
-            Some("https://images.example/medium.jpg")
+            Some("https://images.example/maxres.jpg")
         );
-        assert_eq!(preferred_thumbnail_url(&[]), None);
         assert_eq!(
-            preferred_thumbnail_url(&[
-                thumbnail("unknown-first", None, None),
-                thumbnail("unknown-last", None, None),
-            ])
+            largest_youtube_thumbnail_url(&[Thumbnail {
+                url: url::Url::parse("https://images.example/unranked.jpg")
+                    .expect("unranked thumbnail URL"),
+                quality: Some("provider-specific".to_owned()),
+                width: None,
+                height: None,
+            }]),
+            None,
+            "unknown provider order must not be misrepresented as an image-size guarantee"
+        );
+    }
+
+    #[test]
+    fn every_exact_youtube_thumbnail_size_has_a_stable_filename() {
+        for (size, filename) in [
+            (YouTubeThumbnailSize::Default, "default.jpg"),
+            (YouTubeThumbnailSize::Medium, "mqdefault.jpg"),
+            (YouTubeThumbnailSize::High, "hqdefault.jpg"),
+            (YouTubeThumbnailSize::Standard, "sddefault.jpg"),
+            (YouTubeThumbnailSize::Maxres, "maxresdefault.jpg"),
+        ] {
+            assert_eq!(youtube_thumbnail_filename(size), Some(filename));
+        }
+        assert_eq!(
+            youtube_thumbnail_filename(YouTubeThumbnailSize::Disabled),
+            None
+        );
+        assert_eq!(
+            youtube_thumbnail_filename(YouTubeThumbnailSize::Automatic),
+            None
+        );
+    }
+
+    #[test]
+    fn persisted_youtube_thumbnail_rewrites_sizes_without_bypassing_provider_hosts() {
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        let advertised_proxy = url::Url::parse(
+            "https://invidious.example/vi/dQw4w9WgXcQ/hqdefault.jpg?host=i.ytimg.com",
+        )
+        .expect("proxy thumbnail URL");
+        assert_eq!(
+            projected_persisted_thumbnail_url(
+                &media_id,
+                Some(&advertised_proxy),
+                YouTubeThumbnailSize::Standard,
+            )
             .as_ref()
             .map(url::Url::as_str),
-            Some("https://images.example/unknown-last.jpg")
+            Some("https://invidious.example/vi/dQw4w9WgXcQ/sddefault.jpg?host=i.ytimg.com"),
+            "changing size must retain the configured provider host and query"
+        );
+
+        let provider_specific =
+            url::Url::parse("https://proxy.example/api/v1/thumbnail/dQw4w9WgXcQ?quality=high")
+                .expect("provider-specific thumbnail URL");
+        assert_eq!(
+            projected_persisted_thumbnail_url(
+                &media_id,
+                Some(&provider_specific),
+                YouTubeThumbnailSize::Maxres,
+            )
+            .as_ref(),
+            Some(&provider_specific),
+            "an unknown provider URL shape must remain unchanged instead of contacting Google"
+        );
+        assert_eq!(
+            projected_persisted_thumbnail_url(
+                &media_id,
+                Some(&advertised_proxy),
+                YouTubeThumbnailSize::Disabled,
+            ),
+            None
+        );
+        assert_eq!(
+            projected_persisted_thumbnail_url(&media_id, None, YouTubeThumbnailSize::Medium,),
+            None,
+            "missing provider artwork must not synthesize a direct-CDN request"
         );
     }
 
     #[test]
     fn global_search_rows_expose_preferred_video_and_channel_thumbnails_for_prefetch() {
-        let thumbnail = |name: &str, width| Thumbnail {
+        let thumbnail = |name: &str, width, height| Thumbnail {
             url: url::Url::parse(&format!("https://images.example/{name}.jpg"))
                 .expect("fixture thumbnail URL"),
             quality: Some(name.to_owned()),
             width,
-            height: width.map(|value| value / 2),
+            height,
         };
         let candidates = vec![
-            thumbnail("small", Some(320)),
-            thumbnail("maxres", Some(1_280)),
-            thumbnail("medium", Some(640)),
+            thumbnail("default", Some(120), Some(90)),
+            thumbnail("medium", Some(320), Some(180)),
+            thumbnail("high", Some(480), Some(360)),
+            thumbnail("standard", Some(640), Some(480)),
+            thumbnail("maxres", Some(1_280), Some(720)),
         ];
         let store = StateStore::open_in_memory().expect("in-memory state");
         let subscriptions = SubscriptionTree::default();
         let subscribers = HashMap::new();
         let mut video = subscription_video_summary();
         video.thumbnails.clone_from(&candidates);
-        let video_row = row_from_search_item(
+        let video_row = row_from_search_item_with_thumbnail_size(
             &SearchItem::Video(video),
             &store,
             &subscriptions,
             &subscribers,
             SearchRowContext::GlobalSearch,
             NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
+            YouTubeThumbnailSize::Standard,
         );
         let channel_row = row_from_search_item(
             &SearchItem::Channel(ChannelSummary {
@@ -40182,12 +41062,15 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date"),
         );
 
-        for row in [video_row, channel_row] {
-            assert_eq!(
-                row.thumbnail_url.as_ref().map(url::Url::as_str),
-                Some("https://images.example/medium.jpg")
-            );
-        }
+        assert_eq!(
+            video_row.thumbnail_url.as_ref().map(url::Url::as_str),
+            Some("https://images.example/standard.jpg")
+        );
+        assert_eq!(
+            channel_row.thumbnail_url.as_ref().map(url::Url::as_str),
+            Some("https://images.example/high.jpg"),
+            "the YouTube-only video preference must not alter channel artwork"
+        );
     }
 
     #[test]
@@ -42141,6 +43024,40 @@ mod tests {
                 .is_some_and(|details| !details.thumbnail_expanded),
             "a synthetic action without visible artwork must be a no-op"
         );
+
+        controller
+            .view
+            .details
+            .as_mut()
+            .expect("fixture details")
+            .local_video_thumbnail = Some(LocalVideoThumbnailView {
+            path: PathBuf::from("/tmp/youta-local-video.mov"),
+            midpoint_millis: 1_000,
+        });
+        controller.dispatch(UiAction::ToggleThumbnailExpansion);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.thumbnail_expanded),
+            "a ready local-video midpoint frame must be expandable too"
+        );
+        controller
+            .view
+            .details
+            .as_mut()
+            .expect("fixture details")
+            .local_video_thumbnail = None;
+        controller.dispatch(UiAction::ToggleThumbnailExpansion);
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.thumbnail_expanded),
+            "an already-open overlay must remain closable after artwork disappears"
+        );
     }
 
     #[test]
@@ -42194,6 +43111,10 @@ mod tests {
         };
         let mut refreshed = DetailView {
             media_id: previous.media_id.clone(),
+            thumbnail_url: Some(
+                url::Url::parse("https://images.example/refreshed.jpg")
+                    .expect("fixture artwork URL"),
+            ),
             ..DetailView::default()
         };
         preserve_thumbnail_expansion(Some(&previous), &mut refreshed);
@@ -42210,10 +43131,22 @@ mod tests {
         previous.channel_id = "UCsame".to_owned();
         let mut refreshed_channel = DetailView {
             channel_id: "UCsame".to_owned(),
+            thumbnail_url: Some(
+                url::Url::parse("https://images.example/channel.jpg")
+                    .expect("fixture channel artwork URL"),
+            ),
             ..DetailView::default()
         };
         preserve_thumbnail_expansion(Some(&previous), &mut refreshed_channel);
         assert!(refreshed_channel.thumbnail_expanded);
+
+        refreshed_channel.thumbnail_url = None;
+        refreshed_channel.thumbnail_expanded = false;
+        preserve_thumbnail_expansion(Some(&previous), &mut refreshed_channel);
+        assert!(
+            !refreshed_channel.thumbnail_expanded,
+            "same-identity metadata without artwork must not preserve a stale modal state"
+        );
     }
 
     #[test]

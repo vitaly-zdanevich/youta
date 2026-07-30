@@ -33,7 +33,8 @@ use std::io::{BufReader, SeekFrom};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use image::{
-    DynamicImage, GrayAlphaImage, GrayImage, ImageFormat, ImageReader, Limits, RgbImage, RgbaImage,
+    DynamicImage, GenericImageView, GrayAlphaImage, GrayImage, ImageFormat, ImageReader, Limits,
+    RgbImage, RgbaImage,
 };
 use jpeg_decoder::{CodingProcess, Decoder as JpegDecoder, PixelFormat};
 use ratatui::layout::{Rect, Size};
@@ -2740,7 +2741,7 @@ fn load_thumbnail(
     if persistent_cache_allowed && let Some(cache) = cache {
         let _ = cache.store(&target.source, &bytes);
     }
-    encode_thumbnail(picker, target.area, image).map(|encoded| LoadedThumbnail {
+    encode_remote_thumbnail(picker, target, image).map(|encoded| LoadedThumbnail {
         protocol: encoded.protocol,
         render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
@@ -2996,7 +2997,86 @@ fn load_cached_thumbnail(
             return None;
         }
     };
-    Some(encode_thumbnail(picker, target.area, image))
+    Some(encode_remote_thumbnail(picker, target, image))
+}
+
+/// Removes confident YouTube-owned letterbox bands before terminal fitting.
+///
+/// Some YouTube `default`, `high`, and `standard` JPEGs use 4:3 canvases around
+/// visible 16:9 artwork. Cropping only symmetric near-black bands avoids
+/// changing non-dark 4:3 thumbnails while preventing those embedded pixels
+/// from becoming empty terminal rows.
+fn crop_youtube_letterbox(source: &Url, image: DynamicImage) -> DynamicImage {
+    const MAX_DARK_LUMA: u32 = 24;
+    const MAX_NON_DARK_PERCENT: u64 = 2;
+
+    let eligible_source = source.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("img.youtube.com")
+            || host.eq_ignore_ascii_case("ytimg.com")
+            || host.ends_with(".ytimg.com")
+    }) && source
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .is_some_and(|filename| {
+            matches!(filename, "default.jpg" | "hqdefault.jpg" | "sddefault.jpg")
+        });
+    let width = image.width();
+    let height = image.height();
+    if !eligible_source || u64::from(width).saturating_mul(3) != u64::from(height).saturating_mul(4)
+    {
+        return image;
+    }
+
+    let visible_height =
+        u32::try_from(u64::from(width).saturating_mul(9).saturating_add(8) / 16).unwrap_or(height);
+    let total_padding = height.saturating_sub(visible_height);
+    let top_padding = total_padding / 2;
+    let bottom_padding = total_padding.saturating_sub(top_padding);
+    if top_padding < 2 {
+        return image;
+    }
+
+    let band_is_dark = |start_y: u32, rows: u32| {
+        let total_pixels = u64::from(width).saturating_mul(u64::from(rows));
+        let maximum_non_dark = total_pixels.saturating_mul(MAX_NON_DARK_PERCENT) / 100;
+        let mut non_dark = 0_u64;
+        for y in start_y..start_y.saturating_add(rows) {
+            for x in 0..width {
+                let [red, green, blue, _] = image.get_pixel(x, y).0;
+                let luma = (u32::from(red).saturating_mul(54)
+                    + u32::from(green).saturating_mul(183)
+                    + u32::from(blue).saturating_mul(19))
+                    / 256;
+                if luma > MAX_DARK_LUMA {
+                    non_dark = non_dark.saturating_add(1);
+                    if non_dark > maximum_non_dark {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    };
+    if !band_is_dark(0, top_padding)
+        || !band_is_dark(height.saturating_sub(bottom_padding), bottom_padding)
+    {
+        return image;
+    }
+
+    image.crop_imm(0, top_padding, width, visible_height)
+}
+
+/// Applies remote-source normalization before the ordinary terminal fit.
+fn encode_remote_thumbnail(
+    picker: &Picker,
+    target: &ThumbnailTarget,
+    image: DynamicImage,
+) -> Result<EncodedThumbnail, ThumbnailFailure> {
+    encode_thumbnail(
+        picker,
+        target.area,
+        crop_youtube_letterbox(&target.source, image),
+    )
 }
 
 /// Aspect-fits and encodes a decoded image for its exact render area.
@@ -4297,6 +4377,111 @@ pub(crate) mod tests {
         assert!(
             encoded.protocol.last_encoding_result().is_none(),
             "rendering the worker-prepared area must not synchronously resize and encode"
+        );
+    }
+
+    #[test]
+    fn youtube_standard_letterbox_does_not_reserve_blank_terminal_rows() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let source =
+            Url::parse("https://i.ytimg.com/vi/fixture/sddefault.jpg").expect("thumbnail URL");
+        let requested_area = Rect::new(4, 5, 64, 24);
+
+        assert!(manager.synchronize(Some(&source), requested_area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible request"),
+            source
+        );
+        replies
+            .send(Ok(youtube_letterbox_fixture_png()))
+            .expect("letterboxed response");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+
+        assert_eq!(
+            manager.render_size(),
+            Some(Size::new(64, 18)),
+            "embedded YouTube letterbox bands must not become empty rows around Details artwork"
+        );
+    }
+
+    #[test]
+    fn genuine_four_by_three_youtube_standard_thumbnail_is_not_cropped() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let source =
+            Url::parse("https://i.ytimg.com/vi/fixture/sddefault.jpg").expect("thumbnail URL");
+        let requested_area = Rect::new(4, 5, 64, 24);
+        let image = RgbImage::from_pixel(640, 480, image::Rgb([80, 120, 160]));
+
+        assert!(manager.synchronize(Some(&source), requested_area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible request"),
+            source
+        );
+        replies
+            .send(Ok(encode_rgb_png(image)))
+            .expect("four-by-three response");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            manager.render_size(),
+            Some(Size::new(64, 24)),
+            "non-dark 4:3 artwork must retain its original composition"
+        );
+    }
+
+    #[test]
+    fn non_youtube_letterbox_is_not_cropped() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let source =
+            Url::parse("https://images.example/fixture/sddefault.jpg").expect("thumbnail URL");
+        let requested_area = Rect::new(4, 5, 64, 24);
+
+        assert!(manager.synchronize(Some(&source), requested_area));
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("visible request"),
+            source
+        );
+        replies
+            .send(Ok(youtube_letterbox_fixture_png()))
+            .expect("letterboxed response");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            manager.render_size(),
+            Some(Size::new(64, 24)),
+            "generic remote images must not receive YouTube-specific normalization"
+        );
+    }
+
+    #[test]
+    fn persistent_youtube_letterbox_cache_hit_is_cropped() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let source =
+            Url::parse("https://i.ytimg.com/vi/fixture/sddefault.jpg").expect("thumbnail URL");
+        ThumbnailCache::new(cache_directory.clone())
+            .store(&source, &youtube_letterbox_fixture_png())
+            .expect("prime persistent thumbnail cache");
+        let (mut manager, _replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory));
+
+        assert!(manager.synchronize(Some(&source), Rect::new(4, 5, 64, 24)));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            manager.render_size(),
+            Some(Size::new(64, 18)),
+            "a warm persistent-cache hit must use the same crop as a fresh response"
+        );
+        assert!(
+            matches!(
+                observed.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "a warm persistent-cache hit must not reach the network transport"
         );
     }
 
@@ -6055,6 +6240,27 @@ pub(crate) mod tests {
             .write_to(&mut jpeg, ImageFormat::Jpeg)
             .expect("encode deterministic video-frame JPEG");
         jpeg.into_inner()
+    }
+
+    /// Encodes one RGB fixture with a lossless format so darkness thresholds
+    /// remain deterministic across thumbnail-normalization tests.
+    fn encode_rgb_png(image: RgbImage) -> Vec<u8> {
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, ImageFormat::Png)
+            .expect("encode RGB fixture PNG");
+        png.into_inner()
+    }
+
+    /// Models YouTube's 640×480 standard canvas around 640×360 artwork.
+    fn youtube_letterbox_fixture_png() -> Vec<u8> {
+        let mut image = RgbImage::from_pixel(640, 480, image::Rgb([0, 0, 0]));
+        for (_, y, pixel) in image.enumerate_pixels_mut() {
+            if (60..420).contains(&y) {
+                *pixel = image::Rgb([220, 80, 120]);
+            }
+        }
+        encode_rgb_png(image)
     }
 
     /// Encodes a small PNG fixture for thumbnail worker tests.

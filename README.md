@@ -816,6 +816,7 @@ Configure the runtime policy in `~/.config/youta/config.toml`:
 ```toml
 [ui]
 thumbnails = 'auto' # auto, off, or on
+youtube_thumbnail_size = 'automatic'
 show_images_in_tty = true # physical Linux TTY half-block artwork
 thumbnail_height = 20 # maximum terminal rows; minimum 4
 prefetch_search_thumbnails = true
@@ -824,13 +825,42 @@ prefetch_search_thumbnails = true
 `auto` uses conservative protocol detection, `off` disables thumbnail requests
 and rendering, and `on` attempts supported terminal artwork but still falls
 back without fetching when no supported protocol is available.
+`youtube_thumbnail_size` independently chooses the exact YouTube
+video-thumbnail entry used by the normal Details preview:
+
+- `automatic`: use `standard` (640×480) when the terminal window is at most
+  1920 pixels wide, including exactly 1920 pixels; use `maxres` (1280×720) only
+  above 1920 pixels. If the terminal does not report a pixel width, use
+  `standard`.
+- `disabled`: do not fetch or render YouTube video thumbnails.
+- `default`: 120×90.
+- `medium`: 320×180.
+- `high`: 480×360.
+- `standard`: 640×480.
+- `maxres`: 1280×720.
+
+Explicit sizes are strict: if a video does not expose the selected entry,
+Youta shows no video thumbnail and does not fetch another size as a fallback.
+When that preview exists and terminal images are enabled, Youta also warms the
+largest image explicitly advertised for the selected video. Clicking the
+preview opens that cached or in-flight image across the terminal; it does not
+replace the configured preview or prefetch maximum-resolution images for every
+list row. Selecting `disabled` suppresses both the preview and expansion
+request.
+YouTube's 4:3 `default`, `high`, and `standard` JPEG canvases can contain
+symmetric black bands around 16:9 artwork. Youta removes those bands only when
+both expected edge regions are near-black; non-dark 4:3 images and non-YouTube
+artwork retain their original composition.
+The environment override is
+`YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=standard`. Channel artwork and artwork from
+other sources are unaffected by this YouTube-only setting.
 `show_images_in_tty = false` disables only the physical Linux-console
 half-block fallback; Kitty, iTerm2, and Sixel images remain governed by
 `thumbnails`. Its environment override is
 `YOUTA_UI__SHOW_IMAGES_IN_TTY=false`. Thumbnail height defaults to 20 rows and
 is reduced automatically when the Details panel needs space for metadata,
 links, or description text. YouTube video thumbnails instead expand to the
-full Details-pane width at their 16:9 aspect ratio when the description
+full Details-pane width at the selected entry's source aspect ratio when the description
 occupies fewer than 15 wrapped rows or the terminal window itself is at least
 1080 pixels tall. Youta reads the attached terminal window's pixel dimensions,
 so a small window on a 1080p monitor does not trigger the height-based layout.
@@ -995,8 +1025,8 @@ existing rows intact.
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
 skipped, choose whether selected YouTube audio is prepared, choose whether
-Local folder sizes are measured, and press `Enter` to save. These preferences
-can be configured directly:
+Local folder sizes are measured, choose the exact YouTube video-thumbnail
+size, and press `Enter` to save. These preferences can be configured directly:
 
 ```toml
 [playback]
@@ -1007,6 +1037,7 @@ skip_advertisement_chapters = true
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
 show_local_folder_sizes = true
+youtube_thumbnail_size = 'automatic'
 ```
 
 `YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
@@ -1015,6 +1046,8 @@ show_local_folder_sizes = true
 `YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` override the corresponding
 TOML values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
+`YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
+video-thumbnail entry.
 While any of these environment variables is present, the Preferences popup
 shows the override and does not partially replace its draft in `config.toml`.
 

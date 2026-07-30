@@ -75,6 +75,11 @@ theme = 'auto'
 # graphics when no supported image protocol is detected.
 thumbnails = 'auto'
 
+# Exact YouTube video-thumbnail entry. One of: `automatic`, `disabled`,
+# `default`, `medium`, `high`, `standard`, or `maxres`. Automatic uses
+# `standard` through 1920 terminal-window pixels and `maxres` above that.
+youtube_thumbnail_size = 'automatic'
+
 # Render ANSI-16 Unicode half-block artwork on a confirmed physical Linux
 # `/dev/ttyN`. This does not affect Kitty, iTerm2, or Sixel rendering in
 # graphical terminals. YOUTA_UI__SHOW_IMAGES_IN_TTY=false has higher precedence.

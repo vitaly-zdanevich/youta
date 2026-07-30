@@ -50,6 +50,9 @@ pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 /// Environment variable that overrides artwork on a physical Linux TTY.
 pub const TTY_IMAGES_ENV: &str = "YOUTA_UI__SHOW_IMAGES_IN_TTY";
 
+/// Environment variable that overrides the selected `YouTube` thumbnail size.
+pub const YOUTUBE_THUMBNAIL_SIZE_ENV: &str = "YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE";
+
 /// Environment variable that overrides the preferred Bandcamp audio format.
 pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
 
@@ -486,15 +489,16 @@ impl Config {
     /// Persists the preferences currently exposed by the in-app editor.
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, selected
-    /// YouTube-video prewarming, lazy Local-folder size preference, and
-    /// physical-TTY image preference are written together so confirming the
-    /// popup cannot save only part of the draft.
+    /// YouTube-video prewarming, lazy Local-folder size preference, physical-TTY
+    /// image preference, and exact `YouTube` thumbnail size are written together
+    /// so confirming the popup cannot save only part of the draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
     /// [`YOUTUBE_PREWARM_ENV`] and
-    /// [`LOCAL_FOLDER_SIZES_ENV`] and [`TTY_IMAGES_ENV`] retain precedence and
-    /// therefore prevent this writer from storing a shadowed draft.
+    /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
+    /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] retain precedence and therefore prevent
+    /// this writer from storing a shadowed draft.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the playback preference.
@@ -512,6 +516,7 @@ impl Config {
         youtube_prewarm: bool,
         show_local_folder_sizes: bool,
         show_images_in_tty: bool,
+        youtube_thumbnail_size: YouTubeThumbnailSize,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
@@ -519,6 +524,7 @@ impl Config {
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
+            YOUTUBE_THUMBNAIL_SIZE_ENV,
         ]
         .into_iter()
         .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
@@ -550,6 +556,7 @@ impl Config {
             {
                 ui["show_images_in_tty"] = value(show_images_in_tty);
             }
+            ui["youtube_thumbnail_size"] = value(youtube_thumbnail_size.as_config_value());
         }
         {
             let playback = document
@@ -575,6 +582,7 @@ impl Config {
         }
         #[cfg(not(feature = "images"))]
         let _ = show_images_in_tty;
+        self.ui.youtube_thumbnail_size = youtube_thumbnail_size;
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
         self.playback.youtube_prewarm = youtube_prewarm;
         Ok(())
@@ -783,6 +791,8 @@ pub struct UiConfig {
     pub theme: ThemeMode,
     /// Preferred thumbnail behavior.
     pub thumbnails: ThumbnailMode,
+    /// Exact `YouTube` video-thumbnail size, or viewport-based automatic choice.
+    pub youtube_thumbnail_size: YouTubeThumbnailSize,
     /// Render bounded half-block artwork on a confirmed physical Linux TTY.
     pub show_images_in_tty: bool,
     /// Maximum thumbnail height in terminal rows.
@@ -807,6 +817,7 @@ impl Default for UiConfig {
             show_button_hotkeys: true,
             theme: ThemeMode::Auto,
             thumbnails: ThumbnailMode::Auto,
+            youtube_thumbnail_size: YouTubeThumbnailSize::Automatic,
             show_images_in_tty: true,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
@@ -876,6 +887,127 @@ pub enum ThumbnailMode {
     Off,
     /// Attempt artwork and fall back cleanly when unsupported.
     On,
+}
+
+/// Exact `YouTube` video-thumbnail size selected by the user.
+///
+/// Each explicit variant maps to one named `snippet.thumbnails` entry from the
+/// `YouTube` Data API. Youta never falls back to another size: an unavailable
+/// selected entry produces no thumbnail and therefore no unnecessary request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum YouTubeThumbnailSize {
+    /// Choose `standard` at terminal widths up to 1920 pixels and `maxres`
+    /// above that boundary.
+    #[default]
+    Automatic,
+    /// Do not fetch or render `YouTube` video thumbnails.
+    Disabled,
+    /// Request the API's 120×90 `default` entry.
+    Default,
+    /// Request the API's 320×180 `medium` entry.
+    Medium,
+    /// Request the API's 480×360 `high` entry.
+    High,
+    /// Request the API's 640×480 `standard` entry.
+    Standard,
+    /// Request the API's 1280×720 `maxres` entry.
+    Maxres,
+}
+
+impl YouTubeThumbnailSize {
+    /// Complete stable order shown by the in-app Preferences selector.
+    pub const ALL: [Self; 7] = [
+        Self::Automatic,
+        Self::Disabled,
+        Self::Default,
+        Self::Medium,
+        Self::High,
+        Self::Standard,
+        Self::Maxres,
+    ];
+
+    /// Returns the next option in the closed Preferences cycle.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Automatic => Self::Disabled,
+            Self::Disabled => Self::Default,
+            Self::Default => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Standard,
+            Self::Standard => Self::Maxres,
+            Self::Maxres => Self::Automatic,
+        }
+    }
+
+    /// Resolves viewport-aware automatic selection to one exact API entry.
+    #[must_use]
+    pub const fn resolve(self, terminal_width_pixels: Option<u16>) -> Self {
+        const LARGE_WINDOW_WIDTH_PIXELS: u16 = 1_920;
+
+        match self {
+            Self::Automatic => match terminal_width_pixels {
+                Some(width) if width > LARGE_WINDOW_WIDTH_PIXELS => Self::Maxres,
+                _ => Self::Standard,
+            },
+            exact => exact,
+        }
+    }
+
+    /// Returns the exact API quality key after automatic resolution.
+    #[must_use]
+    pub const fn quality(self) -> Option<&'static str> {
+        match self {
+            Self::Automatic | Self::Disabled => None,
+            Self::Default => Some("default"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Standard => Some("standard"),
+            Self::Maxres => Some("maxres"),
+        }
+    }
+
+    /// Returns the documented API pixel dimensions after automatic resolution.
+    #[must_use]
+    pub const fn dimensions(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Automatic | Self::Disabled => None,
+            Self::Default => Some((120, 90)),
+            Self::Medium => Some((320, 180)),
+            Self::High => Some((480, 360)),
+            Self::Standard => Some((640, 480)),
+            Self::Maxres => Some((1_280, 720)),
+        }
+    }
+
+    /// Returns the human-readable Preferences label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic (640×480 or 1280×720)",
+            Self::Disabled => "Disabled",
+            Self::Default => "120×90 (default)",
+            Self::Medium => "320×180 (medium)",
+            Self::High => "480×360 (high)",
+            Self::Standard => "640×480 (standard)",
+            Self::Maxres => "1280×720 (maxres)",
+        }
+    }
+
+    /// Returns the stable human-readable TOML representation.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Disabled => "disabled",
+            Self::Default => "default",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Standard => "standard",
+            Self::Maxres => "maxres",
+        }
+    }
 }
 
 /// Restart-safe local state settings.
@@ -1520,6 +1652,10 @@ mod tests {
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert!(config.persistence.git_commit_on_change);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
+        assert_eq!(
+            config.ui.youtube_thumbnail_size,
+            YouTubeThumbnailSize::Automatic
+        );
         assert!(config.ui.prefetch_search_thumbnails);
         assert!(config.ui.show_images_in_tty);
         assert!(config.ui.show_local_folder_sizes);
@@ -1562,6 +1698,7 @@ auto_download = false
 [ui]
 theme = "light"
 thumbnail_height = 14
+youtube_thumbnail_size = "high"
 prefetch_search_thumbnails = false
 show_images_in_tty = false
 show_local_folder_sizes = false
@@ -1583,6 +1720,7 @@ bandcamp_audio_format = "alac"
         assert!(!config.subscriptions.auto_download);
         assert_eq!(config.ui.theme, ThemeMode::Light);
         assert_eq!(config.ui.thumbnail_height, 14);
+        assert_eq!(config.ui.youtube_thumbnail_size, YouTubeThumbnailSize::High);
         assert!(!config.ui.prefetch_search_thumbnails);
         assert!(!config.ui.show_images_in_tty);
         assert!(!config.ui.show_local_folder_sizes);
@@ -1608,6 +1746,85 @@ bandcamp_audio_format = "alac"
 
         assert!(config.ui.show_images_in_tty);
         assert_eq!(config.ui.thumbnails, ThumbnailMode::Auto);
+        assert_eq!(
+            config.ui.youtube_thumbnail_size,
+            YouTubeThumbnailSize::Automatic
+        );
+    }
+
+    #[test]
+    fn youtube_thumbnail_sizes_have_stable_serde_names_and_metadata() {
+        let expected = [
+            (YouTubeThumbnailSize::Automatic, "automatic", None, None),
+            (YouTubeThumbnailSize::Disabled, "disabled", None, None),
+            (
+                YouTubeThumbnailSize::Default,
+                "default",
+                Some("default"),
+                Some((120, 90)),
+            ),
+            (
+                YouTubeThumbnailSize::Medium,
+                "medium",
+                Some("medium"),
+                Some((320, 180)),
+            ),
+            (
+                YouTubeThumbnailSize::High,
+                "high",
+                Some("high"),
+                Some((480, 360)),
+            ),
+            (
+                YouTubeThumbnailSize::Standard,
+                "standard",
+                Some("standard"),
+                Some((640, 480)),
+            ),
+            (
+                YouTubeThumbnailSize::Maxres,
+                "maxres",
+                Some("maxres"),
+                Some((1_280, 720)),
+            ),
+        ];
+
+        for (size, name, quality, dimensions) in expected {
+            let encoded = serde_json::to_string(&size).expect("serialize thumbnail size");
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<YouTubeThumbnailSize>(&encoded)
+                    .expect("deserialize thumbnail size"),
+                size
+            );
+            assert_eq!(size.as_config_value(), name);
+            assert_eq!(size.quality(), quality);
+            assert_eq!(size.dimensions(), dimensions);
+        }
+    }
+
+    #[test]
+    fn automatic_youtube_thumbnail_size_uses_terminal_pixel_width_boundary() {
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(None),
+            YouTubeThumbnailSize::Standard
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(Some(1_919)),
+            YouTubeThumbnailSize::Standard
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(Some(1_920)),
+            YouTubeThumbnailSize::Standard
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(Some(1_921)),
+            YouTubeThumbnailSize::Maxres
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::High.resolve(Some(u16::MAX)),
+            YouTubeThumbnailSize::High
+        );
     }
 
     #[test]
@@ -1625,6 +1842,10 @@ bandcamp_audio_format = "alac"
             assert!(!config.ui.show_images_in_tty);
             assert!(!config.ui.show_local_folder_sizes);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
+            assert_eq!(
+                config.ui.youtube_thumbnail_size,
+                YouTubeThumbnailSize::Maxres
+            );
             assert_eq!(
                 config.providers.bandcamp_audio_format,
                 BandcampAudioFormat::OggVorbis
@@ -1666,6 +1887,7 @@ bandcamp_audio_format = "alac"
             .env(TTY_IMAGES_ENV, "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
+            .env(YOUTUBE_THUMBNAIL_SIZE_ENV, "maxres")
             .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
             .env(
                 "YOUTA_PROVIDERS__YOUTUBE_API_KEY",
@@ -1738,7 +1960,14 @@ youtube_api_key = "keep-this-existing-secret"
             .expect("load configuration");
 
         config
-            .save_tui_preferences(SubscriptionsLayout::Split, false, false, false, false)
+            .save_tui_preferences(
+                SubscriptionsLayout::Split,
+                false,
+                false,
+                false,
+                false,
+                YouTubeThumbnailSize::Maxres,
+            )
             .expect("save TUI preferences");
 
         let contents = fs::read_to_string(&path).expect("read updated configuration");
@@ -1750,6 +1979,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("skip_advertisement_chapters = false"));
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
         #[cfg(feature = "images")]
         assert!(contents.contains("show_images_in_tty = false"));
         #[cfg(not(feature = "images"))]
@@ -1760,6 +1990,10 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!config.ui.show_images_in_tty);
         #[cfg(not(feature = "images"))]
         assert!(config.ui.show_images_in_tty);
+        assert_eq!(
+            config.ui.youtube_thumbnail_size,
+            YouTubeThumbnailSize::Maxres
+        );
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
 
@@ -1771,6 +2005,10 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!reloaded.ui.show_images_in_tty);
         #[cfg(not(feature = "images"))]
         assert!(reloaded.ui.show_images_in_tty);
+        assert_eq!(
+            reloaded.ui.youtube_thumbnail_size,
+            YouTubeThumbnailSize::Maxres
+        );
         assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
     }
@@ -1888,11 +2126,20 @@ youtube_api_key = "keep-this-existing-secret"
             let override_name = std::env::var(OVERRIDE_NAME).expect("override name");
             let mut config =
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            let original_thumbnail_size = config.ui.youtube_thumbnail_size;
             let error = config
-                .save_tui_preferences(SubscriptionsLayout::Split, false, true, true, true)
+                .save_tui_preferences(
+                    SubscriptionsLayout::Split,
+                    false,
+                    true,
+                    true,
+                    true,
+                    YouTubeThumbnailSize::Standard,
+                )
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
+            assert_eq!(config.ui.youtube_thumbnail_size, original_thumbnail_size);
             return;
         }
 
@@ -1902,6 +2149,7 @@ youtube_api_key = "keep-this-existing-secret"
             (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),
+            (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
         ];
         for (override_name, override_value) in overrides
             .into_iter()

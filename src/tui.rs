@@ -38,7 +38,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     BandcampAudioFormat, DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout,
-    ThumbnailMode,
+    ThumbnailMode, YouTubeThumbnailSize,
 };
 use crate::domain::{Chapter, MediaId, MediaKind, SourceKind, decode_url_path_segment_once};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
@@ -534,6 +534,14 @@ pub struct DetailView {
     /// The URL is never rendered as text. Unsupported terminals omit the
     /// image without fetching it.
     pub thumbnail_url: Option<url::Url>,
+    /// Largest provider-advertised image reserved for full-terminal expansion.
+    ///
+    /// The normal Details preview continues to use [`Self::thumbnail_url`],
+    /// which follows the configured YouTube size. Image-enabled renderers may
+    /// warm this separate target before the user clicks the visible preview.
+    pub expanded_thumbnail_url: Option<url::Url>,
+    /// Source pixel dimensions used to reserve an aspect-correct preview area.
+    pub thumbnail_dimensions: Option<(u32, u32)>,
     /// Lazy midpoint-frame target for a selected local video.
     pub local_video_thumbnail: Option<LocalVideoThumbnailView>,
     /// Whether artwork occupies all remaining rows in the Details panel.
@@ -663,6 +671,8 @@ pub struct PreferencesPopupView {
     pub skip_advertisement_chapters: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
     pub youtube_prewarm: bool,
+    /// Draft exact `YouTube` thumbnail size saved only on confirmation.
+    pub youtube_thumbnail_size: YouTubeThumbnailSize,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
     pub show_local_folder_sizes: bool,
     /// Draft physical-Linux-TTY artwork behavior saved only on confirmation.
@@ -1385,6 +1395,8 @@ pub enum UiAction {
     Quit,
     /// Record graphical-opener and physical-Linux-console capabilities.
     SetExternalOpenerAvailable(bool),
+    /// Record the terminal window's current pixel width, when available.
+    SetTerminalWindowWidthPixels(Option<u16>),
     /// Report that F8 retained its keyboard pointer without physical GPM input.
     ReportGpmUnavailable {
         /// Whether this binary was compiled with the GPM input adapter.
@@ -1639,6 +1651,8 @@ pub enum UiAction {
     ToggleSkipAdvertisementChapters,
     /// Toggle selected-video YouTube prewarming in the draft.
     ToggleYouTubePrewarm,
+    /// Cycle the exact YouTube thumbnail size in the draft.
+    CycleYouTubeThumbnailSize,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
     ToggleLocalFolderSizes,
     /// Toggle half-block artwork on a physical Linux TTY in the draft.
@@ -1757,8 +1771,8 @@ trait ThumbnailRenderer {
     fn synchronize_local_video(&mut self, _source: &LocalVideoThumbnailView, _area: Rect) -> bool {
         false
     }
-    /// Replaces the cache-only backlog for artwork rows selected by the TUI.
-    fn synchronize_prefetch(&mut self, _rows: &[RowView]) -> bool {
+    /// Replaces the cache-only backlog for artwork selected by the TUI.
+    fn synchronize_prefetch(&mut self, _sources: &[url::Url]) -> bool {
         false
     }
     /// Temporarily hides artwork behind a modal without invalidating its work.
@@ -1922,20 +1936,13 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         changed
     }
 
-    fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
-        let sources_unchanged = self
-            .prefetch_sources
-            .iter()
-            .eq(rows.iter().filter_map(|row| row.thumbnail_url.as_ref()));
+    fn synchronize_prefetch(&mut self, sources: &[url::Url]) -> bool {
+        let sources_unchanged = self.prefetch_sources == sources;
         if sources_unchanged && self.prefetched_visible_source == self.visible_source {
             return false;
         }
         self.prefetch_sources.clear();
-        self.prefetch_sources.extend(
-            rows.iter()
-                .filter_map(|row| row.thumbnail_url.as_ref())
-                .cloned(),
-        );
+        self.prefetch_sources.extend_from_slice(sources);
         self.prefetched_visible_source
             .clone_from(&self.visible_source);
         self.manager.synchronize_prefetch(&self.prefetch_sources)
@@ -2286,6 +2293,20 @@ fn current_terminal_window_metrics() -> Option<TerminalWindowMetrics> {
     TerminalWindowMetrics::new(window.columns, window.rows, window.width, window.height)
 }
 
+/// Reads only the terminal window's pixel width for thumbnail-size selection.
+///
+/// Some terminals report zero pixel height while still providing a usable
+/// width. Automatic YouTube sizing must not discard that independent value.
+fn current_terminal_window_pixel_width() -> Option<u16> {
+    let window = crossterm::terminal::window_size().ok()?;
+    nonzero_terminal_window_pixel_width(window.width)
+}
+
+/// Validates one independently reported terminal-window pixel width.
+const fn nonzero_terminal_window_pixel_width(width: u16) -> Option<u16> {
+    if width == 0 { None } else { Some(width) }
+}
+
 /// Number of wrapped description rows below which YouTube artwork expands.
 const SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT: usize = 15;
 
@@ -2311,21 +2332,26 @@ fn youtube_description_is_short(details: &DetailView, pane_width: u16) -> bool {
 ///
 /// At 1080 terminal-window pixels and above, or when a YouTube description
 /// occupies fewer than 15 rendered rows, the returned row count maps the pane's
-/// complete cell width to a 16:9 pixel rectangle. A short description can use
-/// the same 10×20 fallback cell geometry as the image backend when a terminal
-/// omits pixel dimensions; the 1080-pixel rule itself requires a complete
-/// window report.
+/// complete cell width to the selected thumbnail's source aspect ratio. A
+/// short description can use the same 10×20 fallback cell geometry as the
+/// image backend when a terminal omits pixel dimensions; the 1080-pixel rule
+/// itself requires a complete window report.
 fn youtube_thumbnail_height(
     configured_height: u16,
     pane_width: u16,
     youtube_video: bool,
     short_description: bool,
+    thumbnail_dimensions: Option<(u32, u32)>,
     terminal_window: Option<TerminalWindowMetrics>,
 ) -> u16 {
     const LARGE_TERMINAL_HEIGHT_PIXELS: u16 = 1080;
     const FALLBACK_CELL_PIXELS: (u16, u16) = (10, 20);
 
     if !youtube_video || pane_width == 0 {
+        return configured_height;
+    }
+    let (source_width, source_height) = thumbnail_dimensions.unwrap_or((16, 9));
+    if source_width == 0 || source_height == 0 {
         return configured_height;
     }
     let (numerator, denominator) = match terminal_window {
@@ -2335,18 +2361,18 @@ fn youtube_thumbnail_height(
             (
                 u64::from(pane_width)
                     .saturating_mul(u64::from(window.width_pixels))
-                    .saturating_mul(9)
+                    .saturating_mul(u64::from(source_height))
                     .saturating_mul(u64::from(window.rows)),
                 u64::from(window.columns)
-                    .saturating_mul(16)
+                    .saturating_mul(u64::from(source_width))
                     .saturating_mul(u64::from(window.height_pixels)),
             )
         }
         None if short_description => (
             u64::from(pane_width)
                 .saturating_mul(u64::from(FALLBACK_CELL_PIXELS.0))
-                .saturating_mul(9),
-            u64::from(FALLBACK_CELL_PIXELS.1).saturating_mul(16),
+                .saturating_mul(u64::from(source_height)),
+            u64::from(FALLBACK_CELL_PIXELS.1).saturating_mul(u64::from(source_width)),
         ),
         Some(_) | None => return configured_height,
     };
@@ -2375,6 +2401,9 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         terminal_attachment.external_opener_available(),
     ));
     let mut session = TerminalSession::enter()?;
+    controller.dispatch(UiAction::SetTerminalWindowWidthPixels(
+        current_terminal_window_pixel_width(),
+    ));
     let mut input = TerminalInput::new();
     let mut thumbnail_renderer =
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
@@ -2461,7 +2490,11 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                         controller.dispatch(action);
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    controller.dispatch(UiAction::SetTerminalWindowWidthPixels(
+                        current_terminal_window_pixel_width(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -2772,6 +2805,14 @@ fn synchronize_thumbnail_prefetch(
     settings: &UiSettings,
     renderer: &mut dyn ThumbnailRenderer,
 ) -> bool {
+    let mut sources = Vec::new();
+    if let Some(source) = view
+        .details
+        .as_ref()
+        .and_then(|details| details.expanded_thumbnail_url.as_ref())
+    {
+        sources.push(source.clone());
+    }
     let rows = match view.screen {
         Screen::Search | Screen::YouTubeMusic if settings.prefetch_search_thumbnails => {
             view.rows.as_slice()
@@ -2779,7 +2820,12 @@ fn synchronize_thumbnail_prefetch(
         Screen::Subscriptions => view.subscriptions.sources.as_slice(),
         _ => &[],
     };
-    renderer.synchronize_prefetch(rows)
+    for source in rows.iter().filter_map(|row| row.thumbnail_url.as_ref()) {
+        if !sources.contains(source) {
+            sources.push(source.clone());
+        }
+    }
+    renderer.synchronize_prefetch(&sources)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2971,6 +3017,8 @@ struct HitMap {
     information_panel_identity: Option<InformationPanelIdentity>,
     /// Cells occupied by actual, ready artwork in the Details panel.
     thumbnail_area: Option<Rect>,
+    /// Full-terminal click target used to close an expanded artwork overlay.
+    thumbnail_overlay_area: Option<Rect>,
     /// Actual wrapped-line offset rendered in the Details description.
     details_scroll_offset: usize,
     /// Largest wrapped-line offset that can change the visible description.
@@ -3325,6 +3373,73 @@ fn nearest_free_label_slot(
     best.map(|(_, _, row, start)| (row, start))
 }
 
+/// Reports whether expanded Details owns a renderable artwork source.
+fn expanded_thumbnail_available(view: &ViewModel) -> bool {
+    let Some(details) = view
+        .details
+        .as_ref()
+        .filter(|details| details.thumbnail_expanded)
+    else {
+        return false;
+    };
+    details.expanded_thumbnail_url.is_some()
+        || details.thumbnail_url.is_some()
+        || details.local_video_thumbnail.is_some()
+        || details
+            .expanded_wikidata_item
+            .as_deref()
+            .and_then(|item_id| {
+                details
+                    .wikidata_entities
+                    .iter()
+                    .find(|entity| entity.item_id == item_id)
+            })
+            .is_some_and(|entity| entity.image_url.is_some())
+}
+
+/// Renders expanded artwork as a modal, aspect-fitted terminal overlay.
+fn render_fullscreen_thumbnail_overlay(
+    frame: &mut Frame<'_>,
+    view: &ViewModel,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    renderer: &mut dyn ThumbnailRenderer,
+) {
+    let Some(details) = view.details.as_ref() else {
+        return;
+    };
+    let expanded_wikidata_entity = details
+        .expanded_wikidata_item
+        .as_deref()
+        .and_then(|item_id| {
+            details
+                .wikidata_entities
+                .iter()
+                .find(|entity| entity.item_id == item_id)
+        });
+    let visible_thumbnail_url = details
+        .expanded_thumbnail_url
+        .as_ref()
+        .or(details.thumbnail_url.as_ref())
+        .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
+    let visible_local_video = details.local_video_thumbnail.as_ref();
+    let area = frame.area();
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme.base), area);
+    if let Some(local_video) = visible_local_video {
+        renderer.synchronize_local_video(local_video, area);
+    } else {
+        renderer.synchronize(visible_thumbnail_url, area);
+    }
+    let prepared = renderer.prepared_artwork_area(area).unwrap_or(area);
+    let artwork_area = centered_sized_rect(prepared.width, prepared.height, area);
+    let artwork_rendered = renderer.has_rendered_artwork();
+    renderer.render(frame, artwork_area, theme);
+    hit_map.thumbnail_overlay_area = Some(area);
+    hit_map.thumbnail_area = artwork_rendered.then_some(artwork_area);
+}
+
 fn render_frame(
     frame: &mut Frame<'_>,
     view: &ViewModel,
@@ -3333,6 +3448,7 @@ fn render_frame(
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
     let theme = Theme::for_terminal(settings.funny_mode, view.physical_linux_console);
+    hit_map.thumbnail_overlay_area = None;
     frame.render_widget(Block::default().style(theme.base), frame.area());
 
     let chapter_label_rows = if view.waveform_visible {
@@ -3370,10 +3486,26 @@ fn render_frame(
         || view.local_file_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    let thumbnail_is_fullscreen = !thumbnail_is_obscured
+        && expanded_thumbnail_available(view)
+        && thumbnail_renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.is_enabled());
     if thumbnail_is_obscured {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
             renderer.obscure();
         }
+        render_body(
+            frame,
+            sections[1],
+            view,
+            settings.show_hotkeys,
+            settings.thumbnail_height,
+            &theme,
+            hit_map,
+            None,
+        );
+    } else if thumbnail_is_fullscreen {
         render_body(
             frame,
             sections[1],
@@ -3393,7 +3525,7 @@ fn render_frame(
             settings.thumbnail_height,
             &theme,
             hit_map,
-            thumbnail_renderer,
+            thumbnail_renderer.take(),
         );
     }
     if let Some(download) = view.download.as_ref() {
@@ -3422,6 +3554,9 @@ fn render_frame(
         subscription_refresh_available(view),
         hit_map,
     );
+    if thumbnail_is_fullscreen && let Some(renderer) = thumbnail_renderer.as_deref_mut() {
+        render_fullscreen_thumbnail_overlay(frame, view, &theme, hit_map, renderer);
+    }
     if view.help_open {
         render_help(frame, &theme);
     }
@@ -4543,6 +4678,7 @@ fn render_details_with_terminal_window(
         area.width,
         youtube_details.is_some(),
         youtube_details.is_some_and(|details| youtube_description_is_short(details, area.width)),
+        youtube_details.and_then(|details| details.thumbnail_dimensions),
         terminal_window,
     );
     render_information_panel(
@@ -8329,7 +8465,7 @@ fn render_preferences_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(76, 88, frame.area());
+    let area = centered_rect(76, 94, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -8344,6 +8480,7 @@ fn render_preferences_popup(
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -8450,6 +8587,36 @@ fn render_preferences_popup(
         ),
     ));
 
+    let youtube_thumbnail_label = if cfg!(feature = "images") {
+        format!(
+            "[t] YouTube thumbnails: {}",
+            preferences.youtube_thumbnail_size.label()
+        )
+    } else {
+        "YouTube thumbnails: unavailable in this build".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(youtube_thumbnail_label.clone())
+            .style(if cfg!(feature = "images") {
+                theme.selected
+            } else {
+                theme.muted
+            })
+            .alignment(Alignment::Center),
+        sections[4],
+    );
+    if cfg!(feature = "images") {
+        hit_map.preferences_buttons.push((
+            UiAction::CycleYouTubeThumbnailSize,
+            Rect::new(
+                centered_line_x(sections[4], terminal_text_width(&youtube_thumbnail_label)),
+                sections[4].y,
+                terminal_text_width(&youtube_thumbnail_label).min(sections[4].width),
+                1,
+            ),
+        ));
+    }
+
     let folder_size_label = format!(
         "[f] Show Local folder sizes: {}",
         if preferences.show_local_folder_sizes {
@@ -8466,14 +8633,14 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[4],
+        sections[5],
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleLocalFolderSizes,
         Rect::new(
-            centered_line_x(sections[4], terminal_text_width(&folder_size_label)),
-            sections[4].y,
-            terminal_text_width(&folder_size_label).min(sections[4].width),
+            centered_line_x(sections[5], terminal_text_width(&folder_size_label)),
+            sections[5].y,
+            terminal_text_width(&folder_size_label).min(sections[5].width),
             1,
         ),
     ));
@@ -8500,15 +8667,15 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[5],
+        sections[6],
     );
     if cfg!(feature = "images") {
         hit_map.preferences_buttons.push((
             UiAction::ToggleTtyImages,
             Rect::new(
-                centered_line_x(sections[5], terminal_text_width(&tty_images_label)),
-                sections[5].y,
-                terminal_text_width(&tty_images_label).min(sections[5].width),
+                centered_line_x(sections[6], terminal_text_width(&tty_images_label)),
+                sections[6].y,
+                terminal_text_width(&tty_images_label).min(sections[6].width),
                 1,
             ),
         ));
@@ -8530,22 +8697,22 @@ fn render_preferences_popup(
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[6],
+        sections[7],
     );
     if cfg!(feature = "bandcamp") {
         hit_map.preferences_buttons.push((
             UiAction::CycleBandcampAudioFormat,
             Rect::new(
-                centered_line_x(sections[6], terminal_text_width(&bandcamp_format_label)),
-                sections[6].y,
-                terminal_text_width(&bandcamp_format_label).min(sections[6].width),
+                centered_line_x(sections[7], terminal_text_width(&bandcamp_format_label)),
+                sections[7].y,
+                terminal_text_width(&bandcamp_format_label).min(sections[7].width),
                 1,
             ),
         ));
     }
 
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 640×480 through 1920 px and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -8568,7 +8735,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[7],
+        sections[8],
     );
 
     let buttons = [
@@ -8584,15 +8751,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[8],
+        sections[9],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[8], total_width);
+    let mut x = centered_line_x(sections[9], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[8].y, width, 1)));
+            .push((action, Rect::new(x, sections[9].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -9467,6 +9634,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Enter => Some(UiAction::SubmitPreferences),
             KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
             KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
+            KeyCode::Char('t') if cfg!(feature = "images") => {
+                Some(UiAction::CycleYouTubeThumbnailSize)
+            }
             KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
             KeyCode::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
             KeyCode::Char('b') if cfg!(feature = "bandcamp") => {
@@ -9484,7 +9654,12 @@ fn key_action_with_page_rows_unfiltered(
             _ => None,
         };
     }
-    if view.text_selection_mode {
+    if view.text_selection_mode
+        && !view
+            .details
+            .as_ref()
+            .is_some_and(|details| details.thumbnail_expanded)
+    {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
@@ -9536,6 +9711,16 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::Char('q') => Some(UiAction::Quit),
             _ => None,
         };
+    }
+    let thumbnail_expanded = view
+        .details
+        .as_ref()
+        .is_some_and(|details| details.thumbnail_expanded);
+    if thumbnail_expanded && key.code == KeyCode::Esc {
+        return Some(UiAction::ToggleThumbnailExpansion);
+    }
+    if expanded_thumbnail_available(view) {
+        return None;
     }
     if view.search_editing {
         return match key.code {
@@ -10099,6 +10284,14 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+    if let Some(area) = hit_map.thumbnail_overlay_area {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if contains(area, mouse.column, mouse.row) => {
+                Some(UiAction::ToggleThumbnailExpansion)
+            }
+            _ => None,
+        };
+    }
     if view.text_selection_mode {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -10643,12 +10836,8 @@ mod tests {
             true
         }
 
-        fn synchronize_prefetch(&mut self, rows: &[RowView]) -> bool {
-            self.prefetch_batches.push(
-                rows.iter()
-                    .filter_map(|row| row.thumbnail_url.clone())
-                    .collect(),
-            );
+        fn synchronize_prefetch(&mut self, sources: &[url::Url]) -> bool {
+            self.prefetch_batches.push(sources.to_vec());
             true
         }
 
@@ -15172,6 +15361,7 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
+                youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
@@ -15190,6 +15380,10 @@ mod tests {
         assert!(rendered.contains("[d] Drill-down"));
         assert!(rendered.contains("[s] Split"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
+        #[cfg(feature = "images")]
+        assert!(rendered.contains("[t] YouTube thumbnails: 640×480 (standard)"));
+        #[cfg(not(feature = "images"))]
+        assert!(rendered.contains("YouTube thumbnails: unavailable in this build"));
         assert!(rendered.contains("[f] Show Local folder sizes: on"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[i] Show images in TTY: on"));
@@ -15209,6 +15403,16 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleYouTubePrewarm)
+        );
+        #[cfg(feature = "images")]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &view),
+            Some(UiAction::CycleYouTubeThumbnailSize)
+        );
+        #[cfg(not(feature = "images"))]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &view),
+            None
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
@@ -15272,6 +15476,27 @@ mod tests {
             ),
             Some(UiAction::ToggleYouTubePrewarm)
         );
+        #[cfg(feature = "images")]
+        {
+            let (_, thumbnail_size_target) = hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(action, _)| action == &UiAction::CycleYouTubeThumbnailSize)
+                .expect("YouTube thumbnail-size target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: thumbnail_size_target.x,
+                        row: thumbnail_size_target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::CycleYouTubeThumbnailSize)
+            );
+        }
         let (_, folder_size_target) = hit_map
             .preferences_buttons
             .iter()
@@ -15340,6 +15565,40 @@ mod tests {
                 Some(UiAction::CycleBandcampAudioFormat)
             );
         }
+        for (action, label) in [
+            (UiAction::SubmitPreferences, "[Enter] Save"),
+            (UiAction::DismissPreferences, "[Esc] Cancel"),
+        ] {
+            let target = hit_map
+                .preferences_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == &action).then_some(*area))
+                .expect("visible Preferences footer target");
+            let visible_label = (target.x..target.right())
+                .map(|column| {
+                    terminal.backend().buffer()[(column, target.y)]
+                        .symbol()
+                        .to_owned()
+                })
+                .collect::<String>();
+            assert_eq!(
+                visible_label, label,
+                "Preferences footer target must cover its rendered label"
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(action)
+            );
+        }
     }
 
     #[test]
@@ -15350,6 +15609,7 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
+                youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
@@ -16770,6 +17030,11 @@ mod tests {
                 ..RowView::default()
             }],
             playing_media_id: Some(media_id),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
             radio_recording: Some(RadioRecordingView {
                 station_id: "sector-radio-progressive-flac".to_owned(),
                 station_name: "Sector Radio — Progressive".to_owned(),
@@ -16895,6 +17160,11 @@ mod tests {
                     ..RowView::default()
                 },
             ],
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -17865,7 +18135,7 @@ mod tests {
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw paused Wikidata media");
         let rendered = rendered_text(&terminal);
-        assert!(!rendered.contains(WIKIDATA_MEDIA_PAUSE_SYMBOL));
+        assert!(!rendered.contains("⏸ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Video fixture.webm"));
     }
@@ -17943,6 +18213,142 @@ mod tests {
             &mut renderer,
         ));
         assert!(renderer.prefetch_batches.last().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn thumbnail_prefetch_prioritizes_the_selected_expansion_image() {
+        let expanded = url::Url::parse("https://i.ytimg.com/vi/selected/maxresdefault.jpg")
+            .expect("expanded thumbnail URL");
+        let selected = url::Url::parse("https://i.ytimg.com/vi/selected/sddefault.jpg")
+            .expect("selected thumbnail URL");
+        let next = url::Url::parse("https://i.ytimg.com/vi/next/sddefault.jpg")
+            .expect("next thumbnail URL");
+        let view = ViewModel {
+            screen: Screen::Search,
+            rows: vec![
+                RowView {
+                    thumbnail_url: Some(selected.clone()),
+                    ..RowView::default()
+                },
+                RowView {
+                    thumbnail_url: Some(next.clone()),
+                    ..RowView::default()
+                },
+            ],
+            details: Some(DetailView {
+                thumbnail_url: Some(selected),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut renderer = MockThumbnailRenderer::default();
+
+        assert!(synchronize_thumbnail_prefetch(
+            &view,
+            &UiSettings::default(),
+            &mut renderer,
+        ));
+        assert_eq!(
+            renderer.prefetch_batches,
+            [vec![
+                expanded.clone(),
+                view.rows[0]
+                    .thumbnail_url
+                    .clone()
+                    .expect("selected thumbnail"),
+                next.clone()
+            ]],
+            "the click target must warm before list thumbnails without replacing their configured size"
+        );
+
+        let no_list_warming = UiSettings {
+            prefetch_search_thumbnails: false,
+            ..UiSettings::default()
+        };
+        assert!(synchronize_thumbnail_prefetch(
+            &view,
+            &no_list_warming,
+            &mut renderer,
+        ));
+        assert_eq!(
+            renderer.prefetch_batches.last(),
+            Some(&vec![expanded.clone()]),
+            "selected expansion warming is independent from the list-prefetch preference"
+        );
+
+        let mut same_source = view;
+        same_source
+            .details
+            .as_mut()
+            .expect("fixture details")
+            .expanded_thumbnail_url = Some(expanded.clone());
+        same_source.rows[0].thumbnail_url = Some(expanded.clone());
+        assert!(synchronize_thumbnail_prefetch(
+            &same_source,
+            &UiSettings::default(),
+            &mut renderer,
+        ));
+        assert_eq!(
+            renderer.prefetch_batches.last(),
+            Some(&vec![expanded, next]),
+            "the same configured and expanded URL must be requested only once"
+        );
+    }
+
+    #[test]
+    fn expanded_youtube_artwork_uses_the_largest_advertised_image() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let selected =
+            url::Url::parse("https://i.ytimg.com/vi/fixture/sddefault.jpg").expect("selected URL");
+        let expanded = url::Url::parse("https://i.ytimg.com/vi/fixture/maxresdefault.jpg")
+            .expect("expanded URL");
+        let view = ViewModel {
+            details: Some(DetailView {
+                source: "YouTube".to_owned(),
+                thumbnail_url: Some(selected),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                thumbnail_expanded: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(80, 30)),
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut renderer),
+                );
+            })
+            .expect("draw expanded YouTube artwork");
+
+        assert_eq!(
+            renderer.synchronized[0].0.as_ref(),
+            Some(&expanded),
+            "the full-terminal overlay must use the largest advertised source"
+        );
+    }
+
+    #[test]
+    fn automatic_thumbnail_width_accepts_an_independent_pixel_report() {
+        assert_eq!(nonzero_terminal_window_pixel_width(0), None);
+        assert_eq!(
+            nonzero_terminal_window_pixel_width(2_560),
+            Some(2_560),
+            "a usable width must survive even when other window metrics are unavailable"
+        );
     }
 
     #[test]
@@ -18035,6 +18441,10 @@ mod tests {
         assert_eq!(requested_area.height, 24);
         assert_eq!(rendered_area.height, 17);
         assert_eq!(
+            rendered_area.y, requested_area.y,
+            "the TUI must not insert empty rows before ready artwork"
+        );
+        assert_eq!(
             details_row.y,
             rendered_area.bottom(),
             "aspect-ratio padding must not become empty rows before Details text"
@@ -18117,6 +18527,7 @@ mod tests {
                 64,
                 false,
                 true,
+                None,
                 TerminalWindowMetrics::new(120, 60, 1920, 1080),
             ),
             7,
@@ -18187,9 +18598,14 @@ mod tests {
             );
         }
         assert_eq!(
-            youtube_thumbnail_height(7, details_area.width, true, true, None),
+            youtube_thumbnail_height(7, details_area.width, true, true, None, None),
             18,
             "short descriptions should use the image backend's fallback cell geometry"
+        );
+        assert_eq!(
+            youtube_thumbnail_height(7, details_area.width, true, true, Some((640, 480)), None,),
+            24,
+            "standard 4:3 artwork must reserve its full width without side gaps"
         );
     }
 
@@ -18245,7 +18661,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_artwork_uses_all_remaining_right_panel_rows_in_wide_and_narrow_layouts() {
+    fn expanded_artwork_uses_the_full_terminal_and_preserves_aspect_fit() {
         for (width, height) in [(120, 40), (70, 50)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).expect("terminal");
@@ -18267,24 +18683,6 @@ mod tests {
                 ..ViewModel::default()
             };
             let mut hit_map = HitMap::default();
-            let mut normal = MockThumbnailRenderer {
-                enabled: true,
-                rendered_artwork: true,
-                ..MockThumbnailRenderer::default()
-            };
-            terminal
-                .draw(|frame| {
-                    render_frame(
-                        frame,
-                        &view,
-                        &UiSettings::default(),
-                        &mut hit_map,
-                        Some(&mut normal),
-                    );
-                })
-                .expect("draw configured artwork");
-            let normal_area = normal.synchronized[0].1;
-
             view.details
                 .as_mut()
                 .expect("fixture details")
@@ -18292,7 +18690,7 @@ mod tests {
             let mut expanded = MockThumbnailRenderer {
                 enabled: true,
                 rendered_artwork: true,
-                prepared_artwork_size: Some(Size::new(normal_area.width, 3)),
+                prepared_artwork_size: Some(Size::new(width / 2, height / 2)),
                 ..MockThumbnailRenderer::default()
             };
             terminal
@@ -18309,33 +18707,249 @@ mod tests {
             let expanded_requested_area = expanded.synchronized[0].1;
             let expanded_rendered_area = expanded.rendered_areas[0];
 
-            assert!(expanded_requested_area.height > normal_area.height);
-            assert_eq!(expanded_requested_area.x, hit_map.details_panel.x);
-            assert_eq!(expanded_requested_area.width, hit_map.details_panel.width);
+            assert_eq!(expanded_requested_area, Rect::new(0, 0, width, height));
+            assert_eq!(expanded_rendered_area.width, width / 2);
+            assert_eq!(expanded_rendered_area.height, height / 2);
             assert_eq!(
-                expanded_requested_area.bottom(),
-                hit_map.details_panel.bottom()
+                expanded_rendered_area,
+                centered_sized_rect(width / 2, height / 2, expanded_requested_area)
             );
-            assert_eq!(expanded_rendered_area.width, expanded_requested_area.width);
-            assert_eq!(expanded_rendered_area.height, 3);
             assert_eq!(hit_map.thumbnail_area, Some(expanded_rendered_area));
+            assert_eq!(
+                hit_map.thumbnail_overlay_area,
+                Some(Rect::new(0, 0, width, height))
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ToggleThumbnailExpansion),
+                "a second click in the overlay letterbox must restore Details"
+            );
             assert!(
                 !rendered_text(&terminal).contains("Hidden while artwork is expanded."),
-                "expanded artwork must reserve the full pane and hide following Details text"
+                "the full-terminal overlay must cover following Details text"
             );
-            if width < 80 {
-                assert!(
-                    hit_map.rows.bottom() <= hit_map.details_panel.y,
-                    "narrow layout must retain the list above the expanded right/details panel"
-                );
-            } else {
-                assert_eq!(
-                    hit_map.rows.right(),
-                    hit_map.details_panel.x,
-                    "wide layout must retain the left panel beside expanded artwork"
-                );
-            }
+            assert!(
+                !rendered_text(&terminal).contains("Left-panel fixture"),
+                "the full-terminal overlay must cover the media list"
+            );
         }
+    }
+
+    #[test]
+    fn expanded_thumbnail_escape_precedes_details_and_parent_navigation() {
+        let view = ViewModel {
+            screen: Screen::Local,
+            details_focused: true,
+            text_selection_mode: true,
+            playlist_back_available: true,
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/fullscreen.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &view),
+            None,
+            "the expanded thumbnail behaves as a modal overlay"
+        );
+    }
+
+    #[test]
+    fn expanded_thumbnail_precedes_hidden_search_editing() {
+        let view = ViewModel {
+            search_editing: true,
+            search_query: "hidden query".to_owned(),
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/fullscreen.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &view),
+            None,
+            "typing must not edit a search field hidden behind the artwork"
+        );
+    }
+
+    #[test]
+    fn stale_thumbnail_expansion_can_close_without_blocking_navigation() {
+        let view = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &view),
+            Some(UiAction::MoveSelection(1)),
+            "an absent artwork source must not make normal Details modal"
+        );
+    }
+
+    #[test]
+    fn error_popup_obscures_expanded_thumbnail_and_keeps_input_precedence() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/fullscreen.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            }),
+            error_popup: Some(ErrorPopupView {
+                title: "Fixture error".to_owned(),
+                report: "Complete fixture report".to_owned(),
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw popup over expanded thumbnail");
+
+        assert_eq!(thumbnails.obscure_count, 1);
+        assert!(thumbnails.synchronized.is_empty());
+        assert!(hit_map.thumbnail_overlay_area.is_none());
+        assert!(rendered_text(&terminal).contains("Fixture error"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissErrorPopup)
+        );
+    }
+
+    #[test]
+    fn expanded_thumbnail_owns_the_full_hitbox_while_loading() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/loading.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: false,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw loading expanded thumbnail");
+
+        assert_eq!(thumbnails.synchronized[0].1, Rect::new(0, 0, 100, 32));
+        assert_eq!(
+            hit_map.thumbnail_overlay_area,
+            Some(Rect::new(0, 0, 100, 32))
+        );
+        assert!(hit_map.thumbnail_area.is_none());
+    }
+
+    #[test]
+    fn expanded_local_video_synchronizes_its_midpoint_against_the_full_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("terminal");
+        let local_video = LocalVideoThumbnailView {
+            path: PathBuf::from("/tmp/youta-expanded-video.mov"),
+            midpoint_millis: 42_000,
+        };
+        let view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_expanded: true,
+                local_video_thumbnail: Some(local_video.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw expanded local video");
+
+        assert_eq!(
+            thumbnails.synchronized_local_videos,
+            [(local_video, Rect::new(0, 0, 100, 32))]
+        );
+        assert!(thumbnails.synchronized.is_empty());
     }
 
     #[test]
