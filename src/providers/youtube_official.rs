@@ -3008,7 +3008,7 @@ mod tests {
         let pairs = query_pairs(&requests[0]);
         assert_eq!(pairs.get("part").map(String::as_str), Some("snippet"));
         assert_eq!(pairs.get("videoId").map(String::as_str), Some(VIDEO_ID));
-        assert_eq!(pairs.get("maxResults").map(String::as_str), Some("10"));
+        assert_eq!(pairs.get("maxResults").map(String::as_str), Some("20"));
         assert_eq!(pairs.get("order").map(String::as_str), Some("relevance"));
         assert_eq!(
             pairs.get("textFormat").map(String::as_str),
@@ -3049,7 +3049,7 @@ mod tests {
         server.finish();
         assert!(matches!(
             error,
-            ProviderError::InvalidResponse(message) if message.contains("more than 10")
+            ProviderError::InvalidResponse(message) if message.contains("more than 20")
         ));
 
         let oversized_text = "x".repeat(MAX_VIDEO_COMMENT_TEXT_BYTES + 1);

@@ -634,7 +634,7 @@ These are distinct integration modes:
   and
   [`channels.list`](https://developers.google.com/youtube/v3/docs/channels/list).
   Selected videos expose the public comment count and a bounded, RAM-cached
-  popup containing up to ten relevance-ordered top-level comments through
+  popup containing up to twenty relevance-ordered top-level comments through
   [`commentThreads.list`](https://developers.google.com/youtube/v3/docs/commentThreads/list).
   Account actions such as subscribing or posting comments require OAuth; an
   API key alone cannot authorize them. The roadmap includes opt-in,

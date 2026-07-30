@@ -1057,7 +1057,7 @@ pub struct VideoCommentsPopupView {
     pub video_title: String,
     /// Explicit request/result state.
     pub state: VideoCommentsPopupState,
-    /// At most ten bounded public top-level comments.
+    /// At most twenty bounded public top-level comments.
     pub comments: Vec<VideoCommentView>,
     /// Zero-based wrapped-line offset at the top of the viewport.
     pub scroll_offset: usize,
@@ -4798,7 +4798,7 @@ fn render_information_panel(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            button("F6", "Ten comments", show_hotkeys),
+            button("F6", "Twenty comments", show_hotkeys),
             theme.accent,
             UiAction::OpenVideoComments,
         );
@@ -22039,17 +22039,17 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw supported YouTube comments control");
-        assert!(rendered_text(&youtube_terminal).contains("[F6] Ten comments"));
+        assert!(rendered_text(&youtube_terminal).contains("[F6] Twenty comments"));
         let comments_target = youtube_hit_map
             .detail_buttons
             .iter()
             .find_map(|(action, target)| {
                 (action == &UiAction::OpenVideoComments).then_some(*target)
             })
-            .expect("Ten comments hit target");
+            .expect("Twenty comments hit target");
         assert_eq!(
             comments_target.width,
-            terminal_text_width("[F6] Ten comments"),
+            terminal_text_width("[F6] Twenty comments"),
         );
         assert_eq!(
             mouse_action(
@@ -22083,7 +22083,7 @@ prose 07:25 remains clickable but is not a chapter";
         local_terminal
             .draw(|frame| render(frame, &local, &UiSettings::default(), &mut local_hit_map))
             .expect("draw unsupported Local comments control");
-        assert!(!rendered_text(&local_terminal).contains("[F6] Ten comments"));
+        assert!(!rendered_text(&local_terminal).contains("[F6] Twenty comments"));
         assert!(
             local_hit_map
                 .detail_buttons
@@ -22108,7 +22108,7 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw unsupported YouTube comments control");
-        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Ten comments"));
+        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Twenty comments"));
         assert!(
             unsupported_hit_map
                 .detail_buttons
@@ -22119,7 +22119,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn comments_popup_scrolls_with_bounded_keyboard_mouse_and_close_controls() {
-        let comments = (0..10)
+        let comments = (0..20)
             .map(|index| VideoCommentView {
                 author_name: format!("Author {index}"),
                 like_count: u64::try_from(index).expect("fixture index"),
@@ -22149,7 +22149,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("YouTube comments"));
         assert!(rendered.contains("[Esc] Close"));
         assert!(
-            !rendered.contains("10 comments"),
+            !rendered.contains("20 comments"),
             "the fixed popup limit is already advertised by the F6 control"
         );
         assert!(

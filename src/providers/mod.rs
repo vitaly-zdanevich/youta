@@ -87,7 +87,7 @@ pub struct ProviderCapabilities {
 ///
 /// Keeping this bound in the provider contract prevents a remote response from
 /// turning the comments popup into an unbounded allocation.
-pub const MAX_VIDEO_COMMENTS: usize = 10;
+pub const MAX_VIDEO_COMMENTS: usize = 20;
 
 /// Maximum encoded byte length of one public comment identifier.
 pub const MAX_VIDEO_COMMENT_ID_BYTES: usize = 256;
@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn public_video_comments_are_bounded_and_unsupported_by_default() {
-        assert_eq!(MAX_VIDEO_COMMENTS, 10);
+        assert_eq!(MAX_VIDEO_COMMENTS, 20);
         assert!(!MinimalProvider.capabilities().video_comments);
         assert!(matches!(
             MinimalProvider.video_comments("video"),

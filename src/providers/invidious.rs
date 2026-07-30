@@ -1861,7 +1861,7 @@ mod tests {
         let comments = InvidiousProvider::convert_video_comments(raw, "dQw4w9WgXcQ")
             .expect("a normal Invidious page should be truncated to the shared limit");
         assert_eq!(comments.len(), MAX_VIDEO_COMMENTS);
-        assert_eq!(comments[9].comment_id, "Ugz-comment-9");
+        assert_eq!(comments[19].comment_id, "Ugz-comment-19");
     }
 
     #[test]
