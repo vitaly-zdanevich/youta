@@ -92,7 +92,7 @@ pub struct WikidataExternalLookup {
 pub struct WikidataEntityStatements {
     /// Validated Wikidata item identifier.
     pub item_id: String,
-    /// Bounded property groups in stable property-ID order.
+    /// Bounded property groups in stable editorial display order.
     pub statements: Vec<WikidataStatement>,
     /// Canonical Wikipedia articles supplied by Wikidata for this item.
     ///
@@ -793,19 +793,29 @@ impl PendingStatementValue {
                 upper_bound,
                 unit_id,
             } => {
-                let bounds = lower_bound
-                    .as_deref()
-                    .zip(upper_bound.as_deref())
-                    .filter(|(lower, upper)| *lower != amount || *upper != amount)
-                    .map_or_else(String::new, |(lower, upper)| format!(" ({lower}–{upper})"));
-                let unit = unit_id.as_ref().map_or_else(String::new, |unit_id| {
-                    format!(
-                        " {}",
-                        labels.get(unit_id).map_or(unit_id.as_str(), String::as_str)
-                    )
+                let display = format_wikidata_duration_quantity(
+                    property_id,
+                    amount,
+                    lower_bound.as_deref(),
+                    upper_bound.as_deref(),
+                    unit_id.as_deref(),
+                )
+                .unwrap_or_else(|| {
+                    let bounds = lower_bound
+                        .as_deref()
+                        .zip(upper_bound.as_deref())
+                        .filter(|(lower, upper)| *lower != amount || *upper != amount)
+                        .map_or_else(String::new, |(lower, upper)| format!(" ({lower}–{upper})"));
+                    let unit = unit_id.as_ref().map_or_else(String::new, |unit_id| {
+                        format!(
+                            " {}",
+                            labels.get(unit_id).map_or(unit_id.as_str(), String::as_str)
+                        )
+                    });
+                    format!("{amount}{bounds}{unit}")
                 });
                 WikidataStatementValue {
-                    display: format!("{amount}{bounds}{unit}"),
+                    display,
                     item_id: None,
                     external_url: None,
                     preview_url: None,
@@ -1975,10 +1985,11 @@ fn render_entity_statements(
     formatter_urls: &BTreeMap<String, String>,
 ) -> WikidataEntityStatements {
     let omissions = pending.omissions;
+    let mut statements = pending.statements;
+    statements.sort_by_key(|statement| wikidata_property_display_rank(&statement.property_id));
     WikidataEntityStatements {
         item_id: pending.item_id,
-        statements: pending
-            .statements
+        statements: statements
             .into_iter()
             .map(|statement| {
                 let property_id = statement.property_id;
@@ -2005,6 +2016,81 @@ fn render_entity_statements(
         truncated: omissions.is_truncated(),
         hard_bounds_reached: omissions.hard_bounds_reached,
         unsupported_values_omitted: omissions.unsupported_values_omitted,
+    }
+}
+
+/// Assigns the few editorially useful Wikidata properties to fixed display
+/// positions while preserving the provider's deterministic order for all
+/// ordinary properties.
+fn wikidata_property_display_rank(property_id: &str) -> u8 {
+    match property_id {
+        "P31" => 0,
+        "P7937" => 1,
+        "P1476" => 2,
+        "P136" => 3,
+        "P407" => 4,
+        "P155" => 6,
+        "P156" => 7,
+        _ => 5,
+    }
+}
+
+/// Formats a Wikidata duration expressed in seconds as a media clock.
+///
+/// Quantities with uncertainty bounds or another unit retain the generic
+/// quantity representation so the formatter does not discard information.
+fn format_wikidata_duration_quantity(
+    property_id: &str,
+    amount: &str,
+    lower_bound: Option<&str>,
+    upper_bound: Option<&str>,
+    unit_id: Option<&str>,
+) -> Option<String> {
+    const SECOND_ITEM_ID: &str = "Q11574";
+
+    let exact_bounds = match (lower_bound, upper_bound) {
+        (None, None) => true,
+        (Some(lower), Some(upper)) => lower == amount && upper == amount,
+        (Some(_), None) | (None, Some(_)) => false,
+    };
+    if property_id != "P2047" || unit_id != Some(SECOND_ITEM_ID) || !exact_bounds {
+        return None;
+    }
+    let rounded_seconds = round_nonnegative_decimal_seconds(amount)?;
+    let hours = rounded_seconds / 3_600;
+    let minutes = (rounded_seconds % 3_600) / 60;
+    let seconds = rounded_seconds % 60;
+    Some(if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    })
+}
+
+/// Rounds Wikibase's signed decimal quantity syntax to whole seconds without
+/// passing through a floating-point representation.
+fn round_nonnegative_decimal_seconds(amount: &str) -> Option<u64> {
+    let unsigned = amount.strip_prefix('+').unwrap_or(amount);
+    if unsigned.starts_with('-') || unsigned.is_empty() {
+        return None;
+    }
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) if !whole.is_empty() && !fraction.is_empty() => {
+            (whole, Some(fraction))
+        }
+        Some(_) => return None,
+        None => (unsigned, None),
+    };
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let seconds = whole.parse::<u64>().ok()?;
+    if fraction.is_some_and(|fraction| fraction.as_bytes()[0] >= b'5') {
+        seconds.checked_add(1)
+    } else {
+        Some(seconds)
     }
 }
 
@@ -2665,6 +2751,82 @@ mod tests {
         assert!(!diagnostic.contains("qualifier-hash-must-not-leak"));
         assert!(!diagnostic.contains("reference-hash-must-not-leak"));
         assert!(!diagnostic.contains("preferred"));
+    }
+
+    #[test]
+    fn entity_statements_use_editorial_priorities_and_keep_sequence_links_last() {
+        let statement = |property_id: &str| PendingStatement {
+            property_id: property_id.to_owned(),
+            values: vec![PendingStatementValue::Plain(property_id.to_owned())],
+        };
+        let pending = PendingEntityStatements {
+            item_id: "Q42".to_owned(),
+            statements: [
+                "P156", "P900", "P407", "P31", "P155", "P136", "P1476", "P7937", "P100",
+            ]
+            .into_iter()
+            .map(statement)
+            .collect(),
+            wikipedia_sitelinks: Vec::new(),
+            wikipedia_sitelinks_omitted: false,
+            omissions: OmissionState::default(),
+        };
+
+        let rendered = render_entity_statements(pending, &BTreeMap::new(), &BTreeMap::new());
+
+        assert_eq!(
+            rendered
+                .statements
+                .iter()
+                .map(|statement| statement.property_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "P31", "P7937", "P1476", "P136", "P407", "P900", "P100", "P155", "P156",
+            ]
+        );
+    }
+
+    #[test]
+    fn duration_in_seconds_uses_a_media_clock_without_losing_uncertainty() {
+        let labels = BTreeMap::from([
+            ("Q11574".to_owned(), "second".to_owned()),
+            ("Q7727".to_owned(), "minute".to_owned()),
+        ]);
+        let render = |property_id: &str,
+                      amount: &str,
+                      lower_bound: Option<&str>,
+                      upper_bound: Option<&str>,
+                      unit_id: &str| {
+            PendingStatementValue::Quantity {
+                amount: amount.to_owned(),
+                lower_bound: lower_bound.map(str::to_owned),
+                upper_bound: upper_bound.map(str::to_owned),
+                unit_id: Some(unit_id.to_owned()),
+            }
+            .render(property_id, &labels, &BTreeMap::new())
+            .display
+        };
+
+        assert_eq!(render("P2047", "+211.8", None, None, "Q11574"), "3:32");
+        assert_eq!(render("P2047", "+59.5", None, None, "Q11574"), "1:00");
+        assert_eq!(render("P2047", "+3599.5", None, None, "Q11574"), "1:00:00");
+        assert_eq!(
+            render("P2047", "+211.8", Some("+211.8"), Some("+211.8"), "Q11574",),
+            "3:32"
+        );
+        assert_eq!(
+            render("P2047", "+211.8", Some("+210"), Some("+214"), "Q11574",),
+            "+211.8 (+210–+214) second"
+        );
+        assert_eq!(render("P2047", "+2", None, None, "Q7727"), "+2 minute");
+        assert_eq!(
+            render("P2048", "+211.8", None, None, "Q11574"),
+            "+211.8 second"
+        );
+        assert_eq!(
+            render("P2047", "+18446744073709551616", None, None, "Q11574",),
+            "+18446744073709551616 second"
+        );
     }
 
     #[test]
