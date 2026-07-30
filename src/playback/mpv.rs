@@ -511,6 +511,10 @@ mod unix {
         }
         let mut command = vec![json!("loadfile"), json!(input.location), json!("replace")];
         let mut options = serde_json::Map::new();
+        // mpv's global pause property survives `loadfile replace`. Make a new
+        // application-owned selection start atomically even when the previous
+        // item was paused.
+        options.insert("pause".to_owned(), Value::String("no".to_owned()));
         if !input.start_at.is_zero() {
             // `loadfile` is asynchronous: a following `seek` can run before
             // mpv has loaded a seekable stream. The per-file `start` option
@@ -1179,7 +1183,7 @@ mod unix {
         }
 
         #[test]
-        fn normal_loadfile_command_preserves_the_existing_three_arguments() {
+        fn normal_loadfile_command_atomically_clears_global_pause() {
             let input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
 
             assert_eq!(
@@ -1188,6 +1192,8 @@ mod unix {
                     json!("loadfile"),
                     json!("https://www.youtube.com/watch?v=fixture"),
                     json!("replace"),
+                    json!(-1),
+                    json!({"pause": "no"}),
                 ]
             );
         }
@@ -1260,7 +1266,10 @@ mod unix {
                     json!("https://www.youtube.com/watch?v=fixture"),
                     json!("replace"),
                     json!(-1),
-                    json!({"ytdl-raw-options": "check-formats="}),
+                    json!({
+                        "pause": "no",
+                        "ytdl-raw-options": "check-formats=",
+                    }),
                 ]
             );
         }
@@ -1277,7 +1286,10 @@ mod unix {
                     json!("https://www.youtube.com/watch?v=fixture"),
                     json!("replace"),
                     json!(-1),
-                    json!({"start": "30"}),
+                    json!({
+                        "pause": "no",
+                        "start": "30",
+                    }),
                 ]
             );
         }
@@ -1296,6 +1308,7 @@ mod unix {
                     json!("replace"),
                     json!(-1),
                     json!({
+                        "pause": "no",
                         "start": "30.5",
                         "ytdl-raw-options": "check-formats=",
                     }),
@@ -1327,6 +1340,7 @@ mod unix {
                     json!({
                         "force-media-title": "Human-readable video name",
                         "http-header-fields": r"Accept: audio/webm\,audio/ogg,X-Path: one\\two",
+                        "pause": "no",
                         "ytdl": "no",
                     }),
                 ]
@@ -1353,7 +1367,7 @@ mod unix {
         }
 
         #[test]
-        fn backend_play_resumes_with_one_atomic_loadfile_request() {
+        fn backend_play_unpauses_after_one_atomic_resumed_loadfile_request() {
             let temporary = tempfile::tempdir().expect("temporary directory");
             let (client, server) = UnixStream::pair().expect("mock IPC pair");
             let (command_sender, command_receiver) = mpsc::channel();
@@ -1427,11 +1441,14 @@ mod unix {
                         json!("/tmp/fixture.opus"),
                         json!("replace"),
                         json!(-1),
-                        json!({"start": "30"}),
+                        json!({
+                            "pause": "no",
+                            "start": "30",
+                        }),
                     ],
                     vec![json!("quit")],
                 ],
-                "a separate seek would race mpv's asynchronous loadfile"
+                "resume and unpause options must share the atomic replacement request"
             );
         }
 
