@@ -4627,6 +4627,8 @@ struct RightDetailButton {
     column: u16,
     /// Exact rendered label used to size the mouse target.
     label: String,
+    /// Exact style retained when a left-side action later shares this row.
+    style: Style,
     /// Action dispatched by a click inside the label.
     action: UiAction,
 }
@@ -4695,8 +4697,45 @@ fn push_right_detail_button<'a>(
         line_index,
         column,
         label,
+        style,
         action,
     });
+}
+
+/// Places a left-side action in the earliest ordered space before a right control.
+///
+/// Pairing the two columns keeps actions near the top without overlapping on
+/// narrow panes. The monotonic row cursor preserves action order; once no
+/// remaining right-control row has enough room, the action and its successors
+/// receive appended rows.
+fn push_left_detail_button<'a>(
+    lines: &mut Vec<Line<'a>>,
+    right_buttons: &[RightDetailButton],
+    next_left_row: &mut usize,
+    panel_width: u16,
+    label: String,
+    style: Style,
+    action: UiAction,
+) -> (usize, String, UiAction) {
+    let label_width = terminal_text_width(&label).min(panel_width);
+    let shared_row = right_buttons.iter().find(|button| {
+        button.line_index >= *next_left_row && button.column >= label_width.saturating_add(2)
+    });
+    let line_index = if let Some(button) = shared_row {
+        let gap = button.column.saturating_sub(label_width);
+        lines[button.line_index] = Line::from(vec![
+            Span::styled(label.clone(), style),
+            Span::raw(" ".repeat(usize::from(gap))),
+            Span::styled(button.label.clone(), button.style),
+        ]);
+        button.line_index
+    } else {
+        let line_index = lines.len();
+        lines.push(Line::styled(label.clone(), style));
+        line_index
+    };
+    *next_left_row = line_index.saturating_add(1);
+    (line_index, label, action)
 }
 
 fn render_information_panel(
@@ -4941,6 +4980,7 @@ fn render_information_panel(
             UiAction::RequestLocalTrash,
         );
     }
+    let mut next_left_row = 0;
     let radio_favorite_button = (kind == InformationPanelKind::Radio).then(|| {
         let label = button(
             "f",
@@ -4951,16 +4991,19 @@ fn render_information_panel(
             },
             show_hotkeys,
         );
-        let line_index = lines.len();
-        lines.push(Line::styled(
-            label.clone(),
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            label,
             if details.radio_favorite {
                 theme.selected
             } else {
                 theme.accent
             },
-        ));
-        (line_index, label, UiAction::ToggleRadioFavorite)
+            UiAction::ToggleRadioFavorite,
+        )
     });
     let details_playlist_item = view
         .playlist_item
@@ -4976,29 +5019,44 @@ fn render_information_panel(
             },
             show_hotkeys,
         );
-        let line_index = lines.len();
-        lines.push(Line::styled(
-            label.clone(),
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            label,
             if item.in_todo {
                 theme.selected
             } else {
                 theme.accent
             },
-        ));
-        (line_index, label, UiAction::ToggleTodoPlaylist)
+            UiAction::ToggleTodoPlaylist,
+        )
     });
     let playlist_button = details_playlist_item.map(|_| {
         let label = button("P", "Playlist…", show_hotkeys);
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::OpenPlaylistPopup)
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            label,
+            theme.accent,
+            UiAction::OpenPlaylistPopup,
+        )
     });
     let edit_playlist_button = (view.screen == Screen::Playlists && view.playlist_edit_available)
         .then(|| {
             let label = button("e", "Edit playlist", show_hotkeys);
-            let line_index = lines.len();
-            lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, label, UiAction::EditSelectedPlaylist)
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                label,
+                theme.accent,
+                UiAction::EditSelectedPlaylist,
+            )
         });
     let private_note_button = view.private_note_available.then(|| {
         let label = button(
@@ -5010,16 +5068,19 @@ fn render_information_panel(
             },
             show_hotkeys,
         );
-        let line_index = lines.len();
-        lines.push(Line::styled(
-            label.clone(),
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            label,
             if details.has_private_note {
                 theme.selected
             } else {
                 theme.accent
             },
-        ));
-        (line_index, label, UiAction::EditPrivateNote)
+            UiAction::EditPrivateNote,
+        )
     });
     let subscription_button = (!details.channel_id.is_empty()).then(|| {
         let label = button(
@@ -5031,18 +5092,30 @@ fn render_information_panel(
             },
             show_hotkeys,
         );
-        let line_index = lines.len();
-        lines.push(Line::styled(label.clone(), theme.accent));
-        (line_index, label, UiAction::ToggleSubscription)
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            label,
+            theme.accent,
+            UiAction::ToggleSubscription,
+        )
     });
     let rename_button = (cfg!(feature = "local-rename")
         && kind == InformationPanelKind::Local
         && details.local_renamable)
         .then(|| {
             let label = button("r", "Rename", show_hotkeys);
-            let line_index = lines.len();
-            lines.push(Line::styled(label.clone(), theme.accent));
-            (line_index, label, UiAction::BeginLocalRename)
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                label,
+                theme.accent,
+                UiAction::BeginLocalRename,
+            )
         });
     match kind {
         InformationPanelKind::Video => {
@@ -16163,6 +16236,140 @@ mod tests {
     }
 
     #[test]
+    fn left_detail_actions_fill_unused_rows_before_right_controls() {
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
+        let view = ViewModel {
+            video_comments_available: true,
+            private_note_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture video".to_owned(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                title: "Fixture video".to_owned(),
+                source: "YouTube".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_name: "Fixture channel".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 32)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render(frame, &view, &UiSettings::default(), &mut hit_map);
+            })
+            .expect("draw paired detail actions");
+
+        let area_for = |action: &UiAction| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == action).then_some(*area))
+                .unwrap_or_else(|| panic!("missing detail action {action:?}"))
+        };
+        for (left, right) in [
+            (
+                UiAction::ToggleTodoPlaylist,
+                UiAction::ToggleTextSelectionMode,
+            ),
+            (UiAction::OpenPlaylistPopup, UiAction::OpenVideoComments),
+            (UiAction::EditPrivateNote, UiAction::OpenChannelInBrowser),
+            (UiAction::ToggleSubscription, UiAction::OpenInBrowser),
+        ] {
+            let left_area = area_for(&left);
+            let right_area = area_for(&right);
+            assert_eq!(
+                left_area.y, right_area.y,
+                "the left action should reuse the earliest compatible right-control row"
+            );
+            assert!(
+                left_area.right().saturating_add(2) <= right_area.x,
+                "paired controls must retain a two-cell gap"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_detail_actions_preserve_order_after_pairing_stops() {
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
+        let view = ViewModel {
+            video_comments_available: true,
+            private_note_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture video".to_owned(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                source: "YouTube".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(62, 32)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw narrow paired detail actions");
+
+        let actions = [
+            UiAction::ToggleTodoPlaylist,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
+            UiAction::ToggleSubscription,
+        ];
+        let placements = actions.each_ref().map(|expected| {
+            let (_, area) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| action == expected)
+                .expect("left-side detail action");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected.clone())
+            );
+            assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "[");
+            *area
+        });
+        assert!(
+            placements.windows(2).all(|pair| pair[0].y < pair[1].y),
+            "left-side actions must retain their logical order on narrow panes"
+        );
+        let rendered = rendered_text(&terminal);
+        for label in [
+            "[l] Add to todo",
+            "[P] Playlist…",
+            "[n] Add private note",
+            "[s] Subscribe (locally)",
+        ] {
+            assert!(rendered.contains(label), "missing rendered label {label:?}");
+        }
+    }
+
+    #[test]
     fn channel_handle_display_accepts_one_trailing_slash_but_rejects_extra_path() {
         let handle =
             url::Url::parse("https://www.youtube.com/@myChanName/").expect("fixture handle");
@@ -22307,9 +22514,13 @@ prose 07:25 remains clickable but is not a chapter";
                         "Move to Trash must be right-aligned"
                     );
                     if let Some(rename_area) = rename_area {
+                        assert_eq!(
+                            rename_area.y, select_area.y,
+                            "Rename should reuse the free space before Select mode"
+                        );
                         assert!(
-                            rename_area.y > trash_area.y,
-                            "the left-aligned Rename control follows the reserved right column"
+                            rename_area.right().saturating_add(2) <= select_area.x,
+                            "paired Local controls must retain a two-cell gap"
                         );
                     }
                 }
