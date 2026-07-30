@@ -19229,14 +19229,6 @@ impl UiController for AppController {
             UiAction::CycleRadioSort => self.cycle_radio_sort(),
             UiAction::ToggleRadioFavorite => self.toggle_selected_radio_favorite(),
             UiAction::ToggleRadioRecording => self.toggle_radio_recording(),
-            UiAction::ToggleWaveform => {
-                self.view.right_panel_mode =
-                    if self.view.right_panel_mode == RightPanelMode::Waveform {
-                        RightPanelMode::Details
-                    } else {
-                        RightPanelMode::Waveform
-                    };
-            }
             UiAction::ShowChannel => self.show_selected_channel(),
             UiAction::OpenLocalParent => self.open_local_parent(),
             UiAction::GoBack => self.go_back(),

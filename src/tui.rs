@@ -1447,8 +1447,6 @@ pub enum UiAction {
     ToggleRadioFavorite,
     /// Start or stop original-quality capture of the currently playing Radio station.
     ToggleRadioRecording,
-    /// Toggle between details and waveform.
-    ToggleWaveform,
     /// Show information about the playing channel.
     ShowChannel,
     /// Open the parent of the currently displayed Local directory.
@@ -9476,7 +9474,9 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Char('[') if !view.playback.live => Some(UiAction::ChangeChapter(-1)),
         KeyCode::Char(']') if !view.playback.live => Some(UiAction::ChangeChapter(1)),
         KeyCode::Char('r') => Some(UiAction::ToggleRepeat),
-        KeyCode::Char('w') => Some(UiAction::ToggleWaveform),
+        // Waveform remains visible in the shortcut legend as a reserved
+        // feature, but must not replace useful Details until it is complete.
+        KeyCode::Char('w') => None,
         KeyCode::Char('c') => Some(UiAction::ShowChannel),
         KeyCode::Char('s') => Some(UiAction::ToggleSubscription),
         KeyCode::Backspace => Some(UiAction::GoBack),
@@ -11835,6 +11835,10 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Youta help"));
+        assert!(
+            rendered.contains("w waveform"),
+            "the reserved roadmap shortcut must remain discoverable"
+        );
         assert!(rendered.contains("Details: Alt+←/→ history"));
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
@@ -12642,6 +12646,26 @@ mod tests {
             None,
             "the playlist chooser is not a text editor"
         );
+    }
+
+    #[test]
+    fn reserved_waveform_shortcut_is_a_noop_outside_editors() {
+        let shortcut = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        for right_panel_mode in [
+            RightPanelMode::Details,
+            RightPanelMode::Channel,
+            RightPanelMode::Waveform,
+        ] {
+            let view = ViewModel {
+                right_panel_mode,
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(shortcut, &view),
+                None,
+                "the reserved shortcut must not replace the useful right pane"
+            );
+        }
     }
 
     #[test]
