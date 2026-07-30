@@ -3672,13 +3672,10 @@ fn active_tab_window(
 fn search_panel_title(view: &ViewModel) -> String {
     if !view.search_editing {
         match view.screen {
-            Screen::Local if !view.local_path.is_empty() => {
-                return format!(" Local — {} ", view.local_path);
-            }
-            Screen::Local => return " Local ".to_owned(),
             Screen::Radio if view.search_query.trim().is_empty() => return String::new(),
             Screen::Radio => {}
             Screen::Subscriptions
+            | Screen::Local
             | Screen::Downloaded
             | Screen::History
             | Screen::Playlists
@@ -11272,12 +11269,14 @@ mod tests {
         view.search_editing = false;
         for screen in [
             Screen::Subscriptions,
+            Screen::Local,
             Screen::Playlists,
             Screen::Downloaded,
             Screen::History,
             Screen::Statistics,
         ] {
             view.screen = screen;
+            view.local_path = "/fixture/music".to_owned();
             view.search_query = "stale YouTube query".to_owned();
             assert_eq!(
                 search_panel_title(&view),
@@ -11323,6 +11322,7 @@ mod tests {
     fn headingless_top_left_screens_reclaim_the_first_content_row() {
         for screen in [
             Screen::Radio,
+            Screen::Local,
             Screen::Playlists,
             Screen::Downloaded,
             Screen::History,
@@ -11332,6 +11332,7 @@ mod tests {
             let mut terminal = Terminal::new(backend).expect("terminal");
             let view = ViewModel {
                 screen,
+                local_path: "/fixture/music".to_owned(),
                 rows: vec![RowView {
                     title: format!("{screen:?} fixture"),
                     compact: true,
