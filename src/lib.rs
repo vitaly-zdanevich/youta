@@ -19,6 +19,9 @@ pub mod subscriptions;
 pub(crate) mod terminal_environment;
 pub mod waveform;
 
+#[cfg(feature = "waveform")]
+pub mod local_waveform;
+
 #[cfg(feature = "tui")]
 pub mod git_sync;
 

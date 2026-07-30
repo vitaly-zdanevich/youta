@@ -535,8 +535,8 @@ pub fn remap_local_path_prefix(path: &Path, mappings: &[LocalMoveMapping]) -> Op
 ///
 /// # Errors
 ///
-/// Returns [`LocalIdentityRemapError`] if the destination path cannot be stored
-/// in Youta's UTF-8 external-ID field.
+/// Returns [`LocalIdentityRemapError`] if the destination path cannot be
+/// represented as an absolute file URL.
 pub fn remap_local_media_id(
     media_id: &mut MediaId,
     mappings: &[LocalMoveMapping],
@@ -544,45 +544,73 @@ pub fn remap_local_media_id(
     if media_id.source != SourceKind::Local {
         return Ok(false);
     }
-    let Some(remapped) = remap_local_path_prefix(Path::new(&media_id.external_id), mappings) else {
+    let file_url_identity =
+        url::Url::parse(&media_id.external_id).is_ok_and(|url| url.scheme() == "file");
+    let Some(path) = local_locator_path(&media_id.external_id) else {
         return Ok(false);
     };
-    let Some(remapped) = remapped.to_str() else {
-        return Err(LocalIdentityRemapError::NonUtf8Destination(remapped));
+    let Some(remapped) = remap_local_path_prefix(&path, mappings) else {
+        return Ok(false);
     };
-    remapped.clone_into(&mut media_id.external_id);
+    media_id.external_id = if !file_url_identity {
+        remapped.to_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+            url::Url::from_file_path(&remapped)
+                .expect("an absolute remapped path must form a file URL")
+                .to_string()
+        })
+    } else {
+        url::Url::from_file_path(&remapped)
+            .map_err(|()| LocalIdentityRemapError::NonUtf8Destination(remapped))?
+            .to_string()
+    };
     Ok(true)
 }
 
 /// Applies completed move mappings to a stored local replay locator.
 ///
-/// The locator is treated as a filesystem path, not as a URL. Non-matching
+/// Current file URLs and legacy absolute paths are both accepted. Non-matching
 /// locators remain unchanged and return `false`.
 ///
 /// # Errors
 ///
-/// Returns [`LocalIdentityRemapError`] if a destination path cannot be stored
-/// in a UTF-8 replay-locator column.
+/// Returns [`LocalIdentityRemapError`] if a non-UTF-8 destination cannot be
+/// represented as an absolute file URL.
 pub fn remap_local_replay_locator(
     replay_locator: &mut String,
     mappings: &[LocalMoveMapping],
 ) -> Result<bool, LocalIdentityRemapError> {
-    let Some(remapped) = remap_local_path_prefix(Path::new(replay_locator), mappings) else {
+    let Some(path) = local_locator_path(replay_locator) else {
         return Ok(false);
     };
-    let Some(remapped) = remapped.to_str() else {
-        return Err(LocalIdentityRemapError::NonUtf8Destination(remapped));
+    let Some(remapped) = remap_local_path_prefix(&path, mappings) else {
+        return Ok(false);
     };
-    remapped.clone_into(replay_locator);
+    *replay_locator = match remapped.to_str() {
+        Some(path) => path.to_owned(),
+        None => url::Url::from_file_path(&remapped)
+            .map_err(|()| LocalIdentityRemapError::NonUtf8Destination(remapped.clone()))?
+            .to_string(),
+    };
     Ok(true)
 }
 
-/// A durable local identity cannot represent a non-UTF-8 destination path.
+/// A durable Local locator cannot represent the supplied destination path.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LocalIdentityRemapError {
-    /// The filesystem path cannot be represented by the persisted `String`.
-    #[error("moved local path is not valid UTF-8: `{0}`")]
+    /// The filesystem path cannot be represented by a persisted file URL.
+    #[error("moved local path cannot be represented as a file URL: `{0}`")]
     NonUtf8Destination(PathBuf),
+}
+
+/// Decodes a current file-URL or legacy absolute-path Local locator.
+fn local_locator_path(locator: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(locator)
+        && url.scheme() == "file"
+    {
+        return url.to_file_path().ok();
+    }
+    let path = PathBuf::from(locator);
+    path.is_absolute().then_some(path)
 }
 
 trait NoReplaceRenamer {
@@ -1954,6 +1982,10 @@ mod tests {
         let mut local = MediaId::new(SourceKind::Local, "/music/album/one.flac");
         assert!(remap_local_media_id(&mut local, &mappings).expect("UTF-8 remap"));
         assert_eq!(local.external_id, "/library/favourite/one.flac");
+
+        let mut current = MediaId::new(SourceKind::Local, "file:///music/album/one.flac");
+        assert!(remap_local_media_id(&mut current, &mappings).expect("file-URL remap"));
+        assert_eq!(current.external_id, "file:///library/favourite/one.flac");
 
         let mut youtube = MediaId::new(SourceKind::YouTube, "/music/album/one.flac");
         assert!(!remap_local_media_id(&mut youtube, &mappings).expect("non-local unchanged"));

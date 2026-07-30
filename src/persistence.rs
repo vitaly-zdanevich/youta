@@ -6,7 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
+#[cfg(any(
+    feature = "sqlite-state",
+    feature = "local-rename",
+    feature = "local-move",
+    test
+))]
 use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "sqlite-state")]
 use std::time::Duration;
 
@@ -4277,7 +4284,9 @@ fn validate_playlist_webpage(media: &PlaylistMediaSnapshot) -> Result<(), Persis
         let path = url.to_file_path().map_err(|()| {
             invalid_playlist("Local playlist webpage must be an absolute file URL")
         })?;
-        if path != Path::new(&media.id.external_id) || !path.is_absolute() {
+        if persisted_local_locator_path(&media.id.external_id).as_ref() != Some(&path)
+            || !path.is_absolute()
+        {
             return Err(invalid_playlist(
                 "Local playlist webpage does not match its media identity",
             ));
@@ -4336,7 +4345,11 @@ fn validate_playlist_replay_locator(media: &PlaylistMediaSnapshot) -> Result<(),
     }
     match media.id.source {
         SourceKind::Local => {
-            let path = Path::new(&media.replay_locator);
+            let Some(path) = persisted_local_locator_path(&media.replay_locator) else {
+                return Err(invalid_playlist(
+                    "Local playlist replay locator must be an absolute path or file URL",
+                ));
+            };
             if !path.is_absolute()
                 || path.file_name().is_none()
                 || path.components().any(|component| {
@@ -4345,10 +4358,10 @@ fn validate_playlist_replay_locator(media: &PlaylistMediaSnapshot) -> Result<(),
                         std::path::Component::CurDir | std::path::Component::ParentDir
                     )
                 })
-                || media.replay_locator != media.id.external_id
+                || persisted_local_locator_path(&media.id.external_id).as_ref() != Some(&path)
             {
                 return Err(invalid_playlist(
-                    "Local playlist replay locator must equal its normalized absolute media path",
+                    "Local playlist replay locator must identify the same normalized absolute media path",
                 ));
             }
         }
@@ -6698,7 +6711,7 @@ fn validate_history_replay_locator(
     locator: &str,
 ) -> Result<(), PersistenceError> {
     if source == &SourceKind::Local {
-        if Path::new(locator).is_absolute() {
+        if persisted_local_locator_path(locator).is_some() {
             return Ok(());
         }
         return Err(PersistenceError::InvalidHistoryReplayLocator {
@@ -6777,6 +6790,17 @@ fn validate_history_replay_locator(
         _ => {}
     }
     Ok(())
+}
+
+/// Decodes a current file-URL or legacy absolute-path persisted Local locator.
+fn persisted_local_locator_path(locator: &str) -> Option<PathBuf> {
+    if let Ok(url) = Url::parse(locator)
+        && url.scheme() == "file"
+    {
+        return url.to_file_path().ok().filter(|path| path.is_absolute());
+    }
+    let path = PathBuf::from(locator);
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(feature = "sqlite-state")]

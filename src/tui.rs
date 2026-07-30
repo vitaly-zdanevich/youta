@@ -5,6 +5,7 @@
 
 use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -49,7 +50,7 @@ use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
-use crate::waveform::Peak;
+use crate::waveform::{Peak, PeakPyramid};
 
 /// Official Google instructions for creating and restricting a `YouTube` API key.
 pub const YOUTUBE_API_KEY_GUIDE_URL: &str =
@@ -78,6 +79,12 @@ const MAX_CHAPTER_LABEL_ROWS: u16 = 4;
 
 /// Body rows retained even when a dense chapter timeline requests more space.
 const MIN_BODY_ROWS: u16 = 8;
+
+/// Maximum number of terminal rows used by the expanded local waveform.
+const WAVEFORM_ROWS: u16 = 4;
+
+/// Player rows reserved for the waveform plus its one-line playback status.
+const WAVEFORM_PLAYER_ROWS: u16 = WAVEFORM_ROWS + 1;
 
 /// Top-level Youta screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -199,10 +206,42 @@ pub enum RightPanelMode {
     /// Metadata and description.
     #[default]
     Details,
-    /// Cached or progressively generated waveform.
-    Waveform,
     /// Channel or feed information for the playing item.
     Channel,
+}
+
+/// Owner-aware state of the lazily generated local waveform.
+///
+/// Keeping the decoded peak pyramid in the immutable view lets terminal
+/// resizes select a suitable resolution without decoding the local file again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WaveformView {
+    /// No eligible local media currently owns the waveform track.
+    #[default]
+    Unavailable,
+    /// The background worker is inspecting the exact local media item.
+    Loading {
+        /// Local media identity captured when generation started.
+        media_id: MediaId,
+    },
+    /// A complete, reusable multiresolution peak envelope.
+    Ready {
+        /// Local media identity owning these peaks.
+        media_id: MediaId,
+        /// Controller generation identifying the exact file identity behind these peaks.
+        generation: u64,
+        /// Duration used for owner-aware mouse seeking.
+        duration: Duration,
+        /// Width-independent peak data shared without per-frame cloning.
+        pyramid: Arc<PeakPyramid>,
+    },
+    /// Generation failed for the exact local media item.
+    Failed {
+        /// Local media identity owning this failure.
+        media_id: MediaId,
+        /// Short actionable failure text.
+        message: String,
+    },
 }
 
 /// Seek-bar visual style.
@@ -1154,8 +1193,12 @@ pub struct ViewModel {
     pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
     pub right_panel_mode: RightPanelMode,
-    /// Waveform peaks chosen for the current terminal width.
-    pub waveform: Vec<Peak>,
+    /// Whether the local waveform replaces the normal player seek bar.
+    pub waveform_visible: bool,
+    /// Owner-aware local waveform generation and peak state.
+    pub waveform: WaveformView,
+    /// Whether the active backend loaded the exact file identity behind the waveform.
+    pub waveform_playback_matches: bool,
     /// Current player state.
     pub playback: PlaybackStatus,
     /// Best-effort current programme or track for the playing radio station.
@@ -1260,7 +1303,9 @@ impl Default for ViewModel {
             selected_detail_link: None,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
-            waveform: Vec::new(),
+            waveform_visible: false,
+            waveform: WaveformView::Unavailable,
+            waveform_playback_matches: false,
             playback: PlaybackStatus::default(),
             radio_now_playing: None,
             radio_recording: None,
@@ -1420,6 +1465,15 @@ pub enum UiAction {
         /// Absolute playback destination in seconds.
         seconds: u64,
     },
+    /// Seek within, or start, the exact local file generation owning a waveform.
+    ActivateWaveformTimecode {
+        /// Media identity captured when the waveform was rendered.
+        media_id: MediaId,
+        /// Controller generation identifying the waveform's exact file identity.
+        generation: u64,
+        /// Absolute playback destination in seconds.
+        seconds: u64,
+    },
     /// Replace Details with a `YouTube` video referenced by its description.
     ActivateDescriptionVideo {
         /// Stable eleven-character `YouTube` video identifier.
@@ -1435,6 +1489,8 @@ pub enum UiAction {
     ChangeChapter(i32),
     /// Toggle timestamps inside chapter labels without changing seek targets.
     ToggleChapterTimestamps,
+    /// Open or close the selected playable local file's waveform.
+    ToggleWaveform,
     /// Toggle repeat-current-item.
     ToggleRepeat,
     /// Toggle automatic continuation within the active source list.
@@ -2796,7 +2852,10 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     } else {
         settings.playing_tick
     };
-    let wait = if view.local_browse_pending || view.local_artwork_pending {
+    let wait = if view.local_browse_pending
+        || view.local_artwork_pending
+        || matches!(view.waveform, WaveformView::Loading { .. })
+    {
         playback_wait.min(LOCAL_BROWSE_RESPONSE_POLL_INTERVAL)
     } else if view.search_activity.is_some() || view.subscriptions.loading || view.playback_starting
     {
@@ -2911,6 +2970,8 @@ struct HitMap {
     detail_text_rows: Vec<SelectableDetailsRow>,
     seek_bar: Rect,
     seek_markers: Vec<(UiAction, Rect)>,
+    /// Owner-bearing waveform click target; stale frames clear it before render.
+    waveform_seek: Option<WaveformSeekTarget>,
     buttons: Vec<(UiAction, Rect)>,
     now_playing: Option<Rect>,
     error_buttons: Vec<(UiAction, Rect)>,
@@ -2947,6 +3008,15 @@ struct HitMap {
     local_move_rows: Rect,
     /// First destination model row represented by [`Self::local_move_rows`].
     local_move_first_index: usize,
+}
+
+/// Exact local media and duration represented by one waveform rectangle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WaveformSeekTarget {
+    area: Rect,
+    media_id: MediaId,
+    generation: u64,
+    duration: Duration,
 }
 
 /// Exact terminal cells belonging to one visible, selectable Details row.
@@ -3253,19 +3323,28 @@ fn render_frame(
     let theme = Theme::for_terminal(settings.funny_mode, view.physical_linux_console);
     frame.render_widget(Block::default().style(theme.base), frame.area());
 
-    let chapter_label_rows = chapter_label_row_count(
-        view,
-        frame.area().width,
-        frame.area().height,
-        view.download.is_some(),
-    );
+    let chapter_label_rows = if view.waveform_visible {
+        0
+    } else {
+        chapter_label_row_count(
+            view,
+            frame.area().width,
+            frame.area().height,
+            view.download.is_some(),
+        )
+    };
+    let player_rows = if view.waveform_visible {
+        WAVEFORM_PLAYER_ROWS
+    } else {
+        2_u16.saturating_add(chapter_label_rows)
+    };
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(8),
             Constraint::Length(if view.download.is_some() { 2 } else { 0 }),
-            Constraint::Length(2_u16.saturating_add(chapter_label_rows)),
+            Constraint::Length(player_rows),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -3743,6 +3822,7 @@ fn render_body(
     hit_map: &mut HitMap,
     thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
+    hit_map.waveform_seek = None;
     hit_map.detail_links.clear();
     hit_map.detail_buttons.clear();
     hit_map.detail_text_rows.clear();
@@ -3813,13 +3893,6 @@ fn render_body(
                 hit_map,
                 thumbnail_renderer,
             );
-        }
-        RightPanelMode::Waveform => {
-            hit_map.information_panel_identity = None;
-            if let Some(renderer) = thumbnail_renderer {
-                renderer.clear();
-            }
-            render_waveform(frame, panes[1], view, theme);
         }
         RightPanelMode::Channel => {
             render_subscription_source_details(
@@ -5928,50 +6001,156 @@ fn render_subscription_source_details(
     );
 }
 
-fn render_waveform(frame: &mut Frame<'_>, area: Rect, view: &ViewModel, theme: &Theme) {
-    let inner = render_main_panel_heading(frame, area, "Waveform — click to seek", theme.heading);
-    if view.waveform.is_empty() || inner.width == 0 || inner.height == 0 {
-        frame.render_widget(
-            Paragraph::new("Waveform is generated lazily for downloaded or cached audio.")
-                .style(theme.muted)
-                .wrap(Wrap { trim: true }),
-            inner,
-        );
+fn render_waveform(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    hit_map.waveform_seek = None;
+    if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let columns = usize::from(inner.width);
-    let mut text = String::with_capacity(columns);
+    let (media_id, generation, duration, pyramid) = match &view.waveform {
+        WaveformView::Unavailable => {
+            frame.render_widget(
+                Paragraph::new("Waveform is available for playable local files.")
+                    .style(theme.muted)
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        WaveformView::Loading { .. } => {
+            frame.render_widget(
+                Paragraph::new("Generating local waveform…")
+                    .style(theme.muted)
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        WaveformView::Failed { message, .. } => {
+            frame.render_widget(
+                Paragraph::new(format!("Waveform unavailable: {message}"))
+                    .style(theme.muted)
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        WaveformView::Ready {
+            media_id,
+            generation,
+            duration,
+            pyramid,
+        } => (media_id, *generation, *duration, pyramid),
+    };
+
+    let columns = usize::from(area.width);
+    let peaks = pyramid.reduced_for_width(columns);
+    if peaks.is_empty() {
+        frame.render_widget(
+            Paragraph::new("The local file contains no waveform samples.")
+                .style(theme.muted)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    let played_columns =
+        if view.waveform_playback_matches && !duration.is_zero() && !view.playback.idle {
+            usize::try_from(
+                view.playback
+                    .position
+                    .as_nanos()
+                    .saturating_mul(columns as u128)
+                    .checked_div(duration.as_nanos())
+                    .unwrap_or_default()
+                    .min(columns as u128),
+            )
+            .unwrap_or(columns)
+        } else {
+            0
+        };
+
+    let waveform_height = area.height.min(WAVEFORM_ROWS);
+    let waveform_area = Rect::new(area.x, area.y, area.width, waveform_height);
+    let row_count = usize::from(waveform_height);
+    let mut played_rows = (0..row_count)
+        .map(|_| String::with_capacity(played_columns))
+        .collect::<Vec<_>>();
+    let mut remaining_rows = (0..row_count)
+        .map(|_| String::with_capacity(columns.saturating_sub(played_columns)))
+        .collect::<Vec<_>>();
     for column in 0..columns {
         let index = column
-            .saturating_mul(view.waveform.len())
+            .saturating_mul(peaks.len())
             .checked_div(columns)
             .unwrap_or_default()
-            .min(view.waveform.len().saturating_sub(1));
-        let peak = view.waveform[index];
-        let amplitude = i32::from(peak.maximum)
-            .abs()
-            .max(i32::from(peak.minimum).abs());
-        let symbol = match amplitude {
-            0..=4095 => '▁',
-            4096..=8191 => '▂',
-            8192..=12_287 => '▃',
-            12_288..=16_383 => '▄',
-            16_384..=20_479 => '▅',
-            20_480..=24_575 => '▆',
-            24_576..=28_671 => '▇',
-            _ => '█',
+            .min(peaks.len().saturating_sub(1));
+        let symbols = waveform_column_symbols(peaks[index], row_count);
+        let target_rows = if column < played_columns {
+            &mut played_rows
+        } else {
+            &mut remaining_rows
         };
-        text.push(symbol);
+        for (row, symbol) in symbols.into_iter().take(row_count).enumerate() {
+            target_rows[row].push(symbol);
+        }
     }
-    let vertical_padding = inner.height.saturating_sub(1) / 2;
-    let waveform_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(vertical_padding),
-        inner.width,
-        1,
-    );
-    frame.render_widget(Paragraph::new(text).style(theme.accent), waveform_area);
+
+    let played_style = theme.progress.add_modifier(Modifier::BOLD);
+    let lines = played_rows
+        .into_iter()
+        .zip(remaining_rows)
+        .map(|(played, remaining)| {
+            Line::from(vec![
+                Span::styled(played, played_style),
+                Span::styled(remaining, theme.muted),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), waveform_area);
+    if waveform_area.width > 0 && !duration.is_zero() {
+        hit_map.waveform_seek = Some(WaveformSeekTarget {
+            area: waveform_area,
+            media_id: media_id.clone(),
+            generation,
+            duration,
+        });
+    }
+}
+
+/// Maps one peak magnitude to bottom-up terminal block cells.
+///
+/// Every row contributes eight amplitude levels. Silence retains a one-eighth
+/// baseline in the bottom row so the seek target remains visible across quiet
+/// passages.
+fn waveform_column_symbols(peak: Peak, row_count: usize) -> [char; WAVEFORM_ROWS as usize] {
+    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let row_count = row_count.clamp(1, WAVEFORM_ROWS as usize);
+    let maximum_level = row_count.saturating_mul(8);
+    let amplitude = i32::from(peak.maximum)
+        .abs()
+        .max(i32::from(peak.minimum).abs()) as usize;
+    let level = if amplitude == 0 {
+        1
+    } else {
+        1 + amplitude
+            .saturating_sub(1)
+            .saturating_mul(maximum_level.saturating_sub(1))
+            / 32_767
+    }
+    .min(maximum_level);
+    let mut symbols = [' '; WAVEFORM_ROWS as usize];
+    for (row, symbol) in symbols.iter_mut().take(row_count).enumerate() {
+        let levels_below = row_count.saturating_sub(row + 1).saturating_mul(8);
+        *symbol = BLOCKS[level.saturating_sub(levels_below).min(8)];
+    }
+    symbols
 }
 
 fn render_seek_bar(
@@ -5984,6 +6163,7 @@ fn render_seek_bar(
 ) {
     hit_map.seek_bar = Rect::default();
     hit_map.seek_markers.clear();
+    hit_map.waveform_seek = None;
     hit_map.now_playing = None;
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
     let ratio = if duration.is_zero() {
@@ -6071,6 +6251,29 @@ fn render_seek_bar(
         "{status_prefix}{}{marker}",
         title.as_deref().unwrap_or_default()
     );
+    if view.waveform_visible {
+        let waveform_height = area.height.saturating_sub(1).min(WAVEFORM_ROWS);
+        let waveform_area = Rect::new(area.x, area.y, area.width, waveform_height);
+        render_waveform(frame, waveform_area, view, theme, hit_map);
+        if area.height > waveform_height {
+            let status_area = Rect::new(
+                area.x,
+                area.y.saturating_add(waveform_height),
+                area.width,
+                1,
+            );
+            render_seek_status(
+                frame,
+                status_area,
+                &label,
+                title_offset,
+                title_width,
+                recording_active,
+                hit_map,
+            );
+        }
+        return;
+    }
     if view.playback.live && !live_seekable {
         let status_area = if area.height >= 2 {
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1)
@@ -9474,9 +9677,13 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Char('[') if !view.playback.live => Some(UiAction::ChangeChapter(-1)),
         KeyCode::Char(']') if !view.playback.live => Some(UiAction::ChangeChapter(1)),
         KeyCode::Char('r') => Some(UiAction::ToggleRepeat),
-        // Waveform remains visible in the shortcut legend as a reserved
-        // feature, but must not replace useful Details until it is complete.
-        KeyCode::Char('w') => None,
+        KeyCode::Char('w')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            Some(UiAction::ToggleWaveform)
+        }
         KeyCode::Char('c') => Some(UiAction::ShowChannel),
         KeyCode::Char('s') => Some(UiAction::ToggleSubscription),
         KeyCode::Backspace => Some(UiAction::GoBack),
@@ -9849,6 +10056,32 @@ fn mouse_action_unfiltered(
                     return Some(UiAction::ActivateDetailLink(*index));
                 }
             }
+            if let Some(target) = hit_map
+                .waveform_seek
+                .as_ref()
+                .filter(|target| contains(target.area, mouse.column, mouse.row))
+            {
+                let offset = u64::from(mouse.column.saturating_sub(target.area.x));
+                let last_column = u64::from(target.area.width.saturating_sub(1));
+                let duration_nanos = target.duration.as_nanos();
+                let last_instant_nanos = duration_nanos.saturating_sub(1);
+                let nanoseconds = u128::from(offset)
+                    .saturating_mul(duration_nanos)
+                    .checked_div(u128::from(last_column.max(1)))
+                    .unwrap_or_default()
+                    .min(last_instant_nanos);
+                let seconds = u64::try_from(
+                    nanoseconds
+                        .checked_div(Duration::from_secs(1).as_nanos())
+                        .unwrap_or_default(),
+                )
+                .unwrap_or(u64::MAX);
+                return Some(UiAction::ActivateWaveformTimecode {
+                    media_id: target.media_id.clone(),
+                    generation: target.generation,
+                    seconds,
+                });
+            }
             if contains(hit_map.details_panel, mouse.column, mouse.row) {
                 return Some(UiAction::SetDetailsFocus(true));
             }
@@ -10190,9 +10423,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::domain::SourceKind;
-
     use super::*;
+    use crate::domain::SourceKind;
 
     /// Cloneable byte sink used to inspect Crossterm's emitted SGR ordering.
     #[derive(Clone, Default)]
@@ -10843,6 +11075,26 @@ mod tests {
         };
         let view = ViewModel {
             local_artwork_pending: true,
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            event_wait(&view, &settings),
+            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn pending_local_waveform_uses_the_interactive_response_budget() {
+        let settings = UiSettings {
+            idle_tick: Duration::from_secs(2),
+            playing_tick: Duration::from_millis(250),
+            ..UiSettings::default()
+        };
+        let view = ViewModel {
+            waveform: WaveformView::Loading {
+                media_id: MediaId::new(SourceKind::Local, "/music/track.mp3"),
+            },
             ..ViewModel::default()
         };
 
@@ -12649,23 +12901,606 @@ mod tests {
     }
 
     #[test]
-    fn reserved_waveform_shortcut_is_a_noop_outside_editors() {
+    fn waveform_shortcut_toggles_outside_editors() {
         let shortcut = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
-        for right_panel_mode in [
-            RightPanelMode::Details,
-            RightPanelMode::Channel,
-            RightPanelMode::Waveform,
+        for right_panel_mode in [RightPanelMode::Details, RightPanelMode::Channel] {
+            for waveform_visible in [false, true] {
+                let view = ViewModel {
+                    right_panel_mode,
+                    waveform_visible,
+                    ..ViewModel::default()
+                };
+                assert_eq!(
+                    key_action(shortcut, &view),
+                    Some(UiAction::ToggleWaveform),
+                    "the controller validates whether the selected item is eligible"
+                );
+            }
+        }
+    }
+
+    const TEST_WAVEFORM_GENERATION: u64 = 73;
+
+    /// Builds a ready waveform with one finest-level peak per supplied value.
+    fn ready_waveform(media_id: MediaId, duration: Duration, amplitudes: &[i16]) -> WaveformView {
+        let peaks = amplitudes
+            .iter()
+            .copied()
+            .map(|maximum| Peak {
+                minimum: 0,
+                maximum,
+            })
+            .collect::<Vec<_>>();
+        WaveformView::Ready {
+            media_id,
+            generation: TEST_WAVEFORM_GENERATION,
+            duration,
+            pyramid: Arc::new(PeakPyramid::from_peaks(peaks, 1, amplitudes.len())),
+        }
+    }
+
+    #[test]
+    fn ready_waveform_renders_amplitudes_and_playback_progress() {
+        let backend = TestBackend::new(8, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::Local, "/music/amplitudes.flac");
+        let view = ViewModel {
+            waveform: ready_waveform(
+                media_id.clone(),
+                Duration::from_secs(80),
+                &[0, 4_096, 8_192, 12_288, 16_384, 20_480, 24_576, 28_672],
+            ),
+            playing_media_id: Some(media_id),
+            waveform_playback_matches: true,
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(40),
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut theme = Theme::new(false);
+        theme.progress = Style::default().fg(Color::Red);
+        theme.muted = Style::default().fg(Color::Blue);
+
+        terminal
+            .draw(|frame| {
+                render_waveform(frame, frame.area(), &view, &theme, &mut hit_map);
+            })
+            .expect("draw ready waveform");
+
+        let waveform_area = hit_map
+            .waveform_seek
+            .as_ref()
+            .expect("ready waveform seek target")
+            .area;
+        assert_eq!(waveform_area.height, WAVEFORM_ROWS);
+        let row_symbols = (0..waveform_area.height)
+            .map(|row| {
+                (waveform_area.x..waveform_area.right())
+                    .map(|column| {
+                        terminal.backend().buffer()[(column, waveform_area.y.saturating_add(row))]
+                            .symbol()
+                            .to_owned()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            row_symbols,
+            ["       ▄", "     ▄██", "   ▄████", "▁▄██████"]
+        );
+        for row in 0..waveform_area.height {
+            for offset in 0..waveform_area.width {
+                let cell = &terminal.backend().buffer()[(
+                    waveform_area.x.saturating_add(offset),
+                    waveform_area.y.saturating_add(row),
+                )];
+                let foreground = cell.fg;
+                assert_eq!(
+                    foreground,
+                    if offset < 4 { Color::Red } else { Color::Blue },
+                    "the first half of every row must use the played style"
+                );
+                assert_eq!(
+                    cell.modifier.contains(Modifier::BOLD),
+                    offset < 4,
+                    "played waveform cells must retain their emphasis"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waveform_progress_colors_are_distinct_in_every_builtin_theme() {
+        for theme in [
+            Theme::new(false),
+            Theme::new(true),
+            Theme::for_terminal(false, true),
         ] {
+            let backend = TestBackend::new(2, WAVEFORM_ROWS);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let media_id = MediaId::new(SourceKind::Local, "/music/colors.flac");
             let view = ViewModel {
-                right_panel_mode,
+                waveform: ready_waveform(media_id.clone(), Duration::from_secs(2), &[i16::MAX; 2]),
+                playing_media_id: Some(media_id),
+                waveform_playback_matches: true,
+                playback: PlaybackStatus {
+                    idle: false,
+                    position: Duration::from_secs(1),
+                    ..PlaybackStatus::default()
+                },
                 ..ViewModel::default()
             };
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &theme, &mut hit_map);
+                })
+                .expect("draw waveform color fixture");
+
+            for row in 0..WAVEFORM_ROWS {
+                let played = &terminal.backend().buffer()[(0, row)];
+                let remaining = &terminal.backend().buffer()[(1, row)];
+                assert_eq!(played.fg, theme.progress.fg.expect("played foreground"));
+                assert_eq!(remaining.fg, theme.muted.fg.expect("remaining foreground"));
+                assert_ne!(
+                    played.fg, remaining.fg,
+                    "played and remaining waveform cells must be visibly distinct"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ready_waveform_click_seeks_its_owner_when_another_item_is_playing() {
+        let backend = TestBackend::new(10, WAVEFORM_ROWS);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let waveform_owner = MediaId::new(SourceKind::Local, "/music/selected.flac");
+        let playing_owner = MediaId::new(SourceKind::Local, "/music/playing.flac");
+        let view = ViewModel {
+            waveform: ready_waveform(
+                waveform_owner.clone(),
+                Duration::from_secs(100),
+                &[i16::MAX; 10],
+            ),
+            playing_media_id: Some(playing_owner),
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(75),
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+            })
+            .expect("draw owner-aware waveform");
+
+        let target = hit_map
+            .waveform_seek
+            .as_ref()
+            .expect("waveform seek target")
+            .clone();
+        assert_eq!(target.area.height, WAVEFORM_ROWS);
+        for row in target.area.y..target.area.bottom() {
             assert_eq!(
-                key_action(shortcut, &view),
-                None,
-                "the reserved shortcut must not replace the useful right pane"
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.area.x.saturating_add(target.area.width / 2),
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ActivateWaveformTimecode {
+                    media_id: waveform_owner.clone(),
+                    generation: TEST_WAVEFORM_GENERATION,
+                    seconds: 55,
+                }),
+                "every waveform row must seek the selected waveform owner"
             );
         }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.area.right().saturating_sub(1),
+                    row: target.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateWaveformTimecode {
+                media_id: waveform_owner,
+                generation: TEST_WAVEFORM_GENERATION,
+                seconds: 99,
+            }),
+            "the rightmost waveform cell must map to the final valid second"
+        );
+    }
+
+    #[test]
+    fn waveform_uses_and_seeks_every_available_height_up_to_four_rows() {
+        let media_id = MediaId::new(SourceKind::Local, "/music/height.flac");
+        for height in 1..=WAVEFORM_ROWS {
+            let backend = TestBackend::new(4, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let view = ViewModel {
+                waveform: ready_waveform(media_id.clone(), Duration::from_secs(40), &[i16::MAX; 4]),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("draw height-constrained waveform");
+
+            let target = hit_map
+                .waveform_seek
+                .as_ref()
+                .expect("height-constrained waveform target");
+            assert_eq!(target.area.height, height);
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.area.x.saturating_add(2),
+                        row: target.area.bottom().saturating_sub(1),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ActivateWaveformTimecode {
+                    media_id: media_id.clone(),
+                    generation: TEST_WAVEFORM_GENERATION,
+                    seconds: 26,
+                }),
+                "every rendered waveform row must remain seekable"
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_progress_requires_an_exact_playback_identity_match() {
+        let backend = TestBackend::new(8, WAVEFORM_ROWS);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let colliding_display_id = MediaId::new(SourceKind::Local, "/music/track-�.flac");
+        let view = ViewModel {
+            waveform: ready_waveform(
+                colliding_display_id.clone(),
+                Duration::from_secs(80),
+                &[i16::MAX; 8],
+            ),
+            playing_media_id: Some(colliding_display_id),
+            waveform_playback_matches: false,
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(40),
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut theme = Theme::new(false);
+        theme.progress = Style::default().fg(Color::Red);
+        theme.muted = Style::default().fg(Color::Blue);
+
+        terminal
+            .draw(|frame| {
+                render_waveform(frame, frame.area(), &view, &theme, &mut hit_map);
+            })
+            .expect("draw identity-mismatched waveform");
+
+        let area = hit_map
+            .waveform_seek
+            .as_ref()
+            .expect("identity-mismatched waveform target")
+            .area;
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                assert_eq!(
+                    terminal.backend().buffer()[(column, row)].fg,
+                    Color::Blue,
+                    "a colliding display ID must not borrow another file's progress"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waveform_fractional_duration_clicks_use_exact_time_on_every_row() {
+        for (duration, column_offset, expected_second) in [
+            (Duration::from_millis(1_900), 4, 1),
+            (Duration::from_millis(1_900), 7, 1),
+            (Duration::from_millis(900), 7, 0),
+        ] {
+            let backend = TestBackend::new(8, WAVEFORM_ROWS);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let media_id = MediaId::new(SourceKind::Local, "/music/short.flac");
+            let view = ViewModel {
+                waveform: ready_waveform(media_id.clone(), duration, &[i16::MAX; 8]),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("draw fractional-duration waveform");
+            let target = hit_map
+                .waveform_seek
+                .as_ref()
+                .expect("fractional waveform seek target");
+
+            assert_eq!(target.area.height, WAVEFORM_ROWS);
+            for row in target.area.y..target.area.bottom() {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.area.x.saturating_add(column_offset),
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(UiAction::ActivateWaveformTimecode {
+                        media_id: media_id.clone(),
+                        generation: TEST_WAVEFORM_GENERATION,
+                        seconds: expected_second,
+                    }),
+                    "fractional-duration clicks must map by exact time on every waveform row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_ready_waveforms_clear_stale_seek_targets() {
+        let backend = TestBackend::new(48, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::Local, "/music/pending.flac");
+        let ready = ready_waveform(media_id.clone(), Duration::from_secs(60), &[i16::MAX; 8]);
+        let cases = [
+            (
+                WaveformView::Loading {
+                    media_id: media_id.clone(),
+                },
+                "Generating local waveform",
+            ),
+            (
+                WaveformView::Failed {
+                    media_id: media_id.clone(),
+                    message: "decode failed".to_owned(),
+                },
+                "decode failed",
+            ),
+            (WaveformView::Unavailable, "playable local files"),
+        ];
+        let mut view = ViewModel {
+            waveform: ready.clone(),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        for (state, expected_message) in cases {
+            view.waveform = ready.clone();
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("prime ready waveform target");
+            let stale_area = hit_map
+                .waveform_seek
+                .as_ref()
+                .expect("primed waveform seek target")
+                .area;
+
+            view.waveform = state;
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("draw non-ready waveform state");
+
+            assert!(
+                hit_map.waveform_seek.is_none(),
+                "a non-ready state must clear the previous owner's hit target"
+            );
+            assert!(
+                rendered_text(&terminal).contains(expected_message),
+                "the non-ready state must explain itself"
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: stale_area.x,
+                        row: stale_area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                None,
+                "clicking the stale waveform rectangle must do nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_replaces_seek_bar_without_hiding_details_or_leaving_stale_targets() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let media_id = MediaId::new(SourceKind::Local, "/music/closed.flac");
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            right_panel_mode: RightPanelMode::Details,
+            waveform_visible: true,
+            waveform: ready_waveform(media_id.clone(), Duration::from_secs(60), &[i16::MAX; 8]),
+            details: Some(DetailView {
+                media_id: Some(media_id.clone()),
+                title: "Waveform fixture".to_owned(),
+                description: "Details remain visible while the waveform replaces the seek bar."
+                    .to_owned(),
+                ..DetailView::default()
+            }),
+            playing_media_id: Some(media_id.clone()),
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(30),
+                duration: Some(Duration::from_secs(60)),
+                ..PlaybackStatus::default()
+            },
+            playback_chapters: vec![Chapter {
+                title: "Hidden chapter label".to_owned(),
+                start_seconds: 0,
+                end_seconds: Some(60),
+            }],
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None);
+            })
+            .expect("draw ready waveform in place of the seek bar");
+        let target = hit_map
+            .waveform_seek
+            .as_ref()
+            .expect("waveform seek target")
+            .clone();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("Details remain visible"),
+            "the Details pane must remain visible while the waveform is enabled: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Waveform — click to seek"),
+            "the waveform is a seek track, not a right-panel mode"
+        );
+        assert!(
+            !rendered.contains("Hidden chapter label"),
+            "chapter labels must not consume rows while the waveform replaces the seek bar"
+        );
+        assert_eq!(target.area.height, WAVEFORM_ROWS);
+        assert_eq!(hit_map.seek_bar, Rect::default());
+        assert!(hit_map.seek_markers.is_empty());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleTextSelectionMode),
+            "waveform visibility must not disable Details interactions"
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &view),
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1))),
+            "waveform visibility must not disable Details scrolling"
+        );
+
+        view.waveform_visible = false;
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None);
+            })
+            .expect("restore the normal seek bar");
+
+        assert!(hit_map.waveform_seek.is_none());
+        assert_ne!(hit_map.seek_bar, Rect::default());
+        assert!(
+            matches!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hit_map
+                            .seek_bar
+                            .x
+                            .saturating_add(hit_map.seek_bar.width / 2),
+                        row: hit_map.seek_bar.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::SeekPercent(_))
+            ),
+            "disabling the waveform must restore the normal percentage seek target"
+        );
+    }
+
+    #[test]
+    fn waveform_reduction_survives_narrow_resizes_without_losing_a_transient() {
+        let media_id = MediaId::new(SourceKind::Local, "/music/transient.flac");
+        let mut amplitudes = vec![0; 257];
+        amplitudes[128] = i16::MAX;
+        let view = ViewModel {
+            waveform: ready_waveform(media_id.clone(), Duration::from_secs(257), &amplitudes),
+            ..ViewModel::default()
+        };
+
+        for width in [1, 2, 3, 7, 31, 80] {
+            let backend = TestBackend::new(width, 3);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| {
+                    render_waveform(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .expect("draw reduced waveform");
+
+            assert!(
+                rendered_text(&terminal).contains('█'),
+                "width {width} must retain the short full-scale transient"
+            );
+            let target = hit_map
+                .waveform_seek
+                .as_ref()
+                .expect("resized waveform seek target");
+            assert_eq!(target.area.width, width);
+            assert_eq!(target.media_id, media_id);
+        }
+
+        let backend = TestBackend::new(1, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap {
+            waveform_seek: Some(WaveformSeekTarget {
+                area: Rect::new(0, 0, 1, 1),
+                media_id,
+                generation: TEST_WAVEFORM_GENERATION,
+                duration: Duration::from_secs(257),
+            }),
+            ..HitMap::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_waveform(
+                    frame,
+                    Rect::default(),
+                    &view,
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw zero-area waveform after resize");
+        assert!(
+            hit_map.waveform_seek.is_none(),
+            "a zero-area resize must clear the old target without indexing peaks"
+        );
     }
 
     #[test]

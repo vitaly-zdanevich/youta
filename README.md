@@ -25,8 +25,8 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
 > working TUI and core state model, human-readable TOML persistence, optional
 > SQLite persistence, OPML import/export, configuration loading, official
 > YouTube Data API v3 and Invidious discovery, and supervised `mpv`/`yt-dlp`
-> integration. The larger provider, upload, remote sync, scrobbling, waveform,
-> and audiophile feature set described in the roadmap is not implemented yet.
+> integration. The larger provider, upload, remote sync, scrobbling, and
+> audiophile feature set described in the roadmap is not implemented yet.
 > Do not treat an existing Cargo feature name as a support claim.
 
 ## Why this design
@@ -51,6 +51,13 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   terminal images are enabled, selecting a finite local video lazily extracts
   its midpoint frame through a bounded `ffmpeg` worker and reuses the persistent
   thumbnail cache on later visits.
+  `[w]` lazily generates a waveform for a local audio or video file with the
+  existing `ffmpeg` helper and replaces the normal seek bar without hiding
+  Details. Peak extraction is cancellable, runs outside the UI thread, aligns
+  delayed or shorter audio with the whole media timeline, skips mathematically
+  inevitable intermediate compactions for long files, and retains only a
+  bounded min/max envelope in RAM; clicking any waveform row starts or seeks
+  the exact selected file at that position.
   A conservative display-only fallback repairs strong Windows-1251 text that
   legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
   are never rewritten.
@@ -69,7 +76,7 @@ Yes: external `mpv` still plays through the same Youta TUI and seek bar.
 Youta starts `mpv` without a window or terminal input and controls it through a
 private IPC socket. Playback position, duration, pause, volume, end-of-file,
 and errors flow back into Youta's state. Seeking from keys, mouse clicks,
-chapters, or a future waveform sends IPC commands to the same player process.
+chapters, or a local waveform sends IPC commands to the same player process.
 The backend requires `mpv` 0.38 or newer so resume positions and extractor
 options can be applied atomically through `loadfile` per-file options.
 
@@ -453,10 +460,11 @@ For a small local-only build:
 
 ```sh
 cargo build --release --no-default-features \
-	--features tui,local,backend-mpv
+	--features tui,local,waveform,backend-mpv
 ```
 
-This intentionally omits terminal thumbnails. A custom
+This intentionally omits terminal thumbnails while retaining local waveform
+generation. A custom
 `--no-default-features` build must list `images` explicitly when artwork is
 wanted.
 

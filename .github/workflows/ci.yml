@@ -145,6 +145,8 @@ jobs:
           cargo check --locked --no-default-features --features subscriptions --lib
           cargo check --locked --no-default-features --features tui
           cargo check --locked --no-default-features --features images
+          cargo check --locked --no-default-features --features waveform --lib
+          cargo check --locked --no-default-features --features tui,waveform
           cargo check --locked --no-default-features --features tui,local-browser
           cargo check --locked --no-default-features --features tui,local-metadata
           cargo check --locked --no-default-features --features tui,local-rename

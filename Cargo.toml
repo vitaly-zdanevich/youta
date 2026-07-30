@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.19.5"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -60,6 +60,7 @@ app = [
     "wikidata",
     "generic-ytdlp",
     "tracker-music",
+    "waveform",
     "backend-mpv",
     "yt-dlp",
 ]
@@ -94,7 +95,8 @@ alsa = []
 jack = []
 pulseaudio = []
 pipewire = []
-waveform = []
+# Lazy local-file peak extraction through the user's existing FFmpeg helper.
+waveform = ["local-browser"]
 # Terminal artwork and thumbnail decoding and rendering.
 images = [
     "tui",

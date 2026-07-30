@@ -757,11 +757,34 @@ explicit text modifiers, avoiding empty color sequences that Linux VT treats
 as an untracked style reset. Startup also resets terminal style before the
 first clear and draw.
 
-Waveform rendering is a separate library-shaped module (**roadmap**). It
-produces a resolution-independent peak envelope cached by media fingerprint,
-then downsamples to terminal columns. Generation is cancellable, low priority,
-and never required for playback. The widget consumes only an envelope and
-timeline interface so it can later be extracted into its own crate.
+Local waveform rendering uses two deliberately separate layers. The
+backend-independent `waveform` module incrementally constructs signed min/max
+peak pyramids and merges every covered peak when reducing them to terminal
+columns, so a short transient cannot disappear between point samples. It owns
+no decoder, filesystem, cache, or terminal types and can later be extracted
+into its own crate without changing the application boundary.
+
+The `local_waveform` adapter invokes the existing `ffmpeg` helper without a
+shell and streams normalized signed 16-bit PCM into a fixed Rust read buffer.
+It calculates cross-channel extrema incrementally, so decoded audio is never
+retained in full. Callers without probed channel metadata use a bounded
+`astats` compatibility path rather than guessing the interleaved frame shape.
+Timestamp-aware resampling and bounded silence padding align delayed, gapped,
+or shorter audio with the player's whole-media timeline before peak buckets
+are formed. When duration and sample-rate metadata prove that the bounded
+builder must compact a long timeline, extraction starts at the equivalent
+aligned power-of-two bucket size; associative min/max merging preserves the
+resulting pyramid while avoiding intermediate peaks that would be discarded.
+A dedicated latest-only worker keeps decoding outside the UI and provider
+threads. Requests are cancellable, bound to replacement-sensitive file
+identity, and rejected if their selection generation is stale.
+Successful pyramids live in an entry- and byte-bounded RAM cache; waveform
+generation is never required for playback. When enabled, the TUI renders four
+waveform rows in place of the normal seek bar while leaving the right panel
+independent. It receives only owner, duration, and peak data, and a mouse click
+on any row emits an owner-bearing timecode action so it cannot seek unrelated
+media. Played columns use the normal progress style while future columns use a
+muted style, so progress remains distinct even when bold text is unavailable.
 
 ## Uploads and external writes
 

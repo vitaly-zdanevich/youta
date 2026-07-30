@@ -1185,7 +1185,7 @@ pub enum Screen {
     Playlist(PlaylistId),
     /// A channel or equivalent source page.
     Channel(MediaId),
-    /// Full-screen waveform navigation.
+    /// Legacy serialized waveform screen retained for backwards-compatible state reads.
     Waveform,
 }
 

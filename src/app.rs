@@ -30,7 +30,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-#[cfg(any(feature = "apple-podcasts", feature = "rss", feature = "yt-dlp"))]
+#[cfg(any(
+    feature = "apple-podcasts",
+    feature = "rss",
+    feature = "waveform",
+    feature = "yt-dlp"
+))]
 use crossbeam_channel::{TrySendError, bounded};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -62,6 +67,11 @@ use crate::local_move::LocalMoveMapping;
 use crate::local_move::{
     LocalMoveDestinationLimits, LocalMoveError, LocalMoveLimits, LocalMovePlan, LocalMoveRecovery,
     LocalMoveReport,
+};
+#[cfg(feature = "waveform")]
+use crate::local_waveform::{
+    FfmpegLocalWaveformExtractor, LocalWaveformError, LocalWaveformExtractor,
+    LocalWaveformIdentity, LocalWaveformRequest, WaveformCancellation,
 };
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
@@ -157,7 +167,7 @@ use crate::tui::{
     PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
     PrivateNotePopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
     SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
-    VideoCommentView, VideoCommentsPopupState, VideoCommentsPopupView, ViewModel,
+    VideoCommentView, VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
     YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
@@ -756,6 +766,8 @@ struct LocalMediaItem {
     comment: Option<String>,
     metadata_url: Option<String>,
     acoustid_id: Option<String>,
+    /// Full-precision media duration retained for timeline-sensitive features.
+    precise_duration: Option<Duration>,
     duration_seconds: Option<u64>,
     size_bytes: u64,
     container: String,
@@ -771,6 +783,33 @@ const MAX_LOCAL_FFPROBE_JSON_BYTES: usize = 64 * 1024;
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CACHED_LOCAL_MEDIA_ITEMS: usize = 128;
+#[cfg(feature = "waveform")]
+const MAX_CACHED_LOCAL_WAVEFORMS: usize = 64;
+#[cfg(feature = "waveform")]
+const MAX_CACHED_LOCAL_WAVEFORM_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "waveform")]
+const LOCAL_WAVEFORM_REVALIDATION_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "waveform")]
+const LOCAL_WAVEFORM_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Maximum harmless duration rounding difference between FFprobe and playback.
+#[cfg(feature = "waveform")]
+const LOCAL_WAVEFORM_PLAYBACK_DURATION_TOLERANCE: Duration = Duration::from_secs(1);
+
+/// Whether a backend timeline is compatible with an identity-matched waveform.
+///
+/// Local metadata retains sub-second precision, while queue snapshots and
+/// playback backends may temporarily expose a whole-second duration. A narrow
+/// tolerance keeps progress visible without accepting a materially different
+/// timeline.
+#[cfg(feature = "waveform")]
+fn local_waveform_playback_duration_matches(
+    waveform_duration: Duration,
+    playback_duration: Option<Duration>,
+) -> bool {
+    playback_duration.is_some_and(|duration| {
+        duration.abs_diff(waveform_duration) < LOCAL_WAVEFORM_PLAYBACK_DURATION_TOLERANCE
+    })
+}
 
 /// Technical container and first-audio-stream metadata returned by a local probe.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -785,8 +824,8 @@ struct LocalTechnicalMetadata {
     sample_rate_hz: Option<u32>,
     /// Audio channel count.
     channels: Option<u8>,
-    /// Whole-media duration rounded down to seconds.
-    duration_seconds: Option<u64>,
+    /// Full-precision whole-media duration.
+    duration: Option<Duration>,
 }
 
 /// Injectable metadata boundary for one selected local-media file.
@@ -942,6 +981,89 @@ struct CachedLocalMediaItem {
 struct LocalMediaMetadataResponse {
     path: PathBuf,
     result: Option<(LocalFileIdentity, LocalMediaItem)>,
+}
+
+/// Replacement-sensitive key for one RAM-only local waveform.
+#[cfg(feature = "waveform")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LocalWaveformCacheKey {
+    path: PathBuf,
+    identity: LocalWaveformIdentity,
+    /// Exact timeline used when normalizing the retained peak pyramid.
+    timeline_duration: Duration,
+}
+
+/// One successful bounded peak pyramid retained for fast in-process revisits.
+#[cfg(feature = "waveform")]
+#[derive(Clone)]
+struct CachedLocalWaveform {
+    pyramid: Arc<crate::waveform::PeakPyramid>,
+    estimated_bytes: usize,
+}
+
+/// Sole generation-owned local waveform request visible to the controller.
+#[cfg(feature = "waveform")]
+struct PendingLocalWaveform {
+    generation: u64,
+    media_id: MediaId,
+    key: LocalWaveformCacheKey,
+    duration: Duration,
+    cancellation: WaveformCancellation,
+}
+
+/// Exact generated waveform currently represented by the rendered seek target.
+#[cfg(feature = "waveform")]
+#[derive(Clone)]
+struct DisplayedLocalWaveform {
+    generation: u64,
+    key: LocalWaveformCacheKey,
+}
+
+/// Exact filesystem object loaded by a Local-browser playback action.
+#[cfg(feature = "waveform")]
+#[derive(Clone)]
+struct CurrentLocalWaveformPlayback {
+    path: PathBuf,
+    identity: LocalWaveformIdentity,
+}
+
+/// Path-bound delay before a failed local waveform may touch the filesystem again.
+#[cfg(feature = "waveform")]
+#[derive(Clone)]
+struct LocalWaveformRetry {
+    path: PathBuf,
+    retry_at: Instant,
+}
+
+/// Commands accepted by the dedicated local waveform worker.
+#[cfg(feature = "waveform")]
+enum LocalWaveformWorkerRequest {
+    Generate {
+        generation: u64,
+        request: LocalWaveformRequest,
+        cancellation: WaveformCancellation,
+    },
+    Shutdown,
+}
+
+/// Identity-bound completion returned by the dedicated waveform worker.
+#[cfg(feature = "waveform")]
+struct LocalWaveformWorkerResponse {
+    generation: u64,
+    path: PathBuf,
+    result: Result<crate::local_waveform::LocalWaveformResult, LocalWaveformError>,
+}
+
+/// Metadata readiness required for owner-aware waveform seeking.
+#[cfg(feature = "waveform")]
+enum LocalWaveformMetadata {
+    Loading,
+    Ready {
+        duration: Duration,
+        sample_rate_hz: Option<u32>,
+        audio_channels: Option<u8>,
+    },
+    Unavailable,
 }
 
 /// One process-local folder-size result valid only for its Local generation.
@@ -2662,6 +2784,7 @@ struct DetailNavigationSnapshot {
     details_text_selection: Option<DetailsTextSelection>,
     selected_detail_link: Option<usize>,
     right_panel_mode: RightPanelMode,
+    waveform_visible: bool,
     active_description_video: Option<ActiveDescriptionVideo>,
 }
 
@@ -2913,6 +3036,57 @@ pub struct AppController {
     local_media_metadata_sender: Sender<LocalMediaMetadataResponse>,
     /// Completed selected-file metadata drained by the TUI event loop.
     local_media_metadata_responses: Receiver<LocalMediaMetadataResponse>,
+    /// Latest-only requests for the dedicated local waveform worker.
+    #[cfg(feature = "waveform")]
+    local_waveform_requests: Option<Sender<LocalWaveformWorkerRequest>>,
+    /// Controller-side receiver used to replace one queued stale request.
+    #[cfg(feature = "waveform")]
+    local_waveform_request_drain: Receiver<LocalWaveformWorkerRequest>,
+    /// Identity-bound waveform completions drained by the TUI event loop.
+    #[cfg(feature = "waveform")]
+    local_waveform_responses: Receiver<LocalWaveformWorkerResponse>,
+    /// Join handle for the sole FFmpeg waveform worker.
+    #[cfg(feature = "waveform")]
+    local_waveform_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner rejecting stale waveform completions.
+    #[cfg(feature = "waveform")]
+    local_waveform_generation: u64,
+    /// Monotonic owner rejecting clicks from an obsolete rendered waveform.
+    #[cfg(feature = "waveform")]
+    local_waveform_display_generation: u64,
+    /// Exact cache entry represented by the current waveform hit target.
+    #[cfg(feature = "waveform")]
+    displayed_local_waveform: Option<DisplayedLocalWaveform>,
+    /// Earliest time a ready waveform should revalidate its file identity.
+    #[cfg(feature = "waveform")]
+    local_waveform_revalidate_at: Option<Instant>,
+    /// Exact selected path and earliest retry for the current failure.
+    #[cfg(feature = "waveform")]
+    local_waveform_retry: Option<LocalWaveformRetry>,
+    /// Exact selected local file currently generating in the worker.
+    #[cfg(feature = "waveform")]
+    pending_local_waveform: Option<PendingLocalWaveform>,
+    /// Identity-scoped failure retained until the file changes or is retried.
+    #[cfg(feature = "waveform")]
+    failed_local_waveform_key: Option<LocalWaveformCacheKey>,
+    /// RAM-only identity-bound waveform cache.
+    #[cfg(feature = "waveform")]
+    local_waveform_cache: HashMap<LocalWaveformCacheKey, CachedLocalWaveform>,
+    /// Least-recently-used order for bounded waveform eviction.
+    #[cfg(feature = "waveform")]
+    local_waveform_cache_order: VecDeque<LocalWaveformCacheKey>,
+    /// Estimated peak bytes retained across every cached pyramid.
+    #[cfg(feature = "waveform")]
+    local_waveform_cache_bytes: usize,
+    /// Whether a disconnected waveform worker has already been reported.
+    #[cfg(feature = "waveform")]
+    local_waveform_disconnect_reported: bool,
+    /// Exact Local file identity accepted by the active playback backend.
+    #[cfg(feature = "waveform")]
+    current_local_waveform_playback: Option<CurrentLocalWaveformPlayback>,
+    /// Previous Local waveform owner awaiting one confirmed queue successor.
+    #[cfg(feature = "waveform")]
+    local_waveform_follow_from: Option<MediaId>,
     /// Generation rejecting directory responses for an older Local route.
     local_generation: u64,
     /// Shared cancellation generation checked during recursive folder walks.
@@ -2935,6 +3109,9 @@ pub struct AppController {
     local_folder_size_pending: Option<PathBuf>,
     /// Child path reselected after an asynchronous move to its parent.
     pending_local_reselection: Option<(u64, PathBuf)>,
+    /// Saved Local row waiting for the initial listing that restores the waveform.
+    #[cfg(feature = "waveform")]
+    pending_restored_local_waveform_selection: Option<(u64, usize)>,
     /// Exact current-directory entries toggled into the next move batch.
     #[cfg(feature = "local-move")]
     local_move_marks: HashSet<PathBuf>,
@@ -3205,6 +3382,12 @@ impl AppController {
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
+        #[cfg(feature = "waveform")]
+        let (local_waveform_request_sender, local_waveform_request_receiver) = bounded(1);
+        #[cfg(feature = "waveform")]
+        let local_waveform_request_drain = local_waveform_request_receiver.clone();
+        #[cfg(feature = "waveform")]
+        let (local_waveform_response_sender, local_waveform_responses) = unbounded();
         let (url_open_result_sender, url_open_results) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
@@ -3261,6 +3444,26 @@ impl AppController {
         let local_browse_requests = local_browse_thread
             .as_ref()
             .map(|_| local_browse_request_sender);
+        #[cfg(feature = "waveform")]
+        let local_waveform_thread_result = thread::Builder::new()
+            .name("youta-local-waveform".to_owned())
+            .spawn(move || {
+                local_waveform_worker(
+                    local_waveform_request_receiver,
+                    local_waveform_response_sender,
+                    Arc::new(FfmpegLocalWaveformExtractor::default()),
+                );
+            });
+        #[cfg(feature = "waveform")]
+        let (local_waveform_thread, local_waveform_thread_error) =
+            match local_waveform_thread_result {
+                Ok(handle) => (Some(handle), None),
+                Err(error) => (None, Some(error)),
+            };
+        #[cfg(feature = "waveform")]
+        let local_waveform_requests = local_waveform_thread
+            .as_ref()
+            .map(|_| local_waveform_request_sender);
 
         let (saved, session_restore_error) = match store.session() {
             Ok(saved) => (saved.unwrap_or_default(), None),
@@ -3298,11 +3501,10 @@ impl AppController {
             selected: saved.selected_row,
             details_focused: saved.focus == PanelFocus::Right,
             details_scroll: usize::try_from(saved.details_scroll).unwrap_or(usize::MAX),
-            right_panel_mode: if saved.waveform_visible {
-                RightPanelMode::Waveform
-            } else {
-                RightPanelMode::Details
-            },
+            right_panel_mode: RightPanelMode::Details,
+            waveform_visible: cfg!(feature = "waveform")
+                && saved.waveform_visible
+                && matches!(saved.screen, StoredScreen::Local),
             show_chapter_timestamps: !saved.chapter_timestamps_hidden,
             ..ViewModel::default()
         };
@@ -3597,6 +3799,40 @@ impl AppController {
             local_media_loader: Arc::new(SystemLocalMediaLoader),
             local_media_metadata_sender,
             local_media_metadata_responses,
+            #[cfg(feature = "waveform")]
+            local_waveform_requests,
+            #[cfg(feature = "waveform")]
+            local_waveform_request_drain,
+            #[cfg(feature = "waveform")]
+            local_waveform_responses,
+            #[cfg(feature = "waveform")]
+            local_waveform_thread,
+            #[cfg(feature = "waveform")]
+            local_waveform_generation: 0,
+            #[cfg(feature = "waveform")]
+            local_waveform_display_generation: 0,
+            #[cfg(feature = "waveform")]
+            displayed_local_waveform: None,
+            #[cfg(feature = "waveform")]
+            local_waveform_revalidate_at: None,
+            #[cfg(feature = "waveform")]
+            local_waveform_retry: None,
+            #[cfg(feature = "waveform")]
+            pending_local_waveform: None,
+            #[cfg(feature = "waveform")]
+            failed_local_waveform_key: None,
+            #[cfg(feature = "waveform")]
+            local_waveform_cache: HashMap::new(),
+            #[cfg(feature = "waveform")]
+            local_waveform_cache_order: VecDeque::new(),
+            #[cfg(feature = "waveform")]
+            local_waveform_cache_bytes: 0,
+            #[cfg(feature = "waveform")]
+            local_waveform_disconnect_reported: false,
+            #[cfg(feature = "waveform")]
+            current_local_waveform_playback: None,
+            #[cfg(feature = "waveform")]
+            local_waveform_follow_from: None,
             local_generation: 0,
             local_folder_size_generation: Arc::new(AtomicU64::new(0)),
             local_folder_size_cache: HashMap::new(),
@@ -3608,6 +3844,8 @@ impl AppController {
             local_folder_size_queue: VecDeque::new(),
             local_folder_size_pending: None,
             pending_local_reselection: None,
+            #[cfg(feature = "waveform")]
+            pending_restored_local_waveform_selection: None,
             #[cfg(feature = "local-move")]
             local_move_marks: HashSet::new(),
             #[cfg(feature = "local-move")]
@@ -3859,6 +4097,10 @@ impl AppController {
         }
         if let Some(error) = local_browse_thread_error {
             controller.show_error("Could not start the Local browser worker", &error);
+        }
+        #[cfg(feature = "waveform")]
+        if let Some(error) = local_waveform_thread_error {
+            controller.show_error("Could not start the local waveform worker", &error);
         }
         #[cfg(any(feature = "local-rename", feature = "local-move"))]
         match local_move_reconciliation {
@@ -7918,10 +8160,7 @@ impl AppController {
             .local_results
             .iter()
             .map(|item| RowView {
-                media_id: Some(MediaId::new(
-                    SourceKind::Local,
-                    item.path.display().to_string(),
-                )),
+                media_id: Some(local_media_id(&item.path)),
                 title: item.title.clone(),
                 subtitle: local_media_subtitle(item),
                 source: "Local".to_owned(),
@@ -8048,8 +8287,7 @@ impl AppController {
                 .rows
                 .get(self.view.selected)
                 .and_then(|row| row.media_id.as_ref())
-                .filter(|media_id| media_id.source == SourceKind::Local)
-                .map(|media_id| PathBuf::from(&media_id.external_id)),
+                .and_then(local_path_from_media_id),
             Screen::History => self
                 .history_entries
                 .get(self.view.selected)
@@ -8122,10 +8360,10 @@ impl AppController {
                 self.local_results[index] = item;
                 if self.view.screen == Screen::Search
                     && let Some(row) = self.view.rows.get_mut(index)
-                    && row.media_id.as_ref().is_some_and(|media_id| {
-                        media_id.source == SourceKind::Local
-                            && Path::new(&media_id.external_id) == path
-                    })
+                    && row
+                        .media_id
+                        .as_ref()
+                        .is_some_and(|media_id| local_path_matches_media_id(&path, media_id))
                 {
                     row.subtitle = local_media_subtitle(&self.local_results[index]);
                 }
@@ -8192,9 +8430,8 @@ impl AppController {
                 .details
                 .as_ref()
                 .and_then(|details| details.media_id.as_ref())
-                .filter(|media_id| media_id.source == SourceKind::Local)
-                .and_then(|media_id| {
-                    let path = PathBuf::from(&media_id.external_id);
+                .and_then(local_path_from_media_id)
+                .and_then(|path| {
                     (cfg!(not(feature = "local-video-thumbnails"))
                         || crate::local_browser::classify_local_file(&path)
                             != Some(crate::local_browser::LocalEntryKind::Video))
@@ -8264,9 +8501,10 @@ impl AppController {
             return;
         };
         let selected_matches = selected_local_path_matches
-            || details.media_id.as_ref().is_some_and(|media_id| {
-                media_id.source == SourceKind::Local && Path::new(&media_id.external_id) == path
-            });
+            || details
+                .media_id
+                .as_ref()
+                .is_some_and(|media_id| local_path_matches_media_id(path, media_id));
         if selected_matches {
             details.thumbnail_url.clone_from(artwork);
         }
@@ -8307,10 +8545,25 @@ impl AppController {
             return;
         }
         self.view.local_browse_pending = false;
+        #[cfg(feature = "waveform")]
+        let restored_waveform_selection = self
+            .pending_restored_local_waveform_selection
+            .take()
+            .filter(|(pending_generation, _)| *pending_generation == generation)
+            .map(|(_, selected)| selected);
+        #[cfg(not(feature = "waveform"))]
+        let restored_waveform_selection: Option<usize> = None;
         match result {
             Ok(listing) => {
                 let truncated = listing.truncated;
                 let path = listing.path.display().to_string();
+                let selected = restored_waveform_selection.unwrap_or_default().min(
+                    listing
+                        .entries
+                        .len()
+                        .saturating_add(usize::from(listing.parent.is_some()))
+                        .saturating_sub(1),
+                );
                 let reselected_path = self
                     .pending_local_reselection
                     .take()
@@ -8318,7 +8571,7 @@ impl AppController {
                     .map(|(_, child)| child);
                 self.local_listing = Some(listing);
                 self.sort_local_listing();
-                self.view.selected = 0;
+                self.view.selected = selected;
                 self.select_local_path(reselected_path.as_deref());
                 #[cfg(feature = "local-move")]
                 {
@@ -8376,6 +8629,10 @@ impl AppController {
             && self.local_listing.is_some()
             && !self.view.rows.is_empty();
         self.local_generation = self.local_generation.wrapping_add(1);
+        #[cfg(feature = "waveform")]
+        {
+            self.pending_restored_local_waveform_selection = None;
+        }
         self.invalidate_local_folder_sizes();
         self.pending_local_reselection = reselect_child
             .clone()
@@ -8768,7 +9025,7 @@ impl AppController {
             .entries
             .iter()
             .filter(|entry| entry.kind.is_playable())
-            .map(|entry| MediaId::new(SourceKind::Local, entry.path.display().to_string()))
+            .map(|entry| local_media_id(&entry.path))
             .collect::<Vec<_>>();
         self.local_progress_cache.extend(
             progress_ids
@@ -8889,7 +9146,7 @@ impl AppController {
             let media_id = entry
                 .kind
                 .is_playable()
-                .then(|| MediaId::new(SourceKind::Local, entry.path.display().to_string()));
+                .then(|| local_media_id(&entry.path));
             let playback = media_id
                 .as_ref()
                 .and_then(|id| self.local_progress_cache.get(id))
@@ -8976,10 +9233,7 @@ impl AppController {
                 .unwrap_or_else(|| local_media_item_stub(entry.path.clone(), Some(size_bytes)));
             let metadata_pending = !item.technical_metadata_probed;
             self.view.details = Some(DetailView {
-                media_id: Some(MediaId::new(
-                    SourceKind::Local,
-                    entry.path.display().to_string(),
-                )),
+                media_id: Some(local_media_id(&entry.path)),
                 title: item.title.clone(),
                 source: match entry.kind {
                     LocalEntryKind::Video => "Local video (audio playback)",
@@ -9218,10 +9472,7 @@ impl AppController {
             && let Some(item) = self.local_results.get(self.view.selected)
         {
             self.view.details = Some(DetailView {
-                media_id: Some(MediaId::new(
-                    SourceKind::Local,
-                    item.path.display().to_string(),
-                )),
+                media_id: Some(local_media_id(&item.path)),
                 title: item.title.clone(),
                 source: "Local".to_owned(),
                 length: item
@@ -9726,7 +9977,9 @@ impl AppController {
             .as_ref()
             .filter(|media_id| media_id.source == SourceKind::Local)
             .ok_or_else(|| "The selected download has no local media identity".to_owned())?;
-        let path = PathBuf::from(&media_id.external_id);
+        let path = local_path_from_media_id(media_id).ok_or_else(|| {
+            "The selected download has an invalid local media identity".to_owned()
+        })?;
         if !path.is_absolute()
             || !path.is_file()
             || !is_supported_media_path(&path.to_string_lossy())
@@ -9833,7 +10086,7 @@ impl AppController {
             let entry = listing.entries.get(self.local_entry_index()?)?;
             return (entry.kind.is_playable() && entry.path.is_file()).then(|| {
                 (
-                    MediaId::new(SourceKind::Local, entry.path.display().to_string()),
+                    local_media_id(&entry.path),
                     entry.display_name().into_owned(),
                 )
             });
@@ -11848,7 +12101,7 @@ impl AppController {
             && let Some(index) = listing
                 .entries
                 .iter()
-                .position(|entry| entry.path.display().to_string() == item.media.id.external_id)
+                .position(|entry| local_path_matches_media_id(&entry.path, &item.media.id))
         {
             self.view.screen = Screen::Local;
             self.view.selected = index.saturating_add(usize::from(listing.parent.is_some()));
@@ -12170,6 +12423,7 @@ impl AppController {
             details_text_selection: self.view.details_text_selection.take(),
             selected_detail_link: self.view.selected_detail_link,
             right_panel_mode: self.view.right_panel_mode,
+            waveform_visible: self.view.waveform_visible,
             active_description_video: self.active_description_video.take(),
         }
     }
@@ -12195,6 +12449,7 @@ impl AppController {
         self.view.details_text_selection = snapshot.details_text_selection;
         self.view.selected_detail_link = snapshot.selected_detail_link;
         self.view.right_panel_mode = snapshot.right_panel_mode;
+        self.view.waveform_visible = snapshot.waveform_visible;
         self.active_description_video = snapshot.active_description_video;
 
         let pending_video_id = self.active_description_video.as_ref().and_then(|linked| {
@@ -12276,6 +12531,13 @@ impl AppController {
         self.view.details_text_selection = None;
         self.view.selected_detail_link = None;
         self.view.right_panel_mode = RightPanelMode::Details;
+        self.view.waveform_visible = false;
+        self.view.waveform = WaveformView::Unavailable;
+        #[cfg(feature = "waveform")]
+        {
+            self.cancel_local_waveform();
+            self.failed_local_waveform_key = None;
+        }
         self.view.details = Some(DetailView {
             media_id: Some(MediaId::new(SourceKind::YouTube, &video_id)),
             title: LINKED_VIDEO_LOADING_TITLE.to_owned(),
@@ -12516,41 +12778,22 @@ impl AppController {
 
     /// Seeks the active item, or starts the selected item, at a description timecode.
     fn activate_timecode(&mut self, media_id: MediaId, seconds: u64) {
+        let target = Duration::from_secs(seconds);
         if self.current_media.as_ref() == Some(&media_id) && self.player.is_some() {
-            if self.seek_is_unavailable_for_live_radio() {
-                return;
-            }
-            if self
-                .view
-                .playback
-                .duration
-                .is_some_and(|duration| seconds >= duration.as_secs())
-            {
-                self.view.status_line = "That timecode is outside the media duration".to_owned();
-                return;
-            }
-            let previous = self.view.playback.position;
-            if previous != Duration::from_secs(seconds) {
-                const MAX_SEEK_BACK_ENTRIES: usize = 32;
-                if self.seek_back.len() == MAX_SEEK_BACK_ENTRIES {
-                    self.seek_back.pop_front();
-                }
-                self.seek_back.push_back((media_id, previous));
-            }
-            self.player_command(PlayerCommand::SeekAbsolute(Duration::from_secs(seconds)));
-            self.view.status_line = format!("Seeking to {}", format_seconds(seconds));
+            self.seek_active_timecode(media_id, target, seconds);
             return;
         }
 
-        let selected_item = (self
+        let selected_owner_matches = self
             .view
             .details
             .as_ref()
             .and_then(|details| details.media_id.as_ref())
-            == Some(&media_id))
-        .then(|| self.selected_queue_item().ok())
-        .flatten()
-        .filter(|item| item.media.id == media_id);
+            == Some(&media_id);
+        let selected_item = selected_owner_matches
+            .then(|| self.selected_queue_item().ok())
+            .flatten()
+            .filter(|item| item.media.id == media_id);
         if let Some(item) = selected_item {
             if item
                 .media
@@ -12569,6 +12812,816 @@ impl AppController {
         } else {
             self.view.status_line =
                 "That timecode does not belong to the selected or playing item".to_owned();
+        }
+    }
+
+    /// Applies one already-validated absolute seek to the active backend.
+    fn seek_active_timecode(&mut self, media_id: MediaId, target: Duration, seconds: u64) {
+        if self.seek_is_unavailable_for_live_radio() {
+            return;
+        }
+        if self
+            .view
+            .playback
+            .duration
+            .is_some_and(|duration| target >= duration)
+        {
+            self.view.status_line = "That timecode is outside the media duration".to_owned();
+            return;
+        }
+        let previous = self.view.playback.position;
+        if previous != target {
+            const MAX_SEEK_BACK_ENTRIES: usize = 32;
+            if self.seek_back.len() == MAX_SEEK_BACK_ENTRIES {
+                self.seek_back.pop_front();
+            }
+            self.seek_back.push_back((media_id, previous));
+        }
+        self.player_command(PlayerCommand::SeekAbsolute(target));
+        self.view.status_line = format!("Seeking to {}", format_seconds(seconds));
+    }
+
+    /// Handles a click from one exact identity-bound rendered Local waveform.
+    #[cfg(feature = "waveform")]
+    fn activate_local_waveform_timecode(
+        &mut self,
+        media_id: MediaId,
+        generation: u64,
+        seconds: u64,
+    ) {
+        let Some(displayed) = self
+            .displayed_local_waveform
+            .as_ref()
+            .filter(|displayed| displayed.generation == generation)
+            .cloned()
+        else {
+            self.view.status_line = "That waveform is no longer selected".to_owned();
+            return;
+        };
+        let ready_matches = matches!(
+            &self.view.waveform,
+            WaveformView::Ready {
+                media_id: owner,
+                generation: owner_generation,
+                ..
+            } if owner == &media_id && *owner_generation == generation
+        );
+        let Some((selected_media_id, path)) = self.selected_local_waveform_target() else {
+            self.view.status_line = "That waveform is no longer selected".to_owned();
+            return;
+        };
+        if !ready_matches || selected_media_id != media_id || displayed.key.path != path {
+            self.view.status_line = "That waveform is no longer selected".to_owned();
+            return;
+        }
+        let request = match LocalWaveformRequest::from_path(path.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                self.invalidate_displayed_local_waveform();
+                self.set_local_waveform_failure(media_id, path, None, error.to_string());
+                return;
+            }
+        };
+        if request.identity() != &displayed.key.identity {
+            self.invalidate_displayed_local_waveform();
+            self.view.waveform = WaveformView::Loading {
+                media_id: media_id.clone(),
+            };
+            self.view.status_line = "The local file changed; regenerating its waveform…".to_owned();
+            self.synchronize_local_waveform();
+            return;
+        }
+        match self.selected_local_waveform_metadata(&path) {
+            LocalWaveformMetadata::Ready { duration, .. }
+                if duration == displayed.key.timeline_duration => {}
+            LocalWaveformMetadata::Ready { .. } => {
+                self.invalidate_displayed_local_waveform();
+                self.view.waveform = WaveformView::Loading {
+                    media_id: media_id.clone(),
+                };
+                self.view.status_line =
+                    "The local duration changed; regenerating its waveform…".to_owned();
+                self.synchronize_local_waveform();
+                return;
+            }
+            LocalWaveformMetadata::Loading => {
+                self.invalidate_displayed_local_waveform();
+                self.view.waveform = WaveformView::Loading { media_id };
+                self.view.status_line =
+                    "Refreshing local duration before seeking the waveform…".to_owned();
+                return;
+            }
+            LocalWaveformMetadata::Unavailable => {
+                self.set_local_waveform_failure(
+                    media_id,
+                    path,
+                    None,
+                    "duration metadata is unavailable".to_owned(),
+                );
+                return;
+            }
+        }
+        let target = Duration::from_secs(seconds);
+        if target >= displayed.key.timeline_duration {
+            self.view.status_line = "That timecode is outside the media duration".to_owned();
+            return;
+        }
+        let active_identity_matches = self.player.is_some()
+            && self.playback_phase != PlaybackPhase::Idle
+            && self
+                .current_local_waveform_playback
+                .as_ref()
+                .is_some_and(|current| {
+                    current.path == path && current.identity == displayed.key.identity
+                });
+        if active_identity_matches
+            && !local_waveform_playback_duration_matches(
+                displayed.key.timeline_duration,
+                self.view.playback.duration,
+            )
+        {
+            self.view.status_line =
+                "The playback duration differs from this waveform; select the file again to refresh it"
+                    .to_owned();
+            self.refresh_local_waveform_playback_match();
+            return;
+        }
+        if active_identity_matches {
+            self.seek_active_timecode(media_id, target, seconds);
+            return;
+        }
+        let size_bytes = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        let item = self
+            .cached_local_media_item(&path, size_bytes)
+            .filter(|item| item.technical_metadata_probed)
+            .unwrap_or_else(|| {
+                let item = local_media_item(path.clone());
+                if let Some(identity) = local_file_identity(&path) {
+                    self.cache_local_media_item(identity, item.clone());
+                }
+                item
+            });
+        let precise_duration = item.precise_duration.or_else(|| {
+            item.duration_seconds
+                .filter(|duration| *duration > 0)
+                .map(Duration::from_secs)
+        });
+        if precise_duration.is_some_and(|duration| target >= duration) {
+            self.view.status_line = "That timecode is outside the media duration".to_owned();
+            return;
+        }
+        let mut item = match queue_item_from_local(&item) {
+            Ok(item) => item,
+            Err(error) => {
+                self.show_error_message("Local media could not be played", error);
+                return;
+            }
+        };
+        item.start_at_seconds = Some(seconds);
+        self.play_queue_item(item, false);
+    }
+
+    /// Returns the exact selected playable local file eligible for a waveform.
+    fn selected_local_waveform_target(&self) -> Option<(MediaId, PathBuf)> {
+        if self.view.screen != Screen::Local {
+            return None;
+        }
+        let media_id = self
+            .view
+            .details
+            .as_ref()?
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)?
+            .clone();
+        let entry = self
+            .local_entry_index()
+            .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
+            .filter(|entry| entry.kind.is_playable())?;
+        (local_media_id(&entry.path) == media_id).then(|| (media_id, entry.path.clone()))
+    }
+
+    /// Replaces the seek bar with a lazy waveform for selected local media.
+    fn toggle_waveform(&mut self) {
+        if self.view.waveform_visible {
+            self.view.waveform_visible = false;
+            self.view.waveform = WaveformView::Unavailable;
+            #[cfg(feature = "waveform")]
+            {
+                self.cancel_local_waveform();
+                self.failed_local_waveform_key = None;
+                self.local_waveform_retry = None;
+                self.invalidate_displayed_local_waveform();
+            }
+            self.view.status_line = "Showing seek bar".to_owned();
+            return;
+        }
+        let Some((media_id, _)) = self.selected_local_waveform_target() else {
+            self.view.status_line =
+                "Waveform is available for playable local files only".to_owned();
+            return;
+        };
+        if !cfg!(feature = "waveform") {
+            self.view.status_line = "This build omits local waveform support".to_owned();
+            return;
+        }
+        self.view.waveform_visible = true;
+        self.view.waveform = WaveformView::Loading { media_id };
+        self.view.status_line = "Generating local waveform…".to_owned();
+        #[cfg(feature = "waveform")]
+        {
+            self.failed_local_waveform_key = None;
+            self.local_waveform_retry = None;
+            self.invalidate_displayed_local_waveform();
+            self.synchronize_local_waveform();
+        }
+    }
+
+    /// Returns current identity-bound duration or schedules its metadata probe.
+    #[cfg(feature = "waveform")]
+    fn selected_local_waveform_metadata(&mut self, path: &Path) -> LocalWaveformMetadata {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return LocalWaveformMetadata::Unavailable;
+        };
+        let Some(item) = self.cached_local_media_item(path, metadata.len()) else {
+            self.request_local_media_metadata(path.to_owned());
+            return LocalWaveformMetadata::Loading;
+        };
+        if !item.technical_metadata_probed {
+            self.request_local_media_metadata(path.to_owned());
+            return LocalWaveformMetadata::Loading;
+        }
+        let duration = item.precise_duration.or_else(|| {
+            item.duration_seconds
+                .filter(|duration| *duration > 0)
+                .map(Duration::from_secs)
+        });
+        duration.map_or(LocalWaveformMetadata::Unavailable, |duration| {
+            LocalWaveformMetadata::Ready {
+                duration,
+                sample_rate_hz: item.sample_rate_hz,
+                audio_channels: item.channels,
+            }
+        })
+    }
+
+    /// Keeps the visible seek-bar waveform synchronized with the selected local file.
+    #[cfg(feature = "waveform")]
+    fn synchronize_local_waveform(&mut self) {
+        let now = Instant::now();
+        if !self.view.waveform_visible {
+            self.cancel_local_waveform();
+            self.failed_local_waveform_key = None;
+            self.local_waveform_retry = None;
+            self.invalidate_displayed_local_waveform();
+            return;
+        }
+        let Some((media_id, path)) = self.selected_local_waveform_target() else {
+            self.cancel_local_waveform();
+            self.failed_local_waveform_key = None;
+            self.local_waveform_retry = None;
+            self.invalidate_displayed_local_waveform();
+            self.view.waveform = WaveformView::Unavailable;
+            if self.view.screen == Screen::Local
+                && self.view.local_browse_pending
+                && self.local_listing.is_none()
+            {
+                // A restored waveform preference can become actionable only
+                // after the asynchronous initial Local listing reconstructs
+                // its selected file and Details owner.
+                return;
+            }
+            self.view.waveform_visible = false;
+            return;
+        };
+        let displayed_is_current =
+            self.displayed_local_waveform
+                .as_ref()
+                .is_some_and(|displayed| {
+                    displayed.key.path == path
+                        && matches!(
+                            &self.view.waveform,
+                            WaveformView::Ready {
+                                media_id: owner,
+                                generation,
+                                ..
+                            } if owner == &media_id && *generation == displayed.generation
+                        )
+                });
+        if displayed_is_current
+            && self
+                .local_waveform_revalidate_at
+                .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        let failed_for_owner = matches!(
+            &self.view.waveform,
+            WaveformView::Failed {
+                media_id: owner,
+                ..
+            } if owner == &media_id
+        );
+        if failed_for_owner
+            && self
+                .local_waveform_retry
+                .as_ref()
+                .is_some_and(|retry| retry.path == path && now < retry.retry_at)
+        {
+            return;
+        }
+        let request = match LocalWaveformRequest::from_path(path.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                self.cancel_local_waveform();
+                self.set_local_waveform_failure(media_id, path, None, error.to_string());
+                return;
+            }
+        };
+        let stale_pending = self
+            .pending_local_waveform
+            .as_ref()
+            .is_some_and(|pending| pending.media_id != media_id || pending.key.path != path);
+        if stale_pending {
+            self.cancel_local_waveform();
+        }
+        let (duration, sample_rate_hz, audio_channels) =
+            match self.selected_local_waveform_metadata(&path) {
+                LocalWaveformMetadata::Loading => {
+                    self.invalidate_displayed_local_waveform();
+                    self.view.waveform = WaveformView::Loading { media_id };
+                    return;
+                }
+                LocalWaveformMetadata::Unavailable => {
+                    self.cancel_local_waveform();
+                    self.set_local_waveform_failure(
+                        media_id,
+                        path,
+                        None,
+                        "duration metadata is unavailable".to_owned(),
+                    );
+                    return;
+                }
+                LocalWaveformMetadata::Ready {
+                    duration,
+                    sample_rate_hz,
+                    audio_channels,
+                } => (duration, sample_rate_hz, audio_channels),
+            };
+        let key = LocalWaveformCacheKey {
+            path: path.clone(),
+            identity: request.identity().clone(),
+            timeline_duration: duration,
+        };
+        if displayed_is_current
+            && self
+                .displayed_local_waveform
+                .as_ref()
+                .is_some_and(|displayed| displayed.key == key)
+        {
+            self.failed_local_waveform_key = None;
+            self.local_waveform_retry = None;
+            self.local_waveform_revalidate_at = Some(now + LOCAL_WAVEFORM_REVALIDATION_INTERVAL);
+            return;
+        }
+        if failed_for_owner
+            && self
+                .failed_local_waveform_key
+                .as_ref()
+                .is_some_and(|failed| failed == &key)
+        {
+            self.local_waveform_retry = Some(LocalWaveformRetry {
+                path,
+                retry_at: now + LOCAL_WAVEFORM_FAILURE_RETRY_INTERVAL,
+            });
+            return;
+        }
+        self.failed_local_waveform_key = None;
+        self.local_waveform_retry = None;
+        let stale_pending = self
+            .pending_local_waveform
+            .as_ref()
+            .is_some_and(|pending| pending.media_id != media_id || pending.key != key);
+        if stale_pending {
+            self.cancel_local_waveform();
+        }
+        let mut request = request.with_timeline_duration(duration);
+        if let Some(sample_rate_hz) = sample_rate_hz {
+            request = request.with_sample_rate_hz(sample_rate_hz);
+        }
+        if let Some(audio_channels) = audio_channels {
+            request = request.with_audio_channels(u16::from(audio_channels));
+        }
+        if let Some(cached) = self.local_waveform_cache.get(&key).cloned() {
+            self.promote_local_waveform_cache_key(&key);
+            self.cancel_local_waveform();
+            self.failed_local_waveform_key = None;
+            self.show_ready_local_waveform(media_id, key, duration, cached.pyramid);
+            return;
+        }
+        if self
+            .pending_local_waveform
+            .as_ref()
+            .is_some_and(|pending| pending.key == key && pending.media_id == media_id)
+        {
+            self.invalidate_displayed_local_waveform();
+            self.view.waveform = WaveformView::Loading { media_id };
+            return;
+        }
+        self.cancel_local_waveform();
+        let Some(sender) = self.local_waveform_requests.as_ref() else {
+            self.set_local_waveform_failure(
+                media_id,
+                key.path.clone(),
+                Some(key),
+                "the waveform worker is unavailable".to_owned(),
+            );
+            return;
+        };
+        self.local_waveform_generation = self.local_waveform_generation.wrapping_add(1);
+        let generation = self.local_waveform_generation;
+        let cancellation = WaveformCancellation::new();
+        let mut command = LocalWaveformWorkerRequest::Generate {
+            generation,
+            request,
+            cancellation: cancellation.clone(),
+        };
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    command = returned;
+                    let _ = self.local_waveform_request_drain.try_recv();
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.set_local_waveform_failure(
+                        media_id,
+                        key.path.clone(),
+                        Some(key),
+                        "the waveform worker stopped".to_owned(),
+                    );
+                    return;
+                }
+            }
+        }
+        self.pending_local_waveform = Some(PendingLocalWaveform {
+            generation,
+            media_id: media_id.clone(),
+            key,
+            duration,
+            cancellation,
+        });
+        self.invalidate_displayed_local_waveform();
+        self.view.waveform = WaveformView::Loading { media_id };
+    }
+
+    /// Returns the media owner represented by the visible waveform state.
+    #[cfg(feature = "waveform")]
+    fn visible_local_waveform_media_id(&self) -> Option<&MediaId> {
+        match &self.view.waveform {
+            WaveformView::Loading { media_id }
+            | WaveformView::Ready { media_id, .. }
+            | WaveformView::Failed { media_id, .. } => Some(media_id),
+            WaveformView::Unavailable => None,
+        }
+    }
+
+    /// Captures a Local waveform selection across one automatic queue transition.
+    ///
+    /// A non-Local queue item may sit between two Local tracks. In that case
+    /// the original Local owner remains pending until a later Local successor
+    /// starts or the user changes the visible waveform selection.
+    #[cfg(feature = "waveform")]
+    fn local_waveform_follow_intent_after_eof(&self) -> Option<MediaId> {
+        let Some(current_media_id) = self.current_media.as_ref() else {
+            return None;
+        };
+        if current_media_id.source != SourceKind::Local {
+            return self.local_waveform_follow_from.clone();
+        }
+        if !self.view.waveform_visible || self.view.screen != Screen::Local {
+            return None;
+        }
+        let selected_media_id = self
+            .selected_local_waveform_target()
+            .map(|(media_id, _)| media_id);
+        (selected_media_id.as_ref() == Some(current_media_id)
+            && self.visible_local_waveform_media_id() == Some(current_media_id))
+        .then(|| current_media_id.clone())
+    }
+
+    /// Moves a selected Local waveform to a confirmed queue successor.
+    ///
+    /// The prior visible waveform owner is captured at EOF instead of inferred
+    /// from adjacent queue indices. This supports cross-directory successors
+    /// and intervening non-Local queue items while preserving a selection the
+    /// user changes before the new Local track starts.
+    #[cfg(feature = "waveform")]
+    fn follow_local_waveform_playback_transition(&mut self) {
+        let Some(previous_media_id) = self.local_waveform_follow_from.clone() else {
+            return;
+        };
+        let Some(current_media_id) = self.current_media.clone() else {
+            self.local_waveform_follow_from = None;
+            return;
+        };
+        if current_media_id.source != SourceKind::Local {
+            return;
+        }
+        self.local_waveform_follow_from = None;
+        if !self.view.waveform_visible || self.view.screen != Screen::Local {
+            return;
+        }
+        let Some((selected_media_id, _)) = self.selected_local_waveform_target() else {
+            return;
+        };
+        if selected_media_id != previous_media_id
+            || self.visible_local_waveform_media_id() != Some(&previous_media_id)
+            || selected_media_id == current_media_id
+        {
+            return;
+        }
+        if let Some((index, has_parent)) = self.local_listing.as_ref().and_then(|listing| {
+            listing
+                .entries
+                .iter()
+                .position(|entry| local_path_matches_media_id(&entry.path, &current_media_id))
+                .map(|index| (index, listing.parent.is_some()))
+        }) {
+            self.view.selected = index.saturating_add(usize::from(has_parent));
+            self.update_local_browser_detail();
+            self.refresh_selected_playlist_state();
+            self.synchronize_local_waveform();
+            return;
+        }
+        let Some(path) = self
+            .current_local_waveform_playback
+            .as_ref()
+            .filter(|current| local_path_matches_media_id(&current.path, &current_media_id))
+            .map(|current| current.path.clone())
+        else {
+            return;
+        };
+        let Some(parent) = path.parent().map(Path::to_owned) else {
+            return;
+        };
+        self.browse_local_directory_with_reselection(parent, Some(path));
+    }
+
+    /// Clears the identity token behind the current waveform hit target.
+    #[cfg(feature = "waveform")]
+    fn invalidate_displayed_local_waveform(&mut self) {
+        self.displayed_local_waveform = None;
+        self.local_waveform_revalidate_at = None;
+        self.view.waveform_playback_matches = false;
+    }
+
+    /// Refreshes whether playback and the rendered waveform share one exact file.
+    #[cfg(feature = "waveform")]
+    fn refresh_local_waveform_playback_match(&mut self) {
+        self.view.waveform_playback_matches = self
+            .displayed_local_waveform
+            .as_ref()
+            .zip(self.current_local_waveform_playback.as_ref())
+            .is_some_and(|(displayed, current)| {
+                displayed.key.path == current.path
+                    && displayed.key.identity == current.identity
+                    && local_waveform_playback_duration_matches(
+                        displayed.key.timeline_duration,
+                        self.view.playback.duration,
+                    )
+            });
+    }
+
+    /// Publishes one identity-bound cached pyramid under a fresh click token.
+    #[cfg(feature = "waveform")]
+    fn show_ready_local_waveform(
+        &mut self,
+        media_id: MediaId,
+        key: LocalWaveformCacheKey,
+        duration: Duration,
+        pyramid: Arc<crate::waveform::PeakPyramid>,
+    ) {
+        self.local_waveform_display_generation =
+            self.local_waveform_display_generation.wrapping_add(1);
+        let generation = self.local_waveform_display_generation;
+        self.displayed_local_waveform = Some(DisplayedLocalWaveform { generation, key });
+        self.local_waveform_revalidate_at =
+            Some(Instant::now() + LOCAL_WAVEFORM_REVALIDATION_INTERVAL);
+        self.view.waveform = WaveformView::Ready {
+            media_id,
+            generation,
+            duration,
+            pyramid,
+        };
+        self.refresh_local_waveform_playback_match();
+    }
+
+    /// Records one terminal waveform failure for the exact file identity.
+    #[cfg(feature = "waveform")]
+    fn set_local_waveform_failure(
+        &mut self,
+        media_id: MediaId,
+        path: PathBuf,
+        key: Option<LocalWaveformCacheKey>,
+        message: String,
+    ) {
+        self.invalidate_displayed_local_waveform();
+        self.local_waveform_retry = Some(LocalWaveformRetry {
+            path,
+            retry_at: Instant::now() + LOCAL_WAVEFORM_FAILURE_RETRY_INTERVAL,
+        });
+        self.failed_local_waveform_key = key;
+        self.view.waveform = WaveformView::Failed { media_id, message };
+    }
+
+    /// Cancels the active or queued generation without clearing reusable peaks.
+    #[cfg(feature = "waveform")]
+    fn cancel_local_waveform(&mut self) {
+        if let Some(pending) = self.pending_local_waveform.take() {
+            pending.cancellation.cancel();
+        }
+        let _ = self.local_waveform_request_drain.try_recv();
+    }
+
+    /// Promotes one cache key without cloning its peak data.
+    #[cfg(feature = "waveform")]
+    fn promote_local_waveform_cache_key(&mut self, key: &LocalWaveformCacheKey) {
+        self.local_waveform_cache_order
+            .retain(|candidate| candidate != key);
+        self.local_waveform_cache_order.push_back(key.clone());
+    }
+
+    /// Stores one identity-bound waveform under entry and byte limits.
+    #[cfg(feature = "waveform")]
+    fn cache_local_waveform(
+        &mut self,
+        key: LocalWaveformCacheKey,
+        pyramid: Arc<crate::waveform::PeakPyramid>,
+    ) {
+        let replaced_keys = self
+            .local_waveform_cache
+            .keys()
+            .filter(|candidate| candidate.path == key.path && *candidate != &key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for replaced in &replaced_keys {
+            if let Some(previous) = self.local_waveform_cache.remove(replaced) {
+                self.local_waveform_cache_bytes = self
+                    .local_waveform_cache_bytes
+                    .saturating_sub(previous.estimated_bytes);
+            }
+        }
+        self.local_waveform_cache_order
+            .retain(|candidate| !replaced_keys.contains(candidate));
+        if let Some(previous) = self.local_waveform_cache.remove(&key) {
+            self.local_waveform_cache_bytes = self
+                .local_waveform_cache_bytes
+                .saturating_sub(previous.estimated_bytes);
+        }
+        self.local_waveform_cache_order
+            .retain(|candidate| candidate != &key);
+        let estimated_bytes = waveform_pyramid_bytes(&pyramid);
+        if estimated_bytes > MAX_CACHED_LOCAL_WAVEFORM_BYTES {
+            return;
+        }
+        while self.local_waveform_cache.len() >= MAX_CACHED_LOCAL_WAVEFORMS
+            || self
+                .local_waveform_cache_bytes
+                .saturating_add(estimated_bytes)
+                > MAX_CACHED_LOCAL_WAVEFORM_BYTES
+        {
+            let Some(oldest) = self.local_waveform_cache_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.local_waveform_cache.remove(&oldest) {
+                self.local_waveform_cache_bytes = self
+                    .local_waveform_cache_bytes
+                    .saturating_sub(removed.estimated_bytes);
+            }
+        }
+        self.local_waveform_cache_bytes = self
+            .local_waveform_cache_bytes
+            .saturating_add(estimated_bytes);
+        self.local_waveform_cache.insert(
+            key.clone(),
+            CachedLocalWaveform {
+                pyramid,
+                estimated_bytes,
+            },
+        );
+        self.local_waveform_cache_order.push_back(key);
+    }
+
+    /// Applies every currently available waveform completion.
+    #[cfg(feature = "waveform")]
+    fn drain_local_waveform_responses(&mut self) {
+        loop {
+            match self.local_waveform_responses.try_recv() {
+                Ok(response) => {
+                    let Some(pending) = self.pending_local_waveform.as_ref() else {
+                        continue;
+                    };
+                    if pending.generation != response.generation
+                        || pending.key.path != response.path
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_local_waveform
+                        .take()
+                        .expect("the matching pending waveform exists");
+                    match response.result {
+                        Ok(result) if result.identity() == &pending.key.identity => {
+                            let identity_is_current =
+                                LocalWaveformIdentity::from_path(&pending.key.path)
+                                    .ok()
+                                    .as_ref()
+                                    == Some(&pending.key.identity);
+                            if !identity_is_current {
+                                self.failed_local_waveform_key = None;
+                                self.local_waveform_retry = None;
+                                if self.view.waveform_visible
+                                    && self.selected_local_waveform_target().is_some_and(
+                                        |(selected, path)| {
+                                            selected == pending.media_id && path == pending.key.path
+                                        },
+                                    )
+                                {
+                                    self.invalidate_displayed_local_waveform();
+                                    self.view.waveform = WaveformView::Loading {
+                                        media_id: pending.media_id,
+                                    };
+                                    self.view.status_line =
+                                        "The local file changed; regenerating its waveform…"
+                                            .to_owned();
+                                    self.synchronize_local_waveform();
+                                }
+                                continue;
+                            }
+                            let pyramid = Arc::new(result.into_pyramid());
+                            self.failed_local_waveform_key = None;
+                            self.local_waveform_retry = None;
+                            self.cache_local_waveform(pending.key.clone(), Arc::clone(&pyramid));
+                            if self.view.waveform_visible
+                                && self.selected_local_waveform_target().is_some_and(
+                                    |(selected, path)| {
+                                        selected == pending.media_id && path == pending.key.path
+                                    },
+                                )
+                            {
+                                self.show_ready_local_waveform(
+                                    pending.media_id,
+                                    pending.key,
+                                    pending.duration,
+                                    pyramid,
+                                );
+                                self.view.status_line = "Local waveform ready".to_owned();
+                            }
+                        }
+                        Ok(_) => {
+                            self.set_local_waveform_failure(
+                                pending.media_id,
+                                pending.key.path.clone(),
+                                Some(pending.key),
+                                "the local file changed during generation".to_owned(),
+                            );
+                        }
+                        Err(LocalWaveformError::Cancelled) => {}
+                        Err(error) => {
+                            self.set_local_waveform_failure(
+                                pending.media_id,
+                                pending.key.path.clone(),
+                                Some(pending.key),
+                                error.to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.local_waveform_disconnect_reported {
+                        self.local_waveform_disconnect_reported = true;
+                        let pending_key = self
+                            .pending_local_waveform
+                            .as_ref()
+                            .map(|pending| pending.key.clone());
+                        self.cancel_local_waveform();
+                        if let Some((media_id, path)) = self.selected_local_waveform_target() {
+                            let key = pending_key.filter(|key| key.path == path);
+                            self.set_local_waveform_failure(
+                                media_id,
+                                path,
+                                key,
+                                "the waveform worker stopped".to_owned(),
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -12928,10 +13981,18 @@ impl AppController {
                 self.prepare_tracker_item(index, Some(origin));
             }
             AutoplayStep::SourceChanged => {
+                #[cfg(feature = "waveform")]
+                {
+                    self.local_waveform_follow_from = None;
+                }
                 self.view.status_line =
                     "Autoplay stopped because the source list changed".to_owned();
             }
             AutoplayStep::Exhausted => {
+                #[cfg(feature = "waveform")]
+                {
+                    self.local_waveform_follow_from = None;
+                }
                 self.view.status_line = "Autoplay reached the end of this list".to_owned();
             }
         }
@@ -13065,6 +14126,11 @@ impl AppController {
         let mut canonical_input = PlaybackInput::new(item.playback_location.clone());
         canonical_input.start_at = Duration::from_secs(start_at);
         canonical_input.title = Some(item.media.title.clone());
+        #[cfg(feature = "waveform")]
+        let local_playback_candidate = (media_id.source == SourceKind::Local)
+            .then(|| local_playback_path(&canonical_input.location))
+            .flatten()
+            .and_then(|path| LocalWaveformRequest::from_path(path).ok());
         #[cfg(feature = "yt-dlp")]
         let had_resolved_input = resolved_input.is_some();
         let mut input = resolved_input.unwrap_or_else(|| canonical_input.clone());
@@ -13106,6 +14172,21 @@ impl AppController {
         };
         match play_result {
             Ok(()) => {
+                #[cfg(feature = "waveform")]
+                {
+                    self.current_local_waveform_playback =
+                        local_playback_candidate.and_then(|request| {
+                            (LocalWaveformIdentity::from_path(request.path())
+                                .ok()
+                                .as_ref()
+                                == Some(request.identity()))
+                            .then(|| CurrentLocalWaveformPlayback {
+                                path: request.path().to_owned(),
+                                identity: request.identity().clone(),
+                            })
+                        });
+                    self.refresh_local_waveform_playback_match();
+                }
                 if media_changed {
                     self.seek_back.clear();
                 }
@@ -13165,6 +14246,8 @@ impl AppController {
                     title: Some(item.media.title.clone()),
                     ..PlaybackStatus::default()
                 };
+                #[cfg(feature = "waveform")]
+                self.refresh_local_waveform_playback_match();
                 self.view.playback_chapters = chapters;
                 self.view.status_line = format!("Loading {}…", item.media.title);
                 if !live_stream
@@ -13269,6 +14352,8 @@ impl AppController {
                 // replace it with a long, expiring, potentially sensitive URL.
                 status.title = Some(self.current_playback_title());
                 self.view.playback = status;
+                #[cfg(feature = "waveform")]
+                self.refresh_local_waveform_playback_match();
                 #[cfg(feature = "radio")]
                 {
                     let icy_title = self.view.playback.stream_title.clone();
@@ -13366,6 +14451,8 @@ impl AppController {
                             self.show_error("Playing, but history could not be saved", &error);
                         }
                         self.checkpoint_playback_started();
+                        #[cfg(feature = "waveform")]
+                        self.follow_local_waveform_playback_transition();
                     }
                 }
                 Ok(Some(PlaybackEvent::Ended(end))) => {
@@ -13438,7 +14525,13 @@ impl AppController {
                     self.persist_position();
                 }
                 let autoplay_origin = self.current_autoplay_origin.clone();
+                #[cfg(feature = "waveform")]
+                let local_waveform_follow_from = self.local_waveform_follow_intent_after_eof();
                 self.reset_playback_state();
+                #[cfg(feature = "waveform")]
+                {
+                    self.local_waveform_follow_from = local_waveform_follow_from;
+                }
                 match self.playback_queue.advance().cloned() {
                     Some(next) => {
                         if self.config.playback.autoplay
@@ -13457,12 +14550,20 @@ impl AppController {
                         if let Some(origin) = origin {
                             self.continue_autoplay(origin);
                         } else {
+                            #[cfg(feature = "waveform")]
+                            {
+                                self.local_waveform_follow_from = None;
+                            }
                             self.view.status_line =
                                 "Playback queue finished; this item has no autoplay list"
                                     .to_owned();
                         }
                     }
                     None => {
+                        #[cfg(feature = "waveform")]
+                        {
+                            self.local_waveform_follow_from = None;
+                        }
                         self.queued_autoplay_resume_origin = None;
                         self.view.status_line = "Playback queue finished".to_owned();
                     }
@@ -13632,6 +14733,12 @@ impl AppController {
         self.seek_back.clear();
         self.view.playback_chapters.clear();
         self.view.radio_now_playing = None;
+        #[cfg(feature = "waveform")]
+        {
+            self.current_local_waveform_playback = None;
+            self.local_waveform_follow_from = None;
+            self.refresh_local_waveform_playback_match();
+        }
         self.view.playback = PlaybackStatus {
             volume: self.config.playback.volume_percent,
             speed: f64::from(self.config.playback.speed_percent) / 100.0,
@@ -14075,6 +15182,9 @@ impl AppController {
                     self.schedule_local_folder_sizes();
                     self.view.status_line = format!("Local folder: {}", self.view.local_path);
                 } else {
+                    #[cfg(feature = "waveform")]
+                    let restored_waveform_selection =
+                        self.view.waveform_visible.then_some(self.view.selected);
                     let restored = PathBuf::from(&self.view.local_path);
                     let directory = if !self.view.local_path.is_empty() && restored.is_dir() {
                         restored
@@ -14082,6 +15192,16 @@ impl AppController {
                         default_local_browse_root()
                     };
                     self.browse_local_directory(directory);
+                    #[cfg(feature = "waveform")]
+                    if self.view.local_browse_pending
+                        && let Some(selected) = restored_waveform_selection
+                    {
+                        // Initial Local navigation is asynchronous. Retain the
+                        // restart-safe row separately until its matching
+                        // listing replaces the empty startup view.
+                        self.pending_restored_local_waveform_selection =
+                            Some((self.local_generation, selected));
+                    }
                 }
             }
             Screen::Subscriptions => self.populate_subscriptions(),
@@ -16247,10 +17367,7 @@ impl AppController {
                 }
             };
             self.view.rows.push(RowView {
-                media_id: Some(MediaId::new(
-                    SourceKind::Local,
-                    entry_path.display().to_string(),
-                )),
+                media_id: Some(local_media_id(&entry_path)),
                 title: entry.file_name().to_string_lossy().into_owned(),
                 subtitle: human_bytes(size),
                 source: "Local download".to_owned(),
@@ -16287,7 +17404,10 @@ impl AppController {
             self.view.details = None;
             return;
         };
-        let path = PathBuf::from(&media_id.external_id);
+        let Some(path) = local_path_from_media_id(&media_id) else {
+            self.view.details = None;
+            return;
+        };
         let local_video = crate::local_browser::classify_local_file(&path)
             == Some(crate::local_browser::LocalEntryKind::Video);
         let (description, length, local_video_thumbnail, metadata_pending) = if local_video {
@@ -18707,6 +19827,19 @@ impl AppController {
         }
     }
 
+    /// Cancels, stops, and joins the dedicated local waveform worker.
+    #[cfg(feature = "waveform")]
+    fn shutdown_local_waveform_worker(&mut self) {
+        self.cancel_local_waveform();
+        if let Some(sender) = self.local_waveform_requests.take() {
+            let _ = sender.send(LocalWaveformWorkerRequest::Shutdown);
+        }
+        if let Some(handle) = self.local_waveform_thread.take() {
+            let _ = handle.join();
+        }
+        while self.local_waveform_responses.try_recv().is_ok() {}
+    }
+
     fn save_session(&mut self) -> bool {
         self.save_session_with_local_move_attempt(
             #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -18805,7 +19938,7 @@ impl AppController {
             bandcamp_search_text: self.bandcamp_search_query.clone(),
             apple_podcasts_search_text: self.apple_podcasts_search_query.clone(),
             local_path: (!self.view.local_path.is_empty()).then(|| self.view.local_path.clone()),
-            waveform_visible: self.view.right_panel_mode == RightPanelMode::Waveform,
+            waveform_visible: self.view.waveform_visible,
             chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
             ..SessionState::default()
         };
@@ -18852,6 +19985,8 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        #[cfg(feature = "waveform")]
+        self.shutdown_local_waveform_worker();
         self.shutdown_local_browse_worker();
         #[cfg(feature = "radio")]
         self.finalize_radio_recording_for_shutdown();
@@ -19167,6 +20302,19 @@ impl UiController for AppController {
             UiAction::ActivateTimecode { media_id, seconds } => {
                 self.activate_timecode(media_id, seconds);
             }
+            UiAction::ActivateWaveformTimecode {
+                media_id,
+                generation,
+                seconds,
+            } => {
+                #[cfg(feature = "waveform")]
+                self.activate_local_waveform_timecode(media_id, generation, seconds);
+                #[cfg(not(feature = "waveform"))]
+                {
+                    let _ = (media_id, generation, seconds);
+                    self.view.status_line = "This build omits local waveform support".to_owned();
+                }
+            }
             UiAction::ActivateDescriptionVideo {
                 video_id,
                 start_seconds,
@@ -19198,6 +20346,7 @@ impl UiController for AppController {
                     }
                 );
             }
+            UiAction::ToggleWaveform => self.toggle_waveform(),
             UiAction::ToggleRepeat => {
                 if self
                     .current_media
@@ -19467,6 +20616,8 @@ impl UiController for AppController {
         }
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "waveform")]
+        self.drain_local_waveform_responses();
         self.drain_local_browse_responses(true);
         loop {
             match self.provider_responses.try_recv() {
@@ -19507,6 +20658,8 @@ impl UiController for AppController {
         self.update_youtube_prewarm_for_imminent_next(Instant::now());
         #[cfg(feature = "radio")]
         self.request_due_radio_now_playing(now);
+        #[cfg(feature = "waveform")]
+        self.synchronize_local_waveform();
         if self.session_dirty && self.last_session_save.elapsed() >= Duration::from_secs(30) {
             self.save_session();
         }
@@ -19688,6 +20841,44 @@ fn local_browse_worker(
     }
 }
 
+/// Resolves local waveform requests serially so FFmpeg work cannot block UI or
+/// general provider operations.
+#[cfg(feature = "waveform")]
+fn local_waveform_worker(
+    requests: Receiver<LocalWaveformWorkerRequest>,
+    responses: Sender<LocalWaveformWorkerResponse>,
+    extractor: Arc<dyn LocalWaveformExtractor>,
+) {
+    while let Ok(command) = requests.recv() {
+        let LocalWaveformWorkerRequest::Generate {
+            generation,
+            request,
+            cancellation,
+        } = command
+        else {
+            break;
+        };
+        let path = request.path().to_owned();
+        let result = extractor.extract(&request, &cancellation);
+        if responses
+            .send(LocalWaveformWorkerResponse {
+                generation,
+                path,
+                result,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Estimates retained peak storage for RAM-cache byte eviction.
+#[cfg(feature = "waveform")]
+fn waveform_pyramid_bytes(pyramid: &crate::waveform::PeakPyramid) -> usize {
+    pyramid.retained_bytes()
+}
+
 /// Adds one independently actionable Local move message to a popup payload.
 #[cfg(feature = "local-move")]
 fn append_local_move_message(message: &mut Option<String>, addition: String) {
@@ -19831,11 +21022,11 @@ fn remap_local_queue_item(item: &mut QueueItem, mappings: &[LocalMoveMapping]) {
     if item.media.id.source != SourceKind::Local {
         return;
     }
-    if let Some(path) =
-        crate::local_move::remap_local_path_prefix(Path::new(&item.playback_location), mappings)
-        && let Some(path_text) = path.to_str()
+    if let Some(path) = local_path_from_locator(&item.playback_location)
+        .and_then(|path| crate::local_move::remap_local_path_prefix(&path, mappings))
+        && let Ok(url) = url::Url::from_file_path(path)
     {
-        item.playback_location = path_text.to_owned();
+        item.playback_location = url.to_string();
     }
     if let Ok(path) = item.media.webpage_url.to_file_path()
         && let Some(remapped) = crate::local_move::remap_local_path_prefix(&path, mappings)
@@ -21503,7 +22694,7 @@ fn parse_local_ffprobe_output(path: &Path, payload: &[u8]) -> Option<LocalTechni
             .and_then(|stream| stream.channels)
             .and_then(|channels| u8::try_from(channels).ok())
             .filter(|channels| *channels > 0),
-        duration_seconds: format
+        duration: format
             .and_then(|format| format.duration.as_deref())
             .and_then(parse_local_probe_duration),
     })
@@ -21584,13 +22775,12 @@ fn parse_local_probe_bitrate(value: &str) -> Option<u32> {
     u32::try_from(kilobits).ok().filter(|bitrate| *bitrate > 0)
 }
 
-/// Converts a finite positive decimal duration to whole seconds.
-fn parse_local_probe_duration(value: &str) -> Option<u64> {
+/// Converts a finite positive decimal duration without discarding its tail.
+fn parse_local_probe_duration(value: &str) -> Option<Duration> {
     let seconds = value.parse::<f64>().ok()?;
     Duration::try_from_secs_f64(seconds)
         .ok()
-        .map(|duration| duration.as_secs())
-        .filter(|seconds| *seconds > 0)
+        .filter(|duration| !duration.is_zero())
 }
 
 /// Returns the best-effort container label available without a media probe.
@@ -21652,9 +22842,18 @@ fn apply_local_technical_metadata(item: &mut LocalMediaItem, metadata: LocalTech
     if let Some(channels) = metadata.channels {
         item.channels = Some(channels);
     }
-    if let Some(duration_seconds) = metadata.duration_seconds {
-        item.duration_seconds = Some(duration_seconds);
+    if let Some(duration) = metadata.duration {
+        set_local_media_duration(item, duration);
     }
+}
+
+/// Stores one precise duration while preserving the existing whole-second UI model.
+fn set_local_media_duration(item: &mut LocalMediaItem, duration: Duration) {
+    item.precise_duration = (!duration.is_zero()).then_some(duration);
+    item.duration_seconds = item
+        .precise_duration
+        .map(|duration| duration.as_secs())
+        .filter(|seconds| *seconds > 0);
 }
 
 /// Reads one local item and enriches it through the installed media probe.
@@ -21703,6 +22902,7 @@ fn local_media_item_stub(path: PathBuf, known_size_bytes: Option<u64>) -> LocalM
         comment: None,
         metadata_url: None,
         acoustid_id: None,
+        precise_duration: None,
         duration_seconds: None,
         size_bytes,
         container,
@@ -21766,8 +22966,7 @@ fn read_local_tags(item: &mut LocalMediaItem) {
         return;
     };
     let properties = tagged.properties();
-    item.duration_seconds =
-        (!properties.duration().is_zero()).then(|| properties.duration().as_secs());
+    set_local_media_duration(item, properties.duration());
     item.bitrate_kbps = properties.audio_bitrate().or(properties.overall_bitrate());
     item.sample_rate_hz = properties.sample_rate();
     item.channels = properties.channels();
@@ -21828,8 +23027,7 @@ fn read_local_mpeg_tags(item: &mut LocalMediaItem) -> bool {
         return false;
     };
     let properties = mpeg.properties();
-    item.duration_seconds =
-        (!properties.duration().is_zero()).then(|| properties.duration().as_secs());
+    set_local_media_duration(item, properties.duration());
     item.bitrate_kbps = (properties.audio_bitrate() > 0)
         .then(|| properties.audio_bitrate())
         .or_else(|| (properties.overall_bitrate() > 0).then(|| properties.overall_bitrate()));
@@ -22060,8 +23258,7 @@ fn read_local_flac_tags(item: &mut LocalMediaItem) -> bool {
         return false;
     };
     let properties = flac.properties();
-    item.duration_seconds =
-        (!properties.duration().is_zero()).then(|| properties.duration().as_secs());
+    set_local_media_duration(item, properties.duration());
     item.bitrate_kbps = (properties.audio_bitrate() > 0)
         .then(|| properties.audio_bitrate())
         .or_else(|| (properties.overall_bitrate() > 0).then(|| properties.overall_bitrate()));
@@ -24073,11 +25270,8 @@ fn history_replay_locator(item: &QueueItem) -> Option<String> {
     // removing query secrets from identity/progress needs a separate migration.
     match item.media.id.source {
         SourceKind::Local => {
-            let path = Path::new(&item.media.id.external_id);
-            (path.is_absolute()
-                && !item.media.id.external_id.is_empty()
-                && item.media.id.external_id.len() <= MAX_HISTORY_REPLAY_LOCATOR_BYTES)
-                .then(|| item.media.id.external_id.clone())
+            let path = local_path_from_media_id(&item.media.id)?;
+            local_replay_locator(&path)
         }
         SourceKind::YouTube => validate_youtube_video_id(&item.media.id.external_id)
             .is_ok()
@@ -24127,8 +25321,7 @@ fn ensure_playlist_snapshot_available(snapshot: &PlaylistMediaSnapshot) -> Resul
     if snapshot.id.source != SourceKind::Local {
         return Ok(());
     }
-    let path = Path::new(&snapshot.replay_locator);
-    if path.is_absolute() && path.is_file() {
+    if local_path_from_locator(&snapshot.replay_locator).is_some_and(|path| path.is_file()) {
         Ok(())
     } else {
         Err("The local playlist file was removed or moved".to_owned())
@@ -24193,10 +25386,8 @@ fn history_replay_target(entry: &HistoryEntry) -> Result<HistoryReplayTarget, St
         if locator.is_empty() || locator.len() > MAX_HISTORY_REPLAY_LOCATOR_BYTES {
             return Err("The saved local path is empty or exceeds the supported limit".to_owned());
         }
-        let path = PathBuf::from(locator);
-        if !path.is_absolute() {
-            return Err("The saved local path is not absolute".to_owned());
-        }
+        let path = local_path_from_locator(locator)
+            .ok_or_else(|| "The saved local path is not absolute".to_owned())?;
         return Ok(HistoryReplayTarget::Local(path));
     }
 
@@ -24256,17 +25447,16 @@ fn queue_item_from_playlist_entry(entry: &PlaylistEntry) -> Result<QueueItem, St
     }
 
     let (webpage_url, playback_location) = if entry.media.id.source == SourceKind::Local {
-        let path = PathBuf::from(&entry.media.replay_locator);
-        if !path.is_absolute() {
-            return Err("The saved local playlist path is not absolute".to_owned());
-        }
+        let path = local_path_from_locator(&entry.media.replay_locator)
+            .ok_or_else(|| "The saved local playlist path is not absolute".to_owned())?;
         let webpage_url = url::Url::from_file_path(&path).map_err(|()| {
             format!(
                 "The saved local playlist path cannot be represented as a file URL: {}",
                 path.display()
             )
         })?;
-        (webpage_url, path.to_string_lossy().into_owned())
+        let playback_location = webpage_url.to_string();
+        (webpage_url, playback_location)
     } else if entry.media.id.source == SourceKind::YouTube {
         validate_youtube_video_id(&entry.media.id.external_id)
             .map_err(|_| "The saved YouTube playlist identifier is invalid".to_owned())?;
@@ -24343,9 +25533,10 @@ fn queue_item_from_history(
                     path.display()
                 )
             })?;
+            let playback_location = webpage_url.to_string();
             (
                 webpage_url,
-                path.display().to_string(),
+                playback_location,
                 path.to_string_lossy().into_owned(),
             )
         }
@@ -24410,7 +25601,19 @@ fn video_is_autoplay_playable(video: &VideoSummary) -> bool {
 
 /// Matches the stable local path encoded in a queue media identifier.
 fn local_path_matches_media_id(path: &Path, media_id: &MediaId) -> bool {
-    media_id.source == SourceKind::Local && path.display().to_string() == media_id.external_id
+    local_path_from_media_id(media_id).as_deref() == Some(path)
+}
+
+/// Decodes one exact local backend locator without interpreting remote URLs.
+#[cfg(feature = "waveform")]
+fn local_playback_path(location: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(location) {
+        return (url.scheme() == "file")
+            .then(|| url.to_file_path().ok())
+            .flatten();
+    }
+    let path = PathBuf::from(location);
+    path.is_absolute().then_some(path)
 }
 
 /// Matches a prepared tracker row without relying on a possibly duplicated
@@ -24770,6 +25973,59 @@ fn canonical_apple_episode_url(
         .then_some(url)
 }
 
+/// Builds a stable, lossless identity for one absolute Local path.
+///
+/// A file URL preserves non-UTF-8 Unix path bytes through percent encoding,
+/// unlike `Path::display()`, which may merge distinct files through replacement
+/// characters. The byte fallback keeps identity distinct if a caller supplies
+/// a path that cannot be represented as an absolute file URL.
+fn local_media_id(path: &Path) -> MediaId {
+    let external_id = url::Url::from_file_path(path).map_or_else(
+        |()| {
+            use std::fmt::Write as _;
+
+            let mut encoded = String::from("path-bytes:");
+            for byte in path.as_os_str().as_encoded_bytes() {
+                let _ = write!(encoded, "{byte:02X}");
+            }
+            encoded
+        },
+        |url| url.to_string(),
+    );
+    MediaId::new(SourceKind::Local, external_id)
+}
+
+/// Recovers an exact Local path from a current file-URL or legacy path locator.
+fn local_path_from_locator(locator: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(locator)
+        && url.scheme() == "file"
+    {
+        return url.to_file_path().ok();
+    }
+    let path = PathBuf::from(locator);
+    path.is_absolute().then_some(path)
+}
+
+/// Recovers the exact path carried by a Local media identity.
+fn local_path_from_media_id(media_id: &MediaId) -> Option<PathBuf> {
+    (media_id.source == SourceKind::Local)
+        .then(|| local_path_from_locator(&media_id.external_id))
+        .flatten()
+}
+
+/// Produces a readable Local replay locator without losing non-UTF-8 bytes.
+fn local_replay_locator(path: &Path) -> Option<String> {
+    let locator = path.to_str().map_or_else(
+        || {
+            url::Url::from_file_path(path)
+                .ok()
+                .map(|url| url.to_string())
+        },
+        |path| Some(path.to_owned()),
+    )?;
+    (!locator.is_empty() && locator.len() <= MAX_HISTORY_REPLAY_LOCATOR_BYTES).then_some(locator)
+}
+
 fn queue_item_from_local(item: &LocalMediaItem) -> Result<QueueItem, String> {
     let webpage_url = url::Url::from_file_path(&item.path).map_err(|()| {
         format!(
@@ -24777,9 +26033,10 @@ fn queue_item_from_local(item: &LocalMediaItem) -> Result<QueueItem, String> {
             item.path.display()
         )
     })?;
+    let playback_location = webpage_url.to_string();
     Ok(QueueItem {
         media: MediaItem {
-            id: MediaId::new(SourceKind::Local, item.path.display().to_string()),
+            id: local_media_id(&item.path),
             kind: media_kind_for_source(&SourceKind::Local, &item.path.to_string_lossy()),
             title: item.title.clone(),
             creator: item.artist.clone(),
@@ -24793,7 +26050,7 @@ fn queue_item_from_local(item: &LocalMediaItem) -> Result<QueueItem, String> {
             chapters: Vec::new(),
             captions: Vec::new(),
         },
-        playback_location: item.path.display().to_string(),
+        playback_location,
         start_at_seconds: None,
         added_at: unix_time(),
     })
@@ -25427,6 +26684,7 @@ mod tests {
         fn load(&self, path: PathBuf) -> LocalMediaItem {
             assert_eq!(path, self.expected_path);
             let mut item = local_media_item_stub(path, None);
+            item.precise_duration = Some(Duration::from_secs(self.duration_seconds));
             item.duration_seconds = Some(self.duration_seconds);
             item.technical_metadata_probed = true;
             item
@@ -25927,7 +27185,7 @@ mod tests {
             "Fixture module",
         );
 
-        let local_id = MediaId::new(SourceKind::Local, "/tmp/fixture.opus");
+        let local_id = local_media_id(Path::new("/tmp/fixture.opus"));
         controller.view.screen = Screen::Local;
         controller.view.details = Some(DetailView {
             media_id: Some(local_id.clone()),
@@ -26491,7 +27749,7 @@ mod tests {
         config.ensure_directories().expect("private Youta folders");
         let path = config.downloads_dir().join("fixture.opus");
         std::fs::write(&path, b"fixture media").expect("download fixture");
-        let media_id = MediaId::new(SourceKind::Local, path.to_string_lossy());
+        let media_id = local_media_id(&path);
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
 
@@ -26520,7 +27778,12 @@ mod tests {
 
         let playback = playback.lock().expect("mock playback");
         assert_eq!(playback.played.len(), 1);
-        assert_eq!(playback.played[0].location, path.to_string_lossy());
+        assert_eq!(
+            playback.played[0].location,
+            url::Url::from_file_path(&path)
+                .expect("downloaded fixture playback URL")
+                .to_string()
+        );
     }
 
     #[cfg(feature = "local-trash")]
@@ -27285,7 +28548,7 @@ mod tests {
         std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
         let webpage_url = url::Url::from_file_path(&video).expect("absolute local file URL");
         let snapshot = PlaylistMediaSnapshot {
-            id: MediaId::new(SourceKind::Local, video.to_string_lossy()),
+            id: local_media_id(&video),
             kind: MediaKind::Video,
             title: "Playlist MOV".to_owned(),
             creator: None,
@@ -27360,7 +28623,7 @@ mod tests {
         std::fs::write(&path, b"fixture media").expect("fixture file");
         let webpage_url = url::Url::from_file_path(&path).expect("absolute local file URL");
         let snapshot = PlaylistMediaSnapshot {
-            id: MediaId::new(SourceKind::Local, path.to_string_lossy()),
+            id: local_media_id(&path),
             kind: MediaKind::Audio,
             title: "fixture.opus".to_owned(),
             creator: None,
@@ -27826,7 +29089,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = config.downloads_dir().join("restart fixture.opus");
-        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let media_id = local_media_id(&track);
         {
             let store = StateStore::open(&config).expect("disk state");
             std::fs::write(&track, b"fixture").expect("downloaded media fixture");
@@ -32569,8 +33832,8 @@ mod tests {
         let source = media_directory.join("before.flac");
         let target = media_directory.join("after.flac");
         std::fs::write(&source, b"fixture audio").expect("source fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let snapshot = playlist_snapshot_from_queue_item(
             &queue_item_from_local(&local_media_item(source.clone())).expect("local queue item"),
         )
@@ -32696,7 +33959,9 @@ mod tests {
                 .first()
                 .expect("playlist replay")
                 .location,
-            target.to_string_lossy()
+            url::Url::from_file_path(&target)
+                .expect("renamed playlist playback URL")
+                .to_string()
         );
     }
 
@@ -32897,8 +34162,8 @@ mod tests {
         let source = source_directory.join("song.flac");
         let target = destination_directory.join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let (mut controller, _state) = controller_with_mock_statuses([]);
         controller.local_progress_cache.insert(
             source_id,
@@ -32970,8 +34235,8 @@ mod tests {
         let source = source_directory.join("song.flac");
         let target = destination_directory.join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let (mut controller, _state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
         controller
@@ -33109,7 +34374,7 @@ mod tests {
         controller.local_listing = Some(listing);
         controller.refresh_local_browser_rows();
         controller.select_local_path(Some(&source));
-        let old_id = MediaId::new(SourceKind::Local, source.display().to_string());
+        let old_id = local_media_id(&source);
         controller.current_media = Some(old_id.clone());
         controller.view.playing_media_id = Some(old_id.clone());
         controller.local_progress_cache.insert(
@@ -33167,7 +34432,7 @@ mod tests {
         );
         assert!(controller.view.local_file_popup.is_none());
         assert!(!controller.local_move_execution_pending);
-        let target_id = MediaId::new(SourceKind::Local, target.display().to_string());
+        let target_id = local_media_id(&target);
         assert_eq!(controller.current_media.as_ref(), Some(&target_id));
         assert_eq!(controller.view.playing_media_id.as_ref(), Some(&target_id));
         assert_eq!(
@@ -33197,8 +34462,8 @@ mod tests {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("moved/source.flac");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping {
             source: source.clone(),
             target: target.clone(),
@@ -33261,8 +34526,8 @@ mod tests {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping { source, target };
         let (mut controller, _state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
@@ -33320,8 +34585,8 @@ mod tests {
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         std::fs::write(&target, b"moved audio").expect("moved Local fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping {
             source,
             target: target.clone(),
@@ -33384,8 +34649,8 @@ mod tests {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping { source, target };
         let (mut controller, _state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
@@ -33448,8 +34713,8 @@ mod tests {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping { source, target };
         let (mut controller, _state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
@@ -33669,8 +34934,8 @@ mod tests {
         let source = source_directory.join("song.flac");
         let target = destination_directory.join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let plan = crate::local_move::validate_local_move(
             &source_directory,
             std::slice::from_ref(&source),
@@ -33793,9 +35058,8 @@ mod tests {
         let untouched_target = destination_directory.join("untouched.flac");
         std::fs::write(&completed_source, b"done").expect("completed source");
         std::fs::write(&untouched_source, b"untouched").expect("untouched source");
-        let completed_id = MediaId::new(SourceKind::Local, completed_source.to_string_lossy());
-        let completed_target_id =
-            MediaId::new(SourceKind::Local, completed_target.to_string_lossy());
+        let completed_id = local_media_id(&completed_source);
+        let completed_target_id = local_media_id(&completed_target);
         let mappings = vec![
             LocalMoveMapping {
                 source: completed_source.clone(),
@@ -33858,8 +35122,8 @@ mod tests {
         let source = source_directory.join("song.flac");
         let target = destination_directory.join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
-        let source_id = MediaId::new(SourceKind::Local, source.to_string_lossy());
-        let target_id = MediaId::new(SourceKind::Local, target.to_string_lossy());
+        let source_id = local_media_id(&source);
+        let target_id = local_media_id(&target);
         let mapping = LocalMoveMapping {
             source: source.clone(),
             target: target.clone(),
@@ -33988,7 +35252,7 @@ mod tests {
         controller.local_listing = Some(listing.clone());
         controller.hydrate_local_progress_cache();
         controller.refresh_local_browser_rows();
-        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let media_id = local_media_id(&track);
         let row_index = controller
             .view
             .rows
@@ -34198,6 +35462,7 @@ mod tests {
         assert_eq!(probe.calls, 1);
         assert_eq!(item.container, "WebM");
         assert_eq!(item.codec, "Opus");
+        assert_eq!(item.precise_duration, Some(Duration::from_millis(42_750)));
         assert_eq!(item.duration_seconds, Some(42));
         assert_eq!(item.bitrate_kbps, Some(128));
         assert_eq!(item.sample_rate_hz, Some(48_000));
@@ -34208,6 +35473,20 @@ mod tests {
         let subtitle = local_media_subtitle(&item);
         assert!(subtitle.contains("Opus"));
         assert!(!subtitle.contains("WEBM"));
+    }
+
+    #[test]
+    fn local_probe_duration_retains_fractional_and_subsecond_timelines() {
+        assert_eq!(
+            parse_local_probe_duration("1.900000"),
+            Some(Duration::from_millis(1_900))
+        );
+        assert_eq!(
+            parse_local_probe_duration("0.900000"),
+            Some(Duration::from_millis(900))
+        );
+        assert_eq!(parse_local_probe_duration("0"), None);
+        assert_eq!(parse_local_probe_duration("N/A"), None);
     }
 
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
@@ -34387,7 +35666,7 @@ mod tests {
                         bitrate_kbps: Some(128),
                         sample_rate_hz: Some(48_000),
                         channels: Some(2),
-                        duration_seconds: Some(42),
+                        duration: Some(Duration::from_secs(42)),
                     },
                 );
                 item.technical_metadata_probed = true;
@@ -34505,6 +35784,1695 @@ mod tests {
                     .join(format!("{MAX_CACHED_LOCAL_MEDIA_ITEMS}.flac"))
             )
         );
+    }
+
+    /// Seeds one exact Local fixture duration in the controller's metadata cache.
+    #[cfg(feature = "waveform")]
+    fn cache_local_waveform_fixture_metadata(
+        controller: &mut AppController,
+        media_path: &Path,
+        duration: Duration,
+    ) {
+        let size_bytes = std::fs::metadata(media_path)
+            .expect("waveform fixture metadata")
+            .len();
+        let mut item = local_media_item_stub(media_path.to_owned(), Some(size_bytes));
+        set_local_media_duration(&mut item, duration);
+        item.sample_rate_hz = Some(48_000);
+        item.channels = Some(2);
+        item.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(media_path).expect("waveform fixture identity"),
+            item,
+        );
+    }
+
+    /// Selects one fixture through the real Local listing and seeds exact metadata.
+    #[cfg(feature = "waveform")]
+    fn select_local_waveform_fixture(
+        controller: &mut AppController,
+        directory: &Path,
+        media_path: &Path,
+        duration: Duration,
+    ) -> MediaId {
+        let listing = crate::local_browser::list_local_directory(
+            directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local waveform listing");
+        let entry_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == media_path)
+            .expect("waveform fixture in Local listing");
+        controller.view.screen = Screen::Local;
+        controller.view.selected =
+            entry_index.saturating_add(usize::from(listing.parent.is_some()));
+        controller.local_listing = Some(listing);
+        controller.rebuild_local_browser_rows();
+        cache_local_waveform_fixture_metadata(controller, media_path, duration);
+        controller.update_local_browser_detail();
+        local_media_id(media_path)
+    }
+
+    /// Publishes a small identity-bound waveform for one selected Local fixture.
+    #[cfg(feature = "waveform")]
+    fn show_local_waveform_fixture(
+        controller: &mut AppController,
+        media_id: MediaId,
+        media_path: &Path,
+        duration: Duration,
+    ) -> u64 {
+        let request = LocalWaveformRequest::from_path(media_path.to_owned())
+            .expect("selected Local waveform request");
+        let key = LocalWaveformCacheKey {
+            path: media_path.to_owned(),
+            identity: request.identity().clone(),
+            timeline_duration: duration,
+        };
+        let pyramid = Arc::new(crate::waveform::PeakPyramid::from_peaks(
+            vec![crate::waveform::Peak {
+                minimum: -1,
+                maximum: 1,
+            }],
+            1,
+            1,
+        ));
+        controller.view.waveform_visible = true;
+        controller.show_ready_local_waveform(media_id, key, duration, pyramid);
+        controller.local_waveform_display_generation
+    }
+
+    #[cfg(not(feature = "waveform"))]
+    #[test]
+    fn omitted_waveform_feature_leaves_the_seek_bar_visible() {
+        let fixture = tempfile::tempdir().expect("temporary omitted-waveform fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"local audio").expect("write omitted-waveform fixture");
+        let media_id = local_media_id(&media_path);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("omitted-waveform Local listing");
+        let entry_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == media_path)
+            .expect("omitted-waveform fixture in listing");
+        controller.view.screen = Screen::Local;
+        controller.view.selected =
+            entry_index.saturating_add(usize::from(listing.parent.is_some()));
+        controller.local_listing = Some(listing);
+        controller.view.details = Some(DetailView {
+            media_id: Some(media_id),
+            title: "Local fixture".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::ToggleWaveform);
+
+        assert!(!controller.view.waveform_visible);
+        assert_eq!(controller.view.waveform, WaveformView::Unavailable);
+        assert_eq!(
+            controller.view.status_line,
+            "This build omits local waveform support"
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn restored_waveform_waits_for_delayed_initial_local_listing() {
+        let fixture = tempfile::tempdir().expect("temporary restored waveform folder");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"restored local audio")
+            .expect("write restored waveform fixture");
+        let media_id = local_media_id(&media_path);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.local_path = fixture.path().display().to_string();
+        controller.view.selected = 1;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = true;
+        controller.view.waveform = WaveformView::Unavailable;
+        controller.config.ui.show_local_folder_sizes = false;
+        controller.view.local_folder_sizes_enabled = false;
+        controller.local_listing = None;
+        controller.view.rows.clear();
+        controller.view.details = None;
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.populate_local_screen();
+
+        assert!(controller.view.local_browse_pending);
+        assert_eq!(
+            controller.pending_restored_local_waveform_selection,
+            Some((controller.local_generation, 1)),
+            "the saved row must remain generation-bound until its listing arrives"
+        );
+        controller.synchronize_local_waveform();
+        assert!(
+            controller.view.waveform_visible,
+            "an empty pre-listing Details owner must not discard the restored waveform"
+        );
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            ..
+        } = captured.try_recv().expect("initial Local browse request")
+        else {
+            panic!("expected a Local browse request");
+        };
+        let listing = crate::local_browser::list_local_directory(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("restored Local listing");
+
+        controller.handle_local_browse_response(LocalBrowseResponse::Browse {
+            generation,
+            result: Ok(listing),
+        });
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(media_path.as_path()),
+            "the completed listing must reconstruct the saved local selection"
+        );
+        controller.synchronize_local_waveform();
+        assert!(controller.view.waveform_visible);
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Loading { media_id: owner } if owner == &media_id
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn waveform_visibility_persists_independently_of_details_panel() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = true;
+
+        assert!(controller.save_session());
+
+        let saved = controller
+            .store
+            .session()
+            .expect("saved waveform session")
+            .expect("active waveform session");
+        assert!(saved.waveform_visible);
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn detail_navigation_snapshot_restores_waveform_visibility() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = true;
+        controller.view.details = Some(DetailView {
+            title: "Local details".to_owned(),
+            ..DetailView::default()
+        });
+
+        let snapshot = controller.take_detail_navigation_snapshot();
+        controller.view.waveform_visible = false;
+        controller.restore_detail_navigation_snapshot(snapshot);
+
+        assert!(controller.view.waveform_visible);
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Local details")
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn non_local_waveform_toggle_keeps_details_visible() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = false;
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+            title: "Remote fixture".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::ToggleWaveform);
+
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Details);
+        assert!(!controller.view.waveform_visible);
+        assert_eq!(controller.view.waveform, WaveformView::Unavailable);
+        assert_eq!(
+            controller.view.status_line,
+            "Waveform is available for playable local files only"
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_toggle_preserves_right_panel_and_cancels_request() {
+        let fixture = tempfile::tempdir().expect("temporary waveform fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"mock local audio").expect("write local waveform fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            Duration::from_secs(42),
+        );
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.waveform_visible = false;
+
+        controller.dispatch(UiAction::ToggleWaveform);
+
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Channel);
+        assert!(controller.view.waveform_visible);
+        assert_eq!(
+            controller.view.waveform,
+            WaveformView::Loading {
+                media_id: media_id.clone()
+            }
+        );
+        let cancellation = controller
+            .pending_local_waveform
+            .as_ref()
+            .expect("pending local waveform")
+            .cancellation
+            .clone();
+        assert!(!cancellation.is_cancelled());
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+
+        controller.dispatch(UiAction::ToggleWaveform);
+
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Channel);
+        assert!(!controller.view.waveform_visible);
+        assert_eq!(controller.view.waveform, WaveformView::Unavailable);
+        assert!(controller.pending_local_waveform.is_none());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(controller.view.status_line, "Showing seek bar");
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_request_keeps_fractional_and_subsecond_duration() {
+        for duration in [Duration::from_millis(1_900), Duration::from_millis(900)] {
+            let fixture = tempfile::tempdir().expect("temporary duration fixture");
+            let media_path = fixture.path().join("short.flac");
+            std::fs::write(&media_path, b"short local audio")
+                .expect("write short waveform fixture");
+            let (mut controller, _state) = controller_with_mock_statuses([]);
+            controller.shutdown_local_waveform_worker();
+            let (requests, captured_requests) = bounded(1);
+            controller.local_waveform_requests = Some(requests);
+            controller.local_waveform_request_drain = captured_requests.clone();
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+
+            controller.dispatch(UiAction::ToggleWaveform);
+
+            let LocalWaveformWorkerRequest::Generate { request, .. } = captured_requests
+                .try_recv()
+                .expect("fractional waveform request")
+            else {
+                panic!("expected waveform generation request");
+            };
+            assert_eq!(request.timeline_duration(), Some(duration));
+            assert_eq!(request.sample_rate_hz(), Some(48_000));
+            assert_eq!(request.audio_channels(), Some(2));
+            assert_eq!(
+                controller
+                    .pending_local_waveform
+                    .as_ref()
+                    .map(|pending| pending.duration),
+                Some(duration)
+            );
+        }
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn active_local_waveform_click_accepts_fractional_duration_interior() {
+        for (duration, seconds) in [
+            (Duration::from_millis(1_900), 1),
+            (Duration::from_millis(900), 0),
+        ] {
+            let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+            let media_path = fixture.path().join("short.flac");
+            std::fs::write(&media_path, b"short local audio")
+                .expect("write active waveform fixture");
+            let mut item =
+                local_media_item_stub(media_path.clone(), Some(b"short local audio".len() as u64));
+            set_local_media_duration(&mut item, duration);
+            item.technical_metadata_probed = true;
+            let queue_item = queue_item_from_local(&item).expect("active Local queue item");
+            let media_id = queue_item.media.id.clone();
+            let (mut controller, state) = controller_with_mock_statuses([]);
+            controller.play_queue_item(queue_item, false);
+            controller.view.playback.duration = Some(duration);
+            state.lock().expect("mock state").commands.clear();
+
+            controller.dispatch(UiAction::ActivateTimecode { media_id, seconds });
+
+            assert_eq!(
+                state.lock().expect("mock state").commands,
+                [PlayerCommand::SeekAbsolute(Duration::from_secs(seconds))]
+            );
+        }
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn inactive_local_waveform_click_starts_selected_file_at_requested_second() {
+        for (duration, seconds) in [
+            (Duration::from_millis(1_900), 1),
+            (Duration::from_millis(900), 0),
+        ] {
+            for play_another_local_file in [false, true] {
+                let fixture = tempfile::tempdir().expect("temporary inactive waveform fixture");
+                let selected_path = fixture.path().join("selected.flac");
+                let other_path = fixture.path().join("other.flac");
+                std::fs::write(&selected_path, b"selected local audio")
+                    .expect("write selected waveform fixture");
+                std::fs::write(&other_path, b"other local audio")
+                    .expect("write other waveform fixture");
+                let (mut controller, state) = controller_with_mock_statuses([]);
+                if play_another_local_file {
+                    let other =
+                        local_media_item_stub(other_path, Some(b"other local audio".len() as u64));
+                    controller.play_queue_item(
+                        queue_item_from_local(&other).expect("other Local queue item"),
+                        false,
+                    );
+                }
+                let media_id = select_local_waveform_fixture(
+                    &mut controller,
+                    fixture.path(),
+                    &selected_path,
+                    duration,
+                );
+                let generation = show_local_waveform_fixture(
+                    &mut controller,
+                    media_id.clone(),
+                    &selected_path,
+                    duration,
+                );
+
+                controller.dispatch(UiAction::ActivateWaveformTimecode {
+                    media_id: media_id.clone(),
+                    generation,
+                    seconds,
+                });
+
+                let state = state.lock().expect("mock state");
+                let played = state.played.last().expect("selected Local playback");
+                assert_eq!(played.start_at, Duration::from_secs(seconds));
+                assert_eq!(
+                    played.location,
+                    url::Url::from_file_path(&selected_path)
+                        .expect("selected Local playback URL")
+                        .to_string()
+                );
+                assert_eq!(controller.current_media.as_ref(), Some(&media_id));
+                assert_eq!(
+                    state.played.len(),
+                    usize::from(play_another_local_file).saturating_add(1)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn active_identity_bound_local_waveform_click_seeks_without_restarting() {
+        let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+        let media_path = fixture.path().join("active.flac");
+        std::fs::write(&media_path, b"active local audio").expect("write active waveform fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        controller.activate_local_browser_selection();
+        controller.view.playback.duration = Some(duration);
+        let generation =
+            show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(
+            state.commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(21))]
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_duration_tolerance_accepts_only_subsecond_rounding() {
+        let waveform_duration = Duration::from_secs(42);
+        for (playback_duration, expected) in [
+            (None, false),
+            (Some(Duration::from_secs(42)), true),
+            (Some(Duration::from_millis(41_001)), true),
+            (Some(Duration::from_millis(42_999)), true),
+            (Some(Duration::from_secs(41)), false),
+            (Some(Duration::from_secs(43)), false),
+            (Some(Duration::from_millis(40_999)), false),
+        ] {
+            assert_eq!(
+                local_waveform_playback_duration_matches(waveform_duration, playback_duration),
+                expected,
+                "duration compatibility must accept only strict subsecond differences"
+            );
+        }
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn active_local_waveform_accepts_subsecond_backend_duration_rounding() {
+        let fixture = tempfile::tempdir().expect("temporary rounded-duration fixture");
+        let media_path = fixture.path().join("rounded.flac");
+        std::fs::write(&media_path, b"rounded local audio")
+            .expect("write rounded-duration fixture");
+        let waveform_duration = Duration::from_millis(42_750);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            waveform_duration,
+        );
+        controller.activate_local_browser_selection();
+        controller.view.playback.duration = Some(Duration::from_secs(42));
+        let generation = show_local_waveform_fixture(
+            &mut controller,
+            media_id.clone(),
+            &media_path,
+            waveform_duration,
+        );
+        controller.refresh_local_waveform_playback_match();
+        state.lock().expect("mock state").commands.clear();
+
+        assert!(
+            controller.view.waveform_playback_matches,
+            "whole-second backend metadata must not hide precise waveform progress"
+        );
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 1);
+        assert_eq!(
+            state.commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(21))]
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn active_local_waveform_rejects_a_different_backend_duration() {
+        let fixture = tempfile::tempdir().expect("temporary duration-mismatch fixture");
+        let media_path = fixture.path().join("active.flac");
+        std::fs::write(&media_path, b"active local audio")
+            .expect("write duration-mismatch fixture");
+        let waveform_duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            waveform_duration,
+        );
+        controller.activate_local_browser_selection();
+        controller.view.playback.duration = Some(waveform_duration);
+        let generation = show_local_waveform_fixture(
+            &mut controller,
+            media_id.clone(),
+            &media_path,
+            waveform_duration,
+        );
+        assert!(controller.view.waveform_playback_matches);
+        controller.view.playback.duration = Some(Duration::from_secs(84));
+        controller.refresh_local_waveform_playback_match();
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 1);
+        assert!(state.commands.is_empty());
+        assert!(!controller.view.waveform_playback_matches);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("playback duration differs")
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn generic_local_queue_start_captures_identity_for_waveform_seek() {
+        let fixture = tempfile::tempdir().expect("temporary generic Local queue fixture");
+        let media_path = fixture.path().join("queued.flac");
+        std::fs::write(&media_path, b"queued local audio")
+            .expect("write generic Local queue fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        let item =
+            local_media_item_stub(media_path.clone(), Some(b"queued local audio".len() as u64));
+        controller.play_queue_item(
+            queue_item_from_local(&item).expect("generic Local queue item"),
+            false,
+        );
+        controller.view.playback.duration = Some(duration);
+        let generation =
+            show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(
+            state.played.len(),
+            1,
+            "playlist, History, and autoplay use this central queue boundary"
+        );
+        assert_eq!(
+            state.commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(21))]
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn replaced_selected_file_waveform_restarts_instead_of_seeking_old_stream() {
+        let fixture = tempfile::tempdir().expect("temporary replacement-click fixture");
+        let media_path = fixture.path().join("replaceable.flac");
+        std::fs::write(&media_path, b"old local audio")
+            .expect("write original replacement-click fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        controller.activate_local_browser_selection();
+        let old_identity = controller
+            .current_local_waveform_playback
+            .as_ref()
+            .expect("original playback identity")
+            .identity
+            .clone();
+        state.lock().expect("mock state").commands.clear();
+
+        std::fs::write(
+            &media_path,
+            b"replacement local audio with another identity",
+        )
+        .expect("replace selected Local file");
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        let replacement = LocalWaveformRequest::from_path(media_path.clone())
+            .expect("replacement waveform identity");
+        assert_ne!(replacement.identity(), &old_identity);
+        let generation =
+            show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(
+            state.played.len(),
+            2,
+            "a replacement at the same path must start a new stream"
+        );
+        assert!(
+            state.commands.is_empty(),
+            "the old stream must not receive a seek"
+        );
+        assert_eq!(state.played[1].start_at, Duration::from_secs(21));
+        let current = controller
+            .current_local_waveform_playback
+            .as_ref()
+            .expect("replacement playback identity");
+        assert_eq!(current.path, media_path);
+        assert_eq!(&current.identity, replacement.identity());
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn waveform_click_revalidates_replacement_after_render() {
+        let fixture = tempfile::tempdir().expect("temporary stale-click fixture");
+        let media_path = fixture.path().join("stale.flac");
+        std::fs::write(&media_path, b"old local audio").expect("write stale-click fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        let generation =
+            show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+        let rendered_key = controller
+            .displayed_local_waveform
+            .as_ref()
+            .expect("rendered waveform identity")
+            .key
+            .clone();
+
+        std::fs::write(
+            &media_path,
+            b"replacement local audio with another identity",
+        )
+        .expect("replace waveform after render");
+        select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id: media_id.clone(),
+            generation,
+            seconds: 21,
+        });
+
+        assert!(state.lock().expect("mock state").played.is_empty());
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "a stale waveform click must not seek any active stream"
+        );
+        let replacement = controller
+            .pending_local_waveform
+            .as_ref()
+            .expect("replacement waveform request");
+        assert_ne!(replacement.key, rendered_key);
+        assert_eq!(replacement.media_id, media_id);
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(all(feature = "waveform", unix))]
+    #[test]
+    fn selected_local_waveform_uses_original_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 waveform fixture");
+        let filename = std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec());
+        let media_path = fixture.path().join(filename);
+        std::fs::write(&media_path, b"non-UTF-8 local audio")
+            .expect("write non-UTF-8 waveform fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            Duration::from_secs(42),
+        );
+
+        let target = controller
+            .selected_local_waveform_target()
+            .expect("selected non-UTF-8 waveform target");
+
+        assert_eq!(target.0, media_id);
+        assert_eq!(target.1, media_path);
+    }
+
+    #[cfg(all(feature = "waveform", unix))]
+    #[test]
+    fn non_utf8_local_media_ids_and_waveform_targets_remain_distinct() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 collision fixture");
+        let first_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
+        let second_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"track-\xFE.flac".to_vec()));
+        std::fs::write(&first_path, b"first local audio").expect("write first non-UTF-8 fixture");
+        std::fs::write(&second_path, b"second local audio with another identity")
+            .expect("write second non-UTF-8 fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &first_path, duration);
+        controller.activate_local_browser_selection();
+        state.lock().expect("mock state").commands.clear();
+
+        let second_media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &second_path, duration);
+        assert_ne!(
+            first_media_id, second_media_id,
+            "lossless file-URL IDs must preserve distinct non-UTF-8 paths"
+        );
+        let generation = show_local_waveform_fixture(
+            &mut controller,
+            second_media_id.clone(),
+            &second_path,
+            duration,
+        );
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id: second_media_id,
+            generation,
+            seconds: 21,
+        });
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(
+            state.played.len(),
+            2,
+            "the exact selected path must start as a distinct Local item: {}",
+            controller.view.status_line
+        );
+        assert_ne!(
+            state.played[0].location, state.played[1].location,
+            "percent-encoded file URLs must preserve distinct non-UTF-8 paths"
+        );
+        assert!(
+            state.commands.is_empty(),
+            "the first colliding stream must not receive a seek"
+        );
+        assert_eq!(
+            controller
+                .current_local_waveform_playback
+                .as_ref()
+                .map(|current| current.path.as_path()),
+            Some(second_path.as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_local_files_keep_separate_progress_and_history() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 playback fixture");
+        let first_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
+        let second_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"track-\xFE.flac".to_vec()));
+        std::fs::write(&first_path, b"first local audio").expect("write first Local fixture");
+        std::fs::write(&second_path, b"second local audio").expect("write second Local fixture");
+        let local_queue_item = |path: &Path| {
+            let mut item = local_media_item_stub(path.to_owned(), None);
+            set_local_media_duration(&mut item, Duration::from_secs(100));
+            queue_item_from_local(&item).expect("non-UTF-8 Local queue item")
+        };
+        let first = local_queue_item(&first_path);
+        let second = local_queue_item(&second_path);
+        let first_id = first.media.id.clone();
+        let second_id = second.media.id.clone();
+        assert_ne!(first_id, second_id);
+        let (mut controller, _state, _statuses, events) = controller_with_mock_lifecycle([], []);
+
+        controller.play_queue_item(first, false);
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+        controller.view.playback.position = Duration::from_secs(17);
+        controller.view.playback.duration = Some(Duration::from_secs(100));
+
+        controller.play_queue_item(second, false);
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+
+        assert_eq!(
+            controller
+                .store
+                .progress(&first_id)
+                .expect("first Local progress")
+                .map(|progress| progress.position_seconds),
+            Some(17)
+        );
+        assert_eq!(
+            controller
+                .store
+                .progress(&second_id)
+                .expect("second Local progress")
+                .map(|progress| progress.position_seconds),
+            Some(0)
+        );
+        let history = controller.store.history(false, 10).expect("Local history");
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|entry| entry.media_id == first_id));
+        assert!(history.iter().any(|entry| entry.media_id == second_id));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn hiding_waveform_cancels_local_waveform_request() {
+        let fixture = tempfile::tempdir().expect("temporary waveform visibility fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"local audio").expect("write waveform visibility fixture");
+        let request = LocalWaveformRequest::from_path(media_path.clone())
+            .expect("waveform visibility request");
+        let cancellation = WaveformCancellation::new();
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.pending_local_waveform = Some(PendingLocalWaveform {
+            generation: 1,
+            media_id: local_media_id(&media_path),
+            key: LocalWaveformCacheKey {
+                path: media_path,
+                identity: request.identity().clone(),
+                timeline_duration: Duration::from_secs(42),
+            },
+            duration: Duration::from_secs(42),
+            cancellation: cancellation.clone(),
+        });
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = false;
+
+        controller.synchronize_local_waveform();
+
+        assert!(controller.pending_local_waveform.is_none());
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn selecting_metadata_loading_file_cancels_previous_waveform() {
+        let fixture = tempfile::tempdir().expect("temporary waveform selection fixture");
+        let first_path = fixture.path().join("first.flac");
+        let second_path = fixture.path().join("second.flac");
+        std::fs::write(&first_path, b"first local audio").expect("write first waveform fixture");
+        std::fs::write(&second_path, b"second local audio").expect("write second waveform fixture");
+        let first_request =
+            LocalWaveformRequest::from_path(first_path.clone()).expect("first waveform request");
+        let first_cancellation = WaveformCancellation::new();
+        let second_id = local_media_id(&second_path);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.local_media_loader = Arc::new(FixedDurationLocalMediaLoader {
+            expected_path: second_path.clone(),
+            duration_seconds: 84,
+        });
+        controller.pending_local_waveform = Some(PendingLocalWaveform {
+            generation: 1,
+            media_id: local_media_id(&first_path),
+            key: LocalWaveformCacheKey {
+                path: first_path,
+                identity: first_request.identity().clone(),
+                timeline_duration: Duration::from_secs(42),
+            },
+            duration: Duration::from_secs(42),
+            cancellation: first_cancellation.clone(),
+        });
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = true;
+        controller.view.waveform = WaveformView::Loading {
+            media_id: second_id.clone(),
+        };
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("waveform selection listing");
+        let second_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == second_path)
+            .expect("second waveform fixture in listing");
+        controller.view.screen = Screen::Local;
+        controller.view.selected =
+            second_index.saturating_add(usize::from(listing.parent.is_some()));
+        controller.local_listing = Some(listing);
+        controller.rebuild_local_browser_rows();
+        controller.update_local_browser_detail();
+
+        controller.synchronize_local_waveform();
+
+        assert!(controller.pending_local_waveform.is_none());
+        assert!(first_cancellation.is_cancelled());
+        assert_eq!(
+            controller.view.waveform,
+            WaveformView::Loading {
+                media_id: second_id
+            }
+        );
+        await_local_metadata(&mut controller);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn stale_local_waveform_response_cannot_replace_newer_owner() {
+        let fixture = tempfile::tempdir().expect("temporary waveform owner fixture");
+        let media_path = fixture.path().join("new-owner.flac");
+        std::fs::write(&media_path, b"new owner").expect("write waveform owner fixture");
+        let request =
+            LocalWaveformRequest::from_path(media_path.clone()).expect("waveform owner request");
+        let media_id = local_media_id(&media_path);
+        let key = LocalWaveformCacheKey {
+            path: media_path.clone(),
+            identity: request.identity().clone(),
+            timeline_duration: Duration::from_secs(42),
+        };
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (responses, response_queue) = unbounded();
+        controller.local_waveform_responses = response_queue;
+        controller.local_waveform_generation = 2;
+        controller.pending_local_waveform = Some(PendingLocalWaveform {
+            generation: 2,
+            media_id: media_id.clone(),
+            key,
+            duration: Duration::from_secs(42),
+            cancellation: WaveformCancellation::new(),
+        });
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = true;
+        controller.view.waveform = WaveformView::Loading {
+            media_id: media_id.clone(),
+        };
+        controller.view.details = Some(DetailView {
+            media_id: Some(media_id.clone()),
+            title: "New owner".to_owned(),
+            ..DetailView::default()
+        });
+        controller.view.status_line = "new owner still loading".to_owned();
+        responses
+            .send(LocalWaveformWorkerResponse {
+                generation: 1,
+                path: media_path,
+                result: Err(LocalWaveformError::Cancelled),
+            })
+            .expect("queue stale waveform response");
+
+        controller.drain_local_waveform_responses();
+
+        assert_eq!(
+            controller
+                .pending_local_waveform
+                .as_ref()
+                .map(|pending| pending.generation),
+            Some(2)
+        );
+        assert_eq!(controller.view.waveform, WaveformView::Loading { media_id });
+        assert_eq!(controller.view.status_line, "new owner still loading");
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn completed_waveform_is_revalidated_before_display_after_replacement() {
+        let fixture = tempfile::tempdir().expect("temporary completed replacement fixture");
+        let media_path = fixture.path().join("completed.flac");
+        std::fs::write(&media_path, b"old completed waveform")
+            .expect("write completed replacement fixture");
+        let duration = Duration::from_secs(42);
+        let old_request = LocalWaveformRequest::from_path(media_path.clone())
+            .expect("old completed waveform request");
+        let old_key = LocalWaveformCacheKey {
+            path: media_path.clone(),
+            identity: old_request.identity().clone(),
+            timeline_duration: duration,
+        };
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let (responses, response_queue) = unbounded();
+        controller.local_waveform_responses = response_queue;
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        controller.view.waveform_visible = true;
+        controller.view.waveform = WaveformView::Loading {
+            media_id: media_id.clone(),
+        };
+        controller.pending_local_waveform = Some(PendingLocalWaveform {
+            generation: 1,
+            media_id: media_id.clone(),
+            key: old_key.clone(),
+            duration,
+            cancellation: WaveformCancellation::new(),
+        });
+        let pyramid = crate::waveform::PeakPyramid::from_peaks(
+            vec![crate::waveform::Peak {
+                minimum: -1,
+                maximum: 1,
+            }],
+            1,
+            1,
+        );
+
+        std::fs::write(
+            &media_path,
+            b"replacement completed waveform with another identity",
+        )
+        .expect("replace completed waveform before response drain");
+        select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        responses
+            .send(LocalWaveformWorkerResponse {
+                generation: 1,
+                path: media_path.clone(),
+                result: Ok(crate::local_waveform::LocalWaveformResult::new(
+                    old_request.identity().clone(),
+                    pyramid,
+                )),
+            })
+            .expect("queue old successful waveform");
+
+        controller.drain_local_waveform_responses();
+
+        assert!(
+            !controller.local_waveform_cache.contains_key(&old_key),
+            "old peaks must not enter the cache after same-path replacement"
+        );
+        assert!(!matches!(
+            controller.view.waveform,
+            WaveformView::Ready { .. }
+        ));
+        let replacement = controller
+            .pending_local_waveform
+            .as_ref()
+            .expect("replacement generation after stale success");
+        assert_ne!(replacement.key, old_key);
+        assert_eq!(replacement.key.path, media_path);
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn waveform_click_rejects_changed_duration_for_same_file_identity() {
+        let fixture = tempfile::tempdir().expect("temporary duration correction fixture");
+        let media_path = fixture.path().join("duration.flac");
+        std::fs::write(&media_path, b"duration correction local audio")
+            .expect("write duration correction fixture");
+        let rendered_duration = Duration::from_secs(100);
+        let corrected_duration = Duration::from_secs(200);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            rendered_duration,
+        );
+        let generation = show_local_waveform_fixture(
+            &mut controller,
+            media_id.clone(),
+            &media_path,
+            rendered_duration,
+        );
+        let size_bytes = std::fs::metadata(&media_path)
+            .expect("duration correction metadata")
+            .len();
+        let mut corrected = local_media_item_stub(media_path.clone(), Some(size_bytes));
+        set_local_media_duration(&mut corrected, corrected_duration);
+        corrected.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(&media_path).expect("unchanged duration-correction identity"),
+            corrected,
+        );
+
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id,
+            generation,
+            seconds: 50,
+        });
+
+        assert!(state.lock().expect("mock state").played.is_empty());
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "stale timeline coordinates must not reach the backend"
+        );
+        assert_eq!(
+            controller
+                .pending_local_waveform
+                .as_ref()
+                .map(|pending| pending.duration),
+            Some(corrected_duration)
+        );
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn replaced_local_file_retries_identity_scoped_waveform_failure() {
+        let fixture = tempfile::tempdir().expect("temporary failed waveform fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"old waveform").expect("write original waveform fixture");
+        let media_id = local_media_id(&media_path);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let (responses, response_queue) = unbounded();
+        controller.local_waveform_responses = response_queue;
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.view.waveform_visible = false;
+        let selected_media_id = select_local_waveform_fixture(
+            &mut controller,
+            fixture.path(),
+            &media_path,
+            Duration::from_secs(42),
+        );
+        assert_eq!(selected_media_id, media_id);
+
+        controller.dispatch(UiAction::ToggleWaveform);
+
+        let original_pending = controller
+            .pending_local_waveform
+            .as_ref()
+            .expect("original waveform request");
+        let original_generation = original_pending.generation;
+        let original_key = original_pending.key.clone();
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+        responses
+            .send(LocalWaveformWorkerResponse {
+                generation: original_generation,
+                path: media_path.clone(),
+                result: Err(LocalWaveformError::DecodeFailed),
+            })
+            .expect("queue waveform failure");
+        controller.drain_local_waveform_responses();
+
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Failed { media_id: owner, .. } if owner == &media_id
+        ));
+        assert_eq!(
+            controller.failed_local_waveform_key.as_ref(),
+            Some(&original_key)
+        );
+        std::fs::remove_file(&media_path).expect("remove failed waveform before retry deadline");
+        controller.synchronize_local_waveform();
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "an unchanged failed identity must not spin a new extraction"
+        );
+        assert_eq!(
+            controller.failed_local_waveform_key.as_ref(),
+            Some(&original_key),
+            "a keyed failure must not re-stat before its retry deadline"
+        );
+
+        std::fs::write(&media_path, b"new waveform identity")
+            .expect("replace failed waveform fixture");
+        let mut replacement_metadata = local_media_item_stub(
+            media_path.clone(),
+            Some(b"new waveform identity".len() as u64),
+        );
+        replacement_metadata.duration_seconds = Some(43);
+        replacement_metadata.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(&media_path).expect("replacement local identity"),
+            replacement_metadata,
+        );
+        controller
+            .local_waveform_retry
+            .as_mut()
+            .expect("identity-scoped retry")
+            .retry_at = Instant::now() - Duration::from_millis(1);
+
+        controller.synchronize_local_waveform();
+
+        let replacement_pending = controller
+            .pending_local_waveform
+            .as_ref()
+            .expect("replacement waveform request");
+        assert_ne!(replacement_pending.key, original_key);
+        assert!(replacement_pending.generation > original_generation);
+        assert!(controller.failed_local_waveform_key.is_none());
+        assert_eq!(controller.view.waveform, WaveformView::Loading { media_id });
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn unavailable_local_waveform_retries_after_its_bounded_delay() {
+        let fixture = tempfile::tempdir().expect("temporary unkeyed retry fixture");
+        let media_path = fixture.path().join("retry.flac");
+        std::fs::write(&media_path, b"retry local audio").expect("write unkeyed retry fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        controller.view.waveform_visible = true;
+        std::fs::remove_file(&media_path).expect("temporarily remove waveform fixture");
+
+        controller.synchronize_local_waveform();
+
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Failed { media_id: owner, .. } if owner == &media_id
+        ));
+        assert!(controller.failed_local_waveform_key.is_none());
+        let retry = controller
+            .local_waveform_retry
+            .clone()
+            .expect("bounded unkeyed retry deadline");
+        assert_eq!(retry.path, media_path);
+        controller.synchronize_local_waveform();
+        assert_eq!(
+            controller
+                .local_waveform_retry
+                .as_ref()
+                .map(|retry| retry.retry_at),
+            Some(retry.retry_at),
+            "ticks before the deadline must not retry filesystem work"
+        );
+        assert!(captured_requests.try_recv().is_err());
+
+        std::fs::write(&media_path, b"restored retry local audio")
+            .expect("restore waveform fixture");
+        let mut metadata = local_media_item_stub(
+            media_path.clone(),
+            Some(b"restored retry local audio".len() as u64),
+        );
+        set_local_media_duration(&mut metadata, duration);
+        metadata.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(&media_path).expect("restored retry identity"),
+            metadata,
+        );
+        controller
+            .local_waveform_retry
+            .as_mut()
+            .expect("restored retry state")
+            .retry_at = Instant::now() - Duration::from_millis(1);
+
+        controller.synchronize_local_waveform();
+
+        assert!(controller.pending_local_waveform.is_some());
+        assert!(controller.local_waveform_retry.is_none());
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(all(feature = "waveform", unix))]
+    #[test]
+    fn failed_non_utf8_path_does_not_delay_a_distinct_selection() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fixture = tempfile::tempdir().expect("temporary retry collision fixture");
+        let first_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"retry-\xFF.flac".to_vec()));
+        let second_path = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"retry-\xFE.flac".to_vec()));
+        std::fs::write(&first_path, b"first retry audio")
+            .expect("write first retry collision fixture");
+        std::fs::write(&second_path, b"second retry audio")
+            .expect("write second retry collision fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &first_path, duration);
+        controller.view.waveform_visible = true;
+        std::fs::remove_file(&first_path).expect("remove first retry collision fixture");
+        controller.synchronize_local_waveform();
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Failed { media_id, .. } if media_id == &first_media_id
+        ));
+        assert_eq!(
+            controller
+                .local_waveform_retry
+                .as_ref()
+                .map(|retry| retry.path.as_path()),
+            Some(first_path.as_path())
+        );
+
+        let second_media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &second_path, duration);
+        assert_ne!(
+            first_media_id, second_media_id,
+            "lossless Local IDs must preserve the distinct paths"
+        );
+        controller.synchronize_local_waveform();
+
+        assert_eq!(
+            controller
+                .pending_local_waveform
+                .as_ref()
+                .map(|pending| pending.key.path.as_path()),
+            Some(second_path.as_path()),
+            "retry state for the first exact path must not delay the second"
+        );
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(LocalWaveformWorkerRequest::Generate { .. })
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn ready_local_waveform_revalidates_periodically_but_clicks_immediately() {
+        let fixture = tempfile::tempdir().expect("temporary revalidation fixture");
+        let media_path = fixture.path().join("revalidate.flac");
+        std::fs::write(&media_path, b"revalidation local audio")
+            .expect("write revalidation fixture");
+        let duration = Duration::from_secs(42);
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let media_id =
+            select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        let generation =
+            show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+        std::fs::remove_file(&media_path).expect("remove rendered waveform fixture");
+
+        controller.synchronize_local_waveform();
+
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Ready {
+                generation: owner_generation,
+                ..
+            } if *owner_generation == generation
+        ));
+        controller.dispatch(UiAction::ActivateWaveformTimecode {
+            media_id: media_id.clone(),
+            generation,
+            seconds: 21,
+        });
+        assert!(state.lock().expect("mock state").played.is_empty());
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Failed { media_id: owner, .. } if owner == &media_id
+        ));
+
+        std::fs::write(&media_path, b"revalidation local audio")
+            .expect("restore periodic revalidation fixture");
+        select_local_waveform_fixture(&mut controller, fixture.path(), &media_path, duration);
+        show_local_waveform_fixture(&mut controller, media_id.clone(), &media_path, duration);
+        std::fs::remove_file(&media_path).expect("remove periodic revalidation fixture");
+        controller.local_waveform_revalidate_at = Some(Instant::now() - Duration::from_millis(1));
+
+        controller.synchronize_local_waveform();
+
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Failed { media_id: owner, .. } if owner == &media_id
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_ram_cache_enforces_entry_and_byte_limits() {
+        let fixture = tempfile::tempdir().expect("temporary waveform cache fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let one_peak = Arc::new(crate::waveform::PeakPyramid::from_peaks(
+            vec![crate::waveform::Peak {
+                minimum: -1,
+                maximum: 1,
+            }],
+            1,
+            1,
+        ));
+        let mut first_key = None;
+        let mut newest_key = None;
+        for index in 0..=MAX_CACHED_LOCAL_WAVEFORMS {
+            let path = fixture.path().join(format!("entry-{index}.flac"));
+            std::fs::write(&path, [u8::try_from(index).expect("bounded fixture byte")])
+                .expect("write waveform cache fixture");
+            let request =
+                LocalWaveformRequest::from_path(path.clone()).expect("waveform cache request");
+            let key = LocalWaveformCacheKey {
+                path,
+                identity: request.identity().clone(),
+                timeline_duration: Duration::from_secs(1),
+            };
+            first_key.get_or_insert_with(|| key.clone());
+            newest_key = Some(key.clone());
+            controller.cache_local_waveform(key, Arc::clone(&one_peak));
+        }
+
+        assert_eq!(
+            controller.local_waveform_cache.len(),
+            MAX_CACHED_LOCAL_WAVEFORMS
+        );
+        assert!(
+            !controller
+                .local_waveform_cache
+                .contains_key(first_key.as_ref().expect("oldest waveform key"))
+        );
+        assert!(
+            controller
+                .local_waveform_cache
+                .contains_key(newest_key.as_ref().expect("newest waveform key"))
+        );
+        assert!(controller.local_waveform_cache_bytes <= MAX_CACHED_LOCAL_WAVEFORM_BYTES);
+
+        controller.local_waveform_cache.clear();
+        controller.local_waveform_cache_order.clear();
+        controller.local_waveform_cache_bytes = 0;
+        let large_peak_count =
+            MAX_CACHED_LOCAL_WAVEFORM_BYTES / std::mem::size_of::<crate::waveform::Peak>() / 4;
+        let large_pyramid = Arc::new(crate::waveform::PeakPyramid::from_peaks(
+            vec![
+                crate::waveform::Peak {
+                    minimum: -32_000,
+                    maximum: 32_000,
+                };
+                large_peak_count
+            ],
+            1,
+            large_peak_count,
+        ));
+        assert!(
+            waveform_pyramid_bytes(&large_pyramid) <= MAX_CACHED_LOCAL_WAVEFORM_BYTES,
+            "each large fixture must remain individually cacheable"
+        );
+        let mut large_keys = Vec::new();
+        for index in 0..2 {
+            let path = fixture.path().join(format!("bytes-{index}.flac"));
+            std::fs::write(&path, [b'a' + index]).expect("write byte-bound fixture");
+            let request =
+                LocalWaveformRequest::from_path(path.clone()).expect("byte-bound request");
+            let key = LocalWaveformCacheKey {
+                path,
+                identity: request.identity().clone(),
+                timeline_duration: Duration::from_secs(1),
+            };
+            controller.cache_local_waveform(key.clone(), Arc::clone(&large_pyramid));
+            large_keys.push(key);
+        }
+
+        assert!(controller.local_waveform_cache_bytes <= MAX_CACHED_LOCAL_WAVEFORM_BYTES);
+        assert!(
+            !controller.local_waveform_cache.contains_key(&large_keys[0]),
+            "byte pressure must evict the least-recently-used waveform"
+        );
+        assert!(controller.local_waveform_cache.contains_key(&large_keys[1]));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_ram_cache_counts_retained_peak_capacity() {
+        let fixture = tempfile::tempdir().expect("temporary waveform capacity fixture");
+        let media_path = fixture.path().join("capacity.flac");
+        std::fs::write(&media_path, b"capacity").expect("write waveform capacity fixture");
+        let request =
+            LocalWaveformRequest::from_path(media_path.clone()).expect("capacity request");
+        let key = LocalWaveformCacheKey {
+            path: media_path,
+            identity: request.identity().clone(),
+            timeline_duration: Duration::from_secs(1),
+        };
+        let retained_capacity =
+            MAX_CACHED_LOCAL_WAVEFORM_BYTES / std::mem::size_of::<crate::waveform::Peak>() + 1;
+        let mut peaks = Vec::with_capacity(retained_capacity);
+        peaks.push(crate::waveform::Peak {
+            minimum: -1,
+            maximum: 1,
+        });
+        let pyramid = Arc::new(crate::waveform::PeakPyramid::from_peaks(peaks, 1, 1));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+
+        assert!(
+            waveform_pyramid_bytes(&pyramid) > MAX_CACHED_LOCAL_WAVEFORM_BYTES,
+            "spare peak capacity is retained memory and must count toward the cache limit"
+        );
+        controller.cache_local_waveform(key, pyramid);
+
+        assert!(controller.local_waveform_cache.is_empty());
+        assert!(controller.local_waveform_cache_order.is_empty());
+        assert_eq!(controller.local_waveform_cache_bytes, 0);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_cache_is_scoped_to_exact_timeline_duration() {
+        let fixture = tempfile::tempdir().expect("temporary waveform duration-cache fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"duration-sensitive waveform")
+            .expect("write waveform duration-cache fixture");
+        let request = LocalWaveformRequest::from_path(media_path.clone())
+            .expect("waveform duration-cache request");
+        let short_key = LocalWaveformCacheKey {
+            path: media_path.clone(),
+            identity: request.identity().clone(),
+            timeline_duration: Duration::from_millis(1_900),
+        };
+        let long_key = LocalWaveformCacheKey {
+            path: media_path,
+            identity: request.identity().clone(),
+            timeline_duration: Duration::from_millis(2_100),
+        };
+        let waveform = Arc::new(crate::waveform::PeakPyramid::from_peaks(
+            vec![crate::waveform::Peak {
+                minimum: -10,
+                maximum: 10,
+            }],
+            1,
+            1,
+        ));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+
+        controller.cache_local_waveform(short_key.clone(), Arc::clone(&waveform));
+
+        assert!(controller.local_waveform_cache.contains_key(&short_key));
+        assert!(
+            !controller.local_waveform_cache.contains_key(&long_key),
+            "a waveform normalized to one exact duration must not satisfy another"
+        );
+
+        controller.cache_local_waveform(long_key.clone(), waveform);
+
+        assert!(
+            !controller.local_waveform_cache.contains_key(&short_key),
+            "a newer duration for the same path must evict stale normalized peaks"
+        );
+        assert!(controller.local_waveform_cache.contains_key(&long_key));
+        assert_eq!(controller.local_waveform_cache.len(), 1);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_cache_replaces_stale_file_identity_for_same_path() {
+        let fixture = tempfile::tempdir().expect("temporary waveform replacement fixture");
+        let media_path = fixture.path().join("track.flac");
+        std::fs::write(&media_path, b"old").expect("write original waveform fixture");
+        let original =
+            LocalWaveformRequest::from_path(media_path.clone()).expect("original waveform request");
+        let original_key = LocalWaveformCacheKey {
+            path: media_path.clone(),
+            identity: original.identity().clone(),
+            timeline_duration: Duration::from_secs(1),
+        };
+        let waveform = Arc::new(crate::waveform::PeakPyramid::from_peaks(
+            vec![crate::waveform::Peak {
+                minimum: -10,
+                maximum: 10,
+            }],
+            1,
+            1,
+        ));
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.cache_local_waveform(original_key.clone(), waveform);
+
+        std::fs::write(&media_path, b"replacement").expect("replace waveform fixture");
+        let replacement =
+            LocalWaveformRequest::from_path(media_path.clone()).expect("replacement request");
+        let replacement_key = LocalWaveformCacheKey {
+            path: media_path.clone(),
+            identity: replacement.identity().clone(),
+            timeline_duration: Duration::from_secs(1),
+        };
+
+        assert_ne!(original_key, replacement_key);
+        assert!(controller.local_waveform_cache.contains_key(&original_key));
+        assert!(
+            !controller
+                .local_waveform_cache
+                .contains_key(&replacement_key),
+            "replacement identity must not reuse peaks generated for the old file"
+        );
+        controller.cache_local_waveform(
+            replacement_key.clone(),
+            Arc::new(crate::waveform::PeakPyramid::from_peaks(
+                vec![crate::waveform::Peak {
+                    minimum: -20,
+                    maximum: 20,
+                }],
+                1,
+                1,
+            )),
+        );
+
+        assert!(
+            !controller.local_waveform_cache.contains_key(&original_key),
+            "stale identities for one path must not accumulate in the bounded cache"
+        );
+        assert!(
+            controller
+                .local_waveform_cache
+                .contains_key(&replacement_key)
+        );
+        assert_eq!(controller.local_waveform_cache.len(), 1);
     }
 
     #[cfg(unix)]
@@ -34759,6 +37727,7 @@ mod tests {
             comment: None,
             metadata_url: None,
             acoustid_id: None,
+            precise_duration: None,
             duration_seconds: None,
             size_bytes: 0,
             container: "FLAC".to_owned(),
@@ -38216,6 +41185,7 @@ mod tests {
             comment: Some("Visit the artist website".to_owned()),
             metadata_url: Some("https://artist.example".to_owned()),
             acoustid_id: Some("39e08d1e-ce43-465f-a802-041995e9d150".to_owned()),
+            precise_duration: Some(Duration::from_secs(10)),
             duration_seconds: Some(10),
             size_bytes: 1,
             container: "FLAC".to_owned(),
@@ -38242,7 +41212,10 @@ mod tests {
                 "Local Details omitted {expected:?}"
             );
         }
-        assert_eq!(queued_local.playback_location, "/tmp/youta-fixture.flac");
+        assert_eq!(
+            queued_local.playback_location,
+            "file:///tmp/youta-fixture.flac"
+        );
 
         let tracker = TrackerItem {
             source: "The Mod Archive".to_owned(),
@@ -38400,7 +41373,7 @@ mod tests {
             .store
             .insert_history(&HistoryEntry {
                 id: 0,
-                media_id: MediaId::new(SourceKind::Local, video.display().to_string()),
+                media_id: local_media_id(&video),
                 title: "History MOV".to_owned(),
                 replay_locator: Some(video.display().to_string()),
                 started_at: 1,
@@ -38445,7 +41418,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let track = temporary.path().join("history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
-        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let media_id = local_media_id(&track);
         let mut progress = PlaybackProgress::new(media_id.clone(), Some(180), 1);
         progress.record_position(95, 2);
         let (mut controller, state) = controller_with_mock_statuses([]);
@@ -38473,7 +41446,12 @@ mod tests {
 
         let state = state.lock().expect("mock player state");
         assert_eq!(state.played.len(), 1);
-        assert_eq!(state.played[0].location, track.display().to_string());
+        assert_eq!(
+            state.played[0].location,
+            url::Url::from_file_path(&track)
+                .expect("History fixture playback URL")
+                .to_string()
+        );
         assert_eq!(state.played[0].start_at, Duration::from_secs(65));
         assert_eq!(state.played[0].title.as_deref(), Some("History fixture"));
         assert_eq!(controller.current_media.as_ref(), Some(&media_id));
@@ -38486,7 +41464,7 @@ mod tests {
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = temporary.path().join("playlist history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
-        let media_id = MediaId::new(SourceKind::Local, track.display().to_string());
+        let media_id = local_media_id(&track);
         let store = StateStore::open(&config).expect("disk state");
         store
             .insert_history(&HistoryEntry {
@@ -38641,7 +41619,12 @@ mod tests {
 
         let playback = playback.lock().expect("mock playback");
         assert_eq!(playback.played.len(), 1);
-        assert_eq!(playback.played[0].location, track.display().to_string());
+        assert_eq!(
+            playback.played[0].location,
+            url::Url::from_file_path(&track)
+                .expect("History playlist playback URL")
+                .to_string()
+        );
     }
 
     #[test]
@@ -38690,7 +41673,7 @@ mod tests {
             .store
             .insert_history(&HistoryEntry {
                 id: 0,
-                media_id: MediaId::new(SourceKind::Local, removed.display().to_string()),
+                media_id: local_media_id(&removed),
                 title: "Removed fixture".to_owned(),
                 replay_locator: Some(removed.display().to_string()),
                 started_at: 1,
@@ -38748,7 +41731,7 @@ mod tests {
         for entry in [
             HistoryEntry {
                 id: 0,
-                media_id: MediaId::new(SourceKind::Local, removed.display().to_string()),
+                media_id: local_media_id(&removed),
                 title: "Removed playlist fixture".to_owned(),
                 replay_locator: Some(removed.display().to_string()),
                 started_at: 1,
@@ -39296,9 +42279,477 @@ mod tests {
                 .map(|input| input.location.clone())
                 .collect::<Vec<_>>(),
             [
-                first_path.display().to_string(),
-                second_path.display().to_string()
+                url::Url::from_file_path(&first_path)
+                    .expect("first Local autoplay URL")
+                    .to_string(),
+                url::Url::from_file_path(&second_path)
+                    .expect("second Local autoplay URL")
+                    .to_string()
             ]
+        );
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_follows_confirmed_autoplay_transition() {
+        let directory = tempfile::tempdir().expect("temporary Local waveform folder");
+        let first_path = directory.path().join("first.mp3");
+        let second_path = directory.path().join("second.flac");
+        std::fs::write(&first_path, b"first waveform fixture").expect("first waveform fixture");
+        std::fs::write(&second_path, b"second waveform fixture").expect("second waveform fixture");
+        let duration = Duration::from_secs(1);
+        let active = PlaybackStatus {
+            idle: false,
+            position: duration,
+            duration: Some(duration),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.shutdown_local_waveform_worker();
+        let (requests, captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        controller.local_waveform_request_drain = captured_requests.clone();
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, directory.path(), &first_path, duration);
+        cache_local_waveform_fixture_metadata(&mut controller, &second_path, duration);
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        show_local_waveform_fixture(
+            &mut controller,
+            first_media_id.clone(),
+            &first_path,
+            duration,
+        );
+        assert!(controller.view.waveform_playback_matches);
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(first_path.as_path()),
+            "loading a successor must not move the waveform before playback starts"
+        );
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+
+        let second_media_id = local_media_id(&second_path);
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(second_path.as_path())
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref()),
+            Some(&second_media_id)
+        );
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Loading { media_id } if media_id == &second_media_id
+        ));
+        assert_eq!(
+            controller
+                .pending_local_waveform
+                .as_ref()
+                .map(|pending| pending.key.path.as_path()),
+            Some(second_path.as_path())
+        );
+        let LocalWaveformWorkerRequest::Generate { request, .. } = captured_requests
+            .try_recv()
+            .expect("successor waveform request")
+        else {
+            panic!("expected successor waveform generation");
+        };
+        assert_eq!(request.path(), second_path);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_follows_confirmed_explicit_queue_transition() {
+        let directory = tempfile::tempdir().expect("temporary queued waveform folder");
+        let first_path = directory.path().join("first.flac");
+        let second_path = directory.path().join("queued.flac");
+        std::fs::write(&first_path, b"first queued waveform fixture")
+            .expect("first queued waveform fixture");
+        std::fs::write(&second_path, b"second queued waveform fixture")
+            .expect("second queued waveform fixture");
+        let duration = Duration::from_secs(1);
+        let active = PlaybackStatus {
+            idle: false,
+            position: duration,
+            duration: Some(duration),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.shutdown_local_waveform_worker();
+        let (requests, _captured_requests) = bounded(1);
+        controller.local_waveform_requests = Some(requests);
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, directory.path(), &first_path, duration);
+        cache_local_waveform_fixture_metadata(&mut controller, &second_path, duration);
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        show_local_waveform_fixture(&mut controller, first_media_id, &first_path, duration);
+        let mut second_item = local_media_item_stub(
+            second_path.clone(),
+            Some(
+                std::fs::metadata(&second_path)
+                    .expect("queued fixture metadata")
+                    .len(),
+            ),
+        );
+        set_local_media_duration(&mut second_item, duration);
+        second_item.technical_metadata_probed = true;
+        controller
+            .playback_queue
+            .push(queue_item_from_local(&second_item).expect("queued Local item"));
+
+        events.lock().expect("mock events").extend([
+            PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }),
+            PlaybackEvent::MediaLoaded,
+            PlaybackEvent::PlaybackStarted,
+        ]);
+        controller.update_player();
+        controller.update_player();
+
+        let second_media_id = local_media_id(&second_path);
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(second_path.as_path())
+        );
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Loading { media_id } if media_id == &second_media_id
+        ));
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_follows_a_cross_directory_queue_transition() {
+        let root = tempfile::tempdir().expect("temporary cross-directory waveform root");
+        let first_directory = root.path().join("first-album");
+        let second_directory = root.path().join("second-album");
+        std::fs::create_dir(&first_directory).expect("first album folder");
+        std::fs::create_dir(&second_directory).expect("second album folder");
+        let first_path = first_directory.join("first.flac");
+        let second_path = second_directory.join("queued.flac");
+        std::fs::write(&first_path, b"first cross-directory waveform fixture")
+            .expect("first cross-directory waveform fixture");
+        std::fs::write(&second_path, b"second cross-directory waveform fixture")
+            .expect("second cross-directory waveform fixture");
+        let duration = Duration::from_secs(1);
+        let active = PlaybackStatus {
+            idle: false,
+            position: duration,
+            duration: Some(duration),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.shutdown_local_waveform_worker();
+        let (waveform_requests, captured_waveform_requests) = bounded(1);
+        controller.local_waveform_requests = Some(waveform_requests);
+        controller.local_waveform_request_drain = captured_waveform_requests.clone();
+        let (browse_requests, captured_browse_requests) = unbounded();
+        controller.local_browse_requests = Some(browse_requests);
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, &first_directory, &first_path, duration);
+        cache_local_waveform_fixture_metadata(&mut controller, &second_path, duration);
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        show_local_waveform_fixture(&mut controller, first_media_id, &first_path, duration);
+        let mut second_item = local_media_item_stub(
+            second_path.clone(),
+            Some(
+                std::fs::metadata(&second_path)
+                    .expect("queued fixture metadata")
+                    .len(),
+            ),
+        );
+        set_local_media_duration(&mut second_item, duration);
+        second_item.technical_metadata_probed = true;
+        controller
+            .playback_queue
+            .push(queue_item_from_local(&second_item).expect("queued Local item"));
+
+        events.lock().expect("mock events").extend([
+            PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }),
+            PlaybackEvent::MediaLoaded,
+            PlaybackEvent::PlaybackStarted,
+        ]);
+        controller.update_player();
+        controller.update_player();
+
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+        } = captured_browse_requests
+            .try_recv()
+            .expect("successor directory request")
+        else {
+            panic!("expected Local successor directory request");
+        };
+        assert_eq!(directory, second_directory);
+        assert_eq!(preferred_child.as_deref(), Some(second_path.as_path()));
+        let listing = crate::local_browser::list_local_directory_with_preferred_child(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+        )
+        .expect("successor directory listing");
+        controller.handle_local_browse_response(LocalBrowseResponse::Browse {
+            generation,
+            result: Ok(listing),
+        });
+        controller.synchronize_local_waveform();
+
+        let second_media_id = local_media_id(&second_path);
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(second_path.as_path())
+        );
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Loading { media_id } if media_id == &second_media_id
+        ));
+        let LocalWaveformWorkerRequest::Generate { request, .. } = captured_waveform_requests
+            .try_recv()
+            .expect("cross-directory successor waveform request")
+        else {
+            panic!("expected cross-directory successor waveform generation");
+        };
+        assert_eq!(request.path(), second_path);
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_follows_after_an_intervening_non_local_queue_item() {
+        let directory = tempfile::tempdir().expect("temporary mixed-queue waveform folder");
+        let first_path = directory.path().join("first.flac");
+        let second_path = directory.path().join("second.flac");
+        std::fs::write(&first_path, b"first mixed-queue waveform fixture")
+            .expect("first mixed-queue waveform fixture");
+        std::fs::write(&second_path, b"second mixed-queue waveform fixture")
+            .expect("second mixed-queue waveform fixture");
+        let duration = Duration::from_secs(1);
+        let active = PlaybackStatus {
+            idle: false,
+            position: duration,
+            duration: Some(duration),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.shutdown_local_waveform_worker();
+        let (waveform_requests, _captured_waveform_requests) = bounded(1);
+        controller.local_waveform_requests = Some(waveform_requests);
+        let first_media_id =
+            select_local_waveform_fixture(&mut controller, directory.path(), &first_path, duration);
+        cache_local_waveform_fixture_metadata(&mut controller, &second_path, duration);
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        show_local_waveform_fixture(
+            &mut controller,
+            first_media_id.clone(),
+            &first_path,
+            duration,
+        );
+        controller
+            .playback_queue
+            .push(fixture_youtube_item("intervening video"));
+        let mut second_item = local_media_item_stub(
+            second_path.clone(),
+            Some(
+                std::fs::metadata(&second_path)
+                    .expect("second mixed-queue fixture metadata")
+                    .len(),
+            ),
+        );
+        set_local_media_duration(&mut second_item, duration);
+        second_item.technical_metadata_probed = true;
+        controller
+            .playback_queue
+            .push(queue_item_from_local(&second_item).expect("second mixed-queue Local item"));
+
+        events.lock().expect("mock events").extend([
+            PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }),
+            PlaybackEvent::MediaLoaded,
+            PlaybackEvent::PlaybackStarted,
+        ]);
+        controller.update_player();
+        controller.update_player();
+        assert_eq!(
+            controller
+                .current_media
+                .as_ref()
+                .map(|media_id| &media_id.source),
+            Some(&SourceKind::YouTube)
+        );
+        assert_eq!(
+            controller.local_waveform_follow_from.as_ref(),
+            Some(&first_media_id)
+        );
+
+        events.lock().expect("mock events").extend([
+            PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }),
+            PlaybackEvent::MediaLoaded,
+            PlaybackEvent::PlaybackStarted,
+        ]);
+        controller.update_player();
+        controller.update_player();
+
+        let second_media_id = local_media_id(&second_path);
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(second_path.as_path())
+        );
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Loading { media_id } if media_id == &second_media_id
+        ));
+        assert!(controller.local_waveform_follow_from.is_none());
+    }
+
+    #[cfg(feature = "waveform")]
+    #[test]
+    fn local_waveform_transition_preserves_a_manual_selection() {
+        let directory = tempfile::tempdir().expect("temporary manual waveform folder");
+        let first_path = directory.path().join("first.flac");
+        let second_path = directory.path().join("second.flac");
+        let inspected_path = directory.path().join("third-inspected.flac");
+        std::fs::write(&first_path, b"first manual waveform fixture")
+            .expect("first manual waveform fixture");
+        std::fs::write(&second_path, b"second manual waveform fixture")
+            .expect("second manual waveform fixture");
+        std::fs::write(&inspected_path, b"inspected waveform fixture")
+            .expect("inspected waveform fixture");
+        let duration = Duration::from_secs(1);
+        let active = PlaybackStatus {
+            idle: false,
+            position: duration,
+            duration: Some(duration),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, _state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        select_local_waveform_fixture(&mut controller, directory.path(), &first_path, duration);
+        cache_local_waveform_fixture_metadata(&mut controller, &second_path, duration);
+        controller.activate_local_browser_selection();
+        controller.update_player();
+        show_local_waveform_fixture(
+            &mut controller,
+            local_media_id(&first_path),
+            &first_path,
+            duration,
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+        assert_eq!(
+            controller.current_media.as_ref(),
+            Some(&local_media_id(&second_path))
+        );
+        assert_eq!(controller.playback_phase, PlaybackPhase::Loading);
+
+        let inspected_media_id = select_local_waveform_fixture(
+            &mut controller,
+            directory.path(),
+            &inspected_path,
+            duration,
+        );
+        let inspected_generation = show_local_waveform_fixture(
+            &mut controller,
+            inspected_media_id.clone(),
+            &inspected_path,
+            duration,
+        );
+
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(inspected_path.as_path()),
+            "automatic playback must not steal a manually changed Local selection"
+        );
+        assert!(matches!(
+            &controller.view.waveform,
+            WaveformView::Ready {
+                media_id,
+                generation,
+                ..
+            } if media_id == &inspected_media_id && *generation == inspected_generation
+        ));
+        assert_eq!(
+            controller.current_media.as_ref(),
+            Some(&local_media_id(&second_path))
         );
     }
 
