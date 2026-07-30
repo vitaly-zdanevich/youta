@@ -481,7 +481,16 @@ mod unix {
     }
 
     fn normalized_buffered_range(start: f64, end: f64) -> Option<BufferedRange> {
-        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        if !start.is_finite() || !end.is_finite() {
+            return None;
+        }
+        // Opus/WebM codec preroll can make mpv report a small negative cache
+        // start for a valid range beginning at the media timeline origin.
+        if start < -1.0 {
+            return None;
+        }
+        let start = start.max(0.0);
+        if end <= start {
             return None;
         }
         let start = Duration::try_from_secs_f64(start).ok()?;
@@ -1533,10 +1542,28 @@ mod unix {
         }
 
         #[test]
+        fn buffered_range_parser_clamps_negative_codec_preroll_to_the_timeline_origin() {
+            let ranges = parse_buffered_ranges(&json!({
+                "seekable-ranges": [
+                    {"start": -0.0065, "end": 634.5745},
+                ],
+            }));
+
+            assert_eq!(
+                ranges,
+                vec![BufferedRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs_f64(634.5745),
+                }]
+            );
+        }
+
+        #[test]
         fn buffered_range_parser_ignores_malformed_and_invalid_entries() {
             let ranges = parse_buffered_ranges(&json!({
                 "seekable-ranges": [
-                    {"start": -1.0, "end": 2.0},
+                    {"start": -2.0, "end": -1.0},
+                    {"start": -120.0, "end": 2.0},
                     {"start": 3.0, "end": 3.0},
                     {"start": 5.0, "end": 4.0},
                     {"start": "7", "end": 8.0},
