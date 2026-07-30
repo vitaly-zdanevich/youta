@@ -84,6 +84,8 @@ jobs:
             feature_arguments: --no-default-features --features tui
           - feature_set: TUI with Local
             feature_arguments: --no-default-features --features tui,local
+          - feature_set: TUI with AcoustID
+            feature_arguments: --no-default-features --features tui,acoustid,wikidata
           - feature_set: TUI with Apple Podcasts
             feature_arguments: --no-default-features --features tui,apple-podcasts
           - feature_set: TUI with Bandcamp
@@ -146,6 +148,7 @@ jobs:
           cargo check --locked --no-default-features --features tui
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib
+          cargo check --locked --no-default-features --features acoustid --lib
           cargo check --locked --no-default-features --features tui,waveform
           cargo check --locked --no-default-features --features tui,local-browser
           cargo check --locked --no-default-features --features tui,local-metadata

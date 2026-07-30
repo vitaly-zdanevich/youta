@@ -66,7 +66,11 @@ fn main() -> ExitCode {
             } else {
                 let report = youta::diagnostics::DiagnosticReport::capture_error(
                     error.as_ref(),
-                    probe_diagnostic_helpers(PathBuf::from("mpv"), PathBuf::from("yt-dlp")),
+                    probe_diagnostic_helpers(
+                        PathBuf::from("mpv"),
+                        PathBuf::from("yt-dlp"),
+                        PathBuf::from("fpcalc"),
+                    ),
                 );
                 eprintln!("{}", report.render());
             }
@@ -89,13 +93,23 @@ fn is_another_instance_error(error: &anyhow::Error) -> bool {
 fn probe_diagnostic_helpers(
     mpv_executable: PathBuf,
     yt_dlp_executable: PathBuf,
+    fpcalc_executable: PathBuf,
 ) -> Vec<ExternalHelper> {
-    ExternalHelper::probe_many([
+    let helpers = vec![
         (ExternalHelperKind::Mpv, Some(mpv_executable)),
         (ExternalHelperKind::YtDlp, Some(yt_dlp_executable)),
         (ExternalHelperKind::Ffmpeg, Some(PathBuf::from("ffmpeg"))),
         (ExternalHelperKind::Ffprobe, Some(PathBuf::from("ffprobe"))),
-    ])
+    ];
+    #[cfg(feature = "acoustid")]
+    let helpers = {
+        let mut helpers = helpers;
+        helpers.push((ExternalHelperKind::Fpcalc, Some(fpcalc_executable)));
+        helpers
+    };
+    #[cfg(not(feature = "acoustid"))]
+    let _ = fpcalc_executable;
+    ExternalHelper::probe_many(helpers)
 }
 
 fn run() -> Result<()> {
@@ -133,6 +147,7 @@ fn run_tui(config: Config) -> Result<()> {
 
     let diagnostic_mpv = config.providers.mpv_executable.clone();
     let diagnostic_yt_dlp = config.providers.yt_dlp_executable.clone();
+    let diagnostic_fpcalc = config.providers.fpcalc_executable.clone();
     let (provider, provider_startup_error) = match configured_youtube_provider(&config.providers) {
         Ok(provider) => (provider, None),
         Err(error) => (None, Some(error)),
@@ -180,7 +195,11 @@ fn run_tui(config: Config) -> Result<()> {
     if let Some(error) = provider_startup_error {
         let report = DiagnosticReport::capture_error(
             &error,
-            probe_diagnostic_helpers(diagnostic_mpv.clone(), diagnostic_yt_dlp.clone()),
+            probe_diagnostic_helpers(
+                diagnostic_mpv.clone(),
+                diagnostic_yt_dlp.clone(),
+                diagnostic_fpcalc.clone(),
+            ),
         )
         .render();
         controller.show_diagnostic_report("YouTube provider configuration failed", report);
@@ -221,8 +240,11 @@ fn run_tui(config: Config) -> Result<()> {
             Ok(())
         }
         Ok(Err(error)) => {
-            let helpers =
-                probe_diagnostic_helpers(diagnostic_mpv.clone(), diagnostic_yt_dlp.clone());
+            let helpers = probe_diagnostic_helpers(
+                diagnostic_mpv.clone(),
+                diagnostic_yt_dlp.clone(),
+                diagnostic_fpcalc.clone(),
+            );
             let report = DiagnosticReport::capture_error(&error, helpers).render();
             controller.enter_fatal_diagnostic_mode("Terminal UI failed", report);
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -241,7 +263,11 @@ fn run_tui(config: Config) -> Result<()> {
                         Vec::<ExternalHelper>::new(),
                     )
                 })
-                .with_external_helpers(probe_diagnostic_helpers(diagnostic_mpv, diagnostic_yt_dlp))
+                .with_external_helpers(probe_diagnostic_helpers(
+                    diagnostic_mpv,
+                    diagnostic_yt_dlp,
+                    diagnostic_fpcalc,
+                ))
                 .render();
             controller.enter_fatal_diagnostic_mode("Youta panicked", report);
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -393,10 +419,16 @@ struct HelperCheck<'a> {
     required: bool,
 }
 
+/// Returns actionable package guidance for an unavailable optional helper.
+#[cfg(feature = "acoustid")]
+fn helper_install_guidance(name: &str) -> Option<&'static str> {
+    (name == "fpcalc").then_some(youta::audio_identification::FPCALC_INSTALL_GUIDANCE)
+}
+
 fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
     use youta::config::PlaybackBackend;
 
-    let mut checks = Vec::with_capacity(4);
+    let mut checks = Vec::with_capacity(5);
     if cfg!(feature = "backend-mpv") && config.playback.backend == PlaybackBackend::Mpv {
         checks.push(HelperCheck {
             name: "mpv",
@@ -411,6 +443,14 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
             executable: config.providers.yt_dlp_executable.as_path(),
             arguments: &["--version"],
             required: true,
+        });
+    }
+    if cfg!(feature = "acoustid") {
+        checks.push(HelperCheck {
+            name: "fpcalc",
+            executable: config.providers.fpcalc_executable.as_path(),
+            arguments: &["-version"],
+            required: config.providers.acoustid_client_key.is_some(),
         });
     }
     checks.extend([
@@ -469,6 +509,9 @@ fn run_doctor(config: &Config) -> Result<()> {
     if !cfg!(feature = "yt-dlp") {
         println!("yt-dlp: skipped (feature omitted at build time)");
     }
+    if !cfg!(feature = "acoustid") {
+        println!("fpcalc: skipped (AcoustID feature omitted at build time)");
+    }
 
     let mut missing_required = false;
     for check in doctor_helper_checks(config) {
@@ -476,6 +519,10 @@ fn run_doctor(config: &Config) -> Result<()> {
             Ok(version) => println!("{}: {version}", check.name),
             Err(error) => {
                 println!("{}: unavailable ({error})", check.name);
+                #[cfg(feature = "acoustid")]
+                if let Some(guidance) = helper_install_guidance(check.name) {
+                    println!("{guidance}");
+                }
                 missing_required |= check.required;
             }
         }
@@ -594,6 +641,10 @@ fn print_config(config: &Config) {
         config.providers.mpv_executable.display()
     );
     println!(
+        "fpcalc_executable = {}",
+        config.providers.fpcalc_executable.display()
+    );
+    println!(
         "youtube_api_key = {}",
         if config.providers.youtube_api_key.is_some() {
             "configured (redacted)"
@@ -609,6 +660,14 @@ fn print_config(config: &Config) {
             "unset"
         }
     );
+    println!(
+        "acoustid_client_key = {}",
+        if config.providers.acoustid_client_key.is_some() {
+            "configured (redacted)"
+        } else {
+            "unset"
+        }
+    );
 }
 
 #[cfg(test)]
@@ -619,6 +678,8 @@ mod tests {
     use youta::config::{Config, PlaybackBackend};
 
     use super::doctor_helper_checks;
+    #[cfg(feature = "acoustid")]
+    use super::helper_install_guidance;
 
     #[test]
     fn doctor_checks_only_helpers_required_by_compiled_features() {
@@ -633,6 +694,10 @@ mod tests {
         assert_eq!(
             checks.iter().any(|check| check.name == "yt-dlp"),
             cfg!(feature = "yt-dlp")
+        );
+        assert_eq!(
+            checks.iter().any(|check| check.name == "fpcalc"),
+            cfg!(feature = "acoustid")
         );
         assert!(
             checks
@@ -653,6 +718,45 @@ mod tests {
                 .iter()
                 .all(|check| check.name != "mpv")
         );
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn doctor_requires_configured_fpcalc_only_when_fingerprinting_is_enabled() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.providers.fpcalc_executable = "custom-fpcalc".into();
+
+        let optional = doctor_helper_checks(&config)
+            .into_iter()
+            .find(|check| check.name == "fpcalc")
+            .expect("AcoustID build must probe fpcalc");
+        assert!(!optional.required);
+        assert_eq!(optional.executable, std::path::Path::new("custom-fpcalc"));
+        assert_eq!(optional.arguments, ["-version"]);
+
+        config.providers.acoustid_client_key = Some("fixture-client-key".to_owned());
+        let required = doctor_helper_checks(&config)
+            .into_iter()
+            .find(|check| check.name == "fpcalc")
+            .expect("configured AcoustID must retain fpcalc check");
+        assert!(required.required);
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn doctor_install_guidance_is_scoped_to_fpcalc() {
+        let guidance = helper_install_guidance("fpcalc").expect("fpcalc install guidance");
+
+        for command in [
+            "USE=tools emerge media-libs/chromaprint",
+            "apt install libchromaprint-tools",
+            "dnf install chromaprint-tools",
+            "brew install chromaprint",
+        ] {
+            assert!(guidance.contains(command));
+        }
+        assert!(helper_install_guidance("mpv").is_none());
     }
 
     #[cfg(feature = "tui")]

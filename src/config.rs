@@ -102,6 +102,7 @@ struct ProviderCredentials {
     youtube_api_key: Option<String>,
     mod_archive_api_key: Option<String>,
     jamendo_client_id: Option<String>,
+    acoustid_client_key: Option<String>,
 }
 
 /// The root application configuration.
@@ -257,6 +258,9 @@ impl Config {
         }
         if let Some(api_key) = self.providers.youtube_api_key.as_deref() {
             validate_youtube_api_key("providers.youtube_api_key", api_key)?;
+        }
+        if let Some(client_key) = self.providers.acoustid_client_key.as_deref() {
+            validate_acoustid_client_key("providers.acoustid_client_key", client_key)?;
         }
         for (field, credential) in [
             (
@@ -950,12 +954,16 @@ pub struct ProviderConfig {
     ///
     /// Youta does not bundle Jamendo's public documentation/testing client ID.
     pub jamendo_client_id: Option<String>,
+    /// Optional `AcoustID` application API key used for fingerprint lookup.
+    pub acoustid_client_key: Option<String>,
     /// Preferred Bandcamp stream or free-download encoding.
     pub bandcamp_audio_format: BandcampAudioFormat,
     /// `yt-dlp` executable name or path.
     pub yt_dlp_executable: PathBuf,
     /// `mpv` executable name or path.
     pub mpv_executable: PathBuf,
+    /// Chromaprint `fpcalc` executable name or path.
+    pub fpcalc_executable: PathBuf,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -979,9 +987,14 @@ impl fmt::Debug for ProviderConfig {
                 "jamendo_client_id",
                 &self.jamendo_client_id.as_ref().map(|_| "[CONFIGURED]"),
             )
+            .field(
+                "acoustid_client_key",
+                &self.acoustid_client_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("bandcamp_audio_format", &self.bandcamp_audio_format)
             .field("yt_dlp_executable", &self.yt_dlp_executable)
             .field("mpv_executable", &self.mpv_executable)
+            .field("fpcalc_executable", &self.fpcalc_executable)
             .finish()
     }
 }
@@ -997,9 +1010,11 @@ impl Default for ProviderConfig {
             youtube_api_key: None,
             mod_archive_api_key: None,
             jamendo_client_id: None,
+            acoustid_client_key: None,
             bandcamp_audio_format: BandcampAudioFormat::default(),
             yt_dlp_executable: PathBuf::from("yt-dlp"),
             mpv_executable: PathBuf::from("mpv"),
+            fpcalc_executable: PathBuf::from("fpcalc"),
         }
     }
 }
@@ -1214,6 +1229,10 @@ fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
         validate_youtube_api_key("providers.youtube_api_key", api_key)
             .map_err(|error| credential_file_error(path, error))?;
     }
+    if let Some(client_key) = credentials.providers.acoustid_client_key.as_deref() {
+        validate_acoustid_client_key("providers.acoustid_client_key", client_key)
+            .map_err(|error| credential_file_error(path, error))?;
+    }
     for (field, credential) in [
         (
             "providers.mod_archive_api_key",
@@ -1271,6 +1290,22 @@ fn validate_generic_credential(field: &str, credential: &str) -> Result<(), Conf
     if trimmed.is_empty() || trimmed.len() > 4096 || trimmed.chars().any(char::is_control) {
         return Err(ConfigError::Invalid(format!(
             "{field} must contain 1 to 4096 printable characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_acoustid_client_key(field: &str, client_key: &str) -> Result<(), ConfigError> {
+    if client_key != client_key.trim() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain surrounding whitespace"
+        )));
+    }
+    if !(1..=128).contains(&client_key.len())
+        || !client_key.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must contain 1 to 128 printable ASCII characters without spaces"
         )));
     }
     Ok(())
@@ -1495,6 +1530,8 @@ mod tests {
         assert!(config.providers.allow_insecure_http);
         assert_eq!(config.providers.youtube_backend, YouTubeBackend::Auto);
         assert!(config.providers.jamendo_client_id.is_none());
+        assert!(config.providers.acoustid_client_key.is_none());
+        assert_eq!(config.providers.fpcalc_executable, PathBuf::from("fpcalc"));
         assert_eq!(
             config.providers.bandcamp_audio_format,
             BandcampAudioFormat::BestAvailable
@@ -2005,6 +2042,7 @@ youtube_api_key = "keep-this-existing-secret"
             youtube_api_key: Some("youtube-secret-canary".to_owned()),
             mod_archive_api_key: Some("mod-secret-canary".to_owned()),
             jamendo_client_id: Some("jamendo-client-canary".to_owned()),
+            acoustid_client_key: Some("acoustid-secret-canary".to_owned()),
             ..ProviderConfig::default()
         };
         let rendered = format!("{providers:?}");
@@ -2012,6 +2050,7 @@ youtube_api_key = "keep-this-existing-secret"
             "youtube-secret-canary",
             "mod-secret-canary",
             "jamendo-client-canary",
+            "acoustid-secret-canary",
         ] {
             assert!(!rendered.contains(secret));
         }
@@ -2102,6 +2141,68 @@ youtube_api_key = "keep-this-existing-secret"
     }
 
     #[test]
+    fn acoustid_credentials_are_layered_from_the_private_file() {
+        let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join("secrets")).expect("secrets directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[providers]\nfpcalc_executable = \"/opt/chromaprint/bin/fpcalc\"\n",
+        )
+        .expect("public configuration");
+        fs::write(
+            directory.path().join("secrets/credentials.toml"),
+            "[providers]\nacoustid_client_key = \"private-client-key\"\n",
+        )
+        .expect("private credentials");
+
+        let config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load layered credentials");
+
+        assert_eq!(
+            config.providers.acoustid_client_key.as_deref(),
+            Some("private-client-key")
+        );
+        assert_eq!(
+            config.providers.fpcalc_executable,
+            PathBuf::from("/opt/chromaprint/bin/fpcalc")
+        );
+    }
+
+    #[test]
+    fn acoustid_client_key_requires_bounded_printable_ascii() {
+        for value in [
+            String::new(),
+            "contains space".to_owned(),
+            "line\nbreak".to_owned(),
+            "non-ascii-é".to_owned(),
+            "x".repeat(129),
+        ] {
+            let directory = tempdir().expect("temporary directory");
+            let secrets = directory.path().join("secrets");
+            fs::create_dir(&secrets).expect("secrets directory");
+            fs::write(
+                secrets.join("credentials.toml"),
+                format!("[providers]\nacoustid_client_key = {value:?}\n"),
+            )
+            .expect("credential fixture");
+
+            let error = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+                .expect_err("invalid AcoustID key must be rejected");
+            let rendered = error.to_string();
+            assert!(rendered.contains("providers.acoustid_client_key"));
+            if !value.is_empty() {
+                assert!(!rendered.contains(&value));
+            }
+        }
+
+        let mut config = Config::default();
+        config.providers.acoustid_client_key = Some("A1._~-".to_owned());
+        config
+            .validate()
+            .expect("ASCII-graphic AcoustID key is valid");
+    }
+
+    #[test]
     fn malformed_or_unknown_private_credentials_are_rejected() {
         let directory = tempdir().expect("temporary directory");
         fs::create_dir(directory.path().join("secrets")).expect("secrets directory");
@@ -2125,6 +2226,7 @@ youtube_api_key = "keep-this-existing-secret"
             ("youtube_api_key", " AIzaValid_key_123456789012345678"),
             ("mod_archive_api_key", "mod-archive-key "),
             ("jamendo_client_id", "\tjamendo-client-id"),
+            ("acoustid_client_key", "acoustid-key "),
         ] {
             let directory = tempdir().expect("temporary directory");
             let secrets = directory.path().join("secrets");
@@ -2163,6 +2265,7 @@ youtube_api_key = "keep-this-existing-secret"
             ("youtube_api_key", "AIzaValid_key_123456789012345678 "),
             ("mod_archive_api_key", " mod-archive-key"),
             ("jamendo_client_id", "jamendo-client-id\n"),
+            ("acoustid_client_key", "acoustid-client-key "),
         ] {
             let directory = tempdir().expect("temporary directory");
             fs::write(

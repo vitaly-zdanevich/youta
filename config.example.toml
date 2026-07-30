@@ -162,12 +162,15 @@ bandcamp_audio_format = 'best-available'
 #   # Register at https://devportal.jamendo.com/; Youta never ships the
 #   # documentation/testing client ID.
 #   jamendo_client_id = '...'
+#   # Create an application key at https://acoustid.org/api-key.
+#   acoustid_client_key = '...'
 #
 # Environment overrides have the highest precedence, for example:
 #
 #   YOUTA_PROVIDERS__YOUTUBE_API_KEY='...'
 #   YOUTA_PROVIDERS__MOD_ARCHIVE_API_KEY='...'
 #   YOUTA_PROVIDERS__JAMENDO_CLIENT_ID='...'
+#   YOUTA_PROVIDERS__ACOUSTID_CLIENT_KEY='...'
 #
 # If YouTube search has no provider, its TUI setup popup accepts either the API
 # key or the Invidious URL above. It shows both exact destinations:
@@ -183,3 +186,9 @@ bandcamp_audio_format = 'best-available'
 # Helper names may instead be absolute paths.
 yt_dlp_executable = 'yt-dlp'
 mpv_executable = 'mpv'
+
+# `fpcalc` is supplied by Chromaprint. A media file is passed to it only after
+# the user requests local-audio fingerprinting; diagnostics may separately run
+# `fpcalc -version`. AcoustID receives the fingerprint and duration, never the
+# local path or media bytes.
+fpcalc_executable = 'fpcalc'

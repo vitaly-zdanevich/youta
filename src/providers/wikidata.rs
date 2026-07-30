@@ -47,6 +47,8 @@ pub enum WikidataExternalKind {
     YouTubeChannel,
     /// `SoundCloud` path identifier, represented by Wikidata property P3040.
     SoundCloud,
+    /// MusicBrainz recording UUID, represented by Wikidata property P4404.
+    MusicBrainzRecording,
     /// Bilibili video ID, represented by Wikidata property P6456.
     BilibiliVideo,
     /// Bilibili user/channel ID, represented by Wikidata property P6455.
@@ -61,6 +63,7 @@ impl WikidataExternalKind {
             Self::YouTubeVideo => "P1651",
             Self::YouTubeChannel => "P2397",
             Self::SoundCloud => "P3040",
+            Self::MusicBrainzRecording => "P4404",
             Self::BilibiliVideo => "P6456",
             Self::BilibiliChannel => "P6455",
         }
@@ -380,6 +383,15 @@ fn validate_external_id(
                 ))
             }
         }
+        WikidataExternalKind::MusicBrainzRecording => {
+            if is_canonical_lowercase_uuid(external_id) {
+                Ok(())
+            } else {
+                Err(ProviderError::InvalidRequest(
+                    "MusicBrainz recording ID must be a lowercase canonical UUID".to_owned(),
+                ))
+            }
+        }
         WikidataExternalKind::BilibiliVideo => {
             let valid_numeric_id = external_id
                 .strip_prefix("av")
@@ -408,6 +420,22 @@ fn validate_external_id(
             }
         }
     }
+}
+
+/// Returns whether a value is a canonical lowercase UUID string.
+///
+/// MusicBrainz recording identifiers use the fixed `8-4-4-4-12` UUID layout.
+/// Accepting only lowercase hexadecimal digits also keeps the value identical
+/// to Wikidata's P4404 canonical representation.
+fn is_canonical_lowercase_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 fn is_positive_decimal(value: &str) -> bool {
@@ -2360,6 +2388,23 @@ mod tests {
     }
 
     #[test]
+    fn musicbrainz_recording_query_uses_p4404_and_the_exact_uuid() {
+        const RECORDING_ID: &str = "bcf01a23-5fcc-4a59-96b3-817da5f37077";
+
+        let url = build_query_url(WikidataExternalKind::MusicBrainzRecording, RECORDING_ID)
+            .expect("MusicBrainz query URL");
+        let query = url
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .expect("SPARQL query");
+
+        assert!(query.contains(&format!("VALUES ?externalId {{ \"{RECORDING_ID}\" }}")));
+        assert!(query.contains("wdt:P4404 ?externalId"));
+        assert!(query.contains("LIMIT 20"));
+    }
+
+    #[test]
     fn video_and_channel_validation_are_strict() {
         assert!(validate_external_id(WikidataExternalKind::YouTubeVideo, "dQw4w9WgXcQ").is_ok());
         assert!(
@@ -2384,6 +2429,33 @@ mod tests {
         assert!(validate_external_id(WikidataExternalKind::BilibiliVideo, "AV170001").is_err());
         assert!(validate_external_id(WikidataExternalKind::BilibiliChannel, "546195").is_ok());
         assert!(validate_external_id(WikidataExternalKind::BilibiliChannel, "0").is_err());
+    }
+
+    #[test]
+    fn musicbrainz_recording_validation_accepts_only_lowercase_canonical_uuids() {
+        const RECORDING_ID: &str = "bcf01a23-5fcc-4a59-96b3-817da5f37077";
+        let provider = WikidataProvider::new();
+
+        assert!(
+            validate_external_id(WikidataExternalKind::MusicBrainzRecording, RECORDING_ID).is_ok()
+        );
+        for invalid in [
+            "BCF01A23-5FCC-4A59-96B3-817DA5F37077",
+            "bcf01a235fcc4a5996b3817da5f37077",
+            "{bcf01a23-5fcc-4a59-96b3-817da5f37077}",
+            "urn:uuid:bcf01a23-5fcc-4a59-96b3-817da5f37077",
+            "bcf01a23-5fcc-4a59-96b3-817da5f3707g",
+            "bcf01a23-5fcc-4a59-96b3-817da5f3707",
+            " bcf01a23-5fcc-4a59-96b3-817da5f37077",
+        ] {
+            let error = provider
+                .lookup_external(WikidataExternalKind::MusicBrainzRecording, invalid)
+                .expect_err("invalid input must fail before a network lookup");
+            assert!(
+                matches!(error, ProviderError::InvalidRequest(_)),
+                "noncanonical MusicBrainz recording ID should be rejected: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -2451,6 +2523,40 @@ mod tests {
             "https://www.wikidata.org/wiki/Q60231842"
         );
         assert_eq!(lookup.items[0].description.as_deref(), Some("music video"));
+    }
+
+    #[test]
+    fn nonpolitical_musicbrainz_recording_fixture_uses_generic_normalization() {
+        const RECORDING_ID: &str = "bcf01a23-5fcc-4a59-96b3-817da5f37077";
+        let response: SparqlResponse = serde_json::from_str(
+            r#"{
+              "results": {
+                "bindings": [{
+                  "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q1747485"},
+                  "itemLabel": {"type": "literal", "value": "Wanna Get to Know You"},
+                  "itemDescription": {"type": "literal", "value": "2003 song by G-Unit"}
+                }]
+              }
+            }"#,
+        )
+        .expect("MusicBrainz fixture JSON");
+
+        let lookup = normalize_response(
+            WikidataExternalKind::MusicBrainzRecording,
+            RECORDING_ID,
+            response,
+        )
+        .expect("MusicBrainz fixture should normalize");
+
+        assert_eq!(lookup.kind, WikidataExternalKind::MusicBrainzRecording);
+        assert_eq!(lookup.external_id, RECORDING_ID);
+        assert_eq!(lookup.items.len(), 1);
+        assert_eq!(lookup.items[0].item_id, "Q1747485");
+        assert_eq!(lookup.items[0].label, "Wanna Get to Know You");
+        assert_eq!(
+            lookup.items[0].url.as_str(),
+            "https://www.wikidata.org/wiki/Q1747485"
+        );
     }
 
     #[test]

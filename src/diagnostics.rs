@@ -38,6 +38,9 @@ pub const DIAGNOSTIC_FORMAT_VERSION: u32 = 2;
 /// path, but cannot inject diagnostic command arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalHelperKind {
+    /// The Chromaprint fingerprint calculator, queried with `-version`.
+    #[cfg(feature = "acoustid")]
+    Fpcalc,
     /// The `mpv` media player, queried with `--version`.
     Mpv,
     /// The `yt-dlp` media extractor, queried with `--version`.
@@ -51,6 +54,8 @@ pub enum ExternalHelperKind {
 impl ExternalHelperKind {
     const fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "acoustid")]
+            Self::Fpcalc => "fpcalc",
             Self::Mpv => "mpv",
             Self::YtDlp => "yt-dlp",
             Self::Ffmpeg => "ffmpeg",
@@ -62,6 +67,8 @@ impl ExternalHelperKind {
         match self {
             Self::Mpv | Self::YtDlp => &["--version"],
             Self::Ffmpeg | Self::Ffprobe => &["-version"],
+            #[cfg(feature = "acoustid")]
+            Self::Fpcalc => &["-version"],
         }
     }
 }
@@ -445,6 +452,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
     }
 
     record_features!(
+        "acoustid",
         "alsa",
         "app",
         "apple-podcasts",
@@ -1035,6 +1043,8 @@ fn redact_sensitive_assignments(input: &str) -> String {
         "apikey=",
         "cookie:",
         "cookie=",
+        "client_key:",
+        "client_key=",
         "password:",
         "password=",
         "secret:",
@@ -1327,7 +1337,7 @@ VERSION="42 (Stable)"
     #[test]
     fn redacts_secrets_urls_and_home_paths() {
         let input = concat!(
-            "token=hunter2 password: swordfish\n",
+            "token=hunter2 password: swordfish acoustid_client_key=canary\n",
             "Authorization: Bearer abc.def\n",
             "request https://alice:password@example.test/watch?v=private#position\n",
             "at /home/alice/projects/youta/src/main.rs:10\n",
@@ -1337,6 +1347,7 @@ VERSION="42 (Stable)"
 
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("swordfish"));
+        assert!(!redacted.contains("canary"));
         assert!(!redacted.contains("abc.def"));
         assert!(!redacted.contains("alice:password"));
         assert!(!redacted.contains("private"));
@@ -1391,6 +1402,26 @@ VERSION="42 (Stable)"
             helper.probe_status,
             ExternalHelperProbeStatus::Available {
                 version: "mock mpv 1.2 args=--version".to_owned(),
+            }
+        );
+    }
+
+    #[cfg(all(unix, feature = "acoustid"))]
+    #[test]
+    fn fpcalc_probe_uses_the_official_fixed_version_argument() {
+        let executable = MockExecutable::new("printf 'fpcalc mock args=%s\\n' \"$*\"");
+
+        let helper = probe_helper_with_timeout(
+            ExternalHelperKind::Fpcalc,
+            Some(executable.path.clone()),
+            MOCK_HELPER_TIMEOUT,
+        );
+
+        assert_eq!(helper.name, "fpcalc");
+        assert_eq!(
+            helper.probe_status,
+            ExternalHelperProbeStatus::Available {
+                version: "fpcalc mock args=-version".to_owned(),
             }
         );
     }
@@ -1639,5 +1670,6 @@ VERSION="42 (Stable)"
         let features = enabled_compile_features();
 
         assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(features.contains(&"acoustid"), cfg!(feature = "acoustid"));
     }
 }

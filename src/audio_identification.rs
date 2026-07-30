@@ -2,9 +2,11 @@
 //!
 //! [`LocalAudioIdentifier`] runs the installed `fpcalc` executable without a
 //! shell, submits its bounded JSON fingerprint to `AcoustID`, and returns
-//! canonical `MusicBrainz` recording URLs. Identification is deliberately
+//! ranked [`MusicBrainzCandidate`] values. Identification is deliberately
 //! explicit: this module does not scan directories or fingerprint files in the
-//! background.
+//! background. [`AudioIdentificationCancellation`] lets a caller stop an
+//! in-flight `fpcalc` process when its selected file changes or the application
+//! shuts down.
 //!
 //! `AcoustID` documents the lookup parameters and its three-requests-per-second
 //! service limit in the [web-service documentation][acoustid]. Chromaprint
@@ -14,12 +16,17 @@
 //! [chromaprint]: https://acoustid.org/chromaprint
 
 use std::{
-    collections::HashSet,
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
     io::{self, Read},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -31,14 +38,34 @@ use url::Url;
 /// Official `AcoustID` fingerprint-lookup endpoint.
 pub const ACOUSTID_LOOKUP_ENDPOINT: &str = "https://api.acoustid.org/v2/lookup";
 
+/// Package-manager commands that install the official `fpcalc` helper.
+pub const FPCALC_INSTALL_GUIDANCE: &str = "\
+Install the Chromaprint tools package:
+  Gentoo: USE=tools emerge media-libs/chromaprint
+  Debian/Ubuntu: apt install libchromaprint-tools
+  Fedora: dnf install chromaprint-tools
+  macOS (Homebrew): brew install chromaprint";
+
 /// Maximum accepted encoded Chromaprint fingerprint size.
 pub const MAX_FINGERPRINT_BYTES: usize = 1_048_576;
 
 /// Maximum accepted `AcoustID` response size.
 pub const MAX_ACOUSTID_RESPONSE_BYTES: usize = 1_048_576;
 
+/// Maximum number of unique `MusicBrainz` recording candidates returned.
+pub const MAX_RECORDING_CANDIDATES: usize = 256;
+
 /// Maximum number of unique `MusicBrainz` recording URLs returned per lookup.
-pub const MAX_RECORDING_URLS: usize = 256;
+///
+/// This compatibility alias has the same value as
+/// [`MAX_RECORDING_CANDIDATES`].
+pub const MAX_RECORDING_URLS: usize = MAX_RECORDING_CANDIDATES;
+
+/// Conservative minimum spacing between `AcoustID` lookup starts.
+///
+/// A 334-millisecond interval keeps the serialized identifier below the
+/// service's documented limit of three requests per second.
+pub const MIN_ACOUSTID_LOOKUP_INTERVAL: Duration = Duration::from_millis(334);
 
 const DEFAULT_FP_CALC_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_FP_CALC_TIMEOUT: Duration = Duration::from_mins(10);
@@ -49,8 +76,186 @@ const DEFAULT_STDERR_LIMIT: usize = 65_536;
 const MAX_STDOUT_LIMIT: usize = 8_388_608;
 const MAX_STDERR_LIMIT: usize = 1_048_576;
 const MAX_CLIENT_KEY_BYTES: usize = 128;
-const MAX_REMOTE_ERROR_CHARS: usize = 256;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PROCESS_CAPTURE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cloneable cooperative-cancellation signal for one identification request.
+///
+/// Clones observe the same state. Cancellation is permanent, lock-free, and
+/// safe to request from another thread.
+#[derive(Clone, Default)]
+pub struct AudioIdentificationCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AudioIdentificationCancellation {
+    /// Creates a cancellation signal in its active state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation for this signal and all of its clones.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for AudioIdentificationCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioIdentificationCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+trait MonotonicLookupClock: Send {
+    fn now(&self) -> Instant;
+    fn sleep(&mut self, duration: Duration, cancellation: &AudioIdentificationCancellation);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemMonotonicLookupClock;
+
+impl MonotonicLookupClock for SystemMonotonicLookupClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration, cancellation: &AudioIdentificationCancellation) {
+        let mut remaining = duration;
+        while !remaining.is_zero() && !cancellation.is_cancelled() {
+            let slice = remaining.min(PROCESS_POLL_INTERVAL);
+            thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+        }
+    }
+}
+
+struct AcoustIdLookupLimiter {
+    last_lookup_started_at: Option<Instant>,
+    clock: Box<dyn MonotonicLookupClock>,
+}
+
+impl AcoustIdLookupLimiter {
+    fn new(clock: Box<dyn MonotonicLookupClock>) -> Self {
+        Self {
+            last_lookup_started_at: None,
+            clock,
+        }
+    }
+
+    fn wait_for_slot(
+        &mut self,
+        cancellation: &AudioIdentificationCancellation,
+    ) -> Result<(), AudioIdentificationError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(AudioIdentificationError::Cancelled);
+            }
+            let Some(last_started) = self.last_lookup_started_at else {
+                break;
+            };
+            let earliest_start = last_started
+                .checked_add(MIN_ACOUSTID_LOOKUP_INTERVAL)
+                .ok_or(AudioIdentificationError::InvalidHttpConfig)?;
+            let now = self.clock.now();
+            if now >= earliest_start {
+                break;
+            }
+            self.clock
+                .sleep(earliest_start.duration_since(now), cancellation);
+        }
+        if cancellation.is_cancelled() {
+            return Err(AudioIdentificationError::Cancelled);
+        }
+        self.last_lookup_started_at = Some(self.clock.now());
+        Ok(())
+    }
+}
+
+impl Default for AcoustIdLookupLimiter {
+    fn default() -> Self {
+        Self::new(Box::new(SystemMonotonicLookupClock))
+    }
+}
+
+impl fmt::Debug for AcoustIdLookupLimiter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcoustIdLookupLimiter")
+            .field(
+                "has_previous_lookup",
+                &self.last_lookup_started_at.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// One ranked `MusicBrainz` recording linked by an `AcoustID` result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MusicBrainzCandidate {
+    recording_id: String,
+    url: Url,
+    acoustid_result_id: String,
+    score: f64,
+}
+
+impl MusicBrainzCandidate {
+    /// Creates a validated candidate from recording and `AcoustID` UUIDs.
+    ///
+    /// UUIDs are canonicalized to lowercase. Returns `None` when either ID is
+    /// malformed or `score` is not finite and within the inclusive zero-to-one
+    /// range.
+    #[must_use]
+    pub fn new(recording_id: &str, acoustid_result_id: &str, score: f64) -> Option<Self> {
+        let recording_id = canonical_uuid(recording_id)?;
+        let acoustid_result_id = canonical_uuid(acoustid_result_id)?;
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            return None;
+        }
+        let url = Url::parse(&format!("https://musicbrainz.org/recording/{recording_id}")).ok()?;
+        Some(Self {
+            recording_id,
+            url,
+            acoustid_result_id,
+            score,
+        })
+    }
+
+    /// Returns the canonical lowercase `MusicBrainz` recording UUID.
+    #[must_use]
+    pub fn recording_id(&self) -> &str {
+        &self.recording_id
+    }
+
+    /// Returns the canonical `MusicBrainz` recording URL.
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// Returns the canonical lowercase UUID of the supporting `AcoustID`
+    /// result.
+    #[must_use]
+    pub fn acoustid_result_id(&self) -> &str {
+        &self.acoustid_result_id
+    }
+
+    /// Returns the finite `AcoustID` confidence score in the inclusive range
+    /// from zero to one.
+    #[must_use]
+    pub const fn score(&self) -> f64 {
+        self.score
+    }
+}
 
 /// A validated whole-file duration and encoded Chromaprint fingerprint.
 pub struct AudioFingerprint {
@@ -316,7 +521,14 @@ impl fmt::Debug for FpcalcProcessOutput {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("{message}")]
 pub struct FpcalcProcessError {
+    kind: FpcalcProcessErrorKind,
     message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FpcalcProcessErrorKind {
+    Failure,
+    Cancelled,
 }
 
 impl FpcalcProcessError {
@@ -326,8 +538,22 @@ impl FpcalcProcessError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: FpcalcProcessErrorKind::Failure,
             message: message.into(),
         }
+    }
+
+    /// Creates a cooperative-cancellation result for an injected executor.
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            kind: FpcalcProcessErrorKind::Cancelled,
+            message: "fpcalc process was cancelled".to_owned(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.kind == FpcalcProcessErrorKind::Cancelled
     }
 }
 
@@ -342,10 +568,15 @@ pub trait FpcalcProcess: Send {
     fn execute(
         &mut self,
         invocation: &FpcalcInvocation,
+        cancellation: &AudioIdentificationCancellation,
     ) -> Result<FpcalcProcessOutput, FpcalcProcessError>;
 }
 
 /// Shell-free operating-system process executor for `fpcalc`.
+///
+/// Cancellation terminates the configured executable directly. Configure the
+/// actual `fpcalc` executable rather than a wrapper that leaves descendant
+/// processes running.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemFpcalcProcess;
 
@@ -353,7 +584,11 @@ impl FpcalcProcess for SystemFpcalcProcess {
     fn execute(
         &mut self,
         invocation: &FpcalcInvocation,
+        cancellation: &AudioIdentificationCancellation,
     ) -> Result<FpcalcProcessOutput, FpcalcProcessError> {
+        if cancellation.is_cancelled() {
+            return Err(FpcalcProcessError::cancelled());
+        }
         let mut child = Command::new(&invocation.executable)
             .args(&invocation.arguments)
             .stdin(Stdio::null())
@@ -372,35 +607,36 @@ impl FpcalcProcess for SystemFpcalcProcess {
             .ok_or_else(|| FpcalcProcessError::new("fpcalc standard error was unavailable"))?;
         let stdout_limit = invocation.stdout_limit;
         let stderr_limit = invocation.stderr_limit;
-        let stdout_reader = thread::spawn(move || drain_bounded(stdout, stdout_limit));
-        let stderr_reader = thread::spawn(move || drain_bounded(stderr, stderr_limit));
+        let stdout_capture = spawn_capture(stdout, stdout_limit);
+        let stderr_capture = spawn_capture(stderr, stderr_limit);
 
         let deadline = Instant::now()
             .checked_add(invocation.timeout)
             .ok_or_else(|| FpcalcProcessError::new("fpcalc deadline was invalid"))?;
         let status = loop {
+            if cancellation.is_cancelled() {
+                terminate_direct_child(&mut child)?;
+                return Err(FpcalcProcessError::cancelled());
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    join_capture(stdout_reader)?;
-                    join_capture(stderr_reader)?;
+                    terminate_direct_child(&mut child)?;
                     return Err(FpcalcProcessError::new("fpcalc process timed out"));
                 }
                 Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    join_capture(stdout_reader)?;
-                    join_capture(stderr_reader)?;
+                    terminate_direct_child(&mut child)?;
                     return Err(FpcalcProcessError::new("failed to poll the fpcalc process"));
                 }
             }
         };
 
-        let stdout = join_capture(stdout_reader)?;
-        let stderr = join_capture(stderr_reader)?;
+        let capture_deadline = Instant::now()
+            .checked_add(PROCESS_CAPTURE_FINISH_TIMEOUT)
+            .ok_or_else(|| FpcalcProcessError::new("fpcalc output deadline was invalid"))?;
+        let stdout = receive_capture(&stdout_capture, capture_deadline)?;
+        let stderr = receive_capture(&stderr_capture, capture_deadline)?;
         Ok(FpcalcProcessOutput {
             success: status.success(),
             exit_code: status.code(),
@@ -422,6 +658,23 @@ pub trait FingerprintRunner: Send {
     fn fingerprint(
         &mut self,
         audio_path: &Path,
+    ) -> Result<AudioFingerprint, AudioIdentificationError> {
+        self.fingerprint_with_cancellation(audio_path, &AudioIdentificationCancellation::default())
+    }
+
+    /// Produces one validated fingerprint while observing cancellation.
+    ///
+    /// Implementations should return [`AudioIdentificationError::Cancelled`]
+    /// promptly after `cancellation` is requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, invalid paths, process failures, or
+    /// malformed fingerprint output.
+    fn fingerprint_with_cancellation(
+        &mut self,
+        audio_path: &Path,
+        cancellation: &AudioIdentificationCancellation,
     ) -> Result<AudioFingerprint, AudioIdentificationError>;
 }
 
@@ -452,10 +705,14 @@ impl Default for FpcalcFingerprintRunner<SystemFpcalcProcess> {
 }
 
 impl<P: FpcalcProcess> FingerprintRunner for FpcalcFingerprintRunner<P> {
-    fn fingerprint(
+    fn fingerprint_with_cancellation(
         &mut self,
         audio_path: &Path,
+        cancellation: &AudioIdentificationCancellation,
     ) -> Result<AudioFingerprint, AudioIdentificationError> {
+        if cancellation.is_cancelled() {
+            return Err(AudioIdentificationError::Cancelled);
+        }
         let metadata = std::fs::metadata(audio_path)
             .map_err(|_| AudioIdentificationError::InvalidAudioPath)?;
         if !metadata.is_file() {
@@ -475,7 +732,19 @@ impl<P: FpcalcProcess> FingerprintRunner for FpcalcFingerprintRunner<P> {
             stdout_limit: self.config.stdout_limit,
             stderr_limit: self.config.stderr_limit,
         };
-        let output = self.process.execute(&invocation)?;
+        let output = self
+            .process
+            .execute(&invocation, cancellation)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    AudioIdentificationError::Cancelled
+                } else {
+                    AudioIdentificationError::FpcalcProcess(error)
+                }
+            })?;
+        if cancellation.is_cancelled() {
+            return Err(AudioIdentificationError::Cancelled);
+        }
         if output.stdout_exceeded_limit || output.stdout.len() > invocation.stdout_limit {
             return Err(AudioIdentificationError::FpcalcOutputTooLarge {
                 stream: "standard output",
@@ -682,11 +951,31 @@ impl AcoustIdTransport for UreqAcoustIdTransport {
     }
 }
 
+/// Object-safe boundary for explicitly identifying one local audio file.
+///
+/// Application workers can own this trait behind a `Box` and inject mock
+/// implementations without depending on an HTTP transport or `fpcalc`.
+pub trait AudioIdentifier: Send {
+    /// Identifies one local audio file while observing cooperative
+    /// cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cancellation, fingerprinting, transport, response
+    /// bounds, or response parsing fails.
+    fn identify(
+        &mut self,
+        audio_path: &Path,
+        cancellation: &AudioIdentificationCancellation,
+    ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError>;
+}
+
 /// Explicit local-file identifier with injectable process and HTTP boundaries.
 pub struct LocalAudioIdentifier<F, T> {
     fingerprint_runner: F,
     transport: T,
     client_key: String,
+    lookup_limiter: AcoustIdLookupLimiter,
 }
 
 impl<F, T> LocalAudioIdentifier<F, T> {
@@ -712,6 +1001,7 @@ impl<F, T> LocalAudioIdentifier<F, T> {
             fingerprint_runner,
             transport,
             client_key,
+            lookup_limiter: AcoustIdLookupLimiter::default(),
         })
     }
 
@@ -741,9 +1031,8 @@ impl LocalAudioIdentifier<FpcalcFingerprintRunner<SystemFpcalcProcess>, UreqAcou
 impl<F: FingerprintRunner, T: AcoustIdTransport> LocalAudioIdentifier<F, T> {
     /// Identifies one explicitly selected local audio file.
     ///
-    /// URLs are unique, retain `AcoustID` result order, use lowercase UUIDs, and
-    /// always have the form
-    /// `https://musicbrainz.org/recording/00000000-0000-0000-0000-000000000000`.
+    /// Candidates are unique by recording UUID, ranked by descending
+    /// `AcoustID` confidence score, and use canonical lowercase UUIDs and URLs.
     ///
     /// An empty vector means `AcoustID` returned no valid linked `MusicBrainz`
     /// recording.
@@ -752,14 +1041,55 @@ impl<F: FingerprintRunner, T: AcoustIdTransport> LocalAudioIdentifier<F, T> {
     ///
     /// Returns an error when fingerprinting, transport, response bounds, or
     /// response parsing fails.
-    pub fn identify(&mut self, audio_path: &Path) -> Result<Vec<Url>, AudioIdentificationError> {
-        let fingerprint = self.fingerprint_runner.fingerprint(audio_path)?;
+    pub fn identify(
+        &mut self,
+        audio_path: &Path,
+    ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+        self.identify_with_cancellation(audio_path, &AudioIdentificationCancellation::default())
+    }
+
+    /// Identifies one explicitly selected local audio file while observing
+    /// cooperative cancellation.
+    ///
+    /// Cancellation interrupts `fpcalc` promptly. A synchronous HTTP lookup
+    /// cannot be interrupted, but cancellation is checked immediately before
+    /// and after that bounded request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cancellation, fingerprinting, transport, response
+    /// bounds, or response parsing fails.
+    pub fn identify_with_cancellation(
+        &mut self,
+        audio_path: &Path,
+        cancellation: &AudioIdentificationCancellation,
+    ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+        let fingerprint = self
+            .fingerprint_runner
+            .fingerprint_with_cancellation(audio_path, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(AudioIdentificationError::Cancelled);
+        }
         let request = AcoustIdLookupRequest {
             client_key: &self.client_key,
             fingerprint: &fingerprint,
         };
+        self.lookup_limiter.wait_for_slot(cancellation)?;
         let response = self.transport.lookup(&request)?;
+        if cancellation.is_cancelled() {
+            return Err(AudioIdentificationError::Cancelled);
+        }
         parse_acoustid_response(&response.body)
+    }
+}
+
+impl<F: FingerprintRunner, T: AcoustIdTransport> AudioIdentifier for LocalAudioIdentifier<F, T> {
+    fn identify(
+        &mut self,
+        audio_path: &Path,
+        cancellation: &AudioIdentificationCancellation,
+    ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+        self.identify_with_cancellation(audio_path, cancellation)
     }
 }
 
@@ -774,6 +1104,9 @@ impl<F, T> fmt::Debug for LocalAudioIdentifier<F, T> {
 /// Failure identifying an explicitly selected local audio file.
 #[derive(Debug, Error)]
 pub enum AudioIdentificationError {
+    /// The caller cancelled the in-flight identification request.
+    #[error("audio identification was cancelled")]
+    Cancelled,
     /// The configured `AcoustID` application client key is unusable.
     #[error("AcoustID client key is empty or invalid")]
     InvalidClientKey,
@@ -825,12 +1158,10 @@ pub enum AudioIdentificationError {
     #[error("AcoustID returned invalid lookup JSON")]
     InvalidAcoustIdResponse,
     /// `AcoustID` returned a structured API error.
-    #[error("AcoustID rejected the lookup (code {code:?}): {message}")]
+    #[error("AcoustID rejected the lookup (code {code:?})")]
     AcoustIdRejected {
         /// `AcoustID` numeric error code, when supplied.
         code: Option<i64>,
-        /// Bounded, control-free service message.
-        message: String,
     },
 }
 
@@ -860,20 +1191,60 @@ fn drain_bounded(mut reader: impl Read, limit: usize) -> Result<CapturedOutput, 
     })
 }
 
-fn join_capture(
-    handle: thread::JoinHandle<Result<CapturedOutput, io::Error>>,
+fn spawn_capture(
+    reader: impl Read + Send + 'static,
+    limit: usize,
+) -> Receiver<Result<CapturedOutput, io::Error>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(drain_bounded(reader, limit));
+    });
+    receiver
+}
+
+fn receive_capture(
+    receiver: &Receiver<Result<CapturedOutput, io::Error>>,
+    deadline: Instant,
 ) -> Result<CapturedOutput, FpcalcProcessError> {
-    handle
-        .join()
-        .map_err(|_| FpcalcProcessError::new("fpcalc output reader panicked"))?
-        .map_err(|_| FpcalcProcessError::new("failed to read fpcalc process output"))
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(capture)) => Ok(capture),
+        Ok(Err(_)) => Err(FpcalcProcessError::new(
+            "failed to read fpcalc process output",
+        )),
+        Err(RecvTimeoutError::Timeout) => Err(FpcalcProcessError::new(
+            "fpcalc output did not close after the process exited",
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(FpcalcProcessError::new("fpcalc output reader stopped"))
+        }
+    }
+}
+
+fn terminate_direct_child(child: &mut Child) -> Result<(), FpcalcProcessError> {
+    if child.kill().is_err() {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(_) => {
+                return Err(FpcalcProcessError::new(
+                    "failed to terminate the fpcalc process",
+                ));
+            }
+        }
+    }
+    child
+        .wait()
+        .map(|_| ())
+        .map_err(|_| FpcalcProcessError::new("failed to wait for the fpcalc process"))
 }
 
 fn map_process_start_error(error: &io::Error) -> FpcalcProcessError {
     let message = match error.kind() {
-        io::ErrorKind::NotFound => "fpcalc executable was not found",
-        io::ErrorKind::PermissionDenied => "fpcalc executable is not permitted",
-        _ => "failed to start fpcalc",
+        io::ErrorKind::NotFound => {
+            format!("fpcalc executable was not found.\n{FPCALC_INSTALL_GUIDANCE}")
+        }
+        io::ErrorKind::PermissionDenied => "fpcalc executable is not permitted".to_owned(),
+        _ => "failed to start fpcalc".to_owned(),
     };
     FpcalcProcessError::new(message)
 }
@@ -940,22 +1311,25 @@ struct AcoustIdResponse {
 
 #[derive(Deserialize)]
 struct AcoustIdResult {
+    id: Option<String>,
+    score: Option<f64>,
     #[serde(default)]
     recordings: Vec<MusicBrainzRecording>,
 }
 
 #[derive(Deserialize)]
 struct MusicBrainzRecording {
-    id: String,
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AcoustIdApiError {
     code: Option<i64>,
-    message: Option<String>,
 }
 
-fn parse_acoustid_response(bytes: &[u8]) -> Result<Vec<Url>, AudioIdentificationError> {
+fn parse_acoustid_response(
+    bytes: &[u8],
+) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
     if bytes.len() > MAX_ACOUSTID_RESPONSE_BYTES {
         return Err(AudioIdentificationError::AcoustIdResponseTooLarge {
             limit: MAX_ACOUSTID_RESPONSE_BYTES,
@@ -965,33 +1339,59 @@ fn parse_acoustid_response(bytes: &[u8]) -> Result<Vec<Url>, AudioIdentification
         .map_err(|_| AudioIdentificationError::InvalidAcoustIdResponse)?;
     if response.status != "ok" {
         let code = response.error.as_ref().and_then(|error| error.code);
-        let message = response.error.and_then(|error| error.message).map_or_else(
-            || "service returned an unspecified error".to_owned(),
-            |message| sanitize_remote_message(&message),
-        );
-        return Err(AudioIdentificationError::AcoustIdRejected { code, message });
+        return Err(AudioIdentificationError::AcoustIdRejected { code });
     }
 
-    let mut seen = HashSet::new();
-    let mut urls = Vec::new();
-    for recording in response
-        .results
-        .into_iter()
-        .flat_map(|result| result.recordings)
-    {
-        let Some(id) = canonical_uuid(&recording.id) else {
+    let mut candidates_by_recording = BTreeMap::<String, MusicBrainzCandidate>::new();
+    for result in response.results {
+        let Some(result_id) = result.id.as_deref().and_then(canonical_uuid) else {
             continue;
         };
-        if seen.insert(id.clone()) {
-            let url = Url::parse(&format!("https://musicbrainz.org/recording/{id}"))
-                .expect("a validated UUID always forms a canonical MusicBrainz URL");
-            urls.push(url);
-            if urls.len() == MAX_RECORDING_URLS {
-                break;
+        let Some(score) = result
+            .score
+            .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+        else {
+            continue;
+        };
+        for recording in result.recordings {
+            let Some(recording_id) = recording.id.as_deref() else {
+                continue;
+            };
+            let Some(candidate) = MusicBrainzCandidate::new(recording_id, &result_id, score) else {
+                continue;
+            };
+            match candidates_by_recording.entry(candidate.recording_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if candidate_is_better(&candidate, entry.get()) =>
+                {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
             }
         }
     }
-    Ok(urls)
+
+    let mut candidates: Vec<_> = candidates_by_recording.into_values().collect();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.recording_id.cmp(&right.recording_id))
+            .then_with(|| left.acoustid_result_id.cmp(&right.acoustid_result_id))
+    });
+    candidates.truncate(MAX_RECORDING_CANDIDATES);
+    Ok(candidates)
+}
+
+fn candidate_is_better(candidate: &MusicBrainzCandidate, current: &MusicBrainzCandidate) -> bool {
+    match candidate.score.total_cmp(&current.score) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => candidate.acoustid_result_id < current.acoustid_result_id,
+        std::cmp::Ordering::Less => false,
+    }
 }
 
 fn canonical_uuid(value: &str) -> Option<String> {
@@ -1010,19 +1410,6 @@ fn canonical_uuid(value: &str) -> Option<String> {
     Some(value.to_ascii_lowercase())
 }
 
-fn sanitize_remote_message(message: &str) -> String {
-    let sanitized: String = message
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(MAX_REMOTE_ERROR_CHARS)
-        .collect();
-    if sanitized.is_empty() {
-        "service returned an unspecified error".to_owned()
-    } else {
-        sanitized
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1030,6 +1417,10 @@ mod tests {
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use tempfile::TempDir;
@@ -1038,6 +1429,8 @@ mod tests {
 
     const RECORDING_ONE: &str = "38035858-f990-4fbb-b3b2-f2f8b958eeba";
     const RECORDING_TWO_UPPER: &str = "CD2E7C47-16F5-46C6-A37C-A1EB7BF599FF";
+    const ACOUSTID_RESULT_ONE: &str = "11111111-1111-4111-8111-111111111111";
+    const ACOUSTID_RESULT_TWO_UPPER: &str = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
 
     #[derive(Default)]
     struct MockProcess {
@@ -1049,11 +1442,60 @@ mod tests {
         fn execute(
             &mut self,
             invocation: &FpcalcInvocation,
+            _cancellation: &AudioIdentificationCancellation,
         ) -> Result<FpcalcProcessOutput, FpcalcProcessError> {
             self.invocations.push(invocation.clone());
             self.outputs
                 .pop_front()
                 .expect("mock process output must be configured")
+        }
+    }
+
+    struct CancellationAwareProcess {
+        started: Arc<AtomicBool>,
+    }
+
+    impl FpcalcProcess for CancellationAwareProcess {
+        fn execute(
+            &mut self,
+            _invocation: &FpcalcInvocation,
+            cancellation: &AudioIdentificationCancellation,
+        ) -> Result<FpcalcProcessOutput, FpcalcProcessError> {
+            self.started.store(true, Ordering::Release);
+            let fallback_deadline = Instant::now() + Duration::from_secs(2);
+            while !cancellation.is_cancelled() {
+                if Instant::now() >= fallback_deadline {
+                    return Err(FpcalcProcessError::new(
+                        "mock process did not observe cancellation",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(FpcalcProcessError::cancelled())
+        }
+    }
+
+    struct AdvancingLookupClock {
+        now: Instant,
+        waits: Arc<Mutex<Vec<Duration>>>,
+        cancel_on_sleep: bool,
+    }
+
+    impl MonotonicLookupClock for AdvancingLookupClock {
+        fn now(&self) -> Instant {
+            self.now
+        }
+
+        fn sleep(&mut self, duration: Duration, cancellation: &AudioIdentificationCancellation) {
+            self.waits.lock().expect("mock lookup waits").push(duration);
+            if self.cancel_on_sleep {
+                cancellation.cancel();
+            } else {
+                self.now = self
+                    .now
+                    .checked_add(duration)
+                    .expect("bounded mock lookup time");
+            }
         }
     }
 
@@ -1091,10 +1533,14 @@ mod tests {
     struct StaticFingerprintRunner(AudioFingerprint);
 
     impl FingerprintRunner for StaticFingerprintRunner {
-        fn fingerprint(
+        fn fingerprint_with_cancellation(
             &mut self,
             _audio_path: &Path,
+            cancellation: &AudioIdentificationCancellation,
         ) -> Result<AudioFingerprint, AudioIdentificationError> {
+            if cancellation.is_cancelled() {
+                return Err(AudioIdentificationError::Cancelled);
+            }
             AudioFingerprint::new(self.0.duration_seconds(), self.0.encoded())
         }
     }
@@ -1148,6 +1594,100 @@ mod tests {
 
         assert!(matches!(error, AudioIdentificationError::InvalidAudioPath));
         assert!(process.invocations.is_empty());
+    }
+
+    #[test]
+    fn fpcalc_runner_skips_process_for_pre_cancelled_request() {
+        let (_directory, path) = selected_file();
+        let cancellation = AudioIdentificationCancellation::new();
+        cancellation.cancel();
+        let mut runner =
+            FpcalcFingerprintRunner::new(FpcalcConfig::default(), MockProcess::default());
+
+        let error = runner
+            .fingerprint_with_cancellation(&path, &cancellation)
+            .expect_err("cancelled work must not start a process");
+        let process = runner.into_process();
+
+        assert!(matches!(error, AudioIdentificationError::Cancelled));
+        assert!(process.invocations.is_empty());
+    }
+
+    #[test]
+    fn fpcalc_runner_forwards_cooperative_cancellation_to_process() {
+        let (_directory, path) = selected_file();
+        let cancellation = AudioIdentificationCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let process = CancellationAwareProcess {
+            started: Arc::clone(&started),
+        };
+        let mut runner = FpcalcFingerprintRunner::new(FpcalcConfig::default(), process);
+        let worker = thread::spawn(move || {
+            runner.fingerprint_with_cancellation(&path, &worker_cancellation)
+        });
+        let started_deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::Acquire) && Instant::now() < started_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(started.load(Ordering::Acquire));
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("mock fingerprint worker must not panic")
+            .expect_err("cooperative cancellation must stop fingerprinting");
+
+        assert!(matches!(error, AudioIdentificationError::Cancelled));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_fpcalc_cancellation_terminates_the_direct_executable_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new().expect("temporary directory");
+        let executable = directory.path().join("blocking-fpcalc");
+        let marker = PathBuf::from(format!("{}.started", executable.display()));
+        fs::write(
+            &executable,
+            b"#!/bin/sh\n: > \"$0.started\"\nwhile :; do :; done\n",
+        )
+        .expect("mock executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("mock executable metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("executable permissions");
+        let invocation = FpcalcInvocation {
+            executable: executable.into_os_string(),
+            arguments: Vec::new(),
+            timeout: Duration::from_secs(5),
+            stdout_limit: 64,
+            stderr_limit: 64,
+        };
+        let cancellation = AudioIdentificationCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker =
+            thread::spawn(move || SystemFpcalcProcess.execute(&invocation, &worker_cancellation));
+        let started_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < started_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(marker.exists(), "mock executable did not start");
+
+        let cancellation_started = Instant::now();
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("system process worker must not panic")
+            .expect_err("cancellation must stop the direct executable");
+
+        assert_eq!(error, FpcalcProcessError::cancelled());
+        assert!(
+            cancellation_started.elapsed() < Duration::from_secs(2),
+            "direct-process cancellation exceeded its bounded test deadline"
+        );
     }
 
     #[test]
@@ -1209,7 +1749,116 @@ mod tests {
     }
 
     #[test]
-    fn identifier_posts_required_fields_and_returns_canonical_unique_urls() {
+    fn missing_fpcalc_error_lists_verified_package_commands_without_source_details() {
+        let source = io::Error::new(
+            io::ErrorKind::NotFound,
+            "private executable path must not be shown",
+        );
+
+        let rendered = map_process_start_error(&source).to_string();
+
+        assert!(rendered.starts_with("fpcalc executable was not found."));
+        for command in [
+            "USE=tools emerge media-libs/chromaprint",
+            "apt install libchromaprint-tools",
+            "dnf install chromaprint-tools",
+            "brew install chromaprint",
+        ] {
+            assert!(
+                rendered.contains(command),
+                "missing installation command: {command}"
+            );
+        }
+        assert!(!rendered.contains("private executable path"));
+    }
+
+    #[test]
+    fn candidate_constructor_canonicalizes_ids_and_rejects_invalid_scores() {
+        let candidate =
+            MusicBrainzCandidate::new(RECORDING_TWO_UPPER, ACOUSTID_RESULT_TWO_UPPER, 0.8)
+                .expect("valid candidate");
+
+        assert_eq!(
+            candidate.recording_id(),
+            "cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff"
+        );
+        assert_eq!(
+            candidate.acoustid_result_id(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(candidate.score(), 0.8);
+        assert!(MusicBrainzCandidate::new(RECORDING_ONE, ACOUSTID_RESULT_ONE, f64::NAN).is_none());
+        assert!(MusicBrainzCandidate::new(RECORDING_ONE, ACOUSTID_RESULT_ONE, 1.1).is_none());
+    }
+
+    #[test]
+    fn candidates_are_deterministic_across_result_order_and_score_ties() {
+        let response_one = format!(
+            r#"{{
+                "status":"ok",
+                "results":[
+                    {{
+                      "id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                      "score":0.7,
+                      "recordings":[{{"id":"{RECORDING_ONE}"}}]
+                    }},
+                    {{
+                      "id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                      "score":0.7,
+                      "recordings":[{{"id":"{RECORDING_ONE}"}}]
+                    }},
+                    {{
+                      "id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                      "score":0.9,
+                      "recordings":[{{"id":"{RECORDING_TWO_UPPER}"}}]
+                    }}
+                ]
+            }}"#
+        );
+        let response_two = format!(
+            r#"{{
+                "status":"ok",
+                "results":[
+                    {{
+                      "id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                      "score":0.9,
+                      "recordings":[{{"id":"{RECORDING_TWO_UPPER}"}}]
+                    }},
+                    {{
+                      "id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                      "score":0.7,
+                      "recordings":[{{"id":"{RECORDING_ONE}"}}]
+                    }},
+                    {{
+                      "id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                      "score":0.7,
+                      "recordings":[{{"id":"{RECORDING_ONE}"}}]
+                    }}
+                ]
+            }}"#
+        );
+
+        let candidates_one =
+            parse_acoustid_response(response_one.as_bytes()).expect("first valid response");
+        let candidates_two =
+            parse_acoustid_response(response_two.as_bytes()).expect("second valid response");
+
+        assert_eq!(candidates_one, candidates_two);
+        assert_eq!(
+            candidates_one
+                .iter()
+                .map(MusicBrainzCandidate::recording_id)
+                .collect::<Vec<_>>(),
+            vec!["cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff", RECORDING_ONE,]
+        );
+        assert_eq!(
+            candidates_one[1].acoustid_result_id(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn identifier_posts_required_fields_and_returns_ranked_unique_candidates() {
         let (_directory, path) = selected_file();
         let fingerprint = AudioFingerprint::new(641, "AQAB_mock").expect("valid mock fingerprint");
         let mut transport = MockTransport::default();
@@ -1219,12 +1868,20 @@ mod tests {
                 r#"{{
                     "status":"ok",
                     "results":[
-                        {{"recordings":[
+                        {{
+                          "id":"{ACOUSTID_RESULT_ONE}",
+                          "score":0.7,
+                          "recordings":[
                             {{"id":"{RECORDING_ONE}"}},
                             {{"id":"{RECORDING_TWO_UPPER}"}},
                             {{"id":"not-a-recording-id"}}
-                        ]}},
-                        {{"recordings":[{{"id":"{RECORDING_ONE}"}}]}}
+                          ]
+                        }},
+                        {{
+                          "id":"{ACOUSTID_RESULT_TWO_UPPER}",
+                          "score":0.95,
+                          "recordings":[{{"id":"{RECORDING_ONE}"}}]
+                        }}
                     ]
                 }}"#
             ))));
@@ -1232,14 +1889,32 @@ mod tests {
             LocalAudioIdentifier::new(StaticFingerprintRunner(fingerprint), transport, "test-key")
                 .expect("valid identifier");
 
-        let urls = identifier.identify(&path).expect("successful lookup");
+        let candidates = identifier.identify(&path).expect("successful lookup");
         let (_, transport) = identifier.into_parts();
 
         assert_eq!(
-            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.recording_id(),
+                    candidate.url().as_str(),
+                    candidate.acoustid_result_id(),
+                    candidate.score(),
+                ))
+                .collect::<Vec<_>>(),
             vec![
-                "https://musicbrainz.org/recording/38035858-f990-4fbb-b3b2-f2f8b958eeba",
-                "https://musicbrainz.org/recording/cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff",
+                (
+                    RECORDING_ONE,
+                    "https://musicbrainz.org/recording/38035858-f990-4fbb-b3b2-f2f8b958eeba",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    0.95,
+                ),
+                (
+                    "cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff",
+                    "https://musicbrainz.org/recording/cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff",
+                    ACOUSTID_RESULT_ONE,
+                    0.7,
+                ),
             ]
         );
         assert_eq!(
@@ -1254,6 +1929,80 @@ mod tests {
     }
 
     #[test]
+    fn identifier_spaces_lookup_starts_below_the_service_rate_limit() {
+        let (_directory, path) = selected_file();
+        let fingerprint = AudioFingerprint::new(641, "AQAB_mock").expect("valid mock fingerprint");
+        let mut transport = MockTransport::default();
+        for _ in 0..3 {
+            transport
+                .responses
+                .push_back(Ok(AcoustIdTransportResponse::new(
+                    br#"{"status":"ok","results":[]}"#,
+                )));
+        }
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let mut identifier =
+            LocalAudioIdentifier::new(StaticFingerprintRunner(fingerprint), transport, "test-key")
+                .expect("valid identifier");
+        identifier.lookup_limiter = AcoustIdLookupLimiter::new(Box::new(AdvancingLookupClock {
+            now: Instant::now(),
+            waits: Arc::clone(&waits),
+            cancel_on_sleep: false,
+        }));
+
+        for _ in 0..3 {
+            identifier.identify(&path).expect("rate-limited lookup");
+        }
+        let (_, transport) = identifier.into_parts();
+
+        assert_eq!(
+            waits.lock().expect("mock lookup waits").as_slice(),
+            [MIN_ACOUSTID_LOOKUP_INTERVAL, MIN_ACOUSTID_LOOKUP_INTERVAL,]
+        );
+        assert_eq!(transport.requests.len(), 3);
+    }
+
+    #[test]
+    fn identifier_cancels_while_waiting_for_the_next_lookup_slot() {
+        let (_directory, path) = selected_file();
+        let fingerprint = AudioFingerprint::new(641, "AQAB_mock").expect("valid mock fingerprint");
+        let mut transport = MockTransport::default();
+        transport
+            .responses
+            .push_back(Ok(AcoustIdTransportResponse::new(
+                br#"{"status":"ok","results":[]}"#,
+            )));
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let mut identifier =
+            LocalAudioIdentifier::new(StaticFingerprintRunner(fingerprint), transport, "test-key")
+                .expect("valid identifier");
+        identifier.lookup_limiter = AcoustIdLookupLimiter::new(Box::new(AdvancingLookupClock {
+            now: Instant::now(),
+            waits: Arc::clone(&waits),
+            cancel_on_sleep: true,
+        }));
+        identifier.identify(&path).expect("initial lookup");
+        let cancellation = AudioIdentificationCancellation::new();
+
+        let error = identifier
+            .identify_with_cancellation(&path, &cancellation)
+            .expect_err("rate-limit waiting must observe cancellation");
+        let (_, transport) = identifier.into_parts();
+
+        assert!(matches!(error, AudioIdentificationError::Cancelled));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            waits.lock().expect("mock lookup waits").as_slice(),
+            [MIN_ACOUSTID_LOOKUP_INTERVAL]
+        );
+        assert_eq!(
+            transport.requests.len(),
+            1,
+            "a cancelled wait must not start another HTTP lookup"
+        );
+    }
+
+    #[test]
     fn identifier_accepts_a_successful_lookup_without_matches() {
         let (_directory, path) = selected_file();
         let fingerprint = AudioFingerprint::new(120, "AQAB_mock").expect("valid mock fingerprint");
@@ -1263,20 +2012,21 @@ mod tests {
             .push_back(Ok(AcoustIdTransportResponse::new(
                 br#"{"status":"ok","results":[]}"#,
             )));
-        let mut identifier =
+        let identifier =
             LocalAudioIdentifier::new(StaticFingerprintRunner(fingerprint), transport, "test-key")
                 .expect("valid identifier");
+        let mut identifier: Box<dyn AudioIdentifier> = Box::new(identifier);
 
         assert!(
             identifier
-                .identify(&path)
+                .identify(&path, &AudioIdentificationCancellation::default())
                 .expect("valid empty lookup")
                 .is_empty()
         );
     }
 
     #[test]
-    fn identifier_reports_bounded_sanitized_api_errors() {
+    fn identifier_reports_api_error_codes_without_remote_messages() {
         let (_directory, path) = selected_file();
         let fingerprint = AudioFingerprint::new(120, "AQAB_mock").expect("valid mock fingerprint");
         let mut transport = MockTransport::default();
@@ -1298,11 +2048,41 @@ mod tests {
 
         assert!(matches!(
             error,
-            AudioIdentificationError::AcoustIdRejected {
-                code: Some(4),
-                ref message
-            } if message == "invalidAPI key"
+            AudioIdentificationError::AcoustIdRejected { code: Some(4) }
         ));
+        assert!(!error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn remote_error_messages_cannot_expose_the_client_key_or_fingerprint() {
+        const CLIENT_KEY: &str = "echoed-secret-client-key";
+        const FINGERPRINT: &str = "AQAB_echoed_secret_fingerprint";
+        let (_directory, path) = selected_file();
+        let fingerprint = AudioFingerprint::new(120, FINGERPRINT).expect("valid mock fingerprint");
+        let mut transport = MockTransport::default();
+        transport
+            .responses
+            .push_back(Ok(AcoustIdTransportResponse::new(format!(
+                r#"{{
+                    "status":"error",
+                    "error":{{
+                        "code":4,
+                        "message":"client={CLIENT_KEY}; fingerprint={FINGERPRINT}"
+                    }}
+                }}"#
+            ))));
+        let mut identifier =
+            LocalAudioIdentifier::new(StaticFingerprintRunner(fingerprint), transport, CLIENT_KEY)
+                .expect("valid identifier");
+
+        let error = identifier
+            .identify(&path)
+            .expect_err("API rejection must fail");
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains(CLIENT_KEY));
+        assert!(!rendered.contains(FINGERPRINT));
+        assert_eq!(rendered, "AcoustID rejected the lookup (code Some(4))");
     }
 
     #[test]

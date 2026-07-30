@@ -786,6 +786,25 @@ on any row emits an owner-bearing timecode action so it cannot seek unrelated
 media. Played columns use the normal progress style while future columns use a
 muted style, so progress remains distinct even when bold text is unavailable.
 
+Local audio identification is a separate explicit pipeline. The `acoustid`
+feature invokes Chromaprint's official `fpcalc` utility without a shell,
+captures bounded JSON, and posts only its encoded fingerprint and duration to
+AcoustID over the existing bounded HTTP transport. It does not send a path,
+filename, tag, or media byte to the service. A dedicated latest-only worker
+keeps both helper execution and lookup outside the TUI and general provider
+thread. Selection changes and shutdown cooperatively terminate `fpcalc`;
+stale completions are rejected by request generation plus filesystem identity.
+Successful responses—including no-match responses—use a 64-entry RAM-only LRU
+cache keyed by path and replacement-sensitive identity.
+
+AcoustID candidates are deduplicated by MusicBrainz recording UUID and ranked
+deterministically by score. Details retains their canonical MusicBrainz links,
+then optionally asks the existing Wikidata adapter for property
+[`P4404`](https://www.wikidata.org/wiki/Property:P4404) using only the
+top-ranked recording. Wikidata's normal persistent positive/negative cache and
+expandable statement renderer remain authoritative for that enrichment;
+fingerprint candidates themselves are not persisted.
+
 ## Uploads and external writes
 
 Uploads, comments, remote subscriptions, scrobbles, and sync are explicit

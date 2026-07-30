@@ -548,6 +548,13 @@ pub struct DetailView {
     pub local_movable: bool,
     /// Whether the selected local entry can be moved to recoverable Trash.
     pub local_trashable: bool,
+    /// Whether the selected local audio file should offer fingerprinting.
+    ///
+    /// A successful identity-bound lookup, including one with no matches,
+    /// hides the action while its cached result remains projected in Details.
+    pub local_fingerprint_available: bool,
+    /// Whether the selected file owns an active fingerprint lookup.
+    pub local_fingerprint_pending: bool,
 }
 
 /// Current route inside the Subscriptions screen.
@@ -1160,6 +1167,8 @@ pub struct ViewModel {
     pub local_browse_pending: bool,
     /// Whether selected Local artwork is awaiting background extraction.
     pub local_artwork_pending: bool,
+    /// Monotonic frame counter for explicit local-audio fingerprinting.
+    pub local_fingerprint_animation_frame: usize,
     /// Monotonic frame counter for the active ASCII search animation.
     pub search_animation_frame: usize,
     /// Whether accepted media is waiting for authoritative playback start.
@@ -1288,6 +1297,7 @@ impl Default for ViewModel {
             search_activity: None,
             local_browse_pending: false,
             local_artwork_pending: false,
+            local_fingerprint_animation_frame: 0,
             search_animation_frame: 0,
             playback_starting: false,
             playback_start_animation_frame: 0,
@@ -1491,6 +1501,8 @@ pub enum UiAction {
     ToggleChapterTimestamps,
     /// Open or close the selected playable local file's waveform.
     ToggleWaveform,
+    /// Fingerprint the selected local audio file and query AcoustID.
+    FingerprintLocalAudio,
     /// Toggle repeat-current-item.
     ToggleRepeat,
     /// Toggle automatic continuation within the active source list.
@@ -4882,6 +4894,27 @@ fn render_information_panel(
                 theme.accent
             },
             UiAction::ToggleRadioRecording,
+        );
+    }
+    if kind == InformationPanelKind::Local && details.local_fingerprint_available {
+        let action_text = if details.local_fingerprint_pending {
+            let frame = ASCII_ACTIVITY_FRAMES
+                [view.local_fingerprint_animation_frame % ASCII_ACTIVITY_FRAMES.len()];
+            format!("Fingerprinting {frame}")
+        } else {
+            "Fingerprint".to_owned()
+        };
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("f", &action_text, show_hotkeys),
+            if details.local_fingerprint_pending {
+                theme.selected
+            } else {
+                theme.accent
+            },
+            UiAction::FingerprintLocalAudio,
         );
     }
     if cfg!(feature = "local-move") && kind == InformationPanelKind::Local && details.local_movable
@@ -9506,6 +9539,15 @@ fn key_action_with_page_rows_unfiltered(
         }
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
         KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
+        KeyCode::Char('f')
+            if view.screen == Screen::Local
+                && view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.local_fingerprint_available) =>
+        {
+            Some(UiAction::FingerprintLocalAudio)
+        }
         KeyCode::Char('r') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioRecording),
         KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         #[cfg(feature = "local-rename")]
@@ -22292,6 +22334,100 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             }
         }
+    }
+
+    #[test]
+    fn local_audio_fingerprint_action_is_scoped_clickable_and_animated() {
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            local_fingerprint_animation_frame: 1,
+            details: Some(DetailView {
+                title: "01 - Track.flac".to_owned(),
+                source: "Local audio".to_owned(),
+                description: "Full path: /music/01 - Track.flac".to_owned(),
+                local_fingerprint_available: true,
+                local_fingerprint_pending: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Local audio fingerprint action");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[f] Fingerprinting /"));
+        let fingerprint_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::FingerprintLocalAudio).then_some(*area)
+            })
+            .expect("fingerprint control");
+        assert_eq!(fingerprint_area.right(), hit_map.details_panel.right());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
+            Some(UiAction::FingerprintLocalAudio)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: fingerprint_area.x,
+                    row: fingerprint_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::FingerprintLocalAudio)
+        );
+
+        let details = view.details.as_mut().expect("Local audio details");
+        details.local_fingerprint_available = false;
+        details.local_fingerprint_pending = false;
+        details.links.push(DetailLinkView {
+            label: "MusicBrainz recording 1".to_owned(),
+            url: "https://musicbrainz.org/recording/11111111-1111-4111-8111-111111111111"
+                .to_owned(),
+            wikidata_item_id: None,
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw fingerprinted Local audio details");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("[f] Fingerprint"));
+        assert!(rendered.contains("MusicBrainz recording 1"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::FingerprintLocalAudio)
+        );
+        assert_ne!(
+            key_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &view),
+            Some(UiAction::FingerprintLocalAudio)
+        );
+
+        let folder = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                title: "Album".to_owned(),
+                source: "Local folder".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+                &folder
+            ),
+            Some(UiAction::FingerprintLocalAudio)
+        );
     }
 
     #[cfg(feature = "local-trash")]

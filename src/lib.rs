@@ -28,7 +28,7 @@ pub mod git_sync;
 #[cfg(any(feature = "local-move", feature = "local-rename"))]
 pub mod local_move;
 
-#[cfg(feature = "network")]
+#[cfg(feature = "acoustid")]
 pub mod audio_identification;
 
 #[cfg(all(feature = "gpm", target_os = "linux"))]

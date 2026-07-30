@@ -58,6 +58,13 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   inevitable intermediate compactions for long files, and retains only a
   bounded min/max envelope in RAM; clicking any waveform row starts or seeks
   the exact selected file at that position.
+  For an audio file, `[f] Fingerprint` explicitly runs Chromaprint's official
+  `fpcalc` helper off the UI thread and submits only its encoded fingerprint
+  and duration to [AcoustID](https://acoustid.org/). Ranked
+  [MusicBrainz](https://musicbrainz.org/) recording links are cached in bounded
+  RAM by file identity; the best match is also offered to Wikidata enrichment
+  when that feature is enabled. Changing the selection cancels obsolete work,
+  and Youta never scans or uploads local media automatically.
   A conservative display-only fallback repairs strong Windows-1251 text that
   legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
   are never rewritten.
@@ -389,10 +396,19 @@ cargo run --locked -- --help
 ```
 
 The default build expects `mpv` and `yt-dlp` at runtime for online playback.
-They remain separate executables so they can be updated quickly when sites
-change. Human-readable persistence is part of the core build. The default
-feature set enables `images`. Runtime capability checks decide whether the TUI
-may fetch and render artwork.
+It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
+audio identification. These remain separate executables so they can be updated
+without rebuilding Youta. Human-readable persistence is part of the core
+build. The default feature set enables `images`. Runtime capability checks
+decide whether the TUI may fetch and render artwork.
+
+Install `fpcalc` from your operating system's
+[Chromaprint](https://github.com/acoustid/chromaprint) tools package:
+
+- Gentoo: `USE=tools emerge media-libs/chromaprint`
+- Debian/Ubuntu: `apt install libchromaprint-tools`
+- Fedora: `dnf install chromaprint-tools`
+- macOS with Homebrew: `brew install chromaprint`
 
 Build the otherwise complete default application without image decoding or
 terminal-image dependencies with:
@@ -450,11 +466,15 @@ Store the plaintext API key separately in
 ```toml
 [providers]
 youtube_api_key = '...'
+# Create an application key at https://acoustid.org/api-key.
+acoustid_client_key = '...'
 ```
 
 `auto` prefers that key when the official adapter is compiled in, then falls
 back to `invidious_base_url`. `official` and `invidious` select only that
-backend. Both the TUI and `youta search` use this selection.
+backend. Both the TUI and `youta search` use this selection. The AcoustID key
+enables the Local Details `[f] Fingerprint` action; `fpcalc_executable` in
+`config.toml` can select a non-default Chromaprint helper path.
 
 For a small local-only build:
 

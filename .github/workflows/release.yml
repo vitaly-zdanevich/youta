@@ -82,6 +82,7 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features sqlite-state
           cargo test --locked --all-targets --no-default-features --features tui
           cargo test --locked --all-targets --no-default-features --features tui,local
+          cargo test --locked --all-targets --no-default-features --features tui,acoustid,wikidata
           cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts
           cargo test --locked --all-targets --no-default-features --features tui,bandcamp
           cargo test --locked --all-targets --no-default-features --features tui,radio
@@ -100,6 +101,7 @@ jobs:
           cargo test --locked --doc --no-default-features --features sqlite-state
           cargo test --locked --doc --no-default-features --features tui
           cargo test --locked --doc --no-default-features --features tui,local
+          cargo test --locked --doc --no-default-features --features tui,acoustid,wikidata
           cargo test --locked --doc --no-default-features --features tui,apple-podcasts
           cargo test --locked --doc --no-default-features --features tui,bandcamp
           cargo test --locked --doc --no-default-features --features tui,radio

@@ -1,6 +1,6 @@
 [package]
 name = "youta"
-version = "0.20.1"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -37,6 +37,7 @@ default = [
 app = [
     "tui",
     "gpm",
+    "acoustid",
     "local",
     "rss",
     "invidious",
@@ -112,6 +113,11 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
+# On-demand local-file Chromaprint fingerprinting and AcoustID lookup.
+#
+# The official `fpcalc` helper performs media decoding and fingerprinting, so
+# this feature does not add a second Rust media-decoding stack.
+acoustid = ["network", "local-browser"]
 # Compatibility umbrella retaining every Local-file capability.
 local = [
     "local-browser",

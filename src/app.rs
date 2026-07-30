@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 #[cfg(any(
+    feature = "acoustid",
     feature = "apple-podcasts",
     feature = "rss",
     feature = "waveform",
@@ -39,6 +40,12 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossbeam_channel::{TrySendError, bounded};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(feature = "acoustid")]
+use crate::audio_identification::{
+    AudioIdentificationCancellation, AudioIdentificationError, AudioIdentifier, FpcalcConfig,
+    FpcalcFingerprintRunner, LocalAudioIdentifier, MusicBrainzCandidate, SystemFpcalcProcess,
+    UreqAcoustIdTransport,
+};
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
@@ -783,6 +790,10 @@ const MAX_LOCAL_FFPROBE_JSON_BYTES: usize = 64 * 1024;
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CACHED_LOCAL_MEDIA_ITEMS: usize = 128;
+#[cfg(feature = "acoustid")]
+const MAX_CACHED_LOCAL_FINGERPRINTS: usize = 64;
+#[cfg(feature = "acoustid")]
+const LOCAL_FINGERPRINT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "waveform")]
 const MAX_CACHED_LOCAL_WAVEFORMS: usize = 64;
 #[cfg(feature = "waveform")]
@@ -955,7 +966,7 @@ struct LocalFfprobeFormat {
 }
 
 /// Filesystem identity preventing selected-file metadata from surviving replacement.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LocalFileIdentity {
     length: u64,
     modified: Option<SystemTime>,
@@ -981,6 +992,57 @@ struct CachedLocalMediaItem {
 struct LocalMediaMetadataResponse {
     path: PathBuf,
     result: Option<(LocalFileIdentity, LocalMediaItem)>,
+}
+
+/// Replacement-sensitive RAM key for one explicit local-audio lookup.
+#[cfg(feature = "acoustid")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LocalFingerprintCacheKey {
+    path: PathBuf,
+    identity: LocalFileIdentity,
+}
+
+/// One successful, including empty, AcoustID result retained in RAM.
+#[cfg(feature = "acoustid")]
+#[derive(Clone)]
+struct CachedLocalFingerprint {
+    candidates: Arc<Vec<MusicBrainzCandidate>>,
+}
+
+/// Sole generation-owned fingerprint request visible to the controller.
+#[cfg(feature = "acoustid")]
+struct PendingLocalFingerprint {
+    generation: u64,
+    media_id: MediaId,
+    key: LocalFingerprintCacheKey,
+    cancellation: AudioIdentificationCancellation,
+}
+
+/// Exact MusicBrainz recording lookup owned by Local fingerprint details.
+#[cfg(all(feature = "acoustid", feature = "wikidata"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingLocalFingerprintWikidata {
+    generation: u64,
+    recording_id: String,
+}
+
+/// Commands accepted by the dedicated local-audio identification worker.
+#[cfg(feature = "acoustid")]
+enum LocalFingerprintWorkerRequest {
+    Identify {
+        generation: u64,
+        path: PathBuf,
+        cancellation: AudioIdentificationCancellation,
+    },
+    Shutdown,
+}
+
+/// Identity-owned completion returned by the local-audio worker.
+#[cfg(feature = "acoustid")]
+struct LocalFingerprintWorkerResponse {
+    generation: u64,
+    path: PathBuf,
+    result: Result<Vec<MusicBrainzCandidate>, AudioIdentificationError>,
 }
 
 /// Replacement-sensitive key for one RAM-only local waveform.
@@ -3036,6 +3098,42 @@ pub struct AppController {
     local_media_metadata_sender: Sender<LocalMediaMetadataResponse>,
     /// Completed selected-file metadata drained by the TUI event loop.
     local_media_metadata_responses: Receiver<LocalMediaMetadataResponse>,
+    /// Latest-only requests for the dedicated local-audio identifier.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_requests: Option<Sender<LocalFingerprintWorkerRequest>>,
+    /// Controller-side receiver used to replace one queued stale request.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_request_drain: Receiver<LocalFingerprintWorkerRequest>,
+    /// Identity-bound fingerprint completions drained by the TUI event loop.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_responses: Receiver<LocalFingerprintWorkerResponse>,
+    /// Join handle for the sole Chromaprint/AcoustID worker.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner rejecting stale fingerprint completions.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_generation: u64,
+    /// Exact selected local audio file currently being identified.
+    #[cfg(feature = "acoustid")]
+    pending_local_fingerprint: Option<PendingLocalFingerprint>,
+    /// RAM-only identity-bound successful lookup cache.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_cache: HashMap<LocalFingerprintCacheKey, CachedLocalFingerprint>,
+    /// Least-recently-used order for bounded fingerprint eviction.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_cache_order: VecDeque<LocalFingerprintCacheKey>,
+    /// Exact identity represented by the current MusicBrainz links.
+    #[cfg(feature = "acoustid")]
+    displayed_local_fingerprint: Option<LocalFingerprintCacheKey>,
+    /// Earliest time a displayed fingerprint should revalidate its file.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_revalidate_at: Option<Instant>,
+    /// Whether a disconnected fingerprint worker has already been reported.
+    #[cfg(feature = "acoustid")]
+    local_fingerprint_disconnect_reported: bool,
+    /// Exact in-flight P4404 lookup requested by Local fingerprint details.
+    #[cfg(all(feature = "acoustid", feature = "wikidata"))]
+    pending_local_fingerprint_wikidata: Option<PendingLocalFingerprintWikidata>,
     /// Latest-only requests for the dedicated local waveform worker.
     #[cfg(feature = "waveform")]
     local_waveform_requests: Option<Sender<LocalWaveformWorkerRequest>>,
@@ -3382,6 +3480,12 @@ impl AppController {
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
+        #[cfg(feature = "acoustid")]
+        let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
+        #[cfg(feature = "acoustid")]
+        let local_fingerprint_request_drain = local_fingerprint_request_receiver.clone();
+        #[cfg(feature = "acoustid")]
+        let (local_fingerprint_response_sender, local_fingerprint_responses) = unbounded();
         #[cfg(feature = "waveform")]
         let (local_waveform_request_sender, local_waveform_request_receiver) = bounded(1);
         #[cfg(feature = "waveform")]
@@ -3444,6 +3548,42 @@ impl AppController {
         let local_browse_requests = local_browse_thread
             .as_ref()
             .map(|_| local_browse_request_sender);
+        #[cfg(feature = "acoustid")]
+        let (local_fingerprint_thread, local_fingerprint_thread_error) =
+            if let Some(client_key) = config.providers.acoustid_client_key.clone() {
+                match FpcalcConfig::new(config.providers.fpcalc_executable.clone()).and_then(
+                    |fpcalc_config| {
+                        LocalAudioIdentifier::new(
+                            FpcalcFingerprintRunner::new(fpcalc_config, SystemFpcalcProcess),
+                            UreqAcoustIdTransport::default(),
+                            client_key,
+                        )
+                    },
+                ) {
+                    Ok(identifier) => {
+                        let worker = thread::Builder::new()
+                            .name("youta-local-fingerprint".to_owned())
+                            .spawn(move || {
+                                local_fingerprint_worker(
+                                    local_fingerprint_request_receiver,
+                                    local_fingerprint_response_sender,
+                                    Box::new(identifier),
+                                );
+                            });
+                        match worker {
+                            Ok(handle) => (Some(handle), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        }
+                    }
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else {
+                (None, None)
+            };
+        #[cfg(feature = "acoustid")]
+        let local_fingerprint_requests = local_fingerprint_thread
+            .as_ref()
+            .map(|_| local_fingerprint_request_sender);
         #[cfg(feature = "waveform")]
         let local_waveform_thread_result = thread::Builder::new()
             .name("youta-local-waveform".to_owned())
@@ -3799,6 +3939,30 @@ impl AppController {
             local_media_loader: Arc::new(SystemLocalMediaLoader),
             local_media_metadata_sender,
             local_media_metadata_responses,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_requests,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_request_drain,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_responses,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_thread,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_generation: 0,
+            #[cfg(feature = "acoustid")]
+            pending_local_fingerprint: None,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_cache: HashMap::new(),
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_cache_order: VecDeque::new(),
+            #[cfg(feature = "acoustid")]
+            displayed_local_fingerprint: None,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_revalidate_at: None,
+            #[cfg(feature = "acoustid")]
+            local_fingerprint_disconnect_reported: false,
+            #[cfg(all(feature = "acoustid", feature = "wikidata"))]
+            pending_local_fingerprint_wikidata: None,
             #[cfg(feature = "waveform")]
             local_waveform_requests,
             #[cfg(feature = "waveform")]
@@ -4097,6 +4261,10 @@ impl AppController {
         }
         if let Some(error) = local_browse_thread_error {
             controller.show_error("Could not start the Local browser worker", &error);
+        }
+        #[cfg(feature = "acoustid")]
+        if let Some(error) = local_fingerprint_thread_error {
+            controller.show_error_message("Could not start local fingerprinting", error);
         }
         #[cfg(feature = "waveform")]
         if let Some(error) = local_waveform_thread_error {
@@ -6325,7 +6493,7 @@ impl AppController {
         if self.apply_fresh_cached_wikidata(kind, external_id) {
             return;
         }
-        self.send_wikidata_request(generation, kind, external_id);
+        let _ = self.send_wikidata_request(generation, kind, external_id);
     }
 
     /// Invalidates pending work before a different Details identity is shown.
@@ -6333,6 +6501,10 @@ impl AppController {
     fn invalidate_wikidata_lookup(&mut self) {
         self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
         self.scheduled_channel_wikidata = None;
+        #[cfg(feature = "acoustid")]
+        {
+            self.pending_local_fingerprint_wikidata = None;
+        }
     }
 
     /// Reapplies a fresh positive or empty cache entry to the visible panel.
@@ -6368,22 +6540,23 @@ impl AppController {
         generation: u64,
         kind: crate::providers::wikidata::WikidataExternalKind,
         external_id: &str,
-    ) {
+    ) -> bool {
         let property_id = kind.property_id();
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = format!("loading {property_id} lazily…");
         }
-        if !self.send_provider_request(
+        let sent = self.send_provider_request(
             ProviderRequest::Wikidata {
                 generation,
                 kind,
                 external_id: external_id.to_owned(),
             },
             "Could not start the Wikidata lookup",
-        ) && let Some(details) = self.view.details.as_mut()
-        {
+        );
+        if !sent && let Some(details) = self.view.details.as_mut() {
             details.wikidata = "provider worker unavailable".to_owned();
         }
+        sent
     }
 
     /// Restores a cached channel item immediately, otherwise deferring network
@@ -6424,7 +6597,7 @@ impl AppController {
         {
             return;
         }
-        self.send_wikidata_request(
+        let _ = self.send_wikidata_request(
             scheduled.generation,
             WikidataExternalKind::YouTubeChannel,
             &scheduled.channel_id,
@@ -7693,6 +7866,20 @@ impl AppController {
                 external_id,
                 result,
             } => {
+                #[cfg(feature = "acoustid")]
+                if self
+                    .pending_local_fingerprint_wikidata
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.generation == generation
+                            && pending.recording_id == external_id
+                            && property_id
+                                == crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                                    .property_id()
+                    })
+                {
+                    self.pending_local_fingerprint_wikidata = None;
+                }
                 if generation != self.wikidata_generation {
                     return;
                 }
@@ -9206,6 +9393,8 @@ impl AppController {
     fn update_local_browser_detail(&mut self) {
         use crate::local_browser::LocalEntryKind;
 
+        #[cfg(feature = "acoustid")]
+        self.cancel_stale_local_fingerprint();
         let Some(listing) = self.local_listing.as_ref() else {
             self.view.details = None;
             return;
@@ -9219,6 +9408,8 @@ impl AppController {
                 description: format!("Full path: {}", parent.display()),
                 ..DetailView::default()
             });
+            #[cfg(all(feature = "acoustid", feature = "wikidata"))]
+            self.invalidate_wikidata_lookup();
             return;
         }
         let Some(index) = self.local_entry_index() else {
@@ -9289,6 +9480,11 @@ impl AppController {
                 local_trashable: cfg!(feature = "local-trash"),
                 ..DetailView::default()
             });
+        }
+        #[cfg(feature = "acoustid")]
+        {
+            let first_recording = self.apply_local_fingerprint_details();
+            self.request_local_fingerprint_wikidata(first_recording.as_deref());
         }
         #[cfg(all(feature = "local-artwork", feature = "images"))]
         self.request_selected_local_artwork();
@@ -13003,6 +13199,303 @@ impl AppController {
         (local_media_id(&entry.path) == media_id).then(|| (media_id, entry.path.clone()))
     }
 
+    /// Returns the exact selected local audio file and its replacement identity.
+    #[cfg(feature = "acoustid")]
+    fn selected_local_fingerprint_target(&self) -> Option<(MediaId, LocalFingerprintCacheKey)> {
+        if self.view.screen != Screen::Local {
+            return None;
+        }
+        let media_id = self
+            .view
+            .details
+            .as_ref()?
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)?
+            .clone();
+        let entry = self
+            .local_entry_index()
+            .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
+            .filter(|entry| entry.kind == crate::local_browser::LocalEntryKind::Audio)?;
+        if local_media_id(&entry.path) != media_id {
+            return None;
+        }
+        let identity = local_file_identity(&entry.path)?;
+        Some((
+            media_id,
+            LocalFingerprintCacheKey {
+                path: entry.path.clone(),
+                identity,
+            },
+        ))
+    }
+
+    /// Cancels active and queued fingerprint work without discarding safe cache entries.
+    #[cfg(feature = "acoustid")]
+    fn cancel_local_fingerprint(&mut self) {
+        if let Some(pending) = self.pending_local_fingerprint.take() {
+            pending.cancellation.cancel();
+        }
+        while let Ok(command) = self.local_fingerprint_request_drain.try_recv() {
+            if let LocalFingerprintWorkerRequest::Identify { cancellation, .. } = command {
+                cancellation.cancel();
+            }
+        }
+        self.view.local_fingerprint_animation_frame = 0;
+        if let Some(details) = self.view.details.as_mut() {
+            details.local_fingerprint_pending = false;
+        }
+    }
+
+    /// Stops fingerprint work when Local selection no longer owns its exact file.
+    #[cfg(feature = "acoustid")]
+    fn cancel_stale_local_fingerprint(&mut self) {
+        let selected = self.selected_local_fingerprint_target().map(|(_, key)| key);
+        if self
+            .pending_local_fingerprint
+            .as_ref()
+            .is_some_and(|pending| selected.as_ref() != Some(&pending.key))
+        {
+            self.cancel_local_fingerprint();
+        }
+    }
+
+    /// Promotes one successful fingerprint cache entry to most-recent use.
+    #[cfg(feature = "acoustid")]
+    fn promote_local_fingerprint_cache_key(&mut self, key: &LocalFingerprintCacheKey) {
+        self.local_fingerprint_cache_order
+            .retain(|candidate| candidate != key);
+        self.local_fingerprint_cache_order.push_back(key.clone());
+    }
+
+    /// Stores one successful lookup, including an empty match set, in bounded RAM.
+    #[cfg(feature = "acoustid")]
+    fn cache_local_fingerprint(
+        &mut self,
+        key: LocalFingerprintCacheKey,
+        candidates: Vec<MusicBrainzCandidate>,
+    ) {
+        self.local_fingerprint_cache.remove(&key);
+        self.local_fingerprint_cache_order
+            .retain(|candidate| candidate != &key);
+        while self.local_fingerprint_cache.len() >= MAX_CACHED_LOCAL_FINGERPRINTS {
+            let Some(oldest) = self.local_fingerprint_cache_order.pop_front() else {
+                break;
+            };
+            self.local_fingerprint_cache.remove(&oldest);
+        }
+        self.local_fingerprint_cache.insert(
+            key.clone(),
+            CachedLocalFingerprint {
+                candidates: Arc::new(candidates),
+            },
+        );
+        self.local_fingerprint_cache_order.push_back(key);
+    }
+
+    /// Projects cached MusicBrainz candidates and pending state into Local Details.
+    #[cfg(feature = "acoustid")]
+    fn apply_local_fingerprint_details(&mut self) -> Option<String> {
+        let Some((_, key)) = self.selected_local_fingerprint_target() else {
+            self.displayed_local_fingerprint = None;
+            self.local_fingerprint_revalidate_at = None;
+            self.view.selected_detail_link = None;
+            if let Some(details) = self.view.details.as_mut() {
+                details.local_fingerprint_available = false;
+                details.local_fingerprint_pending = false;
+                details.links.clear();
+            }
+            return None;
+        };
+        let pending = self
+            .pending_local_fingerprint
+            .as_ref()
+            .is_some_and(|pending| pending.key == key);
+        let candidates = self
+            .local_fingerprint_cache
+            .get(&key)
+            .map(|cached| Arc::clone(&cached.candidates));
+        let fingerprinted = candidates.is_some();
+        if fingerprinted {
+            self.promote_local_fingerprint_cache_key(&key);
+            self.displayed_local_fingerprint = Some(key.clone());
+            self.local_fingerprint_revalidate_at =
+                Some(Instant::now() + LOCAL_FINGERPRINT_REVALIDATION_INTERVAL);
+        } else {
+            self.displayed_local_fingerprint = None;
+            self.local_fingerprint_revalidate_at = None;
+        }
+        self.view.selected_detail_link = None;
+        let Some(details) = self.view.details.as_mut() else {
+            return None;
+        };
+        details.local_fingerprint_available = !fingerprinted;
+        details.local_fingerprint_pending = pending;
+        details.links.clear();
+        let candidates = candidates?;
+        details
+            .links
+            .extend(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| DetailLinkView {
+                        label: format!(
+                            "MusicBrainz recording {} · {:.1}% match",
+                            index.saturating_add(1),
+                            candidate.score() * 100.0
+                        ),
+                        url: candidate.url().to_string(),
+                        wikidata_item_id: None,
+                    }),
+            );
+        candidates
+            .first()
+            .map(|candidate| candidate.recording_id().to_owned())
+    }
+
+    /// Periodically drops displayed fingerprint data after local-file replacement.
+    #[cfg(feature = "acoustid")]
+    fn revalidate_displayed_local_fingerprint(&mut self, now: Instant) {
+        let Some(displayed) = self.displayed_local_fingerprint.as_ref() else {
+            return;
+        };
+        if self
+            .local_fingerprint_revalidate_at
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        if self
+            .selected_local_fingerprint_target()
+            .is_some_and(|(_, current)| &current == displayed)
+        {
+            self.local_fingerprint_revalidate_at =
+                Some(now + LOCAL_FINGERPRINT_REVALIDATION_INTERVAL);
+            return;
+        }
+
+        self.displayed_local_fingerprint = None;
+        self.local_fingerprint_revalidate_at = None;
+        let current_target = self.selected_local_fingerprint_target();
+        let first_recording = self.apply_local_fingerprint_details();
+        self.request_local_fingerprint_wikidata(first_recording.as_deref());
+        self.view.status_line =
+            if current_target.is_some() && self.displayed_local_fingerprint.is_none() {
+                "The local audio file changed; press f to fingerprint it again".to_owned()
+            } else if current_target.is_none() {
+                "The fingerprinted local audio file is no longer available".to_owned()
+            } else {
+                "Updated fingerprint details for the current local audio file".to_owned()
+            };
+    }
+
+    /// Starts one explicit identity-bound Chromaprint and AcoustID lookup.
+    #[cfg(feature = "acoustid")]
+    fn fingerprint_selected_local_audio(&mut self) {
+        let Some((media_id, key)) = self.selected_local_fingerprint_target() else {
+            self.view.status_line =
+                "Fingerprinting is available for local audio files only".to_owned();
+            return;
+        };
+        if self.local_fingerprint_cache.contains_key(&key) {
+            let first_recording = self.apply_local_fingerprint_details();
+            self.request_local_fingerprint_wikidata(first_recording.as_deref());
+            self.view.status_line =
+                "Using the cached fingerprint result for this unchanged file".to_owned();
+            return;
+        }
+        if self
+            .pending_local_fingerprint
+            .as_ref()
+            .is_some_and(|pending| pending.key == key)
+        {
+            self.view.status_line = "Fingerprinting is already in progress".to_owned();
+            return;
+        }
+        if self.config.providers.acoustid_client_key.is_none() {
+            self.view.status_line = format!(
+                "Add providers.acoustid_client_key to {}",
+                self.config.credentials_file().display()
+            );
+            return;
+        }
+        self.cancel_local_fingerprint();
+        let Some(sender) = self.local_fingerprint_requests.as_ref() else {
+            self.view.status_line = "The local fingerprint worker is unavailable".to_owned();
+            return;
+        };
+        self.local_fingerprint_generation = self.local_fingerprint_generation.wrapping_add(1);
+        let generation = self.local_fingerprint_generation;
+        let cancellation = AudioIdentificationCancellation::new();
+        let mut command = LocalFingerprintWorkerRequest::Identify {
+            generation,
+            path: key.path.clone(),
+            cancellation: cancellation.clone(),
+        };
+        let sent = loop {
+            match sender.try_send(command) {
+                Ok(()) => break true,
+                Err(TrySendError::Full(returned)) => {
+                    if let Ok(stale) = self.local_fingerprint_request_drain.try_recv()
+                        && let LocalFingerprintWorkerRequest::Identify { cancellation, .. } = stale
+                    {
+                        cancellation.cancel();
+                    }
+                    command = returned;
+                }
+                Err(TrySendError::Disconnected(_)) => break false,
+            }
+        };
+        if !sent {
+            self.view.status_line = "The local fingerprint worker stopped".to_owned();
+            return;
+        }
+        self.pending_local_fingerprint = Some(PendingLocalFingerprint {
+            generation,
+            media_id,
+            key,
+            cancellation,
+        });
+        self.view.local_fingerprint_animation_frame = 0;
+        if let Some(details) = self.view.details.as_mut() {
+            details.local_fingerprint_pending = true;
+        }
+        self.view.status_line = "Fingerprinting local audio…".to_owned();
+    }
+
+    /// Applies or clears MusicBrainz-owned Wikidata state for Local Details.
+    #[cfg(all(feature = "acoustid", feature = "wikidata"))]
+    fn request_local_fingerprint_wikidata(&mut self, recording_id: Option<&str>) {
+        let Some(recording_id) = recording_id else {
+            self.invalidate_wikidata_lookup();
+            return;
+        };
+        if self
+            .pending_local_fingerprint_wikidata
+            .as_ref()
+            .is_some_and(|pending| pending.recording_id == recording_id)
+        {
+            return;
+        }
+        self.invalidate_wikidata_lookup();
+        let generation = self.wikidata_generation;
+        let kind = crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording;
+        if self.apply_fresh_cached_wikidata(kind, recording_id) {
+            return;
+        }
+        if self.send_wikidata_request(generation, kind, recording_id) {
+            self.pending_local_fingerprint_wikidata = Some(PendingLocalFingerprintWikidata {
+                generation,
+                recording_id: recording_id.to_owned(),
+            });
+        }
+    }
+
+    /// Keeps Local fingerprint links functional in builds without Wikidata.
+    #[cfg(all(feature = "acoustid", not(feature = "wikidata")))]
+    fn request_local_fingerprint_wikidata(&mut self, _recording_id: Option<&str>) {}
+
     /// Replaces the seek bar with a lazy waveform for selected local media.
     fn toggle_waveform(&mut self) {
         if self.view.waveform_visible {
@@ -13513,6 +14006,115 @@ impl AppController {
             },
         );
         self.local_waveform_cache_order.push_back(key);
+    }
+
+    /// Applies every currently available local-audio identification completion.
+    #[cfg(feature = "acoustid")]
+    fn drain_local_fingerprint_responses(&mut self) {
+        loop {
+            match self.local_fingerprint_responses.try_recv() {
+                Ok(response) => {
+                    let Some(pending) = self.pending_local_fingerprint.as_ref() else {
+                        continue;
+                    };
+                    if pending.generation != response.generation
+                        || pending.key.path != response.path
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_local_fingerprint
+                        .take()
+                        .expect("the matching pending fingerprint exists");
+                    self.view.local_fingerprint_animation_frame = 0;
+                    match response.result {
+                        Ok(candidates)
+                            if local_file_identity(&pending.key.path).as_ref()
+                                == Some(&pending.key.identity) =>
+                        {
+                            let count = candidates.len();
+                            self.cache_local_fingerprint(pending.key.clone(), candidates);
+                            if self.selected_local_fingerprint_target().is_some_and(
+                                |(selected_media_id, selected_key)| {
+                                    selected_media_id == pending.media_id
+                                        && selected_key == pending.key
+                                },
+                            ) {
+                                let first_recording = self.apply_local_fingerprint_details();
+                                self.request_local_fingerprint_wikidata(first_recording.as_deref());
+                                self.view.status_line = if count == 0 {
+                                    "AcoustID found no linked MusicBrainz recording".to_owned()
+                                } else {
+                                    format!(
+                                        "Found {count} MusicBrainz recording candidate{}",
+                                        if count == 1 { "" } else { "s" }
+                                    )
+                                };
+                            }
+                        }
+                        Ok(_) => {
+                            if self.selected_local_fingerprint_target().is_some_and(
+                                |(_, selected_key)| selected_key.path == pending.key.path,
+                            ) {
+                                self.view.status_line =
+                                    "The local audio file changed; press f to fingerprint it again"
+                                        .to_owned();
+                                if let Some(details) = self.view.details.as_mut() {
+                                    details.local_fingerprint_pending = false;
+                                }
+                            }
+                        }
+                        Err(AudioIdentificationError::Cancelled) => {}
+                        Err(error) => {
+                            if self.selected_local_fingerprint_target().is_some_and(
+                                |(selected_media_id, selected_key)| {
+                                    selected_media_id == pending.media_id
+                                        && selected_key == pending.key
+                                },
+                            ) {
+                                if let Some(details) = self.view.details.as_mut() {
+                                    details.local_fingerprint_pending = false;
+                                }
+                                self.show_error_message(
+                                    "Local audio fingerprinting failed",
+                                    error.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.local_fingerprint_disconnect_reported {
+                        self.local_fingerprint_disconnect_reported = true;
+                        let worker_was_started = self.local_fingerprint_requests.take().is_some();
+                        self.cancel_local_fingerprint();
+                        let (placeholder_sender, placeholder_receiver) = bounded(1);
+                        drop(placeholder_sender);
+                        self.local_fingerprint_request_drain = placeholder_receiver;
+                        if let Some(handle) = self.local_fingerprint_thread.take() {
+                            let _ = handle.join();
+                        }
+                        if worker_was_started {
+                            self.show_error_message(
+                                "Local fingerprint worker stopped",
+                                "the background Chromaprint/AcoustID channel disconnected unexpectedly",
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Advances the selected fingerprint button's ASCII activity frame.
+    #[cfg(feature = "acoustid")]
+    fn advance_local_fingerprint_animation(&mut self) {
+        if self.pending_local_fingerprint.is_some() {
+            self.view.local_fingerprint_animation_frame =
+                self.view.local_fingerprint_animation_frame.wrapping_add(1);
+        }
     }
 
     /// Applies every currently available waveform completion.
@@ -14894,6 +15496,8 @@ impl AppController {
         #[cfg(feature = "yt-dlp")]
         self.cancel_youtube_prewarm();
         if self.view.screen == Screen::Local && screen != Screen::Local {
+            #[cfg(feature = "acoustid")]
+            self.cancel_local_fingerprint();
             self.invalidate_local_folder_sizes();
         }
         self.view.search_editing = false;
@@ -17904,7 +18508,7 @@ impl AppController {
 
     fn diagnostic_helpers(&mut self) -> Vec<ExternalHelper> {
         if self.diagnostic_helpers_cache.is_none() {
-            self.diagnostic_helpers_cache = Some(ExternalHelper::probe_many([
+            let mut helpers = vec![
                 (
                     ExternalHelperKind::Mpv,
                     Some(self.config.providers.mpv_executable.clone()),
@@ -17913,7 +18517,13 @@ impl AppController {
                     ExternalHelperKind::YtDlp,
                     Some(self.config.providers.yt_dlp_executable.clone()),
                 ),
-            ]));
+            ];
+            #[cfg(feature = "acoustid")]
+            helpers.push((
+                ExternalHelperKind::Fpcalc,
+                Some(self.config.providers.fpcalc_executable.clone()),
+            ));
+            self.diagnostic_helpers_cache = Some(ExternalHelper::probe_many(helpers));
         }
         self.diagnostic_helpers_cache
             .as_ref()
@@ -19827,6 +20437,19 @@ impl AppController {
         }
     }
 
+    /// Cancels, stops, and joins the dedicated local-audio identifier.
+    #[cfg(feature = "acoustid")]
+    fn shutdown_local_fingerprint_worker(&mut self) {
+        self.cancel_local_fingerprint();
+        if let Some(sender) = self.local_fingerprint_requests.take() {
+            let _ = sender.send(LocalFingerprintWorkerRequest::Shutdown);
+        }
+        if let Some(handle) = self.local_fingerprint_thread.take() {
+            let _ = handle.join();
+        }
+        while self.local_fingerprint_responses.try_recv().is_ok() {}
+    }
+
     /// Cancels, stops, and joins the dedicated local waveform worker.
     #[cfg(feature = "waveform")]
     fn shutdown_local_waveform_worker(&mut self) {
@@ -19985,6 +20608,8 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        #[cfg(feature = "acoustid")]
+        self.shutdown_local_fingerprint_worker();
         #[cfg(feature = "waveform")]
         self.shutdown_local_waveform_worker();
         self.shutdown_local_browse_worker();
@@ -20347,6 +20972,15 @@ impl UiController for AppController {
                 );
             }
             UiAction::ToggleWaveform => self.toggle_waveform(),
+            UiAction::FingerprintLocalAudio => {
+                #[cfg(feature = "acoustid")]
+                self.fingerprint_selected_local_audio();
+                #[cfg(not(feature = "acoustid"))]
+                {
+                    self.view.status_line =
+                        "This build omits AcoustID fingerprinting support".to_owned();
+                }
+            }
             UiAction::ToggleRepeat => {
                 if self
                     .current_media
@@ -20616,6 +21250,8 @@ impl UiController for AppController {
         }
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "acoustid")]
+        self.drain_local_fingerprint_responses();
         #[cfg(feature = "waveform")]
         self.drain_local_waveform_responses();
         self.drain_local_browse_responses(true);
@@ -20642,7 +21278,11 @@ impl UiController for AppController {
         self.drain_bandcamp_resolver_responses();
         self.advance_search_animation();
         self.advance_playback_start_animation();
+        #[cfg(feature = "acoustid")]
+        self.advance_local_fingerprint_animation();
         let now = Instant::now();
+        #[cfg(feature = "acoustid")]
+        self.revalidate_displayed_local_fingerprint(now);
         self.request_due_channel_details(now);
         #[cfg(feature = "wikidata")]
         self.request_due_channel_wikidata(now);
@@ -20836,6 +21476,37 @@ fn local_browse_worker(
             LocalBrowseRequest::Shutdown => break,
         };
         if responses.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+/// Resolves explicit local-audio fingerprints without blocking navigation or
+/// the general remote-provider worker.
+#[cfg(feature = "acoustid")]
+fn local_fingerprint_worker(
+    requests: Receiver<LocalFingerprintWorkerRequest>,
+    responses: Sender<LocalFingerprintWorkerResponse>,
+    mut identifier: Box<dyn AudioIdentifier>,
+) {
+    while let Ok(command) = requests.recv() {
+        let LocalFingerprintWorkerRequest::Identify {
+            generation,
+            path,
+            cancellation,
+        } = command
+        else {
+            break;
+        };
+        let result = identifier.identify(&path, &cancellation);
+        if responses
+            .send(LocalFingerprintWorkerResponse {
+                generation,
+                path,
+                result,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -26636,7 +27307,7 @@ mod tests {
     use std::collections::VecDeque;
     #[cfg(feature = "yt-dlp")]
     use std::io::Cursor;
-    #[cfg(feature = "yt-dlp")]
+    #[cfg(any(feature = "acoustid", feature = "yt-dlp"))]
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -26702,6 +27373,83 @@ mod tests {
             controller.pending_local_media_metadata.is_none(),
             "local metadata worker did not complete before the test deadline"
         );
+    }
+
+    /// Deterministic successful identifier used by Local fingerprint tests.
+    #[cfg(feature = "acoustid")]
+    struct ScriptedAudioIdentifier {
+        outcomes: VecDeque<Vec<MusicBrainzCandidate>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "acoustid")]
+    impl AudioIdentifier for ScriptedAudioIdentifier {
+        fn identify(
+            &mut self,
+            _audio_path: &Path,
+            cancellation: &AudioIdentificationCancellation,
+        ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if cancellation.is_cancelled() {
+                return Err(AudioIdentificationError::Cancelled);
+            }
+            Ok(self
+                .outcomes
+                .pop_front()
+                .expect("a scripted fingerprint outcome"))
+        }
+    }
+
+    /// Deterministic missing-helper failure used to verify controller guidance.
+    #[cfg(feature = "acoustid")]
+    struct MissingFpcalcAudioIdentifier;
+
+    #[cfg(feature = "acoustid")]
+    impl AudioIdentifier for MissingFpcalcAudioIdentifier {
+        fn identify(
+            &mut self,
+            _audio_path: &Path,
+            _cancellation: &AudioIdentificationCancellation,
+        ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+            Err(AudioIdentificationError::FpcalcProcess(
+                crate::audio_identification::FpcalcProcessError::new(format!(
+                    "fpcalc executable was not found.\n{}",
+                    crate::audio_identification::FPCALC_INSTALL_GUIDANCE
+                )),
+            ))
+        }
+    }
+
+    /// Identifier that blocks until the controller cancels its exact request.
+    #[cfg(feature = "acoustid")]
+    struct CancellationBlockingAudioIdentifier {
+        started: Arc<AtomicBool>,
+        observed_cancellation: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "acoustid")]
+    impl AudioIdentifier for CancellationBlockingAudioIdentifier {
+        fn identify(
+            &mut self,
+            _audio_path: &Path,
+            cancellation: &AudioIdentificationCancellation,
+        ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
+            self.started.store(true, Ordering::Release);
+            let fallback_deadline = Instant::now() + Duration::from_secs(2);
+            while !cancellation.is_cancelled() && Instant::now() < fallback_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if cancellation.is_cancelled() {
+                self.observed_cancellation.store(true, Ordering::Release);
+                Err(AudioIdentificationError::Cancelled)
+            } else {
+                Err(AudioIdentificationError::FpcalcProcess(
+                    crate::audio_identification::FpcalcProcessError::new(
+                        "mock identifier was not cancelled",
+                    ),
+                ))
+            }
+        }
     }
 
     #[test]
@@ -35784,6 +36532,731 @@ mod tests {
                     .join(format!("{MAX_CACHED_LOCAL_MEDIA_ITEMS}.flac"))
             )
         );
+    }
+
+    /// Builds an isolated Local controller and captures incidental Wikidata
+    /// requests so fingerprint tests never use the network.
+    #[cfg(feature = "acoustid")]
+    fn controller_with_local_fingerprint_config(
+        client_key: Option<&str>,
+    ) -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
+        let fixture = tempfile::tempdir().expect("temporary fingerprint controller fixture");
+        let mut config = Config::for_dir(fixture.path().join("youta"));
+        config.providers.acoustid_client_key = client_key.map(str::to_owned);
+        let store = StateStore::open_in_memory().expect("in-memory fingerprint state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (provider_requests, captured_provider_requests) = unbounded();
+        controller.provider_requests = Some(provider_requests);
+        (fixture, controller, captured_provider_requests)
+    }
+
+    /// Replaces the system identifier with one deterministic test boundary.
+    #[cfg(feature = "acoustid")]
+    fn install_local_fingerprint_identifier(
+        controller: &mut AppController,
+        identifier: Box<dyn AudioIdentifier>,
+    ) {
+        controller.shutdown_local_fingerprint_worker();
+        let (request_sender, requests) = bounded(1);
+        let request_drain = requests.clone();
+        let (response_sender, responses) = unbounded();
+        let worker = thread::Builder::new()
+            .name("youta-test-local-fingerprint".to_owned())
+            .spawn(move || local_fingerprint_worker(requests, response_sender, identifier))
+            .expect("test fingerprint worker");
+        controller.local_fingerprint_requests = Some(request_sender);
+        controller.local_fingerprint_request_drain = request_drain;
+        controller.local_fingerprint_responses = responses;
+        controller.local_fingerprint_thread = Some(worker);
+        controller.local_fingerprint_disconnect_reported = false;
+    }
+
+    /// Installs captured channels for deterministic stale-completion tests.
+    #[cfg(feature = "acoustid")]
+    fn install_captured_local_fingerprint_channels(
+        controller: &mut AppController,
+    ) -> (
+        Receiver<LocalFingerprintWorkerRequest>,
+        Sender<LocalFingerprintWorkerResponse>,
+    ) {
+        controller.shutdown_local_fingerprint_worker();
+        let (request_sender, requests) = bounded(1);
+        let request_drain = requests.clone();
+        let (response_sender, responses) = unbounded();
+        controller.local_fingerprint_requests = Some(request_sender);
+        controller.local_fingerprint_request_drain = request_drain;
+        controller.local_fingerprint_responses = responses;
+        controller.local_fingerprint_thread = None;
+        controller.local_fingerprint_disconnect_reported = false;
+        (requests, response_sender)
+    }
+
+    /// Selects one exact entry through the real Local listing.
+    #[cfg(feature = "acoustid")]
+    fn select_local_fingerprint_fixture(
+        controller: &mut AppController,
+        directory: &Path,
+        selected_path: &Path,
+    ) -> MediaId {
+        let listing = crate::local_browser::list_local_directory(
+            directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local fingerprint listing");
+        let entry_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == selected_path)
+            .expect("fingerprint fixture in Local listing");
+        controller.view.screen = Screen::Local;
+        controller.view.selected =
+            entry_index.saturating_add(usize::from(listing.parent.is_some()));
+        controller.local_listing = Some(listing);
+        controller.rebuild_local_browser_rows();
+        controller.update_local_browser_detail();
+        local_media_id(selected_path)
+    }
+
+    /// Waits for the dedicated test identifier and drains its result.
+    #[cfg(feature = "acoustid")]
+    fn await_local_fingerprint(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.pending_local_fingerprint.is_some() && Instant::now() < deadline {
+            controller.drain_local_fingerprint_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            controller.pending_local_fingerprint.is_none(),
+            "local fingerprint worker did not complete before the test deadline"
+        );
+    }
+
+    /// Creates one canonical candidate without exposing live AcoustID data.
+    #[cfg(feature = "acoustid")]
+    fn local_fingerprint_candidate(
+        recording_id: &str,
+        acoustid_result_id: &str,
+        score: f64,
+    ) -> MusicBrainzCandidate {
+        MusicBrainzCandidate::new(recording_id, acoustid_result_id, score)
+            .expect("valid fingerprint candidate fixture")
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
+        let media = tempfile::tempdir().expect("temporary fingerprint eligibility fixture");
+        let audio = media.path().join("track.flac");
+        let video = media.path().join("clip.mp4");
+        let image = media.path().join("cover.jpg");
+        let folder = media.path().join("album");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        std::fs::write(&video, b"video fixture").expect("write video fixture");
+        std::fs::write(&image, b"image fixture").expect("write image fixture");
+        std::fs::create_dir(&folder).expect("create folder fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(None);
+
+        for (path, expected) in [
+            (&audio, true),
+            (&video, false),
+            (&image, false),
+            (&folder, false),
+        ] {
+            let media_id =
+                select_local_fingerprint_fixture(&mut controller, media.path(), path.as_path());
+            let target = controller.selected_local_fingerprint_target();
+
+            assert_eq!(
+                target.as_ref().map(|(selected, _)| selected),
+                expected.then_some(&media_id),
+                "unexpected fingerprint eligibility for {}",
+                path.display()
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.local_fingerprint_available),
+                expected,
+                "Details action eligibility must match the exact Local kind"
+            );
+        }
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprint_action_points_missing_keys_to_the_private_credentials_file() {
+        let media = tempfile::tempdir().expect("temporary missing-key fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(None);
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let credentials_file = controller.config.credentials_file().to_owned();
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+
+        assert_eq!(
+            controller.view.status_line,
+            format!(
+                "Add providers.acoustid_client_key to {}",
+                credentials_file.display()
+            )
+        );
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert!(controller.local_fingerprint_cache.is_empty());
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn controller_without_an_acoustid_key_has_no_phantom_worker_error() {
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(None);
+
+        controller.drain_local_fingerprint_responses();
+
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn missing_fpcalc_failure_reaches_local_error_popup_with_install_guidance() {
+        let media = tempfile::tempdir().expect("temporary missing-fpcalc fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(MissingFpcalcAudioIdentifier),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        await_local_fingerprint(&mut controller);
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("missing-fpcalc error popup");
+        assert_eq!(popup.title, "Local audio fingerprinting failed");
+        for command in [
+            "USE=tools emerge media-libs/chromaprint",
+            "apt install libchromaprint-tools",
+            "dnf install chromaprint-tools",
+            "brew install chromaprint",
+        ] {
+            assert!(
+                popup.report.contains(command),
+                "missing installation command: {command}"
+            );
+        }
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_fingerprint_available && !details.local_fingerprint_pending
+        }));
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn disconnected_fingerprint_worker_cannot_accept_phantom_follow_up_work() {
+        let media = tempfile::tempdir().expect("temporary disconnected-worker fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let (requests, responses) = install_captured_local_fingerprint_channels(&mut controller);
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        drop(responses);
+
+        controller.drain_local_fingerprint_responses();
+
+        assert!(controller.local_fingerprint_requests.is_none());
+        assert!(controller.local_fingerprint_thread.is_none());
+        assert!(matches!(
+            requests.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        controller.view.error_popup = None;
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert_eq!(
+            controller.view.status_line,
+            "The local fingerprint worker is unavailable"
+        );
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_fingerprint_available && !details.local_fingerprint_pending
+        }));
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprint_f_dispatch_animates_and_caches_an_empty_success() {
+        let media = tempfile::tempdir().expect("temporary empty fingerprint fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(ScriptedAudioIdentifier {
+                outcomes: VecDeque::from([Vec::new()]),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+
+        assert!(controller.pending_local_fingerprint.is_some());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_fingerprint_pending)
+        );
+        assert_eq!(controller.view.local_fingerprint_animation_frame, 0);
+        controller.advance_local_fingerprint_animation();
+        controller.advance_local_fingerprint_animation();
+        assert_eq!(controller.view.local_fingerprint_animation_frame, 2);
+
+        await_local_fingerprint(&mut controller);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.local_fingerprint_cache.len(), 1);
+        assert!(
+            controller
+                .local_fingerprint_cache
+                .values()
+                .all(|cached| cached.candidates.is_empty()),
+            "a successful empty lookup must be cached"
+        );
+        assert_eq!(controller.view.local_fingerprint_animation_frame, 0);
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            !details.local_fingerprint_available && !details.local_fingerprint_pending
+        }));
+        assert_eq!(
+            controller.view.status_line,
+            "AcoustID found no linked MusicBrainz recording"
+        );
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.view.status_line,
+            "Using the cached fingerprint result for this unchanged file"
+        );
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprint_completion_projects_ranked_musicbrainz_links() {
+        const HIGH_RECORDING: &str = "11111111-1111-4111-8111-111111111111";
+        const LOW_RECORDING: &str = "22222222-2222-4222-8222-222222222222";
+        let media = tempfile::tempdir().expect("temporary candidate projection fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let candidates = vec![
+            local_fingerprint_candidate(
+                HIGH_RECORDING,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            ),
+            local_fingerprint_candidate(LOW_RECORDING, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 0.6),
+        ];
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(ScriptedAudioIdentifier {
+                outcomes: VecDeque::from([candidates]),
+                calls,
+            }),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        await_local_fingerprint(&mut controller);
+
+        let details = controller.view.details.as_ref().expect("Local Details");
+        assert!(
+            !details.local_fingerprint_available,
+            "a cached successful result must hide the fingerprint action"
+        );
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .map(|link| (link.label.as_str(), link.url.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "MusicBrainz recording 1 · 95.0% match",
+                    "https://musicbrainz.org/recording/11111111-1111-4111-8111-111111111111",
+                ),
+                (
+                    "MusicBrainz recording 2 · 60.0% match",
+                    "https://musicbrainz.org/recording/22222222-2222-4222-8222-222222222222",
+                ),
+            ]
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "Found 2 MusicBrainz recording candidates"
+        );
+        #[cfg(feature = "wikidata")]
+        assert!(_provider_requests.try_iter().any(|request| matches!(
+            request,
+            ProviderRequest::Wikidata {
+                kind:
+                    crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording,
+                ref external_id,
+                ..
+            } if external_id == HIGH_RECORDING
+        )));
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn tick_reveals_fingerprint_action_after_selected_file_replacement() {
+        let media = tempfile::tempdir().expect("temporary fingerprint revalidation fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"original audio fixture")
+            .expect("write original fingerprint fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(ScriptedAudioIdentifier {
+                outcomes: VecDeque::from([vec![local_fingerprint_candidate(
+                    "11111111-1111-4111-8111-111111111111",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    0.95,
+                )]]),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        await_local_fingerprint(&mut controller);
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            !details.local_fingerprint_available && !details.links.is_empty()
+        }));
+        assert!(controller.displayed_local_fingerprint.is_some());
+
+        std::fs::write(
+            &audio,
+            b"replacement audio fixture with a distinct filesystem identity",
+        )
+        .expect("replace fingerprinted fixture");
+        controller.local_fingerprint_revalidate_at =
+            Some(Instant::now() - Duration::from_millis(1));
+
+        controller.tick();
+
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_fingerprint_available
+                && !details.local_fingerprint_pending
+                && details.links.is_empty()
+        }));
+        assert!(controller.displayed_local_fingerprint.is_none());
+        assert_eq!(
+            controller.view.status_line,
+            "The local audio file changed; press f to fingerprint it again"
+        );
+        #[cfg(feature = "wikidata")]
+        assert!(controller.pending_local_fingerprint_wikidata.is_none());
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "wikidata"))]
+    #[test]
+    fn cached_fingerprint_reuses_one_pending_musicbrainz_wikidata_lookup() {
+        const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let media = tempfile::tempdir().expect("temporary Wikidata dedup fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(ScriptedAudioIdentifier {
+                outcomes: VecDeque::from([vec![local_fingerprint_candidate(
+                    RECORDING_ID,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    0.95,
+                )]]),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        await_local_fingerprint(&mut controller);
+        let (generation, external_id) = provider_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Wikidata {
+                    generation,
+                    kind: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording,
+                    external_id,
+                } => Some((generation, external_id)),
+                _ => None,
+            })
+            .expect("initial MusicBrainz Wikidata request");
+        assert_eq!(external_id, RECORDING_ID);
+        assert_eq!(
+            controller.pending_local_fingerprint_wikidata,
+            Some(PendingLocalFingerprintWikidata {
+                generation,
+                recording_id: RECORDING_ID.to_owned(),
+            })
+        );
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider_requests.try_iter().all(|request| !matches!(
+                request,
+                ProviderRequest::Wikidata {
+                    kind: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording,
+                    ..
+                }
+            )),
+            "cached fingerprint activation must not duplicate the pending P4404 lookup"
+        );
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                .property_id()
+                .to_owned(),
+            external_id,
+            result: Ok(Vec::new()),
+        });
+        assert!(controller.pending_local_fingerprint_wikidata.is_none());
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn replacement_identity_rejects_an_obsolete_fingerprint_completion() {
+        let media = tempfile::tempdir().expect("temporary replacement fingerprint fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"old audio").expect("write original audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let (requests, responses) = install_captured_local_fingerprint_channels(&mut controller);
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        let LocalFingerprintWorkerRequest::Identify {
+            generation, path, ..
+        } = requests.recv().expect("captured fingerprint request")
+        else {
+            panic!("expected an identification request");
+        };
+        std::fs::write(&audio, b"replacement audio with a different identity")
+            .expect("replace audio fixture");
+        responses
+            .send(LocalFingerprintWorkerResponse {
+                generation,
+                path,
+                result: Ok(vec![local_fingerprint_candidate(
+                    "11111111-1111-4111-8111-111111111111",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    0.95,
+                )]),
+            })
+            .expect("send obsolete fingerprint completion");
+
+        controller.drain_local_fingerprint_responses();
+
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert!(controller.local_fingerprint_cache.is_empty());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("local audio file changed")
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.local_fingerprint_pending)
+        );
+        controller.local_fingerprint_requests = None;
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn stale_fingerprint_generation_cannot_replace_the_active_request() {
+        let media = tempfile::tempdir().expect("temporary stale-generation fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let (requests, responses) = install_captured_local_fingerprint_channels(&mut controller);
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        let LocalFingerprintWorkerRequest::Identify {
+            generation, path, ..
+        } = requests
+            .recv()
+            .expect("captured active fingerprint request")
+        else {
+            panic!("expected an identification request");
+        };
+        responses
+            .send(LocalFingerprintWorkerResponse {
+                generation: generation.wrapping_sub(1),
+                path: path.clone(),
+                result: Ok(vec![local_fingerprint_candidate(
+                    "11111111-1111-4111-8111-111111111111",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    0.95,
+                )]),
+            })
+            .expect("send stale fingerprint completion");
+
+        controller.drain_local_fingerprint_responses();
+
+        assert!(controller.pending_local_fingerprint.is_some());
+        assert!(controller.local_fingerprint_cache.is_empty());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_fingerprint_pending)
+        );
+        responses
+            .send(LocalFingerprintWorkerResponse {
+                generation,
+                path,
+                result: Ok(Vec::new()),
+            })
+            .expect("send active fingerprint completion");
+        controller.drain_local_fingerprint_responses();
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert_eq!(controller.local_fingerprint_cache.len(), 1);
+        controller.local_fingerprint_requests = None;
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn changing_local_selection_cancels_the_exact_fingerprint_request() {
+        let media = tempfile::tempdir().expect("temporary selection cancellation fixture");
+        let first = media.path().join("first.flac");
+        let second = media.path().join("second.flac");
+        std::fs::write(&first, b"first audio").expect("write first audio fixture");
+        std::fs::write(&second, b"second audio").expect("write second audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let (requests, _responses) = install_captured_local_fingerprint_channels(&mut controller);
+        select_local_fingerprint_fixture(&mut controller, media.path(), &first);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        let LocalFingerprintWorkerRequest::Identify { cancellation, .. } =
+            requests.recv().expect("captured first fingerprint request")
+        else {
+            panic!("expected an identification request");
+        };
+
+        select_local_fingerprint_fixture(&mut controller, media.path(), &second);
+
+        assert!(cancellation.is_cancelled());
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_fingerprint_available && !details.local_fingerprint_pending
+        }));
+        controller.local_fingerprint_requests = None;
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprint_ram_cache_is_lru_bounded() {
+        let media = tempfile::tempdir().expect("temporary fingerprint cache fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(None);
+        let mut keys = Vec::new();
+        for index in 0..MAX_CACHED_LOCAL_FINGERPRINTS {
+            let path = media.path().join(format!("{index}.flac"));
+            std::fs::write(&path, format!("audio fixture {index}"))
+                .expect("write fingerprint cache fixture");
+            let key = LocalFingerprintCacheKey {
+                identity: local_file_identity(&path).expect("fingerprint cache identity"),
+                path,
+            };
+            controller.cache_local_fingerprint(key.clone(), Vec::new());
+            keys.push(key);
+        }
+        controller.promote_local_fingerprint_cache_key(&keys[0]);
+        let newest_path = media.path().join("newest.flac");
+        std::fs::write(&newest_path, b"newest audio fixture")
+            .expect("write newest fingerprint fixture");
+        let newest = LocalFingerprintCacheKey {
+            identity: local_file_identity(&newest_path).expect("newest fingerprint identity"),
+            path: newest_path,
+        };
+
+        controller.cache_local_fingerprint(newest.clone(), Vec::new());
+
+        assert_eq!(
+            controller.local_fingerprint_cache.len(),
+            MAX_CACHED_LOCAL_FINGERPRINTS
+        );
+        assert!(controller.local_fingerprint_cache.contains_key(&keys[0]));
+        assert!(
+            !controller.local_fingerprint_cache.contains_key(&keys[1]),
+            "the least-recently-used entry must be evicted"
+        );
+        assert!(controller.local_fingerprint_cache.contains_key(&newest));
+        assert_eq!(
+            controller.local_fingerprint_cache_order.len(),
+            MAX_CACHED_LOCAL_FINGERPRINTS
+        );
+    }
+
+    #[cfg(feature = "acoustid")]
+    #[test]
+    fn local_fingerprint_worker_shutdown_cancels_and_joins_active_work() {
+        let media = tempfile::tempdir().expect("temporary fingerprint shutdown fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        let started = Arc::new(AtomicBool::new(false));
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        install_local_fingerprint_identifier(
+            &mut controller,
+            Box::new(CancellationBlockingAudioIdentifier {
+                started: Arc::clone(&started),
+                observed_cancellation: Arc::clone(&observed_cancellation),
+            }),
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::FingerprintLocalAudio);
+        let started_deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::Acquire) && Instant::now() < started_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::Acquire));
+
+        controller.shutdown_local_fingerprint_worker();
+
+        assert!(observed_cancellation.load(Ordering::Acquire));
+        assert!(controller.pending_local_fingerprint.is_none());
+        assert!(controller.local_fingerprint_requests.is_none());
+        assert!(controller.local_fingerprint_thread.is_none());
     }
 
     /// Seeds one exact Local fixture duration in the controller's metadata cache.
