@@ -65,11 +65,11 @@ pub const WIKIDATA_MEDIA_PLAY_SYMBOL: &str = "▶";
 /// Fixed-width marker rendered for the same actively playing Commons value.
 const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "⏸";
 
-/// Bottom seek-status control shown when playback can be resumed.
-const PLAYBACK_RESUME_SYMBOL: &str = "▶";
+/// Marker shown while the current media is playing.
+const PLAYBACK_PLAYING_SYMBOL: &str = "▶";
 
-/// Bottom seek-status control shown when playback can be paused.
-const PLAYBACK_PAUSE_SYMBOL: &str = "⏸";
+/// Marker shown while the current media is paused.
+const PLAYBACK_PAUSED_SYMBOL: &str = "⏸";
 
 /// Official Invidious documentation listing public instances.
 pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
@@ -3882,6 +3882,7 @@ fn render_body(
         true,
         view.selected,
         view.playing_media_id.as_ref(),
+        view.playback.paused,
         view.radio_recording
             .as_ref()
             .map(|recording| recording.station_id.as_str()),
@@ -3930,6 +3931,7 @@ fn render_row_list(
     show_source: bool,
     selected_index: usize,
     playing_media_id: Option<&MediaId>,
+    playback_paused: bool,
     recording_station_id: Option<&str>,
     allow_started_title_italics: bool,
     heading_style: Style,
@@ -3955,6 +3957,11 @@ fn render_row_list(
         .map(|(index, row)| {
             let selected = index == selected_index;
             let playing = playing_index == Some(index);
+            let playing_symbol = if playback_paused {
+                PLAYBACK_PAUSED_SYMBOL
+            } else {
+                PLAYBACK_PLAYING_SYMBOL
+            };
             let row_style = if selected {
                 theme.selected.fg(Color::Black)
             } else if playing {
@@ -4024,7 +4031,7 @@ fn render_row_list(
             let mut title_spans = if row.compact {
                 let mut spans = Vec::with_capacity(3);
                 if playing {
-                    spans.push(Span::styled("▶ ", row_style));
+                    spans.push(Span::styled(format!("{playing_symbol} "), row_style));
                 }
                 if row.radio_favorite {
                     spans.push(Span::styled("★ ", favorite_style));
@@ -4041,7 +4048,10 @@ fn render_row_list(
                 spans
             } else if show_source {
                 let mut spans = vec![
-                    Span::styled(format!("{} ", if playing { "▶" } else { " " }), row_style),
+                    Span::styled(
+                        format!("{} ", if playing { playing_symbol } else { " " }),
+                        row_style,
+                    ),
                     Span::styled(format!("{marker} "), source_style),
                 ];
                 if row.local_marked {
@@ -4050,7 +4060,7 @@ fn render_row_list(
                 spans.push(Span::styled(format!("{watched_marker} "), watched_style));
                 spans
             } else if playing {
-                let mut spans = vec![Span::styled("▶ ", row_style)];
+                let mut spans = vec![Span::styled(format!("{playing_symbol} "), row_style)];
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
@@ -4164,6 +4174,7 @@ fn render_subscriptions_body(
                 false,
                 subscriptions.selected_item,
                 view.playing_media_id.as_ref(),
+                view.playback.paused,
                 view.radio_recording
                     .as_ref()
                     .map(|recording| recording.station_id.as_str()),
@@ -4311,6 +4322,7 @@ fn render_subscriptions_body(
                     false,
                     subscriptions.selected_item,
                     view.playing_media_id.as_ref(),
+                    view.playback.paused,
                     view.radio_recording
                         .as_ref()
                         .map(|recording| recording.station_id.as_str()),
@@ -4357,6 +4369,7 @@ fn render_subscription_source_list(
         true,
         view.subscriptions.selected_source,
         view.playing_media_id.as_ref(),
+        view.playback.paused,
         view.radio_recording
             .as_ref()
             .map(|recording| recording.station_id.as_str()),
@@ -6279,9 +6292,9 @@ fn render_seek_bar(
     } else if view.playback.buffering {
         Some("buffering")
     } else if view.playback.paused {
-        Some(PLAYBACK_RESUME_SYMBOL)
+        Some(PLAYBACK_PAUSED_SYMBOL)
     } else {
-        Some(PLAYBACK_PAUSE_SYMBOL)
+        Some(PLAYBACK_PLAYING_SYMBOL)
     };
     let state_suffix = state.map_or_else(String::new, |state| format!(" {state}"));
     let marker = match settings.seek_bar_style {
@@ -11484,12 +11497,12 @@ mod tests {
     }
 
     #[test]
-    fn play_marker_follows_playing_media_instead_of_selection_while_paused() {
+    fn paused_marker_follows_playing_media_instead_of_selection() {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let playing = MediaId::new(crate::domain::SourceKind::YouTube, "playing");
         let selected = MediaId::new(crate::domain::SourceKind::YouTube, "selected");
-        let view = ViewModel {
+        let mut view = ViewModel {
             rows: vec![
                 RowView {
                     media_id: Some(playing.clone()),
@@ -11531,7 +11544,7 @@ mod tests {
             .expect("draw independent playing and selected rows");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(0, 1)].symbol(), "▶");
+        assert_eq!(buffer[(0, 1)].symbol(), "⏸");
         assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
         assert_eq!(buffer[(0, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, Color::Cyan);
@@ -11539,10 +11552,27 @@ mod tests {
             buffer
                 .content()
                 .iter()
-                .filter(|cell| cell.symbol() == "▶")
+                .filter(|cell| cell.symbol() == "⏸")
                 .count(),
             1
         );
+
+        view.playback.paused = false;
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw playing-state marker");
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "▶");
     }
 
     #[test]
@@ -11567,6 +11597,11 @@ mod tests {
                 },
             ],
             playing_media_id: Some(playing),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -11635,6 +11670,11 @@ mod tests {
             ],
             selected: 2,
             playing_media_id: Some(playing),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -11925,6 +11965,7 @@ mod tests {
                     true,
                     0,
                     None,
+                    false,
                     None,
                     true,
                     Theme::new(false).heading,
@@ -11990,6 +12031,7 @@ mod tests {
                     true,
                     0,
                     None,
+                    false,
                     None,
                     true,
                     Theme::new(false).heading,
@@ -14685,20 +14727,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let playing_row = hit_map.rows.y;
         let selected_row = playing_row.saturating_add(1);
-        assert_eq!(buffer[(hit_map.rows.x, playing_row)].symbol(), "▶");
+        assert_eq!(buffer[(hit_map.rows.x, playing_row)].symbol(), "⏸");
         let playing_title = &buffer[(hit_map.rows.x.saturating_add(4), playing_row)];
         assert_eq!(playing_title.symbol(), "p");
         assert!(playing_title.modifier.contains(Modifier::BOLD));
         assert_eq!(playing_title.fg, Color::Cyan);
         assert_ne!(
             buffer[(hit_map.rows.x, selected_row)].symbol(),
-            "▶",
+            "⏸",
             "selection must not move the playback marker"
         );
         assert_eq!(
             [playing_row, selected_row]
                 .into_iter()
-                .filter(|row| buffer[(hit_map.rows.x, *row)].symbol() == "▶")
+                .filter(|row| buffer[(hit_map.rows.x, *row)].symbol() == "⏸")
                 .count(),
             1
         );
@@ -14729,6 +14771,11 @@ mod tests {
         view.subscriptions.source_title = "Fixture channel".to_owned();
         view.subscriptions.source_subscriber_count = Some(13_045);
         view.playing_media_id = view.subscriptions.items[0].media_id.clone();
+        view.playback = PlaybackStatus {
+            idle: false,
+            paused: false,
+            ..PlaybackStatus::default()
+        };
         let mut hit_map = HitMap::default();
 
         terminal
@@ -20361,13 +20408,13 @@ prose 07:25 remains clickable but is not a chapter";
         let status_row = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
-        let expected = "18:28 / 1:33:06  1×  vol 80% ▶";
+        let expected = "18:28 / 1:33:06  1×  vol 80% ⏸";
         assert!(!track_row.contains(expected));
         assert!(status_row.contains(expected));
     }
 
     #[test]
-    fn seek_status_uses_play_and_pause_action_symbols() {
+    fn seek_status_uses_current_playback_state_symbols() {
         let backend = TestBackend::new(80, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
@@ -20396,7 +20443,7 @@ prose 07:25 remains clickable but is not a chapter";
             })
             .expect("draw paused seek status");
         let paused = rendered_text(&terminal);
-        assert!(paused.contains("vol 80% ▶"));
+        assert!(paused.contains("vol 80% ⏸"));
         assert!(!paused.contains("paused"));
         assert!(!paused.contains("playing"));
 
@@ -20414,7 +20461,7 @@ prose 07:25 remains clickable but is not a chapter";
             })
             .expect("draw playing seek status");
         let playing = rendered_text(&terminal);
-        assert!(playing.contains("vol 80% ⏸"));
+        assert!(playing.contains("vol 80% ▶"));
         assert!(!playing.contains("paused"));
         assert!(!playing.contains("playing"));
 
