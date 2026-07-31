@@ -4669,18 +4669,6 @@ fn render_details_with_terminal_window(
     hit_map: &mut HitMap,
     thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
-    let youtube_details = view
-        .details
-        .as_ref()
-        .filter(|details| details.source == "YouTube");
-    let thumbnail_height = youtube_thumbnail_height(
-        configured_thumbnail_height,
-        area.width,
-        youtube_details.is_some(),
-        youtube_details.is_some_and(|details| youtube_description_is_short(details, area.width)),
-        youtube_details.and_then(|details| details.thumbnail_dimensions),
-        terminal_window,
-    );
     render_information_panel(
         frame,
         area,
@@ -4698,7 +4686,7 @@ fn render_details_with_terminal_window(
             _ => InformationPanelKind::Video,
         },
         true,
-        thumbnail_height,
+        ThumbnailSizing::adaptive_youtube(configured_thumbnail_height, terminal_window),
         thumbnail_renderer,
     );
 }
@@ -4768,8 +4756,65 @@ fn valid_youtube_channel_display_alias(alias: &str) -> bool {
         })
 }
 
-/// One control placed against the right edge of the information panel.
-struct RightDetailButton {
+/// Thumbnail sizing inputs retained until the responsive image width is known.
+#[derive(Clone, Copy)]
+struct ThumbnailSizing {
+    /// User-configured height used when adaptive YouTube sizing does not apply.
+    configured_height: u16,
+    /// Whether YouTube artwork may expand from its rendered column width.
+    adaptive_youtube: bool,
+    /// Current terminal cell and pixel geometry, when the terminal reports it.
+    terminal_window: Option<TerminalWindowMetrics>,
+}
+
+impl ThumbnailSizing {
+    /// Creates fixed sizing for channels and other non-video information panes.
+    const fn fixed(configured_height: u16) -> Self {
+        Self {
+            configured_height,
+            adaptive_youtube: false,
+            terminal_window: None,
+        }
+    }
+
+    /// Creates responsive sizing for media Details panes.
+    const fn adaptive_youtube(
+        configured_height: u16,
+        terminal_window: Option<TerminalWindowMetrics>,
+    ) -> Self {
+        Self {
+            configured_height,
+            adaptive_youtube: true,
+            terminal_window,
+        }
+    }
+
+    /// Resolves the preferred row count after the artwork column is known.
+    fn preferred_height(
+        self,
+        details: &DetailView,
+        artwork_width: u16,
+        description_width: u16,
+    ) -> u16 {
+        let height = youtube_thumbnail_height(
+            self.configured_height,
+            artwork_width,
+            self.adaptive_youtube && details.source == "YouTube",
+            self.adaptive_youtube && youtube_description_is_short(details, description_width),
+            details.thumbnail_dimensions,
+            self.terminal_window,
+        );
+        if details.source == "Local image" {
+            height.saturating_mul(2)
+        } else {
+            height
+        }
+    }
+}
+
+/// One control and its current compact-layout placement.
+#[derive(Clone)]
+struct DetailButtonPlacement {
     /// Zero-based metadata row containing the rendered label.
     line_index: usize,
     /// Terminal-cell offset from the panel's left edge.
@@ -4780,6 +4825,101 @@ struct RightDetailButton {
     style: Style,
     /// Action dispatched by a click inside the label.
     action: UiAction,
+}
+
+/// Responsive action column rendered beside artwork.
+struct DetailActionRail {
+    /// Controls in deterministic visual and keyboard order.
+    buttons: Vec<DetailButtonPlacement>,
+    /// Stable column width across labels whose text changes when toggled.
+    width: u16,
+    /// Row count including one empty row between adjacent labels.
+    height: u16,
+    /// Width remaining for artwork to the left of the rail.
+    artwork_width: u16,
+    /// Requested artwork-block height after fitting the available pane.
+    ///
+    /// The decoded image may aspect-fit to fewer rows. Keeping the rail tied
+    /// to this stable block avoids moving controls when asynchronous artwork
+    /// replaces its loading placeholder.
+    artwork_height: u16,
+}
+
+/// Empty columns between actual artwork and its action rail.
+const DETAIL_ACTION_RAIL_GUTTER: u16 = 2;
+
+/// Smallest useful artwork column when controls move beside it.
+///
+/// Keeping 48 terminal cells prevents a side rail from making standard
+/// media artwork harder to inspect on narrow information panes.
+const MIN_DETAIL_ACTION_RAIL_ARTWORK_WIDTH: u16 = 48;
+
+/// Returns a stable rail slot width for labels that change after activation.
+fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hotkeys: bool) -> u16 {
+    let stable_label = match &button_placement.action {
+        UiAction::ToggleTextSelectionMode => {
+            Some(button("t/Esc", "Exit select mode", show_hotkeys))
+        }
+        UiAction::ToggleRadioFavorite => Some(button("f", "Unfavorite", show_hotkeys)),
+        UiAction::ToggleTodoPlaylist => Some(button("l", "Remove from todo", show_hotkeys)),
+        UiAction::EditPrivateNote => Some(button("n", "Edit private note", show_hotkeys)),
+        UiAction::ToggleSubscription => Some(button("s", "Unsubscribe (locally)", show_hotkeys)),
+        UiAction::ToggleRadioRecording => Some(button("r", "Stop recording", show_hotkeys)),
+        UiAction::FingerprintLocalAudio => Some(button("f", "Fingerprinting |", show_hotkeys)),
+        _ => None,
+    };
+    stable_label.as_deref().map_or_else(
+        || terminal_text_width(&button_placement.label),
+        |label| terminal_text_width(&button_placement.label).max(terminal_text_width(label)),
+    )
+}
+
+/// Chooses a spaced side rail only when every control and useful artwork fit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pure geometry helper keeps responsive layout inputs explicit"
+)]
+fn detail_action_rail(
+    buttons: &[DetailButtonPlacement],
+    panel_width: u16,
+    panel_height: u16,
+    metadata_height: u16,
+    text_reserve: u16,
+    sizing: ThumbnailSizing,
+    details: &DetailView,
+    show_hotkeys: bool,
+) -> Option<DetailActionRail> {
+    if buttons.is_empty() {
+        return None;
+    }
+    let width = buttons
+        .iter()
+        .map(|button| detail_button_layout_width(button, show_hotkeys))
+        .max()
+        .unwrap_or_default();
+    let artwork_width = panel_width.checked_sub(width.saturating_add(DETAIL_ACTION_RAIL_GUTTER))?;
+    if width == 0 || artwork_width < MIN_DETAIL_ACTION_RAIL_ARTWORK_WIDTH {
+        return None;
+    }
+    let button_count = u16::try_from(buttons.len()).unwrap_or(u16::MAX);
+    let height = button_count.saturating_mul(2).saturating_sub(1);
+    let available_height = panel_height
+        .saturating_sub(metadata_height)
+        .saturating_sub(text_reserve);
+    let artwork_height = sizing
+        .preferred_height(details, artwork_width, panel_width)
+        .min(available_height);
+    (artwork_height >= MIN_THUMBNAIL_HEIGHT && height <= artwork_height).then(|| {
+        let mut buttons = buttons.to_vec();
+        buttons.sort_by_key(|button| (button.line_index, button.column));
+        DetailActionRail {
+            buttons,
+            width,
+            height,
+            artwork_width,
+            artwork_height,
+        }
+    })
 }
 
 /// Builds the stable renderer identity used for terminal-cell invalidation.
@@ -4829,7 +4969,7 @@ fn invalidate_terminal_area(frame: &mut Frame<'_>, area: Rect) {
 /// Appends one clipped, right-aligned control and remembers its hit target.
 fn push_right_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
-    buttons: &mut Vec<RightDetailButton>,
+    buttons: &mut Vec<DetailButtonPlacement>,
     panel_width: u16,
     label: String,
     style: Style,
@@ -4842,7 +4982,7 @@ fn push_right_detail_button<'a>(
         Span::raw(" ".repeat(usize::from(column))),
         Span::styled(label.clone(), style),
     ]));
-    buttons.push(RightDetailButton {
+    buttons.push(DetailButtonPlacement {
         line_index,
         column,
         label,
@@ -4859,13 +4999,13 @@ fn push_right_detail_button<'a>(
 /// receive appended rows.
 fn push_left_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
-    right_buttons: &[RightDetailButton],
+    right_buttons: &[DetailButtonPlacement],
     next_left_row: &mut usize,
     panel_width: u16,
     label: String,
     style: Style,
     action: UiAction,
-) -> (usize, String, UiAction) {
+) -> DetailButtonPlacement {
     let label_width = terminal_text_width(&label).min(panel_width);
     let shared_row = right_buttons.iter().find(|button| {
         button.line_index >= *next_left_row && button.column >= label_width.saturating_add(2)
@@ -4884,7 +5024,13 @@ fn push_left_detail_button<'a>(
         line_index
     };
     *next_left_row = line_index.saturating_add(1);
-    (line_index, label, action)
+    DetailButtonPlacement {
+        line_index,
+        column: 0,
+        label,
+        style,
+        action,
+    }
 }
 
 fn render_information_panel(
@@ -4898,7 +5044,7 @@ fn render_information_panel(
     empty_message: &str,
     kind: InformationPanelKind,
     show_text_selection: bool,
-    thumbnail_height: u16,
+    thumbnail_sizing: ThumbnailSizing,
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
     hit_map.details_panel = area;
@@ -5360,6 +5506,83 @@ fn render_information_panel(
             Span::styled(display_license_label(&details.license), theme.accent),
         ]));
     }
+    let mut detail_buttons = [
+        radio_favorite_button,
+        todo_button,
+        playlist_button,
+        edit_playlist_button,
+        private_note_button,
+        subscription_button,
+        rename_button,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    // Preserve the compact layout's established left-actions-first hit-map
+    // order. The side rail independently sorts by visual row and column.
+    detail_buttons.extend(right_buttons);
+    let expanded_wikidata_entity = details
+        .expanded_wikidata_item
+        .as_deref()
+        .and_then(|item_id| {
+            details
+                .wikidata_entities
+                .iter()
+                .find(|entity| entity.item_id == item_id)
+        });
+    let visible_thumbnail_url = details
+        .thumbnail_url
+        .as_ref()
+        .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
+    let visible_local_video = details.local_video_thumbnail.as_ref();
+    let text_reserve = if details.thumbnail_expanded {
+        0
+    } else {
+        u16::from(!details.description.is_empty()) + u16::from(!details.links.is_empty())
+    };
+    let compact_metadata_height = u16::try_from(
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(line_index, _)| {
+                !detail_buttons
+                    .iter()
+                    .any(|button| button.line_index == *line_index)
+            })
+            .count(),
+    )
+    .unwrap_or(u16::MAX)
+    .min(inner.height);
+    let side_rail = (!details.thumbnail_expanded
+        && thumbnail_renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.is_enabled())
+        && (visible_thumbnail_url.is_some() || visible_local_video.is_some()))
+    .then(|| {
+        detail_action_rail(
+            &detail_buttons,
+            inner.width,
+            inner.height,
+            compact_metadata_height,
+            text_reserve,
+            thumbnail_sizing,
+            details,
+            show_hotkeys,
+        )
+    })
+    .flatten();
+    if side_rail.is_some() {
+        lines = lines
+            .into_iter()
+            .enumerate()
+            .filter_map(|(line_index, line)| {
+                (!detail_buttons
+                    .iter()
+                    .any(|button| button.line_index == line_index))
+                .then_some(line)
+            })
+            .collect();
+    }
     let metadata_height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .min(inner.height);
@@ -5368,34 +5591,11 @@ fn render_information_panel(
     // mouse target remains stable even when a title or channel name is long.
     frame.render_widget(Paragraph::new(lines), metadata_area);
     if show_text_selection {
-        let radio_favorite_button_row = radio_favorite_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
-        let subscription_button_row = subscription_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
-        let todo_button_row = todo_button.as_ref().map(|(line_index, _, _)| *line_index);
-        let playlist_button_row = playlist_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
-        let edit_playlist_button_row = edit_playlist_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
-        let private_note_button_row = private_note_button
-            .as_ref()
-            .map(|(line_index, _, _)| *line_index);
-        let rename_button_row = rename_button.as_ref().map(|(line_index, _, _)| *line_index);
         for line_index in 0..usize::from(metadata_height) {
-            if right_buttons
-                .iter()
-                .any(|button| button.line_index == line_index)
-                || radio_favorite_button_row == Some(line_index)
-                || subscription_button_row == Some(line_index)
-                || todo_button_row == Some(line_index)
-                || playlist_button_row == Some(line_index)
-                || edit_playlist_button_row == Some(line_index)
-                || private_note_button_row == Some(line_index)
-                || rename_button_row == Some(line_index)
+            if side_rail.is_none()
+                && detail_buttons
+                    .iter()
+                    .any(|button| button.line_index == line_index)
             {
                 continue;
             }
@@ -5413,82 +5613,40 @@ fn render_information_panel(
             );
         }
     }
-    for (line_index, label, action) in radio_favorite_button
-        .into_iter()
-        .chain(todo_button)
-        .chain(playlist_button)
-        .chain(edit_playlist_button)
-        .chain(private_note_button)
-        .chain(subscription_button)
-        .chain(rename_button)
-    {
-        if line_index >= usize::from(metadata_height) {
-            continue;
-        }
-        let width = terminal_text_width(&label).min(inner.width);
-        if width > 0 {
-            hit_map.detail_buttons.push((
-                action,
-                Rect::new(
-                    inner.x,
-                    inner.y.saturating_add(
-                        u16::try_from(line_index).unwrap_or(metadata_height.saturating_sub(1)),
+    if side_rail.is_none() {
+        for button in &detail_buttons {
+            if button.line_index >= usize::from(metadata_height) {
+                continue;
+            }
+            let width =
+                terminal_text_width(&button.label).min(inner.width.saturating_sub(button.column));
+            if width > 0 {
+                hit_map.detail_buttons.push((
+                    button.action.clone(),
+                    Rect::new(
+                        inner.x.saturating_add(button.column),
+                        inner.y.saturating_add(
+                            u16::try_from(button.line_index)
+                                .unwrap_or(metadata_height.saturating_sub(1)),
+                        ),
+                        width,
+                        1,
                     ),
-                    width,
-                    1,
-                ),
-            ));
-        }
-    }
-    for button in right_buttons {
-        if button.line_index >= usize::from(metadata_height) {
-            continue;
-        }
-        let width =
-            terminal_text_width(&button.label).min(inner.width.saturating_sub(button.column));
-        if width > 0 {
-            hit_map.detail_buttons.push((
-                button.action,
-                Rect::new(
-                    inner.x.saturating_add(button.column),
-                    inner.y.saturating_add(
-                        u16::try_from(button.line_index)
-                            .unwrap_or(metadata_height.saturating_sub(1)),
-                    ),
-                    width,
-                    1,
-                ),
-            ));
+                ));
+            }
         }
     }
 
-    let expanded_wikidata_entity = details
-        .expanded_wikidata_item
-        .as_deref()
-        .and_then(|item_id| {
-            details
-                .wikidata_entities
-                .iter()
-                .find(|entity| entity.item_id == item_id)
-        });
-    let visible_thumbnail_url = details
-        .thumbnail_url
-        .as_ref()
-        .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
-    let visible_local_video = details.local_video_thumbnail.as_ref();
     let mut cursor_y = metadata_area.bottom();
     let mut remaining_height = inner.bottom().saturating_sub(cursor_y);
     if let Some(renderer) = thumbnail_renderer.as_mut() {
-        let text_reserve = if details.thumbnail_expanded {
-            0
-        } else {
-            u16::from(!details.description.is_empty()) + u16::from(!details.links.is_empty())
-        };
-        let preferred_thumbnail_height = if details.source == "Local image" {
-            thumbnail_height.saturating_mul(2)
-        } else {
-            thumbnail_height
-        };
+        let artwork_width = side_rail
+            .as_ref()
+            .map_or(inner.width, |rail| rail.artwork_width);
+        let preferred_thumbnail_height = side_rail.as_ref().map_or_else(
+            || thumbnail_sizing.preferred_height(details, artwork_width, inner.width),
+            |rail| rail.artwork_height,
+        );
         let rendered_thumbnail_height = if details.thumbnail_expanded {
             remaining_height
         } else {
@@ -5501,7 +5659,7 @@ fn render_information_panel(
             && rendered_thumbnail_height >= MIN_THUMBNAIL_HEIGHT
         {
             let available_thumbnail_area =
-                Rect::new(inner.x, cursor_y, inner.width, rendered_thumbnail_height);
+                Rect::new(inner.x, cursor_y, artwork_width, rendered_thumbnail_height);
             if let Some(local_video) = visible_local_video {
                 renderer.synchronize_local_video(local_video, available_thumbnail_area);
             } else {
@@ -5516,7 +5674,7 @@ fn render_information_panel(
             let thumbnail_area = renderer
                 .prepared_artwork_area(available_thumbnail_area)
                 .unwrap_or(available_thumbnail_area);
-            let reserved_thumbnail_height = if details.thumbnail_expanded {
+            let mut reserved_thumbnail_height = if details.thumbnail_expanded {
                 available_thumbnail_area.height
             } else {
                 thumbnail_area.height
@@ -5525,6 +5683,29 @@ fn render_information_panel(
             renderer.render(frame, thumbnail_area, theme);
             if artwork_rendered {
                 hit_map.thumbnail_area = Some(thumbnail_area);
+            }
+            if let Some(rail) = side_rail.as_ref() {
+                let rail_x = inner.right().saturating_sub(rail.width);
+                for (index, button) in rail.buttons.iter().enumerate() {
+                    let row_offset = u16::try_from(index).unwrap_or(u16::MAX).saturating_mul(2);
+                    let button_area =
+                        Rect::new(rail_x, cursor_y.saturating_add(row_offset), rail.width, 1);
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(&button.label, button.style)),
+                        button_area,
+                    );
+                    let width = terminal_text_width(&button.label).min(button_area.width);
+                    if width > 0 {
+                        hit_map.detail_buttons.push((
+                            button.action.clone(),
+                            Rect::new(rail_x, button_area.y, width, 1),
+                        ));
+                    }
+                }
+                // Keep text below both the decoded pixels and the stable rail.
+                // This avoids a layout jump when a panoramic image finishes
+                // loading into fewer rows than its requested artwork block.
+                reserved_thumbnail_height = reserved_thumbnail_height.max(rail.height);
             }
             cursor_y = cursor_y.saturating_add(reserved_thumbnail_height);
             remaining_height = inner.bottom().saturating_sub(cursor_y);
@@ -6210,7 +6391,7 @@ fn render_channel(
         "No channel is selected.",
         InformationPanelKind::Channel,
         false,
-        thumbnail_height,
+        ThumbnailSizing::fixed(thumbnail_height),
         thumbnail_renderer,
     );
 }
@@ -6248,7 +6429,7 @@ fn render_subscription_source_details(
         empty_message,
         kind,
         false,
-        thumbnail_height,
+        ThumbnailSizing::fixed(thumbnail_height),
         thumbnail_renderer,
     );
 }
@@ -16605,6 +16786,340 @@ mod tests {
     }
 
     #[test]
+    fn detail_action_rail_requires_its_complete_spaced_height() {
+        let buttons = (0..8)
+            .map(|line_index| DetailButtonPlacement {
+                line_index,
+                column: 0,
+                label: "[x] Action".to_owned(),
+                style: Style::default(),
+                action: UiAction::SetDetailsFocus(true),
+            })
+            .collect::<Vec<_>>();
+        let details = DetailView {
+            source: "Local audio".to_owned(),
+            ..DetailView::default()
+        };
+        let sizing = ThumbnailSizing::fixed(30);
+
+        assert!(
+            detail_action_rail(&buttons, 120, 14, 0, 0, sizing, &details, true).is_none(),
+            "a wide pane one row short must keep the compact controls above artwork"
+        );
+        let exact_fit = detail_action_rail(&buttons, 120, 15, 0, 0, sizing, &details, true)
+            .expect("the complete 15-row rail should fit");
+        assert_eq!(exact_fit.height, 15);
+    }
+
+    #[test]
+    fn wide_subscription_channel_uses_the_shared_spaced_action_rail() {
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            external_opener_available: true,
+            details: Some(DetailView {
+                title: "Fixture channel".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "Channel description below artwork.".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/channel-action-rail.jpg")
+                        .expect("fixture channel artwork URL"),
+                ),
+                channel_id: "UCfixture".to_owned(),
+                channel_name: "Fixture channel".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                channel_subscriber_count: Some(1_234),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        view.subscriptions.source_title = "Fixture channel".to_owned();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(90, 8)),
+            ..MockThumbnailRenderer::default()
+        };
+        let theme = Theme::new(false);
+
+        terminal
+            .draw(|frame| {
+                render_subscription_source_details(
+                    frame,
+                    Rect::new(0, 0, 140, 30),
+                    &view,
+                    true,
+                    12,
+                    &theme,
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw subscription channel action rail");
+
+        let area_for = |action: &UiAction| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == action).then_some(*area))
+                .unwrap_or_else(|| panic!("missing channel action {action:?}"))
+        };
+        let subscribe_area = area_for(&UiAction::ToggleSubscription);
+        let open_area = area_for(&UiAction::OpenChannelInBrowser);
+        let thumbnail_area = hit_map
+            .thumbnail_area
+            .expect("ready channel artwork hitbox");
+        assert_eq!(subscribe_area.y, thumbnail_area.y);
+        assert_eq!(open_area.y, subscribe_area.y.saturating_add(2));
+        assert!(
+            thumbnail_area.right().saturating_add(2) <= subscribe_area.x
+                && thumbnail_area.right().saturating_add(2) <= open_area.x
+        );
+        assert_eq!(
+            thumbnail_area.y,
+            hit_map.details_panel.y.saturating_add(1),
+            "channel statistics must remain above the shared artwork block"
+        );
+        let buffer = terminal.backend().buffer();
+        let description_y = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("Channel description below artwork.")
+            })
+            .expect("rendered channel description");
+        assert_eq!(
+            description_y,
+            thumbnail_area.bottom().max(open_area.bottom()),
+            "channel description must start below both artwork and its controls"
+        );
+        assert!(rendered_text(&terminal).contains("Subscribers: 1,234"));
+    }
+
+    #[test]
+    fn wide_artwork_places_all_detail_actions_in_a_spaced_right_rail() {
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
+        let view = ViewModel {
+            video_comments_available: true,
+            private_note_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture video".to_owned(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                title: "Fixture video".to_owned(),
+                source: "YouTube".to_owned(),
+                length: "12:34".to_owned(),
+                views: "1,234".to_owned(),
+                likes: "56".to_owned(),
+                comments: "78".to_owned(),
+                description: format!(
+                    "Description starts below the shared artwork block. {}",
+                    "x".repeat(150)
+                ),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/wide-action-rail.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                thumbnail_dimensions: Some((640, 480)),
+                channel_id: "UCfixture".to_owned(),
+                channel_name: "Fixture channel".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(120, 20)),
+            ..MockThumbnailRenderer::default()
+        };
+        let theme = Theme::new(false);
+
+        terminal
+            .draw(|frame| {
+                render_details_with_terminal_window(
+                    frame,
+                    Rect::new(0, 0, 180, 44),
+                    &view,
+                    true,
+                    12,
+                    None,
+                    &theme,
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw wide detail-action rail");
+
+        let thumbnail_area = hit_map.thumbnail_area.expect("ready artwork hitbox");
+        let expected_actions = [
+            UiAction::ToggleTodoPlaylist,
+            UiAction::ToggleTextSelectionMode,
+            UiAction::OpenPlaylistPopup,
+            UiAction::OpenVideoComments,
+            UiAction::EditPrivateNote,
+            UiAction::OpenChannelInBrowser,
+            UiAction::ToggleSubscription,
+            UiAction::OpenInBrowser,
+        ];
+        let mut action_areas = expected_actions
+            .iter()
+            .map(|expected| {
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, area)| (action == expected).then_some(*area))
+                    .unwrap_or_else(|| panic!("missing detail action {expected:?}"))
+            })
+            .collect::<Vec<_>>();
+        action_areas.sort_by_key(|area| area.y);
+
+        assert_eq!(
+            hit_map.detail_buttons.len(),
+            expected_actions.len(),
+            "every visible detail action must participate in the rail"
+        );
+        assert_eq!(
+            thumbnail_area.y,
+            hit_map.details_panel.y.saturating_add(1),
+            "only the statistics row may precede artwork when the selected title is already visible"
+        );
+        assert_eq!(
+            action_areas.first().map(|area| area.y),
+            Some(thumbnail_area.y),
+            "the action rail and artwork must start on the same row"
+        );
+        assert!(
+            action_areas
+                .windows(2)
+                .all(|pair| pair[1].y == pair[0].y.saturating_add(2)),
+            "one empty row must separate every adjacent action"
+        );
+        assert!(
+            action_areas
+                .iter()
+                .all(|area| thumbnail_area.right().saturating_add(2) <= area.x),
+            "every action must retain a two-cell gutter to the right of the artwork"
+        );
+        let expected_labels = [
+            "[l] Add to todo".to_owned(),
+            "[t] Select mode".to_owned(),
+            "[P] Playlist…".to_owned(),
+            "[F6] Twenty comments".to_owned(),
+            "[n] Add private note".to_owned(),
+            format!("[O] {} channel · @fixture", system_url_opener_name()),
+            "[s] Subscribe (locally)".to_owned(),
+            format!("[o] {} video", system_url_opener_name()),
+        ];
+        for ((expected, expected_label), area) in expected_actions
+            .iter()
+            .zip(expected_labels.iter())
+            .zip(action_areas.iter())
+        {
+            let rendered_label = (area.left()..area.right())
+                .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                .collect::<String>();
+            assert_eq!(
+                rendered_label,
+                expected_label.as_str(),
+                "the visible rail label must describe its exact mouse action"
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected.clone()),
+                "the exact visible label must retain its action"
+            );
+        }
+        let spacer = action_areas[0];
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: spacer.x,
+                    row: spacer.y.saturating_add(1),
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetDetailsFocus(true)),
+            "the empty row between labels must not activate either action"
+        );
+        for pair in action_areas.windows(2) {
+            let spacer_y = pair[0].y.saturating_add(1);
+            assert!(
+                (pair[0].x..hit_map.details_panel.right()).all(|x| terminal.backend().buffer()
+                    [(x, spacer_y)]
+                    .symbol()
+                    .chars()
+                    .all(char::is_whitespace)),
+                "the visual spacer row between actions must remain empty"
+            );
+        }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: thumbnail_area.x,
+                    row: thumbnail_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleThumbnailExpansion),
+            "moving controls must preserve the exact artwork expansion target"
+        );
+        let details_row = hit_map
+            .detail_text_rows
+            .iter()
+            .find(|row| {
+                row.cells
+                    .concat()
+                    .contains("Description starts below the shared artwork block.")
+            })
+            .expect("description row");
+        let rail_bottom = action_areas.last().expect("last action").bottom();
+        assert_eq!(
+            details_row.y,
+            thumbnail_area.bottom().max(rail_bottom),
+            "the description must reclaim the full pane below artwork and controls"
+        );
+        assert_eq!(
+            details_row.x, hit_map.details_panel.x,
+            "description text must reclaim the pane's left edge"
+        );
+        assert!(
+            u16::try_from(details_row.cells.len()).unwrap_or(u16::MAX) > thumbnail_area.width,
+            "description wrapping must reclaim more width than the artwork column"
+        );
+    }
+
+    #[test]
     fn narrow_detail_actions_preserve_order_after_pairing_stops() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
         let view = ViewModel {
@@ -16673,6 +17188,89 @@ mod tests {
             "[s] Subscribe (locally)",
         ] {
             assert!(rendered.contains(label), "missing rendered label {label:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_artwork_keeps_all_actions_above_a_full_width_thumbnail() {
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
+        let view = ViewModel {
+            video_comments_available: true,
+            private_note_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture video".to_owned(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                title: "Fixture video".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "Narrow fallback description.".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://images.example/narrow-fallback.jpg")
+                        .expect("fixture thumbnail URL"),
+                ),
+                thumbnail_dimensions: Some((640, 480)),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture")
+                        .expect("fixture channel URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 44)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(80, 20)),
+            ..MockThumbnailRenderer::default()
+        };
+        let theme = Theme::new(false);
+
+        terminal
+            .draw(|frame| {
+                render_details_with_terminal_window(
+                    frame,
+                    Rect::new(0, 0, 80, 44),
+                    &view,
+                    true,
+                    12,
+                    None,
+                    &theme,
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw narrow artwork fallback");
+
+        let [(_, requested_thumbnail)] = thumbnails.synchronized.as_slice() else {
+            panic!("expected one synchronized thumbnail");
+        };
+        assert_eq!(requested_thumbnail.x, hit_map.details_panel.x);
+        assert_eq!(requested_thumbnail.width, hit_map.details_panel.width);
+        for expected in [
+            UiAction::ToggleTextSelectionMode,
+            UiAction::OpenVideoComments,
+            UiAction::OpenChannelInBrowser,
+            UiAction::OpenInBrowser,
+            UiAction::ToggleTodoPlaylist,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
+            UiAction::ToggleSubscription,
+        ] {
+            let (_, area) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .unwrap_or_else(|| panic!("missing narrow fallback action {expected:?}"));
+            assert!(
+                area.bottom() <= requested_thumbnail.y,
+                "{expected:?} must remain above full-width artwork"
+            );
         }
     }
 
