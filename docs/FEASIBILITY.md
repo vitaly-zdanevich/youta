@@ -238,7 +238,7 @@ metadata worker.
 | Odysee | Public API/extractor options | Separate adapter is plausible after terms and fixtures are reviewed. |
 | Rumble | Public pages/extractor | Experimental; expect breakage. |
 | Bilibili | API/extractor with regional/auth variation | Separate build flag and fixture tests. |
-| Yandex Music/podcasts | Token-based unofficial ecosystem | Experimental; user-supplied token, no bundled credentials. |
+| Yandex Music/podcasts | Private token-based client API | Experimental first-class adapter with a user-supplied OAuth access token and no bundled credentials. Music and podcast catalogue shapes are supported. Audiobook search is a potentially empty, exact-metadata filter over generic results because the inspected Music clients expose no stable first-class audiobook search/playback contract. |
 | VK audio/video | Restricted and account-sensitive APIs | Defer until a documented lawful API route and scopes are verified. |
 | knizhnyvoz.com | Site-specific scraping | Defer; author navigation is feasible but brittle and needs permission/robots review. |
 | 4duk.ru | Public MP3 live stream plus bounded current-track JSON | Implemented in the static Radio catalogue. Keep its published HTTP stream/metadata warning visible, send no credentials, retry passive metadata with capped backoff, and do not infer an open-content licence. |

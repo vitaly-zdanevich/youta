@@ -21,6 +21,7 @@ use std::sync::Mutex;
     feature = "apple-podcasts",
     feature = "bandcamp",
     feature = "rss",
+    feature = "yandex-music",
     feature = "youtube-music"
 ))]
 use std::sync::atomic::AtomicBool;
@@ -35,9 +36,12 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
     feature = "apple-podcasts",
     feature = "rss",
     feature = "waveform",
+    feature = "yandex-music",
     feature = "yt-dlp"
 ))]
 use crossbeam_channel::{TrySendError, bounded};
+#[cfg(feature = "yandex-music")]
+use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(feature = "acoustid")]
@@ -63,6 +67,8 @@ use crate::domain::{
     PlaylistMediaSnapshot, PlaylistSummary, PodcastShowSummary, QueueItem, Screen as StoredScreen,
     SessionState, SourceKind, TODO_PLAYLIST_ID, decode_url_path_segment_once,
 };
+#[cfg(feature = "yandex-music")]
+use crate::domain::{PendingYandexMusicReaction, YandexMusicReaction};
 use crate::links::{
     LinkTarget, is_advertisement_chapter_title, normalize_description_chapter_lines,
     parse_description_chapters, parse_description_links, parse_description_video_links,
@@ -110,6 +116,8 @@ use crate::playback::{
 };
 #[cfg(test)]
 use crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES;
+#[cfg(feature = "rss")]
+use crate::providers::PodcastEpisodeSummary;
 #[cfg(feature = "apple-podcasts")]
 use crate::providers::apple_podcasts::{
     ApplePodcastEpisodeMetadata, ApplePodcastMetadata, ApplePodcastsResolver,
@@ -142,23 +150,32 @@ use crate::providers::radio_wikidata::wikidata_item_ids_for_station;
 use crate::providers::rss::{
     PodcastEpisode, PodcastFeed, RssPodcastProvider, podcast_episode_external_id,
 };
+#[cfg(feature = "yandex-music")]
+use crate::providers::yandex_music::{
+    DEFAULT_MY_WAVE_RECOMMENDATIONS, YandexMusicAccount, YandexMusicAlbum, YandexMusicAlbumSummary,
+    YandexMusicArtistPage, YandexMusicArtworkSize, YandexMusicClient, YandexMusicContentKind,
+    YandexMusicMedia, YandexMusicRecommendationBatch, YandexMusicSearchItem, YandexMusicSearchPage,
+    YandexMusicSearchScope, YandexMusicTrack,
+};
+#[cfg(feature = "yandex-music")]
+use crate::providers::yandex_music_media::{YandexMusicDownloadProgress, YandexMusicMediaFetcher};
 #[cfg(feature = "youtube-music")]
 use crate::providers::youtube_music::{
     YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
 };
 use crate::providers::{
     ChannelDetails, ChannelExternalLinkKind, ChannelStatisticsMode, ChannelSubscriberCount,
-    ChannelSummary, ChannelVideosRequest, MAX_VIDEO_COMMENTS, PodcastEpisodeSummary, Provider,
-    SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort as ProviderSearchSort,
-    SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
-    invidious_youtube_provider, official_youtube_provider, validate_youtube_video_id,
+    ChannelSummary, ChannelVideosRequest, MAX_VIDEO_COMMENTS, Provider, SearchFeature, SearchItem,
+    SearchPage, SearchRequest, SearchSort as ProviderSearchSort, SearchTarget, Thumbnail,
+    VideoComment, VideoDetails, VideoOrientation, VideoSummary, invidious_youtube_provider,
+    official_youtube_provider, validate_youtube_video_id,
 };
 use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
 use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
 use crate::tui::DetailLinkView;
-#[cfg(feature = "yt-dlp")]
+#[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
 use crate::tui::DownloadView;
 #[cfg(feature = "local-move")]
 use crate::tui::LocalMoveDestinationView;
@@ -166,6 +183,8 @@ use crate::tui::LocalMoveDestinationView;
 use crate::tui::RadioRecordingView;
 #[cfg(feature = "radio")]
 use crate::tui::RadioSort;
+#[cfg(feature = "yandex-music")]
+use crate::tui::{DetailLinkInternalTarget, DetailLinkPresentation};
 use crate::tui::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
     DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
@@ -175,11 +194,17 @@ use crate::tui::{
     PrivateNotePopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
     SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
     VideoCommentView, VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
-    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
+    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
+    YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::tui::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
+};
+#[cfg(feature = "yandex-music")]
+use crate::tui::{
+    YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
+    YandexMusicSetupPopupView,
 };
 
 /// Truncates a clipboard payload without splitting a UTF-8 character.
@@ -214,6 +239,55 @@ const GPM_UNAVAILABLE_OPENRC_STATUS: &str =
 const GPM_NOT_COMPILED_STATUS: &str =
     "This Youta build has no GPM support. F8 keyboard pointer remains active.";
 const GPM_NOTICE_DURATION: Duration = Duration::from_secs(6);
+
+/// Minimum attached terminal window that uses Yandex's 800×800 panel artwork.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_LARGE_ARTWORK_MIN_PIXELS: (u16, u16) = (1_920, 1_200);
+
+/// Minimum attached terminal window that uses Yandex's 1000×1000 panel artwork.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_4K_ARTWORK_MIN_PIXELS: (u16, u16) = (3_840, 2_160);
+
+/// Chooses a Yandex panel preset from the attached terminal window itself.
+#[cfg(feature = "yandex-music")]
+const fn yandex_music_artwork_size_for_terminal(
+    width: Option<u16>,
+    height: Option<u16>,
+) -> YandexMusicArtworkSize {
+    match (width, height) {
+        (Some(width), Some(height))
+            if width >= YANDEX_MUSIC_4K_ARTWORK_MIN_PIXELS.0
+                && height >= YANDEX_MUSIC_4K_ARTWORK_MIN_PIXELS.1 =>
+        {
+            YandexMusicArtworkSize::FourK
+        }
+        (Some(width), Some(height))
+            if width >= YANDEX_MUSIC_LARGE_ARTWORK_MIN_PIXELS.0
+                && height >= YANDEX_MUSIC_LARGE_ARTWORK_MIN_PIXELS.1 =>
+        {
+            YandexMusicArtworkSize::Large
+        }
+        _ => YandexMusicArtworkSize::Standard,
+    }
+}
+
+/// Adds bootstrap guidance only when the retained error identifies its cause.
+///
+/// A transport-level `401` precisely identifies rejected credentials. Other
+/// failures must not tell the listener to replace a working private token.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_bootstrap_failure_message(error: &str) -> String {
+    let guidance = match error {
+        "provider returned HTTP status 401" => {
+            "Replace an expired OAuth token in the private credentials file."
+        }
+        "provider returned HTTP status 429" => {
+            "Yandex Music rate-limited this request. Keep the saved OAuth token and try again later."
+        }
+        _ => return error.to_owned(),
+    };
+    format!("{error}\n\n{guidance}")
+}
 
 /// Chooses a truthful physical-console pointer notice for this binary.
 ///
@@ -512,6 +586,8 @@ pub enum SearchRoute {
     YouTube,
     /// The music tab queries `music.youtube.com` through the installed `yt-dlp`.
     YouTubeMusic,
+    /// The Yandex Music tab queries the authenticated private catalogue.
+    YandexMusic,
     /// The Bandcamp tab queries public track and album search pages.
     Bandcamp,
     /// The podcast tab queries Apple's public, storefront-specific catalogue.
@@ -520,6 +596,165 @@ pub enum SearchRoute {
     TrackerArchives,
     /// The screen does not perform remote search.
     None,
+}
+
+/// Current level inside the authenticated Yandex Music tab.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum YandexMusicRoute {
+    /// The account's default My Wave recommendations.
+    #[default]
+    Recommendations,
+    /// One explicit catalogue search page.
+    Search,
+    /// Tracks belonging to one explicitly opened album.
+    Album,
+    /// Popular tracks and albums belonging to one exact artist identity.
+    Artist,
+}
+
+#[cfg(feature = "yandex-music")]
+impl YandexMusicRoute {
+    /// Projects controller navigation into the immutable terminal view.
+    const fn view(self) -> YandexMusicRouteView {
+        match self {
+            Self::Recommendations => YandexMusicRouteView::Recommendations,
+            Self::Search => YandexMusicRouteView::Search,
+            Self::Album => YandexMusicRouteView::Album,
+            Self::Artist => YandexMusicRouteView::Artist,
+        }
+    }
+}
+
+/// One row in the current Yandex Music list, with provider identity intact.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug)]
+enum YandexMusicRow {
+    /// A playable track, podcast episode, or audiobook chapter.
+    Track(Box<YandexMusicTrack>),
+    /// An album, podcast show, or audiobook container.
+    Album(Box<YandexMusicAlbumSummary>),
+}
+
+/// One bounded in-tab location restored by Esc after opening an artist or album.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug)]
+struct YandexMusicNavigationSnapshot {
+    /// List route represented by the retained rows.
+    route: YandexMusicRoute,
+    /// Exact provider rows in their current order.
+    rows: Vec<YandexMusicRow>,
+    /// Selected row restored within the retained list.
+    selected: usize,
+    /// Loaded album metadata required by album-download actions.
+    album: Option<YandexMusicAlbum>,
+    /// Exact artist identity when the retained route is an artist page.
+    artist_id: Option<String>,
+}
+
+/// Work isolated from the terminal event loop and other source providers.
+#[cfg(feature = "yandex-music")]
+enum YandexMusicWorkerRequest {
+    /// Validate a candidate OAuth token and load its recommendations.
+    ConfigureAndBootstrap { generation: u64, token: String },
+    /// Adopt one candidate only after its validated credential is durable.
+    AdoptToken { token: String },
+    /// Load recommendations using the already configured client.
+    Bootstrap { generation: u64 },
+    /// Continue one retained My Wave session after its last track starts.
+    ContinueMyWave {
+        generation: u64,
+        session_id: String,
+        boundary_track_id: String,
+        queue: Vec<String>,
+    },
+    /// Search one exact content category.
+    Search {
+        generation: u64,
+        query: String,
+        scope: YandexMusicSearchScope,
+    },
+    /// Load one complete album.
+    Album { generation: u64, album_id: String },
+    /// Load one exact artist's popular tracks and albums.
+    Artist { generation: u64, artist_id: String },
+    /// Resolve one short-lived highest-quality media URL.
+    Resolve {
+        generation: u64,
+        track: Box<YandexMusicTrack>,
+    },
+}
+
+/// Commands accepted by the sole serialized Yandex Music reaction lane.
+#[cfg(feature = "yandex-music")]
+enum YandexMusicReactionWorkerRequest {
+    /// Synchronize one durable desired-state revision.
+    Synchronize(PendingYandexMusicReaction),
+    /// Adopt a validated token only after private credential persistence.
+    AdoptToken(String),
+    /// Finish queued coalesced work and stop the dispatcher.
+    Shutdown,
+}
+
+/// Playback context retained while an authenticated Yandex URL is resolved.
+#[cfg(feature = "yandex-music")]
+struct PendingYandexMusicPlayback {
+    /// Request generation used to ignore stale provider and media completions.
+    generation: u64,
+    /// Stable track identity expected in the response.
+    track_id: String,
+    /// Credential-free queue metadata persisted by normal playback handling.
+    item: QueueItem,
+    /// Whether an existing queue cursor already owns this activation.
+    queue_cursor_already_positioned: bool,
+    /// Same-source autoplay continuation, when enabled.
+    origin: Option<AutoplayOrigin>,
+}
+
+/// One playback-triggered My Wave continuation awaiting its provider response.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingYandexMusicContinuation {
+    /// Independent owner that is not invalidated by media-resolution requests.
+    generation: u64,
+    /// Session expected to own the continuation response.
+    session_id: String,
+    /// Last visible track whose confirmed playback triggered the request.
+    boundary_track_id: String,
+}
+
+/// One original-quality track requested by a Yandex batch download.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone)]
+struct YandexMusicDownloadItem {
+    /// Provider metadata required for fresh highest-quality resolution.
+    track: YandexMusicTrack,
+    /// Human-readable filename stem before collision handling.
+    file_stem: String,
+}
+
+/// Completion messages from media fetches that must not block terminal input.
+#[cfg(feature = "yandex-music")]
+enum YandexMusicMediaJobResponse {
+    /// A decrypted temporary file is ready for mpv.
+    Playback {
+        generation: u64,
+        track_id: String,
+        result: Result<PathBuf, String>,
+    },
+    /// Byte progress for one file in an album/recommendation batch.
+    DownloadProgress {
+        generation: u64,
+        title: String,
+        progress: YandexMusicDownloadProgress,
+    },
+    /// Every requested item was attempted.
+    DownloadFinished {
+        generation: u64,
+        batch_title: String,
+        completed_paths: Vec<PathBuf>,
+        failures: Vec<String>,
+    },
 }
 
 /// Current level inside the independent Apple Podcasts tab.
@@ -1308,7 +1543,7 @@ fn classify_known_host(host: &str, path: &str) -> SourceKind {
         SourceKind::LibriVox
     } else if host == "commons.wikimedia.org" {
         SourceKind::WikimediaCommons
-    } else if host_matches(host, "music.yandex.ru") {
+    } else if host_matches(host, "music.yandex.ru") || host_matches(host, "music.yandex.com") {
         SourceKind::YandexMusic
     } else if host_matches(host, "bbc.co.uk") || host_matches(host, "bbc.com") {
         SourceKind::BbcRadio
@@ -1325,6 +1560,26 @@ fn classify_known_host(host: &str, path: &str) -> SourceKind {
     } else {
         SourceKind::GenericYtDlp
     }
+}
+
+/// Extracts a bounded numeric album identity from a canonical Yandex Music URL.
+fn yandex_music_album_id_from_url(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !host_matches(&host, "music.yandex.ru") && !host_matches(&host, "music.yandex.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "album" {
+        return None;
+    }
+    let album_id = segments.next()?;
+    if album_id.is_empty()
+        || album_id.len() > 64
+        || !album_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(album_id.to_owned())
 }
 
 fn is_supported_media_path(path: &str) -> bool {
@@ -1585,6 +1840,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
     match screen {
         Screen::Search => SearchRoute::YouTube,
         Screen::YouTubeMusic => SearchRoute::YouTubeMusic,
+        Screen::YandexMusic => SearchRoute::YandexMusic,
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
@@ -1887,6 +2143,44 @@ enum ProviderResponse {
         generation: u64,
         query: String,
         result: Result<Vec<YouTubeMusicTrack>, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicBootstrap {
+        generation: u64,
+        result: Result<(YandexMusicAccount, YandexMusicRecommendationBatch), String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicContinuation {
+        generation: u64,
+        session_id: String,
+        boundary_track_id: String,
+        result: Result<YandexMusicRecommendationBatch, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicSearch {
+        generation: u64,
+        result: Result<YandexMusicSearchPage, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicAlbum {
+        generation: u64,
+        result: Result<YandexMusicAlbum, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicArtist {
+        generation: u64,
+        result: Result<YandexMusicArtistPage, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicResolved {
+        generation: u64,
+        track: YandexMusicTrack,
+        result: Result<YandexMusicMedia, String>,
+    },
+    #[cfg(feature = "yandex-music")]
+    YandexMusicReaction {
+        pending: PendingYandexMusicReaction,
+        result: Result<(), String>,
     },
     #[cfg(feature = "bandcamp")]
     BandcampSearch {
@@ -2374,6 +2668,12 @@ enum AutoplayOrigin {
         generation: u64,
         index: usize,
     },
+    #[cfg(feature = "yandex-music")]
+    YandexMusic {
+        /// Credential-free tracks captured from the activated provider list.
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
     Subscription {
         channel_id: String,
         index: usize,
@@ -2649,6 +2949,30 @@ struct ScheduledChannelWikidata {
     due_at: Instant,
 }
 
+/// Exact Yandex Music identities deferred until list navigation settles.
+#[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+#[derive(Clone, Debug)]
+struct ScheduledYandexMusicWikidata {
+    /// Lookup generation that owns every queued identity.
+    generation: u64,
+    /// Missing exact identities, retained in deterministic presentation order.
+    lookups: VecDeque<(crate::providers::wikidata::WikidataExternalKind, String)>,
+    /// Earliest instant at which the first background request may start.
+    due_at: Instant,
+}
+
+/// One Yandex Music identity currently owned by the shared provider worker.
+#[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingYandexMusicWikidata {
+    /// Lookup generation that owns the response.
+    generation: u64,
+    /// Exact Wikidata external-ID property.
+    property_id: &'static str,
+    /// Exact provider identifier queried through that property.
+    external_id: String,
+}
+
 #[cfg(feature = "yt-dlp")]
 const YOUTUBE_PREWARM_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Remaining playback window in which one guaranteed next `YouTube` item may
@@ -2791,6 +3115,9 @@ struct CachedRssFeedInfo {
 
 /// Maximum number of internal Details pages retained in either direction.
 const MAX_DETAIL_NAVIGATION_HISTORY: usize = 16;
+/// Maximum nested Yandex Music artist/album locations retained for Esc.
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_NAVIGATION_HISTORY: usize = 16;
 /// Maximum expanded Wikidata entities retained in process memory.
 #[cfg(feature = "wikidata")]
 const MAX_CACHED_WIKIDATA_ENTITIES: usize = 8;
@@ -2974,6 +3301,103 @@ pub struct AppController {
     youtube_music_search_query: String,
     /// Selected `YouTube Music` row retained while another tab is visible.
     youtube_music_selected: usize,
+    /// Query retained independently for the authenticated Yandex Music tab.
+    ///
+    /// Minimal builds retain this value so opening and closing them cannot
+    /// erase state written by a build that includes Yandex Music.
+    yandex_music_search_query: String,
+    /// Selected Yandex Music row retained while another tab is visible.
+    ///
+    /// This remains present without the provider feature for lossless session
+    /// round-tripping across differently configured builds.
+    yandex_music_selected: usize,
+    /// Current recommendations, search results, or opened-album tracks.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_rows: Vec<YandexMusicRow>,
+    /// Navigation level represented by [`Self::yandex_music_rows`].
+    #[cfg(feature = "yandex-music")]
+    yandex_music_route: YandexMusicRoute,
+    /// Album owning the current rows when inside an album.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_album: Option<YandexMusicAlbum>,
+    /// Exact artist identity owning the current artist route.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_artist_id: Option<String>,
+    /// Bounded in-tab artist/album locations restored by Esc.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_navigation_back: VecDeque<YandexMusicNavigationSnapshot>,
+    /// Account validated for the configured OAuth token.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_account: Option<YandexMusicAccount>,
+    /// Candidate OAuth token retained only until remote account validation.
+    #[cfg(feature = "yandex-music")]
+    pending_yandex_music_token: Option<(u64, String)>,
+    /// Bounded My Wave batches retained for playback and the twenty-track download action.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_recommendations: Option<YandexMusicRecommendationBatch>,
+    /// Independent owner for a playback-triggered My Wave continuation.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_continuation_generation: u64,
+    /// At most one My Wave continuation may be in flight.
+    #[cfg(feature = "yandex-music")]
+    pending_yandex_music_continuation: Option<PendingYandexMusicContinuation>,
+    /// Boundary already queried successfully or without yielding a new track.
+    #[cfg(feature = "yandex-music")]
+    last_yandex_music_continuation_boundary: Option<String>,
+    /// Monotonic owner for catalogue and media completions.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_generation: u64,
+    /// Queue activation waiting for the highest-quality resolver or decryptor.
+    #[cfg(feature = "yandex-music")]
+    pending_yandex_music_playback: Option<PendingYandexMusicPlayback>,
+    /// Dedicated authenticated-provider requests.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_requests: Option<Sender<YandexMusicWorkerRequest>>,
+    /// Cooperative stop signal checked before the provider accepts more work.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_stopping: Arc<AtomicBool>,
+    /// Dedicated authenticated-provider thread.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_thread: Option<JoinHandle<()>>,
+    /// Sole request path for foreground and lifecycle reaction mutations.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reaction_requests: Option<Sender<YandexMusicReactionWorkerRequest>>,
+    /// Receiver clone used only to replace one full queued revision for the same key.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reaction_request_drain: Receiver<YandexMusicReactionWorkerRequest>,
+    /// Cooperative stop signal for the serialized reaction dispatcher.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reaction_stopping: Arc<AtomicBool>,
+    /// Sole serialized Yandex Music reaction dispatcher.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reaction_thread: Option<JoinHandle<()>>,
+    /// Media preparation and batch-download completions.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_media_job_responses: Receiver<YandexMusicMediaJobResponse>,
+    /// Sender cloned only into bounded-lifetime media workers.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_media_job_sender: Sender<YandexMusicMediaJobResponse>,
+    /// Sole encrypted playback preparation worker.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_playback_thread: Option<JoinHandle<()>>,
+    /// Cancellation flag observed between encrypted playback chunks.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_playback_cancel: Option<Arc<AtomicBool>>,
+    /// Superseded preparations retained until they can be joined safely.
+    #[cfg(feature = "yandex-music")]
+    retired_yandex_music_playback_threads: Vec<JoinHandle<()>>,
+    /// Sole album or recommendation download worker.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_download_thread: Option<JoinHandle<()>>,
+    /// Cancellation flag observed between Yandex Music batch-download chunks.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_download_cancel: Option<Arc<AtomicBool>>,
+    /// Generation identifying the currently visible batch download.
+    #[cfg(feature = "yandex-music")]
+    yandex_music_download_generation: u64,
+    /// Test-only observer for the exact batch assembled by controller actions.
+    #[cfg(all(test, feature = "yandex-music"))]
+    yandex_music_download_batch_capture: Option<Sender<(String, Vec<YandexMusicDownloadItem>)>>,
     /// Query retained independently for the Bandcamp tab.
     #[cfg(feature = "bandcamp")]
     bandcamp_search_query: String,
@@ -2998,6 +3422,9 @@ pub struct AppController {
     youtube_music_results: Vec<SearchItem>,
     /// Current terminal-window width used only by automatic thumbnail sizing.
     terminal_window_width_pixels: Option<u16>,
+    /// Current terminal-window height used by adaptive Yandex artwork sizing.
+    #[cfg(feature = "yandex-music")]
+    terminal_window_height_pixels: Option<u16>,
     /// Query retained independently for the `Apple Podcasts` tab.
     apple_podcasts_search_query: String,
     /// Lowercase storefront owning the retained Apple show results.
@@ -3325,6 +3752,12 @@ pub struct AppController {
     /// Debounced Wikidata lookup for the stable subscription source.
     #[cfg(feature = "wikidata")]
     scheduled_channel_wikidata: Option<ScheduledChannelWikidata>,
+    /// Debounced exact-ID enrichment for the stable Yandex Music selection.
+    #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+    scheduled_yandex_music_wikidata: Option<ScheduledYandexMusicWikidata>,
+    /// Sole Yandex Music Wikidata request allowed in the shared worker queue.
+    #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+    pending_yandex_music_wikidata: Option<PendingYandexMusicWikidata>,
     search_generation: u64,
     details_generation: u64,
     #[cfg(feature = "wikidata")]
@@ -3479,6 +3912,19 @@ impl AppController {
         };
         let (response_sender, provider_responses) = unbounded();
         let (request_sender, request_receiver) = unbounded();
+        #[cfg(feature = "yandex-music")]
+        let (yandex_music_request_sender, yandex_music_request_receiver) = bounded(1);
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_stopping = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "yandex-music")]
+        let (yandex_music_reaction_request_sender, yandex_music_reaction_request_receiver) =
+            bounded(YANDEX_MUSIC_REACTION_QUEUE_CAPACITY);
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_request_drain = yandex_music_reaction_request_receiver.clone();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_stopping = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "yandex-music")]
+        let (yandex_music_media_job_sender, yandex_music_media_job_responses) = unbounded();
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
@@ -3511,6 +3957,59 @@ impl AppController {
                 executable: config.providers.yt_dlp_executable.clone(),
                 ..YouTubeMusicSearchConfig::default()
             }));
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_initial_token = config.providers.yandex_music_token.clone();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_initial_token = yandex_music_initial_token.clone();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_response_sender = response_sender.clone();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_worker_stopping = Arc::clone(&yandex_music_stopping);
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_thread_result = thread::Builder::new()
+            .name("youta-yandex-music".to_owned())
+            .spawn(move || {
+                yandex_music_provider_worker(
+                    yandex_music_request_receiver,
+                    yandex_music_response_sender,
+                    yandex_music_initial_token,
+                    yandex_music_worker_stopping,
+                );
+            });
+        #[cfg(feature = "yandex-music")]
+        let (yandex_music_thread, yandex_music_thread_error) = match yandex_music_thread_result {
+            Ok(handle) => (Some(handle), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_requests = yandex_music_thread
+            .as_ref()
+            .map(|_| yandex_music_request_sender);
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_response_sender = response_sender.clone();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_worker_stopping = Arc::clone(&yandex_music_reaction_stopping);
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_thread_result = thread::Builder::new()
+            .name("youta-yandex-reactions".to_owned())
+            .spawn(move || {
+                yandex_music_reaction_dispatcher_worker(
+                    yandex_music_reaction_request_receiver,
+                    yandex_music_reaction_response_sender,
+                    SystemYandexMusicReactionSynchronizer::new(yandex_music_reaction_initial_token),
+                    yandex_music_reaction_worker_stopping,
+                );
+            });
+        #[cfg(feature = "yandex-music")]
+        let (yandex_music_reaction_thread, yandex_music_reaction_thread_error) =
+            match yandex_music_reaction_thread_result {
+                Ok(handle) => (Some(handle), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_reaction_requests = yandex_music_reaction_thread
+            .as_ref()
+            .map(|_| yandex_music_reaction_request_sender);
         let provider_storage_root = config.config_dir().to_owned();
         let provider_thread_result = thread::Builder::new()
             .name("youta-provider-worker".to_owned())
@@ -3633,6 +4132,8 @@ impl AppController {
             local_path: saved.local_path.clone().unwrap_or_default(),
             search_query: match saved.screen {
                 StoredScreen::YouTubeMusic => saved.youtube_music_search_text.clone(),
+                #[cfg(feature = "yandex-music")]
+                StoredScreen::YandexMusic => saved.yandex_music_search_text.clone(),
                 #[cfg(feature = "bandcamp")]
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
@@ -3740,6 +4241,14 @@ impl AppController {
         }
         let youtube_music_selected = saved.youtube_music_selected_row.unwrap_or_else(|| {
             if view.screen == Screen::YouTubeMusic {
+                view.selected
+            } else {
+                0
+            }
+        });
+        let yandex_music_search_query = saved.yandex_music_search_text.clone();
+        let yandex_music_selected = saved.yandex_music_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::YandexMusic {
                 view.selected
             } else {
                 0
@@ -3868,6 +4377,66 @@ impl AppController {
             youtube_selected,
             youtube_music_search_query,
             youtube_music_selected,
+            yandex_music_search_query,
+            yandex_music_selected,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_rows: Vec::new(),
+            #[cfg(feature = "yandex-music")]
+            yandex_music_route: YandexMusicRoute::Recommendations,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_album: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_artist_id: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_navigation_back: VecDeque::new(),
+            #[cfg(feature = "yandex-music")]
+            yandex_music_account: None,
+            #[cfg(feature = "yandex-music")]
+            pending_yandex_music_token: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_recommendations: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_continuation_generation: 0,
+            #[cfg(feature = "yandex-music")]
+            pending_yandex_music_continuation: None,
+            #[cfg(feature = "yandex-music")]
+            last_yandex_music_continuation_boundary: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_generation: 0,
+            #[cfg(feature = "yandex-music")]
+            pending_yandex_music_playback: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_requests,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_stopping,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_thread,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reaction_requests,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reaction_request_drain,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reaction_stopping,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reaction_thread,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_media_job_responses,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_media_job_sender,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_playback_thread: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_playback_cancel: None,
+            #[cfg(feature = "yandex-music")]
+            retired_yandex_music_playback_threads: Vec::new(),
+            #[cfg(feature = "yandex-music")]
+            yandex_music_download_thread: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_download_cancel: None,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_download_generation: 0,
+            #[cfg(all(test, feature = "yandex-music"))]
+            yandex_music_download_batch_capture: None,
             #[cfg(feature = "bandcamp")]
             bandcamp_search_query,
             #[cfg(feature = "bandcamp")]
@@ -3883,6 +4452,8 @@ impl AppController {
             youtube_results,
             youtube_music_results,
             terminal_window_width_pixels: None,
+            #[cfg(feature = "yandex-music")]
+            terminal_window_height_pixels: None,
             apple_podcasts_search_query,
             #[cfg(feature = "apple-podcasts")]
             apple_podcasts_storefront,
@@ -4087,6 +4658,10 @@ impl AppController {
             scheduled_channel_details: None,
             #[cfg(feature = "wikidata")]
             scheduled_channel_wikidata: None,
+            #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+            scheduled_yandex_music_wikidata: None,
+            #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+            pending_yandex_music_wikidata: None,
             search_generation: 0,
             details_generation: 0,
             #[cfg(feature = "wikidata")]
@@ -4262,6 +4837,15 @@ impl AppController {
         if let Some(error) = provider_thread_error {
             controller.show_error("Could not start the provider worker", &error);
         }
+        #[cfg(feature = "yandex-music")]
+        if let Some(error) = yandex_music_thread_error {
+            controller.show_error_message("Could not start the Yandex Music worker", error);
+        }
+        #[cfg(feature = "yandex-music")]
+        if let Some(error) = yandex_music_reaction_thread_error {
+            controller
+                .show_error_message("Could not start the Yandex Music reaction worker", error);
+        }
         if let Some(error) = local_browse_thread_error {
             controller.show_error("Could not start the Local browser worker", &error);
         }
@@ -4303,6 +4887,14 @@ impl AppController {
             }
         }
         controller.refresh_selected_playlist_state();
+        #[cfg(feature = "yandex-music")]
+        if controller.view.screen == Screen::YandexMusic {
+            // My Wave uses the foreground provider lane. Queue it before
+            // launching the independent bounded offline-reaction retry pass.
+            controller.open_yandex_music_home();
+        }
+        #[cfg(feature = "yandex-music")]
+        controller.retry_pending_yandex_music_reactions();
         controller
     }
 
@@ -4476,6 +5068,53 @@ impl AppController {
         };
         let mut cursor = value.len();
         if delete_previous_editor_word(value, &mut cursor) {
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn append_yandex_music_token_character(&mut self, character: char) {
+        if character.is_control() {
+            return;
+        }
+        let Some(popup) = self.view.yandex_music_setup_popup.as_mut() else {
+            return;
+        };
+        if popup.validating {
+            return;
+        }
+        if popup
+            .token
+            .len()
+            .checked_add(character.len_utf8())
+            .is_some_and(|length| length <= 8 * 1024)
+        {
+            popup.token.push(character);
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn delete_yandex_music_token_character(&mut self) {
+        if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+            if popup.validating {
+                return;
+            }
+            popup.token.pop();
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn delete_yandex_music_token_word(&mut self) {
+        let Some(popup) = self.view.yandex_music_setup_popup.as_mut() else {
+            return;
+        };
+        if popup.validating {
+            return;
+        }
+        let mut cursor = popup.token.len();
+        if delete_previous_editor_word(&mut popup.token, &mut cursor) {
             popup.validation_error = None;
         }
     }
@@ -4721,6 +5360,22 @@ impl AppController {
             SearchRoute::YouTubeMusic => match parse_direct_youtube_input(&query) {
                 Ok(Some(direct)) => self.open_direct_youtube_music(direct),
                 Ok(None) => self.submit_youtube_music_search(query),
+                Err(error) => self.view.status_line = error.to_owned(),
+            },
+            SearchRoute::YandexMusic => match parse_direct_source_input(&query) {
+                Ok(Some(direct)) if direct.source == SourceKind::YandexMusic => {
+                    if let Some(album_id) = yandex_music_album_id_from_url(&direct.url) {
+                        self.open_yandex_music_album(album_id);
+                    } else {
+                        self.view.status_line =
+                            "Enter a canonical Yandex Music album URL or search text".to_owned();
+                    }
+                }
+                Ok(Some(_)) => {
+                    self.view.status_line =
+                        "Enter a canonical Yandex Music album URL or search text".to_owned();
+                }
+                Ok(None) => self.submit_yandex_music_search(query),
                 Err(error) => self.view.status_line = error.to_owned(),
             },
             SearchRoute::Bandcamp => match parse_direct_source_input(&query) {
@@ -5080,6 +5735,1514 @@ impl AppController {
     fn submit_youtube_music_search(&mut self, _query: String) {
         self.view.status_line =
             "This build omits the `youtube-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn send_yandex_music_request(
+        &mut self,
+        request: YandexMusicWorkerRequest,
+        operation: &str,
+    ) -> bool {
+        let Some(sender) = self.yandex_music_requests.as_ref() else {
+            self.show_error_message(
+                operation,
+                "the Yandex Music worker is unavailable; it may have failed during startup",
+            );
+            return false;
+        };
+        match sender.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.view.status_line =
+                    "Yandex Music is finishing the previous request; try again in a moment"
+                        .to_owned();
+                return false;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.show_error_message(
+                    operation,
+                    "the Yandex Music worker stopped before accepting the request",
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Sends one command through the sole serialized reaction dispatcher.
+    #[cfg(feature = "yandex-music")]
+    fn send_yandex_music_reaction_request(
+        &mut self,
+        request: YandexMusicReactionWorkerRequest,
+        operation: &str,
+    ) -> bool {
+        let Some(sender) = self.yandex_music_reaction_requests.as_ref() else {
+            self.show_error_message(
+                operation,
+                "the Yandex Music reaction worker is unavailable; the durable intent will be retried later",
+            );
+            return false;
+        };
+        match sender.try_send(request) {
+            Ok(()) => true,
+            Err(TrySendError::Full(request)) => {
+                let queued = match self.yandex_music_reaction_request_drain.try_recv() {
+                    Ok(queued) => queued,
+                    Err(TryRecvError::Empty) => {
+                        return match sender.try_send(request) {
+                            Ok(()) => true,
+                            Err(TrySendError::Full(_)) => {
+                                self.view.status_line =
+                                    "Reaction saved offline; Youta will retry it later".to_owned();
+                                false
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                self.show_error_message(
+                                    operation,
+                                    "the Yandex Music reaction worker stopped; the durable intent will be retried later",
+                                );
+                                false
+                            }
+                        };
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        self.show_error_message(
+                            operation,
+                            "the Yandex Music reaction worker stopped; the durable intent will be retried later",
+                        );
+                        return false;
+                    }
+                };
+                let replaces_same_key = matches!(
+                    (&request, &queued),
+                    (
+                        YandexMusicReactionWorkerRequest::Synchronize(next),
+                        YandexMusicReactionWorkerRequest::Synchronize(previous),
+                    ) if next.account_uid == previous.account_uid
+                        && next.track_id == previous.track_id
+                        && next.generation > previous.generation
+                );
+                let retained = if replaces_same_key { request } else { queued };
+                if sender.try_send(retained).is_err() {
+                    self.show_error_message(
+                        operation,
+                        "the Yandex Music reaction worker stopped; the durable intent will be retried later",
+                    );
+                    return false;
+                }
+                if !replaces_same_key {
+                    self.view.status_line =
+                        "Reaction saved offline; Youta will retry it later".to_owned();
+                }
+                replaces_same_key
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.show_error_message(
+                    operation,
+                    "the Yandex Music reaction worker stopped; the durable intent will be retried later",
+                );
+                false
+            }
+        }
+    }
+
+    /// Invalidates playback-triggered continuation work for an obsolete session.
+    #[cfg(feature = "yandex-music")]
+    fn reset_yandex_music_continuation(&mut self) {
+        self.yandex_music_continuation_generation =
+            self.yandex_music_continuation_generation.wrapping_add(1);
+        self.pending_yandex_music_continuation = None;
+        self.last_yandex_music_continuation_boundary = None;
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn open_yandex_music_home(&mut self) {
+        if self.config.providers.yandex_music_token.is_none() {
+            self.open_yandex_music_setup();
+            return;
+        }
+        self.cancel_pending_yandex_music_playback();
+        self.reset_yandex_music_continuation();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        self.set_yandex_music_route(YandexMusicRoute::Recommendations);
+        self.yandex_music_album = None;
+        self.yandex_music_artist_id = None;
+        self.yandex_music_navigation_back.clear();
+        self.view.rows.clear();
+        self.view.details = None;
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::Bootstrap { generation },
+            "Could not load Yandex Music recommendations",
+        ) {
+            self.begin_search_activity(SearchActivity::YandexMusic);
+            self.view.status_line = "Loading My Wave recommendations…".to_owned();
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn submit_yandex_music_search(&mut self, query: String) {
+        if self.config.providers.yandex_music_token.is_none() {
+            self.open_yandex_music_setup();
+            return;
+        }
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        let scope = match self.view.yandex_music_search_kind {
+            YandexMusicSearchKind::All => YandexMusicSearchScope::All,
+            YandexMusicSearchKind::Music => YandexMusicSearchScope::Music,
+            YandexMusicSearchKind::Podcasts => YandexMusicSearchScope::Podcasts,
+            YandexMusicSearchKind::Audiobooks => YandexMusicSearchScope::Audiobooks,
+        };
+        self.yandex_music_search_query.clone_from(&query);
+        self.set_yandex_music_route(YandexMusicRoute::Search);
+        self.yandex_music_album = None;
+        self.yandex_music_artist_id = None;
+        self.yandex_music_navigation_back.clear();
+        self.yandex_music_rows.clear();
+        self.yandex_music_selected = 0;
+        self.view.selected = 0;
+        self.view.rows.clear();
+        self.view.details = None;
+        self.view.yandex_music_actions = YandexMusicActionsView::default();
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::Search {
+                generation,
+                query,
+                scope,
+            },
+            "Could not start the Yandex Music search",
+        ) {
+            self.begin_search_activity(SearchActivity::YandexMusic);
+            self.view.status_line = format!(
+                "Searching Yandex Music {}…",
+                self.view
+                    .yandex_music_search_kind
+                    .label()
+                    .to_ascii_lowercase()
+            );
+        }
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    fn submit_yandex_music_search(&mut self, _query: String) {
+        self.view.status_line =
+            "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn open_yandex_music_setup(&mut self) {
+        self.view.yandex_music_setup_popup = Some(YandexMusicSetupPopupView {
+            token: String::new(),
+            token_path: self.config.credentials_file().display().to_string(),
+            validating: false,
+            validation_error: None,
+        });
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn submit_yandex_music_setup(&mut self) {
+        let token = {
+            let Some(popup) = self.view.yandex_music_setup_popup.as_mut() else {
+                return;
+            };
+            if popup.validating {
+                self.view.status_line =
+                    "Yandex Music token validation is already running".to_owned();
+                return;
+            }
+            let token = popup.token.trim().to_owned();
+            if token.is_empty() {
+                popup.validation_error = Some("Enter a Yandex OAuth access token".to_owned());
+                return;
+            }
+            token
+        };
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        self.pending_yandex_music_token = Some((generation, token.clone()));
+        if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+            popup.validating = true;
+            popup.validation_error = None;
+        }
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::ConfigureAndBootstrap { generation, token },
+            "Could not configure Yandex Music",
+        ) {
+            self.begin_search_activity(SearchActivity::YandexMusic);
+            self.view.status_line = "Validating Yandex Music and loading My Wave…".to_owned();
+        } else {
+            self.pending_yandex_music_token = None;
+            if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+                popup.validating = false;
+                popup.validation_error =
+                    Some("The Yandex Music worker could not validate this token".to_owned());
+            }
+        }
+    }
+
+    /// Cancels candidate-token validation without replacing the working credential.
+    #[cfg(feature = "yandex-music")]
+    fn dismiss_yandex_music_setup(&mut self) {
+        if self.pending_yandex_music_token.take().is_some() {
+            self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+            self.finish_search_activity(SearchActivity::YandexMusic);
+        }
+        self.view.yandex_music_setup_popup = None;
+        self.view.status_line =
+            "Yandex Music setup cancelled; your saved token was kept".to_owned();
+    }
+
+    /// Queues one bounded pass through the sole serialized reaction lane.
+    ///
+    /// The foreground catalogue worker remains independent, while lifecycle
+    /// retries and live user choices share one mutation dispatcher. This keeps
+    /// opposite two-request reaction sequences from interleaving remotely.
+    #[cfg(feature = "yandex-music")]
+    fn retry_pending_yandex_music_reactions(&mut self) -> bool {
+        let pending = match self.store.pending_yandex_music_reactions() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.show_error("Could not restore pending Yandex Music reactions", &error);
+                return false;
+            }
+        };
+        if self.config.providers.yandex_music_token.is_none() {
+            return true;
+        };
+        let pending = bounded_yandex_music_reaction_retry_batch(pending);
+        let mut queued_all = true;
+        for pending in pending {
+            queued_all &= self.send_yandex_music_reaction_request(
+                YandexMusicReactionWorkerRequest::Synchronize(pending),
+                "Could not retry pending Yandex Music reactions",
+            );
+        }
+        queued_all
+    }
+
+    /// Reapplies durable offline intent over provider snapshots after restart.
+    #[cfg(feature = "yandex-music")]
+    fn overlay_pending_yandex_music_reactions(&mut self) {
+        let Some(account_uid) = self
+            .yandex_music_account
+            .as_ref()
+            .map(|account| account.uid.clone())
+        else {
+            return;
+        };
+        let pending = match self.store.pending_yandex_music_reactions() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.show_error("Could not restore pending Yandex Music reactions", &error);
+                return;
+            }
+        };
+        apply_pending_yandex_music_reactions(&mut self.yandex_music_rows, &account_uid, &pending);
+        if let Some(recommendations) = self.yandex_music_recommendations.as_mut() {
+            apply_pending_yandex_music_track_reactions(
+                recommendations
+                    .tracks
+                    .iter_mut()
+                    .map(|recommendation| &mut recommendation.track),
+                &account_uid,
+                &pending,
+            );
+        }
+        if let Some(album) = self.yandex_music_album.as_mut() {
+            apply_pending_yandex_music_track_reactions(
+                album
+                    .tracks
+                    .iter_mut()
+                    .map(|album_track| &mut album_track.track),
+                &account_uid,
+                &pending,
+            );
+        }
+    }
+
+    /// Applies one provider reaction acknowledgement to the durable outbox.
+    ///
+    /// Failed network requests intentionally count as a successful persistence
+    /// outcome because the intent remains on disk for the next retry.
+    #[cfg(feature = "yandex-music")]
+    fn apply_yandex_music_reaction_response(
+        &mut self,
+        pending: PendingYandexMusicReaction,
+        result: Result<(), String>,
+        report_offline_status: bool,
+    ) -> bool {
+        match result {
+            Ok(()) => {
+                if let Err(error) = self.store.acknowledge_yandex_music_reaction(
+                    &pending.account_uid,
+                    &pending.track_id,
+                    pending.generation,
+                ) {
+                    self.show_error("Could not acknowledge a Yandex Music reaction", &error);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => {
+                if report_offline_status && self.view.screen == Screen::YandexMusic {
+                    self.view.status_line =
+                        "Reaction saved offline; Youta will retry it later".to_owned();
+                }
+                true
+            }
+        }
+    }
+
+    /// Invalidates one pending resolve/decrypt job without blocking the UI.
+    #[cfg(feature = "yandex-music")]
+    fn cancel_pending_yandex_music_playback(&mut self) {
+        let had_pending = self.pending_yandex_music_playback.take().is_some();
+        if let Some(cancellation) = self.yandex_music_playback_cancel.take() {
+            cancellation.store(true, AtomicOrdering::Release);
+        }
+        if let Some(handle) = self.yandex_music_playback_thread.take() {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                self.retired_yandex_music_playback_threads.push(handle);
+            }
+        }
+        if had_pending {
+            self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+            self.clear_playback_start_activity();
+        }
+        self.reap_retired_yandex_music_playback_threads();
+    }
+
+    /// Joins superseded playback preparations only after their worker exits.
+    #[cfg(feature = "yandex-music")]
+    fn reap_retired_yandex_music_playback_threads(&mut self) {
+        let mut index = 0;
+        while index < self.retired_yandex_music_playback_threads.len() {
+            if self.retired_yandex_music_playback_threads[index].is_finished() {
+                let handle = self
+                    .retired_yandex_music_playback_threads
+                    .swap_remove(index);
+                let _ = handle.join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn drain_yandex_music_media_job_responses(&mut self) {
+        self.reap_retired_yandex_music_playback_threads();
+        while let Ok(response) = self.yandex_music_media_job_responses.try_recv() {
+            match response {
+                YandexMusicMediaJobResponse::Playback {
+                    generation,
+                    track_id,
+                    result,
+                } => {
+                    if self
+                        .pending_yandex_music_playback
+                        .as_ref()
+                        .is_none_or(|pending| {
+                            pending.generation != generation || pending.track_id != track_id
+                        })
+                        || generation != self.yandex_music_generation
+                    {
+                        continue;
+                    }
+                    if let Some(handle) = self.yandex_music_playback_thread.take() {
+                        let _ = handle.join();
+                    }
+                    self.yandex_music_playback_cancel = None;
+                    let pending = self
+                        .pending_yandex_music_playback
+                        .take()
+                        .expect("matching prepared Yandex playback was checked above");
+                    self.clear_playback_start_activity();
+                    match result {
+                        Ok(path) => {
+                            let mut input = PlaybackInput::new(path.to_string_lossy().into_owned());
+                            input.bypass_ytdl = true;
+                            self.play_queue_item_with_origin_and_input(
+                                pending.item,
+                                pending.queue_cursor_already_positioned,
+                                pending.origin,
+                                Some(input),
+                            );
+                        }
+                        Err(error) => {
+                            self.show_error_message("Yandex Music playback failed", error);
+                        }
+                    }
+                }
+                YandexMusicMediaJobResponse::DownloadProgress {
+                    generation,
+                    title,
+                    progress,
+                } => {
+                    if generation != self.yandex_music_download_generation {
+                        continue;
+                    }
+                    self.view.download = Some(DownloadView {
+                        title,
+                        downloaded_bytes: progress.bytes_written,
+                        total_bytes: progress.total_bytes,
+                        active: true,
+                        ..DownloadView::default()
+                    });
+                }
+                YandexMusicMediaJobResponse::DownloadFinished {
+                    generation,
+                    batch_title,
+                    completed_paths,
+                    failures,
+                } => {
+                    if let Some(handle) = self.yandex_music_download_thread.take() {
+                        let _ = handle.join();
+                    }
+                    self.yandex_music_download_cancel = None;
+                    if generation != self.yandex_music_download_generation {
+                        continue;
+                    }
+                    let completed = completed_paths.len();
+                    self.view.download = Some(DownloadView {
+                        title: batch_title.clone(),
+                        active: false,
+                        completed_path: completed_paths
+                            .last()
+                            .map(|path| path.display().to_string()),
+                        ..DownloadView::default()
+                    });
+                    #[cfg(feature = "yt-dlp")]
+                    {
+                        self.download_completion_notice_deadline =
+                            Some(Instant::now() + DOWNLOAD_COMPLETION_NOTICE_DURATION);
+                    }
+                    if self.view.screen == Screen::Downloaded {
+                        self.populate_downloads();
+                        self.refresh_selected_playlist_state();
+                    }
+                    if failures.is_empty() {
+                        self.view.status_line = format!(
+                            "Downloaded {completed} Yandex Music track{}",
+                            plural_s(completed)
+                        );
+                    } else {
+                        self.view.status_line = format!(
+                            "Downloaded {completed} track{}; {} failed",
+                            plural_s(completed),
+                            failures.len()
+                        );
+                        self.show_error_message(
+                            "Some Yandex Music downloads failed",
+                            failures.join("\n"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keeps controller and presentation routes synchronized.
+    #[cfg(feature = "yandex-music")]
+    fn set_yandex_music_route(&mut self, route: YandexMusicRoute) {
+        self.yandex_music_route = route;
+        self.view.yandex_music_route = route.view();
+    }
+
+    /// Restores a cached My Wave page without waiting for another network request.
+    #[cfg(feature = "yandex-music")]
+    fn restore_yandex_music_home(&mut self) {
+        let Some(tracks) = self
+            .yandex_music_recommendations
+            .as_ref()
+            .map(|batch| batch.tracks.clone())
+        else {
+            self.open_yandex_music_home();
+            return;
+        };
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        self.finish_search_activity(SearchActivity::YandexMusic);
+        self.set_yandex_music_route(YandexMusicRoute::Recommendations);
+        self.yandex_music_album = None;
+        self.yandex_music_artist_id = None;
+        self.yandex_music_navigation_back.clear();
+        self.yandex_music_rows = tracks
+            .into_iter()
+            .map(|item| YandexMusicRow::Track(Box::new(item.track)))
+            .collect();
+        self.overlay_pending_yandex_music_reactions();
+        self.yandex_music_selected = 0;
+        self.view.selected = 0;
+        if self.view.screen == Screen::YandexMusic {
+            self.refresh_yandex_music_rows();
+        }
+        self.view.status_line = "My Wave recommendations restored from memory".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn refresh_yandex_music_rows(&mut self) {
+        let artwork_size = self.effective_yandex_music_artwork_size();
+        self.view.yandex_music_route = self.yandex_music_route.view();
+        self.view.rows = self
+            .yandex_music_rows
+            .iter()
+            .map(|row| match row {
+                YandexMusicRow::Track(track) => RowView {
+                    media_id: Some(MediaId::new(SourceKind::YandexMusic, &track.id)),
+                    title: track.title.clone(),
+                    subtitle: yandex_music_track_subtitle(track),
+                    source: "Yandex Music".to_owned(),
+                    thumbnail_url: track
+                        .panel_artwork_url(artwork_size)
+                        .or_else(|| track.artwork_url.clone()),
+                    compact: true,
+                    ..RowView::default()
+                },
+                YandexMusicRow::Album(album) => RowView {
+                    title: album.title.clone(),
+                    subtitle: format!(
+                        "{} · {}",
+                        yandex_music_artist_names(&album.artists),
+                        yandex_music_container_row_label(album.content_kind)
+                    ),
+                    source: "Yandex Music".to_owned(),
+                    thumbnail_url: album
+                        .panel_artwork_url(artwork_size)
+                        .or_else(|| album.artwork_url.clone()),
+                    compact: true,
+                    hide_watched_marker: true,
+                    ..RowView::default()
+                },
+            })
+            .collect();
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
+        self.view.selected = self
+            .yandex_music_selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.update_yandex_music_detail();
+        self.refresh_selected_playlist_state();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn update_yandex_music_detail(&mut self) {
+        let artwork_size = self.effective_yandex_music_artwork_size();
+        let Some(row) = self.yandex_music_rows.get(self.view.selected) else {
+            self.view.details = None;
+            self.view.yandex_music_actions = YandexMusicActionsView::default();
+            return;
+        };
+        let (details, actions) = match row {
+            YandexMusicRow::Track(track) => {
+                let album_available = track.album.is_some();
+                let artist_available = track.artists.iter().any(|artist| artist.id.is_some());
+                (
+                    DetailView {
+                        media_id: Some(MediaId::new(SourceKind::YandexMusic, &track.id)),
+                        title: track.title.clone(),
+                        source: "Yandex Music".to_owned(),
+                        channel_name: yandex_music_artist_names(&track.artists),
+                        length: track
+                            .duration_ms
+                            .map(|milliseconds| format_seconds(milliseconds / 1_000))
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        description: yandex_music_track_description(track),
+                        license: "Yandex Music subscription".to_owned(),
+                        thumbnail_url: track
+                            .panel_artwork_url(artwork_size)
+                            .or_else(|| track.artwork_url.clone()),
+                        thumbnail_dimensions: Some(artwork_size.dimensions()),
+                        expanded_thumbnail_url: track
+                            .expanded_artwork_url()
+                            .or_else(|| track.artwork_url.clone()),
+                        links: yandex_music_track_detail_links(track),
+                        ..DetailView::default()
+                    },
+                    YandexMusicActionsView {
+                        track_selected: true,
+                        artist_available,
+                        reaction: match track.reaction {
+                            YandexMusicReaction::Neutral => YandexMusicReactionView::Neutral,
+                            YandexMusicReaction::Liked => YandexMusicReactionView::Liked,
+                            YandexMusicReaction::Disliked => YandexMusicReactionView::Disliked,
+                        },
+                        album_available,
+                        album_open: self.yandex_music_route == YandexMusicRoute::Album,
+                        twenty_recommendations_available: self
+                            .yandex_music_recommendations
+                            .as_ref()
+                            .is_some_and(|batch| {
+                                batch.tracks.len() >= DEFAULT_MY_WAVE_RECOMMENDATIONS
+                            }),
+                    },
+                )
+            }
+            YandexMusicRow::Album(album) => (
+                DetailView {
+                    title: album.title.clone(),
+                    source: "Yandex Music album".to_owned(),
+                    channel_name: yandex_music_artist_names(&album.artists),
+                    description: format!(
+                        "{}\nPress Enter or b to open this album.",
+                        yandex_music_content_kind_label(album.content_kind)
+                    ),
+                    license: "Yandex Music subscription".to_owned(),
+                    thumbnail_url: album
+                        .panel_artwork_url(artwork_size)
+                        .or_else(|| album.artwork_url.clone()),
+                    thumbnail_dimensions: Some(artwork_size.dimensions()),
+                    expanded_thumbnail_url: album
+                        .expanded_artwork_url()
+                        .or_else(|| album.artwork_url.clone()),
+                    links: yandex_music_album_detail_links(album),
+                    ..DetailView::default()
+                },
+                YandexMusicActionsView {
+                    artist_available: album.artists.iter().any(|artist| artist.id.is_some()),
+                    album_available: true,
+                    twenty_recommendations_available: self
+                        .yandex_music_recommendations
+                        .as_ref()
+                        .is_some_and(|batch| batch.tracks.len() >= DEFAULT_MY_WAVE_RECOMMENDATIONS),
+                    ..YandexMusicActionsView::default()
+                },
+            ),
+        };
+        self.view.details = Some(details);
+        self.view.yandex_music_actions = actions;
+        self.request_selected_yandex_music_wikidata();
+    }
+
+    /// Reprojects retained Yandex artwork after a terminal threshold crossing.
+    ///
+    /// This updates only URLs already represented by provider models. It does
+    /// not repeat catalogue or Wikidata requests.
+    #[cfg(feature = "yandex-music")]
+    fn refresh_yandex_music_artwork_projection(&mut self) {
+        if self.view.screen != Screen::YandexMusic {
+            return;
+        }
+        let artwork_size = self.effective_yandex_music_artwork_size();
+        for (view_row, model_row) in self.view.rows.iter_mut().zip(&self.yandex_music_rows) {
+            view_row.thumbnail_url = yandex_music_panel_artwork_url(model_row, artwork_size);
+        }
+        let selected_artwork = self
+            .yandex_music_rows
+            .get(self.view.selected)
+            .and_then(|row| yandex_music_panel_artwork_url(row, artwork_size));
+        let selected_dimensions = selected_artwork.as_ref().map(|_| artwork_size.dimensions());
+        if let Some(details) = self.view.details.as_mut().filter(|details| {
+            details.source.starts_with("Yandex Music")
+                || details
+                    .media_id
+                    .as_ref()
+                    .is_some_and(|media_id| media_id.source == SourceKind::YandexMusic)
+        }) {
+            details.thumbnail_url = selected_artwork;
+            details.thumbnail_dimensions = selected_dimensions;
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn activate_yandex_music_selection(&mut self) {
+        let Some(row) = self.yandex_music_rows.get(self.view.selected).cloned() else {
+            self.view.status_line = "Select a Yandex Music item first".to_owned();
+            return;
+        };
+        match row {
+            YandexMusicRow::Album(album) => self.open_yandex_music_album(album.id),
+            YandexMusicRow::Track(track) => {
+                let item = queue_item_from_yandex_music_track(&track);
+                let origin = self
+                    .config
+                    .playback
+                    .autoplay
+                    .then(|| self.autoplay_origin_for_media(&item.media.id))
+                    .flatten();
+                self.request_yandex_music_playback(*track, item, false, origin);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    fn activate_yandex_music_selection(&mut self) {
+        self.view.status_line =
+            "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn open_yandex_music_album(&mut self, album_id: String) {
+        if self.yandex_music_route == YandexMusicRoute::Album
+            && self
+                .yandex_music_album
+                .as_ref()
+                .is_some_and(|album| album.summary.id == album_id)
+        {
+            self.view.status_line = "This Yandex Music album is already open".to_owned();
+            return;
+        }
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::Album {
+                generation,
+                album_id,
+            },
+            "Could not open the Yandex Music album",
+        ) {
+            self.push_yandex_music_navigation_snapshot();
+            self.begin_search_activity(SearchActivity::YandexMusic);
+            self.view.status_line = "Loading album tracks…".to_owned();
+        }
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    fn open_yandex_music_album(&mut self, _album_id: String) {
+        self.view.status_line =
+            "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn open_selected_yandex_music_album(&mut self) {
+        let album_id = match self.yandex_music_rows.get(self.view.selected) {
+            Some(YandexMusicRow::Track(track)) => {
+                track.album.as_ref().map(|album| album.id.clone())
+            }
+            Some(YandexMusicRow::Album(album)) => Some(album.id.clone()),
+            None => None,
+        };
+        if let Some(album_id) = album_id {
+            self.open_yandex_music_album(album_id);
+        } else {
+            self.view.status_line = "The selected item has no album".to_owned();
+        }
+    }
+
+    /// Opens the first exact artist represented by the selected Yandex row.
+    #[cfg(feature = "yandex-music")]
+    fn open_selected_yandex_music_artist(&mut self) {
+        let artists = self
+            .yandex_music_rows
+            .get(self.view.selected)
+            .map(|row| match row {
+                YandexMusicRow::Track(track) => track.artists.as_slice(),
+                YandexMusicRow::Album(album) => album.artists.as_slice(),
+            })
+            .unwrap_or_default();
+        let artist_id = artists.iter().find_map(|artist| artist.id.clone());
+        if let Some(artist_id) = artist_id {
+            self.open_yandex_music_artist(artist_id);
+        } else {
+            self.view.status_line = "The selected item has no identified artist".to_owned();
+        }
+    }
+
+    /// Loads one exact artist without falling back to ambiguous name search.
+    #[cfg(feature = "yandex-music")]
+    fn open_yandex_music_artist(&mut self, artist_id: String) {
+        if self.yandex_music_route == YandexMusicRoute::Artist
+            && self.yandex_music_artist_id.as_deref() == Some(artist_id.as_str())
+        {
+            self.view.status_line = "This Yandex Music artist is already open".to_owned();
+            return;
+        }
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::Artist {
+                generation,
+                artist_id,
+            },
+            "Could not open the Yandex Music artist",
+        ) {
+            self.push_yandex_music_navigation_snapshot();
+            self.begin_search_activity(SearchActivity::YandexMusic);
+            self.view.status_line = "Loading artist tracks and albums…".to_owned();
+        }
+    }
+
+    /// Retains one bounded Yandex list location before nested navigation.
+    #[cfg(feature = "yandex-music")]
+    fn push_yandex_music_navigation_snapshot(&mut self) {
+        if self.yandex_music_navigation_back.len() >= MAX_YANDEX_MUSIC_NAVIGATION_HISTORY {
+            self.yandex_music_navigation_back.pop_front();
+        }
+        self.yandex_music_navigation_back
+            .push_back(YandexMusicNavigationSnapshot {
+                route: self.yandex_music_route,
+                rows: self.yandex_music_rows.clone(),
+                selected: self.view.selected,
+                album: self.yandex_music_album.clone(),
+                artist_id: self.yandex_music_artist_id.clone(),
+            });
+    }
+
+    /// Restores the parent artist/album list without another network request.
+    #[cfg(feature = "yandex-music")]
+    fn close_yandex_music_child(&mut self) -> bool {
+        if !matches!(
+            self.yandex_music_route,
+            YandexMusicRoute::Album | YandexMusicRoute::Artist
+        ) {
+            return false;
+        }
+        let Some(snapshot) = self.yandex_music_navigation_back.pop_back() else {
+            self.open_yandex_music_home();
+            return true;
+        };
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        self.finish_search_activity(SearchActivity::YandexMusic);
+        self.set_yandex_music_route(snapshot.route);
+        self.yandex_music_album = snapshot.album;
+        self.yandex_music_artist_id = snapshot.artist_id;
+        self.yandex_music_rows = snapshot.rows;
+        self.yandex_music_selected = snapshot.selected;
+        self.view.selected = snapshot.selected;
+        self.refresh_yandex_music_rows();
+        self.view.status_line = "Returned to the previous Yandex Music page".to_owned();
+        true
+    }
+
+    /// Downloads one selected track through the authenticated highest-quality resolver.
+    #[cfg(feature = "yandex-music")]
+    fn download_selected_yandex_music_track(&mut self) {
+        let Some(YandexMusicRow::Track(track)) =
+            self.yandex_music_rows.get(self.view.selected).cloned()
+        else {
+            self.view.status_line = "Select a Yandex Music track before downloading it".to_owned();
+            return;
+        };
+        let title = track.title.clone();
+        let file_stem = format!(
+            "{} — {}",
+            yandex_music_artist_names(&track.artists),
+            track.title
+        );
+        self.start_yandex_music_download_batch(
+            format!("Yandex Music track — {title}"),
+            vec![YandexMusicDownloadItem {
+                track: *track,
+                file_stem,
+            }],
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn download_yandex_music_album(&mut self) {
+        let Some(album) = self.yandex_music_album.as_ref() else {
+            self.view.status_line = "Open a Yandex Music album before downloading it".to_owned();
+            return;
+        };
+        let items = album
+            .tracks
+            .iter()
+            .map(|album_track| YandexMusicDownloadItem {
+                track: album_track.track.clone(),
+                file_stem: format!(
+                    "{} — {:02}-{:02} — {}",
+                    album.summary.title,
+                    album_track.volume_number,
+                    album_track.track_number,
+                    album_track.track.title
+                ),
+            })
+            .collect::<Vec<_>>();
+        self.start_yandex_music_download_batch(
+            format!("Yandex Music album — {}", album.summary.title),
+            items,
+        );
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    fn download_yandex_music_album(&mut self) {
+        self.view.status_line =
+            "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn download_twenty_yandex_music_recommendations(&mut self) {
+        let Some(recommendations) = self.yandex_music_recommendations.as_ref() else {
+            self.view.status_line = "Yandex Music recommendations are not loaded yet".to_owned();
+            return;
+        };
+        if recommendations.tracks.len() < DEFAULT_MY_WAVE_RECOMMENDATIONS {
+            self.view.status_line =
+                "Yandex Music returned fewer than twenty unique recommendations".to_owned();
+            return;
+        }
+        let items = recommendations
+            .tracks
+            .iter()
+            .take(DEFAULT_MY_WAVE_RECOMMENDATIONS)
+            .enumerate()
+            .map(|(index, recommendation)| YandexMusicDownloadItem {
+                track: recommendation.track.clone(),
+                file_stem: format!(
+                    "My Wave {:02} — {} — {}",
+                    index.saturating_add(1),
+                    yandex_music_artist_names(&recommendation.track.artists),
+                    recommendation.track.title
+                ),
+            })
+            .collect::<Vec<_>>();
+        self.start_yandex_music_download_batch(
+            "Twenty Yandex Music recommendations".to_owned(),
+            items,
+        );
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    fn download_twenty_yandex_music_recommendations(&mut self) {
+        self.view.status_line =
+            "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn start_yandex_music_download_batch(
+        &mut self,
+        batch_title: String,
+        items: Vec<YandexMusicDownloadItem>,
+    ) {
+        self.drain_yandex_music_media_job_responses();
+        if self.yandex_music_download_thread.is_some() {
+            self.view.status_line = "One Yandex Music download batch is already running".to_owned();
+            return;
+        }
+        #[cfg(feature = "yt-dlp")]
+        if self.active_download.is_some() {
+            self.view.status_line =
+                "Another media download is already running; wait for it to finish".to_owned();
+            return;
+        }
+        if items.is_empty() {
+            self.view.status_line = "This Yandex Music batch has no tracks to download".to_owned();
+            return;
+        }
+        let Some(token) = self.config.providers.yandex_music_token.clone() else {
+            self.open_yandex_music_setup();
+            return;
+        };
+        #[cfg(test)]
+        if let Some(capture) = self.yandex_music_download_batch_capture.as_ref() {
+            capture
+                .send((batch_title, items))
+                .expect("Yandex Music download-batch test observer");
+            return;
+        }
+        if let Err(error) = self.config.ensure_directories() {
+            self.show_error(
+                "Could not prepare the Yandex Music download directory",
+                &error,
+            );
+            return;
+        }
+        let destination = self.config.downloads_dir();
+        self.yandex_music_download_generation =
+            self.yandex_music_download_generation.wrapping_add(1);
+        let generation = self.yandex_music_download_generation;
+        let response_sender = self.yandex_music_media_job_sender.clone();
+        let worker_title = batch_title.clone();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        match thread::Builder::new()
+            .name("youta-yandex-download".to_owned())
+            .spawn(move || {
+                yandex_music_download_batch_worker(
+                    generation,
+                    token,
+                    worker_title,
+                    items,
+                    destination,
+                    response_sender,
+                    worker_cancellation,
+                );
+            }) {
+            Ok(handle) => {
+                self.yandex_music_download_thread = Some(handle);
+                self.yandex_music_download_cancel = Some(cancellation);
+                self.view.download = Some(DownloadView {
+                    title: batch_title.clone(),
+                    active: true,
+                    ..DownloadView::default()
+                });
+                self.view.status_line = format!("Downloading {batch_title} in original quality…");
+            }
+            Err(error) => {
+                self.show_error("Could not start the Yandex Music download", &error);
+            }
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn request_yandex_music_playback(
+        &mut self,
+        track: YandexMusicTrack,
+        item: QueueItem,
+        queue_cursor_already_positioned: bool,
+        origin: Option<AutoplayOrigin>,
+    ) {
+        self.cancel_pending_yandex_music_playback();
+        self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
+        let generation = self.yandex_music_generation;
+        self.pending_yandex_music_playback = Some(PendingYandexMusicPlayback {
+            generation,
+            track_id: track.id.clone(),
+            item,
+            queue_cursor_already_positioned,
+            origin,
+        });
+        if self.send_yandex_music_request(
+            YandexMusicWorkerRequest::Resolve {
+                generation,
+                track: Box::new(track),
+            },
+            "Could not resolve the Yandex Music track",
+        ) {
+            self.begin_playback_start_activity();
+            self.view.status_line = "Resolving highest-quality Yandex audio…".to_owned();
+        } else {
+            self.pending_yandex_music_playback = None;
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn play_resolved_yandex_music_track(
+        &mut self,
+        pending: PendingYandexMusicPlayback,
+        media: YandexMusicMedia,
+    ) {
+        if media.decryption_key().is_none() {
+            self.clear_playback_start_activity();
+            let mut input = PlaybackInput::new(media.url.to_string());
+            input.bypass_ytdl = true;
+            self.play_queue_item_with_origin_and_input(
+                pending.item,
+                pending.queue_cursor_already_positioned,
+                pending.origin,
+                Some(input),
+            );
+            return;
+        }
+
+        let directory = self.config.cache_dir().join("yandex-music-playback");
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.clear_playback_start_activity();
+            self.show_error(
+                "Could not prepare Yandex Music's private playback cache",
+                &error,
+            );
+            return;
+        }
+        let cache_key = yandex_music_playback_cache_key(
+            &pending.track_id,
+            media.codec.file_extension(),
+            &format!("{:?}", media.quality),
+            media.bitrate_kbps,
+            media.size_bytes,
+        );
+        let destination = directory.join(format!("{}.{}", cache_key, media.codec.file_extension()));
+        if let Err(error) = prune_yandex_music_playback_cache(&directory, Some(&destination)) {
+            self.clear_playback_start_activity();
+            self.show_error("Could not bound the Yandex Music playback cache", &error);
+            return;
+        }
+        if yandex_music_playback_cache_file_is_valid(&destination, media.size_bytes) {
+            self.clear_playback_start_activity();
+            let mut input = PlaybackInput::new(destination.to_string_lossy().into_owned());
+            input.bypass_ytdl = true;
+            self.play_queue_item_with_origin_and_input(
+                pending.item,
+                pending.queue_cursor_already_positioned,
+                pending.origin,
+                Some(input),
+            );
+            return;
+        }
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                if let Err(error) = std::fs::remove_file(&destination) {
+                    self.clear_playback_start_activity();
+                    self.show_error(
+                        "Could not replace an invalid Yandex Music cache file",
+                        &error,
+                    );
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                self.clear_playback_start_activity();
+                self.show_error("Could not inspect the Yandex Music playback cache", &error);
+                return;
+            }
+        }
+
+        let generation = pending.generation;
+        let track_id = pending.track_id.clone();
+        let response_track_id = track_id.clone();
+        let response_sender = self.yandex_music_media_job_sender.clone();
+        let worker_destination = destination.clone();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let thread = thread::Builder::new()
+            .name("youta-yandex-playback".to_owned())
+            .spawn(move || {
+                let result = YandexMusicMediaFetcher::default()
+                    .fetch_with_progress_and_cancellation(
+                        &media,
+                        &worker_destination,
+                        &worker_cancellation,
+                        |_| {},
+                    )
+                    .map(|_| {
+                        let _ = prune_yandex_music_playback_cache(
+                            worker_destination
+                                .parent()
+                                .unwrap_or_else(|| Path::new(".")),
+                            Some(&worker_destination),
+                        );
+                        worker_destination
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = response_sender.send(YandexMusicMediaJobResponse::Playback {
+                    generation,
+                    track_id: response_track_id,
+                    result,
+                });
+            });
+        match thread {
+            Ok(handle) => {
+                self.pending_yandex_music_playback = Some(pending);
+                self.yandex_music_playback_thread = Some(handle);
+                self.yandex_music_playback_cancel = Some(cancellation);
+                self.view.status_line =
+                    "Decrypting highest-quality Yandex audio for playback…".to_owned();
+            }
+            Err(error) => {
+                self.clear_playback_start_activity();
+                self.show_error("Could not start Yandex Music media preparation", &error);
+            }
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn toggle_yandex_music_reaction(&mut self, requested: YandexMusicReaction) {
+        let selected = self.view.selected;
+        let Some(YandexMusicRow::Track(track)) = self.yandex_music_rows.get(selected) else {
+            self.view.status_line = "Select a Yandex Music track first".to_owned();
+            return;
+        };
+        let track_id = track.id.clone();
+        let next = if track.reaction == requested {
+            YandexMusicReaction::Neutral
+        } else {
+            requested
+        };
+        let Some(account_uid) = self
+            .yandex_music_account
+            .as_ref()
+            .map(|account| account.uid.clone())
+        else {
+            self.view.status_line =
+                "Yandex Music account metadata is still loading; try again shortly".to_owned();
+            return;
+        };
+        let pending =
+            match self
+                .store
+                .queue_yandex_music_reaction(&account_uid, &track_id, next, unix_time())
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.show_error("Could not save the Yandex Music reaction", &error);
+                    return;
+                }
+            };
+        if let Some(YandexMusicRow::Track(track)) = self.yandex_music_rows.get_mut(selected)
+            && track.id == track_id
+        {
+            track.reaction = next;
+        }
+        // A reaction is an in-place edit, so it must also retain the exact
+        // row used when the Yandex tab is restored or refreshed later.
+        self.yandex_music_selected = selected;
+        self.update_yandex_music_detail();
+        if self.send_yandex_music_reaction_request(
+            YandexMusicReactionWorkerRequest::Synchronize(pending),
+            "Could not send the Yandex Music reaction",
+        ) {
+            self.view.status_line = "Updating Yandex Music reaction…".to_owned();
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn request_selected_yandex_music_wikidata(&mut self) {
+        #[cfg(feature = "wikidata")]
+        {
+            let Some(row) = self.yandex_music_rows.get(self.view.selected) else {
+                return;
+            };
+            let lookups = yandex_music_wikidata_lookups(row);
+            self.invalidate_wikidata_lookup();
+            let generation = self.wikidata_generation;
+            if let Some(details) = self.view.details.as_mut() {
+                details.links.retain(|link| link.wikidata_item_id.is_none());
+                details.wikidata.clear();
+            }
+            let mut missing = VecDeque::new();
+            for (kind, external_id) in lookups {
+                if !self.apply_fresh_cached_wikidata_merge(kind, &external_id) {
+                    missing.push_back((kind, external_id));
+                }
+            }
+            if !missing.is_empty() {
+                self.scheduled_yandex_music_wikidata = Some(ScheduledYandexMusicWikidata {
+                    generation,
+                    lookups: missing,
+                    due_at: Instant::now() + CHANNEL_DETAILS_DEBOUNCE,
+                });
+            }
+        }
+    }
+
+    /// Moves the visible Yandex cursor to the track that actually began playback.
+    ///
+    /// Autoplay resolves authenticated media asynchronously, so changing the
+    /// selection when a request is queued can expose artwork for a track that
+    /// never starts. The backend lifecycle event is the authoritative point at
+    /// which the details panel should follow the new track.
+    #[cfg(feature = "yandex-music")]
+    fn follow_yandex_music_playback_selection(&mut self) {
+        if self.view.screen != Screen::YandexMusic {
+            return;
+        }
+        let Some(track_id) = self.current_media.as_ref().and_then(|media_id| {
+            (media_id.source == SourceKind::YandexMusic).then(|| media_id.external_id.clone())
+        }) else {
+            return;
+        };
+        let Some(index) = self
+            .yandex_music_rows
+            .iter()
+            .position(|row| matches!(row, YandexMusicRow::Track(track) if track.id == track_id))
+        else {
+            return;
+        };
+        if self.view.selected != index {
+            self.view.selected = index;
+            self.yandex_music_selected = index;
+            self.update_yandex_music_detail();
+            self.refresh_selected_playlist_state();
+        }
+        self.request_more_yandex_music_if_last_started(&track_id);
+    }
+
+    /// Requests one continuation after confirmed playback reaches My Wave's end.
+    ///
+    /// The request is keyed by the last track identity. Repeated lifecycle
+    /// events and replaying a boundary that yielded no additions cannot create
+    /// a request loop. A newly appended last track becomes a new boundary.
+    #[cfg(feature = "yandex-music")]
+    fn request_more_yandex_music_if_last_started(&mut self, playing_track_id: &str) {
+        if self.yandex_music_route != YandexMusicRoute::Recommendations
+            || self.pending_yandex_music_continuation.is_some()
+            || self.last_yandex_music_continuation_boundary.as_deref() == Some(playing_track_id)
+        {
+            return;
+        }
+        let Some((session_id, boundary_track_id, queue)) = self
+            .yandex_music_recommendations
+            .as_ref()
+            .and_then(|recommendations| {
+                let boundary = recommendations.tracks.last()?;
+                (boundary.track.id == playing_track_id).then(|| {
+                    let queue_start = recommendations
+                        .tracks
+                        .len()
+                        .saturating_sub(DEFAULT_MY_WAVE_RECOMMENDATIONS);
+                    (
+                        recommendations.session_id.clone(),
+                        boundary.track.id.clone(),
+                        recommendations.tracks[queue_start..]
+                            .iter()
+                            .map(|recommendation| recommendation.track.id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        self.yandex_music_continuation_generation =
+            self.yandex_music_continuation_generation.wrapping_add(1);
+        let generation = self.yandex_music_continuation_generation;
+        self.pending_yandex_music_continuation = Some(PendingYandexMusicContinuation {
+            generation,
+            session_id: session_id.clone(),
+            boundary_track_id: boundary_track_id.clone(),
+        });
+        self.last_yandex_music_continuation_boundary = Some(boundary_track_id.clone());
+        if !self.send_yandex_music_request(
+            YandexMusicWorkerRequest::ContinueMyWave {
+                generation,
+                session_id,
+                boundary_track_id,
+                queue,
+            },
+            "Could not continue My Wave",
+        ) {
+            self.pending_yandex_music_continuation = None;
+            self.last_yandex_music_continuation_boundary = None;
+        }
+    }
+
+    /// Applies one exact continuation without replacing the visible My Wave page.
+    #[cfg(feature = "yandex-music")]
+    fn apply_yandex_music_continuation(
+        &mut self,
+        generation: u64,
+        session_id: String,
+        boundary_track_id: String,
+        result: Result<YandexMusicRecommendationBatch, String>,
+    ) {
+        let Some(pending) = self.pending_yandex_music_continuation.as_ref() else {
+            return;
+        };
+        if pending.generation != generation
+            || pending.session_id != session_id
+            || pending.boundary_track_id != boundary_track_id
+        {
+            return;
+        }
+        self.pending_yandex_music_continuation = None;
+        let Some(current_session_id) = self
+            .yandex_music_recommendations
+            .as_ref()
+            .map(|recommendations| recommendations.session_id.as_str())
+        else {
+            return;
+        };
+        if current_session_id != session_id {
+            return;
+        }
+        let continuation = match result {
+            Ok(continuation) if continuation.session_id == session_id => continuation,
+            Ok(_) => {
+                if self.view.screen == Screen::YandexMusic {
+                    self.show_error_message(
+                        "My Wave continuation failed",
+                        "Yandex Music returned a different recommendation session",
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                if self.last_yandex_music_continuation_boundary.as_deref()
+                    == Some(boundary_track_id.as_str())
+                {
+                    self.last_yandex_music_continuation_boundary = None;
+                }
+                if self.view.screen == Screen::YandexMusic {
+                    self.show_error_message("My Wave continuation failed", error);
+                }
+                return;
+            }
+        };
+        let added_tracks = {
+            let recommendations = self
+                .yandex_music_recommendations
+                .as_mut()
+                .expect("the matching My Wave session was checked above");
+            let mut seen = recommendations
+                .tracks
+                .iter()
+                .map(|recommendation| recommendation.track.id.clone())
+                .collect::<HashSet<_>>();
+            let mut added = Vec::new();
+            for recommendation in continuation.tracks {
+                if seen.insert(recommendation.track.id.clone()) {
+                    added.push(recommendation.track.clone());
+                    recommendations.tracks.push(recommendation);
+                }
+            }
+            added
+        };
+        if added_tracks.is_empty() {
+            if self.view.screen == Screen::YandexMusic
+                && self.yandex_music_route == YandexMusicRoute::Recommendations
+            {
+                self.view.status_line = "My Wave returned no additional tracks".to_owned();
+            }
+            return;
+        }
+        if self.yandex_music_route == YandexMusicRoute::Recommendations {
+            self.yandex_music_rows.extend(
+                added_tracks
+                    .iter()
+                    .cloned()
+                    .map(|track| YandexMusicRow::Track(Box::new(track))),
+            );
+            self.overlay_pending_yandex_music_reactions();
+            if self.view.screen == Screen::YandexMusic {
+                self.refresh_yandex_music_rows();
+                self.view.status_line = format!(
+                    "{} more My Wave track{} loaded",
+                    added_tracks.len(),
+                    plural_s(added_tracks.len())
+                );
+            }
+        }
+        self.refresh_yandex_music_autoplay_origin();
+    }
+
+    /// Replaces a My Wave autoplay snapshot after new tracks are appended.
+    #[cfg(feature = "yandex-music")]
+    fn refresh_yandex_music_autoplay_origin(&mut self) {
+        let Some(current_media) = self
+            .current_media
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::YandexMusic)
+        else {
+            return;
+        };
+        let Some(recommendations) = self.yandex_music_recommendations.as_ref() else {
+            return;
+        };
+        let items = recommendations
+            .tracks
+            .iter()
+            .map(|recommendation| queue_item_from_yandex_music_track(&recommendation.track))
+            .collect::<Vec<_>>();
+        let Some(index) = items
+            .iter()
+            .position(|item| item.media.id == *current_media)
+        else {
+            return;
+        };
+        let replacement = AutoplayOrigin::YandexMusic {
+            items: items.into(),
+            index,
+        };
+        if matches!(
+            self.current_autoplay_origin,
+            Some(AutoplayOrigin::YandexMusic { .. })
+        ) {
+            self.current_autoplay_origin = Some(replacement.clone());
+        }
+        if matches!(
+            self.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YandexMusic { .. })
+        ) {
+            self.queued_autoplay_resume_origin = Some(replacement);
+        }
     }
 
     /// Loads one strict canonical Bandcamp page into the first-class tab.
@@ -6375,6 +8538,7 @@ impl AppController {
                 label: channel_external_link_label(link.kind, &link.label),
                 url: link.url.to_string(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             })
             .collect();
         details.links.extend(wikidata_links);
@@ -6508,6 +8672,11 @@ impl AppController {
     fn invalidate_wikidata_lookup(&mut self) {
         self.wikidata_generation = self.wikidata_generation.wrapping_add(1);
         self.scheduled_channel_wikidata = None;
+        #[cfg(feature = "yandex-music")]
+        {
+            self.scheduled_yandex_music_wikidata = None;
+            self.pending_yandex_music_wikidata = None;
+        }
         #[cfg(feature = "acoustid")]
         {
             self.pending_local_fingerprint_wikidata = None;
@@ -6540,6 +8709,30 @@ impl AppController {
         }
     }
 
+    /// Merges a fresh cached lookup into a multi-identity Details panel.
+    #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+    fn apply_fresh_cached_wikidata_merge(
+        &mut self,
+        kind: crate::providers::wikidata::WikidataExternalKind,
+        external_id: &str,
+    ) -> bool {
+        let property_id = kind.property_id();
+        let now = unix_time();
+        match self.store.cached_wikidata(property_id, external_id) {
+            Ok(Some(cached)) if cached.is_fresh_at(now) => {
+                self.view.selected_detail_link = self.view.details.as_mut().and_then(|details| {
+                    merge_yandex_music_wikidata_links(details, kind, external_id, &cached.items)
+                });
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                self.show_error("Wikidata cache could not be read", &error);
+                false
+            }
+        }
+    }
+
     /// Sends one generation-owned Wikidata request without blocking the TUI.
     #[cfg(feature = "wikidata")]
     fn send_wikidata_request(
@@ -6549,7 +8742,9 @@ impl AppController {
         external_id: &str,
     ) -> bool {
         let property_id = kind.property_id();
-        if let Some(details) = self.view.details.as_mut() {
+        if let Some(details) = self.view.details.as_mut()
+            && !is_yandex_music_wikidata_property(property_id)
+        {
             details.wikidata = format!("loading {property_id} lazily…");
         }
         let sent = self.send_provider_request(
@@ -6609,6 +8804,44 @@ impl AppController {
             WikidataExternalKind::YouTubeChannel,
             &scheduled.channel_id,
         );
+    }
+
+    /// Starts at most one deferred Yandex Music exact-ID lookup.
+    ///
+    /// The generic provider worker is shared with visible YouTube and
+    /// subscription work. Serializing a stable selection's track, artist, and
+    /// album identities prevents rapid `j`/`k` navigation from queuing a long
+    /// tail of stale Wikidata requests ahead of foreground provider actions.
+    #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+    fn request_due_yandex_music_wikidata(&mut self, now: Instant) {
+        if self.pending_yandex_music_wikidata.is_some() {
+            return;
+        }
+        let Some(mut scheduled) = self.scheduled_yandex_music_wikidata.take() else {
+            return;
+        };
+        if now < scheduled.due_at {
+            self.scheduled_yandex_music_wikidata = Some(scheduled);
+            return;
+        }
+        if scheduled.generation != self.wikidata_generation
+            || self.view.screen != Screen::YandexMusic
+        {
+            return;
+        }
+        let Some((kind, external_id)) = scheduled.lookups.pop_front() else {
+            return;
+        };
+        if self.send_wikidata_request(scheduled.generation, kind, &external_id) {
+            self.pending_yandex_music_wikidata = Some(PendingYandexMusicWikidata {
+                generation: scheduled.generation,
+                property_id: kind.property_id(),
+                external_id,
+            });
+            if !scheduled.lookups.is_empty() {
+                self.scheduled_yandex_music_wikidata = Some(scheduled);
+            }
+        }
     }
 
     fn handle_provider_response(&mut self, response: ProviderResponse) {
@@ -6744,6 +8977,272 @@ impl AppController {
                         }
                     }
                 }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicBootstrap { generation, result } => {
+                if generation != self.yandex_music_generation {
+                    return;
+                }
+                let candidate_token = self.pending_yandex_music_token.as_ref().and_then(
+                    |(candidate_generation, token)| {
+                        (*candidate_generation == generation).then(|| token.clone())
+                    },
+                );
+                self.finish_search_activity(SearchActivity::YandexMusic);
+                match result {
+                    Ok((account, recommendations)) => {
+                        if let Some(token) = candidate_token {
+                            if let Err(error) = self.config.save_yandex_music_token(token.clone()) {
+                                self.pending_yandex_music_token = None;
+                                if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+                                    popup.validating = false;
+                                    popup.validation_error = Some(error.to_string());
+                                }
+                                self.view.status_line =
+                                    "Yandex Music token is valid but could not be saved".to_owned();
+                                return;
+                            }
+                            if !self.send_yandex_music_request(
+                                YandexMusicWorkerRequest::AdoptToken {
+                                    token: token.clone(),
+                                },
+                                "Could not activate the validated Yandex Music token",
+                            ) {
+                                self.pending_yandex_music_token = None;
+                                if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+                                    popup.validating = false;
+                                    popup.validation_error = Some(
+                                        "The validated token was saved, but the provider worker stopped"
+                                            .to_owned(),
+                                    );
+                                }
+                                return;
+                            }
+                            if !self.send_yandex_music_reaction_request(
+                                YandexMusicReactionWorkerRequest::AdoptToken(token),
+                                "Could not activate Yandex Music reactions",
+                            ) {
+                                self.pending_yandex_music_token = None;
+                                if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+                                    popup.validating = false;
+                                    popup.validation_error = Some(
+                                        "The token was saved, but the reaction worker stopped; restart Youta to retry"
+                                            .to_owned(),
+                                    );
+                                }
+                                return;
+                            }
+                            self.pending_yandex_music_token = None;
+                            self.view.yandex_music_setup_popup = None;
+                        }
+                        let count = recommendations.tracks.len();
+                        self.reset_yandex_music_continuation();
+                        self.yandex_music_account = Some(account);
+                        self.yandex_music_rows = recommendations
+                            .tracks
+                            .iter()
+                            .map(|item| YandexMusicRow::Track(Box::new(item.track.clone())))
+                            .collect();
+                        self.yandex_music_recommendations = Some(recommendations);
+                        self.overlay_pending_yandex_music_reactions();
+                        self.set_yandex_music_route(YandexMusicRoute::Recommendations);
+                        self.yandex_music_selected = 0;
+                        if self.view.screen == Screen::YandexMusic {
+                            self.view.selected = 0;
+                            self.refresh_yandex_music_rows();
+                            self.view.status_line =
+                                format!("{count} My Wave recommendation{} loaded", plural_s(count));
+                        }
+                        self.retry_pending_yandex_music_reactions();
+                    }
+                    Err(error) => {
+                        if candidate_token.is_some() {
+                            self.pending_yandex_music_token = None;
+                            if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
+                                popup.validating = false;
+                                popup.validation_error = Some(error);
+                            }
+                            self.view.status_line =
+                                "Yandex Music rejected the replacement token".to_owned();
+                            return;
+                        }
+                        if self.view.screen == Screen::YandexMusic {
+                            self.show_error_message(
+                                "Yandex Music could not start",
+                                yandex_music_bootstrap_failure_message(&error),
+                            );
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicContinuation {
+                generation,
+                session_id,
+                boundary_track_id,
+                result,
+            } => self.apply_yandex_music_continuation(
+                generation,
+                session_id,
+                boundary_track_id,
+                result,
+            ),
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicSearch { generation, result } => {
+                if generation != self.yandex_music_generation {
+                    return;
+                }
+                self.finish_search_activity(SearchActivity::YandexMusic);
+                match result {
+                    Ok(page) => {
+                        self.yandex_music_rows = page
+                            .items
+                            .into_iter()
+                            .map(|item| match item {
+                                YandexMusicSearchItem::Track(track) => YandexMusicRow::Track(track),
+                                YandexMusicSearchItem::Album(album) => YandexMusicRow::Album(album),
+                            })
+                            .collect();
+                        self.overlay_pending_yandex_music_reactions();
+                        self.yandex_music_selected = 0;
+                        if self.view.screen == Screen::YandexMusic {
+                            self.view.selected = 0;
+                            self.refresh_yandex_music_rows();
+                            let count = self.yandex_music_rows.len();
+                            self.view.status_line =
+                                format!("{count} Yandex Music result{} loaded", plural_s(count));
+                        }
+                    }
+                    Err(error) => {
+                        if self.view.screen == Screen::YandexMusic {
+                            self.show_error_message("Yandex Music search failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicAlbum { generation, result } => {
+                if generation != self.yandex_music_generation {
+                    return;
+                }
+                self.finish_search_activity(SearchActivity::YandexMusic);
+                match result {
+                    Ok(album) => {
+                        let count = album.tracks.len();
+                        self.yandex_music_rows = album
+                            .tracks
+                            .iter()
+                            .map(|item| YandexMusicRow::Track(Box::new(item.track.clone())))
+                            .collect();
+                        self.yandex_music_album = Some(album);
+                        self.yandex_music_artist_id = None;
+                        self.overlay_pending_yandex_music_reactions();
+                        self.set_yandex_music_route(YandexMusicRoute::Album);
+                        self.yandex_music_selected = 0;
+                        if self.view.screen == Screen::YandexMusic {
+                            self.view.selected = 0;
+                            self.refresh_yandex_music_rows();
+                            self.view.status_line =
+                                format!("{count} album track{} loaded", plural_s(count));
+                        }
+                    }
+                    Err(error) => {
+                        self.yandex_music_navigation_back.pop_back();
+                        if self.view.screen == Screen::YandexMusic {
+                            self.show_error_message("Yandex Music album failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicArtist { generation, result } => {
+                if generation != self.yandex_music_generation {
+                    return;
+                }
+                self.finish_search_activity(SearchActivity::YandexMusic);
+                match result {
+                    Ok(page) => {
+                        let Some(artist_id) = page.artist.id.clone() else {
+                            self.yandex_music_navigation_back.pop_back();
+                            if self.view.screen == Screen::YandexMusic {
+                                self.show_error_message(
+                                    "Yandex Music artist failed",
+                                    "Yandex Music returned an artist without its exact identity",
+                                );
+                            }
+                            return;
+                        };
+                        let track_count = page.popular_tracks.len();
+                        let album_count = page.albums.len();
+                        self.yandex_music_rows = page
+                            .popular_tracks
+                            .into_iter()
+                            .map(|track| YandexMusicRow::Track(Box::new(track)))
+                            .chain(
+                                page.albums
+                                    .into_iter()
+                                    .map(|album| YandexMusicRow::Album(Box::new(album))),
+                            )
+                            .collect();
+                        self.yandex_music_album = None;
+                        self.yandex_music_artist_id = Some(artist_id);
+                        self.overlay_pending_yandex_music_reactions();
+                        self.set_yandex_music_route(YandexMusicRoute::Artist);
+                        self.yandex_music_selected = 0;
+                        if self.view.screen == Screen::YandexMusic {
+                            self.view.selected = 0;
+                            self.refresh_yandex_music_rows();
+                            self.view.status_line = format!(
+                                "{track_count} popular track{} and {album_count} album{} loaded",
+                                plural_s(track_count),
+                                plural_s(album_count)
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.yandex_music_navigation_back.pop_back();
+                        if self.view.screen == Screen::YandexMusic {
+                            self.show_error_message("Yandex Music artist failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicResolved {
+                generation,
+                track,
+                result,
+            } => {
+                let matches_pending =
+                    self.pending_yandex_music_playback
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.generation == generation && pending.track_id == track.id
+                        });
+                if generation != self.yandex_music_generation {
+                    if matches_pending {
+                        self.cancel_pending_yandex_music_playback();
+                    }
+                    return;
+                }
+                if !matches_pending {
+                    return;
+                }
+                let pending = self
+                    .pending_yandex_music_playback
+                    .take()
+                    .expect("matching Yandex Music playback was checked above");
+                match result {
+                    Ok(media) => self.play_resolved_yandex_music_track(pending, media),
+                    Err(error) => {
+                        self.clear_playback_start_activity();
+                        self.show_error_message("Yandex Music playback failed", error);
+                    }
+                }
+            }
+            #[cfg(feature = "yandex-music")]
+            ProviderResponse::YandexMusicReaction { pending, result } => {
+                self.apply_yandex_music_reaction_response(pending, result, true);
             }
             #[cfg(feature = "bandcamp")]
             ProviderResponse::BandcampSearch {
@@ -7877,6 +10376,18 @@ impl AppController {
                 external_id,
                 result,
             } => {
+                #[cfg(feature = "yandex-music")]
+                if self
+                    .pending_yandex_music_wikidata
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.generation == generation
+                            && pending.property_id == property_id
+                            && pending.external_id == external_id
+                    })
+                {
+                    self.pending_yandex_music_wikidata = None;
+                }
                 #[cfg(feature = "acoustid")]
                 if self
                     .pending_local_fingerprint_wikidata
@@ -7912,11 +10423,22 @@ impl AppController {
                         if let Err(error) = self.store.put_cached_wikidata(&cached) {
                             self.show_error("Wikidata cache write failed", &error);
                         }
-                        self.view.selected_detail_link = self
-                            .view
-                            .details
-                            .as_mut()
-                            .and_then(|details| apply_wikidata_links(details, &cached.items));
+                        self.view.selected_detail_link =
+                            self.view.details.as_mut().and_then(|details| {
+                                #[cfg(feature = "yandex-music")]
+                                if self.view.screen == Screen::YandexMusic
+                                    && let Some(kind) =
+                                        yandex_music_wikidata_kind(&cached.property_id)
+                                {
+                                    return merge_yandex_music_wikidata_links(
+                                        details,
+                                        kind,
+                                        &cached.external_id,
+                                        &cached.items,
+                                    );
+                                }
+                                apply_wikidata_links(details, &cached.items)
+                            });
                     }
                     Err(error) => {
                         if let Some(details) = self.view.details.as_mut() {
@@ -7983,6 +10505,15 @@ impl AppController {
             .ui
             .youtube_thumbnail_size
             .resolve(self.terminal_window_width_pixels)
+    }
+
+    /// Resolves the Yandex details-panel artwork preset for this terminal.
+    #[cfg(feature = "yandex-music")]
+    fn effective_yandex_music_artwork_size(&self) -> YandexMusicArtworkSize {
+        yandex_music_artwork_size_for_terminal(
+            self.terminal_window_width_pixels,
+            self.terminal_window_height_pixels,
+        )
     }
 
     /// Reprojects visible YouTube artwork without fetching another size.
@@ -8097,14 +10628,26 @@ impl AppController {
         }
     }
 
-    /// Applies a resize only when it changes Automatic's exact API entry.
-    fn set_terminal_window_width_pixels(&mut self, width: Option<u16>) {
-        let previous = self.effective_youtube_thumbnail_size();
+    /// Applies attached-terminal pixel changes to source-specific artwork policies.
+    fn set_terminal_window_pixels(&mut self, width: Option<u16>, height: Option<u16>) {
+        let previous_youtube = self.effective_youtube_thumbnail_size();
+        #[cfg(feature = "yandex-music")]
+        let previous_yandex = self.effective_yandex_music_artwork_size();
         self.terminal_window_width_pixels = width;
-        if previous != self.effective_youtube_thumbnail_size()
+        #[cfg(feature = "yandex-music")]
+        {
+            self.terminal_window_height_pixels = height;
+        }
+        #[cfg(not(feature = "yandex-music"))]
+        let _ = height;
+        if previous_youtube != self.effective_youtube_thumbnail_size()
             && self.config.ui.youtube_thumbnail_size == YouTubeThumbnailSize::Automatic
         {
             self.refresh_youtube_thumbnail_projection();
+        }
+        #[cfg(feature = "yandex-music")]
+        if previous_yandex != self.effective_yandex_music_artwork_size() {
+            self.refresh_yandex_music_artwork_projection();
         }
     }
 
@@ -8222,6 +10765,7 @@ impl AppController {
                 label: "Bandcamp page".to_owned(),
                 url: release.webpage_url.to_string(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             }],
             ..DetailView::default()
         });
@@ -8287,6 +10831,7 @@ impl AppController {
                     label: "Apple Podcasts".to_owned(),
                     url: url.to_string(),
                     wikidata_item_id: None,
+                    ..DetailLinkView::default()
                 }]
             })
             .unwrap_or_default();
@@ -8344,6 +10889,7 @@ impl AppController {
                 label: "Apple Podcasts".to_owned(),
                 url,
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             }],
             ..DetailView::default()
         });
@@ -8420,6 +10966,7 @@ impl AppController {
                 label: "Apple Podcasts episode".to_owned(),
                 url: url.to_string(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             });
         }
         if let Some(show) = self.active_apple_podcast_show.as_ref()
@@ -8429,6 +10976,7 @@ impl AppController {
                 label: "Apple Podcasts show".to_owned(),
                 url: url.to_string(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             });
         }
         let description = episode.description.clone().unwrap_or_default();
@@ -8642,6 +11190,7 @@ impl AppController {
                 .map(|entry| PathBuf::from(&entry.media.replay_locator))
                 .filter(|path| path.is_file()),
             Screen::YouTubeMusic
+            | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::Radio
@@ -8674,6 +11223,7 @@ impl AppController {
                         Screen::History => self.update_history_detail(),
                         Screen::Playlists => self.update_playlist_detail(),
                         Screen::YouTubeMusic
+                        | Screen::YandexMusic
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
                         | Screen::Radio
@@ -8708,6 +11258,7 @@ impl AppController {
                 Screen::History => self.update_history_detail(),
                 Screen::Playlists => self.update_playlist_detail(),
                 Screen::YouTubeMusic
+                | Screen::YandexMusic
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
                 | Screen::Radio
@@ -9798,6 +12349,15 @@ impl AppController {
                 self.update_radio_detail();
                 return;
             }
+            Screen::YandexMusic => {
+                #[cfg(feature = "yandex-music")]
+                self.update_yandex_music_detail();
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.details = None;
+                }
+                return;
+            }
             Screen::Search | Screen::TrackerMusic => {}
             Screen::YouTubeMusic
             | Screen::Subscriptions
@@ -9952,6 +12512,12 @@ impl AppController {
             {
                 self.submit_youtube_search(page);
             }
+        } else if self.view.screen == Screen::YandexMusic {
+            #[cfg(feature = "yandex-music")]
+            {
+                self.yandex_music_selected = self.view.selected;
+                self.update_yandex_music_detail();
+            }
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -10004,6 +12570,12 @@ impl AppController {
                 && self.direct_item.is_none());
         if youtube_list_active {
             self.request_selected_details();
+        } else if self.view.screen == Screen::YandexMusic {
+            #[cfg(feature = "yandex-music")]
+            {
+                self.yandex_music_selected = self.view.selected;
+                self.update_yandex_music_detail();
+            }
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -10087,6 +12659,24 @@ impl AppController {
                 .get(self.view.selected)
                 .ok_or_else(|| "No tracker item is selected".to_owned())?;
             return queue_item_from_tracker(item);
+        }
+        if self.view.screen == Screen::YandexMusic {
+            #[cfg(feature = "yandex-music")]
+            {
+                return match self.yandex_music_rows.get(self.view.selected) {
+                    Some(YandexMusicRow::Track(track)) => {
+                        Ok(queue_item_from_yandex_music_track(track))
+                    }
+                    Some(YandexMusicRow::Album(_)) => {
+                        Err("Open the album and select one of its tracks".to_owned())
+                    }
+                    None => Err("No Yandex Music item is selected".to_owned()),
+                };
+            }
+            #[cfg(not(feature = "yandex-music"))]
+            {
+                return Err("This build omits Yandex Music support".to_owned());
+            }
         }
         if self.view.screen == Screen::Subscriptions {
             let video_is_active = match self.view.subscriptions.layout {
@@ -10733,6 +13323,14 @@ impl AppController {
                     label: details.title.clone(),
                 })
             }
+            Screen::YandexMusic => {
+                let details = self.view.details.as_ref()?;
+                let media_id = details.media_id.clone()?;
+                Some(PrivateNoteSelection {
+                    target: CommentTarget::Media { media_id },
+                    label: details.title.clone(),
+                })
+            }
             Screen::Search | Screen::YouTubeMusic => {
                 if let Some(item) = self.selected_youtube_item() {
                     return match item {
@@ -11365,9 +13963,23 @@ impl AppController {
 
     #[cfg(feature = "yt-dlp")]
     fn start_selected_download(&mut self) {
+        #[cfg(feature = "yandex-music")]
+        if self.view.screen == Screen::YandexMusic {
+            self.download_selected_yandex_music_track();
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        self.drain_yandex_music_media_job_responses();
         if self.active_download.is_some() {
             self.view.status_line =
                 "One download is already running; wait for it to finish".to_owned();
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        if self.yandex_music_download_thread.is_some() {
+            self.view.status_line =
+                "A Yandex Music download batch is already running; wait for it to finish"
+                    .to_owned();
             return;
         }
         clear_download_completion_notice(
@@ -11437,6 +14049,11 @@ impl AppController {
 
     #[cfg(not(feature = "yt-dlp"))]
     fn start_selected_download(&mut self) {
+        #[cfg(feature = "yandex-music")]
+        if self.view.screen == Screen::YandexMusic {
+            self.download_selected_yandex_music_track();
+            return;
+        }
         self.view.status_line =
             "Download support was disabled when this Youta binary was built".to_owned();
     }
@@ -11572,6 +14189,10 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::YandexMusic {
+            self.activate_yandex_music_selection();
+            return;
+        }
         if self.view.screen == Screen::Local {
             self.activate_local_browser_selection();
             return;
@@ -12944,6 +15565,17 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        #[cfg(feature = "yandex-music")]
+        if self.view.screen == Screen::YandexMusic && self.close_yandex_music_child() {
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        if self.view.screen == Screen::YandexMusic
+            && self.yandex_music_route == YandexMusicRoute::Search
+        {
+            self.restore_yandex_music_home();
+            return;
+        }
         if self.view.screen == Screen::Playlists
             && matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
         {
@@ -13500,6 +16132,7 @@ impl AppController {
                         ),
                         url: candidate.url().to_string(),
                         wikidata_item_id: None,
+                        ..DetailLinkView::default()
                     }),
             );
         candidates
@@ -14468,6 +17101,34 @@ impl AppController {
                     index: self.view.selected,
                 });
             }
+            #[cfg(feature = "yandex-music")]
+            Screen::YandexMusic => {
+                let selected = self.view.selected;
+                if let Some(YandexMusicRow::Track(track)) = self.yandex_music_rows.get(selected)
+                    && media_id.source == SourceKind::YandexMusic
+                    && track.id == media_id.external_id
+                {
+                    let index = self.yandex_music_rows[..=selected]
+                        .iter()
+                        .filter(|row| matches!(row, YandexMusicRow::Track(_)))
+                        .count()
+                        .saturating_sub(1);
+                    let items = self
+                        .yandex_music_rows
+                        .iter()
+                        .filter_map(|row| match row {
+                            YandexMusicRow::Track(track) => {
+                                Some(queue_item_from_yandex_music_track(track))
+                            }
+                            YandexMusicRow::Album(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    return Some(AutoplayOrigin::YandexMusic {
+                        items: items.into(),
+                        index,
+                    });
+                }
+            }
             Screen::Subscriptions => {
                 if let Some(channel_id) = self.active_subscription_channel_id.as_ref()
                     && let Some(items) = self.subscription_video_cache.get(channel_id)
@@ -14545,6 +17206,23 @@ impl AppController {
                         index,
                     });
                 }
+            }
+        }
+        #[cfg(feature = "yandex-music")]
+        if media_id.source == SourceKind::YandexMusic {
+            let items = self
+                .yandex_music_rows
+                .iter()
+                .filter_map(|row| match row {
+                    YandexMusicRow::Track(track) => Some(queue_item_from_yandex_music_track(track)),
+                    YandexMusicRow::Album(_) => None,
+                })
+                .collect::<Vec<_>>();
+            if let Some(index) = items.iter().position(|item| item.media.id == *media_id) {
+                return Some(AutoplayOrigin::YandexMusic {
+                    items: items.into(),
+                    index,
+                });
             }
         }
         if media_id.source == SourceKind::Local {
@@ -14628,6 +17306,18 @@ impl AppController {
                     })
                     .unwrap_or(AutoplayStep::Exhausted)
             }
+            #[cfg(feature = "yandex-music")]
+            AutoplayOrigin::YandexMusic { items, index } => items
+                .get(index.saturating_add(1))
+                .cloned()
+                .map(|item| AutoplayStep::Play {
+                    item: Box::new(item),
+                    origin: AutoplayOrigin::YandexMusic {
+                        items: Arc::clone(items),
+                        index: index.saturating_add(1),
+                    },
+                })
+                .unwrap_or(AutoplayStep::Exhausted),
             AutoplayOrigin::Subscription { channel_id, index } => self
                 .subscription_video_cache
                 .get(channel_id)
@@ -14803,6 +17493,27 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        #[cfg(not(feature = "yandex-music"))]
+        if item.media.id.source == SourceKind::YandexMusic {
+            self.view.status_line =
+                "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        if item.media.id.source != SourceKind::YandexMusic {
+            self.cancel_pending_yandex_music_playback();
+        }
+        #[cfg(feature = "yandex-music")]
+        if resolved_input.is_none() && item.media.id.source == SourceKind::YandexMusic {
+            let track = yandex_music_track_from_queue_item(&item);
+            self.request_yandex_music_playback(
+                track,
+                item,
+                queue_cursor_already_positioned,
+                origin,
+            );
+            return;
+        }
         #[cfg(feature = "radio")]
         if self.active_radio_recording.is_some()
             && self.current_media.as_ref() != Some(&item.media.id)
@@ -15218,6 +17929,8 @@ impl AppController {
                             self.show_error("Playing, but history could not be saved", &error);
                         }
                         self.checkpoint_playback_started();
+                        #[cfg(feature = "yandex-music")]
+                        self.follow_yandex_music_playback_selection();
                         #[cfg(feature = "waveform")]
                         self.follow_local_waveform_playback_transition();
                     }
@@ -15681,6 +18394,14 @@ impl AppController {
                     .clone_from(&self.view.search_query);
                 self.youtube_music_selected = self.view.selected;
             }
+            #[cfg(feature = "yandex-music")]
+            Screen::YandexMusic => {
+                self.yandex_music_search_query
+                    .clone_from(&self.view.search_query);
+                self.yandex_music_selected = self.view.selected;
+            }
+            #[cfg(not(feature = "yandex-music"))]
+            Screen::YandexMusic => {}
             #[cfg(feature = "bandcamp")]
             Screen::Bandcamp => {
                 self.bandcamp_search_query
@@ -15745,6 +18466,17 @@ impl AppController {
                     .clone_from(&self.youtube_music_search_query);
                 self.view.selected = self.youtube_music_selected;
             }
+            #[cfg(feature = "yandex-music")]
+            Screen::YandexMusic => {
+                self.view
+                    .search_query
+                    .clone_from(&self.yandex_music_search_query);
+                self.view.selected = self
+                    .yandex_music_selected
+                    .min(self.yandex_music_rows.len().saturating_sub(1));
+            }
+            #[cfg(not(feature = "yandex-music"))]
+            Screen::YandexMusic => self.view.selected = 0,
             #[cfg(feature = "bandcamp")]
             Screen::Bandcamp => {
                 self.view
@@ -15817,6 +18549,11 @@ impl AppController {
             self.request_selected_details();
         } else if screen == Screen::YouTubeMusic && !self.youtube_music_results.is_empty() {
             self.request_selected_details();
+        } else if screen == Screen::YandexMusic {
+            #[cfg(feature = "yandex-music")]
+            if self.yandex_music_rows.is_empty() {
+                self.open_yandex_music_home();
+            }
         } else if screen == Screen::ApplePodcasts {
             match self.apple_podcasts_route {
                 ApplePodcastsRoute::Shows if !self.apple_podcasts_results.is_empty() => {
@@ -15880,6 +18617,50 @@ impl AppController {
                         }
                     )
                 };
+            }
+            Screen::YandexMusic => {
+                #[cfg(feature = "yandex-music")]
+                {
+                    if self.yandex_music_rows.is_empty() {
+                        self.view.rows.clear();
+                        self.view.details = None;
+                        self.view.status_line =
+                            if self.config.providers.yandex_music_token.is_some() {
+                                "Loading My Wave recommendations…".to_owned()
+                            } else {
+                                "Yandex Music needs an OAuth access token".to_owned()
+                            };
+                    } else {
+                        self.refresh_yandex_music_rows();
+                        self.view.status_line = match self.yandex_music_route {
+                            YandexMusicRoute::Recommendations => {
+                                "My Wave recommendations; press / to search".to_owned()
+                            }
+                            YandexMusicRoute::Search => format!(
+                                "{} Yandex Music result{}",
+                                self.yandex_music_rows.len(),
+                                plural_s(self.yandex_music_rows.len())
+                            ),
+                            YandexMusicRoute::Album => format!(
+                                "{} album track{}",
+                                self.yandex_music_rows.len(),
+                                plural_s(self.yandex_music_rows.len())
+                            ),
+                            YandexMusicRoute::Artist => format!(
+                                "{} artist item{}",
+                                self.yandex_music_rows.len(),
+                                plural_s(self.yandex_music_rows.len())
+                            ),
+                        };
+                    }
+                }
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.rows.clear();
+                    self.view.details = None;
+                    self.view.status_line =
+                        "This build omits the `yandex-music` feature".to_owned();
+                }
             }
             Screen::Bandcamp => {
                 #[cfg(feature = "bandcamp")]
@@ -16499,6 +19280,7 @@ impl AppController {
                 label: format!("{} ({item_id})", station.name),
                 url: format!("https://www.wikidata.org/wiki/{item_id}"),
                 wikidata_item_id: Some((*item_id).to_owned()),
+                ..DetailLinkView::default()
             })
             .collect();
         #[cfg(not(feature = "wikidata"))]
@@ -16877,6 +19659,7 @@ impl AppController {
                         label: "Canonical media page".to_owned(),
                         url: entry.media.webpage_url.to_string(),
                         wikidata_item_id: None,
+                        ..DetailLinkView::default()
                     })
                     .into_iter()
                     .collect();
@@ -17283,8 +20066,6 @@ impl AppController {
                     .cloned()
             })
             .flatten();
-        #[cfg(not(feature = "rss"))]
-        let rss_info: Option<()> = None;
         #[cfg(feature = "rss")]
         let source_title = rss_info
             .as_ref()
@@ -17331,6 +20112,7 @@ impl AppController {
                     label: "Podcast website".to_owned(),
                     url: url.to_string(),
                     wikidata_item_id: None,
+                    ..DetailLinkView::default()
                 }]
             })
             .unwrap_or_default();
@@ -18696,7 +21478,7 @@ impl AppController {
 
     fn diagnostic_helpers(&mut self) -> Vec<ExternalHelper> {
         if self.diagnostic_helpers_cache.is_none() {
-            let mut helpers = vec![
+            let helpers = vec![
                 (
                     ExternalHelperKind::Mpv,
                     Some(self.config.providers.mpv_executable.clone()),
@@ -18707,10 +21489,14 @@ impl AppController {
                 ),
             ];
             #[cfg(feature = "acoustid")]
-            helpers.push((
-                ExternalHelperKind::Fpcalc,
-                Some(self.config.providers.fpcalc_executable.clone()),
-            ));
+            let helpers = {
+                let mut helpers = helpers;
+                helpers.push((
+                    ExternalHelperKind::Fpcalc,
+                    Some(self.config.providers.fpcalc_executable.clone()),
+                ));
+                helpers
+            };
             self.diagnostic_helpers_cache = Some(ExternalHelper::probe_many(helpers));
         }
         self.diagnostic_helpers_cache
@@ -20678,6 +23464,72 @@ impl AppController {
         while self.local_waveform_responses.try_recv().is_ok() {}
     }
 
+    /// Cancels and joins authenticated media workers before state publication.
+    #[cfg(feature = "yandex-music")]
+    fn shutdown_yandex_music_media_workers(&mut self) {
+        self.cancel_pending_yandex_music_playback();
+        if let Some(cancellation) = self.yandex_music_download_cancel.take() {
+            cancellation.store(true, AtomicOrdering::Release);
+        }
+        if let Some(handle) = self.yandex_music_download_thread.take() {
+            let _ = handle.join();
+        }
+        for handle in self.retired_yandex_music_playback_threads.drain(..) {
+            let _ = handle.join();
+        }
+        while self.yandex_music_media_job_responses.try_recv().is_ok() {}
+    }
+
+    /// Applies every reaction response already published before shutdown.
+    ///
+    /// The compare-and-update persistence operation acknowledges only the
+    /// current generation and retains its revision in the desired-state ledger.
+    #[cfg(feature = "yandex-music")]
+    fn drain_yandex_music_reaction_responses_for_shutdown(&mut self) -> bool {
+        let mut acknowledgements_persisted = true;
+        while let Ok(response) = self.provider_responses.try_recv() {
+            if let ProviderResponse::YandexMusicReaction { pending, result } = response {
+                acknowledgements_persisted &=
+                    self.apply_yandex_music_reaction_response(pending, result, false);
+            }
+        }
+        acknowledgements_persisted
+    }
+
+    /// Makes one bounded shutdown retry and stops both Yandex Music workers.
+    ///
+    /// Live choices and lifecycle retries share the same serialized reaction
+    /// lane. A slow mutation is detached after a short deadline; its durable
+    /// unacknowledged intent remains available on the next start.
+    #[cfg(feature = "yandex-music")]
+    fn shutdown_yandex_music_worker(&mut self) -> bool {
+        let mut acknowledgements_persisted = true;
+        acknowledgements_persisted &= self.drain_yandex_music_reaction_responses_for_shutdown();
+        let pending_read_succeeded = self.retry_pending_yandex_music_reactions();
+
+        self.yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        self.yandex_music_requests.take();
+        if let Some(handle) = self.yandex_music_thread.take() {
+            let _ = join_yandex_music_provider_worker_within(
+                handle,
+                YANDEX_MUSIC_PROVIDER_SHUTDOWN_BUDGET,
+            );
+        }
+        if let Some(sender) = self.yandex_music_reaction_requests.take() {
+            let _ = sender.try_send(YandexMusicReactionWorkerRequest::Shutdown);
+        }
+        if let Some(worker) = self.yandex_music_reaction_thread.take() {
+            let _ = join_yandex_music_reaction_dispatcher_within(
+                worker,
+                YANDEX_MUSIC_REACTION_SHUTDOWN_BUDGET,
+                &self.yandex_music_reaction_stopping,
+            );
+        }
+        acknowledgements_persisted &= self.drain_yandex_music_reaction_responses_for_shutdown();
+        pending_read_succeeded && acknowledgements_persisted
+    }
+
     fn save_session(&mut self) -> bool {
         self.save_session_with_local_move_attempt(
             #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -20704,6 +23556,10 @@ impl AppController {
             self.youtube_music_search_query
                 .clone_from(&self.view.search_query);
             self.youtube_music_selected = self.view.selected;
+        } else if self.view.screen == Screen::YandexMusic {
+            self.yandex_music_search_query
+                .clone_from(&self.view.search_query);
+            self.yandex_music_selected = self.view.selected;
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -20763,6 +23619,7 @@ impl AppController {
             selected_row: self.view.selected,
             youtube_selected_row: Some(self.youtube_selected),
             youtube_music_selected_row: Some(self.youtube_music_selected),
+            yandex_music_selected_row: Some(self.yandex_music_selected),
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
@@ -20772,6 +23629,7 @@ impl AppController {
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
+            yandex_music_search_text: self.yandex_music_search_query.clone(),
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
             apple_podcasts_search_text: self.apple_podcasts_search_query.clone(),
@@ -20839,6 +23697,12 @@ impl AppController {
         if let Some(mut download) = self.active_download.take() {
             download.cancel_and_join();
         }
+        #[cfg(feature = "yandex-music")]
+        self.shutdown_yandex_music_media_workers();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_state_ready = self.shutdown_yandex_music_worker();
+        #[cfg(not(feature = "yandex-music"))]
+        let yandex_music_state_ready = true;
         #[cfg(any(feature = "local-rename", feature = "local-move"))]
         let local_move_state_ready =
             self.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Explicit);
@@ -20858,7 +23722,10 @@ impl AppController {
                     #[cfg(any(feature = "local-rename", feature = "local-move"))]
                     LocalMovePersistenceAttempt::Explicit,
                 );
-                persistence_succeeded = position_saved && checkpoint_published && session_saved;
+                persistence_succeeded = yandex_music_state_ready
+                    && position_saved
+                    && checkpoint_published
+                    && session_saved;
             } else {
                 persistence_succeeded = false;
             }
@@ -20903,8 +23770,8 @@ impl UiController for AppController {
                 self.view.external_opener_available = available;
                 self.view.physical_linux_console = !available;
             }
-            UiAction::SetTerminalWindowWidthPixels(width) => {
-                self.set_terminal_window_width_pixels(width);
+            UiAction::SetTerminalWindowPixels { width, height } => {
+                self.set_terminal_window_pixels(width, height);
             }
             UiAction::ReportGpmUnavailable {
                 gpm_supported,
@@ -20995,6 +23862,83 @@ impl UiController for AppController {
                         self.submit_search();
                     }
                 }
+            }
+            UiAction::CycleYandexMusicSearchKind => {
+                #[cfg(feature = "yandex-music")]
+                {
+                    if self.view.screen == Screen::YandexMusic {
+                        self.view.yandex_music_search_kind =
+                            self.view.yandex_music_search_kind.next();
+                        if self.yandex_music_route == YandexMusicRoute::Search
+                            && !self.yandex_music_search_query.trim().is_empty()
+                        {
+                            self.submit_yandex_music_search(self.yandex_music_search_query.clone());
+                        } else {
+                            self.view.status_line = format!(
+                                "Yandex Music search target: {}",
+                                self.view.yandex_music_search_kind.label()
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::ToggleYandexMusicLike => {
+                #[cfg(feature = "yandex-music")]
+                self.toggle_yandex_music_reaction(YandexMusicReaction::Liked);
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::ToggleYandexMusicDislike => {
+                #[cfg(feature = "yandex-music")]
+                self.toggle_yandex_music_reaction(YandexMusicReaction::Disliked);
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::OpenYandexMusicAlbum => {
+                #[cfg(feature = "yandex-music")]
+                self.open_selected_yandex_music_album();
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::OpenYandexMusicArtist => {
+                #[cfg(feature = "yandex-music")]
+                self.open_selected_yandex_music_artist();
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::OpenYandexMusicArtistById(artist_id) => {
+                #[cfg(feature = "yandex-music")]
+                self.open_yandex_music_artist(artist_id);
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    let _ = artist_id;
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::OpenYandexMusicAlbumById(album_id) => {
+                #[cfg(feature = "yandex-music")]
+                self.open_yandex_music_album(album_id);
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    let _ = album_id;
+                    self.view.status_line = "This build omits Yandex Music".to_owned();
+                }
+            }
+            UiAction::DownloadYandexMusicAlbum => self.download_yandex_music_album(),
+            UiAction::DownloadTwentyYandexMusicRecommendations => {
+                self.download_twenty_yandex_music_recommendations();
             }
             UiAction::MoveSelection(delta) => {
                 self.view.details_focused = false;
@@ -21349,6 +24293,35 @@ impl UiController for AppController {
                 self.view.status_line =
                     "YouTube provider setup cancelled; your selection was kept".to_owned();
             }
+            UiAction::AppendYandexMusicTokenCharacter(character) => {
+                #[cfg(feature = "yandex-music")]
+                self.append_yandex_music_token_character(character);
+                #[cfg(not(feature = "yandex-music"))]
+                let _ = character;
+            }
+            UiAction::DeleteYandexMusicTokenCharacter => {
+                #[cfg(feature = "yandex-music")]
+                self.delete_yandex_music_token_character();
+            }
+            UiAction::DeleteYandexMusicTokenWord => {
+                #[cfg(feature = "yandex-music")]
+                self.delete_yandex_music_token_word();
+            }
+            UiAction::OpenYandexOAuthGuide => {
+                self.open_external_url(YANDEX_OAUTH_GUIDE_URL);
+            }
+            UiAction::SubmitYandexMusicSetup => {
+                #[cfg(feature = "yandex-music")]
+                self.submit_yandex_music_setup();
+            }
+            UiAction::DismissYandexMusicSetup => {
+                #[cfg(feature = "yandex-music")]
+                self.dismiss_yandex_music_setup();
+                #[cfg(not(feature = "yandex-music"))]
+                {
+                    self.view.yandex_music_setup_popup = None;
+                }
+            }
             UiAction::OpenRssSubscriptionPopup => self.open_rss_subscription_popup(),
             UiAction::AppendRssSubscriptionCharacter(character) => {
                 if let Some(popup) = self.view.rss_subscription_popup.as_mut()
@@ -21463,6 +24436,8 @@ impl UiController for AppController {
         }
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "yandex-music")]
+        self.drain_yandex_music_media_job_responses();
         #[cfg(feature = "acoustid")]
         self.drain_local_fingerprint_responses();
         #[cfg(feature = "waveform")]
@@ -21499,6 +24474,8 @@ impl UiController for AppController {
         self.request_due_channel_details(now);
         #[cfg(feature = "wikidata")]
         self.request_due_channel_wikidata(now);
+        #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+        self.request_due_yandex_music_wikidata(now);
         #[cfg(feature = "yt-dlp")]
         {
             self.drain_youtube_prewarm_responses();
@@ -22110,6 +25087,618 @@ fn youtube_music_provider_worker(
             break;
         }
     }
+}
+
+/// Maximum durable offline reactions attempted during one startup or shutdown.
+///
+/// The outbox itself remains bounded at 10,000 rows, but a lifecycle boundary
+/// must never turn that storage bound into thousands of synchronous requests.
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_REACTION_RETRIES_PER_PASS: usize = 2;
+
+/// Maximum queued reaction commands outside the currently running mutation.
+///
+/// Every desired state is durable before it reaches this bounded lane. A full
+/// lane may therefore defer a different track until the next lifecycle retry,
+/// while a newer revision for the same queued key replaces the older revision.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_REACTION_QUEUE_CAPACITY: usize = 32;
+
+/// Maximum graceful-shutdown wait for the foreground provider worker.
+///
+/// A request already inside the blocking HTTP client may run until its own
+/// network timeout. Detaching after this budget keeps terminal shutdown
+/// responsive; the worker owns no controller or persistent state.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_PROVIDER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Maximum graceful-shutdown wait for the serialized reaction dispatcher.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_REACTION_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Poll cadence for deadline-aware Yandex Music worker joins.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Selects the small deterministic prefix attempted at one lifecycle boundary.
+#[cfg(feature = "yandex-music")]
+fn bounded_yandex_music_reaction_retry_batch(
+    pending: Vec<PendingYandexMusicReaction>,
+) -> Vec<PendingYandexMusicReaction> {
+    pending
+        .into_iter()
+        .take(MAX_YANDEX_MUSIC_REACTION_RETRIES_PER_PASS)
+        .collect()
+}
+
+/// Waits for the foreground provider worker without making process shutdown
+/// depend on the blocking HTTP client's full timeout.
+#[cfg(feature = "yandex-music")]
+fn join_yandex_music_provider_worker_within(worker: JoinHandle<()>, budget: Duration) -> bool {
+    let deadline = Instant::now().checked_add(budget);
+    loop {
+        if worker.is_finished() {
+            let _ = worker.join();
+            return true;
+        }
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(YANDEX_MUSIC_WORKER_JOIN_POLL_INTERVAL),
+        );
+    }
+}
+
+/// Waits no longer than `budget` for the serialized reaction dispatcher.
+///
+/// At the deadline, the cooperative stop flag prevents another queued mutation
+/// from starting after the current blocking provider call returns. Dropping the
+/// join handle is safe because every unacknowledged desired state remains in
+/// the durable ledger.
+#[cfg(feature = "yandex-music")]
+fn join_yandex_music_reaction_dispatcher_within(
+    worker: JoinHandle<()>,
+    budget: Duration,
+    stopping: &AtomicBool,
+) -> bool {
+    let deadline = Instant::now().checked_add(budget);
+    loop {
+        if worker.is_finished() {
+            let _ = worker.join();
+            return true;
+        }
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            stopping.store(true, AtomicOrdering::Release);
+            return false;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(YANDEX_MUSIC_WORKER_JOIN_POLL_INTERVAL),
+        );
+    }
+}
+
+/// Provider operations required by the serialized Yandex Music reaction lane.
+#[cfg(feature = "yandex-music")]
+trait YandexMusicReactionSynchronizer {
+    /// Replaces the client credential after the candidate was validated and saved.
+    fn adopt_token(&mut self, token: String);
+
+    /// Applies one complete mutually exclusive desired reaction.
+    fn synchronize(&mut self, pending: &PendingYandexMusicReaction) -> Result<(), String>;
+}
+
+/// Production reaction synchronizer backed by the authenticated Yandex client.
+#[cfg(feature = "yandex-music")]
+struct SystemYandexMusicReactionSynchronizer {
+    client: Result<YandexMusicClient, String>,
+}
+
+#[cfg(feature = "yandex-music")]
+impl SystemYandexMusicReactionSynchronizer {
+    /// Creates a synchronizer from the private configured OAuth token.
+    fn new(token: Option<String>) -> Self {
+        Self {
+            client: token
+                .ok_or_else(|| "Yandex Music OAuth token is not configured".to_owned())
+                .and_then(|token| YandexMusicClient::new(token).map_err(|error| error.to_string())),
+        }
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+impl YandexMusicReactionSynchronizer for SystemYandexMusicReactionSynchronizer {
+    fn adopt_token(&mut self, token: String) {
+        self.client = YandexMusicClient::new(token).map_err(|error| error.to_string());
+    }
+
+    fn synchronize(&mut self, pending: &PendingYandexMusicReaction) -> Result<(), String> {
+        self.client
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|client| {
+                client
+                    .set_reaction(&pending.account_uid, &pending.track_id, pending.reaction)
+                    .map_err(|error| error.to_string())
+            })
+    }
+}
+
+/// Coalesces one queued revision into a bounded per-key dispatcher batch.
+#[cfg(feature = "yandex-music")]
+fn coalesce_yandex_music_reaction(
+    batch: &mut Vec<PendingYandexMusicReaction>,
+    pending: PendingYandexMusicReaction,
+) {
+    if let Some(existing) = batch.iter_mut().find(|existing| {
+        existing.account_uid == pending.account_uid && existing.track_id == pending.track_id
+    }) {
+        if pending.generation > existing.generation {
+            *existing = pending;
+        }
+    } else {
+        batch.push(pending);
+    }
+}
+
+/// Runs all live and lifecycle reaction mutations through one serialized lane.
+///
+/// Contiguous queued revisions are coalesced by account and track before any
+/// network call starts. A newer revision that arrives during a blocking call
+/// runs only after that complete remove/add sequence finishes, so opposite
+/// reaction sequences cannot interleave on the remote service.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_reaction_dispatcher_worker<S: YandexMusicReactionSynchronizer>(
+    requests: Receiver<YandexMusicReactionWorkerRequest>,
+    responses: Sender<ProviderResponse>,
+    mut synchronizer: S,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut deferred = None;
+    let mut synchronized_generations = HashMap::<(String, String), u64>::new();
+    loop {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let request = match deferred.take() {
+            Some(request) => request,
+            None => match requests.recv() {
+                Ok(request) => request,
+                Err(_) => break,
+            },
+        };
+        match request {
+            YandexMusicReactionWorkerRequest::AdoptToken(token) => {
+                synchronizer.adopt_token(token);
+            }
+            YandexMusicReactionWorkerRequest::Shutdown => break,
+            YandexMusicReactionWorkerRequest::Synchronize(first) => {
+                let mut batch = vec![first];
+                loop {
+                    match requests.try_recv() {
+                        Ok(YandexMusicReactionWorkerRequest::Synchronize(pending)) => {
+                            coalesce_yandex_music_reaction(&mut batch, pending);
+                        }
+                        Ok(control) => {
+                            deferred = Some(control);
+                            break;
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                for pending in batch {
+                    if stopping.load(AtomicOrdering::Acquire) {
+                        return;
+                    }
+                    let key = (pending.account_uid.clone(), pending.track_id.clone());
+                    let result = if synchronized_generations
+                        .get(&key)
+                        .is_some_and(|generation| *generation >= pending.generation)
+                    {
+                        Ok(())
+                    } else {
+                        synchronizer.synchronize(&pending)
+                    };
+                    if result.is_ok() {
+                        synchronized_generations.insert(key, pending.generation);
+                    }
+                    if responses
+                        .send(ProviderResponse::YandexMusicReaction { pending, result })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Runs authenticated Yandex Music work independently from every public source.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_provider_worker(
+    requests: Receiver<YandexMusicWorkerRequest>,
+    responses: Sender<ProviderResponse>,
+    initial_token: Option<String>,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut client = initial_token
+        .ok_or_else(|| "Yandex Music OAuth token is not configured".to_owned())
+        .and_then(|token| YandexMusicClient::new(token).map_err(|error| error.to_string()));
+    while let Ok(request) = requests.recv() {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let response = match request {
+            YandexMusicWorkerRequest::ConfigureAndBootstrap { generation, token } => {
+                let candidate = YandexMusicClient::new(token).map_err(|error| error.to_string());
+                ProviderResponse::YandexMusicBootstrap {
+                    generation,
+                    result: candidate
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(yandex_music_bootstrap),
+                }
+            }
+            YandexMusicWorkerRequest::AdoptToken { token } => {
+                client = YandexMusicClient::new(token).map_err(|error| error.to_string());
+                continue;
+            }
+            YandexMusicWorkerRequest::Bootstrap { generation } => {
+                ProviderResponse::YandexMusicBootstrap {
+                    generation,
+                    result: client
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(yandex_music_bootstrap),
+                }
+            }
+            YandexMusicWorkerRequest::ContinueMyWave {
+                generation,
+                session_id,
+                boundary_track_id,
+                queue,
+            } => ProviderResponse::YandexMusicContinuation {
+                generation,
+                result: client.as_ref().map_err(Clone::clone).and_then(|client| {
+                    client
+                        .more_my_wave(&session_id, &queue)
+                        .map_err(|error| error.to_string())
+                }),
+                session_id,
+                boundary_track_id,
+            },
+            YandexMusicWorkerRequest::Search {
+                generation,
+                query,
+                scope,
+            } => ProviderResponse::YandexMusicSearch {
+                generation,
+                result: client.as_ref().map_err(Clone::clone).and_then(|client| {
+                    client
+                        .search(&query, scope, 0, 50)
+                        .map_err(|error| error.to_string())
+                }),
+            },
+            YandexMusicWorkerRequest::Album {
+                generation,
+                album_id,
+            } => ProviderResponse::YandexMusicAlbum {
+                generation,
+                result: client.as_ref().map_err(Clone::clone).and_then(|client| {
+                    client
+                        .album_with_tracks(&album_id)
+                        .map_err(|error| error.to_string())
+                }),
+            },
+            YandexMusicWorkerRequest::Artist {
+                generation,
+                artist_id,
+            } => ProviderResponse::YandexMusicArtist {
+                generation,
+                result: client.as_ref().map_err(Clone::clone).and_then(|client| {
+                    client
+                        .artist_page(&artist_id)
+                        .map_err(|error| error.to_string())
+                }),
+            },
+            YandexMusicWorkerRequest::Resolve { generation, track } => {
+                ProviderResponse::YandexMusicResolved {
+                    generation,
+                    result: client.as_ref().map_err(Clone::clone).and_then(|client| {
+                        client
+                            .resolve_media(&track.id)
+                            .map_err(|error| error.to_string())
+                    }),
+                    track: *track,
+                }
+            }
+        };
+        if responses.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+fn yandex_music_bootstrap(
+    client: &YandexMusicClient,
+) -> Result<(YandexMusicAccount, YandexMusicRecommendationBatch), String> {
+    let account = client
+        .validate_account()
+        .map_err(|error| error.to_string())?;
+    let recommendations = client.my_wave().map_err(|error| error.to_string())?;
+    Ok((account, recommendations))
+}
+
+/// Maximum UTF-8 bytes retained in a generated Yandex Music filename stem.
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_FILENAME_STEM_BYTES: usize = 180;
+
+/// Minimum byte delta between Yandex Music download progress messages.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_PROGRESS_BYTE_STEP: u64 = 1024 * 1024;
+
+/// Maximum silence between Yandex Music download progress messages.
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_PROGRESS_TIME_STEP: Duration = Duration::from_millis(150);
+
+/// Maximum complete decrypted objects retained in the private playback cache.
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_PLAYBACK_CACHE_FILES: usize = 64;
+
+/// Maximum bytes retained across complete decrypted playback-cache objects.
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_PLAYBACK_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Builds a filesystem-safe cache identity from stable non-secret media metadata.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_playback_cache_key(
+    track_id: &str,
+    extension: &str,
+    quality: &str,
+    bitrate_kbps: Option<u32>,
+    size_bytes: Option<u64>,
+) -> String {
+    let identity = format!(
+        "{track_id}\0{extension}\0{quality}\0{}\0{}",
+        bitrate_kbps.unwrap_or_default(),
+        size_bytes.unwrap_or_default()
+    );
+    format!("{:x}", Sha256::digest(identity.as_bytes()))
+}
+
+/// Accepts a cached object only when the provider supplied an exact size.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_playback_cache_file_is_valid(path: &Path, expected_size: Option<u64>) -> bool {
+    let Some(expected_size) = expected_size.filter(|size| *size > 0) else {
+        return false;
+    };
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() == expected_size)
+}
+
+/// Removes oldest complete cache objects until both private cache bounds hold.
+#[cfg(feature = "yandex-music")]
+fn prune_yandex_music_playback_cache(
+    directory: &Path,
+    retained: Option<&Path>,
+) -> std::io::Result<()> {
+    prune_yandex_music_playback_cache_to_limits(
+        directory,
+        retained,
+        MAX_YANDEX_MUSIC_PLAYBACK_CACHE_FILES,
+        MAX_YANDEX_MUSIC_PLAYBACK_CACHE_BYTES,
+    )
+}
+
+/// Limit-parameterized cache pruning used by production bounds and tests.
+#[cfg(feature = "yandex-music")]
+fn prune_yandex_music_playback_cache_to_limits(
+    directory: &Path,
+    retained: Option<&Path>,
+    maximum_files: usize,
+    maximum_bytes: u64,
+) -> std::io::Result<()> {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) => return Err(error),
+        };
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".part"))
+        {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        entries.push((
+            path,
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
+    }
+    entries.sort_unstable_by_key(|(_, _, modified)| *modified);
+    let mut file_count = entries.len();
+    for (path, bytes, _) in entries {
+        if file_count <= maximum_files && total_bytes <= maximum_bytes {
+            break;
+        }
+        if retained.is_some_and(|retained| retained == path) {
+            continue;
+        }
+        std::fs::remove_file(path)?;
+        file_count = file_count.saturating_sub(1);
+        total_bytes = total_bytes.saturating_sub(bytes);
+    }
+    Ok(())
+}
+
+/// Converts provider metadata into one portable, bounded filename stem.
+#[cfg(feature = "yandex-music")]
+fn sanitize_yandex_music_filename_stem(value: &str) -> String {
+    let mut stem = value
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    stem = stem.trim_matches([' ', '.']).to_owned();
+    truncate_utf8_bytes(&mut stem, MAX_YANDEX_MUSIC_FILENAME_STEM_BYTES);
+    stem = stem.trim_end_matches([' ', '.']).to_owned();
+    if stem.is_empty() {
+        "Yandex Music track".to_owned()
+    } else {
+        stem
+    }
+}
+
+/// Chooses a non-existing download path without replacing prior media.
+#[cfg(feature = "yandex-music")]
+fn available_yandex_music_download_path(
+    directory: &Path,
+    requested_stem: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    let stem = sanitize_yandex_music_filename_stem(requested_stem);
+    for sequence in 1_u16..=10_000 {
+        let filename = if sequence == 1 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem} ({sequence}).{extension}")
+        };
+        let candidate = directory.join(filename);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect Yandex Music download destination: {error}"
+                ));
+            }
+        }
+    }
+    Err("could not choose an unused Yandex Music download filename".to_owned())
+}
+
+/// Resolves, decrypts, and publishes one original-quality download batch.
+///
+/// Provider and media work remains on this dedicated thread. Every track is
+/// attempted independently so a malformed or unavailable item does not discard
+/// successful files from the same album or recommendation batch.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_download_batch_worker(
+    generation: u64,
+    token: String,
+    batch_title: String,
+    items: Vec<YandexMusicDownloadItem>,
+    destination_directory: PathBuf,
+    responses: Sender<YandexMusicMediaJobResponse>,
+    cancellation: Arc<AtomicBool>,
+) {
+    let client = match YandexMusicClient::new(token) {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = responses.send(YandexMusicMediaJobResponse::DownloadFinished {
+                generation,
+                batch_title,
+                completed_paths: Vec::new(),
+                failures: vec![error.to_string()],
+            });
+            return;
+        }
+    };
+    let fetcher = YandexMusicMediaFetcher::default();
+    let mut completed_paths = Vec::with_capacity(items.len());
+    let mut failures = Vec::new();
+
+    for item in items {
+        if cancellation.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let title = item.track.title.clone();
+        let result = client
+            .resolve_media(&item.track.id)
+            .map_err(|error| error.to_string())
+            .and_then(|media| {
+                let destination = available_yandex_music_download_path(
+                    &destination_directory,
+                    &item.file_stem,
+                    media.codec.file_extension(),
+                )?;
+                let mut last_reported_bytes = 0_u64;
+                let mut last_reported_at = Instant::now();
+                fetcher
+                    .fetch_with_progress_and_cancellation(
+                        &media,
+                        &destination,
+                        &cancellation,
+                        |progress| {
+                            let complete = progress
+                                .total_bytes
+                                .is_some_and(|total| progress.bytes_written >= total);
+                            if complete
+                                || progress.bytes_written.saturating_sub(last_reported_bytes)
+                                    >= YANDEX_MUSIC_PROGRESS_BYTE_STEP
+                                || last_reported_at.elapsed() >= YANDEX_MUSIC_PROGRESS_TIME_STEP
+                            {
+                                let _ =
+                                    responses.send(YandexMusicMediaJobResponse::DownloadProgress {
+                                        generation,
+                                        title: title.clone(),
+                                        progress,
+                                    });
+                                last_reported_bytes = progress.bytes_written;
+                                last_reported_at = Instant::now();
+                            }
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(destination)
+            });
+        if cancellation.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        match result {
+            Ok(path) => completed_paths.push(path),
+            Err(error) => failures.push(format!("{title}: {error}")),
+        }
+    }
+
+    let _ = responses.send(YandexMusicMediaJobResponse::DownloadFinished {
+        generation,
+        batch_title,
+        completed_paths,
+        failures,
+    });
 }
 
 fn provider_worker(
@@ -25705,6 +29294,10 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::YouTubeMusic => StoredScreen::YouTubeMusic,
         #[cfg(not(feature = "youtube-music"))]
         Screen::YouTubeMusic => StoredScreen::Search,
+        #[cfg(feature = "yandex-music")]
+        Screen::YandexMusic => StoredScreen::YandexMusic,
+        #[cfg(not(feature = "yandex-music"))]
+        Screen::YandexMusic => StoredScreen::Search,
         #[cfg(feature = "bandcamp")]
         Screen::Bandcamp => StoredScreen::Bandcamp,
         #[cfg(not(feature = "bandcamp"))]
@@ -25765,6 +29358,10 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         StoredScreen::YouTubeMusic => Screen::YouTubeMusic,
         #[cfg(not(feature = "youtube-music"))]
         StoredScreen::YouTubeMusic => Screen::Search,
+        #[cfg(feature = "yandex-music")]
+        StoredScreen::YandexMusic => Screen::YandexMusic,
+        #[cfg(not(feature = "yandex-music"))]
+        StoredScreen::YandexMusic => Screen::Search,
         #[cfg(feature = "bandcamp")]
         StoredScreen::Bandcamp => Screen::Bandcamp,
         #[cfg(not(feature = "bandcamp"))]
@@ -26928,10 +30525,309 @@ fn bandcamp_search_summary(
     }
 }
 
+/// Applies the newest durable offline reaction to every matching visible row.
+#[cfg(feature = "yandex-music")]
+fn apply_pending_yandex_music_reactions(
+    rows: &mut [YandexMusicRow],
+    account_uid: &str,
+    pending: &[PendingYandexMusicReaction],
+) {
+    apply_pending_yandex_music_track_reactions(
+        rows.iter_mut().filter_map(|row| match row {
+            YandexMusicRow::Track(track) => Some(track.as_mut()),
+            YandexMusicRow::Album(_) => None,
+        }),
+        account_uid,
+        pending,
+    );
+}
+
+/// Overlays pending user intent without allowing stale provider state to win.
+#[cfg(feature = "yandex-music")]
+fn apply_pending_yandex_music_track_reactions<'a>(
+    tracks: impl IntoIterator<Item = &'a mut YandexMusicTrack>,
+    account_uid: &str,
+    pending: &[PendingYandexMusicReaction],
+) {
+    let mut latest = HashMap::<String, (u64, YandexMusicReaction)>::new();
+    for intent in pending
+        .iter()
+        .filter(|intent| intent.account_uid == account_uid)
+    {
+        let entry = latest
+            .entry(intent.track_id.clone())
+            .or_insert((intent.generation, intent.reaction));
+        if intent.generation > entry.0 {
+            *entry = (intent.generation, intent.reaction);
+        }
+    }
+    for track in tracks {
+        if let Some((_, reaction)) = latest.get(&track.id) {
+            track.reaction = *reaction;
+        }
+    }
+}
+
 /// Builds a canonical queue item from one action-resolved Bandcamp track.
 ///
 /// The short-lived `media_url` and its headers deliberately remain outside
 /// the returned queue item.
+#[cfg(feature = "yandex-music")]
+fn queue_item_from_yandex_music_track(track: &YandexMusicTrack) -> QueueItem {
+    QueueItem {
+        media: MediaItem {
+            id: MediaId::new(SourceKind::YandexMusic, &track.id),
+            kind: MediaKind::Audio,
+            title: track.title.clone(),
+            creator: Some(yandex_music_artist_names(&track.artists)),
+            description: Some(yandex_music_track_description(track)),
+            webpage_url: track.webpage_url.clone(),
+            thumbnail_url: track.artwork_url.clone(),
+            duration_seconds: track.duration_ms.map(|milliseconds| milliseconds / 1_000),
+            published_at: None,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::Unknown,
+            chapters: Vec::new(),
+            captions: Vec::new(),
+        },
+        // Stable provider pages survive process restarts. Playback resolves a
+        // fresh, highest-quality CDN URL immediately before handing it to mpv.
+        playback_location: track.webpage_url.to_string(),
+        start_at_seconds: None,
+        added_at: unix_time(),
+    }
+}
+
+/// Returns every exact Yandex Music identity that can enrich one selected row.
+///
+/// A track contributes its own identity, all identified artists, and its album.
+/// An album contributes itself and all identified artists. Canonical ordering
+/// and deduplication keep cache reads and provider requests deterministic.
+#[cfg(all(feature = "yandex-music", feature = "wikidata"))]
+fn yandex_music_wikidata_lookups(
+    row: &YandexMusicRow,
+) -> Vec<(crate::providers::wikidata::WikidataExternalKind, String)> {
+    use crate::providers::wikidata::WikidataExternalKind;
+
+    let mut lookups = Vec::new();
+    match row {
+        YandexMusicRow::Track(track) => {
+            lookups.push((WikidataExternalKind::YandexMusicTrack, track.id.clone()));
+            lookups.extend(track.artists.iter().filter_map(|artist| {
+                artist
+                    .id
+                    .as_ref()
+                    .map(|id| (WikidataExternalKind::YandexMusicArtist, id.clone()))
+            }));
+            if let Some(album) = track.album.as_ref() {
+                lookups.push((WikidataExternalKind::YandexMusicAlbum, album.id.clone()));
+            }
+        }
+        YandexMusicRow::Album(album) => {
+            lookups.push((WikidataExternalKind::YandexMusicAlbum, album.id.clone()));
+            lookups.extend(album.artists.iter().filter_map(|artist| {
+                artist
+                    .id
+                    .as_ref()
+                    .map(|id| (WikidataExternalKind::YandexMusicArtist, id.clone()))
+            }));
+        }
+    }
+    lookups.sort_unstable_by(|left, right| {
+        left.0
+            .property_id()
+            .cmp(right.0.property_id())
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    lookups.dedup();
+    lookups
+}
+
+#[cfg(feature = "yandex-music")]
+fn yandex_music_track_from_queue_item(item: &QueueItem) -> YandexMusicTrack {
+    let artists = item
+        .media
+        .creator
+        .as_deref()
+        .unwrap_or("Yandex Music")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| crate::providers::yandex_music::YandexMusicArtist {
+            id: None,
+            name: name.to_owned(),
+        })
+        .collect();
+    YandexMusicTrack {
+        id: item.media.id.external_id.clone(),
+        title: item.media.title.clone(),
+        artists,
+        album: None,
+        duration_ms: item
+            .media
+            .duration_seconds
+            .and_then(|seconds| seconds.checked_mul(1_000)),
+        artwork_url: item.media.thumbnail_url.clone(),
+        content_kind: YandexMusicContentKind::Music,
+        reaction: YandexMusicReaction::Neutral,
+        webpage_url: item.media.webpage_url.clone(),
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+fn yandex_music_artist_names(
+    artists: &[crate::providers::yandex_music::YandexMusicArtist],
+) -> String {
+    let names = artists
+        .iter()
+        .map(|artist| artist.name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "Yandex Music".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+const fn yandex_music_content_kind_label(kind: YandexMusicContentKind) -> &'static str {
+    match kind {
+        YandexMusicContentKind::Music => "Music",
+        YandexMusicContentKind::Podcast => "Podcast",
+        YandexMusicContentKind::Audiobook => "Audiobook",
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+fn yandex_music_track_subtitle(track: &YandexMusicTrack) -> String {
+    let mut fields = vec![yandex_music_artist_names(&track.artists)];
+    if let Some(album) = track.album.as_ref() {
+        fields.push(album.title.clone());
+    }
+    if let Some(kind) = yandex_music_playable_row_label(track.content_kind) {
+        fields.push(kind.to_owned());
+    }
+    if let Some(duration_ms) = track.duration_ms {
+        fields.push(format_seconds(duration_ms / 1_000));
+    }
+    fields.join(" · ")
+}
+
+/// Returns a compact spoken-word marker while leaving ordinary songs uncluttered.
+#[cfg(feature = "yandex-music")]
+const fn yandex_music_playable_row_label(kind: YandexMusicContentKind) -> Option<&'static str> {
+    match kind {
+        YandexMusicContentKind::Music => None,
+        YandexMusicContentKind::Podcast => Some("podcast episode"),
+        YandexMusicContentKind::Audiobook => Some("audiobook chapter"),
+    }
+}
+
+/// Names one non-playable Yandex catalogue container without calling all rows albums.
+#[cfg(feature = "yandex-music")]
+const fn yandex_music_container_row_label(kind: YandexMusicContentKind) -> &'static str {
+    match kind {
+        YandexMusicContentKind::Music => "album",
+        YandexMusicContentKind::Podcast => "podcast",
+        YandexMusicContentKind::Audiobook => "audiobook",
+    }
+}
+
+/// Projects one retained Yandex row to an allowlisted panel artwork preset.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_panel_artwork_url(
+    row: &YandexMusicRow,
+    size: YandexMusicArtworkSize,
+) -> Option<url::Url> {
+    match row {
+        YandexMusicRow::Track(track) => track
+            .panel_artwork_url(size)
+            .or_else(|| track.artwork_url.clone()),
+        YandexMusicRow::Album(album) => album
+            .panel_artwork_url(size)
+            .or_else(|| album.artwork_url.clone()),
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+fn yandex_music_track_description(track: &YandexMusicTrack) -> String {
+    let mut lines = vec![format!(
+        "Type: {}",
+        yandex_music_content_kind_label(track.content_kind)
+    )];
+    for artist in track
+        .artists
+        .iter()
+        .filter(|artist| artist.webpage_url().is_none())
+    {
+        lines.push(format!("Artist: {}", artist.name));
+    }
+    lines.join("\n")
+}
+
+/// Builds exact browser targets for every identified artist, album, and track.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_track_detail_links(track: &YandexMusicTrack) -> Vec<DetailLinkView> {
+    let mut links = yandex_music_artist_detail_links(&track.artists);
+    if let Some(album) = track.album.as_ref() {
+        links.push(DetailLinkView {
+            prefix: "Album: ".to_owned(),
+            label: album.title.clone(),
+            url: album.webpage_url.to_string(),
+            presentation: DetailLinkPresentation::LabelOnlySpaced,
+            internal_target: Some(DetailLinkInternalTarget::YandexMusicAlbum(album.id.clone())),
+            ..DetailLinkView::default()
+        });
+    }
+    links.push(DetailLinkView {
+        url: track.webpage_url.to_string(),
+        presentation: DetailLinkPresentation::UrlOnlySpaced,
+        ..DetailLinkView::default()
+    });
+    links
+}
+
+/// Builds an album's identified artist targets followed by its bare source URL.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_album_detail_links(album: &YandexMusicAlbumSummary) -> Vec<DetailLinkView> {
+    let mut links = yandex_music_artist_detail_links(&album.artists);
+    links.push(DetailLinkView {
+        url: album.webpage_url.to_string(),
+        presentation: DetailLinkPresentation::UrlOnlySpaced,
+        ..DetailLinkView::default()
+    });
+    links
+}
+
+/// Preserves provider order while omitting missing and repeated artist IDs.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_artist_detail_links(
+    artists: &[crate::providers::yandex_music::YandexMusicArtist],
+) -> Vec<DetailLinkView> {
+    let mut seen_urls = HashSet::new();
+    artists
+        .iter()
+        .filter_map(|artist| {
+            let artist_id = artist.id.clone()?;
+            let url = artist.webpage_url()?.to_string();
+            seen_urls.insert(url.clone()).then(|| DetailLinkView {
+                prefix: "Artist: ".to_owned(),
+                label: artist.name.clone(),
+                url,
+                presentation: DetailLinkPresentation::LabelOnlySpaced,
+                internal_target: Some(DetailLinkInternalTarget::YandexMusicArtist(artist_id)),
+                ..DetailLinkView::default()
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "yandex-music")]
+const fn plural_s(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 #[cfg(feature = "bandcamp")]
 fn queue_item_from_bandcamp_track(
     summary: &BandcampSearchSummary,
@@ -27497,8 +31393,126 @@ fn apply_wikidata_links(
             },
             url: item.url.to_string(),
             wikidata_item_id: Some(item.item_id.clone()),
+            ..DetailLinkView::default()
         }));
     first_wikidata_index
+}
+
+/// Inserts exact Yandex Music Wikidata matches below their provider identity.
+///
+/// Track details can contain multiple artist, album, and track identities. A
+/// generic append would separate an artist's Wikidata disclosure from the
+/// artist it describes, so each result is grouped beside its exact stable ID.
+#[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+fn merge_yandex_music_wikidata_links(
+    details: &mut DetailView,
+    kind: crate::providers::wikidata::WikidataExternalKind,
+    external_id: &str,
+    items: &[crate::domain::WikidataLink],
+) -> Option<usize> {
+    use crate::providers::wikidata::WikidataExternalKind;
+
+    details.wikidata.clear();
+    let mut existing = details
+        .links
+        .iter()
+        .filter_map(|link| link.wikidata_item_id.clone())
+        .collect::<HashSet<_>>();
+    let mut additions = items
+        .iter()
+        .filter_map(|item| {
+            existing
+                .insert(item.item_id.clone())
+                .then(|| DetailLinkView {
+                    label: if item.label == item.item_id {
+                        item.item_id.clone()
+                    } else {
+                        format!("{} ({})", item.label, item.item_id)
+                    },
+                    url: item.url.to_string(),
+                    wikidata_item_id: Some(item.item_id.clone()),
+                    ..DetailLinkView::default()
+                })
+        })
+        .collect::<Vec<_>>();
+    if additions.is_empty() {
+        return None;
+    }
+
+    let internal_anchor = details.links.iter().position(|link| match kind {
+        WikidataExternalKind::YandexMusicArtist => matches!(
+            link.internal_target.as_ref(),
+            Some(DetailLinkInternalTarget::YandexMusicArtist(id)) if id == external_id
+        ),
+        WikidataExternalKind::YandexMusicAlbum => matches!(
+            link.internal_target.as_ref(),
+            Some(DetailLinkInternalTarget::YandexMusicAlbum(id)) if id == external_id
+        ),
+        _ => false,
+    });
+    let anchor = internal_anchor.or_else(|| {
+        let segment = match kind {
+            WikidataExternalKind::YandexMusicTrack => "track",
+            WikidataExternalKind::YandexMusicAlbum => "album",
+            WikidataExternalKind::YandexMusicArtist => "artist",
+            _ => return None,
+        };
+        details
+            .links
+            .iter()
+            .position(|link| yandex_music_url_has_exact_identity(&link.url, segment, external_id))
+    });
+    let insert_at = anchor
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(details.links.len());
+    if anchor.is_some()
+        && let Some(last) = additions.last_mut()
+    {
+        last.presentation = DetailLinkPresentation::LabelAndUrlSpaced;
+    }
+    details.links.splice(insert_at..insert_at, additions);
+    Some(insert_at)
+}
+
+/// Checks one canonical Yandex Music URL for an exact path-segment identity.
+#[cfg(all(feature = "wikidata", feature = "yandex-music"))]
+fn yandex_music_url_has_exact_identity(url: &str, segment: &str, external_id: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host != "music.yandex.ru" && !host.starts_with("music.yandex.") {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments.collect::<Vec<_>>();
+    segments
+        .windows(2)
+        .any(|pair| pair[0] == segment && pair[1] == external_id)
+}
+
+#[cfg(feature = "wikidata")]
+fn is_yandex_music_wikidata_property(property_id: &str) -> bool {
+    yandex_music_wikidata_kind(property_id).is_some()
+}
+
+#[cfg(feature = "wikidata")]
+fn yandex_music_wikidata_kind(
+    property_id: &str,
+) -> Option<crate::providers::wikidata::WikidataExternalKind> {
+    use crate::providers::wikidata::WikidataExternalKind;
+
+    [
+        WikidataExternalKind::YandexMusicTrack,
+        WikidataExternalKind::YandexMusicArtist,
+        WikidataExternalKind::YandexMusicAlbum,
+    ]
+    .into_iter()
+    .find(|kind| kind.property_id() == property_id)
 }
 
 #[cfg(feature = "wikidata")]
@@ -27780,7 +31794,7 @@ mod tests {
     use std::collections::VecDeque;
     #[cfg(feature = "yt-dlp")]
     use std::io::Cursor;
-    #[cfg(any(feature = "acoustid", feature = "yt-dlp"))]
+    #[cfg(any(feature = "acoustid", feature = "yandex-music", feature = "yt-dlp"))]
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -27819,11 +31833,19 @@ mod tests {
     }
 
     /// Deterministic off-thread metadata fixture for local-video controller tests.
+    #[cfg(any(
+        feature = "waveform",
+        all(feature = "images", feature = "local-video-thumbnails")
+    ))]
     struct FixedDurationLocalMediaLoader {
         expected_path: PathBuf,
         duration_seconds: u64,
     }
 
+    #[cfg(any(
+        feature = "waveform",
+        all(feature = "images", feature = "local-video-thumbnails")
+    ))]
     impl LocalMediaLoader for FixedDurationLocalMediaLoader {
         fn load(&self, path: PathBuf) -> LocalMediaItem {
             assert_eq!(path, self.expected_path);
@@ -27836,6 +31858,10 @@ mod tests {
     }
 
     /// Drains one short-lived local metadata worker within a bounded test wait.
+    #[cfg(any(
+        feature = "waveform",
+        all(feature = "images", feature = "local-video-thumbnails")
+    ))]
     fn await_local_metadata(controller: &mut AppController) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while controller.pending_local_media_metadata.is_some() && Instant::now() < deadline {
@@ -27846,6 +31872,2241 @@ mod tests {
             controller.pending_local_media_metadata.is_none(),
             "local metadata worker did not complete before the test deadline"
         );
+    }
+
+    /// Complete provider fixture shared by Yandex Music controller helpers.
+    #[cfg(feature = "yandex-music")]
+    fn yandex_music_track_fixture() -> YandexMusicTrack {
+        let artists = vec![
+            crate::providers::yandex_music::YandexMusicArtist {
+                id: Some("101".to_owned()),
+                name: "First Artist".to_owned(),
+            },
+            crate::providers::yandex_music::YandexMusicArtist {
+                id: Some("202".to_owned()),
+                name: "Second Artist".to_owned(),
+            },
+        ];
+        YandexMusicTrack {
+            id: "303".to_owned(),
+            title: "Fixture Track".to_owned(),
+            artists: artists.clone(),
+            album: Some(YandexMusicAlbumSummary {
+                id: "404".to_owned(),
+                title: "Fixture Album".to_owned(),
+                artists,
+                content_kind: YandexMusicContentKind::Music,
+                artwork_url: Some(
+                    url::Url::parse("https://avatars.yandex.net/get-music-content/fixture/400x400")
+                        .expect("Yandex artwork URL"),
+                ),
+                webpage_url: url::Url::parse("https://music.yandex.com/album/404")
+                    .expect("Yandex album URL"),
+            }),
+            duration_ms: Some(183_000),
+            artwork_url: Some(
+                url::Url::parse("https://avatars.yandex.net/get-music-content/fixture/400x400")
+                    .expect("Yandex artwork URL"),
+            ),
+            content_kind: YandexMusicContentKind::Music,
+            reaction: YandexMusicReaction::Neutral,
+            webpage_url: url::Url::parse("https://music.yandex.com/album/404/track/303")
+                .expect("Yandex track URL"),
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_track_details_expose_distinct_artist_album_and_bare_source_links() {
+        let temporary = tempfile::tempdir().expect("Yandex details root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut track = yandex_music_track_fixture();
+        track
+            .artists
+            .push(crate::providers::yandex_music::YandexMusicArtist {
+                id: None,
+                name: "Unlinked Artist".to_owned(),
+            });
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(track))];
+
+        controller.refresh_yandex_music_rows();
+
+        let details = controller.view.details.as_ref().expect("Yandex details");
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .map(|link| (
+                    link.prefix.as_str(),
+                    link.label.as_str(),
+                    link.url.as_str(),
+                    link.presentation,
+                    link.internal_target.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Artist: ",
+                    "First Artist",
+                    "https://music.yandex.ru/artist/101",
+                    DetailLinkPresentation::LabelOnlySpaced,
+                    Some(DetailLinkInternalTarget::YandexMusicArtist(
+                        "101".to_owned()
+                    )),
+                ),
+                (
+                    "Artist: ",
+                    "Second Artist",
+                    "https://music.yandex.ru/artist/202",
+                    DetailLinkPresentation::LabelOnlySpaced,
+                    Some(DetailLinkInternalTarget::YandexMusicArtist(
+                        "202".to_owned()
+                    )),
+                ),
+                (
+                    "Album: ",
+                    "Fixture Album",
+                    "https://music.yandex.com/album/404",
+                    DetailLinkPresentation::LabelOnlySpaced,
+                    Some(DetailLinkInternalTarget::YandexMusicAlbum("404".to_owned())),
+                ),
+                (
+                    "",
+                    "",
+                    "https://music.yandex.com/album/404/track/303",
+                    DetailLinkPresentation::UrlOnlySpaced,
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(details.description, "Type: Music\nArtist: Unlinked Artist");
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_artist_navigation_uses_exact_ids_and_restores_nested_pages_from_memory() {
+        let temporary = tempfile::tempdir().expect("Yandex artist-navigation root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(1);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.view.screen = Screen::YandexMusic;
+        let original_track = yandex_music_track_fixture();
+        controller.yandex_music_rows =
+            vec![YandexMusicRow::Track(Box::new(original_track.clone()))];
+        controller.refresh_yandex_music_rows();
+
+        assert!(controller.view.yandex_music_actions.artist_available);
+        controller.dispatch(UiAction::OpenYandexMusicArtist);
+        let artist_generation = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exact artist request")
+        {
+            YandexMusicWorkerRequest::Artist {
+                generation,
+                artist_id,
+            } if artist_id == "101" => generation,
+            _ => panic!("unexpected Yandex Music worker request"),
+        };
+        assert_eq!(controller.yandex_music_navigation_back.len(), 1);
+
+        let mut popular_track = original_track.clone();
+        popular_track.id = "505".to_owned();
+        popular_track.title = "Artist Popular Track".to_owned();
+        let artist_album = original_track.album.clone().expect("fixture album");
+        controller.handle_provider_response(ProviderResponse::YandexMusicArtist {
+            generation: artist_generation,
+            result: Ok(YandexMusicArtistPage {
+                artist: original_track.artists[0].clone(),
+                popular_tracks: vec![popular_track.clone()],
+                albums: vec![artist_album.clone()],
+            }),
+        });
+
+        assert_eq!(controller.yandex_music_route, YandexMusicRoute::Artist);
+        assert_eq!(controller.yandex_music_artist_id.as_deref(), Some("101"));
+        assert_eq!(
+            controller
+                .view
+                .rows
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Artist Popular Track", "Fixture Album"]
+        );
+
+        controller.dispatch(UiAction::OpenYandexMusicAlbumById("404".to_owned()));
+        let album_generation = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exact nested album request")
+        {
+            YandexMusicWorkerRequest::Album {
+                generation,
+                album_id,
+            } if album_id == "404" => generation,
+            _ => panic!("unexpected Yandex Music worker request"),
+        };
+        controller.handle_provider_response(ProviderResponse::YandexMusicAlbum {
+            generation: album_generation,
+            result: Ok(YandexMusicAlbum {
+                summary: artist_album,
+                tracks: vec![crate::providers::yandex_music::YandexMusicAlbumTrack {
+                    volume_number: 1,
+                    track_number: 1,
+                    track: popular_track,
+                }],
+            }),
+        });
+        assert_eq!(controller.yandex_music_route, YandexMusicRoute::Album);
+
+        controller.go_back();
+        assert_eq!(controller.yandex_music_route, YandexMusicRoute::Artist);
+        assert_eq!(controller.yandex_music_artist_id.as_deref(), Some("101"));
+        assert_eq!(controller.view.rows[0].title, "Artist Popular Track");
+
+        controller.go_back();
+        assert_eq!(
+            controller.yandex_music_route,
+            YandexMusicRoute::Recommendations
+        );
+        assert_eq!(controller.view.rows[0].title, "Fixture Track");
+        assert!(controller.yandex_music_navigation_back.is_empty());
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_spoken_word_rows_are_not_mislabeled_as_music_tracks_or_albums() {
+        let temporary = tempfile::tempdir().expect("Yandex spoken-word rows root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut episode = yandex_music_track_fixture();
+        episode.content_kind = YandexMusicContentKind::Podcast;
+        episode.album.as_mut().expect("fixture show").content_kind =
+            YandexMusicContentKind::Podcast;
+        let mut audiobook = episode.album.clone().expect("fixture audiobook");
+        audiobook.content_kind = YandexMusicContentKind::Audiobook;
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![
+            YandexMusicRow::Track(Box::new(episode)),
+            YandexMusicRow::Album(Box::new(audiobook)),
+        ];
+
+        controller.refresh_yandex_music_rows();
+
+        assert!(controller.view.rows[0].subtitle.contains("podcast episode"));
+        assert!(controller.view.rows[1].subtitle.ends_with(" · audiobook"));
+        assert!(!controller.view.rows[1].subtitle.ends_with(" · album"));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_details_reserve_native_artwork_for_click_expansion() {
+        let temporary = tempfile::tempdir().expect("Yandex artwork root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+
+        controller.refresh_yandex_music_rows();
+
+        let details = controller.view.details.as_ref().expect("Yandex details");
+        assert_eq!(
+            details.thumbnail_url.as_ref().map(url::Url::as_str),
+            Some("https://avatars.yandex.net/get-music-content/fixture/400x400")
+        );
+        assert_eq!(
+            details
+                .expanded_thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://avatars.yandex.net/get-music-content/fixture/orig")
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_preview_scales_at_full_hd_and_4k_terminal_thresholds() {
+        let temporary = tempfile::tempdir().expect("Yandex adaptive-artwork root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+        controller.refresh_yandex_music_rows();
+
+        for (width, height, expected_size, expected_dimensions) in [
+            (1_920, 1_199, "400x400", (400, 400)),
+            (1_919, 1_200, "400x400", (400, 400)),
+            (1_920, 1_200, "800x800", (800, 800)),
+            (2_560, 1_440, "800x800", (800, 800)),
+            (3_839, 2_160, "800x800", (800, 800)),
+            (3_840, 2_159, "800x800", (800, 800)),
+            (3_840, 2_160, "1000x1000", (1_000, 1_000)),
+            (4_096, 2_160, "1000x1000", (1_000, 1_000)),
+            (1_366, 768, "400x400", (400, 400)),
+        ] {
+            controller.dispatch(UiAction::SetTerminalWindowPixels {
+                width: Some(width),
+                height: Some(height),
+            });
+            let expected =
+                format!("https://avatars.yandex.net/get-music-content/fixture/{expected_size}");
+            assert_eq!(
+                controller.view.rows[0]
+                    .thumbnail_url
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.thumbnail_url.as_ref())
+                    .map(url::Url::as_str),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.expanded_thumbnail_url.as_ref())
+                    .map(url::Url::as_str),
+                Some("https://avatars.yandex.net/get-music-content/fixture/orig"),
+                "the background-prefetched fullscreen source remains native artwork"
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.thumbnail_dimensions),
+                Some(expected_dimensions),
+                "the renderer must know the selected Yandex source dimensions"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    #[test]
+    fn feature_disabled_build_rejects_direct_yandex_album_urls_without_provider_state() {
+        let temporary = tempfile::tempdir().expect("minimal Yandex search state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.search_query = "https://music.yandex.ru/album/24370394".to_owned();
+
+        controller.submit_search();
+
+        assert!(controller.view.status_line.contains("omits"));
+        assert!(controller.view.status_line.contains("yandex-music"));
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    #[test]
+    fn feature_disabled_build_refuses_persisted_yandex_music_playback() {
+        let temporary = tempfile::tempdir().expect("minimal-build state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        let webpage_url = url::Url::parse("https://music.yandex.com/album/2/track/1")
+            .expect("stable Yandex Music page");
+        let item = QueueItem {
+            media: MediaItem {
+                id: MediaId::new(SourceKind::YandexMusic, "1"),
+                kind: MediaKind::Audio,
+                title: "Persisted Yandex track".to_owned(),
+                creator: None,
+                description: None,
+                webpage_url: webpage_url.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(60),
+                published_at: None,
+                statistics: MediaStatistics::default(),
+                license: MediaLicense::Unknown,
+                chapters: Vec::new(),
+                captions: Vec::new(),
+            },
+            playback_location: webpage_url.to_string(),
+            start_at_seconds: None,
+            added_at: 1,
+        };
+
+        controller.play_queue_item(item, false);
+
+        assert!(controller.current_media.is_none());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("omits the `yandex-music` feature"),
+            "a minimal build must explain why persisted Yandex media cannot play"
+        );
+    }
+
+    #[cfg(not(feature = "yandex-music"))]
+    #[test]
+    fn feature_disabled_build_preserves_yandex_music_session_fields() {
+        let temporary = tempfile::tempdir().expect("minimal-build session root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .save_session(
+                &SessionState {
+                    yandex_music_selected_row: Some(17),
+                    yandex_music_search_text: "preserve this query".to_owned(),
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .expect("seed Yandex session state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        assert!(controller.save_session());
+        let saved = controller
+            .store
+            .session()
+            .expect("reload session")
+            .expect("saved session");
+
+        assert_eq!(saved.yandex_music_selected_row, Some(17));
+        assert_eq!(saved.yandex_music_search_text, "preserve this query");
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_download_names_are_portable_bounded_and_never_replace_files() {
+        let long = format!(" .Album:/Track?{}\u{0007}. ", "Ж".repeat(200));
+        let stem = sanitize_yandex_music_filename_stem(&long);
+        assert!(!stem.starts_with([' ', '.']));
+        assert!(!stem.ends_with([' ', '.']));
+        assert!(stem.len() <= MAX_YANDEX_MUSIC_FILENAME_STEM_BYTES);
+        assert!(!stem.chars().any(|character| character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )));
+
+        let temporary = tempfile::tempdir().expect("Yandex download directory");
+        let existing = temporary.path().join("Fixture Track.flac");
+        std::fs::write(&existing, b"existing").expect("existing download");
+        let available =
+            available_yandex_music_download_path(temporary.path(), "Fixture Track", "flac")
+                .expect("available collision-safe destination");
+        assert_eq!(
+            available.file_name().and_then(|name| name.to_str()),
+            Some("Fixture Track (2).flac")
+        );
+        assert_eq!(
+            std::fs::read(existing).expect("prior download"),
+            b"existing",
+            "choosing a destination must not replace prior media"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_album_download_preserves_flattened_track_order_and_positions() {
+        let temporary = tempfile::tempdir().expect("Yandex album download root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (capture, captured_batches) = bounded(1);
+        controller.yandex_music_download_batch_capture = Some(capture);
+
+        let mut album_summary = yandex_music_track_fixture()
+            .album
+            .expect("fixture album summary");
+        album_summary.id = "ordered-album".to_owned();
+        album_summary.title = "Ordered Album".to_owned();
+        let positions = [
+            (1_u32, 1_u32, "track-opening", "Opening"),
+            (1, 2, "track-middle", "Middle"),
+            (2, 1, "track-finale", "Finale"),
+        ];
+        let tracks = positions
+            .into_iter()
+            .map(|(volume_number, track_number, id, title)| {
+                let mut track = yandex_music_track_fixture();
+                track.id = id.to_owned();
+                track.title = title.to_owned();
+                track.album = Some(album_summary.clone());
+                crate::providers::yandex_music::YandexMusicAlbumTrack {
+                    volume_number,
+                    track_number,
+                    track,
+                }
+            })
+            .collect();
+        controller.yandex_music_album = Some(YandexMusicAlbum {
+            summary: album_summary,
+            tracks,
+        });
+
+        controller.download_yandex_music_album();
+
+        let (batch_title, items) = captured_batches
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured controller album batch");
+        assert_eq!(batch_title, "Yandex Music album — Ordered Album");
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.track.id.as_str(), item.file_stem.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("track-opening", "Ordered Album — 01-01 — Opening"),
+                ("track-middle", "Ordered Album — 01-02 — Middle"),
+                ("track-finale", "Ordered Album — 02-01 — Finale"),
+            ],
+            "the controller must preserve the provider's flattened source order and positions"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_recommendation_download_selects_exactly_the_first_twenty_in_order() {
+        let temporary = tempfile::tempdir().expect("Yandex recommendation download root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (capture, captured_batches) = bounded(1);
+        controller.yandex_music_download_batch_capture = Some(capture);
+        controller.yandex_music_recommendations = Some(YandexMusicRecommendationBatch {
+            session_id: "recommendation-session".to_owned(),
+            batch_id: Some("recommendation-batch".to_owned()),
+            tracks: (0_u8..22)
+                .map(|index| {
+                    let mut track = yandex_music_track_fixture();
+                    track.id = format!("recommendation-{index:02}");
+                    track.title = format!("Recommendation {index:02}");
+                    crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                        track,
+                        batch_id: Some(format!("source-batch-{index:02}")),
+                    }
+                })
+                .collect(),
+        });
+
+        controller.download_twenty_yandex_music_recommendations();
+
+        let (batch_title, items) = captured_batches
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured controller recommendation batch");
+        assert_eq!(batch_title, "Twenty Yandex Music recommendations");
+        assert_eq!(items.len(), 20);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.track.id.as_str())
+                .collect::<Vec<_>>(),
+            (0_u8..20)
+                .map(|index| format!("recommendation-{index:02}"))
+                .collect::<Vec<_>>(),
+            "the controller must retain provider order and exclude recommendations after twenty"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.file_stem.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "My Wave 01 — First Artist, Second Artist — Recommendation 00",
+                "My Wave 02 — First Artist, Second Artist — Recommendation 01",
+                "My Wave 03 — First Artist, Second Artist — Recommendation 02",
+                "My Wave 04 — First Artist, Second Artist — Recommendation 03",
+                "My Wave 05 — First Artist, Second Artist — Recommendation 04",
+                "My Wave 06 — First Artist, Second Artist — Recommendation 05",
+                "My Wave 07 — First Artist, Second Artist — Recommendation 06",
+                "My Wave 08 — First Artist, Second Artist — Recommendation 07",
+                "My Wave 09 — First Artist, Second Artist — Recommendation 08",
+                "My Wave 10 — First Artist, Second Artist — Recommendation 09",
+                "My Wave 11 — First Artist, Second Artist — Recommendation 10",
+                "My Wave 12 — First Artist, Second Artist — Recommendation 11",
+                "My Wave 13 — First Artist, Second Artist — Recommendation 12",
+                "My Wave 14 — First Artist, Second Artist — Recommendation 13",
+                "My Wave 15 — First Artist, Second Artist — Recommendation 14",
+                "My Wave 16 — First Artist, Second Artist — Recommendation 15",
+                "My Wave 17 — First Artist, Second Artist — Recommendation 16",
+                "My Wave 18 — First Artist, Second Artist — Recommendation 17",
+                "My Wave 19 — First Artist, Second Artist — Recommendation 18",
+                "My Wave 20 — First Artist, Second Artist — Recommendation 19",
+            ]
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_playback_cache_uses_hashed_identity_and_rejects_partial_files() {
+        let first =
+            yandex_music_playback_cache_key("track:/unsafe", "flac", "Lossless", None, Some(4));
+        let changed =
+            yandex_music_playback_cache_key("track:/unsafe", "flac", "Lossless", None, Some(5));
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains("track"));
+        assert_ne!(first, changed);
+
+        let temporary = tempfile::tempdir().expect("Yandex playback cache");
+        let path = temporary.path().join(format!("{first}.flac"));
+        std::fs::write(&path, b"bad").expect("partial cache fixture");
+        assert!(!yandex_music_playback_cache_file_is_valid(&path, Some(4)));
+        assert!(!yandex_music_playback_cache_file_is_valid(&path, None));
+        std::fs::write(&path, b"good").expect("complete cache fixture");
+        assert!(yandex_music_playback_cache_file_is_valid(&path, Some(4)));
+
+        let older = temporary.path().join("older.flac");
+        let newest = temporary.path().join("newest.flac");
+        std::fs::write(&older, b"old").expect("older cache fixture");
+        std::fs::write(&newest, b"keep").expect("retained cache fixture");
+        prune_yandex_music_playback_cache_to_limits(temporary.path(), Some(&newest), 1, 4)
+            .expect("bounded playback cache");
+        assert!(newest.is_file());
+        assert!(!older.exists());
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_queue_items_persist_only_stable_provider_metadata() {
+        let track = yandex_music_track_fixture();
+        let item = queue_item_from_yandex_music_track(&track);
+        assert_eq!(item.media.id, MediaId::new(SourceKind::YandexMusic, "303"));
+        assert_eq!(item.playback_location, track.webpage_url.as_str());
+        assert!(!item.playback_location.contains("sign="));
+        assert!(!item.playback_location.contains("token="));
+
+        let restored = yandex_music_track_from_queue_item(&item);
+        assert_eq!(restored.id, track.id);
+        assert_eq!(restored.title, track.title);
+        assert_eq!(restored.webpage_url, track.webpage_url);
+        assert_eq!(
+            yandex_music_artist_names(&restored.artists),
+            "First Artist, Second Artist"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_todo_note_and_history_restart_without_persisting_resolved_media() {
+        let temporary = tempfile::tempdir().expect("Yandex integration state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let (factory, _playback, _statuses, events) = mock_playback_factory([], []);
+        let mut controller = AppController::new(config.clone(), store, None, Some(factory));
+        let track = yandex_music_track_fixture();
+        let media_id = MediaId::new(SourceKind::YandexMusic, &track.id);
+        let canonical_url = track.webpage_url.to_string();
+        let note_target = CommentTarget::Media {
+            media_id: media_id.clone(),
+        };
+
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.selected = 0;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(track.clone()))];
+        controller.refresh_yandex_music_rows();
+        controller.toggle_selected_todo();
+        controller.open_private_note_popup();
+        let note = controller
+            .view
+            .private_note_popup
+            .as_mut()
+            .expect("Yandex private-note editor");
+        note.body = "Remember this Yandex track".to_owned();
+        note.cursor_byte = note.body.len();
+        controller.save_private_note();
+
+        let item = queue_item_from_yandex_music_track(&track);
+        let resolved_url = "https://cdn.example.test/audio.flac?token=must-not-persist";
+        let mut resolved_input = PlaybackInput::new(resolved_url);
+        resolved_input.bypass_ytdl = true;
+        controller.play_queue_item_with_origin_and_input(item, false, None, Some(resolved_input));
+        events
+            .lock()
+            .expect("mock playback events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+
+        assert!(controller.shutdown());
+        drop(controller);
+
+        let reopened = StateStore::open(&config).expect("reopened Yandex state");
+        let todo = reopened
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("todo playlist")
+            .expect("persisted todo playlist");
+        let [todo_entry] = todo.entries.as_slice() else {
+            panic!("todo must contain exactly the selected Yandex track");
+        };
+        assert_eq!(todo_entry.media.id, media_id);
+        assert_eq!(todo_entry.media.replay_locator, canonical_url);
+        let playlist_item =
+            queue_item_from_playlist_entry(todo_entry).expect("replayable Yandex todo item");
+        assert_eq!(playlist_item.media.id, media_id);
+        assert_eq!(playlist_item.playback_location, canonical_url);
+
+        let note = reopened
+            .private_note(&note_target)
+            .expect("Yandex private note")
+            .expect("persisted Yandex private note");
+        assert_eq!(note.body, "Remember this Yandex track");
+
+        let history = reopened.history(false, 10).expect("Yandex History");
+        let [history_entry] = history.as_slice() else {
+            panic!("History must contain exactly the started Yandex track");
+        };
+        assert_eq!(history_entry.media_id, media_id);
+        assert_eq!(
+            history_entry.replay_locator.as_deref(),
+            Some(canonical_url.as_str())
+        );
+        let history_target =
+            history_replay_target(history_entry).expect("replayable Yandex History target");
+        let history_item = queue_item_from_history(history_entry, &history_target)
+            .expect("reconstructed Yandex History item");
+        assert_eq!(history_item.media.id, media_id);
+        assert_eq!(history_item.playback_location, canonical_url);
+
+        for state_file in ["playlists.toml", "notes.toml", "history.toml"] {
+            let encoded = std::fs::read_to_string(config.state_dir().join(state_file))
+                .expect("human-readable Yandex state");
+            assert!(
+                !encoded.contains(resolved_url) && !encoded.contains("must-not-persist"),
+                "{state_file} must never retain the RAM-only resolved media URL"
+            );
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn restored_yandex_music_screen_uses_its_own_search_query() {
+        let temporary = tempfile::tempdir().expect("Yandex session root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .save_session(
+                &SessionState {
+                    screen: StoredScreen::YandexMusic,
+                    search_text: "unrelated YouTube query".to_owned(),
+                    yandex_music_search_text: "restored Yandex query".to_owned(),
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .expect("saved Yandex session");
+
+        let controller = AppController::new(config, store, None, None);
+
+        assert_eq!(controller.view.search_query, "restored Yandex query");
+        assert_eq!(
+            controller.yandex_music_search_query,
+            "restored Yandex query"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_bootstrap_without_batch_ids_keeps_recommendations_usable() {
+        let temporary = tempfile::tempdir().expect("Yandex bootstrap root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(1);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.view.screen = Screen::YandexMusic;
+        let generation = controller.yandex_music_generation;
+        let recommendations = (0_u8..20)
+            .map(|index| {
+                let mut track = yandex_music_track_fixture();
+                track.id = format!("track-{index}");
+                track.title = format!("Recommendation {}", index.saturating_add(1));
+                crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                    track,
+                    batch_id: None,
+                }
+            })
+            .collect();
+
+        controller.handle_provider_response(ProviderResponse::YandexMusicBootstrap {
+            generation,
+            result: Ok((
+                YandexMusicAccount {
+                    uid: "account-1".to_owned(),
+                    display_name: Some("Fixture Listener".to_owned()),
+                    service_available: Some(true),
+                },
+                YandexMusicRecommendationBatch {
+                    session_id: "session-1".to_owned(),
+                    batch_id: None,
+                    tracks: recommendations,
+                },
+            )),
+        });
+
+        assert_eq!(controller.view.rows.len(), 20);
+        assert_eq!(controller.view.rows[0].title, "Recommendation 1");
+        assert!(
+            controller
+                .view
+                .yandex_music_actions
+                .twenty_recommendations_available
+        );
+        assert!(
+            controller
+                .yandex_music_recommendations
+                .as_ref()
+                .is_some_and(|batch| {
+                    batch.batch_id.is_none()
+                        && batch.tracks.iter().all(|track| track.batch_id.is_none())
+                })
+        );
+
+        controller.activate_yandex_music_selection();
+
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("selected recommendation resolution request"),
+            YandexMusicWorkerRequest::Resolve { track, .. } if track.id == "track-0"
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_bootstrap_rate_limit_does_not_claim_that_the_token_expired() {
+        let temporary = tempfile::tempdir().expect("Yandex rate-limit root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+        let generation = controller.yandex_music_generation;
+
+        controller.handle_provider_response(ProviderResponse::YandexMusicBootstrap {
+            generation,
+            result: Err("provider returned HTTP status 429".to_owned()),
+        });
+
+        let report = &controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("rate-limit diagnostic")
+            .report;
+        assert!(report.contains("rate-limited"));
+        assert!(report.contains("Keep the saved OAuth token"));
+        assert!(!report.contains("expired OAuth token"));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_bootstrap_unauthorized_response_retains_token_replacement_guidance() {
+        let temporary = tempfile::tempdir().expect("Yandex unauthorized root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+        let generation = controller.yandex_music_generation;
+
+        controller.handle_provider_response(ProviderResponse::YandexMusicBootstrap {
+            generation,
+            result: Err("provider returned HTTP status 401".to_owned()),
+        });
+
+        let report = &controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("unauthorized diagnostic")
+            .report;
+        assert!(report.contains("provider returned HTTP status 401"));
+        assert!(report.contains("Replace an expired OAuth token"));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn first_yandex_search_without_a_token_opens_the_setup_editor() {
+        let temporary = tempfile::tempdir().expect("Yandex first-search root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::YandexMusic;
+
+        controller.submit_yandex_music_search("first query".to_owned());
+
+        assert!(controller.view.yandex_music_setup_popup.is_some());
+        assert!(controller.pending_yandex_music_playback.is_none());
+        assert_eq!(controller.yandex_music_search_query, "");
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn changing_yandex_search_scope_reruns_the_visible_query() {
+        let temporary = tempfile::tempdir().expect("Yandex scope-switch root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(1);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.view.screen = Screen::YandexMusic;
+        controller.set_yandex_music_route(YandexMusicRoute::Search);
+        controller.view.yandex_music_search_kind = YandexMusicSearchKind::Music;
+        controller.view.search_query = "fixture query".to_owned();
+        controller.yandex_music_search_query = "fixture query".to_owned();
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+        controller.refresh_yandex_music_rows();
+
+        controller.dispatch(UiAction::CycleYandexMusicSearchKind);
+
+        assert_eq!(
+            controller.view.yandex_music_search_kind,
+            YandexMusicSearchKind::Podcasts
+        );
+        assert!(controller.yandex_music_rows.is_empty());
+        assert!(controller.view.rows.is_empty());
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement scoped search request"),
+            YandexMusicWorkerRequest::Search { query, scope, .. }
+                if query == "fixture query" && scope == YandexMusicSearchScope::Podcasts
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn direct_yandex_album_url_opens_the_exact_catalogue_item() {
+        let temporary = tempfile::tempdir().expect("Yandex direct-album root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(1);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.search_query = "https://music.yandex.ru/album/24370394".to_owned();
+
+        controller.submit_search();
+
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("direct album request"),
+            YandexMusicWorkerRequest::Album { album_id, .. }
+                if album_id == "24370394"
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn failed_yandex_search_clears_actions_for_the_discarded_selection() {
+        let temporary = tempfile::tempdir().expect("Yandex failed-search root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(1);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+        controller.refresh_yandex_music_rows();
+        assert!(controller.view.yandex_music_actions.track_selected);
+
+        controller.submit_yandex_music_search("fixture query".to_owned());
+        let generation = controller.yandex_music_generation;
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("search request"),
+            YandexMusicWorkerRequest::Search { generation: request_generation, .. }
+                if request_generation == generation
+        ));
+        controller.handle_provider_response(ProviderResponse::YandexMusicSearch {
+            generation,
+            result: Err("malformed live search response".to_owned()),
+        });
+
+        assert!(controller.yandex_music_rows.is_empty());
+        assert!(controller.view.rows.is_empty());
+        assert!(controller.view.details.is_none());
+        assert_eq!(
+            controller.view.yandex_music_actions,
+            YandexMusicActionsView::default(),
+            "controls must never target the selection discarded before a failed search"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_search_back_restores_cached_my_wave_without_network_work() {
+        let temporary = tempfile::tempdir().expect("Yandex route root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let recommended = yandex_music_track_fixture();
+        let mut search_result = recommended.clone();
+        search_result.id = "search-result".to_owned();
+        search_result.title = "Search Result".to_owned();
+        controller.yandex_music_recommendations = Some(YandexMusicRecommendationBatch {
+            session_id: "session-1".to_owned(),
+            batch_id: Some("batch-1".to_owned()),
+            tracks: vec![
+                crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                    track: recommended.clone(),
+                    batch_id: Some("batch-1".to_owned()),
+                },
+            ],
+        });
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(search_result))];
+        controller.yandex_music_route = YandexMusicRoute::Search;
+        controller.view.yandex_music_route = YandexMusicRouteView::Search;
+        controller.view.screen = Screen::YandexMusic;
+        controller.refresh_yandex_music_rows();
+
+        controller.go_back();
+
+        assert_eq!(
+            controller.yandex_music_route,
+            YandexMusicRoute::Recommendations
+        );
+        assert_eq!(
+            controller.view.yandex_music_route,
+            YandexMusicRouteView::Recommendations
+        );
+        assert!(matches!(
+            controller.yandex_music_rows.as_slice(),
+            [YandexMusicRow::Track(track)] if track.id == recommended.id
+        ));
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("My Wave recommendations")
+        );
+    }
+
+    #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
+    #[test]
+    fn selected_yandex_track_requests_track_all_artists_and_album_wikidata() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let track = yandex_music_track_fixture();
+        let lookups = yandex_music_wikidata_lookups(&YandexMusicRow::Track(Box::new(track)));
+        assert_eq!(
+            lookups,
+            vec![
+                (WikidataExternalKind::YandexMusicTrack, "303".to_owned()),
+                (WikidataExternalKind::YandexMusicArtist, "101".to_owned()),
+                (WikidataExternalKind::YandexMusicArtist, "202".to_owned()),
+                (WikidataExternalKind::YandexMusicAlbum, "404".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
+    #[test]
+    fn yandex_wikidata_rows_follow_their_exact_artist_anchors() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let track = yandex_music_track_fixture();
+        let mut details = DetailView {
+            links: yandex_music_track_detail_links(&track),
+            ..DetailView::default()
+        };
+        let item = |item_id: &str, label: &str| crate::domain::WikidataLink {
+            item_id: item_id.to_owned(),
+            label: label.to_owned(),
+            description: None,
+            url: url::Url::parse(&format!("https://www.wikidata.org/wiki/{item_id}"))
+                .expect("Wikidata fixture URL"),
+        };
+
+        merge_yandex_music_wikidata_links(
+            &mut details,
+            WikidataExternalKind::YandexMusicArtist,
+            "202",
+            &[item("Q202", "Second artist item")],
+        );
+        merge_yandex_music_wikidata_links(
+            &mut details,
+            WikidataExternalKind::YandexMusicArtist,
+            "101",
+            &[item("Q101", "First artist item")],
+        );
+
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .map(|link| (
+                    link.prefix.as_str(),
+                    link.label.as_str(),
+                    link.wikidata_item_id.as_deref(),
+                    link.presentation,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Artist: ",
+                    "First Artist",
+                    None,
+                    DetailLinkPresentation::LabelOnlySpaced,
+                ),
+                (
+                    "",
+                    "First artist item (Q101)",
+                    Some("Q101"),
+                    DetailLinkPresentation::LabelAndUrlSpaced,
+                ),
+                (
+                    "Artist: ",
+                    "Second Artist",
+                    None,
+                    DetailLinkPresentation::LabelOnlySpaced,
+                ),
+                (
+                    "",
+                    "Second artist item (Q202)",
+                    Some("Q202"),
+                    DetailLinkPresentation::LabelAndUrlSpaced,
+                ),
+                (
+                    "Album: ",
+                    "Fixture Album",
+                    None,
+                    DetailLinkPresentation::LabelOnlySpaced,
+                ),
+                ("", "", None, DetailLinkPresentation::UrlOnlySpaced,),
+            ]
+        );
+    }
+
+    #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
+    #[test]
+    fn yandex_wikidata_waits_for_stable_selection_and_serializes_exact_ids() {
+        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.selected = 0;
+        controller.view.details = Some(DetailView::default());
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+
+        controller.request_selected_yandex_music_wikidata();
+        let first_generation = controller.wikidata_generation;
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            controller
+                .scheduled_yandex_music_wikidata
+                .as_ref()
+                .expect("deferred exact identities")
+                .lookups
+                .len(),
+            4
+        );
+
+        controller.request_selected_yandex_music_wikidata();
+        assert_ne!(controller.wikidata_generation, first_generation);
+        let scheduled = controller
+            .scheduled_yandex_music_wikidata
+            .clone()
+            .expect("replacement schedule");
+        controller.request_due_yandex_music_wikidata(scheduled.due_at);
+        let (generation, kind, external_id) = match captured_requests
+            .try_recv()
+            .expect("first serialized Wikidata request")
+        {
+            ProviderRequest::Wikidata {
+                generation,
+                kind,
+                external_id,
+            } => (generation, kind, external_id),
+            _ => panic!("unexpected provider request"),
+        };
+        assert_eq!(generation, controller.wikidata_generation);
+        assert_eq!(
+            controller
+                .scheduled_yandex_music_wikidata
+                .as_ref()
+                .expect("remaining exact identities")
+                .lookups
+                .len(),
+            3
+        );
+
+        controller.request_due_yandex_music_wikidata(scheduled.due_at);
+        assert!(
+            matches!(captured_requests.try_recv(), Err(TryRecvError::Empty)),
+            "a second identity must wait for the first provider response"
+        );
+
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: kind.property_id().to_owned(),
+            external_id,
+            result: Ok(Vec::new()),
+        });
+        assert!(controller.pending_yandex_music_wikidata.is_none());
+        controller.request_due_yandex_music_wikidata(scheduled.due_at);
+        assert!(matches!(
+            captured_requests
+                .try_recv()
+                .expect("second serialized Wikidata request"),
+            ProviderRequest::Wikidata { .. }
+        ));
+    }
+
+    #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
+    #[test]
+    fn yandex_wikidata_merges_fresh_cache_before_scheduling_only_misses() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        store
+            .put_cached_wikidata(&CachedWikidataLookup {
+                property_id: WikidataExternalKind::YandexMusicTrack
+                    .property_id()
+                    .to_owned(),
+                external_id: "303".to_owned(),
+                items: vec![crate::domain::WikidataLink {
+                    item_id: "Q638".to_owned(),
+                    label: "Music".to_owned(),
+                    description: Some("auditory art form".to_owned()),
+                    url: url::Url::parse("https://www.wikidata.org/wiki/Q638")
+                        .expect("Wikidata fixture URL"),
+                }],
+                fetched_at: unix_time(),
+                expires_at: i64::MAX,
+            })
+            .expect("seed exact track cache");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.selected = 0;
+        controller.view.details = Some(DetailView::default());
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+
+        controller.request_selected_yandex_music_wikidata();
+
+        let details = controller.view.details.as_ref().expect("Yandex details");
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter_map(|link| link.wikidata_item_id.as_deref())
+                .collect::<Vec<_>>(),
+            ["Q638"],
+            "fresh exact identities must appear without a network round trip"
+        );
+        let scheduled = controller
+            .scheduled_yandex_music_wikidata
+            .as_ref()
+            .expect("only cache misses remain deferred");
+        assert_eq!(scheduled.lookups.len(), 3);
+        assert!(scheduled.lookups.iter().all(|(kind, external_id)| {
+            !(*kind == WikidataExternalKind::YandexMusicTrack && external_id == "303")
+        }));
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_retry_batch_is_bounded_for_a_full_outbox() {
+        let pending = (0_u64..10_000)
+            .map(|index| PendingYandexMusicReaction {
+                account_uid: "account-1".to_owned(),
+                track_id: format!("track-{index:05}"),
+                reaction: YandexMusicReaction::Liked,
+                generation: index.saturating_add(1),
+                updated_at: i64::try_from(index).expect("bounded fixture timestamp"),
+            })
+            .collect();
+
+        let batch = bounded_yandex_music_reaction_retry_batch(pending);
+
+        assert_eq!(batch.len(), MAX_YANDEX_MUSIC_REACTION_RETRIES_PER_PASS);
+        assert!(
+            batch.len() < 10_000,
+            "one startup or shutdown pass must never enqueue the complete durable outbox"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_dispatcher_never_interleaves_opposite_intents() {
+        struct BlockingSynchronizer {
+            started: Sender<(u64, YandexMusicReaction)>,
+            release: Receiver<()>,
+            remote_state: Arc<Mutex<YandexMusicReaction>>,
+        }
+
+        impl YandexMusicReactionSynchronizer for BlockingSynchronizer {
+            fn adopt_token(&mut self, _token: String) {}
+
+            fn synchronize(&mut self, pending: &PendingYandexMusicReaction) -> Result<(), String> {
+                self.started
+                    .send((pending.generation, pending.reaction))
+                    .expect("publish blocked mutation");
+                self.release.recv().expect("release blocked mutation");
+                *self.remote_state.lock().expect("remote state") = pending.reaction;
+                Ok(())
+            }
+        }
+
+        let (requests, request_receiver) = unbounded();
+        let (responses, response_receiver) = unbounded();
+        let (started, started_receiver) = unbounded();
+        let (release, release_receiver) = unbounded();
+        let remote_state = Arc::new(Mutex::new(YandexMusicReaction::Neutral));
+        let worker_state = Arc::clone(&remote_state);
+        let worker = thread::spawn(move || {
+            yandex_music_reaction_dispatcher_worker(
+                request_receiver,
+                responses,
+                BlockingSynchronizer {
+                    started,
+                    release: release_receiver,
+                    remote_state: worker_state,
+                },
+                Arc::new(AtomicBool::new(false)),
+            );
+        });
+        let intent = |generation, reaction| PendingYandexMusicReaction {
+            account_uid: "account-1".to_owned(),
+            track_id: "track-1".to_owned(),
+            reaction,
+            generation,
+            updated_at: i64::try_from(generation).expect("fixture generation"),
+        };
+
+        requests
+            .send(YandexMusicReactionWorkerRequest::Synchronize(intent(
+                1,
+                YandexMusicReaction::Liked,
+            )))
+            .expect("queue old like");
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old mutation started"),
+            (1, YandexMusicReaction::Liked)
+        );
+        requests
+            .send(YandexMusicReactionWorkerRequest::Synchronize(intent(
+                2,
+                YandexMusicReaction::Disliked,
+            )))
+            .expect("queue newer dislike");
+        assert!(
+            started_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "a newer opposite mutation must not start while the older one is in flight"
+        );
+
+        release.send(()).expect("finish old mutation");
+        assert!(matches!(
+            response_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old response"),
+            ProviderResponse::YandexMusicReaction {
+                pending: PendingYandexMusicReaction { generation: 1, .. },
+                result: Ok(()),
+            }
+        ));
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("new mutation started"),
+            (2, YandexMusicReaction::Disliked)
+        );
+        release.send(()).expect("finish new mutation");
+        assert!(matches!(
+            response_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("new response"),
+            ProviderResponse::YandexMusicReaction {
+                pending: PendingYandexMusicReaction { generation: 2, .. },
+                result: Ok(()),
+            }
+        ));
+        requests
+            .send(YandexMusicReactionWorkerRequest::Shutdown)
+            .expect("stop dispatcher");
+        worker.join().expect("dispatcher joined");
+        assert_eq!(
+            *remote_state.lock().expect("remote state"),
+            YandexMusicReaction::Disliked,
+            "the latest desired state must be the final remote state"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_dispatcher_coalesces_queued_revisions_per_track() {
+        struct RecordingSynchronizer {
+            synchronized: Sender<PendingYandexMusicReaction>,
+        }
+
+        impl YandexMusicReactionSynchronizer for RecordingSynchronizer {
+            fn adopt_token(&mut self, _token: String) {}
+
+            fn synchronize(&mut self, pending: &PendingYandexMusicReaction) -> Result<(), String> {
+                self.synchronized
+                    .send(pending.clone())
+                    .expect("record synchronized intent");
+                Ok(())
+            }
+        }
+
+        let (requests, request_receiver) = unbounded();
+        let (responses, _response_receiver) = unbounded();
+        let (synchronized, synchronized_receiver) = unbounded();
+        let intent = |generation, reaction| PendingYandexMusicReaction {
+            account_uid: "account-1".to_owned(),
+            track_id: "track-1".to_owned(),
+            reaction,
+            generation,
+            updated_at: i64::try_from(generation).expect("fixture generation"),
+        };
+        requests
+            .send(YandexMusicReactionWorkerRequest::Synchronize(intent(
+                1,
+                YandexMusicReaction::Liked,
+            )))
+            .expect("queue revision one");
+        requests
+            .send(YandexMusicReactionWorkerRequest::Synchronize(intent(
+                2,
+                YandexMusicReaction::Disliked,
+            )))
+            .expect("queue revision two");
+        requests
+            .send(YandexMusicReactionWorkerRequest::Synchronize(intent(
+                3,
+                YandexMusicReaction::Neutral,
+            )))
+            .expect("queue revision three");
+        requests
+            .send(YandexMusicReactionWorkerRequest::Shutdown)
+            .expect("queue shutdown");
+
+        yandex_music_reaction_dispatcher_worker(
+            request_receiver,
+            responses,
+            RecordingSynchronizer { synchronized },
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let synchronized = synchronized_receiver
+            .try_iter()
+            .collect::<Vec<PendingYandexMusicReaction>>();
+        assert_eq!(synchronized.len(), 1);
+        assert_eq!(synchronized[0].generation, 3);
+        assert_eq!(synchronized[0].reaction, YandexMusicReaction::Neutral);
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_dispatcher_wait_has_a_hard_deadline() {
+        let worker = thread::spawn(|| thread::sleep(Duration::from_secs(1)));
+        let started_at = Instant::now();
+        let stopping = AtomicBool::new(false);
+
+        let joined = join_yandex_music_reaction_dispatcher_within(
+            worker,
+            Duration::from_millis(20),
+            &stopping,
+        );
+
+        assert!(!joined, "a slow reaction dispatcher must be detached");
+        assert!(stopping.load(AtomicOrdering::Acquire));
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "graceful shutdown must not wait for the provider's full network timeout"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_foreground_worker_wait_has_a_hard_deadline() {
+        let worker = thread::spawn(|| thread::sleep(Duration::from_secs(1)));
+        let started_at = Instant::now();
+
+        let joined = join_yandex_music_provider_worker_within(worker, Duration::from_millis(20));
+
+        assert!(
+            !joined,
+            "a slow foreground provider worker must be detached"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "graceful shutdown must not wait for the provider's full network timeout"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_foreground_request_queue_is_bounded() {
+        let (requests, _retained) = bounded(1);
+        requests
+            .try_send(YandexMusicWorkerRequest::Bootstrap { generation: 1 })
+            .expect("first request fits");
+
+        assert!(matches!(
+            requests.try_send(YandexMusicWorkerRequest::Bootstrap { generation: 2 }),
+            Err(TrySendError::Full(YandexMusicWorkerRequest::Bootstrap {
+                generation: 2
+            }))
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_request_queue_is_bounded() {
+        let (requests, _retained) = bounded(YANDEX_MUSIC_REACTION_QUEUE_CAPACITY);
+        for index in 0..YANDEX_MUSIC_REACTION_QUEUE_CAPACITY {
+            requests
+                .try_send(YandexMusicReactionWorkerRequest::Synchronize(
+                    PendingYandexMusicReaction {
+                        account_uid: "account-1".to_owned(),
+                        track_id: format!("track-{index}"),
+                        reaction: YandexMusicReaction::Liked,
+                        generation: 1,
+                        updated_at: 1,
+                    },
+                ))
+                .expect("configured reaction request capacity");
+        }
+
+        assert!(matches!(
+            requests.try_send(YandexMusicReactionWorkerRequest::Synchronize(
+                PendingYandexMusicReaction {
+                    account_uid: "account-1".to_owned(),
+                    track_id: "overflow".to_owned(),
+                    reaction: YandexMusicReaction::Liked,
+                    generation: 1,
+                    updated_at: 1,
+                },
+            )),
+            Err(TrySendError::Full(
+                YandexMusicReactionWorkerRequest::Synchronize(_)
+            ))
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn stopped_yandex_foreground_worker_skips_queued_work() {
+        let (requests, worker_requests) = bounded(1);
+        let (responses, worker_responses) = unbounded();
+        requests
+            .send(YandexMusicWorkerRequest::Bootstrap { generation: 1 })
+            .expect("queued fixture request");
+        drop(requests);
+        let stopping = Arc::new(AtomicBool::new(true));
+
+        yandex_music_provider_worker(worker_requests, responses, None, stopping);
+
+        assert!(matches!(
+            worker_responses.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn my_wave_bootstrap_never_sits_behind_offline_reaction_retries() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 1)
+            .expect("offline reaction");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        controller
+            .yandex_music_reaction_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_reaction_requests.take();
+        if let Some(handle) = controller.yandex_music_reaction_thread.take() {
+            handle.join().expect("reaction fixture joined");
+        }
+        let (foreground_requests, retained_foreground_requests) = bounded(1);
+        controller.yandex_music_requests = Some(foreground_requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        let (reaction_requests, retained_reaction_requests) =
+            bounded(YANDEX_MUSIC_REACTION_QUEUE_CAPACITY);
+        controller.yandex_music_reaction_requests = Some(reaction_requests);
+        controller.yandex_music_reaction_request_drain = retained_reaction_requests.clone();
+        controller
+            .yandex_music_reaction_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.config.providers.yandex_music_token = Some(String::new());
+
+        controller.retry_pending_yandex_music_reactions();
+        controller.open_yandex_music_home();
+
+        assert!(matches!(
+            retained_foreground_requests
+                .try_recv()
+                .expect("foreground My Wave request"),
+            YandexMusicWorkerRequest::Bootstrap { .. }
+        ));
+        assert!(
+            matches!(
+                retained_foreground_requests.try_recv(),
+                Err(TryRecvError::Empty)
+            ),
+            "offline reactions must use the serialized reaction lane"
+        );
+        assert!(matches!(
+            retained_reaction_requests
+                .try_recv()
+                .expect("serialized reaction retry"),
+            YandexMusicReactionWorkerRequest::Synchronize(PendingYandexMusicReaction {
+                generation: 1,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn constructor_retries_and_retains_a_durable_offline_reaction() {
+        let temporary = tempfile::tempdir().expect("Yandex startup state root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let pending = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Disliked, 1)
+            .expect("offline reaction");
+        // An invalid in-memory token makes the production synchronizer fail
+        // before network access while still exercising constructor retry.
+        config.providers.yandex_music_token = Some(String::new());
+
+        let mut controller = AppController::new(config, store, None, None);
+
+        let response = controller
+            .provider_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("constructor-started reaction response");
+        let ProviderResponse::YandexMusicReaction {
+            pending: attempted,
+            result,
+        } = response
+        else {
+            panic!("constructor retry must use the reaction lane");
+        };
+        assert_eq!(attempted, pending);
+        assert!(
+            result.is_err(),
+            "the invalid fixture token must stay offline"
+        );
+        assert_eq!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("retained reaction outbox"),
+            vec![pending],
+            "a failed constructor retry must remain durable for a later start"
+        );
+        assert!(controller.shutdown());
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn successful_shutdown_retry_acknowledges_the_durable_reaction() {
+        struct RecordingSynchronizer {
+            synchronized: Sender<PendingYandexMusicReaction>,
+        }
+
+        impl YandexMusicReactionSynchronizer for RecordingSynchronizer {
+            fn adopt_token(&mut self, _token: String) {}
+
+            fn synchronize(&mut self, pending: &PendingYandexMusicReaction) -> Result<(), String> {
+                self.synchronized
+                    .send(pending.clone())
+                    .expect("record shutdown synchronization");
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("Yandex shutdown state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let pending = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 1)
+            .expect("offline reaction");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller
+            .yandex_music_reaction_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_reaction_requests.take();
+        if let Some(handle) = controller.yandex_music_reaction_thread.take() {
+            handle.join().expect("production reaction worker joined");
+        }
+
+        let (requests, request_receiver) = bounded(YANDEX_MUSIC_REACTION_QUEUE_CAPACITY);
+        let request_drain = request_receiver.clone();
+        let (responses, response_receiver) = unbounded();
+        let (synchronized, synchronized_receiver) = unbounded();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = thread::spawn(move || {
+            yandex_music_reaction_dispatcher_worker(
+                request_receiver,
+                responses,
+                RecordingSynchronizer { synchronized },
+                worker_stopping,
+            );
+        });
+        controller.provider_responses = response_receiver;
+        controller.yandex_music_reaction_requests = Some(requests);
+        controller.yandex_music_reaction_request_drain = request_drain;
+        controller.yandex_music_reaction_stopping = stopping;
+        controller.yandex_music_reaction_thread = Some(worker);
+        controller.config.providers.yandex_music_token = Some("fixture-token".to_owned());
+
+        assert!(controller.shutdown_yandex_music_worker());
+
+        assert_eq!(
+            synchronized_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown synchronization"),
+            pending
+        );
+        assert!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("acknowledged reaction outbox")
+                .is_empty(),
+            "a successful shutdown retry must persist its acknowledgement"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn failed_shutdown_reaction_retry_remains_in_the_durable_outbox() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let pending = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 1)
+            .expect("offline reaction");
+        let mut controller = AppController::new(config, store, None, None);
+
+        assert!(controller.shutdown_yandex_music_worker());
+
+        assert_eq!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("reaction outbox"),
+            vec![pending],
+            "a missing token/provider failure must not acknowledge offline intent"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn successful_reaction_response_acknowledges_the_exact_durable_intent() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let pending = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Disliked, 2)
+            .expect("offline reaction");
+        let mut controller = AppController::new(config, store, None, None);
+
+        assert!(controller.apply_yandex_music_reaction_response(pending, Ok(()), false,));
+        assert!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("reaction outbox")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn stale_successful_reaction_response_cannot_acknowledge_a_newer_intent() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let stale = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 1)
+            .expect("stale offline reaction");
+        let current = store
+            .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Disliked, 2)
+            .expect("newer offline reaction");
+        let mut controller = AppController::new(config, store, None, None);
+
+        assert!(controller.apply_yandex_music_reaction_response(stale, Ok(()), false));
+        assert_eq!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("reaction outbox"),
+            vec![current],
+            "compare-and-update acknowledgement must preserve the newer generation"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn unavailable_yandex_account_does_not_claim_a_reaction_was_saved() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+        controller.view.selected = 0;
+        controller.yandex_music_account = None;
+
+        controller.toggle_yandex_music_reaction(YandexMusicReaction::Liked);
+
+        let YandexMusicRow::Track(track) = &controller.yandex_music_rows[0] else {
+            panic!("track fixture changed kind");
+        };
+        assert_eq!(track.reaction, YandexMusicReaction::Neutral);
+        assert!(
+            controller
+                .store
+                .pending_yandex_music_reactions()
+                .expect("reaction outbox")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_reaction_keeps_the_selected_track_and_synchronizes_saved_selection() {
+        let temporary = tempfile::tempdir().expect("Yandex reaction root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        let first = yandex_music_track_fixture();
+        let mut second = first.clone();
+        second.id = "304".to_owned();
+        second.title = "Second Track".to_owned();
+        second.webpage_url = url::Url::parse("https://music.yandex.ru/album/404/track/304")
+            .expect("second track URL");
+        controller.view.screen = Screen::YandexMusic;
+        controller.view.selected = 1;
+        controller.yandex_music_selected = 0;
+        controller.yandex_music_account = Some(YandexMusicAccount {
+            uid: "account-1".to_owned(),
+            display_name: None,
+            service_available: Some(true),
+        });
+        controller.yandex_music_rows = vec![
+            YandexMusicRow::Track(Box::new(first)),
+            YandexMusicRow::Track(Box::new(second.clone())),
+        ];
+        controller.update_yandex_music_detail();
+
+        controller.toggle_yandex_music_reaction(YandexMusicReaction::Liked);
+
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.yandex_music_selected, 1);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref()),
+            Some(&MediaId::new(SourceKind::YandexMusic, "304"))
+        );
+        let [YandexMusicRow::Track(first), YandexMusicRow::Track(second)] =
+            controller.yandex_music_rows.as_slice()
+        else {
+            panic!("reaction fixture changed row kinds");
+        };
+        assert_eq!(first.reaction, YandexMusicReaction::Neutral);
+        assert_eq!(second.reaction, YandexMusicReaction::Liked);
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn pending_yandex_reaction_overrides_stale_provider_state_after_restart() {
+        let mut current = yandex_music_track_fixture();
+        current.reaction = YandexMusicReaction::Neutral;
+        let mut other_account_track = current.clone();
+        let pending = vec![
+            PendingYandexMusicReaction {
+                account_uid: "account-1".to_owned(),
+                track_id: current.id.clone(),
+                reaction: YandexMusicReaction::Liked,
+                generation: 2,
+                updated_at: 2,
+            },
+            PendingYandexMusicReaction {
+                account_uid: "account-1".to_owned(),
+                track_id: current.id.clone(),
+                reaction: YandexMusicReaction::Disliked,
+                generation: 3,
+                updated_at: 3,
+            },
+            PendingYandexMusicReaction {
+                account_uid: "other-account".to_owned(),
+                track_id: current.id.clone(),
+                reaction: YandexMusicReaction::Liked,
+                generation: 99,
+                updated_at: 99,
+            },
+        ];
+
+        apply_pending_yandex_music_track_reactions([&mut current], "account-1", &pending);
+        apply_pending_yandex_music_track_reactions(
+            [&mut other_account_track],
+            "missing-account",
+            &pending,
+        );
+
+        assert_eq!(current.reaction, YandexMusicReaction::Disliked);
+        assert_eq!(other_account_track.reaction, YandexMusicReaction::Neutral);
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn newer_yandex_playback_supersedes_pending_resolution_and_ignores_late_result() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, retained_receiver) = unbounded();
+        controller.yandex_music_requests = Some(requests);
+        let first = yandex_music_track_fixture();
+        let mut second = first.clone();
+        second.id = "304".to_owned();
+        second.title = "Newer Track".to_owned();
+
+        controller.request_yandex_music_playback(
+            first.clone(),
+            queue_item_from_yandex_music_track(&first),
+            false,
+            None,
+        );
+        let first_generation = controller.yandex_music_generation;
+        let _first_request = retained_receiver.try_recv().expect("first resolve request");
+        controller.request_yandex_music_playback(
+            second.clone(),
+            queue_item_from_yandex_music_track(&second),
+            false,
+            None,
+        );
+        let second_generation = controller.yandex_music_generation;
+        let _second_request = retained_receiver
+            .try_recv()
+            .expect("second resolve request");
+
+        assert!(second_generation > first_generation);
+        assert_eq!(
+            controller
+                .pending_yandex_music_playback
+                .as_ref()
+                .map(|pending| pending.track_id.as_str()),
+            Some("304")
+        );
+        controller.handle_provider_response(ProviderResponse::YandexMusicResolved {
+            generation: first_generation,
+            track: first,
+            result: Err("late stale resolution".to_owned()),
+        });
+        assert_eq!(
+            controller
+                .pending_yandex_music_playback
+                .as_ref()
+                .map(|pending| pending.track_id.as_str()),
+            Some("304"),
+            "a superseded result must not clear or steal the newer request"
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn starting_another_source_cancels_pending_yandex_playback() {
+        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        let track = yandex_music_track_fixture();
+        let old_generation = controller.yandex_music_generation.wrapping_add(1);
+        controller.yandex_music_generation = old_generation;
+        controller.pending_yandex_music_playback = Some(PendingYandexMusicPlayback {
+            generation: old_generation,
+            track_id: track.id.clone(),
+            item: queue_item_from_yandex_music_track(&track),
+            queue_cursor_already_positioned: false,
+            origin: None,
+        });
+        let mut youtube = queue_item_from_yandex_music_track(&track);
+        youtube.media.id = MediaId::new(SourceKind::YouTube, "video-1");
+        youtube.playback_location = "https://www.youtube.com/watch?v=video-1".to_owned();
+
+        controller.play_queue_item_with_origin(youtube, false, None);
+
+        assert!(controller.pending_yandex_music_playback.is_none());
+        assert!(controller.yandex_music_generation > old_generation);
+        controller.handle_provider_response(ProviderResponse::YandexMusicResolved {
+            generation: old_generation,
+            track,
+            result: Err("late stale resolution".to_owned()),
+        });
+        assert!(controller.pending_yandex_music_playback.is_none());
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn unvalidated_replacement_token_does_not_overwrite_the_working_credential() {
+        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config
+            .save_yandex_music_token("working-token".to_owned())
+            .expect("working credential");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, retained_receiver) = unbounded();
+        controller.yandex_music_requests = Some(requests);
+        controller.open_yandex_music_setup();
+        controller
+            .view
+            .yandex_music_setup_popup
+            .as_mut()
+            .expect("token editor")
+            .token = "unvalidated-replacement".to_owned();
+
+        controller.submit_yandex_music_setup();
+        let generation = controller.yandex_music_generation;
+        assert!(matches!(
+            retained_receiver
+                .try_recv()
+                .expect("candidate validation request"),
+            YandexMusicWorkerRequest::ConfigureAndBootstrap {
+                generation: request_generation,
+                token,
+            } if request_generation == generation && token == "unvalidated-replacement"
+        ));
+
+        assert_eq!(
+            controller.config.providers.yandex_music_token.as_deref(),
+            Some("working-token")
+        );
+        assert!(
+            controller.view.yandex_music_setup_popup.is_some(),
+            "the editor must remain open until remote account validation succeeds"
+        );
+        let credentials =
+            std::fs::read_to_string(controller.config.credentials_file()).expect("credentials");
+        assert!(credentials.contains("working-token"));
+        assert!(!credentials.contains("unvalidated-replacement"));
+
+        controller.handle_provider_response(ProviderResponse::YandexMusicBootstrap {
+            generation,
+            result: Err("account rejected the candidate".to_owned()),
+        });
+
+        let popup = controller
+            .view
+            .yandex_music_setup_popup
+            .as_ref()
+            .expect("rejected token remains editable");
+        assert!(!popup.validating);
+        assert_eq!(
+            popup.validation_error.as_deref(),
+            Some("account rejected the candidate")
+        );
+        assert_eq!(
+            controller.config.providers.yandex_music_token.as_deref(),
+            Some("working-token")
+        );
+        assert!(controller.pending_yandex_music_token.is_none());
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn validated_replacement_token_is_saved_and_adopted_atomically() {
+        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config
+            .save_yandex_music_token("working-token".to_owned())
+            .expect("working credential");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, retained_receiver) = unbounded();
+        controller.yandex_music_requests = Some(requests);
+        controller.open_yandex_music_setup();
+        controller
+            .view
+            .yandex_music_setup_popup
+            .as_mut()
+            .expect("token editor")
+            .token = "validated-replacement".to_owned();
+
+        controller.submit_yandex_music_setup();
+        let generation = controller.yandex_music_generation;
+        let _validation_request = retained_receiver
+            .try_recv()
+            .expect("candidate validation request");
+        let track = yandex_music_track_fixture();
+        controller.handle_provider_response(ProviderResponse::YandexMusicBootstrap {
+            generation,
+            result: Ok((
+                YandexMusicAccount {
+                    uid: "account-1".to_owned(),
+                    display_name: Some("Fixture Listener".to_owned()),
+                    service_available: Some(true),
+                },
+                YandexMusicRecommendationBatch {
+                    session_id: "session-1".to_owned(),
+                    batch_id: Some("batch-1".to_owned()),
+                    tracks: vec![
+                        crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                            track,
+                            batch_id: Some("batch-1".to_owned()),
+                        },
+                    ],
+                },
+            )),
+        });
+
+        assert_eq!(
+            controller.config.providers.yandex_music_token.as_deref(),
+            Some("validated-replacement")
+        );
+        assert!(controller.view.yandex_music_setup_popup.is_none());
+        assert!(controller.pending_yandex_music_token.is_none());
+        assert!(matches!(
+            retained_receiver
+                .try_recv()
+                .expect("validated token adoption request"),
+            YandexMusicWorkerRequest::AdoptToken { token }
+                if token == "validated-replacement"
+        ));
+        let credentials =
+            std::fs::read_to_string(controller.config.credentials_file()).expect("credentials");
+        assert!(credentials.contains("validated-replacement"));
+        assert!(!credentials.contains("working-token"));
     }
 
     /// Deterministic successful identifier used by Local fingerprint tests.
@@ -34204,6 +40465,7 @@ mod tests {
                 label: "Telegram: Fixture Telegram".to_owned(),
                 url: "https://t.me/fixture".to_owned(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             }]
         );
         assert_eq!(
@@ -34247,6 +40509,7 @@ mod tests {
                 label: "Fixture entity (Q42)".to_owned(),
                 url: "https://www.wikidata.org/wiki/Q42".to_owned(),
                 wikidata_item_id: Some("Q42".to_owned()),
+                ..DetailLinkView::default()
             }],
             ..DetailView::default()
         });
@@ -34969,7 +41232,10 @@ mod tests {
         controller.refresh_youtube_rows();
 
         for width in [None, Some(1_920)] {
-            controller.dispatch(UiAction::SetTerminalWindowWidthPixels(width));
+            controller.dispatch(UiAction::SetTerminalWindowPixels {
+                width,
+                height: None,
+            });
             assert_eq!(
                 controller.view.rows[0]
                     .thumbnail_url
@@ -34998,7 +41264,10 @@ mod tests {
             );
         }
 
-        controller.dispatch(UiAction::SetTerminalWindowWidthPixels(Some(1_921)));
+        controller.dispatch(UiAction::SetTerminalWindowPixels {
+            width: Some(1_921),
+            height: None,
+        });
         assert_eq!(
             controller.view.rows[0]
                 .thumbnail_url
@@ -43406,6 +49675,38 @@ mod tests {
         controller.shutdown();
     }
 
+    #[cfg(all(feature = "yandex-music", feature = "yt-dlp"))]
+    #[test]
+    fn selected_yandex_download_uses_native_media_pipeline_instead_of_ytdlp() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, requests, _) = controller_with_mock_download(config, process);
+        controller.view.screen = Screen::YandexMusic;
+        controller.yandex_music_rows = vec![YandexMusicRow::Track(Box::new(
+            yandex_music_track_fixture(),
+        ))];
+        controller.view.selected = 0;
+        controller.refresh_yandex_music_rows();
+
+        controller.dispatch(UiAction::Download);
+
+        assert!(
+            requests.lock().expect("download requests").is_empty(),
+            "Yandex Music must not delegate its authenticated provider page to yt-dlp"
+        );
+        assert!(
+            controller.view.yandex_music_setup_popup.is_some(),
+            "the native pipeline must request its OAuth token before starting"
+        );
+        controller.shutdown();
+    }
+
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn failed_download_opens_the_complete_diagnostic_popup() {
@@ -44438,6 +50739,207 @@ mod tests {
                 generation: controller.search_generation,
                 index: 2,
             })
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn autoplay_advances_yandex_my_wave_after_async_resolution() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(183),
+            duration: Some(Duration::from_secs(183)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) =
+            controller_with_mock_lifecycle([active], Vec::<PlaybackEvent>::new());
+        controller
+            .yandex_music_stopping
+            .store(true, AtomicOrdering::Release);
+        controller.yandex_music_requests.take();
+        if let Some(handle) = controller.yandex_music_thread.take() {
+            handle.join().expect("provider fixture joined");
+        }
+        let (requests, captured_requests) = bounded(4);
+        controller.yandex_music_requests = Some(requests);
+        controller
+            .yandex_music_stopping
+            .store(false, AtomicOrdering::Release);
+        controller.config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::YandexMusic;
+        controller.set_yandex_music_route(YandexMusicRoute::Recommendations);
+        let first = yandex_music_track_fixture();
+        let mut second = first.clone();
+        second.id = "304".to_owned();
+        second.title = "Second My Wave Track".to_owned();
+        second.webpage_url = url::Url::parse("https://music.yandex.ru/album/404/track/304")
+            .expect("second track URL");
+        controller.yandex_music_recommendations = Some(YandexMusicRecommendationBatch {
+            session_id: "session-autoplay".to_owned(),
+            batch_id: Some("batch-initial".to_owned()),
+            tracks: [first.clone(), second.clone()]
+                .into_iter()
+                .map(
+                    |track| crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                        track,
+                        batch_id: Some("batch-initial".to_owned()),
+                    },
+                )
+                .collect(),
+        });
+        controller.yandex_music_rows = vec![
+            YandexMusicRow::Track(Box::new(first)),
+            YandexMusicRow::Track(Box::new(second.clone())),
+        ];
+        controller.view.selected = 0;
+
+        controller.activate_yandex_music_selection();
+
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first My Wave resolution"),
+            YandexMusicWorkerRequest::Resolve { track, .. } if track.id == "303"
+        ));
+        let pending = controller
+            .pending_yandex_music_playback
+            .take()
+            .expect("first pending My Wave playback");
+        assert!(
+            pending.origin.is_some(),
+            "an activated My Wave track must retain its same-list autoplay position"
+        );
+        let mut input = PlaybackInput::new("https://audio.yandex.net/fixture-first.flac");
+        input.bypass_ytdl = true;
+        controller.play_queue_item_with_origin_and_input(
+            pending.item,
+            pending.queue_cursor_already_positioned,
+            pending.origin,
+            Some(input),
+        );
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.update_player();
+
+        assert!(matches!(
+            captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second My Wave resolution"),
+            YandexMusicWorkerRequest::Resolve { track, .. } if track.id == "304"
+        ));
+        let pending = controller
+            .pending_yandex_music_playback
+            .take()
+            .expect("second pending My Wave playback");
+        let mut input = PlaybackInput::new("https://audio.yandex.net/fixture-second.flac");
+        input.bypass_ytdl = true;
+        controller.play_queue_item_with_origin_and_input(
+            pending.item,
+            pending.queue_cursor_already_positioned,
+            pending.origin,
+            Some(input),
+        );
+        events
+            .lock()
+            .expect("mock events")
+            .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+        controller.drain_player_events(Duration::ZERO);
+
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.yandex_music_selected, 1);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Second My Wave Track"),
+            "autoplay must select its new Yandex track so the artwork and details follow playback"
+        );
+        let (continuation_generation, continuation_session, continuation_boundary) =
+            match captured_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the last playing My Wave track must request one continuation")
+            {
+                YandexMusicWorkerRequest::ContinueMyWave {
+                    generation,
+                    session_id,
+                    boundary_track_id,
+                    queue,
+                } => {
+                    assert_eq!(session_id, "session-autoplay");
+                    assert_eq!(boundary_track_id, "304");
+                    assert_eq!(queue, ["303", "304"]);
+                    (generation, session_id, boundary_track_id)
+                }
+                _ => panic!("the last My Wave row queued an unrelated provider request"),
+            };
+        let mut third = yandex_music_track_fixture();
+        third.id = "305".to_owned();
+        third.title = "Third My Wave Track".to_owned();
+        third.webpage_url = url::Url::parse("https://music.yandex.ru/album/404/track/305")
+            .expect("third track URL");
+        controller.handle_provider_response(ProviderResponse::YandexMusicContinuation {
+            generation: continuation_generation,
+            session_id: continuation_session,
+            boundary_track_id: continuation_boundary,
+            result: Ok(YandexMusicRecommendationBatch {
+                session_id: "session-autoplay".to_owned(),
+                batch_id: Some("batch-more".to_owned()),
+                tracks: [second, third]
+                    .into_iter()
+                    .map(
+                        |track| crate::providers::yandex_music::YandexMusicRecommendedTrack {
+                            track,
+                            batch_id: Some("batch-more".to_owned()),
+                        },
+                    )
+                    .collect(),
+            }),
+        });
+
+        assert_eq!(controller.yandex_music_rows.len(), 3);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(
+            controller
+                .yandex_music_recommendations
+                .as_ref()
+                .map(|recommendations| recommendations.tracks.len()),
+            Some(3),
+            "a continuation must append only its new track"
+        );
+        assert!(matches!(
+            controller
+                .current_autoplay_origin
+                .as_ref()
+                .map(|origin| controller.next_autoplay_step(origin)),
+            Some(AutoplayStep::Play { item, .. }) if item.media.id.external_id == "305"
+        ));
+        controller.request_more_yandex_music_if_last_started("304");
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "the same boundary must not trigger another continuation"
+        );
+        assert_eq!(
+            state.lock().expect("mock state").played.len(),
+            2,
+            "autoplay must resolve each authenticated URL before handing it to mpv"
         );
     }
 
@@ -46350,6 +52852,7 @@ mod tests {
                 label: "KEXP (Q761627)".to_owned(),
                 url: "https://www.wikidata.org/wiki/Q761627".to_owned(),
                 wikidata_item_id: Some("Q761627".to_owned()),
+                ..DetailLinkView::default()
             }]
         );
         controller.dispatch(UiAction::ToggleWikidataStatements(0));
@@ -50025,6 +56528,8 @@ mod tests {
             Screen::Search,
             #[cfg(feature = "youtube-music")]
             Screen::YouTubeMusic,
+            #[cfg(feature = "yandex-music")]
+            Screen::YandexMusic,
             #[cfg(feature = "apple-podcasts")]
             Screen::ApplePodcasts,
             Screen::Subscriptions,
@@ -50042,6 +56547,11 @@ mod tests {
         #[cfg(not(feature = "youtube-music"))]
         assert_eq!(
             tui_screen_from_stored(&StoredScreen::YouTubeMusic),
+            Screen::Search
+        );
+        #[cfg(not(feature = "yandex-music"))]
+        assert_eq!(
+            tui_screen_from_stored(&StoredScreen::YandexMusic),
             Screen::Search
         );
         #[cfg(not(feature = "apple-podcasts"))]

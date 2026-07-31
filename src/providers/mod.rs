@@ -45,6 +45,10 @@ pub mod sponsorblock;
 pub mod tracker;
 #[cfg(feature = "wikidata")]
 pub mod wikidata;
+#[cfg(feature = "yandex-music")]
+pub mod yandex_music;
+#[cfg(feature = "yandex-music")]
+pub mod yandex_music_media;
 #[cfg(feature = "network")]
 pub mod youtube_channel_page;
 #[cfg(feature = "youtube-music")]

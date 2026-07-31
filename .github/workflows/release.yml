@@ -78,6 +78,8 @@ jobs:
         run: |
           cargo test --locked --all-targets
           cargo test --locked --all-targets --no-default-features
+          cargo test --locked --all-targets --no-default-features --features app-core
+          cargo test --locked --all-targets --no-default-features --features app-core,images
           cargo test --locked --all-targets --no-default-features --features app
           cargo test --locked --all-targets --no-default-features --features sqlite-state
           cargo test --locked --all-targets --no-default-features --features tui
@@ -86,6 +88,8 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts
           cargo test --locked --all-targets --no-default-features --features tui,bandcamp
           cargo test --locked --all-targets --no-default-features --features tui,radio
+          cargo test --locked --all-targets --no-default-features --features tui,yandex-music
+          cargo test --locked --all-targets --no-default-features --features tui,yandex-music,wikidata
           cargo test --locked --all-targets --all-features
 
       - name: Run the explicit end-to-end terminal test
@@ -97,6 +101,8 @@ jobs:
         run: |
           cargo test --locked --doc
           cargo test --locked --doc --no-default-features
+          cargo test --locked --doc --no-default-features --features app-core
+          cargo test --locked --doc --no-default-features --features app-core,images
           cargo test --locked --doc --no-default-features --features app
           cargo test --locked --doc --no-default-features --features sqlite-state
           cargo test --locked --doc --no-default-features --features tui
@@ -105,6 +111,8 @@ jobs:
           cargo test --locked --doc --no-default-features --features tui,apple-podcasts
           cargo test --locked --doc --no-default-features --features tui,bandcamp
           cargo test --locked --doc --no-default-features --features tui,radio
+          cargo test --locked --doc --no-default-features --features tui,yandex-music
+          cargo test --locked --doc --no-default-features --features tui,yandex-music,wikidata
           cargo test --locked --doc --all-features
 
   binaries:

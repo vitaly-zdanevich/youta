@@ -56,6 +56,9 @@ use crate::waveform::{Peak, PeakPyramid};
 pub const YOUTUBE_API_KEY_GUIDE_URL: &str =
     "https://developers.google.com/youtube/registering_an_application";
 
+/// Official overview of Yandex OAuth access tokens.
+pub const YANDEX_OAUTH_GUIDE_URL: &str = "https://yandex.com/dev/id/doc/en/concepts/ya-oauth-intro";
+
 /// Google Cloud page where the user creates and restricts API credentials.
 pub const GOOGLE_CLOUD_CREDENTIALS_URL: &str = "https://console.cloud.google.com/apis/credentials";
 
@@ -94,6 +97,8 @@ pub enum Screen {
     Search,
     /// Music-focused search through `music.youtube.com`.
     YouTubeMusic,
+    /// Personalized recommendations and catalogue search through Yandex Music.
+    YandexMusic,
     /// Artist, album, and track discovery through `Bandcamp`.
     Bandcamp,
     /// Podcast-show discovery through Apple's public catalogue.
@@ -117,9 +122,10 @@ pub enum Screen {
 }
 
 impl Screen {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Search,
         Self::YouTubeMusic,
+        Self::YandexMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
         Self::Radio,
@@ -136,6 +142,7 @@ impl Screen {
     const fn enabled(self) -> bool {
         match self {
             Self::YouTubeMusic => cfg!(feature = "youtube-music"),
+            Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
             Self::Radio => cfg!(feature = "radio"),
@@ -147,6 +154,7 @@ impl Screen {
         match self {
             Self::Search => "YouTube",
             Self::YouTubeMusic => "YouTube Music",
+            Self::YandexMusic => "YandexMusic",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple Podcasts",
             Self::Radio => "Radio",
@@ -164,6 +172,7 @@ impl Screen {
         match self {
             Self::Search => "YouTube",
             Self::YouTubeMusic => "YT Music",
+            Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple",
             Self::Radio => "Radio",
@@ -274,6 +283,98 @@ pub enum YouTubeSearchSort {
     Newest,
 }
 
+/// Exact catalogue category queried by the Yandex Music tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YandexMusicSearchKind {
+    /// Music, podcasts, and audiobooks in one catalogue query.
+    #[default]
+    All,
+    /// Songs, artists, and music albums.
+    Music,
+    /// Podcast shows and episodes.
+    Podcasts,
+    /// Audiobooks identified by explicit provider metadata.
+    Audiobooks,
+}
+
+impl YandexMusicSearchKind {
+    /// Returns the next category in the Yandex Music search selector.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Music,
+            Self::Music => Self::Podcasts,
+            Self::Podcasts => Self::Audiobooks,
+            Self::Audiobooks => Self::All,
+        }
+    }
+
+    /// Returns the compact category label rendered in controls and status.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Music => "music",
+            Self::Podcasts => "podcasts",
+            Self::Audiobooks => "audiobooks",
+        }
+    }
+
+    /// Returns the title-cased category label used in the search panel heading.
+    #[must_use]
+    const fn title_label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Music => "Music",
+            Self::Podcasts => "Podcasts",
+            Self::Audiobooks => "Audiobooks",
+        }
+    }
+}
+
+/// Active content route inside the authenticated Yandex Music tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YandexMusicRouteView {
+    /// The account's default My Wave recommendations.
+    #[default]
+    Recommendations,
+    /// One explicit catalogue search result.
+    Search,
+    /// Tracks belonging to one opened album, podcast, or audiobook.
+    Album,
+    /// Popular tracks and albums belonging to one exact artist.
+    Artist,
+}
+
+/// Reaction state shown for one selected Yandex Music track.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YandexMusicReactionView {
+    /// Neither explicit reaction is selected.
+    #[default]
+    Neutral,
+    /// The track is liked, including an optimistic offline update.
+    Liked,
+    /// The track is disliked, including an optimistic offline update.
+    Disliked,
+}
+
+/// Selection-sensitive controls exposed by the Yandex Music detail panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YandexMusicActionsView {
+    /// Selected row is a playable track, episode, or audiobook chapter.
+    pub track_selected: bool,
+    /// Selected row has an exact primary artist that can open inside Youta.
+    pub artist_available: bool,
+    /// Selected row can open an album, show, or audiobook.
+    pub album_available: bool,
+    /// Current route is an opened album rather than recommendations/search.
+    pub album_open: bool,
+    /// At least ten recommendation tracks can be downloaded as one batch.
+    pub twenty_recommendations_available: bool,
+    /// Optimistic current reaction for the selected track.
+    pub reaction: YandexMusicReactionView,
+}
+
 /// Ordering applied to entries in the Local file browser.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalSizeSort {
@@ -349,6 +450,8 @@ pub enum SearchActivity {
     YouTube,
     /// A music-focused search through `yt-dlp` and `music.youtube.com`.
     YouTubeMusic,
+    /// A Yandex Music catalogue search.
+    YandexMusic,
     /// A public track and album search through `Bandcamp`.
     Bandcamp,
     /// A show search through Apple's public podcast catalogue.
@@ -363,6 +466,7 @@ impl SearchActivity {
         match self {
             Self::YouTube => Screen::Search,
             Self::YouTubeMusic => Screen::YouTubeMusic,
+            Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
             Self::ApplePodcasts => Screen::ApplePodcasts,
             Self::TrackerArchives => Screen::TrackerMusic,
@@ -929,12 +1033,53 @@ pub struct DetailVideoLinkView {
 /// One selectable external link displayed in a details or channel panel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetailLinkView {
+    /// Plain, non-clickable text rendered immediately before the link value.
+    pub prefix: String,
     /// Human-readable link label, such as a Wikidata item name.
     pub label: String,
     /// Absolute URL passed to the controller when the link is activated.
     pub url: String,
     /// Exact Wikidata Q-ID when this link owns a lazy property spoiler.
     pub wikidata_item_id: Option<String>,
+    /// Provider-selected text and spacing treatment for this link.
+    pub presentation: DetailLinkPresentation,
+    /// Optional exact destination opened inside Youta by the adjacent marker.
+    pub internal_target: Option<DetailLinkInternalTarget>,
+}
+
+/// Exact provider destination exposed by one Details-row internal-link marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetailLinkInternalTarget {
+    /// One stable Yandex Music artist identifier.
+    YandexMusicArtist(String),
+    /// One stable Yandex Music album, show, or audiobook identifier.
+    YandexMusicAlbum(String),
+}
+
+impl DetailLinkInternalTarget {
+    /// Builds the semantic controller action dispatched by its one-cell marker.
+    fn action(&self) -> UiAction {
+        match self {
+            Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
+            Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
+        }
+    }
+}
+
+/// Text and vertical-spacing treatment for one external Details link.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetailLinkPresentation {
+    /// Render the human label followed by an em dash and the URL.
+    #[default]
+    LabelAndUrl,
+    /// Render the human label and URL, then reserve one non-clickable row.
+    LabelAndUrlSpaced,
+    /// Render only the label and reserve one non-clickable row after it.
+    LabelOnlySpaced,
+    /// Render only the URL.
+    UrlOnly,
+    /// Render only the URL and reserve one non-clickable row after it.
+    UrlOnlySpaced,
 }
 
 /// Bounded human-facing Wikidata properties cached for one Details page.
@@ -1107,6 +1252,34 @@ impl std::fmt::Debug for YouTubeSetupPopupView {
     }
 }
 
+/// Masked OAuth-token editor for the optional Yandex Music source.
+///
+/// The token remains controller-owned while the popup is open. Rendering and
+/// debug output expose only a fixed redaction marker.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct YandexMusicSetupPopupView {
+    /// Yandex OAuth access token. The renderer never displays this value.
+    pub token: String,
+    /// Exact private credentials path where the token will be stored.
+    pub token_path: String,
+    /// A candidate token is being validated before it can replace durable state.
+    pub validating: bool,
+    /// Actionable validation or provider-construction failure, when present.
+    pub validation_error: Option<String>,
+}
+
+impl std::fmt::Debug for YandexMusicSetupPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("YandexMusicSetupPopupView")
+            .field("token", &"[REDACTED]")
+            .field("token_path", &self.token_path)
+            .field("validating", &self.validating)
+            .field("validation_error", &self.validation_error)
+            .finish()
+    }
+}
+
 /// Selectable credential field in the YouTube provider setup popup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum YouTubeSetupField {
@@ -1171,6 +1344,10 @@ pub struct ViewModel {
     /// Channel searches retain this preference but do not send a video-only
     /// licence filter to the configured provider.
     pub youtube_creative_commons_only: bool,
+    /// Exact category queried by the Yandex Music tab.
+    pub yandex_music_search_kind: YandexMusicSearchKind,
+    /// Active recommendations, search, or album route in the Yandex Music tab.
+    pub yandex_music_route: YandexMusicRouteView,
     /// Submitted provider search that has not reached a terminal response.
     pub search_activity: Option<SearchActivity>,
     /// Whether a foreground Local directory listing is awaiting its response.
@@ -1275,6 +1452,8 @@ pub struct ViewModel {
     pub video_comments_popup: Option<VideoCommentsPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
+    /// Editable OAuth-token setup for the optional Yandex Music source.
+    pub yandex_music_setup_popup: Option<YandexMusicSetupPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
     pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
     /// Focused runtime preferences editor.
@@ -1285,6 +1464,8 @@ pub struct ViewModel {
     pub private_note_popup: Option<PrivateNotePopupView>,
     /// Whether the current selection resolves to a note-capable exact target.
     pub private_note_available: bool,
+    /// Selection-sensitive actions for the Yandex Music tab.
+    pub yandex_music_actions: YandexMusicActionsView,
     /// Explicit rename, move, or recoverable Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
     /// Active or most recently completed supervised download.
@@ -1304,6 +1485,8 @@ impl Default for ViewModel {
             search_kind: SearchKind::Videos,
             youtube_search_sort: YouTubeSearchSort::Relevance,
             youtube_creative_commons_only: false,
+            yandex_music_search_kind: YandexMusicSearchKind::All,
+            yandex_music_route: YandexMusicRouteView::Recommendations,
             search_activity: None,
             local_browse_pending: false,
             local_artwork_pending: false,
@@ -1350,11 +1533,13 @@ impl Default for ViewModel {
             video_comments_available: false,
             video_comments_popup: None,
             youtube_setup_popup: None,
+            yandex_music_setup_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
             private_note_popup: None,
             private_note_available: false,
+            yandex_music_actions: YandexMusicActionsView::default(),
             local_file_popup: None,
             download: None,
             quitting: false,
@@ -1395,8 +1580,13 @@ pub enum UiAction {
     Quit,
     /// Record graphical-opener and physical-Linux-console capabilities.
     SetExternalOpenerAvailable(bool),
-    /// Record the terminal window's current pixel width, when available.
-    SetTerminalWindowWidthPixels(Option<u16>),
+    /// Record the attached terminal window's current pixel dimensions.
+    SetTerminalWindowPixels {
+        /// Independently reported pixel width, when nonzero.
+        width: Option<u16>,
+        /// Independently reported pixel height, when nonzero.
+        height: Option<u16>,
+    },
     /// Report that F8 retained its keyboard pointer without physical GPM input.
     ReportGpmUnavailable {
         /// Whether this binary was compiled with the GPM input adapter.
@@ -1428,6 +1618,24 @@ pub enum UiAction {
     ToggleYouTubeSearchSort,
     /// Restrict `YouTube` video search to Creative Commons-licensed results.
     ToggleYouTubeCreativeCommons,
+    /// Cycle Yandex Music search through music, podcasts, and audiobooks.
+    CycleYandexMusicSearchKind,
+    /// Toggle the selected Yandex Music track's liked state.
+    ToggleYandexMusicLike,
+    /// Toggle the selected Yandex Music track's disliked state.
+    ToggleYandexMusicDislike,
+    /// Open the selected row's primary artist inside Youta.
+    OpenYandexMusicArtist,
+    /// Open the selected track's album or selected album row.
+    OpenYandexMusicAlbum,
+    /// Open one exact Yandex Music artist selected from a Details link.
+    OpenYandexMusicArtistById(String),
+    /// Open one exact Yandex Music album selected from a Details link.
+    OpenYandexMusicAlbumById(String),
+    /// Download every track in the currently opened or selected album.
+    DownloadYandexMusicAlbum,
+    /// Download the first twenty current My Wave recommendations.
+    DownloadTwentyYandexMusicRecommendations,
     /// Move list selection by a signed row count.
     MoveSelection(i32),
     /// Select an exact row.
@@ -1631,6 +1839,18 @@ pub enum UiAction {
     SubmitYouTubeSetup,
     /// Close the YouTube setup popup without saving.
     DismissYouTubeSetup,
+    /// Add one printable character to the masked Yandex Music OAuth token.
+    AppendYandexMusicTokenCharacter(char),
+    /// Remove the final token character.
+    DeleteYandexMusicTokenCharacter,
+    /// Delete the Vim-style word before the token cursor.
+    DeleteYandexMusicTokenWord,
+    /// Open Yandex's official OAuth overview.
+    OpenYandexOAuthGuide,
+    /// Validate and save the Yandex Music OAuth token.
+    SubmitYandexMusicSetup,
+    /// Close the Yandex Music setup popup without saving.
+    DismissYandexMusicSetup,
     /// Open or focus the RSS/Atom podcast-feed editor.
     OpenRssSubscriptionPopup,
     /// Add one printable character to the draft RSS feed URL.
@@ -1720,6 +1940,7 @@ impl UiAction {
                 | Self::OpenYouTubeApiKeyGuide
                 | Self::OpenGoogleCloudCredentials
                 | Self::OpenInvidiousInstances
+                | Self::OpenYandexOAuthGuide
         )
     }
 }
@@ -2293,18 +2514,23 @@ fn current_terminal_window_metrics() -> Option<TerminalWindowMetrics> {
     TerminalWindowMetrics::new(window.columns, window.rows, window.width, window.height)
 }
 
-/// Reads only the terminal window's pixel width for thumbnail-size selection.
+/// Reads independently usable pixel dimensions for source artwork policies.
 ///
-/// Some terminals report zero pixel height while still providing a usable
-/// width. Automatic YouTube sizing must not discard that independent value.
-fn current_terminal_window_pixel_width() -> Option<u16> {
-    let window = crossterm::terminal::window_size().ok()?;
-    nonzero_terminal_window_pixel_width(window.width)
+/// Some terminals report only one pixel dimension. Keeping each value
+/// independently optional preserves YouTube's width-only policy while Yandex
+/// artwork can require both dimensions.
+fn current_terminal_window_pixels() -> (Option<u16>, Option<u16>) {
+    crossterm::terminal::window_size().map_or((None, None), |window| {
+        nonzero_terminal_window_pixels(window.width, window.height)
+    })
 }
 
-/// Validates one independently reported terminal-window pixel width.
-const fn nonzero_terminal_window_pixel_width(width: u16) -> Option<u16> {
-    if width == 0 { None } else { Some(width) }
+/// Validates independently reported terminal-window pixel dimensions.
+const fn nonzero_terminal_window_pixels(width: u16, height: u16) -> (Option<u16>, Option<u16>) {
+    (
+        if width == 0 { None } else { Some(width) },
+        if height == 0 { None } else { Some(height) },
+    )
 }
 
 /// Number of wrapped description rows below which YouTube artwork expands.
@@ -2385,6 +2611,61 @@ fn youtube_thumbnail_height(
         .max(MIN_THUMBNAIL_HEIGHT)
 }
 
+/// Chooses a Yandex artwork height that displays the selected square source
+/// at its useful pixel size without upscaling it beyond that source.
+///
+/// The ordinary thumbnail-height preference remains the minimum requested
+/// block. Complete terminal metrics convert source pixels into terminal rows;
+/// the same conservative 10×20 cell geometry used by the image backend is the
+/// fallback when a terminal omits pixel dimensions.
+fn yandex_music_thumbnail_height(
+    configured_height: u16,
+    pane_width: u16,
+    thumbnail_dimensions: Option<(u32, u32)>,
+    terminal_window: Option<TerminalWindowMetrics>,
+) -> u16 {
+    const FALLBACK_CELL_PIXELS: (u16, u16) = (10, 20);
+
+    let Some((source_width, source_height)) = thumbnail_dimensions else {
+        return configured_height;
+    };
+    if pane_width == 0 || source_width == 0 || source_height == 0 {
+        return configured_height;
+    }
+    let (available_width_pixels, row_numerator, row_denominator) = terminal_window.map_or_else(
+        || {
+            (
+                u64::from(pane_width).saturating_mul(u64::from(FALLBACK_CELL_PIXELS.0)),
+                1_u64,
+                u64::from(FALLBACK_CELL_PIXELS.1),
+            )
+        },
+        |window| {
+            (
+                u64::from(pane_width)
+                    .saturating_mul(u64::from(window.width_pixels))
+                    .checked_div(u64::from(window.columns))
+                    .unwrap_or_default(),
+                u64::from(window.rows),
+                u64::from(window.height_pixels),
+            )
+        },
+    );
+    let rendered_width_pixels = available_width_pixels.min(u64::from(source_width));
+    let numerator = rendered_width_pixels
+        .saturating_mul(u64::from(source_height))
+        .saturating_mul(row_numerator);
+    let denominator = u64::from(source_width).saturating_mul(row_denominator);
+    let height = numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or_default();
+    u16::try_from(height)
+        .unwrap_or(u16::MAX)
+        .max(configured_height)
+        .max(MIN_THUMBNAIL_HEIGHT)
+}
+
 /// Runs Youta in the current terminal until the controller requests shutdown.
 pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Result<()> {
     if !io::stdout().is_terminal() {
@@ -2401,9 +2682,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         terminal_attachment.external_opener_available(),
     ));
     let mut session = TerminalSession::enter()?;
-    controller.dispatch(UiAction::SetTerminalWindowWidthPixels(
-        current_terminal_window_pixel_width(),
-    ));
+    let (width, height) = current_terminal_window_pixels();
+    controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
     let mut input = TerminalInput::new();
     let mut thumbnail_renderer =
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
@@ -2491,9 +2771,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                     }
                 }
                 Event::Resize(_, _) => {
-                    controller.dispatch(UiAction::SetTerminalWindowWidthPixels(
-                        current_terminal_window_pixel_width(),
-                    ));
+                    let (width, height) = current_terminal_window_pixels();
+                    controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
                 }
                 _ => {}
             }
@@ -3047,6 +3326,8 @@ struct HitMap {
     video_comments_page_lines: usize,
     youtube_setup_fields: Vec<(YouTubeSetupField, Rect)>,
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
+    yandex_music_setup_field: Option<Rect>,
+    yandex_music_setup_buttons: Vec<(UiAction, Rect)>,
     rss_subscription_field: Option<Rect>,
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
@@ -3505,6 +3786,7 @@ fn render_frame(
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
         || view.youtube_setup_popup.is_some()
+        || view.yandex_music_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
         || view.preferences_popup.is_some()
         || view.playlist_popup.is_some()
@@ -3584,12 +3866,23 @@ fn render_frame(
         render_fullscreen_thumbnail_overlay(frame, view, &theme, hit_map, renderer);
     }
     if view.help_open {
-        render_help(frame, &theme);
+        render_help(frame, view, &theme);
     }
     hit_map.youtube_setup_fields.clear();
     hit_map.youtube_setup_buttons.clear();
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
         render_youtube_setup_popup(
+            frame,
+            setup,
+            view.external_opener_available,
+            &theme,
+            hit_map,
+        );
+    }
+    hit_map.yandex_music_setup_field = None;
+    hit_map.yandex_music_setup_buttons.clear();
+    if let Some(setup) = view.yandex_music_setup_popup.as_ref() {
+        render_yandex_music_setup_popup(
             frame,
             setup,
             view.external_opener_available,
@@ -3855,6 +4148,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             | Screen::Statistics => return String::new(),
             Screen::Search
             | Screen::YouTubeMusic
+            | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::TrackerMusic => {}
@@ -3874,17 +4168,30 @@ fn search_panel_title(view: &ViewModel) -> String {
                 .unwrap_or_default()
         };
         query.insert(cursor, '▏');
-        format!(
-            " {}: {} ",
-            if view.screen == Screen::Radio {
-                "Filter"
-            } else {
-                "Search"
-            },
-            query
-        )
+        match view.screen {
+            Screen::Radio => format!(" Filter: {query} "),
+            Screen::YandexMusic => format!(
+                " {} search: {query} ",
+                view.yandex_music_search_kind.title_label()
+            ),
+            _ => format!(" Search: {query} "),
+        }
     } else if view.screen == Screen::Radio {
         format!(" Filter: {} ", view.search_query.trim())
+    } else if view.screen == Screen::YandexMusic {
+        match view.yandex_music_route {
+            YandexMusicRouteView::Recommendations => " My Wave ".to_owned(),
+            YandexMusicRouteView::Search => {
+                let scope = view.yandex_music_search_kind.title_label();
+                if view.search_query.is_empty() {
+                    format!(" {scope} search ")
+                } else {
+                    format!(" {scope} · {} ", view.search_query)
+                }
+            }
+            YandexMusicRouteView::Album => " Album ".to_owned(),
+            YandexMusicRouteView::Artist => " Artist ".to_owned(),
+        }
     } else if view.search_query.is_empty() {
         match view.screen {
             Screen::Search => format!(
@@ -3898,6 +4205,9 @@ fn search_panel_title(view: &ViewModel) -> String {
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::TrackerMusic => " Search ".to_owned(),
+            Screen::YandexMusic => {
+                unreachable!("Yandex Music returned with its search scope above")
+            }
             Screen::Local
             | Screen::Radio
             | Screen::Subscriptions
@@ -4695,6 +5005,11 @@ fn render_details_with_terminal_window(
     hit_map: &mut HitMap,
     thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
+    let empty_message = if completed_search_has_no_rows(view) {
+        "Nothing found"
+    } else {
+        "Select an item to load details lazily."
+    };
     render_information_panel(
         frame,
         area,
@@ -4703,11 +5018,12 @@ fn render_details_with_terminal_window(
         theme,
         hit_map,
         "",
-        "Select an item to load details lazily.",
+        empty_message,
         match view.screen {
             Screen::Local => InformationPanelKind::Local,
             Screen::ApplePodcasts => InformationPanelKind::Podcast,
             Screen::Radio => InformationPanelKind::Radio,
+            Screen::YandexMusic => InformationPanelKind::YandexMusic,
             Screen::Bandcamp | Screen::Playlists | Screen::History => InformationPanelKind::Generic,
             _ => InformationPanelKind::Video,
         },
@@ -4715,6 +5031,32 @@ fn render_details_with_terminal_window(
         ThumbnailSizing::adaptive_youtube(configured_thumbnail_height, terminal_window),
         thumbnail_renderer,
     );
+}
+
+/// Distinguishes a completed empty result set from a screen awaiting input.
+fn completed_search_has_no_rows(view: &ViewModel) -> bool {
+    if view.search_editing
+        || view.search_activity.is_some()
+        || !view.rows.is_empty()
+        || view.search_query.trim().is_empty()
+    {
+        return false;
+    }
+    match view.screen {
+        Screen::YandexMusic => view.yandex_music_route == YandexMusicRouteView::Search,
+        Screen::Search
+        | Screen::YouTubeMusic
+        | Screen::Bandcamp
+        | Screen::ApplePodcasts
+        | Screen::TrackerMusic
+        | Screen::Radio => true,
+        Screen::Subscriptions
+        | Screen::Local
+        | Screen::Playlists
+        | Screen::Downloaded
+        | Screen::History
+        | Screen::Statistics => false,
+    }
 }
 
 /// Source-specific metadata layout used by the shared information renderer.
@@ -4728,6 +5070,8 @@ enum InformationPanelKind {
     Channel,
     /// Public live-radio metadata without finite-media statistics.
     Radio,
+    /// Authenticated Yandex Music catalogue details and source-specific actions.
+    YandexMusic,
     /// Local folder, media, or image metadata without remote statistics.
     Local,
     /// Persisted or aggregate rows without source-specific remote statistics.
@@ -4830,7 +5174,14 @@ impl ThumbnailSizing {
             details.thumbnail_dimensions,
             self.terminal_window,
         );
-        if details.source == "Local image" {
+        if details.source.starts_with("Yandex Music") {
+            yandex_music_thumbnail_height(
+                height,
+                artwork_width,
+                details.thumbnail_dimensions,
+                self.terminal_window,
+            )
+        } else if details.source == "Local image" {
             height.saturating_mul(2)
         } else {
             height
@@ -4889,6 +5240,8 @@ fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hot
         UiAction::ToggleSubscription => Some(button("s", "Unsubscribe (locally)", show_hotkeys)),
         UiAction::ToggleRadioRecording => Some(button("r", "Stop recording", show_hotkeys)),
         UiAction::FingerprintLocalAudio => Some(button("f", "Fingerprinting |", show_hotkeys)),
+        UiAction::ToggleYandexMusicLike => Some(button("L", "Remove like", show_hotkeys)),
+        UiAction::ToggleYandexMusicDislike => Some(button("X", "Remove dislike", show_hotkeys)),
         _ => None,
     };
     stable_label.as_deref().map_or_else(
@@ -5178,6 +5531,7 @@ fn render_information_panel(
             InformationPanelKind::Video
                 | InformationPanelKind::Podcast
                 | InformationPanelKind::Radio
+                | InformationPanelKind::YandexMusic
         )
     {
         let opener_name = system_url_opener_name();
@@ -5187,6 +5541,10 @@ fn render_information_panel(
                 || format!("{opener_name} station website"),
                 |url| format!("{opener_name} · {url}"),
             ),
+            InformationPanelKind::YandexMusic if view.yandex_music_actions.track_selected => {
+                format!("{opener_name} track")
+            }
+            InformationPanelKind::YandexMusic => format!("{opener_name} item"),
             _ => format!("{opener_name} video"),
         };
         let label = button(
@@ -5296,6 +5654,93 @@ fn render_information_panel(
             UiAction::ToggleRadioFavorite,
         )
     });
+    let yandex_like_button = (view.screen == Screen::YandexMusic
+        && view.yandex_music_actions.track_selected)
+        .then(|| {
+            let active = view.yandex_music_actions.reaction == YandexMusicReactionView::Liked;
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button(
+                    "L",
+                    if active { "Remove like" } else { "Like" },
+                    show_hotkeys,
+                ),
+                if active { theme.selected } else { theme.accent },
+                UiAction::ToggleYandexMusicLike,
+            )
+        });
+    let yandex_dislike_button = (view.screen == Screen::YandexMusic
+        && view.yandex_music_actions.track_selected)
+        .then(|| {
+            let active = view.yandex_music_actions.reaction == YandexMusicReactionView::Disliked;
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button(
+                    "X",
+                    if active { "Remove dislike" } else { "Dislike" },
+                    show_hotkeys,
+                ),
+                if active { theme.selected } else { theme.accent },
+                UiAction::ToggleYandexMusicDislike,
+            )
+        });
+    let yandex_artist_button = (view.screen == Screen::YandexMusic
+        && view.yandex_music_actions.artist_available)
+        .then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("g", "Open artist", show_hotkeys),
+                theme.accent,
+                UiAction::OpenYandexMusicArtist,
+            )
+        });
+    let yandex_album_button = (view.screen == Screen::YandexMusic
+        && view.yandex_music_actions.album_available)
+        .then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("b", "Open album", show_hotkeys),
+                theme.accent,
+                UiAction::OpenYandexMusicAlbum,
+            )
+        });
+    let yandex_download_album_button =
+        (view.screen == Screen::YandexMusic && view.yandex_music_actions.album_open).then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("Shift+D", "Download album", show_hotkeys),
+                theme.accent,
+                UiAction::DownloadYandexMusicAlbum,
+            )
+        });
+    let yandex_download_recommendations_button = (view.screen == Screen::YandexMusic
+        && view.yandex_music_actions.twenty_recommendations_available)
+        .then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("R", "Download 20 recommendations", show_hotkeys),
+                theme.accent,
+                UiAction::DownloadTwentyYandexMusicRecommendations,
+            )
+        });
     let details_playlist_item = view
         .playlist_item
         .as_ref()
@@ -5439,6 +5884,7 @@ fn render_information_panel(
                 ]));
             }
         }
+        InformationPanelKind::YandexMusic => {}
         InformationPanelKind::Channel => {
             if let Some(count) = details.channel_subscriber_count {
                 lines.push(Line::from(vec![
@@ -5504,6 +5950,12 @@ fn render_information_panel(
     }
     let mut detail_buttons = [
         radio_favorite_button,
+        yandex_like_button,
+        yandex_dislike_button,
+        yandex_artist_button,
+        yandex_album_button,
+        yandex_download_album_button,
+        yandex_download_recommendations_button,
         todo_button,
         playlist_button,
         edit_playlist_button,
@@ -5721,27 +6173,53 @@ fn render_information_panel(
         } else {
             remaining_height.min(1)
         };
-        let desired_link_height = u16::try_from(details.links.len()).unwrap_or(u16::MAX);
+        let mut link_rows = Vec::with_capacity(details.links.len().saturating_mul(2));
+        for (index, link) in details.links.iter().enumerate() {
+            link_rows.push(Some((index, link)));
+            let next_is_wikidata = details
+                .links
+                .get(index.saturating_add(1))
+                .is_some_and(|next| next.wikidata_item_id.is_some());
+            if !next_is_wikidata
+                && matches!(
+                    link.presentation,
+                    DetailLinkPresentation::LabelAndUrlSpaced
+                        | DetailLinkPresentation::LabelOnlySpaced
+                        | DetailLinkPresentation::UrlOnlySpaced
+                )
+            {
+                link_rows.push(None);
+            }
+        }
+        let desired_link_height = u16::try_from(link_rows.len()).unwrap_or(u16::MAX);
         let link_height =
             desired_link_height.min(remaining_height.saturating_sub(description_reserve));
         if link_height > 0 {
-            let visible_links = usize::from(link_height);
             let selected_link = view
                 .selected_detail_link
                 .unwrap_or_default()
                 .min(details.links.len().saturating_sub(1));
-            let first_link = selected_link
-                .saturating_add(1)
-                .saturating_sub(visible_links);
-            for (index, link) in details
-                .links
+            let selected_row = link_rows
                 .iter()
-                .enumerate()
-                .skip(first_link)
-                .take(visible_links)
+                .position(|row| {
+                    row.as_ref()
+                        .is_some_and(|(index, _)| *index == selected_link)
+                })
+                .unwrap_or_default();
+            let first_row = selected_row
+                .saturating_add(1)
+                .saturating_sub(usize::from(link_height));
+            for row in link_rows
+                .iter()
+                .skip(first_row)
+                .take(usize::from(link_height))
             {
+                let Some((index, link)) = row else {
+                    cursor_y = cursor_y.saturating_add(1);
+                    continue;
+                };
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
-                let mut clickable_width = 0_u16;
+                let mut content_offset = 0_u16;
                 let mut spans = Vec::new();
                 if let Some(item_id) = link.wikidata_item_id.as_deref() {
                     let expanded = details.expanded_wikidata_item.as_deref() == Some(item_id);
@@ -5752,11 +6230,11 @@ fn render_information_panel(
                         theme.accent.add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::raw(" "));
-                    clickable_width =
-                        clickable_width.saturating_add(disclosure_width.saturating_add(1));
+                    content_offset =
+                        content_offset.saturating_add(disclosure_width.saturating_add(1));
                     if disclosure_width > 0 {
                         hit_map.detail_buttons.push((
-                            UiAction::ToggleWikidataStatements(index),
+                            UiAction::ToggleWikidataStatements(*index),
                             Rect::new(
                                 link_area.x,
                                 link_area.y,
@@ -5766,27 +6244,81 @@ fn render_information_panel(
                         ));
                     }
                 }
-                spans.extend([
-                    Span::styled(&link.label, theme.base),
-                    Span::styled(" — ", theme.muted),
-                    Span::styled(&link.url, theme.muted),
-                ]);
-                clickable_width = clickable_width
-                    .saturating_add(terminal_text_width(&link.label))
-                    .saturating_add(terminal_text_width(" — "))
-                    .saturating_add(terminal_text_width(&link.url));
+                if !link.prefix.is_empty() {
+                    spans.push(Span::styled(&link.prefix, theme.base));
+                    content_offset =
+                        content_offset.saturating_add(terminal_text_width(&link.prefix));
+                }
+                let external_offset = content_offset;
+                let external_width = match link.presentation {
+                    DetailLinkPresentation::LabelAndUrl
+                    | DetailLinkPresentation::LabelAndUrlSpaced => {
+                        spans.extend([
+                            Span::styled(&link.label, theme.base),
+                            Span::styled(" — ", theme.muted),
+                            Span::styled(&link.url, theme.muted),
+                        ]);
+                        terminal_text_width(&link.label)
+                            .saturating_add(terminal_text_width(" — "))
+                            .saturating_add(terminal_text_width(&link.url))
+                    }
+                    DetailLinkPresentation::LabelOnlySpaced => {
+                        spans.push(Span::styled(
+                            &link.label,
+                            if view.external_opener_available {
+                                theme.accent.add_modifier(Modifier::UNDERLINED)
+                            } else {
+                                theme.muted
+                            },
+                        ));
+                        terminal_text_width(&link.label)
+                    }
+                    DetailLinkPresentation::UrlOnly | DetailLinkPresentation::UrlOnlySpaced => {
+                        spans.push(Span::styled(
+                            &link.url,
+                            if view.external_opener_available {
+                                theme.accent.add_modifier(Modifier::UNDERLINED)
+                            } else {
+                                theme.muted
+                            },
+                        ));
+                        terminal_text_width(&link.url)
+                    }
+                };
+                content_offset = content_offset.saturating_add(external_width);
+                if let Some(target) = link.internal_target.as_ref() {
+                    spans.push(Span::raw(" "));
+                    content_offset = content_offset.saturating_add(1);
+                    let marker = "↪";
+                    let marker_width = terminal_text_width(marker);
+                    spans.push(Span::styled(
+                        marker,
+                        theme.accent.add_modifier(Modifier::BOLD),
+                    ));
+                    let marker_offset = content_offset.min(link_area.width);
+                    let marker_area = Rect::new(
+                        link_area.x.saturating_add(marker_offset),
+                        link_area.y,
+                        marker_width.min(link_area.width.saturating_sub(marker_offset)),
+                        1,
+                    );
+                    if marker_area.width > 0 {
+                        hit_map.detail_buttons.push((target.action(), marker_area));
+                    }
+                }
                 frame.render_widget(Paragraph::new(Line::from(spans)), link_area);
                 if show_text_selection {
                     capture_selectable_details_row(frame, hit_map, link_area);
                 }
+                let clickable_offset = external_offset.min(link_area.width);
                 let clickable_area = Rect::new(
-                    link_area.x,
+                    link_area.x.saturating_add(clickable_offset),
                     link_area.y,
-                    clickable_width.min(link_area.width),
+                    external_width.min(link_area.width.saturating_sub(clickable_offset)),
                     1,
                 );
                 if view.external_opener_available && clickable_area.width > 0 {
-                    hit_map.detail_links.push((index, clickable_area));
+                    hit_map.detail_links.push((*index, clickable_area));
                 }
                 cursor_y = cursor_y.saturating_add(1);
             }
@@ -7328,7 +7860,15 @@ fn centered_line_x(area: Rect, line_width: u16) -> u16 {
         .saturating_add((area.width / 2).saturating_sub(line_width.min(area.width) / 2))
 }
 
-fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
+fn search_kind_help(view: &ViewModel) -> &'static str {
+    if view.screen == Screen::YandexMusic {
+        "  v all/music/podcasts/audiobooks search"
+    } else {
+        "  v video/channel search     N relevance/newest     C CC-only videos"
+    }
+}
+
+fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
     let mut local_help = "  Local: Esc parent     PageUp/Down page     Z size".to_owned();
@@ -7350,7 +7890,7 @@ fn render_help(frame: &mut Frame<'_>, theme: &Theme) {
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         "  F2 offline     F3 history     Backspace back",
         "  F4 playlists     F5 stats     p preferences",
-        "  v video/channel search     N relevance/newest     C CC-only videos",
+        search_kind_help(view),
         "  j/k select     Enter open/play",
         "  ↪ internal video: click the marker after a YouTube URL",
         local_help.as_str(),
@@ -7940,7 +8480,7 @@ fn render_youtube_setup_popup(
         .collect::<Vec<_>>()
         .join("   ");
     frame.render_widget(
-        Paragraph::new(controls)
+        Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
         sections[5],
@@ -7962,6 +8502,205 @@ fn render_youtube_setup_popup(
         ));
         button_x = button_x.saturating_add(width).saturating_add(3);
     }
+}
+
+/// Renders one masked Yandex Music OAuth-token editor.
+fn render_yandex_music_setup_popup(
+    frame: &mut Frame<'_>,
+    setup: &YandexMusicSetupPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let height = if setup.validation_error.is_some() {
+        18
+    } else if setup.validating {
+        17
+    } else {
+        16
+    };
+    let area = centered_sized_rect(100, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        panel_block(
+            if setup.validating {
+                " Validating Yandex Music… "
+            } else {
+                " Configure Yandex Music "
+            },
+            theme,
+        ),
+        area,
+    );
+
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(if setup.validation_error.is_some() || setup.validating {
+                3
+            } else {
+                2
+            }),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(
+            "Yandex Music requires a user OAuth access token—not an API key. \
+             Paste it below; rendering and diagnostics always mask it.",
+        )
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let token = masked_setup_value(
+        &setup.token,
+        usize::from(sections[1].width.saturating_sub(2)),
+    );
+    frame.render_widget(
+        Paragraph::new(if token.is_empty() {
+            "enter an OAuth token".to_owned()
+        } else {
+            token
+        })
+        .style(if setup.validating {
+            theme.muted
+        } else {
+            theme.accent
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if setup.validating {
+                    theme.muted
+                } else {
+                    theme.accent
+                })
+                .title(if setup.validating {
+                    " OAuth token (masked; read-only) "
+                } else {
+                    " ▶ OAuth token (masked) "
+                }),
+        ),
+        sections[1],
+    );
+    if !setup.validating {
+        hit_map.yandex_music_setup_field = Some(sections[1]);
+    }
+
+    frame.render_widget(
+        Paragraph::new(
+            "The integration uses Yandex Music's private client API and can change when Yandex updates it.",
+        )
+        .style(theme.muted)
+        .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+
+    let external_link_style = if external_opener_available {
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme.muted
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if external_opener_available {
+                    "[F1] OAuth guide: "
+                } else {
+                    "OAuth guide: "
+                },
+                if external_opener_available {
+                    theme.accent
+                } else {
+                    theme.muted
+                },
+            ),
+            Span::styled(
+                YANDEX_OAUTH_GUIDE_URL.trim_start_matches("https://"),
+                external_link_style,
+            ),
+        ])),
+        sections[3],
+    );
+    if external_opener_available {
+        hit_map
+            .yandex_music_setup_buttons
+            .push((UiAction::OpenYandexOAuthGuide, sections[3]));
+    }
+
+    let storage = format!(
+        "{}Token saves to: {}\nPlaintext credential; Unix permissions: directories 0700, files 0600. \
+         YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN overrides the saved value.{}",
+        if setup.validating {
+            "Validating the candidate token before saving…\n"
+        } else {
+            ""
+        },
+        setup.token_path,
+        setup
+            .validation_error
+            .as_ref()
+            .map_or_else(String::new, |error| format!("\nError: {error}"))
+    );
+    frame.render_widget(
+        Paragraph::new(storage)
+            .style(if setup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[4],
+    );
+
+    let submit_label = if setup.validating {
+        "[Enter] Validating…"
+    } else {
+        "[Enter] Save and load"
+    };
+    let cancel_label = "[Esc] Cancel";
+    let controls = format!("{submit_label}   {cancel_label}");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(if setup.validating {
+                theme.muted
+            } else {
+                theme.accent
+            }),
+        sections[5],
+    );
+    let controls_width = u16::try_from(controls.chars().count()).unwrap_or(u16::MAX);
+    let mut button_x = sections[5]
+        .x
+        .saturating_add(sections[5].width.saturating_sub(controls_width) / 2);
+    let submit_width = u16::try_from(submit_label.chars().count()).unwrap_or(u16::MAX);
+    if !setup.validating {
+        hit_map.yandex_music_setup_buttons.push((
+            UiAction::SubmitYandexMusicSetup,
+            Rect::new(button_x, sections[5].y, submit_width, sections[5].height),
+        ));
+    }
+    button_x = button_x.saturating_add(submit_width).saturating_add(3);
+    let cancel_width = u16::try_from(cancel_label.chars().count()).unwrap_or(u16::MAX);
+    hit_map.yandex_music_setup_buttons.push((
+        UiAction::DismissYandexMusicSetup,
+        Rect::new(button_x, sections[5].y, cancel_width, sections[5].height),
+    ));
 }
 
 fn render_rss_subscription_popup(
@@ -9856,6 +10595,33 @@ fn key_action_with_page_rows_unfiltered(
             _ => None,
         };
     }
+    if let Some(setup) = view.yandex_music_setup_popup.as_ref() {
+        if setup.validating {
+            return match key.code {
+                KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
+                KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
+                _ => None,
+            };
+        }
+        return match key.code {
+            KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
+            KeyCode::Enter => Some(UiAction::SubmitYandexMusicSetup),
+            KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
+            KeyCode::Backspace => Some(UiAction::DeleteYandexMusicTokenCharacter),
+            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
+                Some(UiAction::DeleteYandexMusicTokenWord)
+            }
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(UiAction::AppendYandexMusicTokenCharacter(character))
+            }
+            _ => None,
+        };
+    }
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
         let other_field = match setup.selected_field {
             YouTubeSetupField::ApiKey => YouTubeSetupField::InvidiousUrl,
@@ -9962,12 +10728,17 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::F(3) => Some(UiAction::ShowScreen(Screen::History)),
         KeyCode::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
         KeyCode::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
+        KeyCode::Char('v') if view.screen == Screen::YandexMusic => {
+            Some(UiAction::CycleYandexMusicSearchKind)
+        }
         KeyCode::Char('v') => Some(UiAction::ToggleSearchKind),
         KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(UiAction::PlayNext)
         }
-        KeyCode::Char('C') => Some(UiAction::ToggleYouTubeCreativeCommons),
+        KeyCode::Char('C') if view.screen != Screen::YandexMusic => {
+            Some(UiAction::ToggleYouTubeCreativeCommons)
+        }
         KeyCode::Char('A') => Some(UiAction::ToggleAutoplay),
         KeyCode::Char('l')
             if view.playlist_item.is_some()
@@ -9993,6 +10764,37 @@ fn key_action_with_page_rows_unfiltered(
         }
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
         KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
+        KeyCode::Char('L')
+            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
+        {
+            Some(UiAction::ToggleYandexMusicLike)
+        }
+        KeyCode::Char('X')
+            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
+        {
+            Some(UiAction::ToggleYandexMusicDislike)
+        }
+        KeyCode::Char('g')
+            if view.screen == Screen::YandexMusic && view.yandex_music_actions.artist_available =>
+        {
+            Some(UiAction::OpenYandexMusicArtist)
+        }
+        KeyCode::Char('b')
+            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_available =>
+        {
+            Some(UiAction::OpenYandexMusicAlbum)
+        }
+        KeyCode::Char('D')
+            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_open =>
+        {
+            Some(UiAction::DownloadYandexMusicAlbum)
+        }
+        KeyCode::Char('R')
+            if view.screen == Screen::YandexMusic
+                && view.yandex_music_actions.twenty_recommendations_available =>
+        {
+            Some(UiAction::DownloadTwentyYandexMusicRecommendations)
+        }
         KeyCode::Char('f')
             if view.screen == Screen::Local
                 && view
@@ -10100,6 +10902,17 @@ fn key_action_with_page_rows_unfiltered(
             Some(UiAction::GoBack)
         }
         KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
+        KeyCode::Esc
+            if view.screen == Screen::YandexMusic
+                && matches!(
+                    view.yandex_music_route,
+                    YandexMusicRouteView::Search
+                        | YandexMusicRouteView::Album
+                        | YandexMusicRouteView::Artist
+                ) =>
+        {
+            Some(UiAction::GoBack)
+        }
         KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
         KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         KeyCode::Up if alt && details_line_scroll_available => {
@@ -10429,6 +11242,25 @@ fn mouse_action_unfiltered(
                 } else {
                     hit_map
                         .rss_subscription_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            _ => None,
+        };
+    }
+    if view.yandex_music_setup_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hit_map
+                    .yandex_music_setup_field
+                    .is_some_and(|area| contains(area, mouse.column, mouse.row))
+                {
+                    None
+                } else {
+                    hit_map
+                        .yandex_music_setup_buttons
                         .iter()
                         .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                         .map(|(action, _)| action.clone())
@@ -11787,6 +12619,437 @@ mod tests {
     }
 
     #[test]
+    fn yandex_music_search_title_and_help_expose_the_selected_scope() {
+        let mut view = ViewModel {
+            screen: Screen::YandexMusic,
+            ..ViewModel::default()
+        };
+        view.yandex_music_route = YandexMusicRouteView::Recommendations;
+        view.search_query = "retained search draft".to_owned();
+        assert_eq!(
+            search_panel_title(&view),
+            " My Wave ",
+            "recommendations must not be mislabeled with a retained search query"
+        );
+
+        view.yandex_music_route = YandexMusicRouteView::Search;
+        for (kind, title) in [
+            (YandexMusicSearchKind::All, "All"),
+            (YandexMusicSearchKind::Music, "Music"),
+            (YandexMusicSearchKind::Podcasts, "Podcasts"),
+            (YandexMusicSearchKind::Audiobooks, "Audiobooks"),
+        ] {
+            view.yandex_music_search_kind = kind;
+            view.search_query.clear();
+            assert_eq!(search_panel_title(&view), format!(" {title} search "));
+
+            view.search_query = "fixture query".to_owned();
+            assert_eq!(
+                search_panel_title(&view),
+                format!(" {title} · fixture query ")
+            );
+
+            view.search_editing = true;
+            view.search_cursor_byte = view.search_query.len();
+            assert_eq!(
+                search_panel_title(&view),
+                format!(" {title} search: fixture query▏ ")
+            );
+            view.search_editing = false;
+        }
+
+        view.yandex_music_route = YandexMusicRouteView::Album;
+        assert_eq!(search_panel_title(&view), " Album ");
+
+        view.yandex_music_route = YandexMusicRouteView::Artist;
+        assert_eq!(search_panel_title(&view), " Artist ");
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::GoBack),
+            "Esc must return from an internally opened artist"
+        );
+
+        assert_eq!(
+            search_kind_help(&view),
+            "  v all/music/podcasts/audiobooks search"
+        );
+        view.screen = Screen::Search;
+        assert_eq!(
+            search_kind_help(&view),
+            "  v video/channel search     N relevance/newest     C CC-only videos"
+        );
+    }
+
+    #[test]
+    fn yandex_music_search_defaults_to_the_complete_catalogue() {
+        assert_eq!(YandexMusicSearchKind::default().label(), "all");
+    }
+
+    #[test]
+    fn yandex_music_details_render_source_specific_actions_with_exact_hit_targets() {
+        let mut view = ViewModel {
+            screen: Screen::YandexMusic,
+            external_opener_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YandexMusic, "303")),
+                title: "Fixture Track".to_owned(),
+                length: "3:03".to_owned(),
+                links: vec![DetailLinkView {
+                    url: "https://music.yandex.com/album/404/track/303".to_owned(),
+                    presentation: DetailLinkPresentation::UrlOnly,
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            yandex_music_actions: YandexMusicActionsView {
+                track_selected: true,
+                artist_available: true,
+                album_available: true,
+                album_open: true,
+                twenty_recommendations_available: true,
+                reaction: YandexMusicReactionView::Neutral,
+            },
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 34)).expect("Yandex Music terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Yandex Music actions");
+        let rendered = rendered_text(&terminal);
+        for label in [
+            "[o] xdg-open track",
+            "[L] Like",
+            "[X] Dislike",
+            "[g] Open artist",
+            "[b] Open album",
+            "[Shift+D] Download album",
+            "[R] Download 20 recommendations",
+        ] {
+            assert!(
+                rendered.contains(label),
+                "Yandex Music details omitted {label:?}:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("xdg-open video"));
+        assert!(
+            !rendered.contains("Length: 3:03"),
+            "Yandex Music duration is already visible in the selected row and player"
+        );
+        for action in [
+            UiAction::OpenInBrowser,
+            UiAction::ToggleYandexMusicLike,
+            UiAction::ToggleYandexMusicDislike,
+            UiAction::OpenYandexMusicArtist,
+            UiAction::OpenYandexMusicAlbum,
+            UiAction::DownloadYandexMusicAlbum,
+            UiAction::DownloadTwentyYandexMusicRecommendations,
+        ] {
+            let target = hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, target)| (candidate == &action).then_some(*target))
+                .unwrap_or_else(|| panic!("missing hit target for {action:?}"));
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(action)
+            );
+        }
+        assert!(!rendered.contains("OAuth token"));
+        let like_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::ToggleYandexMusicLike).then_some(area.y)
+            })
+            .expect("Like row");
+        let dislike_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::ToggleYandexMusicDislike).then_some(area.y)
+            })
+            .expect("Dislike row");
+        assert!(
+            dislike_row > like_row,
+            "Dislike must remain after Like in visual order"
+        );
+        let artist_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::OpenYandexMusicArtist).then_some(area.y)
+            })
+            .expect("Open artist row");
+        let album_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::OpenYandexMusicAlbum).then_some(area.y)
+            })
+            .expect("Open album row");
+        assert!(
+            artist_row < album_row,
+            "Open artist must remain before Open album in visual order"
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenYandexMusicArtist)
+        );
+
+        view.yandex_music_actions = YandexMusicActionsView {
+            album_available: true,
+            ..YandexMusicActionsView::default()
+        };
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Yandex Music album actions");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[o] xdg-open item"));
+        assert!(!rendered.contains("xdg-open track"));
+        assert!(!rendered.contains("[g] Open artist"));
+        assert_ne!(
+            key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenYandexMusicArtist),
+            "the artist action must require an exact selected artist"
+        );
+    }
+
+    #[test]
+    fn yandex_artist_album_and_source_links_have_spaced_exact_mouse_targets() {
+        let source_url = "https://music.yandex.ru/album/404/track/303";
+        let mut view = ViewModel {
+            screen: Screen::YandexMusic,
+            external_opener_available: true,
+            details: Some(DetailView {
+                links: vec![
+                    DetailLinkView {
+                        prefix: "Artist: ".to_owned(),
+                        label: "First Artist".to_owned(),
+                        url: "https://music.yandex.ru/artist/101".to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::YandexMusicArtist(
+                            "101".to_owned(),
+                        )),
+                        presentation: DetailLinkPresentation::LabelOnlySpaced,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        prefix: "Album: ".to_owned(),
+                        label: "Fixture Album".to_owned(),
+                        url: "https://music.yandex.ru/album/404".to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::YandexMusicAlbum(
+                            "404".to_owned(),
+                        )),
+                        presentation: DetailLinkPresentation::LabelOnlySpaced,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: String::new(),
+                        url: source_url.to_owned(),
+                        presentation: DetailLinkPresentation::UrlOnlySpaced,
+                        ..DetailLinkView::default()
+                    },
+                ],
+                description: "Type: Music".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).expect("Yandex link terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Yandex links");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Artist: First Artist"));
+        assert!(rendered.contains("Album: Fixture Album"));
+        assert!(!rendered.contains("Yandex Music —"));
+        assert!(!rendered.contains("Artist: First Artist —"));
+        assert!(!rendered.contains("Album: Fixture Album —"));
+        assert!(rendered.contains(source_url));
+        assert!(rendered.contains("Type: Music"));
+        assert_eq!(rendered.matches('↪').count(), 2);
+        let targets = hit_map
+            .detail_links
+            .iter()
+            .map(|(index, area)| (*index, *area))
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[1].1.y, targets[0].1.y.saturating_add(2));
+        assert_eq!(targets[2].1.y, targets[1].1.y.saturating_add(2));
+        assert_eq!(targets[0].1.width, terminal_text_width("First Artist"));
+        assert_eq!(targets[1].1.width, terminal_text_width("Fixture Album"));
+        assert_eq!(targets[2].1.width, terminal_text_width(source_url));
+        assert_eq!(
+            targets[0].1.x,
+            hit_map
+                .details_panel
+                .x
+                .saturating_add(terminal_text_width("Artist: ")),
+            "the plain Artist prefix must not belong to the external target"
+        );
+        assert_eq!(
+            targets[1].1.x,
+            hit_map
+                .details_panel
+                .x
+                .saturating_add(terminal_text_width("Album: ")),
+            "the plain Album prefix must not belong to the external target"
+        );
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        for (index, area) in targets.iter().copied() {
+            assert_eq!(
+                mouse_action(click(area.x, area.y), &hit_map, &view),
+                Some(UiAction::ActivateDetailLink(index))
+            );
+        }
+        for (action, external_area) in [
+            (
+                UiAction::OpenYandexMusicArtistById("101".to_owned()),
+                targets[0].1,
+            ),
+            (
+                UiAction::OpenYandexMusicAlbumById("404".to_owned()),
+                targets[1].1,
+            ),
+        ] {
+            let marker_area = hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == &action).then_some(*area))
+                .unwrap_or_else(|| panic!("missing internal marker for {action:?}"));
+            assert_eq!(marker_area.width, terminal_text_width("↪"));
+            assert_eq!(marker_area.x, external_area.right().saturating_add(1));
+            assert_eq!(
+                mouse_action(click(marker_area.x, marker_area.y), &hit_map, &view),
+                Some(action)
+            );
+        }
+        for (prefix, target) in [("Artist", targets[0].1), ("Album", targets[1].1)] {
+            assert_eq!(
+                mouse_action(click(hit_map.details_panel.x, target.y), &hit_map, &view,),
+                Some(UiAction::SetDetailsFocus(true)),
+                "the {prefix} prefix must remain plain, non-clickable text"
+            );
+        }
+        assert_eq!(
+            mouse_action(
+                click(targets[0].1.x, targets[0].1.y.saturating_add(1)),
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetDetailsFocus(true)),
+            "the separator row must not activate either adjacent link"
+        );
+
+        let type_row = hit_map
+            .detail_text_rows
+            .iter()
+            .find(|row| row.cells.concat().contains("Type: Music"))
+            .expect("Type details row");
+        assert_eq!(
+            type_row.y,
+            targets[2].1.y.saturating_add(2),
+            "the source URL must retain one blank row before Type"
+        );
+
+        view.external_opener_available = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw internal Yandex links without a browser");
+        assert!(hit_map.detail_links.is_empty());
+        for action in [
+            UiAction::OpenYandexMusicArtistById("101".to_owned()),
+            UiAction::OpenYandexMusicAlbumById("404".to_owned()),
+        ] {
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(candidate, _)| candidate == &action),
+                "internal navigation must remain clickable without an external opener"
+            );
+        }
+    }
+
+    #[test]
+    fn yandex_wikidata_disclosure_follows_its_artist_before_the_blank_row() {
+        let view = ViewModel {
+            screen: Screen::YandexMusic,
+            external_opener_available: true,
+            details: Some(DetailView {
+                links: vec![
+                    DetailLinkView {
+                        prefix: "Artist: ".to_owned(),
+                        label: "Fixture Artist".to_owned(),
+                        url: "https://music.yandex.ru/artist/101".to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::YandexMusicArtist(
+                            "101".to_owned(),
+                        )),
+                        presentation: DetailLinkPresentation::LabelOnlySpaced,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Fixture artist item (Q101)".to_owned(),
+                        url: "https://www.wikidata.org/wiki/Q101".to_owned(),
+                        wikidata_item_id: Some("Q101".to_owned()),
+                        presentation: DetailLinkPresentation::LabelAndUrlSpaced,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        prefix: "Album: ".to_owned(),
+                        label: "Fixture Album".to_owned(),
+                        url: "https://music.yandex.ru/album/404".to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::YandexMusicAlbum(
+                            "404".to_owned(),
+                        )),
+                        presentation: DetailLinkPresentation::LabelOnlySpaced,
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).expect("Yandex Wikidata TUI");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw grouped Yandex Wikidata");
+
+        let row_for = |index| {
+            hit_map
+                .detail_links
+                .iter()
+                .find_map(|(candidate, area)| (*candidate == index).then_some(area.y))
+                .unwrap_or_else(|| panic!("missing Details link {index}"))
+        };
+        let artist_row = row_for(0);
+        let wikidata_row = row_for(1);
+        let album_row = row_for(2);
+        assert_eq!(wikidata_row, artist_row.saturating_add(1));
+        assert_eq!(album_row, wikidata_row.saturating_add(2));
+    }
+
+    #[test]
     fn youtube_search_editor_renders_and_moves_its_cursor_without_seeking() {
         let mut view = ViewModel {
             screen: Screen::Search,
@@ -12592,11 +13855,11 @@ mod tests {
 
     #[test]
     fn popup_panels_keep_their_box_borders() {
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
-            .draw(|frame| render_help(frame, &Theme::new(false)))
+            .draw(|frame| render_help(frame, &ViewModel::default(), &Theme::new(false)))
             .expect("draw bordered help popup");
         let rendered = terminal
             .backend()
@@ -12624,6 +13887,7 @@ mod tests {
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
+        assert!(rendered.contains("t Details-only text selection"));
         assert!(rendered.contains(&format!("Youta v{}", env!("CARGO_PKG_VERSION"))));
         assert!(rendered.contains(env!("CARGO_PKG_REPOSITORY")));
         assert!(!rendered.contains("M/F6 MOD/tracker music"));
@@ -13346,7 +14610,59 @@ mod tests {
     }
 
     #[test]
-    fn control_w_deletes_words_only_in_the_six_text_editors() {
+    fn yandex_music_setup_popup_captures_and_maps_secret_editor_keys() {
+        let view = ViewModel {
+            search_editing: true,
+            help_open: true,
+            yandex_music_setup_popup: Some(YandexMusicSetupPopupView::default()),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE), &view),
+            Some(UiAction::AppendYandexMusicTokenCharacter('A'))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &view),
+            Some(UiAction::DeleteYandexMusicTokenCharacter)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitYandexMusicSetup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenYandexOAuthGuide)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissYandexMusicSetup)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &view
+            ),
+            None,
+            "the modal must not leak the normal quit action"
+        );
+    }
+
+    #[test]
+    fn yandex_music_tab_does_not_reserve_a_token_editor_hotkey() {
+        let view = ViewModel {
+            screen: Screen::YandexMusic,
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &view),
+            None
+        );
+    }
+
+    #[test]
+    fn control_w_deletes_words_only_in_the_seven_text_editors() {
         let chord = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
         let editors = [
             (
@@ -13362,6 +14678,13 @@ mod tests {
                     ..ViewModel::default()
                 },
                 UiAction::DeleteYouTubeSetupWord,
+            ),
+            (
+                ViewModel {
+                    yandex_music_setup_popup: Some(YandexMusicSetupPopupView::default()),
+                    ..ViewModel::default()
+                },
+                UiAction::DeleteYandexMusicTokenWord,
             ),
             (
                 ViewModel {
@@ -14324,6 +15647,7 @@ mod tests {
                         label: "Second".to_owned(),
                         url: "https://example.com/second".to_owned(),
                         wikidata_item_id: Some("Q42".to_owned()),
+                        ..DetailLinkView::default()
                     },
                 ],
                 ..DetailView::default()
@@ -14383,11 +15707,13 @@ mod tests {
                         label: "First entity".to_owned(),
                         url: "https://www.wikidata.org/wiki/Q1".to_owned(),
                         wikidata_item_id: Some("Q1".to_owned()),
+                        ..DetailLinkView::default()
                     },
                     DetailLinkView {
                         label: "Second entity".to_owned(),
                         url: "https://www.wikidata.org/wiki/Q2".to_owned(),
                         wikidata_item_id: Some("Q2".to_owned()),
+                        ..DetailLinkView::default()
                     },
                 ],
                 ..DetailView::default()
@@ -15384,6 +16710,7 @@ mod tests {
                 label: "Podcast website".to_owned(),
                 url: "https://podcasts.example/show".to_owned(),
                 wikidata_item_id: None,
+                ..DetailLinkView::default()
             }],
             ..DetailView::default()
         });
@@ -16056,6 +17383,39 @@ mod tests {
             action,
             UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
         )));
+    }
+
+    #[test]
+    fn completed_empty_search_says_nothing_found_instead_of_requesting_a_selection() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 18)).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::YandexMusic,
+            search_query: "missing fixture".to_owned(),
+            yandex_music_route: YandexMusicRouteView::Search,
+            rows: Vec::new(),
+            search_activity: None,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw empty search details");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Nothing found"));
+        assert!(!rendered.contains("Select an item to load details lazily"));
     }
 
     #[test]
@@ -16946,12 +18306,12 @@ mod tests {
         let thumbnail_area = hit_map.thumbnail_area.expect("ready artwork hitbox");
         let expected_actions = [
             UiAction::ToggleTodoPlaylist,
-            UiAction::OpenPlaylistPopup,
             UiAction::OpenVideoComments,
-            UiAction::EditPrivateNote,
+            UiAction::OpenPlaylistPopup,
             UiAction::OpenChannelInBrowser,
-            UiAction::ToggleSubscription,
+            UiAction::EditPrivateNote,
             UiAction::OpenInBrowser,
+            UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
             .iter()
@@ -16994,12 +18354,12 @@ mod tests {
         );
         let expected_labels = [
             "[l] Add to todo".to_owned(),
-            "[P] Playlist…".to_owned(),
             "[F6] Twenty comments".to_owned(),
-            "[n] Add private note".to_owned(),
+            "[P] Playlist…".to_owned(),
             format!("[O] {} channel · @fixture", system_url_opener_name()),
-            "[s] Subscribe (locally)".to_owned(),
+            "[n] Add private note".to_owned(),
             format!("[o] {} video", system_url_opener_name()),
+            "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
             .iter()
@@ -18138,6 +19498,7 @@ mod tests {
             label: "Douglas Adams (Q42)".to_owned(),
             url: "https://www.wikidata.org/wiki/Q42".to_owned(),
             wikidata_item_id: Some("Q42".to_owned()),
+            ..DetailLinkView::default()
         });
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
@@ -18862,6 +20223,42 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_original_artwork_is_prefetched_behind_the_bounded_panel_image() {
+        let panel =
+            url::Url::parse("https://avatars.yandex.net/get-music-content/fixture/1000x1000")
+                .expect("bounded Yandex panel artwork URL");
+        let original = url::Url::parse("https://avatars.yandex.net/get-music-content/fixture/orig")
+            .expect("original Yandex artwork URL");
+        let view = ViewModel {
+            screen: Screen::YandexMusic,
+            rows: vec![RowView {
+                thumbnail_url: Some(panel.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                source: "Yandex Music".to_owned(),
+                thumbnail_url: Some(panel),
+                expanded_thumbnail_url: Some(original.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut renderer = MockThumbnailRenderer::default();
+
+        assert!(synchronize_thumbnail_prefetch(
+            &view,
+            &UiSettings::default(),
+            &mut renderer,
+        ));
+        assert_eq!(
+            renderer.prefetch_batches,
+            [vec![original]],
+            "Yandex's original image must warm in the background before fullscreen expansion"
+        );
+    }
+
     #[test]
     fn expanded_youtube_artwork_uses_the_largest_advertised_image() {
         let backend = TestBackend::new(120, 40);
@@ -18908,12 +20305,72 @@ mod tests {
     }
 
     #[test]
-    fn automatic_thumbnail_width_accepts_an_independent_pixel_report() {
-        assert_eq!(nonzero_terminal_window_pixel_width(0), None);
+    fn terminal_pixel_dimensions_keep_independent_nonzero_reports() {
         assert_eq!(
-            nonzero_terminal_window_pixel_width(2_560),
-            Some(2_560),
-            "a usable width must survive even when other window metrics are unavailable"
+            nonzero_terminal_window_pixels(0, 1_200),
+            (None, Some(1_200))
+        );
+        assert_eq!(
+            nonzero_terminal_window_pixels(1_920, 0),
+            (Some(1_920), None),
+            "YouTube's usable width must survive a missing pixel height"
+        );
+        assert_eq!(
+            nonzero_terminal_window_pixels(2_560, 1_440),
+            (Some(2_560), Some(1_440))
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn full_hd_yandex_artwork_uses_more_than_the_400_pixel_fallback_area() {
+        let backend = TestBackend::new(192, 60);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::YandexMusic,
+            details: Some(DetailView {
+                title: "Adaptive Yandex artwork".to_owned(),
+                source: "Yandex Music".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://avatars.yandex.net/get-music-content/fixture/800x800")
+                        .expect("fixture thumbnail URL"),
+                ),
+                thumbnail_dimensions: Some((800, 800)),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let terminal_window = TerminalWindowMetrics::new(192, 60, 1_920, 1_200)
+            .expect("complete full-HD terminal metrics");
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+        let theme = Theme::new(false);
+
+        terminal
+            .draw(|frame| {
+                render_details_with_terminal_window(
+                    frame,
+                    Rect::new(96, 0, 96, 58),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    Some(terminal_window),
+                    &theme,
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw adaptive Yandex artwork");
+
+        let [(_, requested_area)] = thumbnails.synchronized.as_slice() else {
+            panic!("expected one synchronized Yandex artwork request");
+        };
+        assert!(
+            requested_area.height > DEFAULT_THUMBNAIL_HEIGHT,
+            "an 800×800 source in a full-HD terminal must render larger than the 400×400 fallback"
         );
     }
 
@@ -22401,6 +23858,109 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn yandex_music_setup_masks_token_and_exposes_private_storage_controls() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let secret = "yandex-oauth-token-never-render";
+        let view = ViewModel {
+            yandex_music_setup_popup: Some(YandexMusicSetupPopupView {
+                token: secret.to_owned(),
+                token_path: "/home/listener/.config/youta/secrets/credentials.toml".to_owned(),
+                validating: false,
+                validation_error: Some("token was rejected".to_owned()),
+            }),
+            ..ViewModel::default()
+        };
+        let debug_view = format!("{view:?}");
+        assert!(!debug_view.contains(secret));
+        assert!(debug_view.contains("[REDACTED]"));
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render(frame, &view, &UiSettings::default(), &mut hit_map);
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(rendered.contains("Configure Yandex Music"));
+        assert!(rendered.contains("OAuth token (masked)"));
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains(&"*".repeat(secret.len())));
+        assert!(normalized.contains("not an API key"));
+        assert!(normalized.contains(YANDEX_OAUTH_GUIDE_URL.trim_start_matches("https://")));
+        assert!(normalized.contains("secrets/credentials.toml"));
+        assert!(normalized.contains("YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN"));
+        assert!(normalized.contains("Error: token was rejected"));
+        assert!(normalized.contains("[Enter] Save and load"));
+        assert!(normalized.contains("[Esc] Cancel"));
+        assert!(hit_map.yandex_music_setup_field.is_some());
+        assert_eq!(hit_map.yandex_music_setup_buttons.len(), 3);
+    }
+
+    #[test]
+    fn yandex_music_setup_is_read_only_while_the_token_is_validating() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            yandex_music_setup_popup: Some(YandexMusicSetupPopupView {
+                token: "candidate-token".to_owned(),
+                token_path: "/home/listener/.config/youta/secrets/credentials.toml".to_owned(),
+                validating: true,
+                validation_error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw validating Yandex Music setup");
+        let rendered = rendered_text(&terminal);
+        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(normalized.contains("Validating Yandex Music"));
+        assert!(normalized.contains("OAuth token (masked; read-only)"));
+        assert!(normalized.contains("Validating the candidate token before saving"));
+        assert!(normalized.contains("[Enter] Validating"));
+        assert!(!normalized.contains("[Enter] Save and load"));
+        assert!(hit_map.yandex_music_setup_field.is_none());
+        assert!(
+            !hit_map
+                .yandex_music_setup_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::SubmitYandexMusicSetup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissYandexMusicSetup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenYandexOAuthGuide)
+        );
+    }
+
+    #[test]
     fn rss_subscription_popup_renders_storage_validation_and_mouse_targets() {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -22803,6 +24363,7 @@ prose 07:25 remains clickable but is not a chapter";
                     label: "Douglas Adams (Q42)".to_owned(),
                     url: "https://www.wikidata.org/wiki/Q42".to_owned(),
                     wikidata_item_id: Some("Q42".to_owned()),
+                    ..DetailLinkView::default()
                 }],
                 ..DetailView::default()
             }),
@@ -22839,8 +24400,9 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("Wikidata disclosure hit target");
         let (_, link_area) = hit_map.detail_links[0];
         assert_eq!(
-            disclosure_area.x, link_area.x,
-            "removing the selection marker must also reclaim its hitbox columns"
+            link_area.x,
+            disclosure_area.right().saturating_add(1),
+            "the disclosure must not overlap the exact external-link hitbox"
         );
         let label_cell = &terminal.backend().buffer()
             [(disclosure_area.right().saturating_add(1), disclosure_area.y)];
@@ -22988,6 +24550,7 @@ prose 07:25 remains clickable but is not a chapter";
                     label: "Fixture creator (Q61113)".to_owned(),
                     url: "https://www.wikidata.org/wiki/Q61113".to_owned(),
                     wikidata_item_id: Some("Q61113".to_owned()),
+                    ..DetailLinkView::default()
                 }],
                 expanded_wikidata_item: Some("Q61113".to_owned()),
                 wikidata_entities: vec![DetailWikidataEntityView {
@@ -23357,11 +24920,13 @@ prose 07:25 remains clickable but is not a chapter";
                         label: "Telegram: Fixture".to_owned(),
                         url: "https://t.me/fixture".to_owned(),
                         wikidata_item_id: None,
+                        ..DetailLinkView::default()
                     },
                     DetailLinkView {
                         label: "Douglas Adams (Q42)".to_owned(),
                         url: "https://www.wikidata.org/wiki/Q42".to_owned(),
                         wikidata_item_id: Some("Q42".to_owned()),
+                        ..DetailLinkView::default()
                     },
                 ],
                 ..DetailView::default()
@@ -23948,6 +25513,7 @@ prose 07:25 remains clickable but is not a chapter";
             url: "https://musicbrainz.org/recording/11111111-1111-4111-8111-111111111111"
                 .to_owned(),
             wikidata_item_id: None,
+            ..DetailLinkView::default()
         });
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
@@ -23986,7 +25552,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[cfg(feature = "local-trash")]
     #[test]
-    fn downloaded_details_offer_right_aligned_recoverable_removal_after_select_mode() {
+    fn downloaded_details_offer_top_right_recoverable_removal() {
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
@@ -24182,6 +25748,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Search,
                 #[cfg(feature = "youtube-music")]
                 Screen::YouTubeMusic,
+                #[cfg(feature = "yandex-music")]
+                Screen::YandexMusic,
                 #[cfg(feature = "bandcamp")]
                 Screen::Bandcamp,
                 #[cfg(feature = "apple-podcasts")]
@@ -24243,13 +25811,33 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw compact tabs");
         #[cfg(feature = "youtube-music")]
         assert!(rendered_text(&terminal).contains("YT Music"));
+        let compact_screens = Screen::ALL
+            .into_iter()
+            .filter(|screen| screen.enabled())
+            .collect::<Vec<_>>();
+        let compact_divider_width = terminal_text_width("│");
+        let visible = active_tab_window(&compact_screens, view.screen, 80, compact_divider_width);
         assert_eq!(
-            compact_hit_map.tabs.len(),
-            Screen::ALL
-                .into_iter()
-                .filter(|screen| screen.enabled())
-                .count()
+            compact_hit_map
+                .tabs
+                .iter()
+                .map(|(screen, _)| *screen)
+                .collect::<Vec<_>>(),
+            compact_screens[visible].to_vec()
         );
+        let mut expected_x = 0_u16;
+        for (index, (screen, area)) in compact_hit_map.tabs.iter().enumerate() {
+            if index > 0 {
+                expected_x = expected_x.saturating_add(compact_divider_width);
+            }
+            let expected_width = terminal_text_width(screen.compact_label());
+            assert_eq!(
+                *area,
+                Rect::new(expected_x, 0, expected_width, 1),
+                "{screen:?} must have an exact label-only hit target"
+            );
+            expected_x = expected_x.saturating_add(expected_width);
+        }
         for (screen, area) in &compact_hit_map.tabs {
             for column in [area.x, area.right().saturating_sub(1)] {
                 let click = MouseEvent {
@@ -24265,6 +25853,10 @@ prose 07:25 remains clickable but is not a chapter";
             }
         }
         for adjacent in compact_hit_map.tabs.windows(2) {
+            assert!(
+                adjacent[0].1.right() <= adjacent[1].1.x,
+                "compact tab hit targets must never overlap"
+            );
             for column in adjacent[0].1.right()..adjacent[1].1.x {
                 let divider_click = MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),

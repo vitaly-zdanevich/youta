@@ -62,6 +62,9 @@ pub const YOUTUBE_BACKEND_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_BACKEND";
 /// Environment variable that overrides the official `YouTube` Data API key.
 pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
 
+/// Environment variable that overrides the Yandex Music OAuth access token.
+pub const YANDEX_MUSIC_TOKEN_ENV: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
+
 /// Environment variable that overrides the configured Invidious base URL.
 pub const INVIDIOUS_BASE_URL_ENV: &str = "YOUTA_PROVIDERS__INVIDIOUS_BASE_URL";
 
@@ -92,17 +95,18 @@ const YOUTA_GITIGNORE_RULES: &[&str] = &[
 /// This mirrors only secret-bearing provider fields. Keeping the schema
 /// separate prevents `secrets/credentials.toml` from silently overriding
 /// ordinary Git-friendly preferences.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CredentialsFile {
     providers: ProviderCredentials,
 }
 
 /// Provider credentials that may be loaded from the private credentials file.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ProviderCredentials {
     youtube_api_key: Option<String>,
+    yandex_music_token: Option<String>,
     mod_archive_api_key: Option<String>,
     jamendo_client_id: Option<String>,
     acoustid_client_key: Option<String>,
@@ -264,6 +268,9 @@ impl Config {
         }
         if let Some(client_key) = self.providers.acoustid_client_key.as_deref() {
             validate_acoustid_client_key("providers.acoustid_client_key", client_key)?;
+        }
+        if let Some(token) = self.providers.yandex_music_token.as_deref() {
+            validate_generic_credential("providers.yandex_music_token", token)?;
         }
         for (field, credential) in [
             (
@@ -442,6 +449,53 @@ impl Config {
                 self.providers.invidious_base_url = Some(url);
             }
         }
+        Ok(())
+    }
+
+    /// Persists one Yandex Music OAuth access token in the private credentials file.
+    ///
+    /// Existing unrelated settings, comments, and credentials are preserved.
+    /// The token is removed from a legacy `[providers]` table in `config.toml`
+    /// before the private file is published. Youta refuses to write while
+    /// [`YANDEX_MUSIC_TOKEN_ENV`] is set because that value would shadow the
+    /// saved credential on the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is empty, contains surrounding
+    /// whitespace or control characters, exceeds 4096 bytes, an environment
+    /// override is active, or either TOML file cannot be updated atomically.
+    #[cfg(all(feature = "tui", feature = "yandex-music"))]
+    pub fn save_yandex_music_token(&mut self, token: String) -> Result<(), ConfigError> {
+        if std::env::var_os(YANDEX_MUSIC_TOKEN_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{YANDEX_MUSIC_TOKEN_ENV} overrides the saved Yandex Music token; change or remove it before saving"
+            )));
+        }
+        validate_generic_credential("providers.yandex_music_token", &token)?;
+
+        self.ensure_directories()?;
+        let config_path = self.config_file();
+        let credentials_path = self.credentials_file();
+        let mut config_document = read_editable_config(&config_path)?;
+        let mut credentials_document = read_editable_credentials(&credentials_path)?;
+        migrate_legacy_provider_credentials(&mut config_document, &mut credentials_document)?;
+
+        if let Some(providers) = config_document
+            .get_mut("providers")
+            .and_then(Item::as_table_mut)
+        {
+            providers.remove("yandex_music_token");
+        }
+        let providers = editable_table(&mut credentials_document, "providers")?;
+        providers["yandex_music_token"] = value(token.clone());
+
+        write_private_config(
+            &credentials_path,
+            credentials_document.to_string().as_bytes(),
+        )?;
+        write_private_config(&config_path, config_document.to_string().as_bytes())?;
+        self.providers.yandex_music_token = Some(token);
         Ok(())
     }
 
@@ -1080,6 +1134,8 @@ pub struct ProviderConfig {
     pub funkwhale_instance_url: Option<Url>,
     /// Optional `YouTube` Data API credential.
     pub youtube_api_key: Option<String>,
+    /// Optional OAuth access token for the user's Yandex Music account.
+    pub yandex_music_token: Option<String>,
     /// Optional Mod Archive API credential or externally resolved reference.
     pub mod_archive_api_key: Option<String>,
     /// Optional client ID issued for the user's Jamendo application.
@@ -1112,6 +1168,10 @@ impl fmt::Debug for ProviderConfig {
                 &self.youtube_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
+                "yandex_music_token",
+                &self.yandex_music_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
                 "mod_archive_api_key",
                 &self.mod_archive_api_key.as_ref().map(|_| "[REDACTED]"),
             )
@@ -1140,6 +1200,7 @@ impl Default for ProviderConfig {
             peertube_instance_url: None,
             funkwhale_instance_url: None,
             youtube_api_key: None,
+            yandex_music_token: None,
             mod_archive_api_key: None,
             jamendo_client_id: None,
             acoustid_client_key: None,
@@ -1365,6 +1426,10 @@ fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
         validate_acoustid_client_key("providers.acoustid_client_key", client_key)
             .map_err(|error| credential_file_error(path, error))?;
     }
+    if let Some(token) = credentials.providers.yandex_music_token.as_deref() {
+        validate_generic_credential("providers.yandex_music_token", token)
+            .map_err(|error| credential_file_error(path, error))?;
+    }
     for (field, credential) in [
         (
             "providers.mod_archive_api_key",
@@ -1566,6 +1631,7 @@ fn migrate_legacy_provider_credentials(
     {
         for field in [
             "youtube_api_key",
+            "yandex_music_token",
             "mod_archive_api_key",
             "jamendo_client_id",
         ] {
@@ -2288,6 +2354,7 @@ youtube_api_key = "keep-this-existing-secret"
     fn provider_debug_output_redacts_all_configured_credentials() {
         let mut providers = ProviderConfig {
             youtube_api_key: Some("youtube-secret-canary".to_owned()),
+            yandex_music_token: Some("yandex-oauth-secret-canary".to_owned()),
             mod_archive_api_key: Some("mod-secret-canary".to_owned()),
             jamendo_client_id: Some("jamendo-client-canary".to_owned()),
             acoustid_client_key: Some("acoustid-secret-canary".to_owned()),
@@ -2296,6 +2363,7 @@ youtube_api_key = "keep-this-existing-secret"
         let rendered = format!("{providers:?}");
         for secret in [
             "youtube-secret-canary",
+            "yandex-oauth-secret-canary",
             "mod-secret-canary",
             "jamendo-client-canary",
             "acoustid-secret-canary",
@@ -2472,6 +2540,7 @@ youtube_api_key = "keep-this-existing-secret"
     fn credentials_reject_surrounding_whitespace_without_loading_trimmed_values() {
         for (field, value) in [
             ("youtube_api_key", " AIzaValid_key_123456789012345678"),
+            ("yandex_music_token", " yandex-oauth-token"),
             ("mod_archive_api_key", "mod-archive-key "),
             ("jamendo_client_id", "\tjamendo-client-id"),
             ("acoustid_client_key", "acoustid-key "),
@@ -2511,6 +2580,7 @@ youtube_api_key = "keep-this-existing-secret"
     fn legacy_provider_credentials_use_the_same_exact_validation() {
         for (field, value) in [
             ("youtube_api_key", "AIzaValid_key_123456789012345678 "),
+            ("yandex_music_token", "yandex-oauth-token "),
             ("mod_archive_api_key", " mod-archive-key"),
             ("jamendo_client_id", "jamendo-client-id\n"),
             ("acoustid_client_key", "acoustid-client-key "),
@@ -2525,6 +2595,56 @@ youtube_api_key = "keep-this-existing-secret"
             let error = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
                 .expect_err("legacy credentials must not be normalized implicitly");
             assert!(error.to_string().contains(&format!("providers.{field}")));
+        }
+    }
+
+    #[cfg(all(feature = "tui", feature = "yandex-music"))]
+    #[test]
+    fn yandex_music_token_saves_privately_and_preserves_unrelated_content() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("youta");
+        fs::create_dir(&root).expect("config directory");
+        fs::write(
+            root.join("config.toml"),
+            "# keep this comment\n[providers]\nyandex_music_token = \"legacy-token\"\nbandcamp_audio_format = \"flac\"\n",
+        )
+        .expect("legacy configuration");
+        let mut config = Config::load_from_dir_with_environment(root.clone(), false)
+            .expect("load legacy credential");
+        let token = "current-yandex-oauth-token";
+
+        config
+            .save_yandex_music_token(token.to_owned())
+            .expect("save Yandex Music token");
+
+        let public = fs::read_to_string(config.config_file()).expect("saved configuration");
+        assert!(public.contains("# keep this comment"));
+        assert!(public.contains("bandcamp_audio_format = \"flac\""));
+        assert!(!public.contains("legacy-token"));
+        assert!(!public.contains(token));
+        let private = fs::read_to_string(config.credentials_file()).expect("private credentials");
+        assert!(private.contains(token));
+        assert!(!private.contains("legacy-token"));
+        assert_eq!(config.providers.yandex_music_token.as_deref(), Some(token));
+
+        let reloaded =
+            Config::load_from_dir_with_environment(root, false).expect("reload saved token");
+        assert_eq!(
+            reloaded.providers.yandex_music_token.as_deref(),
+            Some(token)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(config.credentials_file())
+                    .expect("credentials metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 

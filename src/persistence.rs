@@ -9,8 +9,7 @@ use std::ops::Deref;
 #[cfg(any(
     feature = "sqlite-state",
     feature = "local-rename",
-    feature = "local-move",
-    test
+    feature = "local-move"
 ))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,6 +30,10 @@ use crate::domain::{
     PlaylistMediaSnapshot, PlaylistMembership, PlaylistSummary, PodcastShowSummary, PrivateComment,
     RADIO_FAVORITES_PLAYLIST_ID, RADIO_FAVORITES_PLAYLIST_NAME, SessionState, SourceKind,
     TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink, remote_url_has_non_public_host,
+};
+#[cfg(feature = "yandex-music")]
+use crate::domain::{
+    PendingYandexMusicReaction, YandexMusicReaction, YandexMusicReactionLedgerEntry,
 };
 #[cfg(all(
     any(feature = "local-rename", feature = "local-move"),
@@ -84,6 +87,14 @@ pub const MAX_PLAYLISTS: usize = 1_024;
 pub const MAX_PLAYLIST_ENTRIES: usize = 10_000;
 #[cfg(any(feature = "local-rename", feature = "local-move"))]
 const MAX_LOCAL_MOVE_MAPPINGS: usize = 10_000;
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_ACCOUNT_UID_BYTES: usize = 128;
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_TRACK_ID_BYTES: usize = 256;
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_REACTION_ROWS: usize = 10_000;
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_REACTIONS_DOCUMENT: &str = "Yandex Music reactions";
 
 /// Maximum number of `YouTube` summaries retained in one restart snapshot.
 ///
@@ -343,10 +354,35 @@ const MIGRATIONS: &[&str] = &[
 	CREATE INDEX playlist_entries_media
 		ON playlist_entries(source, external_id, playlist_id);
 	",
+    r"
+	CREATE TABLE yandex_music_reaction_outbox (
+		account_uid TEXT NOT NULL CHECK (
+			length(CAST(account_uid AS BLOB)) BETWEEN 1 AND 128
+			AND account_uid NOT GLOB '*[^0-9A-Za-z._:-]*'
+		),
+		track_id TEXT NOT NULL CHECK (
+			length(CAST(track_id AS BLOB)) BETWEEN 1 AND 256
+			AND track_id NOT GLOB '*[^0-9A-Za-z._:-]*'
+		),
+		reaction TEXT NOT NULL CHECK (
+			reaction IN ('neutral', 'liked', 'disliked')
+		),
+		generation INTEGER NOT NULL CHECK (generation > 0),
+		updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+		PRIMARY KEY (account_uid, track_id)
+	) WITHOUT ROWID;
+	",
+    r"
+	ALTER TABLE yandex_music_reaction_outbox
+	ADD COLUMN acknowledged_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+		acknowledged_generation >= 0
+		AND acknowledged_generation <= generation
+	);
+	",
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// One bounded `YouTube` search snapshot retained across application restarts.
 ///
@@ -1271,6 +1307,239 @@ impl SqliteStateStore {
             return Ok(false);
         }
         self.playlist_contains(RADIO_FAVORITES_PLAYLIST_ID, media_id)
+    }
+
+    /// Lists unacknowledged Yandex Music reactions in canonical identity order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored state is invalid, exceeds the fixed row
+    /// bound, or cannot be queried.
+    #[cfg(feature = "yandex-music")]
+    pub fn pending_yandex_music_reactions(
+        &self,
+    ) -> Result<Vec<PendingYandexMusicReaction>, PersistenceError> {
+        type ReactionColumns = (String, String, String, i64, i64, i64);
+
+        let limit =
+            i64::try_from(MAX_YANDEX_MUSIC_REACTION_ROWS.saturating_add(1)).map_err(|_| {
+                PersistenceError::IntegerOutOfRange {
+                    field: "Yandex Music reaction row limit",
+                }
+            })?;
+        let mut statement = self.connection.prepare_cached(
+            r"
+				SELECT
+					account_uid,
+					track_id,
+					reaction,
+					generation,
+					acknowledged_generation,
+					updated_at
+				FROM yandex_music_reaction_outbox
+				WHERE acknowledged_generation < generation
+				ORDER BY account_uid, track_id
+			LIMIT ?1
+			",
+        )?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<ReactionColumns>, _>>()?;
+        drop(statement);
+        if rows.len() > MAX_YANDEX_MUSIC_REACTION_ROWS {
+            return Err(PersistenceError::StateRowLimitReached {
+                document: YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                maximum_rows: MAX_YANDEX_MUSIC_REACTION_ROWS,
+            });
+        }
+
+        rows.into_iter()
+            .map(
+                |(
+                    account_uid,
+                    track_id,
+                    reaction,
+                    generation,
+                    acknowledged_generation,
+                    updated_at,
+                )| {
+                    let generation = u64::try_from(generation).map_err(|_| {
+                        invalid_yandex_music_reaction(
+                            "stored generation must be a positive persistent integer",
+                        )
+                    })?;
+                    let acknowledged_generation =
+                        u64::try_from(acknowledged_generation).map_err(|_| {
+                            invalid_yandex_music_reaction(
+                                "stored acknowledged generation cannot be negative",
+                            )
+                        })?;
+                    let entry = YandexMusicReactionLedgerEntry {
+                        account_uid,
+                        track_id,
+                        reaction: parse_yandex_music_reaction(&reaction)?,
+                        generation,
+                        acknowledged_generation,
+                        updated_at,
+                    };
+                    validate_yandex_music_reaction_ledger_entry(&entry)?;
+                    entry.pending_intent().ok_or_else(|| {
+                        invalid_yandex_music_reaction(
+                            "pending query returned an acknowledged ledger entry",
+                        )
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Queues one desired reaction with an atomic per-track next generation.
+    ///
+    /// Acknowledged rows remain in the ledger. The next generation therefore
+    /// never reuses a revision that an older in-flight response may still carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounded data, a full ledger, generation
+    /// exhaustion, or a failed transaction.
+    #[cfg(feature = "yandex-music")]
+    pub fn queue_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        reaction: YandexMusicReaction,
+        updated_at: i64,
+    ) -> Result<PendingYandexMusicReaction, PersistenceError> {
+        validate_yandex_music_reaction_identity(account_uid, track_id)?;
+        validate_yandex_music_reaction_timestamp(updated_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let current_generation = transaction
+            .prepare_cached(
+                r"
+				SELECT generation
+				FROM yandex_music_reaction_outbox
+					WHERE account_uid = ?1 AND track_id = ?2
+					",
+            )?
+            .query_row(params![account_uid, track_id], |row| row.get::<_, i64>(0))
+            .optional()?;
+        let generation = match current_generation {
+            Some(current) => {
+                let current = u64::try_from(current).map_err(|_| {
+                    invalid_yandex_music_reaction(
+                        "stored generation must be a positive persistent integer",
+                    )
+                })?;
+                next_yandex_music_reaction_generation(current)?
+            }
+            None => 1,
+        };
+        let generation_sql = to_sql_u64(generation, "Yandex Music reaction generation")?;
+        if current_generation.is_none() {
+            let count: i64 = transaction.query_row(
+                "SELECT count(*) FROM yandex_music_reaction_outbox",
+                [],
+                |row| row.get(0),
+            )?;
+            let maximum = i64::try_from(MAX_YANDEX_MUSIC_REACTION_ROWS).map_err(|_| {
+                PersistenceError::IntegerOutOfRange {
+                    field: "Yandex Music reaction row limit",
+                }
+            })?;
+            if count >= maximum {
+                return Err(PersistenceError::StateRowLimitReached {
+                    document: YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                    maximum_rows: MAX_YANDEX_MUSIC_REACTION_ROWS,
+                });
+            }
+        }
+        if current_generation.is_some() {
+            transaction
+                .prepare_cached(
+                    r"
+					UPDATE yandex_music_reaction_outbox
+					SET reaction = ?3, generation = ?4, updated_at = ?5
+					WHERE account_uid = ?1 AND track_id = ?2
+					",
+                )?
+                .execute(params![
+                    account_uid,
+                    track_id,
+                    yandex_music_reaction_name(reaction),
+                    generation_sql,
+                    updated_at,
+                ])?;
+        } else {
+            transaction
+                .prepare_cached(
+                    r"
+					INSERT INTO yandex_music_reaction_outbox (
+						account_uid,
+						track_id,
+						reaction,
+						generation,
+						acknowledged_generation,
+						updated_at
+					) VALUES (?1, ?2, ?3, ?4, 0, ?5)
+					",
+                )?
+                .execute(params![
+                    account_uid,
+                    track_id,
+                    yandex_music_reaction_name(reaction),
+                    generation_sql,
+                    updated_at,
+                ])?;
+        }
+        transaction.commit()?;
+        Ok(PendingYandexMusicReaction {
+            account_uid: account_uid.to_owned(),
+            track_id: track_id.to_owned(),
+            reaction,
+            generation,
+            updated_at,
+        })
+    }
+
+    /// Acknowledges only the current desired generation without deleting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid identity or generation, or when the
+    /// compare-and-update query fails.
+    #[cfg(feature = "yandex-music")]
+    pub fn acknowledge_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        generation: u64,
+    ) -> Result<bool, PersistenceError> {
+        validate_yandex_music_reaction_identity(account_uid, track_id)?;
+        validate_yandex_music_reaction_generation(generation)?;
+        let generation = to_sql_u64(generation, "Yandex Music reaction generation")?;
+        Ok(self
+            .connection
+            .prepare_cached(
+                r"
+					UPDATE yandex_music_reaction_outbox
+					SET acknowledged_generation = generation
+					WHERE account_uid = ?1
+						AND track_id = ?2
+						AND generation = ?3
+						AND acknowledged_generation < generation
+					",
+            )?
+            .execute(params![account_uid, track_id, generation])?
+            == 1)
     }
 
     /// Saves one periodic playback checkpoint in a single transaction.
@@ -3218,6 +3487,35 @@ pub trait StateBackend {
     ) -> Result<PlaylistToggleOutcome, PersistenceError>;
     /// Tests membership in the hidden persistent Radio favorites playlist.
     fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError>;
+    /// Lists canonical pending Yandex Music desired reactions.
+    #[cfg(feature = "yandex-music")]
+    fn pending_yandex_music_reactions(
+        &self,
+    ) -> Result<Vec<PendingYandexMusicReaction>, PersistenceError>;
+    /// Queues one Yandex Music desired reaction with an atomic next revision.
+    ///
+    /// The returned intent contains the revision that must be sent through the
+    /// serialized provider dispatcher. Acknowledged ledger entries remain
+    /// durable, so a later choice cannot reuse an in-flight revision.
+    #[cfg(feature = "yandex-music")]
+    fn queue_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        reaction: YandexMusicReaction,
+        updated_at: i64,
+    ) -> Result<PendingYandexMusicReaction, PersistenceError>;
+    /// Acknowledges a Yandex Music desired reaction only for its current revision.
+    ///
+    /// The desired ledger row remains durable after acknowledgement. A delayed
+    /// response therefore cannot acknowledge or erase a later user choice.
+    #[cfg(feature = "yandex-music")]
+    fn acknowledge_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        generation: u64,
+    ) -> Result<bool, PersistenceError>;
     /// Saves a bounded periodic playback checkpoint.
     ///
     /// File persistence atomically replaces only its small runtime checkpoint
@@ -3628,6 +3926,40 @@ impl StateBackend for SqliteStateStore {
 
     fn radio_favorite_contains(&self, media_id: &MediaId) -> Result<bool, PersistenceError> {
         SqliteStateStore::radio_favorite_contains(self, media_id)
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn pending_yandex_music_reactions(
+        &self,
+    ) -> Result<Vec<PendingYandexMusicReaction>, PersistenceError> {
+        SqliteStateStore::pending_yandex_music_reactions(self)
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn queue_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        reaction: YandexMusicReaction,
+        updated_at: i64,
+    ) -> Result<PendingYandexMusicReaction, PersistenceError> {
+        SqliteStateStore::queue_yandex_music_reaction(
+            self,
+            account_uid,
+            track_id,
+            reaction,
+            updated_at,
+        )
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn acknowledge_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        generation: u64,
+    ) -> Result<bool, PersistenceError> {
+        SqliteStateStore::acknowledge_yandex_music_reaction(self, account_uid, track_id, generation)
     }
 
     fn checkpoint_playback(
@@ -4050,6 +4382,13 @@ pub enum PersistenceError {
         /// Invariant rejected while saving, restoring, or deleting.
         reason: String,
     },
+    /// A durable Yandex Music desired reaction violates a fixed invariant.
+    #[cfg(feature = "yandex-music")]
+    #[error("Yandex Music pending reaction is invalid: {reason}")]
+    InvalidYandexMusicReaction {
+        /// Rejected identity, ordering, timestamp, or reaction invariant.
+        reason: String,
+    },
     /// A replay locator is empty or exceeds its fixed persistence limit.
     #[error("history replay locator is invalid: {reason}")]
     InvalidHistoryReplayLocator {
@@ -4110,6 +4449,106 @@ pub enum PersistenceError {
         /// Newest version this binary understands.
         supported: u32,
     },
+}
+
+#[cfg(feature = "yandex-music")]
+fn invalid_yandex_music_reaction(reason: impl Into<String>) -> PersistenceError {
+    PersistenceError::InvalidYandexMusicReaction {
+        reason: reason.into(),
+    }
+}
+
+#[cfg(feature = "yandex-music")]
+fn validate_yandex_music_reaction_identity(
+    account_uid: &str,
+    track_id: &str,
+) -> Result<(), PersistenceError> {
+    let valid_component = |value: &str, maximum_bytes: usize| {
+        !value.is_empty()
+            && value.len() <= maximum_bytes
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+    };
+    if !valid_component(account_uid, MAX_YANDEX_MUSIC_ACCOUNT_UID_BYTES) {
+        return Err(invalid_yandex_music_reaction(format!(
+            "account UID must contain only ASCII letters, digits, `.`, `_`, `:`, or `-` and be at most {MAX_YANDEX_MUSIC_ACCOUNT_UID_BYTES} bytes"
+        )));
+    }
+    if !valid_component(track_id, MAX_YANDEX_MUSIC_TRACK_ID_BYTES) {
+        return Err(invalid_yandex_music_reaction(format!(
+            "track ID must contain only ASCII letters, digits, `.`, `_`, `:`, or `-` and be at most {MAX_YANDEX_MUSIC_TRACK_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "yandex-music")]
+fn validate_yandex_music_reaction_generation(generation: u64) -> Result<(), PersistenceError> {
+    if generation == 0 {
+        return Err(invalid_yandex_music_reaction("generation must be positive"));
+    }
+    i64::try_from(generation)
+        .map(|_| ())
+        .map_err(|_| PersistenceError::IntegerOutOfRange {
+            field: "Yandex Music reaction generation",
+        })
+}
+
+#[cfg(feature = "yandex-music")]
+fn next_yandex_music_reaction_generation(current: u64) -> Result<u64, PersistenceError> {
+    let next = current
+        .checked_add(1)
+        .ok_or(PersistenceError::IntegerOutOfRange {
+            field: "Yandex Music reaction generation",
+        })?;
+    validate_yandex_music_reaction_generation(next)?;
+    Ok(next)
+}
+
+#[cfg(feature = "yandex-music")]
+fn validate_yandex_music_reaction_timestamp(updated_at: i64) -> Result<(), PersistenceError> {
+    if updated_at < 0 {
+        return Err(invalid_yandex_music_reaction(
+            "update timestamp cannot be negative",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "yandex-music")]
+fn validate_yandex_music_reaction_ledger_entry(
+    entry: &YandexMusicReactionLedgerEntry,
+) -> Result<(), PersistenceError> {
+    validate_yandex_music_reaction_identity(&entry.account_uid, &entry.track_id)?;
+    validate_yandex_music_reaction_generation(entry.generation)?;
+    if entry.acknowledged_generation > entry.generation {
+        return Err(invalid_yandex_music_reaction(
+            "acknowledged generation cannot exceed the desired generation",
+        ));
+    }
+    validate_yandex_music_reaction_timestamp(entry.updated_at)
+}
+
+#[cfg(all(feature = "yandex-music", feature = "sqlite-state"))]
+const fn yandex_music_reaction_name(reaction: YandexMusicReaction) -> &'static str {
+    match reaction {
+        YandexMusicReaction::Neutral => "neutral",
+        YandexMusicReaction::Liked => "liked",
+        YandexMusicReaction::Disliked => "disliked",
+    }
+}
+
+#[cfg(all(feature = "yandex-music", feature = "sqlite-state"))]
+fn parse_yandex_music_reaction(value: &str) -> Result<YandexMusicReaction, PersistenceError> {
+    match value {
+        "neutral" => Ok(YandexMusicReaction::Neutral),
+        "liked" => Ok(YandexMusicReaction::Liked),
+        "disliked" => Ok(YandexMusicReaction::Disliked),
+        _ => Err(invalid_yandex_music_reaction(format!(
+            "stored reaction {value:?} is unknown"
+        ))),
+    }
 }
 
 fn invalid_playlist(reason: impl Into<String>) -> PersistenceError {
@@ -6898,6 +7337,105 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, feature = "yandex-music"))]
+pub(crate) fn assert_yandex_music_reaction_backend_contract(store: &dyn StateBackend) {
+    let liked = store
+        .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 10)
+        .expect("queue liked state");
+    assert_eq!(liked.generation, 1);
+    assert!(
+        store
+            .acknowledge_yandex_music_reaction("account-1", "track-1", liked.generation)
+            .expect("acknowledge liked state")
+    );
+    assert!(
+        store
+            .pending_yandex_music_reactions()
+            .expect("acknowledged outbox")
+            .is_empty()
+    );
+
+    let disliked = store
+        .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Disliked, 11)
+        .expect("queue disliked state after acknowledgement");
+    assert_eq!(
+        disliked.generation, 2,
+        "an acknowledged ledger entry must retain its monotonic revision"
+    );
+    assert_eq!(
+        store
+            .pending_yandex_music_reactions()
+            .expect("coalesced outbox"),
+        vec![disliked.clone()]
+    );
+    assert!(
+        !store
+            .acknowledge_yandex_music_reaction("account-1", "track-1", 1)
+            .expect("stale acknowledgement")
+    );
+    assert_eq!(
+        store
+            .pending_yandex_music_reactions()
+            .expect("newer state survives stale acknowledgement"),
+        vec![disliked.clone()]
+    );
+    assert!(
+        store
+            .acknowledge_yandex_music_reaction("account-1", "track-1", 2)
+            .expect("exact acknowledgement")
+    );
+
+    for (account_uid, track_id, reaction, updated_at) in [
+        ("account-z", "track-2", YandexMusicReaction::Neutral, 20),
+        ("account-a", "track-9", YandexMusicReaction::Liked, 21),
+        ("account-a", "track-1", YandexMusicReaction::Disliked, 22),
+    ] {
+        store
+            .queue_yandex_music_reaction(account_uid, track_id, reaction, updated_at)
+            .expect("queue canonical-order fixture");
+    }
+    let ordered = store
+        .pending_yandex_music_reactions()
+        .expect("canonical reaction order");
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|pending| (pending.account_uid.as_str(), pending.track_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("account-a", "track-1"),
+            ("account-a", "track-9"),
+            ("account-z", "track-2"),
+        ]
+    );
+
+    for (account_uid, track_id, updated_at) in [
+        ("", "track-3", 1),
+        ("account-2", "track with spaces", 1),
+        (
+            &"a".repeat(MAX_YANDEX_MUSIC_ACCOUNT_UID_BYTES + 1),
+            "track-3",
+            1,
+        ),
+        (
+            "account-2",
+            &"t".repeat(MAX_YANDEX_MUSIC_TRACK_ID_BYTES + 1),
+            1,
+        ),
+        ("account-2", "track-3", -1),
+    ] {
+        assert!(matches!(
+            store.queue_yandex_music_reaction(
+                account_uid,
+                track_id,
+                YandexMusicReaction::Liked,
+                updated_at,
+            ),
+            Err(PersistenceError::InvalidYandexMusicReaction { .. })
+        ));
+    }
+}
+
 #[cfg(all(test, feature = "sqlite-state"))]
 mod tests {
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -6940,6 +7478,13 @@ mod tests {
             chapters: Vec::new(),
             captions: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn sqlite_yandex_music_reactions_match_the_backend_contract() {
+        let store = StateStore::open_in_memory().expect("SQLite state");
+        assert_yandex_music_reaction_backend_contract(&store);
     }
 
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -7667,6 +8212,121 @@ mod tests {
                 .playlist(TODO_PLAYLIST_ID)
                 .expect("new playlist entries table")
                 .is_none()
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn migration_from_v12_preserves_state_and_adds_empty_yandex_reaction_outbox() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=12_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        connection
+            .execute(
+                r"
+				INSERT INTO playback_progress (
+					source, external_id, position_seconds, duration_seconds,
+					played_override, updated_at
+				) VALUES ('youtube', 'dQw4w9WgXcQ', 84, 180, NULL, 12)
+				",
+                [],
+            )
+            .expect("seed version-twelve progress");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .progress(&id("dQw4w9WgXcQ"))
+                .expect("preserved progress")
+                .expect("version-twelve progress")
+                .position_seconds,
+            84
+        );
+        assert!(
+            store
+                .pending_yandex_music_reactions()
+                .expect("new reaction outbox")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn migration_from_v13_preserves_pending_reaction_as_unacknowledged_ledger_entry() {
+        let connection = Connection::open_in_memory().expect("open SQLite");
+        for version in 1..=13_u32 {
+            connection
+                .execute_batch(MIGRATIONS[(version - 1) as usize])
+                .expect("apply historical migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set historical version");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, i64::from(version)],
+                )
+                .expect("record historical migration");
+        }
+        connection
+            .execute(
+                r"
+				INSERT INTO yandex_music_reaction_outbox (
+					account_uid, track_id, reaction, generation, updated_at
+				) VALUES ('account-1', 'track-1', 'liked', 7, 13)
+				",
+                [],
+            )
+            .expect("seed version-thirteen reaction");
+
+        run_migrations(&connection).expect("migrate to current schema");
+        let store = StateStore { connection };
+
+        assert_eq!(
+            store
+                .pending_yandex_music_reactions()
+                .expect("migrated reaction ledger"),
+            vec![PendingYandexMusicReaction {
+                account_uid: "account-1".to_owned(),
+                track_id: "track-1".to_owned(),
+                reaction: YandexMusicReaction::Liked,
+                generation: 7,
+                updated_at: 13,
+            }]
+        );
+        assert!(
+            store
+                .acknowledge_yandex_music_reaction("account-1", "track-1", 7)
+                .expect("acknowledge migrated reaction")
+        );
+        assert_eq!(
+            store
+                .queue_yandex_music_reaction(
+                    "account-1",
+                    "track-1",
+                    YandexMusicReaction::Disliked,
+                    14,
+                )
+                .expect("queue post-migration reaction")
+                .generation,
+            8
         );
     }
 

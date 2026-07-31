@@ -169,6 +169,9 @@ bandcamp_audio_format = 'best-available'
 #   jamendo_client_id = '...'
 #   # Create an application key at https://acoustid.org/api-key.
 #   acoustid_client_key = '...'
+#   # OAuth access token issued for your Yandex Music account. This is not an
+#   # API key; Youta never asks for or stores the account password.
+#   yandex_music_token = '...'
 #
 # Environment overrides have the highest precedence, for example:
 #
@@ -176,6 +179,7 @@ bandcamp_audio_format = 'best-available'
 #   YOUTA_PROVIDERS__MOD_ARCHIVE_API_KEY='...'
 #   YOUTA_PROVIDERS__JAMENDO_CLIENT_ID='...'
 #   YOUTA_PROVIDERS__ACOUSTID_CLIENT_KEY='...'
+#   YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN='...'
 #
 # If YouTube search has no provider, its TUI setup popup accepts either the API
 # key or the Invidious URL above. It shows both exact destinations:

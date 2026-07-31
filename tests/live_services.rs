@@ -41,6 +41,34 @@ const YOUTUBE_MUSIC_TEST_QUERY: &str = "YOUTA_LIVE_YOUTUBE_MUSIC_QUERY";
 #[cfg(feature = "youtube-music")]
 const DEFAULT_YOUTUBE_MUSIC_QUERY: &str = "Massive Attack Teardrop";
 
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_YANDEX_MUSIC_TEST";
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_TEST_TOKEN: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_TEST_QUERY: &str = "YOUTA_LIVE_YANDEX_MUSIC_QUERY";
+#[cfg(feature = "yandex-music")]
+const DEFAULT_YANDEX_MUSIC_QUERY: &str = "Massive Attack Teardrop";
+#[cfg(feature = "yandex-music")]
+const YANDEX_MUSIC_CATALOGUE_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_YANDEX_MUSIC_CATALOGUE_TEST";
+
+/// Loads the opted-in live-test token without copying it into diagnostics.
+#[cfg(feature = "yandex-music")]
+fn yandex_music_live_test_token() -> String {
+    if let Ok(token) = std::env::var(YANDEX_MUSIC_TEST_TOKEN) {
+        return token;
+    }
+    youta::config::Config::load()
+        .unwrap_or_else(|error| panic!("load Youta configuration for the live test: {error}"))
+        .providers
+        .yandex_music_token
+        .unwrap_or_else(|| {
+            panic!(
+                "set {YANDEX_MUSIC_TEST_TOKEN} or save a Yandex Music token in Youta's private credentials file"
+            )
+        })
+}
+
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 const RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_RADIO_TEST";
 #[cfg(all(feature = "backend-mpv", feature = "bbc-radio"))]
@@ -426,6 +454,156 @@ fn youtube_music_keyless_search_returns_playable_tracks_before_timeout() {
                 .query_pairs()
                 .any(|(key, value)| key == "v" && value.as_ref() == track.video_id.as_str())
     }));
+}
+
+/// Exercises authenticated catalogue discovery and media-metadata resolution.
+///
+/// The test never downloads media or mutates durable account state. My Wave
+/// may use its bounded continuation budget. The OAuth token is loaded from
+/// Youta's normal private sources and never included in diagnostics.
+#[cfg(feature = "yandex-music")]
+#[test]
+#[ignore = "requires an opted-in Yandex Music account and OAuth token"]
+fn yandex_music_account_recommendations_search_and_media_metadata_are_usable() {
+    use youta::providers::yandex_music::{
+        DEFAULT_MY_WAVE_RECOMMENDATIONS, YandexMusicClient, YandexMusicSearchItem,
+        YandexMusicSearchScope,
+    };
+
+    assert_eq!(
+        std::env::var(YANDEX_MUSIC_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {YANDEX_MUSIC_TEST_OPT_IN}=1 when invoking this live test"
+    );
+    let token = yandex_music_live_test_token();
+    let query = std::env::var(YANDEX_MUSIC_TEST_QUERY)
+        .unwrap_or_else(|_| DEFAULT_YANDEX_MUSIC_QUERY.to_owned());
+    let client = YandexMusicClient::new(token).expect("create the authenticated Yandex client");
+
+    let account = client
+        .validate_account()
+        .expect("validate the configured Yandex Music account");
+    assert!(!account.uid.trim().is_empty());
+
+    let recommendations = client
+        .my_wave()
+        .expect("load bounded Yandex Music recommendations");
+    assert!(!recommendations.session_id.trim().is_empty());
+    assert!(
+        !recommendations.tracks.is_empty(),
+        "Yandex Music returned no playable recommendations"
+    );
+    assert!(
+        recommendations.tracks.len() <= DEFAULT_MY_WAVE_RECOMMENDATIONS,
+        "the live My Wave page must remain within Youta's bounded default"
+    );
+
+    let search = client
+        .search(&query, YandexMusicSearchScope::Music, 0, 10)
+        .expect("search the live Yandex Music catalogue");
+    assert_eq!(search.scope, YandexMusicSearchScope::Music);
+    assert_eq!(search.query, query);
+    let track = search
+        .items
+        .iter()
+        .find_map(|item| match item {
+            YandexMusicSearchItem::Track(track) => Some(track),
+            YandexMusicSearchItem::Album(_) => None,
+        })
+        .expect("Yandex Music returned no playable track for the configured query");
+    let media = client
+        .resolve_media(&track.id)
+        .expect("resolve media metadata for the live Yandex Music search result");
+    assert_eq!(media.url.scheme(), "https");
+    assert!(media.url.host_str().is_some());
+    assert!(media.url.username().is_empty());
+    assert!(media.url.password().is_none());
+    assert!(!media.codec.file_extension().is_empty());
+}
+
+/// Guards Yandex's mixed catalogue response against spoken-word filtering.
+///
+/// This probe deliberately skips My Wave so recommendation rate limiting
+/// cannot mask regressions in ordinary catalogue search.
+#[cfg(feature = "yandex-music")]
+#[test]
+#[ignore = "requires an opted-in Yandex Music account and OAuth token"]
+fn yandex_music_mixed_search_keeps_spoken_word_results() {
+    use youta::providers::yandex_music::{
+        YandexMusicClient, YandexMusicContentKind, YandexMusicSearchItem, YandexMusicSearchScope,
+    };
+
+    assert_eq!(
+        std::env::var(YANDEX_MUSIC_CATALOGUE_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {YANDEX_MUSIC_CATALOGUE_TEST_OPT_IN}=1 when invoking this live test"
+    );
+    let client = YandexMusicClient::new(yandex_music_live_test_token())
+        .expect("create the authenticated Yandex client");
+
+    let search = client
+        .search("Шопенгауэр", YandexMusicSearchScope::All, 0, 100)
+        .expect("search the live mixed Yandex Music catalogue");
+    assert!(
+        search.items.iter().any(|item| match item {
+            YandexMusicSearchItem::Track(track) => {
+                track.content_kind == YandexMusicContentKind::Audiobook
+            }
+            YandexMusicSearchItem::Album(album) => {
+                album.content_kind == YandexMusicContentKind::Audiobook
+            }
+        }),
+        "mixed search omitted all audiobook results"
+    );
+    assert!(
+        search.items.iter().any(|item| match item {
+            YandexMusicSearchItem::Track(track) => {
+                track.content_kind == YandexMusicContentKind::Podcast
+            }
+            YandexMusicSearchItem::Album(album) => {
+                album.content_kind == YandexMusicContentKind::Podcast
+            }
+        }),
+        "mixed search omitted all podcast results"
+    );
+
+    let podcasts = client
+        .search("Что случилось", YandexMusicSearchScope::Podcasts, 0, 20)
+        .expect("search the live podcast index");
+    assert!(
+        !podcasts.items.is_empty(),
+        "podcast search returned no rows"
+    );
+    assert!(
+        podcasts.items.iter().all(|item| match item {
+            YandexMusicSearchItem::Track(track) => {
+                track.content_kind == YandexMusicContentKind::Podcast
+            }
+            YandexMusicSearchItem::Album(album) => {
+                album.content_kind == YandexMusicContentKind::Podcast
+            }
+        }),
+        "podcast search leaked another content kind"
+    );
+
+    let audiobooks = client
+        .search("Шопенгауэр", YandexMusicSearchScope::Audiobooks, 0, 20)
+        .expect("search the live audiobook index");
+    assert!(
+        !audiobooks.items.is_empty(),
+        "audiobook search returned no rows"
+    );
+    assert!(
+        audiobooks.items.iter().all(|item| match item {
+            YandexMusicSearchItem::Track(track) => {
+                track.content_kind == YandexMusicContentKind::Audiobook
+            }
+            YandexMusicSearchItem::Album(album) => {
+                album.content_kind == YandexMusicContentKind::Audiobook
+            }
+        }),
+        "audiobook search leaked another content kind"
+    );
 }
 
 /// Decodes public regional, playlist, and FLAC streams, then parses station metadata.

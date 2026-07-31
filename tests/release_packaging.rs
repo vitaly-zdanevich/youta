@@ -58,12 +58,27 @@ fn default_release_features_keep_images_and_sqlite_independent() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
     let text_only = feature_closure(&manifest, "app");
+    let yandex_free = feature_closure(&manifest, "app-core");
 
     assert!(default.contains("images"));
     assert!(default.contains("app"));
+    assert!(default.contains("yandex-music"));
     assert!(!default.contains("sqlite-state"));
     assert!(!default.contains("bundled-sqlite"));
     assert!(!default.contains("dep:rusqlite"));
+    assert!(text_only.contains("app-core"));
+    assert!(text_only.contains("yandex-music"));
+    assert!(!yandex_free.contains("yandex-music"));
+    for yandex_only_dependency in ["dep:aes", "dep:ctr", "dep:hmac"] {
+        assert!(
+            !yandex_free.contains(yandex_only_dependency),
+            "`app-core` unexpectedly enables `{yandex_only_dependency}`"
+        );
+    }
+    assert!(
+        yandex_free.is_subset(&text_only),
+        "`app-core` must stay a Yandex-free subset of the complete `app` profile"
+    );
 
     for image_feature in [
         "images",
@@ -79,6 +94,44 @@ fn default_release_features_keep_images_and_sqlite_independent() {
     }
 
     assert_eq!(feature_entries(&manifest, "thumbnails"), ["images"]);
+}
+
+#[test]
+fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
+    let manifest = manifest();
+    let yandex_music = feature_closure(&manifest, "yandex-music");
+    for requirement in [
+        "network",
+        "dep:aes",
+        "dep:base64",
+        "dep:ctr",
+        "dep:hmac",
+        "dep:sha2",
+    ] {
+        assert!(
+            yandex_music.contains(requirement),
+            "`yandex-music` omits `{requirement}`"
+        );
+    }
+    for dependency in ["aes", "base64", "ctr", "hmac", "sha2"] {
+        assert_eq!(
+            manifest["dependencies"][dependency]["optional"].as_bool(),
+            Some(true),
+            "`{dependency}` must not enter Yandex-free builds"
+        );
+    }
+
+    let example = read_repository_file("config.example.toml");
+    assert!(example.contains("yandex_music_token = '...'"));
+    assert!(example.contains("YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN='...'"));
+    assert!(example.contains("This is not an"));
+    assert!(example.contains("API key"));
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("private client API"));
+    assert!(readme.contains("--features app-core,images"));
+    assert!(readme.contains("Audiobook search is best-effort"));
+    assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
 
 #[test]
@@ -144,5 +197,18 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("x86_64-pc-windows-msvc"));
     assert!(ci.contains("aarch64-pc-windows-msvc"));
     assert!(ci.contains("x86_64-unknown-freebsd"));
-    assert!(ci.contains("--features app"));
+    for workflow in [ci.as_str(), release.as_str()] {
+        assert!(
+            workflow.contains("--features app-core"),
+            "workflow omits the complete Yandex-free application lane"
+        );
+        assert!(
+            workflow.contains("--features app-core,images"),
+            "workflow omits the documented Yandex-free graphical application lane"
+        );
+        assert!(
+            workflow.contains("--features tui,yandex-music\n"),
+            "workflow omits the standalone Yandex Music lane without Wikidata"
+        );
+    }
 }

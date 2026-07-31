@@ -33,8 +33,18 @@ default = [
 ]
 
 # Complete application profile shared by default and text-only builds.
+#
+# Yandex Music is included here so normal builds expose the complete top-level
+# source set. `app-core` remains the equivalent profile for distributors and
+# users who intentionally omit the private, experimental Yandex Music API.
 # Image rendering and SQLite remain independent opt-in features.
 app = [
+    "app-core",
+    "yandex-music",
+]
+
+# Complete application profile without the optional Yandex Music adapter.
+app-core = [
     "tui",
     "gpm",
     "acoustid",
@@ -191,7 +201,14 @@ bandcamp = ["network", "yt-dlp"]
 odysee = ["network"]
 rumble = ["network"]
 bilibili = ["network"]
-yandex-music = ["network"]
+yandex-music = [
+    "network",
+    "dep:aes",
+    "dep:base64",
+    "dep:ctr",
+    "dep:hmac",
+    "dep:sha2",
+]
 vk = ["network"]
 
 # Optional archive and peer-to-peer support.
@@ -204,12 +221,16 @@ torrent = []
 bundled-sqlite = ["sqlite-state", "rusqlite/bundled"]
 
 [dependencies]
+aes = { version = "0.8.4", optional = true }
 anyhow = { version = "1.0.104", optional = true }
+base64 = { version = "0.22.1", optional = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4.6.4", features = ["derive"], optional = true }
 crossbeam-channel = { version = "0.5.16", optional = true }
+ctr = { version = "0.9.2", optional = true }
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
+hmac = { version = "0.12.1", optional = true }
 opml = { version = "1.1.6", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }

@@ -30,6 +30,8 @@ const MAX_BOOKMARKS_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATISTICS_DOCUMENT_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_MOVES_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLAYLISTS_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(feature = "yandex-music")]
+const MAX_YANDEX_MUSIC_REACTIONS_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUNTIME_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PLAYBACK_CHECKPOINT_DOCUMENT_BYTES: usize = 16 * 1024;
 const MAX_SEARCH_CACHE_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -281,6 +283,36 @@ struct DiskLocalMoveMapping {
     created_at: i64,
 }
 
+/// Authoritative, human-editable Yandex Music desired-state ledger.
+///
+/// Only stable identities and desired-state metadata belong here. Credentials
+/// and expiring media URLs are deliberately absent from the schema.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct YandexMusicReactionsDocument {
+    format_version: u32,
+    reactions: Vec<YandexMusicReactionLedgerEntry>,
+}
+
+#[cfg(feature = "yandex-music")]
+impl YandexMusicReactionsDocument {
+    fn empty() -> Self {
+        Self {
+            format_version: FILE_FORMAT_VERSION,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn canonicalize(&mut self) {
+        self.reactions.sort_by(|left, right| {
+            left.account_uid
+                .cmp(&right.account_uid)
+                .then_with(|| left.track_id.cmp(&right.track_id))
+        });
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct SearchCacheDocument {
@@ -353,6 +385,8 @@ struct FileDocuments {
     statistics: StatisticsDocument,
     local_moves: LocalMovesDocument,
     playlists: PlaylistsDocument,
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reactions: YandexMusicReactionsDocument,
     runtime: RuntimeDocument,
     playback_checkpoint: PlaybackCheckpointDocument,
     searches: SearchCacheDocument,
@@ -369,6 +403,8 @@ struct FilePaths {
     statistics: PathBuf,
     local_moves: PathBuf,
     playlists: PathBuf,
+    #[cfg(feature = "yandex-music")]
+    yandex_music_reactions: PathBuf,
     runtime: PathBuf,
     playback_checkpoint: PathBuf,
     searches: PathBuf,
@@ -386,6 +422,8 @@ impl FilePaths {
             statistics: config.state_dir().join("statistics.toml"),
             local_moves: config.state_dir().join("local-moves.toml"),
             playlists: config.state_dir().join("playlists.toml"),
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reactions: config.state_dir().join("yandex-music.toml"),
             runtime: config.runtime_dir().join("session.toml"),
             playback_checkpoint: config.runtime_dir().join("playback-checkpoint.toml"),
             searches: config.cache_dir().join("searches.toml"),
@@ -437,7 +475,7 @@ fn file_generation(path: &Path) -> Result<Option<FileGeneration>, PersistenceErr
 fn capture_document_generations(
     paths: &FilePaths,
 ) -> Result<HashMap<&'static str, Option<FileGeneration>>, PersistenceError> {
-    [
+    let documents = [
         ("progress", &paths.progress),
         ("history", &paths.history),
         ("notes", &paths.notes),
@@ -450,9 +488,15 @@ fn capture_document_generations(
         ("search cache", &paths.searches),
         ("provider cache", &paths.provider_cache),
     ]
-    .into_iter()
-    .map(|(document, path)| Ok((document, file_generation(path)?)))
-    .collect()
+    .into_iter();
+    #[cfg(feature = "yandex-music")]
+    let documents = documents.chain(std::iter::once((
+        YANDEX_MUSIC_REACTIONS_DOCUMENT,
+        &paths.yandex_music_reactions,
+    )));
+    documents
+        .map(|(document, path)| Ok((document, file_generation(path)?)))
+        .collect()
 }
 
 fn validate_playback_checkpoint(
@@ -748,6 +792,13 @@ impl FileStateStore {
                 initialized,
                 PlaylistsDocument::empty,
             )?,
+            #[cfg(feature = "yandex-music")]
+            yandex_music_reactions: load_or_default(
+                &paths.yandex_music_reactions,
+                YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                MAX_YANDEX_MUSIC_REACTIONS_DOCUMENT_BYTES,
+                YandexMusicReactionsDocument::empty,
+            )?,
             runtime: load_regenerable(
                 &paths.runtime,
                 "runtime session",
@@ -827,6 +878,13 @@ impl FileStateStore {
                 MAX_PLAYLISTS_DOCUMENT_BYTES,
                 &documents.playlists,
             )?;
+            #[cfg(feature = "yandex-music")]
+            write_document(
+                &paths.yandex_music_reactions,
+                YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                MAX_YANDEX_MUSIC_REACTIONS_DOCUMENT_BYTES,
+                &documents.yandex_music_reactions,
+            )?;
             write_document(
                 &paths.runtime,
                 "runtime session",
@@ -883,6 +941,8 @@ impl FileStateStore {
                 statistics: StatisticsDocument::empty(),
                 local_moves: LocalMovesDocument::empty(),
                 playlists: PlaylistsDocument::empty(),
+                #[cfg(feature = "yandex-music")]
+                yandex_music_reactions: YandexMusicReactionsDocument::empty(),
                 runtime: RuntimeDocument::empty(),
                 playback_checkpoint: PlaybackCheckpointDocument::empty(),
                 searches: SearchCacheDocument::empty(),
@@ -1008,6 +1068,22 @@ impl FileStateStore {
                 &paths.playlists,
                 "playlists",
                 MAX_PLAYLISTS_DOCUMENT_BYTES,
+                document,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn persist_yandex_music_reactions(
+        &self,
+        document: &YandexMusicReactionsDocument,
+    ) -> Result<(), PersistenceError> {
+        if let Some(paths) = &self.paths {
+            self.persist_document(
+                &paths.yandex_music_reactions,
+                YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                MAX_YANDEX_MUSIC_REACTIONS_DOCUMENT_BYTES,
                 document,
             )?;
         }
@@ -1374,6 +1450,99 @@ impl StateBackend for FileStateStore {
             return Ok(false);
         }
         self.playlist_contains(RADIO_FAVORITES_PLAYLIST_ID, media_id)
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn pending_yandex_music_reactions(
+        &self,
+    ) -> Result<Vec<PendingYandexMusicReaction>, PersistenceError> {
+        let documents = self.lock()?;
+        validate_yandex_music_reactions_document(&documents.yandex_music_reactions)?;
+        let mut reactions = documents
+            .yandex_music_reactions
+            .reactions
+            .iter()
+            .filter_map(YandexMusicReactionLedgerEntry::pending_intent)
+            .collect::<Vec<_>>();
+        reactions.sort_by(|left, right| {
+            left.account_uid
+                .cmp(&right.account_uid)
+                .then_with(|| left.track_id.cmp(&right.track_id))
+        });
+        Ok(reactions)
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn queue_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        reaction: YandexMusicReaction,
+        updated_at: i64,
+    ) -> Result<PendingYandexMusicReaction, PersistenceError> {
+        validate_yandex_music_reaction_identity(account_uid, track_id)?;
+        validate_yandex_music_reaction_timestamp(updated_at)?;
+        let mut documents = self.lock()?;
+        let mut next = documents.yandex_music_reactions.clone();
+        if let Some(existing) = next
+            .reactions
+            .iter_mut()
+            .find(|existing| existing.account_uid == account_uid && existing.track_id == track_id)
+        {
+            existing.generation = next_yandex_music_reaction_generation(existing.generation)?;
+            existing.reaction = reaction;
+            existing.updated_at = updated_at;
+        } else {
+            ensure_can_append(
+                YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                next.reactions.len(),
+                MAX_YANDEX_MUSIC_REACTION_ROWS,
+            )?;
+            next.reactions.push(YandexMusicReactionLedgerEntry {
+                account_uid: account_uid.to_owned(),
+                track_id: track_id.to_owned(),
+                reaction,
+                generation: 1,
+                acknowledged_generation: 0,
+                updated_at,
+            });
+        }
+        next.canonicalize();
+        let pending = next
+            .reactions
+            .iter()
+            .find(|entry| entry.account_uid == account_uid && entry.track_id == track_id)
+            .and_then(YandexMusicReactionLedgerEntry::pending_intent)
+            .expect("a newly queued reaction ledger entry must be pending");
+        self.persist_yandex_music_reactions(&next)?;
+        documents.yandex_music_reactions = next;
+        Ok(pending)
+    }
+
+    #[cfg(feature = "yandex-music")]
+    fn acknowledge_yandex_music_reaction(
+        &self,
+        account_uid: &str,
+        track_id: &str,
+        generation: u64,
+    ) -> Result<bool, PersistenceError> {
+        validate_yandex_music_reaction_identity(account_uid, track_id)?;
+        validate_yandex_music_reaction_generation(generation)?;
+        let mut documents = self.lock()?;
+        let mut next = documents.yandex_music_reactions.clone();
+        let Some(entry) = next.reactions.iter_mut().find(|entry| {
+            entry.account_uid == account_uid
+                && entry.track_id == track_id
+                && entry.generation == generation
+                && entry.acknowledged_generation < generation
+        }) else {
+            return Ok(false);
+        };
+        entry.acknowledged_generation = generation;
+        next.canonicalize();
+        self.persist_yandex_music_reactions(&next)?;
+        documents.yandex_music_reactions = next;
+        Ok(true)
     }
 
     fn checkpoint_playback(
@@ -3153,8 +3322,34 @@ fn validate_file_documents(documents: &FileDocuments) -> Result<(), PersistenceE
     validate_playback_checkpoint(&documents.playback_checkpoint)?;
     validate_playlists_document(&documents.playlists)?;
     validate_local_moves_document(&documents.local_moves)?;
+    #[cfg(feature = "yandex-music")]
+    validate_yandex_music_reactions_document(&documents.yandex_music_reactions)?;
     validate_search_cache_document(&documents.searches)?;
     validate_provider_cache_document(&documents.provider_cache)?;
+    Ok(())
+}
+
+#[cfg(feature = "yandex-music")]
+fn validate_yandex_music_reactions_document(
+    document: &YandexMusicReactionsDocument,
+) -> Result<(), PersistenceError> {
+    ensure_row_limit(
+        YANDEX_MUSIC_REACTIONS_DOCUMENT,
+        document.reactions.len(),
+        MAX_YANDEX_MUSIC_REACTION_ROWS,
+    )?;
+    let mut identities = HashSet::with_capacity(document.reactions.len());
+    for entry in &document.reactions {
+        validate_yandex_music_reaction_ledger_entry(entry).map_err(|error| {
+            invalid_file_document(YANDEX_MUSIC_REACTIONS_DOCUMENT, error.to_string())
+        })?;
+        if !identities.insert((entry.account_uid.clone(), entry.track_id.clone())) {
+            return Err(invalid_file_document(
+                YANDEX_MUSIC_REACTIONS_DOCUMENT,
+                "contains duplicate account-and-track identities",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3376,6 +3571,8 @@ fn ensure_documents_supported(documents: &FileDocuments) -> Result<(), Persisten
     ] {
         ensure_format(version)?;
     }
+    #[cfg(feature = "yandex-music")]
+    ensure_format(documents.yandex_music_reactions.format_version)?;
     Ok(())
 }
 
@@ -3898,6 +4095,142 @@ mod tests {
             fs::read_to_string(config.state_dir().join("playlists.toml")).expect("playlist TOML");
         assert!(encoded.contains(RADIO_FAVORITES_PLAYLIST_NAME));
         assert!(encoded.contains("fixture-radio"));
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn file_yandex_music_reactions_match_the_backend_contract() {
+        let store = FileStateStore::open_in_memory().expect("in-memory file state");
+        crate::persistence::assert_yandex_music_reaction_backend_contract(&store);
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_reaction_round_trip_preserves_acknowledged_revision() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let liked;
+        {
+            let store = FileStateStore::open(&config).expect("file state");
+            liked = store
+                .queue_yandex_music_reaction("account-1", "track-1", YandexMusicReaction::Liked, 10)
+                .expect("queue like");
+            assert_eq!(liked.generation, 1);
+            assert!(
+                store
+                    .acknowledge_yandex_music_reaction("account-1", "track-1", liked.generation,)
+                    .expect("acknowledge like")
+            );
+        }
+
+        let disliked;
+        {
+            let store = FileStateStore::open(&config).expect("reopen file state");
+            assert!(
+                store
+                    .pending_yandex_music_reactions()
+                    .expect("acknowledged reaction ledger")
+                    .is_empty()
+            );
+            disliked = store
+                .queue_yandex_music_reaction(
+                    "account-1",
+                    "track-1",
+                    YandexMusicReaction::Disliked,
+                    11,
+                )
+                .expect("queue dislike");
+            assert_eq!(
+                disliked.generation, 2,
+                "restart must not reset an acknowledged reaction revision"
+            );
+            assert_eq!(
+                store
+                    .pending_yandex_music_reactions()
+                    .expect("restored reactions"),
+                vec![disliked.clone()]
+            );
+            assert!(
+                store
+                    .acknowledge_yandex_music_reaction("account-1", "track-1", disliked.generation,)
+                    .expect("acknowledge exact generation")
+            );
+        }
+        let store = FileStateStore::open(&config).expect("reopen cleared file state");
+        assert!(
+            store
+                .pending_yandex_music_reactions()
+                .expect("cleared reactions")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_reaction_document_is_canonical_and_contains_no_secrets_or_urls() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let store = FileStateStore::open(&config).expect("file state");
+        for (account_uid, track_id, reaction) in [
+            ("account-z", "track-2", YandexMusicReaction::Neutral),
+            ("account-a", "track-9", YandexMusicReaction::Liked),
+            ("account-a", "track-1", YandexMusicReaction::Disliked),
+        ] {
+            store
+                .queue_yandex_music_reaction(account_uid, track_id, reaction, 1)
+                .expect("queue reaction");
+        }
+        drop(store);
+
+        let path = config.state_dir().join("yandex-music.toml");
+        let encoded = fs::read_to_string(path).expect("Yandex Music reaction TOML");
+        let document: YandexMusicReactionsDocument =
+            toml::from_str(&encoded).expect("canonical reaction document");
+        assert_eq!(
+            document
+                .reactions
+                .iter()
+                .map(|pending| (pending.account_uid.as_str(), pending.track_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("account-a", "track-1"),
+                ("account-a", "track-9"),
+                ("account-z", "track-2"),
+            ]
+        );
+        for forbidden in [
+            "token",
+            "oauth",
+            "signed_url",
+            "stream_url",
+            "download_url",
+            "https://",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "reaction state must not contain {forbidden:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn yandex_music_reaction_document_rejects_unknown_secret_fields() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        {
+            let _store = FileStateStore::open(&config).expect("initialize file state");
+        }
+        fs::write(
+            config.state_dir().join("yandex-music.toml"),
+            "format_version = 1\ntoken = \"must-not-be-stored\"\nreactions = []\n",
+        )
+        .expect("human-edited reaction TOML");
+
+        assert!(matches!(
+            FileStateStore::open(&config),
+            Err(PersistenceError::TomlDecode(_))
+        ));
     }
 
     #[test]

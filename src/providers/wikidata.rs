@@ -53,6 +53,15 @@ pub enum WikidataExternalKind {
     BilibiliVideo,
     /// Bilibili user/channel ID, represented by Wikidata property P6455.
     BilibiliChannel,
+    /// Yandex Music track ID, represented by Wikidata property P13289.
+    YandexMusicTrack,
+    /// Yandex Music artist ID, represented by Wikidata property P1553.
+    YandexMusicArtist,
+    /// Yandex Music album ID, represented by Wikidata's release property P2819.
+    ///
+    /// Wikidata names P2819 “Yandex Music release ID,” while the Yandex Music
+    /// API and URLs expose the same identifier as an album ID.
+    YandexMusicAlbum,
 }
 
 impl WikidataExternalKind {
@@ -66,6 +75,29 @@ impl WikidataExternalKind {
             Self::MusicBrainzRecording => "P4404",
             Self::BilibiliVideo => "P6456",
             Self::BilibiliChannel => "P6455",
+            Self::YandexMusicTrack => "P13289",
+            Self::YandexMusicArtist => "P1553",
+            Self::YandexMusicAlbum => "P2819",
+        }
+    }
+
+    /// Returns the stable English label of the external-ID property.
+    ///
+    /// These labels describe the Wikidata properties rather than a returned
+    /// item's title. They are kept in code so exact-ID lookup controls remain
+    /// readable before property metadata has been fetched.
+    #[must_use]
+    pub const fn property_label(self) -> &'static str {
+        match self {
+            Self::YouTubeVideo => "YouTube video ID",
+            Self::YouTubeChannel => "YouTube channel ID",
+            Self::SoundCloud => "SoundCloud ID",
+            Self::MusicBrainzRecording => "MusicBrainz recording ID",
+            Self::BilibiliVideo => "Bilibili video ID",
+            Self::BilibiliChannel => "Bilibili user ID",
+            Self::YandexMusicTrack => "Yandex Music track ID",
+            Self::YandexMusicArtist => "Yandex Music artist ID",
+            Self::YandexMusicAlbum => "Yandex Music release ID",
         }
     }
 }
@@ -419,6 +451,18 @@ fn validate_external_id(
                 ))
             }
         }
+        WikidataExternalKind::YandexMusicTrack
+        | WikidataExternalKind::YandexMusicArtist
+        | WikidataExternalKind::YandexMusicAlbum => {
+            if is_bounded_positive_decimal(external_id) {
+                Ok(())
+            } else {
+                Err(ProviderError::InvalidRequest(
+                    "Yandex Music ID must be a positive numeric identifier of at most 20 digits"
+                        .to_owned(),
+                ))
+            }
+        }
     }
 }
 
@@ -440,6 +484,15 @@ fn is_canonical_lowercase_uuid(value: &str) -> bool {
 
 fn is_positive_decimal(value: &str) -> bool {
     !value.is_empty() && !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Validates a provider-supplied decimal ID without freezing a remote service's
+/// evolving identifier width into Youta.
+///
+/// Twenty digits is sufficient for an unsigned 64-bit identifier while still
+/// bounding the value interpolated into a Wikidata query.
+fn is_bounded_positive_decimal(value: &str) -> bool {
+    value.len() <= 20 && is_positive_decimal(value)
 }
 
 /// Extracts a Wikidata-compatible `SoundCloud` account or track path.
@@ -2488,6 +2541,136 @@ mod tests {
         assert!(query.contains(&format!("VALUES ?externalId {{ \"{RECORDING_ID}\" }}")));
         assert!(query.contains("wdt:P4404 ?externalId"));
         assert!(query.contains("LIMIT 20"));
+    }
+
+    #[test]
+    fn yandex_music_external_kinds_use_the_canonical_properties_and_labels() {
+        assert_eq!(
+            WikidataExternalKind::YandexMusicTrack.property_id(),
+            "P13289"
+        );
+        assert_eq!(
+            WikidataExternalKind::YandexMusicTrack.property_label(),
+            "Yandex Music track ID"
+        );
+        assert_eq!(
+            WikidataExternalKind::YandexMusicArtist.property_id(),
+            "P1553"
+        );
+        assert_eq!(
+            WikidataExternalKind::YandexMusicArtist.property_label(),
+            "Yandex Music artist ID"
+        );
+        assert_eq!(
+            WikidataExternalKind::YandexMusicAlbum.property_id(),
+            "P2819"
+        );
+        assert_eq!(
+            WikidataExternalKind::YandexMusicAlbum.property_label(),
+            "Yandex Music release ID"
+        );
+    }
+
+    #[test]
+    fn yandex_music_queries_use_exact_numeric_ids() {
+        for (kind, external_id, property_id) in [
+            (WikidataExternalKind::YandexMusicTrack, "60050452", "P13289"),
+            (WikidataExternalKind::YandexMusicArtist, "79215", "P1553"),
+            (WikidataExternalKind::YandexMusicAlbum, "215688", "P2819"),
+        ] {
+            let url = build_query_url(kind, external_id).expect("Yandex Music query URL");
+            let query = url
+                .query_pairs()
+                .find(|(key, _)| key == "query")
+                .map(|(_, value)| value.into_owned())
+                .expect("SPARQL query");
+
+            assert!(query.contains(&format!("VALUES ?externalId {{ \"{external_id}\" }}")));
+            assert!(query.contains(&format!("wdt:{property_id} ?externalId")));
+            assert!(query.contains("LIMIT 20"));
+        }
+    }
+
+    #[test]
+    fn yandex_music_ids_reject_noncanonical_or_unbounded_values() {
+        for kind in [
+            WikidataExternalKind::YandexMusicTrack,
+            WikidataExternalKind::YandexMusicArtist,
+            WikidataExternalKind::YandexMusicAlbum,
+        ] {
+            assert!(validate_external_id(kind, "1").is_ok());
+            assert!(validate_external_id(kind, "60050452").is_ok());
+            for invalid in [
+                "",
+                "0",
+                "01",
+                "-1",
+                "1.0",
+                " 60050452",
+                "60050452 ",
+                "6005045a",
+                "123456789012345678901",
+            ] {
+                assert!(
+                    validate_external_id(kind, invalid).is_err(),
+                    "{kind:?} unexpectedly accepted {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yandex_music_fixture_normalizes_track_artist_and_album_matches() {
+        let fixture = |item_id: &str, label: &str, description: &str| {
+            serde_json::from_value::<SparqlResponse>(serde_json::json!({
+                "results": {
+                    "bindings": [{
+                        "item": {
+                            "type": "uri",
+                            "value": format!("http://www.wikidata.org/entity/{item_id}")
+                        },
+                        "itemLabel": {"type": "literal", "value": label},
+                        "itemDescription": {"type": "literal", "value": description}
+                    }]
+                }
+            }))
+            .expect("Yandex Music Wikidata fixture")
+        };
+
+        for (kind, external_id, item_id, label, description) in [
+            (
+                WikidataExternalKind::YandexMusicTrack,
+                "60050452",
+                "Q130731837",
+                "Black coal",
+                "music track",
+            ),
+            (
+                WikidataExternalKind::YandexMusicArtist,
+                "79215",
+                "Q15862",
+                "Queen",
+                "British rock band",
+            ),
+            (
+                WikidataExternalKind::YandexMusicAlbum,
+                "215688",
+                "Q219144",
+                "A Night at the Opera",
+                "1975 studio album by Queen",
+            ),
+        ] {
+            let lookup =
+                normalize_response(kind, external_id, fixture(item_id, label, description))
+                    .expect("Yandex Music lookup fixture should normalize");
+
+            assert_eq!(lookup.kind, kind);
+            assert_eq!(lookup.external_id, external_id);
+            assert_eq!(lookup.items.len(), 1);
+            assert_eq!(lookup.items[0].item_id, item_id);
+            assert_eq!(lookup.items[0].label, label);
+            assert_eq!(lookup.items[0].description.as_deref(), Some(description));
+        }
     }
 
     #[test]

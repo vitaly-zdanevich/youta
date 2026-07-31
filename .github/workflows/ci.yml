@@ -78,6 +78,10 @@ jobs:
             feature_arguments: --no-default-features
           - feature_set: text-only application
             feature_arguments: --no-default-features --features app
+          - feature_set: Yandex-free text-only application
+            feature_arguments: --no-default-features --features app-core
+          - feature_set: Yandex-free graphical application
+            feature_arguments: --no-default-features --features app-core,images
           - feature_set: optional SQLite state
             feature_arguments: --no-default-features --features sqlite-state
           - feature_set: TUI only
@@ -92,6 +96,10 @@ jobs:
             feature_arguments: --no-default-features --features tui,bandcamp
           - feature_set: TUI with Radio
             feature_arguments: --no-default-features --features tui,radio
+          - feature_set: TUI with standalone Yandex Music
+            feature_arguments: --no-default-features --features tui,yandex-music
+          - feature_set: TUI with Yandex Music
+            feature_arguments: --no-default-features --features tui,yandex-music,wikidata
           - feature_set: all features
             feature_arguments: --all-features
     steps:
@@ -157,6 +165,9 @@ jobs:
           cargo check --locked --no-default-features --features tui,local-move
           cargo check --locked --no-default-features --features images,local-artwork
           cargo check --locked --no-default-features --features tui,local
+          cargo check --locked --no-default-features --features app-core
+          cargo check --locked --no-default-features --features app-core,images
+          cargo check --locked --no-default-features --features tui,yandex-music
           cargo check --locked --no-default-features --features app
 
   windows-compile:

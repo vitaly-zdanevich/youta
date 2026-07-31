@@ -272,6 +272,13 @@ impl SourceKind {
                 stream: true,
                 ..SourceCapabilities::default()
             },
+            Self::YandexMusic => SourceCapabilities {
+                search: true,
+                video_details: true,
+                download: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            },
             Self::Funkwhale => SourceCapabilities {
                 search: true,
                 video_details: true,
@@ -287,7 +294,6 @@ impl SourceKind {
             | Self::WikimediaCommons
             | Self::ArchiveOrg
             | Self::LibriVox
-            | Self::YandexMusic
             | Self::Bandcamp
             | Self::Odysee
             | Self::Rumble
@@ -365,6 +371,91 @@ impl From<&str> for SourceKind {
             "remote-files" => Self::RemoteFiles,
             other => Self::Other(other.to_owned()),
         }
+    }
+}
+
+/// The desired reaction for one Yandex Music track.
+///
+/// `Neutral` is an explicit remote mutation: it removes a previously sent
+/// like or dislike. It therefore remains in the pending-reaction outbox until
+/// the provider acknowledges that exact intent.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum YandexMusicReaction {
+    /// Neither liked nor disliked.
+    #[default]
+    Neutral,
+    /// Positively rated by the account.
+    Liked,
+    /// Negatively rated by the account.
+    Disliked,
+}
+
+/// One durable desired-state mutation awaiting Yandex Music synchronization.
+///
+/// The record intentionally contains only stable provider identities and
+/// ordering metadata. OAuth tokens, download URLs, and signed stream URLs must
+/// never be copied into this user-owned state.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingYandexMusicReaction {
+    /// Stable Yandex account identifier that owns the reaction.
+    pub account_uid: String,
+    /// Stable Yandex Music track identifier.
+    pub track_id: String,
+    /// Latest desired remote state for the track.
+    pub reaction: YandexMusicReaction,
+    /// Per-account-and-track generation, increasing for every new intent.
+    ///
+    /// An acknowledgement may remove a pending row only when it carries this
+    /// exact generation, which prevents a delayed response from erasing a
+    /// newer offline choice.
+    pub generation: u64,
+    /// Time the desired state changed, in seconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
+/// Durable desired-state ledger for one Yandex Music account and track.
+///
+/// Unlike an ephemeral outbox row, this record survives a successful remote
+/// acknowledgement. Retaining the latest generation prevents a later user
+/// choice from reusing an old revision that may still exist in an in-flight
+/// provider response.
+#[cfg(feature = "yandex-music")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct YandexMusicReactionLedgerEntry {
+    /// Stable Yandex account identifier that owns the reaction.
+    pub account_uid: String,
+    /// Stable Yandex Music track identifier.
+    pub track_id: String,
+    /// Latest desired remote state for the track.
+    pub reaction: YandexMusicReaction,
+    /// Monotonic desired-state revision, including acknowledged revisions.
+    pub generation: u64,
+    /// Latest generation confirmed by the remote service.
+    ///
+    /// Zero represents a ledger entry that has never been acknowledged.
+    #[serde(default)]
+    pub acknowledged_generation: u64,
+    /// Time the desired state last changed, in seconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
+#[cfg(feature = "yandex-music")]
+impl YandexMusicReactionLedgerEntry {
+    /// Returns the desired mutation while this revision still needs syncing.
+    #[must_use]
+    pub fn pending_intent(&self) -> Option<PendingYandexMusicReaction> {
+        (self.acknowledged_generation < self.generation).then(|| PendingYandexMusicReaction {
+            account_uid: self.account_uid.clone(),
+            track_id: self.track_id.clone(),
+            reaction: self.reaction,
+            generation: self.generation,
+            updated_at: self.updated_at,
+        })
     }
 }
 
@@ -1159,6 +1250,8 @@ pub enum Screen {
     Search,
     /// Music-focused `YouTube Music` search results and details.
     YouTubeMusic,
+    /// Yandex Music recommendations, catalogue results, and album tracks.
+    YandexMusic,
     /// Bandcamp track and album search results.
     Bandcamp,
     /// `Apple Podcasts` show search results and details.
@@ -1221,6 +1314,9 @@ pub struct SessionState {
     /// Last selected row in the independent `YouTube Music` result list.
     #[serde(default)]
     pub youtube_music_selected_row: Option<usize>,
+    /// Last selected row in the independent Yandex Music result list.
+    #[serde(default)]
+    pub yandex_music_selected_row: Option<usize>,
     /// Last selected row in the independent Bandcamp result list.
     #[serde(default)]
     pub bandcamp_selected_row: Option<usize>,
@@ -1246,6 +1342,9 @@ pub struct SessionState {
     /// Last search text entered on the independent `YouTube Music` tab.
     #[serde(default)]
     pub youtube_music_search_text: String,
+    /// Last search text entered on the independent Yandex Music tab.
+    #[serde(default)]
+    pub yandex_music_search_text: String,
     /// Last search text entered on the independent Bandcamp tab.
     #[serde(default)]
     pub bandcamp_search_text: String,
@@ -1587,6 +1686,20 @@ mod tests {
             SourceKind::Radio.capabilities(),
             SourceCapabilities {
                 playlists: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            }
+        );
+    }
+
+    #[test]
+    fn yandex_music_capabilities_describe_only_implemented_operations() {
+        assert_eq!(
+            SourceKind::YandexMusic.capabilities(),
+            SourceCapabilities {
+                search: true,
+                video_details: true,
+                download: true,
                 stream: true,
                 ..SourceCapabilities::default()
             }

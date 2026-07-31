@@ -147,6 +147,9 @@ The current pre-alpha foundation includes:
   details, with description-link extraction;
 - an independent YouTube Music tab that searches playable tracks through
   `yt-dlp` without requiring a YouTube Data API key;
+- an experimental authenticated YandexMusic tab for account recommendations,
+  music and podcast search, best-effort audiobook discovery, reactions, album
+  browsing, and bounded batch downloads;
 - an independent Bandcamp tab that searches public track and album pages and
   resolves only the selected release for explicit playback through `yt-dlp`;
 - an independent Apple Podcasts tab that searches the public, unauthenticated
@@ -418,6 +421,19 @@ cargo build --release --locked --no-default-features \
 	--features app
 ```
 
+The default `app` profile includes the experimental YandexMusic adapter. Build
+the same application without Yandex Music code, and retain the default image
+support, with:
+
+```sh
+cargo build --release --locked --no-default-features \
+	--features app-core,images
+```
+
+Omit `images` from that command for the Yandex-free text-only variant. Cargo
+features are additive, so `app-core` is the explicit complete profile without
+`yandex-music`; there is no misleading negative feature.
+
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
 
@@ -466,6 +482,9 @@ Store the plaintext API key separately in
 ```toml
 [providers]
 youtube_api_key = '...'
+# OAuth access token issued for your Yandex Music account. This is not an API
+# key; Youta never asks for or stores the account password.
+yandex_music_token = '...'
 # Create an application key at https://acoustid.org/api-key.
 acoustid_client_key = '...'
 ```
@@ -474,7 +493,10 @@ acoustid_client_key = '...'
 back to `invidious_base_url`. `official` and `invidious` select only that
 backend. Both the TUI and `youta search` use this selection. The AcoustID key
 enables the Local Details `[f] Fingerprint` action; `fpcalc_executable` in
-`config.toml` can select a non-default Chromaprint helper path.
+`config.toml` can select a non-default Chromaprint helper path. The Yandex
+Music credential can instead be supplied for one process with
+`YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN`; environment values take precedence over
+the private credentials file.
 
 For a small local-only build:
 
@@ -664,6 +686,60 @@ These are distinct integration modes:
   When an official or Invidious metadata provider is configured, it may enrich
   the selected track with full public video details; basic music search and
   playback remain keyless.
+- The experimental **YandexMusic** tab uses Yandex Music's private client API,
+  which is neither a documented public developer API nor a stability
+  commitment from Yandex. It is isolated behind the `yandex-music` Cargo
+  feature so distributors can omit the client and its signing dependencies.
+  Normal builds include it through `app`; `app-core` is the complete
+  Yandex-free application profile. An upstream API or authentication change
+  may break this adapter independently of the rest of Youta.
+
+  YandexMusic requires an OAuth access token already issued for the user's
+  account. This credential is **not an API key** and is password-equivalent:
+  Youta never asks for an account password and does not implement a token
+  acquisition flow. Yandex documents the credential model in its
+  [OAuth overview](https://yandex.com/dev/id/doc/en/concepts/ya-oauth-intro);
+  that page does not document a public Yandex Music API or issue a Music token
+  for Youta. Store an already-issued token in
+  `~/.config/youta/secrets/credentials.toml`:
+
+  ```toml
+  [providers]
+  yandex_music_token = '...'
+  ```
+
+  Alternatively, set `YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN` for the Youta
+  process. Do not put a token in `config.toml`, command arguments, issue
+  reports, or diagnostic output.
+
+  The tab opens account recommendations by default and provides bounded search
+  scopes for music, podcasts, and exact audiobook metadata. Albums can be
+  opened and downloaded. My Wave makes at most four recommendation requests
+  and displays up to twenty unique playable tracks, stopping early when the
+  service adds no new track. When confirmed playback reaches the last retained
+  track, Youta makes one guarded continuation request and appends only new
+  tracks. Its twenty-track batch download is enabled only when the bounded
+  responses contain all twenty tracks.
+  Playback and downloads request the highest quality that the account,
+  subscription tier, catalogue item, and region permit. A
+  requested quality is not a promise of a particular codec or lossless tier.
+  Likes and dislikes update the local desired state immediately. Failed or
+  offline reactions stay in a durable outbox and are retried on startup and
+  graceful shutdown without silently reversing the user's latest choice.
+
+  Audiobook search is best-effort and may return no results. The inspected
+  private clients expose no stable first-class audiobook search or playback
+  contract, so Youta queries the generic catalogue and retains only rows whose
+  exact API `type` or `metaType` identifies an audiobook or chapter. It never
+  classifies one from its title, artist, genre, or description. A discovered
+  row is not a promise that the Music API will expose playable media. Youta
+  does not silently route the request through the separate Bookmate service or
+  claim that podcast matches are audiobooks.
+
+  For a selected track, artist, or album, Wikidata enrichment uses exact
+  external identifiers where available and keeps the existing collapsed `[W]`
+  details behavior. It does not guess an entity from a title-only,
+  artist-name-only, or album-title-only match.
 - The separate **Apple Podcasts** tab uses Apple's documented,
   unauthenticated [iTunes Search
   API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html)
@@ -1120,8 +1196,8 @@ The roadmap is intentionally tiered:
 3. **Authenticated integrations:** YouTube OAuth interactions, including
    bidirectional local/YouTube subscription sync, Last.fm, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
-4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex
-   services, VK, cloud.mail.ru, 4duk, knizhnyvoz, archive files, and
+4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex Disk,
+   VK, cloud.mail.ru, 4duk, knizhnyvoz, archive files, and
    torrent-backed sources.
 
 Additional proprietary or scraper-dependent providers are not promised until
@@ -1264,6 +1340,18 @@ Run the same keyless YouTube Music search check locally with:
 
 ```sh
 YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
+```
+
+The authenticated Yandex Music smoke is intentionally local and opt-in because
+it requires a user's OAuth token. Export
+`YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN` through a secret-aware shell or CI store,
+or save the token through Youta's private OAuth-token editor. The smoke then
+validates account authentication, one bounded recommendation response,
+catalogue search, and highest-available media metadata without downloading or
+mutating durable account state:
+
+```sh
+YOUTA_RUN_LIVE_YANDEX_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features yandex-music -- --ignored --exact yandex_music_account_recommendations_search_and_media_metadata_are_usable --nocapture
 ```
 
 Run the Radio smokes locally to resolve and decode real HTTP(S) M3U, PLS, MP3,
