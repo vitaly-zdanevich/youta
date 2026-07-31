@@ -8268,6 +8268,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "yandex-music")]
     #[test]
     fn migration_from_v13_preserves_pending_reaction_as_unacknowledged_ledger_entry() {
         let connection = Connection::open_in_memory().expect("open SQLite");
