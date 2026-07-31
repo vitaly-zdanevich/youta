@@ -4857,9 +4857,6 @@ const MIN_DETAIL_ACTION_RAIL_ARTWORK_WIDTH: u16 = 48;
 /// Returns a stable rail slot width for labels that change after activation.
 fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hotkeys: bool) -> u16 {
     let stable_label = match &button_placement.action {
-        UiAction::ToggleTextSelectionMode => {
-            Some(button("t/Esc", "Exit select mode", show_hotkeys))
-        }
         UiAction::ToggleRadioFavorite => Some(button("f", "Unfavorite", show_hotkeys)),
         UiAction::ToggleTodoPlaylist => Some(button("l", "Remove from todo", show_hotkeys)),
         UiAction::EditPrivateNote => Some(button("n", "Edit private note", show_hotkeys)),
@@ -5093,33 +5090,6 @@ fn render_information_panel(
         Vec::new()
     };
     let mut right_buttons = Vec::with_capacity(4);
-    if show_text_selection {
-        let label = button(
-            if view.text_selection_mode {
-                "t/Esc"
-            } else {
-                "t"
-            },
-            if view.text_selection_mode {
-                "Exit select mode"
-            } else {
-                "Select mode"
-            },
-            show_hotkeys,
-        );
-        push_right_detail_button(
-            &mut lines,
-            &mut right_buttons,
-            inner.width,
-            label,
-            if view.text_selection_mode {
-                theme.selected
-            } else {
-                theme.accent
-            },
-            UiAction::ToggleTextSelectionMode,
-        );
-    }
     if show_text_selection
         && kind == InformationPanelKind::Video
         && view.video_comments_available
@@ -12550,23 +12520,13 @@ mod tests {
         assert!(!rendered.contains("YouTube video search"));
         assert!(rendered.contains("Borderless result"));
         assert!(rendered.contains("Borderless details content"));
-        let (_, select_mode_area) = hit_map
-            .detail_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
-            .expect("Select mode hit target");
-        assert_eq!(
-            select_mode_area.y, hit_map.details_panel.y,
-            "the first Details control must reclaim the removed generic heading row"
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode),
+            "text selection must not consume right-panel space"
         );
-        assert_eq!(
-            select_mode_area.right(),
-            hit_map.details_panel.right(),
-            "Select mode must remain right-aligned"
-        );
-        assert!(hit_map.detail_buttons.iter().any(|(action, target)| action
-            == &UiAction::ToggleTextSelectionMode
-            && target.y == hit_map.details_panel.y));
         assert_eq!(hit_map.rows.y, 1);
         assert_eq!(hit_map.rows.bottom(), buffer.area.bottom());
         assert_eq!(hit_map.rows.right(), hit_map.details_panel.x);
@@ -16175,19 +16135,12 @@ mod tests {
             buffer.content().iter().any(|cell| cell.symbol() == "█"),
             "overflowing details must render a scrollbar thumb"
         );
-        let (_, select_mode_area) = hit_map
-            .detail_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
-            .expect("Select mode hit target");
-        assert_eq!(
-            select_mode_area.y, hit_map.details_panel.y,
-            "scrolling must not restore the removed generic Details heading"
-        );
-        assert_eq!(
-            select_mode_area.right(),
-            hit_map.details_panel.right(),
-            "Select mode must remain right-aligned while Details is scrolled"
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode),
+            "scrolling must not restore the removed Select mode button"
         );
         assert!(hit_map.details_panel.width > 0);
         assert!(hit_map.details_panel.height > 0);
@@ -16645,15 +16598,9 @@ mod tests {
             .iter()
             .find(|(action, _)| action == &UiAction::OpenChannelInBrowser)
             .expect("external channel opener hit target");
-        let (_, text_selection_area) = hit_map
-            .detail_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
-            .expect("text selection hit target");
         assert_eq!(
-            open_channel_area.y,
-            text_selection_area.y.saturating_add(1),
-            "the channel opener should follow Select mode"
+            open_channel_area.y, hit_map.details_panel.y,
+            "the channel opener should reclaim the removed Select mode row"
         );
         assert_eq!(
             open_area.y,
@@ -16664,12 +16611,11 @@ mod tests {
             .details_panel
             .x
             .saturating_add(hit_map.details_panel.width);
-        assert_eq!(
-            text_selection_area
-                .x
-                .saturating_add(text_selection_area.width),
-            expected_right,
-            "Select mode should be right-aligned"
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode)
         );
         assert_eq!(
             open_channel_area.x.saturating_add(open_channel_area.width),
@@ -16764,13 +16710,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing detail action {action:?}"))
         };
         for (left, right) in [
-            (
-                UiAction::ToggleTodoPlaylist,
-                UiAction::ToggleTextSelectionMode,
-            ),
-            (UiAction::OpenPlaylistPopup, UiAction::OpenVideoComments),
-            (UiAction::EditPrivateNote, UiAction::OpenChannelInBrowser),
-            (UiAction::ToggleSubscription, UiAction::OpenInBrowser),
+            (UiAction::ToggleTodoPlaylist, UiAction::OpenVideoComments),
+            (UiAction::OpenPlaylistPopup, UiAction::OpenChannelInBrowser),
+            (UiAction::EditPrivateNote, UiAction::OpenInBrowser),
         ] {
             let left_area = area_for(&left);
             let right_area = area_for(&right);
@@ -16969,7 +16911,6 @@ mod tests {
         let thumbnail_area = hit_map.thumbnail_area.expect("ready artwork hitbox");
         let expected_actions = [
             UiAction::ToggleTodoPlaylist,
-            UiAction::ToggleTextSelectionMode,
             UiAction::OpenPlaylistPopup,
             UiAction::OpenVideoComments,
             UiAction::EditPrivateNote,
@@ -17018,7 +16959,6 @@ mod tests {
         );
         let expected_labels = [
             "[l] Add to todo".to_owned(),
-            "[t] Select mode".to_owned(),
             "[P] Playlist…".to_owned(),
             "[F6] Twenty comments".to_owned(),
             "[n] Add private note".to_owned(),
@@ -17253,7 +17193,6 @@ mod tests {
         assert_eq!(requested_thumbnail.x, hit_map.details_panel.x);
         assert_eq!(requested_thumbnail.width, hit_map.details_panel.width);
         for expected in [
-            UiAction::ToggleTextSelectionMode,
             UiAction::OpenVideoComments,
             UiAction::OpenChannelInBrowser,
             UiAction::OpenInBrowser,
@@ -17322,43 +17261,38 @@ mod tests {
             })
             .expect("draw narrow details");
 
-        let placements = [
-            UiAction::ToggleTextSelectionMode,
-            UiAction::OpenChannelInBrowser,
-            UiAction::OpenInBrowser,
-        ]
-        .map(|expected| {
-            let (_, area) = hit_map
-                .detail_buttons
-                .iter()
-                .find(|(action, _)| action == &expected)
-                .expect("right-side control");
-            assert!(area.width > 0);
-            assert!(area.x >= hit_map.details_panel.x);
-            assert!(
-                area.x.saturating_add(area.width)
-                    <= hit_map
-                        .details_panel
-                        .x
-                        .saturating_add(hit_map.details_panel.width)
-            );
-            assert_eq!(
-                mouse_action(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        column: area.x,
-                        row: area.y,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &hit_map,
-                    &view,
-                ),
-                Some(expected)
-            );
-            *area
-        });
+        let placements =
+            [UiAction::OpenChannelInBrowser, UiAction::OpenInBrowser].map(|expected| {
+                let (_, area) = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find(|(action, _)| action == &expected)
+                    .expect("right-side control");
+                assert!(area.width > 0);
+                assert!(area.x >= hit_map.details_panel.x);
+                assert!(
+                    area.x.saturating_add(area.width)
+                        <= hit_map
+                            .details_panel
+                            .x
+                            .saturating_add(hit_map.details_panel.width)
+                );
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(expected)
+                );
+                *area
+            });
         assert_eq!(placements[1].y, placements[0].y.saturating_add(1));
-        assert_eq!(placements[2].y, placements[1].y.saturating_add(1));
     }
 
     #[test]
@@ -17887,7 +17821,7 @@ mod tests {
     }
 
     #[test]
-    fn details_render_confined_text_selection_control_and_highlight() {
+    fn details_keep_text_selection_on_the_keyboard_without_a_panel_button() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
@@ -17902,22 +17836,16 @@ mod tests {
 
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
-            .expect("draw text-selection control");
-        assert!(rendered_text(&terminal).contains("[t] Select mode"));
-        let selection_area = hit_map
-            .detail_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
-            .map(|(_, area)| *area)
-            .expect("Details text-selection hit target");
-        let click = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: selection_area.x,
-            row: selection_area.y,
-            modifiers: KeyModifiers::NONE,
-        };
+            .expect("draw Details without a text-selection button");
+        assert!(!rendered_text(&terminal).contains("Select mode"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode)
+        );
         assert_eq!(
-            mouse_action(click, &hit_map, &view),
+            key_action(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleTextSelectionMode)
         );
 
@@ -17925,11 +17853,17 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw active text-selection mode");
-        assert!(rendered_text(&terminal).contains("[t/Esc] Exit select mode"));
+        assert!(!rendered_text(&terminal).contains("Exit select mode"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode)
+        );
         assert_eq!(
-            mouse_action(click, &hit_map, &view),
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
             Some(UiAction::ToggleTextSelectionMode),
-            "the in-app exit button remains clickable"
+            "Esc must still leave keyboard-only text-selection mode"
         );
         let (selectable_x, selectable_y) = hit_map
             .detail_text_rows
@@ -18030,17 +17964,16 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains("Select mode"));
-        assert!(!rendered.contains("[t] Select mode"));
+        assert!(!rendered.contains("Select mode"));
         assert!(rendered.contains(&format!("{} video", system_url_opener_name())));
         assert!(!rendered.contains(&format!("[o] {} video", system_url_opener_name())));
         assert!(!rendered.contains(&format!("[O] {}", system_url_opener_name())));
-        assert_eq!(hit_map.detail_buttons.len(), 3);
+        assert_eq!(hit_map.detail_buttons.len(), 2);
         assert!(
             hit_map
                 .detail_buttons
                 .iter()
-                .any(|(action, _)| action == &UiAction::ToggleTextSelectionMode)
+                .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode)
         );
         assert!(
             hit_map
@@ -23752,14 +23685,7 @@ prose 07:25 remains clickable but is not a chapter";
 
             if let Some(move_area) = move_area {
                 assert_eq!(move_area.width, terminal_text_width("[m] Move"));
-                let select_area = hit_map
-                    .detail_buttons
-                    .iter()
-                    .find_map(|(action, area)| {
-                        (action == &UiAction::ToggleTextSelectionMode).then_some(*area)
-                    })
-                    .expect("Select mode control");
-                assert_eq!(move_area.y, select_area.y.saturating_add(1));
+                assert_eq!(move_area.y, hit_map.details_panel.y);
                 assert_eq!(
                     move_area.right(),
                     hit_map.details_panel.right(),
@@ -23774,11 +23700,11 @@ prose 07:25 remains clickable but is not a chapter";
                     );
                     if let Some(rename_area) = rename_area {
                         assert_eq!(
-                            rename_area.y, select_area.y,
-                            "Rename should reuse the free space before Select mode"
+                            rename_area.y, move_area.y,
+                            "Rename should reuse the free space before Move"
                         );
                         assert!(
-                            rename_area.right().saturating_add(2) <= select_area.x,
+                            rename_area.right().saturating_add(2) <= move_area.x,
                             "paired Local controls must retain a two-cell gap"
                         );
                     }
@@ -23926,13 +23852,6 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw Downloaded Details");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[x] Move to Trash"));
-        let select_area = hit_map
-            .detail_buttons
-            .iter()
-            .find_map(|(action, area)| {
-                (action == &UiAction::ToggleTextSelectionMode).then_some(*area)
-            })
-            .expect("Select mode control");
         let trash_area = hit_map
             .detail_buttons
             .iter()
@@ -23940,7 +23859,7 @@ prose 07:25 remains clickable but is not a chapter";
                 (action == &UiAction::RequestDownloadedTrash).then_some(*area)
             })
             .expect("Downloaded Trash control");
-        assert_eq!(trash_area.y, select_area.y.saturating_add(1));
+        assert_eq!(trash_area.y, hit_map.details_panel.y);
         assert_eq!(trash_area.right(), hit_map.details_panel.right());
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &view),
