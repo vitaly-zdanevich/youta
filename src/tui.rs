@@ -5704,6 +5704,12 @@ fn render_information_panel(
                 reserved_thumbnail_height = reserved_thumbnail_height.max(rail.height);
             }
             cursor_y = cursor_y.saturating_add(reserved_thumbnail_height);
+            if !details.thumbnail_expanded && cursor_y < inner.bottom() {
+                // Keep following metadata visually separate from the artwork.
+                // Reserving the row for loading placeholders too prevents a
+                // layout jump when decoded pixels replace the placeholder.
+                cursor_y = cursor_y.saturating_add(1);
+            }
             remaining_height = inner.bottom().saturating_sub(cursor_y);
         } else {
             renderer.clear();
@@ -16864,8 +16870,11 @@ mod tests {
             .expect("rendered channel description");
         assert_eq!(
             description_y,
-            thumbnail_area.bottom().max(open_area.bottom()),
-            "channel description must start below both artwork and its controls"
+            thumbnail_area
+                .bottom()
+                .max(open_area.bottom())
+                .saturating_add(1),
+            "one blank row must separate channel artwork and controls from its description"
         );
         assert!(rendered_text(&terminal).contains("Subscribers: 1,234"));
     }
@@ -17072,8 +17081,8 @@ mod tests {
         let rail_bottom = action_areas.last().expect("last action").bottom();
         assert_eq!(
             details_row.y,
-            thumbnail_area.bottom().max(rail_bottom),
-            "the description must reclaim the full pane below artwork and controls"
+            thumbnail_area.bottom().max(rail_bottom).saturating_add(1),
+            "one blank row must separate artwork and controls from the description"
         );
         assert_eq!(
             details_row.x, hit_map.details_panel.x,
@@ -18947,7 +18956,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_fitted_artwork_places_following_details_on_the_next_row() {
+    fn ready_fitted_artwork_leaves_one_blank_row_before_following_details() {
         let backend = TestBackend::new(120, 44);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
@@ -19003,8 +19012,8 @@ mod tests {
         );
         assert_eq!(
             details_row.y,
-            rendered_area.bottom(),
-            "aspect-ratio padding must not become empty rows before Details text"
+            rendered_area.bottom().saturating_add(1),
+            "one deliberate blank row must separate artwork from Details text"
         );
     }
 
