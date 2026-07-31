@@ -3397,7 +3397,12 @@ fn expanded_thumbnail_available(view: &ViewModel) -> bool {
             .is_some_and(|entity| entity.image_url.is_some())
 }
 
-/// Renders expanded artwork as a modal, aspect-fitted terminal overlay.
+/// Renders expanded artwork as a modal once its terminal pixels are ready.
+///
+/// While the enlarged target is loading, or while an image protocol advances
+/// through its ordinary-cell clearing frame, the existing screen remains
+/// visible behind a compact status label. This prevents a fullscreen `Clear`
+/// from becoming a black frame before the terminal image can be emitted.
 fn render_fullscreen_thumbnail_overlay(
     frame: &mut Frame<'_>,
     view: &ViewModel,
@@ -3425,8 +3430,6 @@ fn render_fullscreen_thumbnail_overlay(
     let visible_local_video = details.local_video_thumbnail.as_ref();
     let area = frame.area();
 
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme.base), area);
     if let Some(local_video) = visible_local_video {
         renderer.synchronize_local_video(local_video, area);
     } else {
@@ -3435,9 +3438,32 @@ fn render_fullscreen_thumbnail_overlay(
     let prepared = renderer.prepared_artwork_area(area).unwrap_or(area);
     let artwork_area = centered_sized_rect(prepared.width, prepared.height, area);
     let artwork_rendered = renderer.has_rendered_artwork();
+    if !artwork_rendered {
+        let status_width = area.width.min(48);
+        let status_area = centered_sized_rect(status_width, 1, area);
+        frame.render_widget(Clear, status_area);
+        frame.render_widget(
+            Paragraph::new("Loading enlarged thumbnail…")
+                .style(theme.muted)
+                .alignment(Alignment::Center),
+            status_area,
+        );
+        // A ready terminal protocol deliberately consumes one ordinary-cell
+        // transition frame before reporting renderable artwork. Rendering it
+        // inside this compact status area advances that state while preserving
+        // the useful body around it; the renderer then requests an immediate
+        // follow-up frame for the actual fullscreen image.
+        renderer.render(frame, status_area, theme);
+        hit_map.thumbnail_overlay_area = Some(area);
+        hit_map.thumbnail_area = None;
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme.base), area);
     renderer.render(frame, artwork_area, theme);
     hit_map.thumbnail_overlay_area = Some(area);
-    hit_map.thumbnail_area = artwork_rendered.then_some(artwork_area);
+    hit_map.thumbnail_area = Some(artwork_area);
 }
 
 fn render_frame(
@@ -19903,6 +19929,129 @@ mod tests {
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("Loading thumbnail…"));
         assert!(rendered.contains("Thumbnail unavailable: thumbnail download failed"));
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn first_ready_expanded_thumbnail_frame_is_never_a_blank_modal() {
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let thumbnail_url = url::Url::parse("https://images.example/fixture-640.png")
+            .expect("fixture thumbnail URL");
+        let expanded_thumbnail_url = url::Url::parse("https://images.example/fixture-maxres.png")
+            .expect("expanded fixture thumbnail URL");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Expanded thumbnail fixture".to_owned(),
+                source: "YouTube".to_owned(),
+                description: "Useful details remain visible.".to_owned(),
+                thumbnail_url: Some(thumbnail_url.clone()),
+                expanded_thumbnail_url: Some(expanded_thumbnail_url.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let mut thumbnails = TerminalThumbnailRenderer::new(manager);
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("start the selected thumbnail request");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker must receive the selected thumbnail"),
+            thumbnail_url
+        );
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .expect("release selected mock thumbnail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "selected thumbnail remained Loading after its mock response"
+            );
+            std::thread::yield_now();
+        }
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                })
+                .expect("stabilize selected thumbnail protocol");
+        }
+
+        view.details
+            .as_mut()
+            .expect("fixture details")
+            .thumbnail_expanded = true;
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw expanded thumbnail loading frame");
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
+        assert!(
+            rendered_text(&terminal).contains("Useful details remain visible."),
+            "loading enlarged artwork must retain useful screen content"
+        );
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker must receive the enlarged thumbnail"),
+            expanded_thumbnail_url,
+            "clicking the selected thumbnail must request its largest advertised image"
+        );
+
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .expect("release successful mock thumbnail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "expanded thumbnail remained Loading after its mock response"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw first ready expanded thumbnail frame");
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("Useful details remain visible."),
+            "the terminal-image clearing transition must retain useful content instead of a blank modal"
+        );
+        assert!(
+            thumbnails.needs_immediate_redraw(),
+            "the clearing transition must schedule its protocol frame without another user click"
+        );
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("draw enlarged terminal-image protocol frame");
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains('\u{10EEEE}') || rendered.contains("\u{1b}_G"),
+            "the immediate follow-up frame must contain the enlarged terminal image"
+        );
     }
 
     #[cfg(feature = "images")]
