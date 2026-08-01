@@ -3859,7 +3859,6 @@ fn render_frame(
             .then_some(view.local_size_sort),
         &status_line,
         !view.playback.idle,
-        subscription_refresh_available(view),
         hit_map,
     );
     if thumbnail_is_fullscreen && let Some(renderer) = thumbnail_renderer.as_deref_mut() {
@@ -7145,7 +7144,7 @@ fn render_seek_bar(
     } else if view.playback.paused {
         Some(PLAYBACK_PAUSED_SYMBOL)
     } else {
-        Some(PLAYBACK_PLAYING_SYMBOL)
+        None
     };
     let state_suffix = state.map_or_else(String::new, |state| format!(" {state}"));
     let marker = match settings.seek_bar_style {
@@ -7684,18 +7683,6 @@ fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     frame.buffer_mut().set_span(x, y, &label, width);
 }
 
-/// Returns whether the active Subscriptions route owns a refreshable item list.
-fn subscription_refresh_available(view: &ViewModel) -> bool {
-    view.screen == Screen::Subscriptions
-        && match view.subscriptions.layout {
-            SubscriptionsLayout::DrillDown => view.subscriptions.route == SubscriptionRoute::Items,
-            SubscriptionsLayout::Split => {
-                view.subscriptions.focus == SubscriptionPane::Items
-                    || view.subscriptions.description_expanded
-            }
-        }
-}
-
 fn render_buttons(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -7713,7 +7700,6 @@ fn render_buttons(
     _local_size_sort: Option<LocalSizeSort>,
     status: &str,
     _playback_active: bool,
-    subscription_refresh_available: bool,
     hit_map: &mut HitMap,
 ) {
     hit_map.buttons.clear();
@@ -7727,7 +7713,7 @@ fn render_buttons(
         return;
     }
 
-    let mut full_buttons = vec![
+    let full_buttons = vec![
         (
             button("/", "Search", settings.show_hotkeys),
             UiAction::BeginSearch,
@@ -7769,12 +7755,6 @@ fn render_buttons(
             UiAction::ToggleHelp,
         ),
     ];
-    if subscription_refresh_available {
-        full_buttons.push((
-            button("R", "Refresh", settings.show_hotkeys),
-            UiAction::RefreshSubscriptionVideos,
-        ));
-    }
     let full_width = full_buttons
         .iter()
         .map(|(label, _)| usize::from(terminal_text_width(label)))
@@ -7783,7 +7763,7 @@ fn render_buttons(
     let buttons = if full_width <= usize::from(area.width) {
         full_buttons
     } else {
-        let mut compact_buttons = vec![
+        let compact_buttons = vec![
             (
                 button("/", "Search", settings.show_hotkeys),
                 UiAction::BeginSearch,
@@ -7821,12 +7801,6 @@ fn render_buttons(
                 UiAction::ToggleHelp,
             ),
         ];
-        if subscription_refresh_available {
-            compact_buttons.push((
-                button("R", "Refresh", settings.show_hotkeys),
-                UiAction::RefreshSubscriptionVideos,
-            ));
-        }
         compact_buttons
     };
     let controls = buttons
@@ -8186,7 +8160,7 @@ fn render_video_comments_popup(
             .track_style(theme.muted)
             .thumb_symbol("█")
             .thumb_style(theme.accent);
-        let mut state = ScrollbarState::new(maximum_offset.saturating_add(visible_lines))
+        let mut state = ScrollbarState::new(maximum_offset.saturating_add(1))
             .position(offset)
             .viewport_content_length(visible_lines);
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
@@ -16534,12 +16508,13 @@ mod tests {
         );
         assert!(rendered.contains("Expanded fixture description"));
         assert!(rendered.contains("[R] Refresh videos"));
+        assert_minimal_footer_actions(&hit_map);
         assert!(
             hit_map
                 .buttons
                 .iter()
-                .any(|(action, _)| action == &UiAction::RefreshSubscriptionVideos),
-            "the global footer must advertise refresh while a channel is open"
+                .all(|(action, _)| action != &UiAction::RefreshSubscriptionVideos),
+            "the footer must not duplicate the contextual subscription refresh button"
         );
         assert!(
             !rendered.contains("[i] Details"),
@@ -21763,7 +21738,6 @@ mod tests {
                     Some(LocalSizeSort::Off),
                     "",
                     false,
-                    false,
                     &mut hit_map,
                 );
             })
@@ -21800,6 +21774,46 @@ mod tests {
     }
 
     #[test]
+    fn bottom_controls_do_not_duplicate_subscription_refresh() {
+        let backend = TestBackend::new(240, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_buttons(
+                    frame,
+                    frame.area(),
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    Screen::Subscriptions,
+                    YouTubeSearchSort::Relevance,
+                    RadioSort::Name,
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
+                    false,
+                    None,
+                    "",
+                    false,
+                    &mut hit_map,
+                );
+            })
+            .expect("draw subscription footer");
+
+        assert!(!rendered_text(&terminal).contains("[R] Refresh"));
+        assert!(
+            hit_map
+                .buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::RefreshSubscriptionVideos),
+            "the footer must not duplicate the refresh action shown beside the subscription list"
+        );
+    }
+
+    #[test]
     fn transient_openrc_notice_replaces_then_restores_the_one_line_footer() {
         let backend = TestBackend::new(40, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -21824,7 +21838,6 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     notice,
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -21858,7 +21871,6 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     "",
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -21922,7 +21934,6 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     "",
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -21988,7 +21999,6 @@ mod tests {
                     true,
                     None,
                     "",
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -22090,7 +22100,6 @@ mod tests {
                     None,
                     "",
                     false,
-                    false,
                     &mut hit_map,
                 );
             })
@@ -22149,7 +22158,6 @@ mod tests {
                     None,
                     "",
                     false,
-                    false,
                     &mut hit_map,
                 );
             })
@@ -22196,7 +22204,6 @@ mod tests {
                     false,
                     None,
                     "",
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -22374,7 +22381,6 @@ mod tests {
                     false,
                     Some(LocalSizeSort::Off),
                     "",
-                    false,
                     false,
                     &mut hit_map,
                 );
@@ -23174,7 +23180,7 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn seek_status_uses_current_playback_state_symbols() {
+    fn seek_status_uses_pause_symbol_without_redundant_playing_marker() {
         let backend = TestBackend::new(80, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
@@ -23221,7 +23227,11 @@ prose 07:25 remains clickable but is not a chapter";
             })
             .expect("draw playing seek status");
         let playing = rendered_text(&terminal);
-        assert!(playing.contains("vol 80% ▶"));
+        assert!(playing.contains("vol 80%"));
+        assert!(
+            !playing.contains("vol 80% ▶"),
+            "active playback does not need a redundant playing marker in the seek status"
+        );
         assert!(!playing.contains("paused"));
         assert!(!playing.contains("playing"));
 
@@ -25282,6 +25292,13 @@ prose 07:25 remains clickable but is not a chapter";
         assert_eq!(
             hit_map.video_comments_scroll_offset, hit_map.video_comments_scroll_maximum,
             "renderer must clamp an oversized restored offset"
+        );
+        let scrollbar_x = hit_map.video_comments_text_area.right();
+        let scrollbar_bottom = hit_map.video_comments_text_area.bottom().saturating_sub(1);
+        assert_eq!(
+            terminal.backend().buffer()[(scrollbar_x, scrollbar_bottom)].symbol(),
+            "█",
+            "the comments scrollbar thumb must reach the bottom at the final content offset"
         );
 
         assert_eq!(
