@@ -238,19 +238,26 @@ fn apple_podcasts_public_search_returns_normalized_shows() {
     );
 }
 
-/// Queries the public Wikidata endpoint for the live `YouTube` fixture.
+/// Creates a Wikidata client after verifying that live service tests were
+/// explicitly enabled.
 #[cfg(feature = "wikidata")]
-#[test]
-#[ignore = "requires the public Wikidata Query Service"]
-fn wikidata_finds_the_youtube_fixture_item() {
-    use youta::providers::wikidata::{WikidataExternalKind, WikidataProvider};
-
+fn live_wikidata_provider() -> youta::providers::wikidata::WikidataProvider {
     assert_eq!(
         std::env::var("YOUTA_RUN_LIVE_WIKIDATA_TEST").as_deref(),
         Ok("1"),
         "set YOUTA_RUN_LIVE_WIKIDATA_TEST=1 when invoking this live test"
     );
-    let provider = WikidataProvider::new();
+    youta::providers::wikidata::WikidataProvider::new()
+}
+
+/// Queries the public Wikidata endpoint for the live `YouTube` video fixture.
+#[cfg(feature = "wikidata")]
+#[test]
+#[ignore = "requires the public Wikidata Query Service"]
+fn wikidata_finds_the_youtube_video_fixture_item() {
+    use youta::providers::wikidata::WikidataExternalKind;
+
+    let provider = live_wikidata_provider();
     let lookup = provider
         .lookup_external(WikidataExternalKind::YouTubeVideo, "aqz-KE-bpKQ")
         .expect("query Wikidata for the real YouTube fixture");
@@ -261,7 +268,17 @@ fn wikidata_finds_the_youtube_fixture_item() {
         "Wikidata no longer links the fixture to Q282456: {:?}",
         lookup.items
     );
+}
 
+/// Queries the public Wikidata endpoint for the live `YouTube` channel
+/// fixture.
+#[cfg(feature = "wikidata")]
+#[test]
+#[ignore = "requires the public Wikidata Query Service"]
+fn wikidata_finds_the_youtube_channel_fixture_item() {
+    use youta::providers::wikidata::WikidataExternalKind;
+
+    let provider = live_wikidata_provider();
     let channel_lookup = provider
         .lookup_external(
             WikidataExternalKind::YouTubeChannel,
@@ -278,6 +295,15 @@ fn wikidata_finds_the_youtube_fixture_item() {
         "Wikidata no longer links the channel fixture to Q61113: {:?}",
         channel_lookup.items
     );
+}
+
+/// Loads labels, formatter links, Commons previews, and Wikipedia sitelinks
+/// for the public non-political media fixture.
+#[cfg(feature = "wikidata")]
+#[test]
+#[ignore = "requires the public Wikidata services"]
+fn wikidata_loads_the_media_fixture_statements() {
+    let provider = live_wikidata_provider();
 
     // Keep the committed fixture non-political while allowing a developer to
     // reproduce another public item through the same live regression path.
@@ -337,6 +363,15 @@ fn wikidata_finds_the_youtube_fixture_item() {
         !entity.hard_bounds_reached,
         "the ordinary live fixture unexpectedly reached a display hard bound"
     );
+}
+
+/// Loads and formats dated follower observations from the public Wikidata
+/// fixture.
+#[cfg(feature = "wikidata")]
+#[test]
+#[ignore = "requires the public Wikidata services"]
+fn wikidata_loads_the_follower_history_fixture() {
+    let provider = live_wikidata_provider();
 
     // Q13520818 is a non-political P8687 example with dated social-account
     // qualifiers. Assert structure rather than mutable follower totals.

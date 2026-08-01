@@ -586,7 +586,7 @@ jobs:
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Query the public Wikidata service
+      - name: Find the public YouTube video fixture
         env:
           YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'
         run: |
@@ -598,7 +598,76 @@ jobs:
               --features wikidata \
               -- \
               --ignored \
-              --exact wikidata_finds_the_youtube_fixture_item \
+              --exact wikidata_finds_the_youtube_video_fixture_item \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Find the public YouTube channel fixture
+        env:
+          YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features wikidata \
+              -- \
+              --ignored \
+              --exact wikidata_finds_the_youtube_channel_fixture_item \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Load public media statements
+        env:
+          YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features wikidata \
+              -- \
+              --ignored \
+              --exact wikidata_loads_the_media_fixture_statements \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Load public follower history
+        env:
+          YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features wikidata \
+              -- \
+              --ignored \
+              --exact wikidata_loads_the_follower_history_fixture \
               --nocapture
             then
               exit 0
@@ -642,10 +711,9 @@ jobs:
             ge \
             0.38
 
-      - name: Decode a public stream and parse passive metadata
+      - name: Decode curated public streams and parse passive metadata
         env:
           YOUTA_RUN_LIVE_RADIO_TEST: '1'
-          YOUTA_RUN_LIVE_BBC_RADIO_TEST: '1'
         run: |
           for attempt in 1 2; do
             if cargo test \
@@ -656,8 +724,22 @@ jobs:
                 -- \
                 --ignored \
                 --exact radio_stream_and_passive_metadata_are_usable \
-                --nocapture \
-              && cargo test \
+                --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Decode a generated NPR stream and parse its current programme
+        env:
+          YOUTA_RUN_LIVE_RADIO_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
                 --locked \
                 --test live_services \
                 --no-default-features \
@@ -665,8 +747,22 @@ jobs:
                 -- \
                 --ignored \
                 --exact generated_npr_station_stream_and_program_are_usable \
-                --nocapture \
-              && cargo test \
+                --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Resolve and decode BBC Sounds radio
+        env:
+          YOUTA_RUN_LIVE_BBC_RADIO_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
                 --locked \
                 --test live_services \
                 --no-default-features \
