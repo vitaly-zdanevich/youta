@@ -951,8 +951,8 @@ pub enum ThumbnailMode {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum YouTubeThumbnailSize {
-    /// Choose `standard` at terminal widths up to 1920 pixels and `maxres`
-    /// above that boundary.
+    /// Choose `high` through 1366 pixels, `standard` through 1920 pixels, and
+    /// `maxres` above that boundary.
     #[default]
     Automatic,
     /// Do not fetch or render `YouTube` video thumbnails.
@@ -998,11 +998,13 @@ impl YouTubeThumbnailSize {
     /// Resolves viewport-aware automatic selection to one exact API entry.
     #[must_use]
     pub const fn resolve(self, terminal_width_pixels: Option<u16>) -> Self {
+        const COMPACT_WINDOW_WIDTH_PIXELS: u16 = 1_366;
         const LARGE_WINDOW_WIDTH_PIXELS: u16 = 1_920;
 
         match self {
             Self::Automatic => match terminal_width_pixels {
                 Some(width) if width > LARGE_WINDOW_WIDTH_PIXELS => Self::Maxres,
+                Some(width) if width <= COMPACT_WINDOW_WIDTH_PIXELS => Self::High,
                 _ => Self::Standard,
             },
             exact => exact,
@@ -1039,7 +1041,7 @@ impl YouTubeThumbnailSize {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Automatic => "Automatic (640×480 or 1280×720)",
+            Self::Automatic => "Automatic (480×360, 640×480, or 1280×720)",
             Self::Disabled => "Disabled",
             Self::Default => "120×90 (default)",
             Self::Medium => "320×180 (medium)",
@@ -1870,9 +1872,17 @@ bandcamp_audio_format = "alac"
     }
 
     #[test]
-    fn automatic_youtube_thumbnail_size_uses_terminal_pixel_width_boundary() {
+    fn automatic_youtube_thumbnail_size_avoids_scaling_at_common_width_boundaries() {
         assert_eq!(
             YouTubeThumbnailSize::Automatic.resolve(None),
+            YouTubeThumbnailSize::Standard
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(Some(1_366)),
+            YouTubeThumbnailSize::High
+        );
+        assert_eq!(
+            YouTubeThumbnailSize::Automatic.resolve(Some(1_367)),
             YouTubeThumbnailSize::Standard
         );
         assert_eq!(

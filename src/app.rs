@@ -41791,7 +41791,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_youtube_thumbnail_projection_changes_only_above_1920_pixels() {
+    fn automatic_youtube_thumbnail_projection_tracks_terminal_pixel_width() {
         let thumbnail = |quality: &str, width, height| Thumbnail {
             url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
                 .expect("fixture thumbnail URL"),
@@ -41800,6 +41800,7 @@ mod tests {
             height: Some(height),
         };
         let thumbnails = vec![
+            thumbnail("high", 480, 360),
             thumbnail("standard", 640, 480),
             thumbnail("maxres", 1_280, 720),
         ];
@@ -41816,7 +41817,38 @@ mod tests {
         ));
         controller.refresh_youtube_rows();
 
-        for width in [None, Some(1_920)] {
+        controller.dispatch(UiAction::SetTerminalWindowPixels {
+            width: Some(1_366),
+            height: None,
+        });
+        assert_eq!(
+            controller.view.rows[0]
+                .thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://images.example/high.jpg")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://images.example/high.jpg")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.expanded_thumbnail_url.as_ref())
+                .map(url::Url::as_str),
+            Some("https://images.example/maxres.jpg"),
+            "the click target must stay at the largest advertised size"
+        );
+
+        for width in [None, Some(1_367), Some(1_920)] {
             controller.dispatch(UiAction::SetTerminalWindowPixels {
                 width,
                 height: None,

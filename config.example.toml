@@ -77,7 +77,8 @@ thumbnails = 'auto'
 
 # Exact YouTube video-thumbnail entry. One of: `automatic`, `disabled`,
 # `default`, `medium`, `high`, `standard`, or `maxres`. Automatic uses
-# `standard` through 1920 terminal-window pixels and `maxres` above that.
+# `high` through 1366 terminal-window pixels, `standard` through 1920 pixels,
+# and `maxres` above that.
 youtube_thumbnail_size = 'automatic'
 
 # Render ANSI-16 Unicode half-block artwork on a confirmed physical Linux

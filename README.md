@@ -905,8 +905,8 @@ back without fetching when no supported protocol is available.
 `youtube_thumbnail_size` independently chooses the exact YouTube
 video-thumbnail entry used by the normal Details preview:
 
-- `automatic`: use `standard` (640×480) when the terminal window is at most
-  1920 pixels wide, including exactly 1920 pixels; use `maxres` (1280×720) only
+- `automatic`: use `high` (480×360) through 1366 terminal-window pixels,
+  `standard` (640×480) from 1367 through 1920 pixels, and `maxres` (1280×720)
   above 1920 pixels. If the terminal does not report a pixel width, use
   `standard`.
 - `disabled`: do not fetch or render YouTube video thumbnails.

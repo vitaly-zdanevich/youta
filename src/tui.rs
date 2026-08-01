@@ -10196,7 +10196,7 @@ fn render_preferences_popup(
     }
 
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 640×480 through 1920 px and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 480×360 through 1366 px, 640×480 through 1920 px, and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
