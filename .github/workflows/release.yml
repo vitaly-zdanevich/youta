@@ -80,9 +80,13 @@ jobs:
           cargo test --locked --all-targets --no-default-features
           cargo test --locked --all-targets --no-default-features --features app-core
           cargo test --locked --all-targets --no-default-features --features app-core,images
+          cargo test --locked --all-targets --no-default-features --features app-core,images,qr
           cargo test --locked --all-targets --no-default-features --features app
+          cargo test --locked --all-targets --no-default-features --features app,images
+          cargo test --locked --all-targets --no-default-features --features app,qr
           cargo test --locked --all-targets --no-default-features --features sqlite-state
           cargo test --locked --all-targets --no-default-features --features tui
+          cargo test --locked --all-targets --no-default-features --features qr
           cargo test --locked --all-targets --no-default-features --features tui,local
           cargo test --locked --all-targets --no-default-features --features tui,acoustid,wikidata
           cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts
@@ -103,9 +107,13 @@ jobs:
           cargo test --locked --doc --no-default-features
           cargo test --locked --doc --no-default-features --features app-core
           cargo test --locked --doc --no-default-features --features app-core,images
+          cargo test --locked --doc --no-default-features --features app-core,images,qr
           cargo test --locked --doc --no-default-features --features app
+          cargo test --locked --doc --no-default-features --features app,images
+          cargo test --locked --doc --no-default-features --features app,qr
           cargo test --locked --doc --no-default-features --features sqlite-state
           cargo test --locked --doc --no-default-features --features tui
+          cargo test --locked --doc --no-default-features --features qr
           cargo test --locked --doc --no-default-features --features tui,local
           cargo test --locked --doc --no-default-features --features tui,acoustid,wikidata
           cargo test --locked --doc --no-default-features --features tui,apple-podcasts
@@ -176,6 +184,12 @@ jobs:
 
       - name: Build the text-only archive
         run: scripts/package-release.sh "${{ matrix.target }}" dist text
+
+      - name: Build the image archive without QR support
+        run: scripts/package-release.sh "${{ matrix.target }}" dist images-no-qr
+
+      - name: Build the text-only archive without QR support
+        run: scripts/package-release.sh "${{ matrix.target }}" dist text-no-qr
 
       - name: Upload binary archives
         uses: actions/upload-artifact@v7

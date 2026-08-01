@@ -173,6 +173,8 @@ use crate::providers::{
     VideoComment, VideoDetails, VideoOrientation, VideoSummary, invidious_youtube_provider,
     official_youtube_provider, validate_youtube_video_id,
 };
+#[cfg(feature = "qr")]
+use crate::qr_code::QrMatrix;
 use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
@@ -190,6 +192,8 @@ use crate::tui::LocalMoveDestinationView;
 use crate::tui::RadioRecordingView;
 #[cfg(feature = "radio")]
 use crate::tui::RadioSort;
+#[cfg(feature = "qr")]
+use crate::tui::VideoQrPopupView;
 #[cfg(feature = "yandex-music")]
 use crate::tui::{DetailLinkInternalTarget, DetailLinkPresentation};
 use crate::tui::{
@@ -8444,6 +8448,49 @@ impl AppController {
             self.youtube_video_comments_generation.wrapping_add(1);
         self.pending_youtube_video_comments = None;
         self.view.video_comments_popup = None;
+    }
+
+    /// Generates an offline QR code for the exact selected YouTube video.
+    ///
+    /// The canonical full watch URL is derived from the validated provider ID
+    /// instead of a provider-supplied alias, so scanning does not require a
+    /// `youtu.be` or mobile-host redirect.
+    #[cfg(feature = "qr")]
+    fn open_youtube_video_qr(&mut self) {
+        self.view.video_qr_popup = None;
+        let Some(details) = self.view.details.as_ref() else {
+            self.view.status_line = "No YouTube video is selected".to_owned();
+            return;
+        };
+        let Some(media_id) = details
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::YouTube)
+        else {
+            self.view.status_line = "No YouTube video is selected".to_owned();
+            return;
+        };
+        let video_id = media_id.external_id.clone();
+        let video_title = details.title.clone();
+        if let Err(error) = validate_youtube_video_id(&video_id) {
+            self.view.status_line =
+                format!("Cannot create QR code: invalid YouTube video ID ({error})");
+            return;
+        }
+        let url = youtube_video_url(&video_id);
+        match QrMatrix::encode(&url) {
+            Ok(matrix) => {
+                self.view.video_qr_popup = Some(VideoQrPopupView {
+                    video_id,
+                    video_title,
+                    url,
+                    matrix,
+                });
+            }
+            Err(error) => {
+                self.view.status_line = format!("Cannot create YouTube video QR code: {error}");
+            }
+        }
     }
 
     /// Opens cached comments or starts one worker-owned selected-video request.
@@ -24476,6 +24523,10 @@ impl UiController for AppController {
                 }
             }
             UiAction::DismissVideoComments => self.invalidate_youtube_video_comments_popup(),
+            #[cfg(feature = "qr")]
+            UiAction::OpenVideoQr => self.open_youtube_video_qr(),
+            #[cfg(feature = "qr")]
+            UiAction::DismissVideoQr => self.view.video_qr_popup = None,
             UiAction::ScrollErrorPopup(movement) => self.scroll_error_popup(movement),
             UiAction::CopyErrorReport => self.copy_error_report(),
             UiAction::FillGitHubIssue => self.fill_github_issue(),
@@ -37554,6 +37605,78 @@ mod tests {
             Some(&ProjectHistoryRemoteState::UpToDate)
         );
         assert!(requests.try_recv().is_err());
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_video_qr_uses_the_canonical_full_watch_url() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+
+        controller.dispatch(UiAction::OpenVideoQr);
+
+        let popup = controller
+            .view
+            .video_qr_popup
+            .as_ref()
+            .expect("selected-video QR popup");
+        assert_eq!(popup.video_id, "dQw4w9WgXcQ");
+        assert_eq!(popup.video_title, "Fixture video");
+        assert_eq!(popup.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert!(!popup.url.contains("youtu.be"));
+        assert!(!popup.url.contains("m.youtube.com"));
+        assert!(popup.matrix.width() > 0);
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_video_qr_refuses_invalid_and_non_youtube_selections() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, "not a video id")),
+            title: "Malformed fixture".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::OpenVideoQr);
+
+        assert!(controller.view.video_qr_popup.is_none());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("invalid YouTube video ID")
+        );
+
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::Local, "/tmp/fixture.mp3")),
+            title: "Local fixture".to_owned(),
+            ..DetailView::default()
+        });
+        controller.view.status_line.clear();
+
+        controller.dispatch(UiAction::OpenVideoQr);
+
+        assert!(controller.view.video_qr_popup.is_none());
+        assert_eq!(controller.view.status_line, "No YouTube video is selected");
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn dismissing_youtube_video_qr_preserves_the_selected_details() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+
+        controller.dispatch(UiAction::OpenVideoQr);
+        controller.dispatch(UiAction::DismissVideoQr);
+
+        assert!(controller.view.video_qr_popup.is_none());
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref()),
+            Some(&MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"))
+        );
     }
 
     #[test]

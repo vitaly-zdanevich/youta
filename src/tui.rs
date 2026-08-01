@@ -45,6 +45,8 @@ use crate::domain::{Chapter, MediaId, MediaKind, SourceKind, decode_url_path_seg
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
+#[cfg(feature = "qr")]
+use crate::qr_code::QrMatrix;
 use crate::report_actions::system_url_opener_name;
 use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
@@ -1220,6 +1222,20 @@ pub struct VideoCommentsPopupView {
     pub scroll_offset: usize,
 }
 
+/// Offline QR representation of one exact selected YouTube video.
+#[cfg(feature = "qr")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoQrPopupView {
+    /// Stable provider video identifier that owns this popup.
+    pub video_id: String,
+    /// Human-readable selected video title retained for controller ownership checks.
+    pub video_title: String,
+    /// Full canonical YouTube watch URL encoded into [`Self::matrix`].
+    pub url: String,
+    /// Provider-independent QR modules generated once when the popup opens.
+    pub matrix: QrMatrix,
+}
+
 /// One source-control commit rendered in the offline-first project-history popup.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectCommitView {
@@ -1504,6 +1520,9 @@ pub struct ViewModel {
     pub video_comments_available: bool,
     /// Scrollable bounded public-comments popup.
     pub video_comments_popup: Option<VideoCommentsPopupView>,
+    /// Offline QR code for the exact selected YouTube video.
+    #[cfg(feature = "qr")]
+    pub video_qr_popup: Option<VideoQrPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
     /// Editable OAuth-token setup for the optional Yandex Music source.
@@ -1588,6 +1607,8 @@ impl Default for ViewModel {
             error_popup: None,
             video_comments_available: false,
             video_comments_popup: None,
+            #[cfg(feature = "qr")]
+            video_qr_popup: None,
             youtube_setup_popup: None,
             yandex_music_setup_popup: None,
             rss_subscription_popup: None,
@@ -1877,6 +1898,12 @@ pub enum UiAction {
     SetVideoCommentsScroll(usize),
     /// Close the public-comments popup without changing Details.
     DismissVideoComments,
+    /// Generate and show a QR code for the selected YouTube video.
+    #[cfg(feature = "qr")]
+    OpenVideoQr,
+    /// Close the selected-video QR popup without changing Details.
+    #[cfg(feature = "qr")]
+    DismissVideoQr,
     /// Scroll the diagnostic report.
     ScrollErrorPopup(ErrorPopupScroll),
     /// Copy the complete diagnostic report.
@@ -2777,14 +2804,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                     Some(renderer.as_mut()),
                 );
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
-                virtual_cursor.render(frame);
+                render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         } else {
             session.terminal.draw(|frame| {
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
-                virtual_cursor.render(frame);
+                render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         }
@@ -3129,17 +3156,10 @@ impl VirtualCursor {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
-        self.bounds = frame.area();
+        self.synchronize_bounds(frame.area());
         if self.bounds.is_empty() {
-            self.active = false;
             return;
         }
-        self.column = self
-            .column
-            .clamp(self.bounds.x, self.bounds.right().saturating_sub(1));
-        self.row = self
-            .row
-            .clamp(self.bounds.y, self.bounds.bottom().saturating_sub(1));
         if !self.active {
             return;
         }
@@ -3153,6 +3173,37 @@ impl VirtualCursor {
                 .add_modifier(Modifier::REVERSED),
         );
     }
+
+    /// Updates the pointer bounds without necessarily drawing its overlay.
+    fn synchronize_bounds(&mut self, bounds: Rect) {
+        self.bounds = bounds;
+        if self.bounds.is_empty() {
+            self.active = false;
+            return;
+        }
+        self.column = self
+            .column
+            .clamp(self.bounds.x, self.bounds.right().saturating_sub(1));
+        self.row = self
+            .row
+            .clamp(self.bounds.y, self.bounds.bottom().saturating_sub(1));
+    }
+}
+
+/// Renders the virtual pointer unless it could corrupt a scanner-sensitive QR symbol.
+fn render_virtual_cursor_overlay(
+    frame: &mut Frame<'_>,
+    view: &ViewModel,
+    virtual_cursor: &mut VirtualCursor,
+) {
+    #[cfg(feature = "qr")]
+    if view.video_qr_popup.is_some() && view.error_popup.is_none() {
+        virtual_cursor.synchronize_bounds(frame.area());
+        return;
+    }
+    #[cfg(not(feature = "qr"))]
+    let _ = view;
+    virtual_cursor.render(frame);
 }
 
 /// Synchronizes cache-only artwork work with the visible screen.
@@ -3470,6 +3521,9 @@ struct HitMap {
     error_buttons: Vec<(UiAction, Rect)>,
     /// Buttons rendered inside the public-comments popup.
     video_comments_buttons: Vec<(UiAction, Rect)>,
+    /// Close control rendered inside the selected-video QR popup.
+    #[cfg(feature = "qr")]
+    video_qr_buttons: Vec<(UiAction, Rect)>,
     /// Wrapped text viewport inside the public-comments popup.
     video_comments_text_area: Rect,
     /// Actual first wrapped comment line rendered in the viewport.
@@ -3959,6 +4013,8 @@ fn render_frame(
         || view.local_file_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    #[cfg(feature = "qr")]
+    let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
         && expanded_thumbnail_available(view)
         && thumbnail_renderer
@@ -4099,6 +4155,13 @@ fn render_frame(
     hit_map.video_comments_page_lines = 0;
     if let Some(popup) = view.video_comments_popup.as_ref() {
         render_video_comments_popup(frame, popup, &theme, hit_map);
+    }
+    #[cfg(feature = "qr")]
+    {
+        hit_map.video_qr_buttons.clear();
+        if let Some(popup) = view.video_qr_popup.as_ref() {
+            render_video_qr_popup(frame, popup, &theme, hit_map);
+        }
     }
     if let Some(error) = view.error_popup.as_ref() {
         render_error_popup(
@@ -8054,6 +8117,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     if !cfg!(feature = "local-browser") {
         local_help.clear();
     }
+    #[cfg(feature = "qr")]
+    let private_note_help = "  n private note     e equalizer     t Details-only text selection\n  Q selected YouTube video QR code";
+    #[cfg(not(feature = "qr"))]
+    let private_note_help = "  n private note     e equalizer     t Details-only text selection";
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -8082,7 +8149,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  l toggle todo     P choose playlist",
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
-        "  n private note     e equalizer     t Details-only text selection",
+        private_note_help,
         "  Alt+j/k select external link     Alt+Enter open selected link",
         "",
         "Mouse",
@@ -8563,6 +8630,145 @@ fn render_video_comments_popup(
         UiAction::DismissVideoComments,
         Rect::new(x, sections[2].y, width, 1),
     ));
+}
+
+/// Number of light modules retained around every QR symbol for scanner reliability.
+#[cfg(feature = "qr")]
+const QR_QUIET_ZONE_MODULES: usize = 4;
+
+/// Renders the selected video's canonical URL as an offline, scanner-safe QR popup.
+#[cfg(feature = "qr")]
+fn render_video_qr_popup(
+    frame: &mut Frame<'_>,
+    popup: &VideoQrPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let symbol_modules = popup
+        .matrix
+        .width()
+        .saturating_add(QR_QUIET_ZONE_MODULES.saturating_mul(2));
+    let symbol_rows = symbol_modules.saturating_add(1) / 2;
+    let required_width = u16::try_from(symbol_modules)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let required_height = u16::try_from(symbol_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+
+    if frame.area().width < required_width || frame.area().height < required_height {
+        render_video_qr_size_fallback(frame, required_width, required_height, theme, hit_map);
+        return;
+    }
+
+    let area = centered_sized_rect(required_width, required_height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" YouTube video QR ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(u16::try_from(symbol_rows).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let qr_style = Style::default().fg(Color::Black).bg(Color::White);
+    let lines = (0..symbol_rows)
+        .map(|terminal_row| {
+            let top = terminal_row.saturating_mul(2);
+            let bottom = top.saturating_add(1);
+            let symbols = (0..symbol_modules)
+                .map(|x| {
+                    match (
+                        qr_module_is_dark(&popup.matrix, x, top),
+                        qr_module_is_dark(&popup.matrix, x, bottom),
+                    ) {
+                        (true, true) => '█',
+                        (true, false) => '▀',
+                        (false, true) => '▄',
+                        (false, false) => ' ',
+                    }
+                })
+                .collect::<String>();
+            Line::styled(symbols, qr_style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).style(qr_style), sections[0]);
+    render_video_qr_close_control(frame, sections[1], theme, hit_map);
+}
+
+/// Returns whether one quiet-zone-inclusive coordinate contains a dark module.
+#[cfg(feature = "qr")]
+fn qr_module_is_dark(matrix: &QrMatrix, x: usize, y: usize) -> bool {
+    let width = matrix.width();
+    let within_x = x.checked_sub(QR_QUIET_ZONE_MODULES).filter(|x| *x < width);
+    let within_y = y.checked_sub(QR_QUIET_ZONE_MODULES).filter(|y| *y < width);
+    within_x
+        .zip(within_y)
+        .is_some_and(|(x, y)| matrix.is_dark(x, y))
+}
+
+/// Renders an explicit resize request rather than clipping an unscannable QR symbol.
+#[cfg(feature = "qr")]
+fn render_video_qr_size_fallback(
+    frame: &mut Frame<'_>,
+    required_width: u16,
+    required_height: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.min(64);
+    let height = frame.area().height.min(8);
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" YouTube video QR ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Terminal is too small for this QR code. Resize to at least {required_width}×{required_height} cells."
+        ))
+        .alignment(Alignment::Center)
+        .style(theme.base)
+        .wrap(Wrap { trim: true }),
+        sections[0],
+    );
+    render_video_qr_close_control(frame, sections[1], theme, hit_map);
+}
+
+/// Renders and records the popup's sole mouse action.
+#[cfg(feature = "qr")]
+fn render_video_qr_close_control(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let label = "[Esc] Close";
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let width = terminal_text_width(label).min(area.width);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    hit_map
+        .video_qr_buttons
+        .push((UiAction::DismissVideoQr, Rect::new(x, area.y, width, 1)));
 }
 
 fn render_youtube_setup_popup(
@@ -10786,6 +10992,15 @@ fn key_action_with_page_rows_unfiltered(
             _ => None,
         };
     }
+    #[cfg(feature = "qr")]
+    {
+        if view.video_qr_popup.is_some() {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('Q') => Some(UiAction::DismissVideoQr),
+                _ => None,
+            };
+        }
+    }
     if let Some(popup) = view.project_history_popup.as_ref() {
         return project_history_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
@@ -11114,6 +11329,20 @@ fn key_action_with_page_rows_unfiltered(
     let wikidata_link_index = keyboard_wikidata_link_index(view);
     match key.code {
         KeyCode::Char('q') => Some(UiAction::Quit),
+        #[cfg(feature = "qr")]
+        KeyCode::Char('Q')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && view.details.as_ref().is_some_and(|details| {
+                    details
+                        .media_id
+                        .as_ref()
+                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
+                }) =>
+        {
+            Some(UiAction::OpenVideoQr)
+        }
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
         KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
         KeyCode::Char('/') => Some(UiAction::BeginSearch),
@@ -11531,6 +11760,19 @@ fn mouse_action_unfiltered(
             }
             _ => None,
         };
+    }
+    #[cfg(feature = "qr")]
+    {
+        if view.video_qr_popup.is_some() {
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => hit_map
+                    .video_qr_buttons
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                    .map(|(action, _)| action.clone()),
+                _ => None,
+            };
+        }
     }
     if view.video_comments_popup.is_some() {
         return match mouse.kind {
@@ -14322,6 +14564,10 @@ mod tests {
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
         assert!(rendered.contains("F9 recent commits and installation details"));
+        #[cfg(feature = "qr")]
+        assert!(rendered.contains("Q selected YouTube video QR code"));
+        #[cfg(not(feature = "qr"))]
+        assert!(!rendered.contains("Q selected YouTube video QR code"));
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         for border in ['┌', '┐', '└', '┘'] {
             assert!(
@@ -25596,6 +25842,276 @@ prose 07:25 remains clickable but is not a chapter";
 
         assert!(rendered.contains("Length: 4:05  Views: 887,263  Likes: 13,045  Comments: 20"));
         assert!(!rendered.contains("Load channel info"));
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_qr_shortcut_is_help_only_and_scoped_to_selected_video() {
+        let youtube = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                title: "Fixture video".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+                &youtube,
+            ),
+            Some(UiAction::OpenVideoQr),
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &youtube
+            ),
+            Some(UiAction::Quit),
+            "the new shortcut must not replace lowercase q quit"
+        );
+        for unsupported in [
+            ViewModel::default(),
+            ViewModel {
+                details: Some(DetailView {
+                    title: "YouTube channel without a selected video".to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            },
+            ViewModel {
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::Local, "/music/local.flac")),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            },
+        ] {
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+                    &unsupported,
+                ),
+                None,
+                "the QR shortcut must require an exact selected YouTube video"
+            );
+        }
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(160, 18)).expect("YouTube QR fixture terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &youtube, &UiSettings::default(), &mut hit_map))
+            .expect("draw YouTube details without a visible QR control");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("Show QR"));
+        assert!(!rendered.contains("[Q]"));
+        assert!(!rendered.contains("QR code"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenVideoQr)
+        );
+        assert!(
+            hit_map
+                .buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenVideoQr)
+        );
+        assert_minimal_footer_actions(&hit_map);
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_qr_popup_renders_conventional_modules_and_captures_input() {
+        let matrix = QrMatrix::encode("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .expect("canonical YouTube URL QR");
+        let symbol_modules = matrix.width() + QR_QUIET_ZONE_MODULES * 2;
+        let popup = VideoQrPopupView {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            video_title: "Fixture video".to_owned(),
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            matrix,
+        };
+        let view = ViewModel {
+            video_qr_popup: Some(popup),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("QR terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw QR popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("YouTube video QR"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'));
+
+        let required_width = u16::try_from(symbol_modules).expect("fixture QR width") + 2;
+        let required_height =
+            u16::try_from(symbol_modules.div_ceil(2)).expect("fixture QR height") + 3;
+        let popup_area =
+            centered_sized_rect(required_width, required_height, Rect::new(0, 0, 80, 24));
+        let quiet_zone_cell = &terminal.backend().buffer()[(popup_area.x + 1, popup_area.y + 1)];
+        assert_eq!(quiet_zone_cell.symbol(), " ");
+        assert_eq!(quiet_zone_cell.bg, Color::White);
+        let finder_cell = &terminal.backend().buffer()[(
+            popup_area.x + 1 + u16::try_from(QR_QUIET_ZONE_MODULES).expect("quiet zone"),
+            popup_area.y + 1 + u16::try_from(QR_QUIET_ZONE_MODULES / 2).expect("finder row"),
+        )];
+        assert_eq!(finder_cell.fg, Color::Black);
+        assert_eq!(finder_cell.bg, Color::White);
+        assert_ne!(finder_cell.symbol(), " ");
+
+        for key in [KeyCode::Esc, KeyCode::Char('Q')] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                Some(UiAction::DismissVideoQr)
+            );
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &view),
+            None,
+            "lowercase quit must not leak through the modal"
+        );
+        let close_area = hit_map
+            .video_qr_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::DismissVideoQr).then_some(*area))
+            .expect("QR close button");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: close_area.x,
+                    row: close_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::DismissVideoQr)
+        );
+        let (_, underlying_tab) = hit_map.tabs.first().expect("underlying tab");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: underlying_tab.x,
+                    row: underlying_tab.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            None,
+            "the QR modal must capture clicks over underlying controls"
+        );
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_qr_popup_suppresses_the_virtual_pointer_overlay() {
+        let view = ViewModel {
+            video_qr_popup: Some(VideoQrPopupView {
+                video_id: "dQw4w9WgXcQ".to_owned(),
+                video_title: "Fixture video".to_owned(),
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                matrix: QrMatrix::encode("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                    .expect("canonical YouTube URL QR"),
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("QR terminal");
+        let mut hit_map = HitMap::default();
+        let mut virtual_cursor = VirtualCursor {
+            active: true,
+            column: 40,
+            row: 12,
+            bounds: Rect::new(0, 0, 80, 24),
+            ..VirtualCursor::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None);
+                render_virtual_cursor_overlay(frame, &view, &mut virtual_cursor);
+            })
+            .expect("draw QR popup with an active virtual pointer");
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.symbol() != "■"),
+            "the virtual pointer must not overwrite a QR module"
+        );
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_qr_popup_requests_resize_instead_of_clipping_the_symbol() {
+        let view = ViewModel {
+            video_qr_popup: Some(VideoQrPopupView {
+                video_id: "dQw4w9WgXcQ".to_owned(),
+                video_title: "Fixture video".to_owned(),
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                matrix: QrMatrix::encode("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                    .expect("canonical YouTube URL QR"),
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("small terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw QR resize fallback");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Terminal is too small"));
+        assert!(rendered.contains("Resize to at least"));
+        assert!(
+            hit_map
+                .video_qr_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::DismissVideoQr)
+        );
+    }
+
+    #[cfg(not(feature = "qr"))]
+    #[test]
+    fn no_qr_build_omits_the_youtube_shortcut_and_help_entry() {
+        let youtube = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                title: "Fixture video".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+                &youtube,
+            ),
+            None,
+            "a build without QR support must leave uppercase Q unbound"
+        );
+
+        let help = ViewModel {
+            help_open: true,
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("help terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &help, &UiSettings::default(), &mut hit_map))
+            .expect("draw help without QR support");
+        assert!(!rendered_text(&terminal).contains("YouTube video QR code"));
     }
 
     #[test]

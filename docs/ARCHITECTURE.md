@@ -931,20 +931,26 @@ branch and failure-path assertions matter more than a single percentage.
 
 Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
-include both official YouTube metadata and Invidious adapters; runtime
-`providers.youtube_backend` chooses one. Distribution/minimal builds can use
+include both official YouTube metadata and Invidious adapters, terminal images,
+and offline QR rendering; runtime `providers.youtube_backend` chooses the
+YouTube adapter. `images` and `qr` are independent default-on capabilities.
+The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
+builds omit that dependency and shortcut. Distribution/minimal builds can use
 `--no-default-features`. Human-readable file persistence is part of the core;
 `sqlite-state` adds optional system-SQLite persistence, while `bundled-sqlite`
 adds the same backend with vendored SQLite.
 
 Tagged releases are produced natively for Linux and macOS on amd64 and arm64.
-Every pair has a default artifact built with `images` and a `-text` artifact
-built with the `app` profile; neither opts into SQLite. Windows amd64/arm64 and the
-portable FreeBSD x86_64 boundary are compile-checked, but are not release
-targets until their runtime playback paths can be validated. The release also
-contains a `cargo vendor` archive and matching Cargo source configuration so
-Gentoo and other external/offline builders use the exact locked dependency
-graph. The Gentoo ebuild is maintained as
+Every pair has four artifacts covering the independent `images` and `qr`
+capabilities: the unsuffixed archive enables both, `-text` omits images,
+`-no-qr` omits QR support, and `-text-no-qr` omits both. None opts into SQLite.
+Windows amd64/arm64 and the portable FreeBSD x86_64 boundary are compile-checked,
+but are not release targets until their runtime playback paths can be
+validated. The release also contains a `cargo vendor` archive and matching
+Cargo source configuration so Gentoo and other external/offline builders use
+the exact locked dependency graph. The Gentoo ebuild exposes positive
+default-on `images` and `qr` USE flags, which can be disabled independently.
+It is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as
 `mpv`, `yt-dlp`, and FFmpeg rather than bundling them.

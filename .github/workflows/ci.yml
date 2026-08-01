@@ -76,16 +76,22 @@ jobs:
             feature_arguments: ''
           - feature_set: no default features
             feature_arguments: --no-default-features
-          - feature_set: text-only application
+          - feature_set: text-only application with QR
+            feature_arguments: --no-default-features --features app,qr
+          - feature_set: graphical application without QR
+            feature_arguments: --no-default-features --features app,images
+          - feature_set: application without images or QR
             feature_arguments: --no-default-features --features app
-          - feature_set: Yandex-free text-only application
+          - feature_set: Yandex-free application without images or QR
             feature_arguments: --no-default-features --features app-core
           - feature_set: Yandex-free graphical application
-            feature_arguments: --no-default-features --features app-core,images
+            feature_arguments: --no-default-features --features app-core,images,qr
           - feature_set: optional SQLite state
             feature_arguments: --no-default-features --features sqlite-state
           - feature_set: TUI only
             feature_arguments: --no-default-features --features tui
+          - feature_set: standalone QR TUI
+            feature_arguments: --no-default-features --features qr
           - feature_set: TUI with Local
             feature_arguments: --no-default-features --features tui,local
           - feature_set: TUI with AcoustID
@@ -154,6 +160,7 @@ jobs:
           cargo check --locked --no-default-features --features cli --bin youta
           cargo check --locked --no-default-features --features subscriptions --lib
           cargo check --locked --no-default-features --features tui
+          cargo check --locked --no-default-features --features qr
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib
           cargo check --locked --no-default-features --features acoustid --lib
@@ -167,8 +174,11 @@ jobs:
           cargo check --locked --no-default-features --features tui,local
           cargo check --locked --no-default-features --features app-core
           cargo check --locked --no-default-features --features app-core,images
+          cargo check --locked --no-default-features --features app-core,images,qr
           cargo check --locked --no-default-features --features tui,yandex-music
           cargo check --locked --no-default-features --features app
+          cargo check --locked --no-default-features --features app,images
+          cargo check --locked --no-default-features --features app,qr
 
   windows-compile:
     name: Windows compile (${{ matrix.architecture }})
@@ -210,7 +220,12 @@ jobs:
       - name: Check the standard application
         run: cargo check --locked --target "${{ matrix.target }}"
 
-      - name: Check the text-only application
+      - name: Check the text-only application with QR
+        run: >-
+          cargo check --locked --target "${{ matrix.target }}"
+          --no-default-features --features app,qr
+
+      - name: Check the application without QR
         run: >-
           cargo check --locked --target "${{ matrix.target }}"
           --no-default-features --features app

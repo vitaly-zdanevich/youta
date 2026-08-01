@@ -54,13 +54,17 @@ fn feature_closure(manifest: &toml::Value, root: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn default_release_features_keep_images_and_sqlite_independent() {
+fn default_release_features_keep_images_qr_and_sqlite_independent() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
     let text_only = feature_closure(&manifest, "app");
+    let tui = feature_closure(&manifest, "tui");
+    let qr = feature_closure(&manifest, "qr");
     let yandex_free = feature_closure(&manifest, "app-core");
 
     assert!(default.contains("images"));
+    assert!(default.contains("qr"));
+    assert!(default.contains("dep:qrcode"));
     assert!(default.contains("app"));
     assert!(default.contains("yandex-music"));
     assert!(!default.contains("sqlite-state"));
@@ -68,6 +72,22 @@ fn default_release_features_keep_images_and_sqlite_independent() {
     assert!(!default.contains("dep:rusqlite"));
     assert!(text_only.contains("app-core"));
     assert!(text_only.contains("yandex-music"));
+    assert!(!text_only.contains("qr"));
+    assert!(!text_only.contains("dep:qrcode"));
+    assert!(!tui.contains("dep:qrcode"));
+    assert_eq!(feature_entries(&manifest, "qr"), ["tui", "dep:qrcode"]);
+    assert!(qr.contains("tui"));
+    assert!(qr.contains("dep:qrcode"));
+    assert_eq!(
+        manifest["dependencies"]["qrcode"]["optional"].as_bool(),
+        Some(true),
+        "QR encoding must remain removable from custom builds"
+    );
+    assert_eq!(
+        manifest["dependencies"]["qrcode"]["default-features"].as_bool(),
+        Some(false),
+        "QR encoding must not pull the crate's image renderer into text builds"
+    );
     assert!(!yandex_free.contains("yandex-music"));
     for yandex_only_dependency in ["dep:aes", "dep:ctr", "dep:hmac"] {
         assert!(
@@ -129,7 +149,8 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app-core,images"));
+    assert!(readme.contains("--features app,qr"));
+    assert!(readme.contains("--features app-core,images,qr"));
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -161,14 +182,21 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
 }
 
 #[test]
-fn release_script_builds_both_portable_non_sqlite_variants() {
+fn release_script_builds_four_portable_non_sqlite_variants() {
     let script = read_repository_file("scripts/package-release.sh");
 
     assert!(!script.contains("--features bundled-sqlite"));
-    assert!(script.contains("--features app"));
+    assert!(script.contains("--features app,qr"));
+    assert!(script.contains("--features app,images"));
+    assert!(script.contains("\t\t\t--features app\n"));
     assert!(script.contains("archive_suffix=-text"));
+    assert!(script.contains("archive_suffix=-no-qr"));
+    assert!(script.contains("archive_suffix=-text-no-qr"));
     assert!(script.contains("images)"));
     assert!(script.contains("text)"));
+    assert!(script.contains("images-no-qr)"));
+    assert!(script.contains("text-no-qr)"));
+    assert!(script.contains("Supported variants: images, text, images-no-qr, text-no-qr"));
     assert!(script.contains("YOUTA_BUILD_ORIGIN=github-release"));
     assert!(!script.contains("install -D"));
     assert!(script.contains("x86_64-unknown-linux-gnu"));
@@ -192,6 +220,8 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     }
     assert!(release.contains("dist images"));
     assert!(release.contains("dist text"));
+    assert!(release.contains("dist images-no-qr"));
+    assert!(release.contains("dist text-no-qr"));
     assert!(release.contains("fetch-depth: 10"));
     assert!(release.contains("brew install gnu-tar"));
 
@@ -207,6 +237,18 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         assert!(
             workflow.contains("--features app-core,images"),
             "workflow omits the documented Yandex-free graphical application lane"
+        );
+        assert!(
+            workflow.contains("--features app,images"),
+            "workflow omits the image-enabled, QR-disabled release boundary"
+        );
+        assert!(
+            workflow.contains("--features app,qr"),
+            "workflow omits the text-only, QR-enabled release boundary"
+        );
+        assert!(
+            workflow.contains("--features qr"),
+            "workflow omits the standalone QR feature boundary"
         );
         assert!(
             workflow.contains("--features tui,yandex-music\n"),

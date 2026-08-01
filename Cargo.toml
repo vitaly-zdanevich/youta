@@ -30,6 +30,7 @@ required-features = ["cli"]
 default = [
     "app",
     "images",
+    "qr",
 ]
 
 # Complete application profile shared by default and text-only builds.
@@ -37,7 +38,7 @@ default = [
 # Yandex Music is included here so normal builds expose the complete top-level
 # source set. `app-core` remains the equivalent profile for distributors and
 # users who intentionally omit the private, experimental Yandex Music API.
-# Image rendering and SQLite remain independent opt-in features.
+# Image rendering, QR encoding, and SQLite remain independent features.
 app = [
     "app-core",
     "yandex-music",
@@ -96,6 +97,8 @@ tui = [
     "dep:toml_edit",
     "dep:unicode-segmentation",
 ]
+# Offline QR codes for exact selected YouTube videos.
+qr = ["tui", "dep:qrcode"]
 # Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
 # This links no system GPM library; F8 retries a missing daemon and retains its
 # keyboard pointer when physical input is unavailable.
@@ -233,6 +236,7 @@ figment = { version = "0.10.19", features = ["env", "toml"] }
 hmac = { version = "0.12.1", optional = true }
 opml = { version = "1.1.6", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
+qrcode = { version = "0.14.1", default-features = false, optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }

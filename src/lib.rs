@@ -13,6 +13,8 @@ pub mod local_browser;
 pub mod persistence;
 pub mod playback;
 pub mod providers;
+#[cfg(feature = "qr")]
+pub mod qr_code;
 pub mod report_actions;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;

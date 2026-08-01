@@ -2,7 +2,7 @@
 #
 # Build a versioned Linux or macOS binary archive for one explicit Rust target.
 # Usage:
-#   scripts/package-release.sh [target-triple] [output-directory] [images|text]
+#   scripts/package-release.sh [target-triple] [output-directory] [images|text|images-no-qr|text-no-qr]
 
 set -Eeuo pipefail
 
@@ -59,9 +59,15 @@ case "${variant}" in
 	text)
 		archive_suffix=-text
 		;;
+	images-no-qr)
+		archive_suffix=-no-qr
+		;;
+	text-no-qr)
+		archive_suffix=-text-no-qr
+		;;
 	*)
 		echo "Unsupported release variant: ${variant}" >&2
-		echo 'Supported variants: images, text' >&2
+		echo 'Supported variants: images, text, images-no-qr, text-no-qr' >&2
 		exit 1
 		;;
 esac
@@ -79,19 +85,38 @@ package_name="youta-${version}-${operating_system}-${architecture}${archive_suff
 package_root="${staging_directory}/${package_name}"
 export YOUTA_BUILD_ORIGIN=github-release
 
-if [[ ${variant} == text ]]; then
-	cargo build \
-		--locked \
-		--release \
-		--target "${target}" \
-		--no-default-features \
-		--features app
-else
-	cargo build \
-		--locked \
-		--release \
-		--target "${target}"
-fi
+case "${variant}" in
+	images)
+		cargo build \
+			--locked \
+			--release \
+			--target "${target}"
+		;;
+	text)
+		cargo build \
+			--locked \
+			--release \
+			--target "${target}" \
+			--no-default-features \
+			--features app,qr
+		;;
+	images-no-qr)
+		cargo build \
+			--locked \
+			--release \
+			--target "${target}" \
+			--no-default-features \
+			--features app,images
+		;;
+	text-no-qr)
+		cargo build \
+			--locked \
+			--release \
+			--target "${target}" \
+			--no-default-features \
+			--features app
+		;;
+esac
 
 mkdir -p "${package_root}/bin" "${package_root}/docs"
 install -m 755 \

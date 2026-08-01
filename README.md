@@ -402,8 +402,8 @@ The default build expects `mpv` and `yt-dlp` at runtime for online playback.
 It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
 audio identification. These remain separate executables so they can be updated
 without rebuilding Youta. Human-readable persistence is part of the core
-build. The default feature set enables `images`. Runtime capability checks
-decide whether the TUI may fetch and render artwork.
+build. The default feature set enables `images` and offline `qr` rendering.
+Runtime capability checks decide whether the TUI may fetch and render artwork.
 
 Install `fpcalc` from your operating system's
 [Chromaprint](https://github.com/acoustid/chromaprint) tools package:
@@ -418,7 +418,7 @@ terminal-image dependencies with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app
+	--features app,qr
 ```
 
 The default `app` profile includes the experimental YandexMusic adapter. Build
@@ -427,10 +427,11 @@ support, with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,images
+	--features app-core,images,qr
 ```
 
-Omit `images` from that command for the Yandex-free text-only variant. Cargo
+Omit `images` from that command for the Yandex-free text-only variant. Omit
+`qr` to remove QR encoding and its shortcut from any custom build. Cargo
 features are additive, so `app-core` is the explicit complete profile without
 `yandex-music`; there is no misleading negative feature.
 
@@ -948,7 +949,7 @@ known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
 dependencies while retaining the other defaults, build with
-`--no-default-features --features app`. For a smaller custom build, omit
+`--no-default-features --features app,qr`. For a smaller custom build, omit
 `images`; include it explicitly to restore rendering. The rendering integration
 uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
@@ -1303,11 +1304,12 @@ is checked through yt-dlp's public songs search with a 15-second process bound
 and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
 failure fails CI. Tagged releases build natively for Linux and macOS on amd64
-and arm64. Each operating-system/architecture pair publishes a normal archive
-and a `-text` archive, plus the release publishes one Cargo vendor archive for
-offline/external build systems. The normal archive enables `images`; the text
-archive omits it. Neither binary archive enables SQLite; human-readable TOML
-remains the standard release persistence backend.
+and arm64. Each operating-system/architecture pair publishes archives for all
+four combinations of the default-on `images` and `qr` capabilities. The
+`-text` suffix omits images, while the `-no-qr` suffix omits QR support. The
+release also publishes one Cargo vendor archive for offline/external build
+systems. No binary archive enables SQLite; human-readable TOML remains the
+standard release persistence backend.
 
 Windows amd64 and arm64 are compile-checked in CI, but Youta does not publish
 Windows binaries yet: the current `mpv` adapter uses Unix-domain-socket IPC and
@@ -1372,8 +1374,9 @@ The Gentoo ebuild is maintained as
 in the
 [`vitaly-zdanevich-overlay`](https://github.com/vitaly-zdanevich/gentoo-overlay).
 It maps provider choices to USE flags and consumes the release vendor archive.
-Its positive `images` USE flag is enabled by default; Gentoo users who want a
-text-only build use the conventional `USE="-images"` override.
+Its positive `images` and `qr` USE flags are enabled by default. Gentoo users
+can independently disable them with conventional `USE="-images"` and
+`USE="-qr"` overrides.
 GitHub Actions use Node 24-based action majors and set the maximum requested job
 timeout to 360 minutes.
 
@@ -1382,6 +1385,8 @@ To produce the same artifacts locally:
 ```sh
 scripts/package-release.sh x86_64-unknown-linux-gnu dist images
 scripts/package-release.sh x86_64-unknown-linux-gnu dist text
+scripts/package-release.sh x86_64-unknown-linux-gnu dist images-no-qr
+scripts/package-release.sh x86_64-unknown-linux-gnu dist text-no-qr
 scripts/package-vendor.sh
 ```
 
