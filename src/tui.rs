@@ -25705,6 +25705,114 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn project_history_popup_preserves_full_messages_provenance_and_scroll_controls() {
+        let current_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let commits = (0..10)
+            .map(|index| ProjectCommitView {
+                hash: if index == 0 {
+                    current_hash.clone()
+                } else {
+                    format!("{index:040x}")
+                },
+                committed_at: format!("2026-07-{:02}T12:34:56+04:00", 31 - index),
+                message: format!(
+                    "Commit title {index}\n\nComplete explanatory body {index}.\n\nCo-authored-by: OpenAI ChatGPT <noreply@openai.com>"
+                ),
+            })
+            .collect();
+        let view = ViewModel {
+            project_history_popup: Some(ProjectHistoryPopupView {
+                commits,
+                current_hash: Some(current_hash),
+                installation: "Portage binary package (media-sound/youta-bin)".to_owned(),
+                executable_path: "/usr/bin/youta".to_owned(),
+                started_in: "/home/alice/Music".to_owned(),
+                build_source: None,
+                remote_state: ProjectHistoryRemoteState::Updated,
+                scroll_offset: 0,
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(92, 30)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw project history popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Recent Youta commits"));
+        assert!(rendered.contains("Portage binary package"));
+        assert!(rendered.contains("Executable: /usr/bin/youta"));
+        assert!(rendered.contains("Started in: /home/alice/Music"));
+        assert!(rendered.contains("aaaaaaaaaaaa · 2026-07-31 · current version"));
+        assert!(rendered.contains("Complete explanatory body 0."));
+        assert!(rendered.contains("Co-authored-by: OpenAI ChatGPT"));
+        assert!(rendered.contains("newer commits are cached in RAM"));
+        assert!(hit_map.project_history_scroll_maximum > 0);
+        assert_eq!(
+            project_history_key_action(
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                0,
+                hit_map.project_history_scroll_maximum,
+                hit_map.project_history_page_lines,
+            ),
+            Some(UiAction::SetProjectHistoryScroll(
+                hit_map.project_history_scroll_maximum
+            ))
+        );
+        assert_eq!(
+            project_history_key_action(
+                KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+                0,
+                hit_map.project_history_scroll_maximum,
+                hit_map.project_history_page_lines,
+            ),
+            Some(UiAction::DismissProjectHistory)
+        );
+        let close_area = hit_map
+            .project_history_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::DismissProjectHistory).then_some(*area)
+            })
+            .expect("project history close button");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: close_area.x,
+                    row: close_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::DismissProjectHistory)
+        );
+    }
+
+    #[test]
+    fn project_history_hotkey_is_global_but_documented_only_in_help() {
+        let view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenProjectHistory)
+        );
+        let mut help = view.clone();
+        help.help_open = true;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &help),
+            Some(UiAction::OpenProjectHistory)
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(240, 1)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw footer");
+        assert!(!rendered_text(&terminal).contains("F9"));
+    }
+
+    #[test]
     fn local_details_offer_move_for_files_and_folders_but_not_parent_navigation() {
         for (title, requested_rename, requested_move, requested_trash) in [
             ("Album", false, true, true),
