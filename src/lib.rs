@@ -18,6 +18,8 @@ pub mod report_actions;
 pub mod subscriptions;
 #[cfg(feature = "tui")]
 pub(crate) mod terminal_environment;
+#[cfg(feature = "local-browser")]
+pub mod text_file_open;
 pub mod waveform;
 
 #[cfg(feature = "waveform")]

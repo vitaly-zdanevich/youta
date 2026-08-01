@@ -14,7 +14,7 @@ use std::time::SystemTime;
 /// Default maximum number of directory entries inspected by one listing.
 pub const DEFAULT_MAX_INSPECTED_ENTRIES: usize = 100_000;
 
-/// Default maximum number of supported entries returned by one listing.
+/// Default maximum number of visible entries returned by one listing.
 pub const DEFAULT_MAX_VISIBLE_ENTRIES: usize = 10_000;
 
 /// Default maximum number of entries inspected while measuring one folder.
@@ -28,7 +28,7 @@ pub const DEFAULT_FOLDER_SIZE_MAX_DEPTH: usize = 64;
 pub struct LocalBrowseLimits {
     /// Maximum number of raw filesystem entries to inspect.
     pub max_inspected_entries: usize,
-    /// Maximum number of supported entries to return.
+    /// Maximum number of entries visible under the selected options to return.
     pub max_visible_entries: usize,
 }
 
@@ -39,6 +39,19 @@ impl Default for LocalBrowseLimits {
             max_visible_entries: DEFAULT_MAX_VISIBLE_ENTRIES,
         }
     }
+}
+
+/// Optional behavior for one local-directory listing.
+///
+/// Dot-prefixed directories and supported media files have always been
+/// eligible for Local listings, so this option deliberately does not alter
+/// their visibility. Enabling [`Self::show_all_files`] additionally returns
+/// unsupported regular files, classified as [`LocalEntryKind::Text`] or
+/// [`LocalEntryKind::Other`]. Symbolic links and special files remain hidden.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalBrowseOptions {
+    /// Whether otherwise unsupported regular files should be returned.
+    pub show_all_files: bool,
 }
 
 /// Resource limits applied to one recursive folder-size measurement.
@@ -105,6 +118,10 @@ pub enum LocalEntryKind {
     TrackerModule,
     /// A supported image file.
     Image,
+    /// A conservatively recognized text file.
+    Text,
+    /// Another regular file included by the show-all-files option.
+    Other,
 }
 
 impl LocalEntryKind {
@@ -124,7 +141,7 @@ pub struct LocalImageDimensions {
     pub height: u32,
 }
 
-/// One supported entry in a local directory.
+/// One visible entry in a local directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEntry {
     /// Exact filesystem basename, including non-UTF-8 names on Unix.
@@ -162,7 +179,7 @@ pub struct LocalDirectoryListing {
     pub path: PathBuf,
     /// Canonical parent directory, or `None` at a filesystem root.
     pub parent: Option<PathBuf>,
-    /// Supported child entries, with directories before files.
+    /// Visible child entries, with directories before files.
     pub entries: Vec<LocalEntry>,
     /// Whether an inspection or visible-entry limit stopped the listing.
     pub truncated: bool,
@@ -353,6 +370,118 @@ pub fn classify_local_file(path: &Path) -> Option<LocalEntryKind> {
     }
 }
 
+/// Returns whether a basename conservatively identifies a text file.
+///
+/// Detection is intentionally based only on well-known extensions and a small
+/// set of conventional extensionless documentation names. Directory listing
+/// must stay non-blocking, so this function never opens a file to sniff its
+/// contents or encoding. Callers should therefore treat a `true` result as an
+/// editor hint rather than a guarantee that every byte is valid Unicode text.
+#[must_use]
+pub fn is_local_text_file(path: &Path) -> bool {
+    if path.extension().is_some_and(|extension| {
+        extension.to_str().is_some_and(|extension| {
+            matches_ascii_case_insensitive(
+                extension,
+                &[
+                    "txt",
+                    "text",
+                    "md",
+                    "markdown",
+                    "rst",
+                    "org",
+                    "adoc",
+                    "asciidoc",
+                    "nfo",
+                    "log",
+                    "csv",
+                    "tsv",
+                    "json",
+                    "json5",
+                    "yaml",
+                    "yml",
+                    "toml",
+                    "xml",
+                    "ini",
+                    "cfg",
+                    "conf",
+                    "properties",
+                    "cue",
+                    "m3u",
+                    "m3u8",
+                    "rs",
+                    "c",
+                    "h",
+                    "cc",
+                    "cpp",
+                    "cxx",
+                    "hpp",
+                    "py",
+                    "rb",
+                    "go",
+                    "java",
+                    "kt",
+                    "kts",
+                    "js",
+                    "jsx",
+                    "ts",
+                    "tsx",
+                    "sh",
+                    "bash",
+                    "zsh",
+                    "fish",
+                    "html",
+                    "htm",
+                    "css",
+                    "scss",
+                    "sass",
+                    "less",
+                    "sql",
+                    "php",
+                    "lua",
+                    "vim",
+                    "el",
+                    "tex",
+                    "bib",
+                ],
+            )
+        })
+    }) {
+        return true;
+    }
+
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            [
+                "readme",
+                "license",
+                "copying",
+                "notice",
+                "authors",
+                "contributors",
+                "changelog",
+                "changes",
+                "install",
+                "todo",
+                "makefile",
+                "dockerfile",
+                ".gitignore",
+                ".gitattributes",
+                ".gitmodules",
+                ".editorconfig",
+                ".env",
+                ".npmrc",
+                ".bashrc",
+                ".zshrc",
+                ".profile",
+                ".vimrc",
+            ]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        })
+}
+
 /// Lists supported entries in one directory without recursing or following
 /// symbolic links.
 ///
@@ -369,7 +498,24 @@ pub fn list_local_directory(
     path: &Path,
     limits: LocalBrowseLimits,
 ) -> Result<LocalDirectoryListing, LocalBrowserError> {
-    list_local_directory_with_preferred_child(path, limits, None)
+    list_local_directory_with_options(path, limits, LocalBrowseOptions::default())
+}
+
+/// Lists local entries using explicit visibility options.
+///
+/// This is the opt-in counterpart to [`list_local_directory`]. Its default
+/// options produce the same media-and-directory-only listing as that function.
+///
+/// # Errors
+///
+/// Returns [`LocalBrowserError`] under the same conditions as
+/// [`list_local_directory`].
+pub fn list_local_directory_with_options(
+    path: &Path,
+    limits: LocalBrowseLimits,
+    options: LocalBrowseOptions,
+) -> Result<LocalDirectoryListing, LocalBrowserError> {
+    list_local_directory_with_preferred_child_and_options(path, limits, None, options)
 }
 
 /// Lists supported entries while reserving space for one direct child.
@@ -396,6 +542,31 @@ pub fn list_local_directory_with_preferred_child(
     limits: LocalBrowseLimits,
     preferred_child: Option<&Path>,
 ) -> Result<LocalDirectoryListing, LocalBrowserError> {
+    list_local_directory_with_preferred_child_and_options(
+        path,
+        limits,
+        preferred_child,
+        LocalBrowseOptions::default(),
+    )
+}
+
+/// Lists local entries with a preferred-child hint and visibility options.
+///
+/// When `options.show_all_files` is enabled, an otherwise unsupported regular
+/// file is also eligible for the preferred-child reservation. All safety and
+/// resource-limit behavior matches
+/// [`list_local_directory_with_preferred_child`].
+///
+/// # Errors
+///
+/// Returns [`LocalBrowserError`] under the same conditions as
+/// [`list_local_directory_with_preferred_child`].
+pub fn list_local_directory_with_preferred_child_and_options(
+    path: &Path,
+    limits: LocalBrowseLimits,
+    preferred_child: Option<&Path>,
+    options: LocalBrowseOptions,
+) -> Result<LocalDirectoryListing, LocalBrowserError> {
     if limits.max_inspected_entries == 0 || limits.max_visible_entries == 0 {
         return Err(LocalBrowserError::InvalidLimits);
     }
@@ -418,7 +589,11 @@ pub fn list_local_directory_with_preferred_child(
     })?;
     let preferred_entry = preferred_child
         .and_then(|path| direct_child_name(&directory, path))
-        .and_then(|name| inspect_supported_child(&directory, name).ok().flatten());
+        .and_then(|name| {
+            inspect_visible_child(&directory, name, options)
+                .ok()
+                .flatten()
+        });
     let preferred_name = preferred_entry.as_ref().map(|entry| entry.name.clone());
     let mut entries = preferred_entry.into_iter().collect::<Vec<_>>();
     let mut inspected_entries = 0_usize;
@@ -446,7 +621,7 @@ pub fn list_local_directory_with_preferred_child(
         {
             continue;
         }
-        let Some(entry) = inspect_supported_child(&directory, name)? else {
+        let Some(entry) = inspect_visible_child(&directory, name, options)? else {
             continue;
         };
 
@@ -483,9 +658,10 @@ fn direct_child_name(directory: &Path, candidate: &Path) -> Option<OsString> {
     }
 }
 
-fn inspect_supported_child(
+fn inspect_visible_child(
     directory: &Path,
     name: OsString,
+    options: LocalBrowseOptions,
 ) -> Result<Option<LocalEntry>, LocalBrowserError> {
     let entry_path = directory.join(&name);
     let metadata =
@@ -501,7 +677,15 @@ fn inspect_supported_child(
     let kind = if file_type.is_dir() {
         Some(LocalEntryKind::Directory)
     } else if file_type.is_file() {
-        classify_local_file(&entry_path)
+        classify_local_file(&entry_path).or_else(|| {
+            options.show_all_files.then(|| {
+                if is_local_text_file(&entry_path) {
+                    LocalEntryKind::Text
+                } else {
+                    LocalEntryKind::Other
+                }
+            })
+        })
     } else {
         None
     };
@@ -962,6 +1146,20 @@ mod tests {
     }
 
     #[test]
+    fn conservatively_classifies_text_basenames_without_reading_contents() {
+        assert!(is_local_text_file(Path::new("notes.TXT")));
+        assert!(is_local_text_file(Path::new("settings.toml")));
+        assert!(is_local_text_file(Path::new("script.rs")));
+        assert!(is_local_text_file(Path::new("README")));
+        assert!(is_local_text_file(Path::new("license")));
+        assert!(is_local_text_file(Path::new("Makefile")));
+        assert!(is_local_text_file(Path::new(".gitignore")));
+        assert!(!is_local_text_file(Path::new("manual.pdf")));
+        assert!(!is_local_text_file(Path::new("payload.bin")));
+        assert!(!is_local_text_file(Path::new("README.backup")));
+    }
+
+    #[test]
     fn lists_supported_entries_nonrecursively_with_directories_first() {
         let fixture = TempDir::new().expect("temporary fixture");
         let album = fixture.path().join("album");
@@ -1001,6 +1199,97 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| entry.name != "nested.mp3")
+        );
+    }
+
+    #[test]
+    fn show_all_files_adds_text_and_other_regular_files_without_changing_default() {
+        let fixture = TempDir::new().expect("temporary fixture");
+        let album = fixture.path().join("album");
+        fs::create_dir(&album).expect("create album");
+        write_file(&fixture.path().join("song.mp3"), b"audio");
+        write_file(&fixture.path().join("notes.TXT"), b"notes");
+        write_file(&fixture.path().join("manual.pdf"), b"pdf");
+
+        let default_listing =
+            list_local_directory(fixture.path(), LocalBrowseLimits::default()).expect("listing");
+        assert_eq!(
+            default_listing
+                .entries
+                .iter()
+                .map(|entry| (&entry.name, entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (&OsString::from("album"), LocalEntryKind::Directory),
+                (&OsString::from("song.mp3"), LocalEntryKind::Audio),
+            ]
+        );
+
+        let all_listing = list_local_directory_with_options(
+            fixture.path(),
+            LocalBrowseLimits::default(),
+            LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all listing");
+        assert_eq!(
+            all_listing
+                .entries
+                .iter()
+                .map(|entry| (&entry.name, entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (&OsString::from("album"), LocalEntryKind::Directory),
+                (&OsString::from("manual.pdf"), LocalEntryKind::Other),
+                (&OsString::from("notes.TXT"), LocalEntryKind::Text),
+                (&OsString::from("song.mp3"), LocalEntryKind::Audio),
+            ]
+        );
+        assert_eq!(all_listing.entries[1].size_bytes, Some(3));
+        assert_eq!(all_listing.entries[2].size_bytes, Some(5));
+    }
+
+    #[test]
+    fn dot_prefixed_supported_entries_remain_visible_in_both_modes() {
+        let fixture = TempDir::new().expect("temporary fixture");
+        fs::create_dir(fixture.path().join(".album")).expect("create hidden album");
+        write_file(&fixture.path().join(".song.mp3"), b"audio");
+        write_file(&fixture.path().join(".notes.txt"), b"notes");
+
+        let default_listing =
+            list_local_directory(fixture.path(), LocalBrowseLimits::default()).expect("listing");
+        assert_eq!(
+            default_listing
+                .entries
+                .iter()
+                .map(|entry| (&entry.name, entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (&OsString::from(".album"), LocalEntryKind::Directory),
+                (&OsString::from(".song.mp3"), LocalEntryKind::Audio),
+            ]
+        );
+
+        let all_listing = list_local_directory_with_options(
+            fixture.path(),
+            LocalBrowseLimits::default(),
+            LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all listing");
+        assert_eq!(
+            all_listing
+                .entries
+                .iter()
+                .map(|entry| (&entry.name, entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (&OsString::from(".album"), LocalEntryKind::Directory),
+                (&OsString::from(".notes.txt"), LocalEntryKind::Text),
+                (&OsString::from(".song.mp3"), LocalEntryKind::Audio),
+            ]
         );
     }
 
@@ -1120,6 +1409,57 @@ mod tests {
         assert_eq!(listing.entries[0].path, preferred);
         assert!(listing.truncated);
         assert!(listing.inspected_entries <= 1);
+    }
+
+    #[test]
+    fn show_all_files_can_reserve_an_unsupported_preferred_child() {
+        let fixture = TempDir::new().expect("temporary fixture");
+        write_file(&fixture.path().join("first.mp3"), b"first");
+        let preferred = fixture.path().join("notes.txt");
+        write_file(&preferred, b"notes");
+
+        let listing = list_local_directory_with_preferred_child_and_options(
+            fixture.path(),
+            LocalBrowseLimits {
+                max_inspected_entries: 1,
+                max_visible_entries: 1,
+            },
+            Some(&preferred),
+            LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all listing with reserved preferred child");
+
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, preferred);
+        assert_eq!(listing.entries[0].kind, LocalEntryKind::Text);
+        assert!(listing.truncated);
+        assert!(listing.inspected_entries <= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_all_files_still_ignores_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().expect("temporary fixture");
+        let target = fixture.path().join("target.bin");
+        write_file(&target, b"target");
+        symlink(&target, fixture.path().join("link.bin")).expect("create symlink");
+
+        let listing = list_local_directory_with_options(
+            fixture.path(),
+            LocalBrowseLimits::default(),
+            LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all listing");
+
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, target);
+        assert_eq!(listing.entries[0].kind, LocalEntryKind::Other);
     }
 
     #[test]

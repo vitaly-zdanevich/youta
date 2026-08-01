@@ -48,6 +48,8 @@ use crate::playback::PlaybackStatus;
 use crate::report_actions::system_url_opener_name;
 use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
+#[cfg(feature = "local-browser")]
+use crate::text_file_open::{TextFileOpenLifecycle, TextFileOpenPlan};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::{Peak, PeakPyramid};
@@ -1460,6 +1462,8 @@ pub struct ViewModel {
     pub skip_advertisement_chapters: bool,
     /// Local file-browser ordering by known file and lazy folder sizes.
     pub local_size_sort: LocalSizeSort,
+    /// Whether Local includes unsupported regular files alongside media.
+    pub show_all_local_files: bool,
     /// Ordering applied to the built-in Radio station catalogue.
     pub radio_sort: RadioSort,
     /// Whether recursive Local-folder sizes and size ordering are available.
@@ -1566,6 +1570,7 @@ impl Default for ViewModel {
             show_chapter_timestamps: true,
             skip_advertisement_chapters: true,
             local_size_sort: LocalSizeSort::Off,
+            show_all_local_files: false,
             radio_sort: RadioSort::Name,
             local_folder_sizes_enabled: true,
             show_images_in_tty: true,
@@ -1786,6 +1791,8 @@ pub enum UiAction {
     ToggleAutoplay,
     /// Cycle Local entry ordering through off, ascending, and descending size.
     ToggleLocalSizeSort,
+    /// Toggle unsupported regular files in the Local listing.
+    ToggleLocalAllFiles,
     /// Cycle Radio stations through name and known-bitrate orderings.
     CycleRadioSort,
     /// Toggle the selected Radio station in persistent favorites.
@@ -2012,6 +2019,16 @@ pub trait UiController {
 
     /// Polls background workers and playback state.
     fn tick(&mut self);
+
+    /// Takes one text-file command after an activation action planned it.
+    #[cfg(feature = "local-browser")]
+    fn take_text_file_open_plan(&mut self) -> Option<TextFileOpenPlan> {
+        None
+    }
+
+    /// Reports the result after the event loop safely handled terminal state.
+    #[cfg(feature = "local-browser")]
+    fn report_text_file_open_result(&mut self, _result: Result<TextFileOpenLifecycle, String>) {}
 }
 
 trait ThumbnailRenderer {
@@ -2834,6 +2851,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 _ => {}
             }
         }
+        #[cfg(feature = "local-browser")]
+        if let Some(plan) = controller.take_text_file_open_plan() {
+            if let Some(renderer) = renderer.as_deref_mut() {
+                renderer.clear();
+            }
+            let result = execute_text_file_open_plan(&mut session, plan);
+            controller.report_text_file_open_result(result);
+        }
         controller.tick();
         thumbnail_renderer = renderer;
     }
@@ -3279,6 +3304,78 @@ impl TerminalSession {
         )?;
         setup_guard.active = false;
         Ok(Self { terminal })
+    }
+
+    /// Restores the ordinary terminal before a foreground console editor runs.
+    #[cfg(feature = "local-browser")]
+    fn suspend(&mut self) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
+        self.terminal.show_cursor()
+    }
+
+    /// Re-enters Youta's clean full-screen terminal after an editor exits.
+    #[cfg(feature = "local-browser")]
+    fn resume(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        write_terminal_startup(self.terminal.backend_mut())?;
+        self.terminal.clear()
+    }
+}
+
+/// Executes one shell-free text-file plan with the required terminal lifecycle.
+#[cfg(feature = "local-browser")]
+fn execute_text_file_open_plan(
+    session: &mut TerminalSession,
+    plan: TextFileOpenPlan,
+) -> Result<TextFileOpenLifecycle, String> {
+    use std::process::{Command, Stdio};
+
+    let lifecycle = plan.lifecycle;
+    let mut command = Command::new(&plan.executable);
+    command.args(&plan.arguments);
+    match lifecycle {
+        TextFileOpenLifecycle::Detached => {
+            let mut child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("cannot start {}: {error}", plan.executable.display()))?;
+            let _ = std::thread::Builder::new()
+                .name("youta-text-file-opener".to_owned())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            Ok(lifecycle)
+        }
+        TextFileOpenLifecycle::SuspendTuiAndWait => {
+            session
+                .suspend()
+                .map_err(|error| format!("cannot suspend the terminal UI: {error}"))?;
+            let editor_result = command.status();
+            let resume_result = session.resume();
+            if let Err(error) = resume_result {
+                return Err(format!("cannot restore the terminal UI: {error}"));
+            }
+            let status = editor_result
+                .map_err(|error| format!("cannot start {}: {error}", plan.executable.display()))?;
+            if status.success() {
+                Ok(lifecycle)
+            } else {
+                Err(format!(
+                    "{} exited with {status}",
+                    plan.executable.display()
+                ))
+            }
+        }
     }
 }
 
@@ -5704,6 +5801,28 @@ fn render_information_panel(
             UiAction::RequestLocalTrash,
         );
     }
+    if kind == InformationPanelKind::Local {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button(
+                "H",
+                if view.show_all_local_files {
+                    "Media files only"
+                } else {
+                    "Show all files"
+                },
+                show_hotkeys,
+            ),
+            if view.show_all_local_files {
+                theme.selected
+            } else {
+                theme.accent
+            },
+            UiAction::ToggleLocalAllFiles,
+        );
+    }
     let mut next_left_row = 0;
     let radio_favorite_button = (kind == InformationPanelKind::Radio).then(|| {
         let label = button(
@@ -7921,7 +8040,8 @@ fn search_kind_help(view: &ViewModel) -> &'static str {
 fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
-    let mut local_help = "  Local: Esc parent     PageUp/Down page     Z size".to_owned();
+    let mut local_help =
+        "  Local: Esc parent     PageUp/Down page     H all files     Z size".to_owned();
     if cfg!(feature = "local-rename") {
         local_help.push_str("     r rename");
     }
@@ -11042,6 +11162,7 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Char('Z') if view.screen == Screen::Local && view.local_folder_sizes_enabled => {
             Some(UiAction::ToggleLocalSizeSort)
         }
+        KeyCode::Char('H') if view.screen == Screen::Local => Some(UiAction::ToggleLocalAllFiles),
         KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
         KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
         KeyCode::Char('L')
@@ -25810,6 +25931,70 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw footer");
         assert!(!rendered_text(&terminal).contains("F9"));
+    }
+
+    #[test]
+    fn show_all_files_hotkey_is_scoped_to_local() {
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Char('H'), modifiers), &local),
+                Some(UiAction::ToggleLocalAllFiles)
+            );
+        }
+
+        let youtube = ViewModel {
+            screen: Screen::Search,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
+                &youtube
+            ),
+            None,
+            "the Local visibility shortcut must not leak to other sources"
+        );
+    }
+
+    #[test]
+    fn local_details_expose_the_current_file_visibility_toggle() {
+        for (show_all_local_files, expected, unexpected) in [
+            (false, "[H] Show all files", "[H] Media files only"),
+            (true, "[H] Media files only", "[H] Show all files"),
+        ] {
+            let backend = TestBackend::new(100, 18);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let view = ViewModel {
+                screen: Screen::Local,
+                show_all_local_files,
+                details: Some(DetailView {
+                    title: "notes.txt".to_owned(),
+                    source: "Local text".to_owned(),
+                    description: "Full path: /music/notes.txt".to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw Local text details");
+            let rendered = rendered_text(&terminal);
+
+            assert!(rendered.contains(expected));
+            assert!(!rendered.contains(unexpected));
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| action == &UiAction::ToggleLocalAllFiles)
+            );
+        }
     }
 
     #[test]

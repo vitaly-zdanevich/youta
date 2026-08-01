@@ -177,6 +177,10 @@ use crate::report_actions::{SystemReportActions, system_url_opener_name};
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
 use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
+#[cfg(feature = "local-browser")]
+use crate::text_file_open::{
+    TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
+};
 use crate::tui::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
 use crate::tui::DownloadView;
@@ -2326,6 +2330,7 @@ enum LocalBrowseRequest {
         generation: u64,
         directory: PathBuf,
         preferred_child: Option<PathBuf>,
+        options: crate::local_browser::LocalBrowseOptions,
     },
     /// Lists only real directories for the non-blocking Move destination chooser.
     #[cfg(feature = "local-move")]
@@ -3527,6 +3532,9 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// One selected text-file command awaiting safe TUI lifecycle handling.
+    #[cfg(feature = "local-browser")]
+    pending_text_file_open: Option<TextFileOpenPlan>,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -4529,6 +4537,8 @@ impl AppController {
             private_note_editor: None,
             pending_playlist_replay: None,
             local_listing: None,
+            #[cfg(feature = "local-browser")]
+            pending_text_file_open: None,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
@@ -11451,7 +11461,9 @@ impl AppController {
                         (!cfg!(feature = "local-video-thumbnails"))
                             .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
                     }
-                    crate::local_browser::LocalEntryKind::Image => None,
+                    crate::local_browser::LocalEntryKind::Image
+                    | crate::local_browser::LocalEntryKind::Text
+                    | crate::local_browser::LocalEntryKind::Other => None,
                 })
         } else {
             self.view
@@ -11679,6 +11691,9 @@ impl AppController {
                 generation: self.local_generation,
                 directory,
                 preferred_child: reselect_child,
+                options: crate::local_browser::LocalBrowseOptions {
+                    show_all_files: self.view.show_all_local_files,
+                },
             },
             "Could not open the local folder",
         ) {
@@ -12170,6 +12185,8 @@ impl AppController {
                 LocalEntryKind::Video => "Local video (audio playback)",
                 LocalEntryKind::TrackerModule => "Local tracker module",
                 LocalEntryKind::Image => "Local image",
+                LocalEntryKind::Text => "Text file",
+                LocalEntryKind::Other => "File",
             };
             let media_id = entry
                 .kind
@@ -12296,10 +12313,16 @@ impl AppController {
                 .flatten();
             self.view.details = Some(DetailView {
                 title: entry.display_name().into_owned(),
-                source: if entry.kind == LocalEntryKind::Image {
-                    "Local image"
-                } else {
-                    "Local folder"
+                source: match entry.kind {
+                    LocalEntryKind::Directory => "Local folder",
+                    LocalEntryKind::Image => "Local image",
+                    LocalEntryKind::Text => "Text file",
+                    LocalEntryKind::Other => "File",
+                    LocalEntryKind::Audio
+                    | LocalEntryKind::Video
+                    | LocalEntryKind::TrackerModule => {
+                        unreachable!("playable entries use the metadata branch")
+                    }
                 }
                 .to_owned(),
                 description: format!(
@@ -14936,6 +14959,21 @@ impl AppController {
         true
     }
 
+    /// Plans one selected text-file opener without running a child inside raw mode.
+    #[cfg(feature = "local-browser")]
+    fn open_local_text_file(&mut self, path: PathBuf) {
+        let context = TextFileOpenContext::current(self.view.physical_linux_console);
+        self.pending_text_file_open = Some(plan_text_file_open(&path, &context));
+        self.view.status_line = format!("Opening {}…", path.display());
+    }
+
+    /// Reports the omitted capability in builds without Local browsing.
+    #[cfg(not(feature = "local-browser"))]
+    fn open_local_text_file(&mut self, path: PathBuf) {
+        let _ = path;
+        self.view.status_line = "This build omits local text-file opening".to_owned();
+    }
+
     fn activate_local_browser_selection(&mut self) {
         use crate::local_browser::LocalEntryKind;
 
@@ -14957,6 +14995,11 @@ impl AppController {
             LocalEntryKind::Image => {
                 self.view.status_line =
                     "Image preview selected; only audio and video entries are playable".to_owned();
+            }
+            LocalEntryKind::Text => self.open_local_text_file(entry.path),
+            LocalEntryKind::Other => {
+                self.view.status_line =
+                    "No default action is available for this file type".to_owned();
             }
             LocalEntryKind::Audio | LocalEntryKind::Video | LocalEntryKind::TrackerModule => {
                 let item = local_media_item(entry.path);
@@ -23274,6 +23317,24 @@ impl AppController {
             .clone_into(&mut self.view.status_line);
     }
 
+    /// Reloads the current Local directory with or without unsupported files.
+    fn toggle_local_all_files(&mut self) {
+        if self.view.screen != Screen::Local {
+            return;
+        }
+        let Some(directory) = self
+            .local_listing
+            .as_ref()
+            .map(|listing| listing.path.clone())
+        else {
+            self.view.status_line = "Wait for the Local folder to finish loading".to_owned();
+            return;
+        };
+        let selected_path = self.selected_local_path().filter(|path| path != &directory);
+        self.view.show_all_local_files = !self.view.show_all_local_files;
+        self.browse_local_directory_with_reselection(directory, selected_path);
+    }
+
     /// Cycles deterministic Radio ordering while retaining the selected station.
     fn cycle_radio_sort(&mut self) {
         if self.view.screen != Screen::Radio {
@@ -24316,6 +24377,7 @@ impl UiController for AppController {
             }
             UiAction::ToggleAutoplay => self.toggle_autoplay(),
             UiAction::ToggleLocalSizeSort => self.toggle_local_size_sort(),
+            UiAction::ToggleLocalAllFiles => self.toggle_local_all_files(),
             UiAction::CycleRadioSort => self.cycle_radio_sort(),
             UiAction::ToggleRadioFavorite => self.toggle_selected_radio_favorite(),
             UiAction::ToggleRadioRecording => self.toggle_radio_recording(),
@@ -24578,6 +24640,20 @@ impl UiController for AppController {
         }
     }
 
+    #[cfg(feature = "local-browser")]
+    fn take_text_file_open_plan(&mut self) -> Option<TextFileOpenPlan> {
+        self.pending_text_file_open.take()
+    }
+
+    #[cfg(feature = "local-browser")]
+    fn report_text_file_open_result(&mut self, result: Result<TextFileOpenLifecycle, String>) {
+        self.view.status_line = match result {
+            Ok(TextFileOpenLifecycle::Detached) => "Requested the system text editor".to_owned(),
+            Ok(TextFileOpenLifecycle::SuspendTuiAndWait) => "Text editor closed".to_owned(),
+            Err(error) => format!("Could not open the text file: {error}"),
+        };
+    }
+
     fn tick(&mut self) {
         expire_transient_footer_notice(
             &mut self.view,
@@ -24786,13 +24862,16 @@ fn local_browse_worker(
                 generation,
                 directory,
                 preferred_child,
+                options,
             } => {
-                let result = crate::local_browser::list_local_directory_with_preferred_child(
-                    &directory,
-                    crate::local_browser::LocalBrowseLimits::default(),
-                    preferred_child.as_deref(),
-                )
-                .map_err(|error| error.to_string());
+                let result =
+                    crate::local_browser::list_local_directory_with_preferred_child_and_options(
+                        &directory,
+                        crate::local_browser::LocalBrowseLimits::default(),
+                        preferred_child.as_deref(),
+                        options,
+                    )
+                    .map_err(|error| error.to_string());
                 LocalBrowseResponse::Browse { generation, result }
             }
             #[cfg(feature = "local-move")]
@@ -43205,6 +43284,188 @@ mod tests {
     }
 
     #[test]
+    fn local_show_all_toggle_reloads_both_modes_and_preserves_supported_selection() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let track = fixture.path().join("song.flac");
+        std::fs::write(&track, b"audio").expect("create Local audio fixture");
+        std::fs::write(fixture.path().join("notes.txt"), b"notes")
+            .expect("create Local text fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("default Local listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.config.ui.show_local_folder_sizes = false;
+        controller.view.local_folder_sizes_enabled = false;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "song.flac")
+            .expect("visible audio row");
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.dispatch(UiAction::ToggleLocalAllFiles);
+
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+            options,
+        } = captured.try_recv().expect("show-all browse request")
+        else {
+            panic!("expected a Local browse request");
+        };
+        assert_eq!(directory, fixture.path());
+        assert_eq!(preferred_child.as_deref(), Some(track.as_path()));
+        assert!(options.show_all_files);
+        assert!(controller.view.show_all_local_files);
+        let listing = crate::local_browser::list_local_directory_with_preferred_child_and_options(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+            options,
+        )
+        .expect("show-all Local listing");
+        controller.handle_local_browse_response(LocalBrowseResponse::Browse {
+            generation,
+            result: Ok(listing),
+        });
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(track.as_path())
+        );
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .any(|row| row.title == "notes.txt")
+        );
+
+        controller.dispatch(UiAction::ToggleLocalAllFiles);
+
+        let LocalBrowseRequest::Browse {
+            generation,
+            directory,
+            preferred_child,
+            options,
+        } = captured.try_recv().expect("default browse request")
+        else {
+            panic!("expected a Local browse request");
+        };
+        assert_eq!(directory, fixture.path());
+        assert_eq!(preferred_child.as_deref(), Some(track.as_path()));
+        assert!(!options.show_all_files);
+        assert!(!controller.view.show_all_local_files);
+        let listing = crate::local_browser::list_local_directory_with_preferred_child_and_options(
+            &directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+            preferred_child.as_deref(),
+            options,
+        )
+        .expect("default Local listing");
+        controller.handle_local_browse_response(LocalBrowseResponse::Browse {
+            generation,
+            result: Ok(listing),
+        });
+        assert_eq!(
+            controller.selected_local_path().as_deref(),
+            Some(track.as_path())
+        );
+        assert!(
+            controller
+                .view
+                .rows
+                .iter()
+                .all(|row| row.title != "notes.txt")
+        );
+    }
+
+    #[cfg(feature = "local-browser")]
+    #[test]
+    fn activating_a_local_text_entry_schedules_its_system_editor_plan() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let notes = fixture.path().join("notes.txt");
+        std::fs::write(&notes, b"notes").expect("create Local text fixture");
+        let listing = crate::local_browser::list_local_directory_with_options(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+            crate::local_browser::LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all Local listing");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.view.physical_linux_console = false;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "notes.txt")
+            .expect("visible text row");
+
+        controller.activate_local_browser_selection();
+
+        let plan = controller
+            .pending_text_file_open
+            .as_ref()
+            .expect("scheduled text-file opener");
+        assert_eq!(
+            plan.arguments.last().map(|argument| argument.as_os_str()),
+            Some(notes.as_os_str())
+        );
+        assert_eq!(plan.lifecycle, TextFileOpenLifecycle::Detached);
+        assert_eq!(
+            controller.view.status_line,
+            format!("Opening {}…", notes.display())
+        );
+    }
+
+    #[cfg(feature = "local-browser")]
+    #[test]
+    fn activating_an_other_local_file_does_not_schedule_an_editor() {
+        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let binary = fixture.path().join("payload.bin");
+        std::fs::write(&binary, b"binary").expect("create Local binary fixture");
+        let listing = crate::local_browser::list_local_directory_with_options(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+            crate::local_browser::LocalBrowseOptions {
+                show_all_files: true,
+            },
+        )
+        .expect("show-all Local listing");
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "payload.bin")
+            .expect("visible other-file row");
+
+        controller.activate_local_browser_selection();
+
+        assert!(controller.pending_text_file_open.is_none());
+        assert!(state.lock().expect("mock player state").played.is_empty());
+        assert_eq!(
+            controller.view.status_line,
+            "No default action is available for this file type"
+        );
+    }
+
+    #[test]
     fn local_browser_rows_and_folder_actions_are_source_specific() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
         let album = fixture.path().join("A long album folder");
@@ -46568,6 +46829,7 @@ mod tests {
             generation,
             directory,
             preferred_child,
+            ..
         } = captured.try_recv().expect("parent browse request")
         else {
             panic!("expected Local parent browse request");
@@ -46636,6 +46898,7 @@ mod tests {
             generation,
             directory,
             preferred_child,
+            ..
         } = captured.try_recv().expect("parent browse request")
         else {
             panic!("expected Local parent browse request");
@@ -46831,6 +47094,7 @@ mod tests {
             generation,
             directory,
             preferred_child,
+            ..
         } = captured_browse.try_recv().expect("refresh request")
         else {
             panic!("expected Local browse request");
@@ -51812,6 +52076,7 @@ mod tests {
             generation,
             directory,
             preferred_child,
+            ..
         } = captured_browse_requests
             .try_recv()
             .expect("successor directory request")
