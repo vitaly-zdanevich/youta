@@ -21,6 +21,8 @@ pub mod bbc;
 pub mod dearrow;
 #[cfg(feature = "funkwhale")]
 pub mod funkwhale;
+#[cfg(feature = "network")]
+pub mod github;
 #[cfg(feature = "invidious")]
 pub mod invidious;
 #[cfg(feature = "jamendo")]

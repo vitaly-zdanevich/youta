@@ -4,6 +4,7 @@
 //! rendering behind separate interfaces so distribution builds can omit
 //! services they do not use.
 
+pub mod build_info;
 pub mod config;
 pub mod diagnostics;
 pub mod domain;

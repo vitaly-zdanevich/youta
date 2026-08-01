@@ -50,6 +50,7 @@ use crate::audio_identification::{
     FpcalcFingerprintRunner, LocalAudioIdentifier, MusicBrainzCandidate, SystemFpcalcProcess,
     UreqAcoustIdTransport,
 };
+use crate::build_info::{self, RuntimeProvenance};
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
@@ -134,6 +135,8 @@ use crate::providers::bbc::{
     STATIONS as BBC_STATIONS, station_by_id as bbc_station_by_id,
     station_from_url as bbc_station_from_url,
 };
+#[cfg(feature = "network")]
+use crate::providers::github::{GitHubCommit, GitHubCommitClient};
 #[cfg(any(feature = "bbc-radio", all(feature = "radio", test)))]
 use crate::providers::radio::RadioStreamKind;
 #[cfg(all(feature = "radio", test))]
@@ -191,9 +194,10 @@ use crate::tui::{
     INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
     MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView,
     PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
-    PrivateNotePopupView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen,
-    SearchActivity, SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController,
-    VideoCommentView, VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
+    PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState,
+    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
+    SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
+    VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
     YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
     YouTubeSetupPopupView,
 };
@@ -1901,6 +1905,11 @@ enum ProviderRequest {
         generation: u64,
         video_id: String,
     },
+    #[cfg(feature = "network")]
+    ProjectHistory {
+        generation: u64,
+        base_sha: String,
+    },
     ChannelDetails {
         generation: u64,
         provider_generation: u64,
@@ -2181,6 +2190,11 @@ enum ProviderResponse {
     YandexMusicReaction {
         pending: PendingYandexMusicReaction,
         result: Result<(), String>,
+    },
+    #[cfg(feature = "network")]
+    ProjectHistory {
+        generation: u64,
+        result: Result<Vec<GitHubCommit>, String>,
     },
     #[cfg(feature = "bandcamp")]
     BandcampSearch {
@@ -3743,6 +3757,15 @@ pub struct AppController {
     youtube_video_comments_generation: u64,
     /// Exact in-flight comments request owned by the visible popup.
     pending_youtube_video_comments: Option<(u64, String)>,
+    /// Newer GitHub commits retained after the first successful popup check.
+    #[cfg(feature = "network")]
+    project_history_remote_cache: Option<Vec<GitHubCommit>>,
+    /// Monotonic owner rejecting a stale GitHub comparison response.
+    #[cfg(feature = "network")]
+    project_history_generation: u64,
+    /// Exact GitHub comparison currently owned by the background provider.
+    #[cfg(feature = "network")]
+    pending_project_history: Option<u64>,
     /// Channel identifiers currently owned by the provider worker.
     pending_channel_details: HashSet<String>,
     /// Selection generation rejecting metadata for a different visible source.
@@ -4653,6 +4676,12 @@ impl AppController {
             youtube_video_comments_cache_bytes: 0,
             youtube_video_comments_generation: 0,
             pending_youtube_video_comments: None,
+            #[cfg(feature = "network")]
+            project_history_remote_cache: None,
+            #[cfg(feature = "network")]
+            project_history_generation: 0,
+            #[cfg(feature = "network")]
+            pending_project_history: None,
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
             scheduled_channel_details: None,
@@ -8461,6 +8490,117 @@ impl AppController {
         }
     }
 
+    /// Opens deterministic build history immediately and checks GitHub at most
+    /// once successfully per process for commits newer than this binary.
+    fn open_project_history(&mut self) {
+        #[cfg(feature = "network")]
+        if let Some(remote) = self.project_history_remote_cache.as_deref() {
+            let state = if remote.is_empty() {
+                ProjectHistoryRemoteState::UpToDate
+            } else {
+                ProjectHistoryRemoteState::Updated
+            };
+            self.view.project_history_popup = Some(project_history_popup(
+                merged_project_history(remote),
+                state,
+                build_info::detect_runtime_provenance().map_err(|error| error.to_string()),
+            ));
+            return;
+        }
+
+        #[cfg(feature = "network")]
+        let state = if self.pending_project_history.is_some() {
+            ProjectHistoryRemoteState::Checking
+        } else {
+            ProjectHistoryRemoteState::Embedded
+        };
+        #[cfg(not(feature = "network"))]
+        let state = ProjectHistoryRemoteState::Embedded;
+        self.view.project_history_popup = Some(project_history_popup(
+            embedded_project_history(),
+            state,
+            build_info::detect_runtime_provenance().map_err(|error| error.to_string()),
+        ));
+
+        #[cfg(feature = "network")]
+        {
+            if self.pending_project_history.is_some() {
+                return;
+            }
+            let base_sha = build_info::current_build_sha();
+            if !valid_full_git_sha(base_sha) {
+                if let Some(popup) = self.view.project_history_popup.as_mut() {
+                    popup.remote_state = ProjectHistoryRemoteState::Unavailable(
+                        "this build has no exact Git commit identifier".to_owned(),
+                    );
+                }
+                return;
+            }
+
+            self.project_history_generation = self.project_history_generation.wrapping_add(1);
+            let generation = self.project_history_generation;
+            let request = ProviderRequest::ProjectHistory {
+                generation,
+                base_sha: base_sha.to_owned(),
+            };
+            if self
+                .provider_requests
+                .as_ref()
+                .is_some_and(|sender| sender.send(request).is_ok())
+            {
+                self.pending_project_history = Some(generation);
+                if let Some(popup) = self.view.project_history_popup.as_mut() {
+                    popup.remote_state = ProjectHistoryRemoteState::Checking;
+                }
+            } else if let Some(popup) = self.view.project_history_popup.as_mut() {
+                popup.remote_state = ProjectHistoryRemoteState::Unavailable(
+                    "the background provider is unavailable".to_owned(),
+                );
+            }
+        }
+    }
+
+    /// Applies one identity-owned GitHub response without reopening a closed popup.
+    #[cfg(feature = "network")]
+    fn handle_project_history_response(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<GitHubCommit>, String>,
+    ) {
+        if self.pending_project_history != Some(generation) {
+            return;
+        }
+        self.pending_project_history = None;
+        match result {
+            Ok(mut remote) => {
+                remote.truncate(10);
+                let state = if remote.is_empty() {
+                    ProjectHistoryRemoteState::UpToDate
+                } else {
+                    ProjectHistoryRemoteState::Updated
+                };
+                let commits = merged_project_history(&remote);
+                self.project_history_remote_cache = Some(remote);
+                let Some(previous) = self.view.project_history_popup.as_ref() else {
+                    return;
+                };
+                let scroll_offset = previous.scroll_offset;
+                let mut popup = project_history_popup(
+                    commits,
+                    state,
+                    build_info::detect_runtime_provenance().map_err(|error| error.to_string()),
+                );
+                popup.scroll_offset = scroll_offset;
+                self.view.project_history_popup = Some(popup);
+            }
+            Err(error) => {
+                if let Some(popup) = self.view.project_history_popup.as_mut() {
+                    popup.remote_state = ProjectHistoryRemoteState::Unavailable(error);
+                }
+            }
+        }
+    }
+
     /// Applies provider metadata only to a matching visible Channel panel.
     fn apply_channel_details_to_view(&mut self, channel: &ChannelSummary) {
         self.apply_channel_artwork_to_subscription_source(channel);
@@ -10150,6 +10290,10 @@ impl AppController {
                         }
                     }
                 }
+            }
+            #[cfg(feature = "network")]
+            ProviderResponse::ProjectHistory { generation, result } => {
+                self.handle_project_history_response(generation, result);
             }
             ProviderResponse::Apple { generation, result } => {
                 if self.finish_playlist_replay(generation, &SourceKind::ApplePodcasts, &result) {
@@ -23783,6 +23927,15 @@ impl UiController for AppController {
                 self.transient_footer_notice_deadline = Some(Instant::now() + GPM_NOTICE_DURATION);
             }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
+            UiAction::OpenProjectHistory => self.open_project_history(),
+            UiAction::SetProjectHistoryScroll(offset) => {
+                if let Some(popup) = self.view.project_history_popup.as_mut() {
+                    popup.scroll_offset = offset;
+                }
+            }
+            UiAction::DismissProjectHistory => {
+                self.view.project_history_popup = None;
+            }
             UiAction::ShowScreen(screen) => self.show_screen(screen),
             UiAction::BeginSearch => self.begin_search_input(),
             UiAction::CancelSearch => self.cancel_search_input(),
@@ -26154,6 +26307,21 @@ fn provider_worker(
                         video_id,
                         result,
                     })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "network")]
+            ProviderRequest::ProjectHistory {
+                generation,
+                base_sha,
+            } => {
+                let result = GitHubCommitClient::new()
+                    .commits_newer_than(&base_sha)
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::ProjectHistory { generation, result })
                     .is_err()
                 {
                     break;
@@ -31264,6 +31432,84 @@ fn video_comments_popup(
     }
 }
 
+/// Converts deterministic build metadata into the renderer-owned commit model.
+fn embedded_project_history() -> Vec<ProjectCommitView> {
+    build_info::embedded_commits()
+        .iter()
+        .take(10)
+        .map(|commit| ProjectCommitView {
+            hash: commit.hash.to_owned(),
+            committed_at: commit.committed_at.to_owned(),
+            message: commit.message.to_owned(),
+        })
+        .collect()
+}
+
+/// Merges newest GitHub descendants with embedded offline history.
+#[cfg(feature = "network")]
+fn merged_project_history(remote: &[GitHubCommit]) -> Vec<ProjectCommitView> {
+    let mut commits = Vec::with_capacity(10);
+    let mut hashes = HashSet::with_capacity(10);
+    for commit in remote
+        .iter()
+        .map(|commit| ProjectCommitView {
+            hash: commit.sha.clone(),
+            committed_at: commit.committed_at.clone(),
+            message: commit.message.clone(),
+        })
+        .chain(embedded_project_history())
+    {
+        let hash = commit.hash.to_ascii_lowercase();
+        if hashes.insert(hash) {
+            commits.push(commit);
+        }
+        if commits.len() == 10 {
+            break;
+        }
+    }
+    commits
+}
+
+/// Builds one popup snapshot from injected provenance for deterministic tests.
+fn project_history_popup(
+    commits: Vec<ProjectCommitView>,
+    remote_state: ProjectHistoryRemoteState,
+    provenance: Result<RuntimeProvenance, String>,
+) -> ProjectHistoryPopupView {
+    let current_hash = build_info::current_build_sha();
+    let current_hash = (current_hash != "unknown").then(|| current_hash.to_owned());
+    match provenance {
+        Ok(provenance) => ProjectHistoryPopupView {
+            commits,
+            current_hash,
+            installation: provenance.installation_source.label().to_owned(),
+            executable_path: provenance.executable_path.display().to_string(),
+            started_in: provenance.launch_directory.display().to_string(),
+            build_source: provenance
+                .build_source_directory
+                .map(|path| path.display().to_string()),
+            remote_state,
+            scroll_offset: 0,
+        },
+        Err(error) => ProjectHistoryPopupView {
+            commits,
+            current_hash,
+            installation: format!("Unavailable: {error}"),
+            executable_path: "Unavailable".to_owned(),
+            started_in: "Unavailable".to_owned(),
+            build_source: None,
+            remote_state,
+            scroll_offset: 0,
+        },
+    }
+}
+
+/// Exact object IDs are required by GitHub's comparison endpoint.
+#[cfg(feature = "network")]
+fn valid_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Formats one publication timestamp in the user's local calendar.
 ///
 /// Relative labels are computed from injected `today`, which keeps date
@@ -34416,6 +34662,19 @@ mod tests {
         (temporary, controller, requests)
     }
 
+    /// Builds a controller with a captured GitHub-history request lane.
+    #[cfg(feature = "network")]
+    fn controller_with_project_history()
+    -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (request_sender, requests) = unbounded();
+        controller.provider_requests = Some(request_sender);
+        (temporary, controller, requests)
+    }
+
     /// Selects one deterministic playable YouTube row without starting a
     /// provider worker or relying on live network metadata.
     fn select_fixture_youtube_video(controller: &mut AppController, screen: Screen) -> MediaId {
@@ -37092,6 +37351,130 @@ mod tests {
             Some("https://www.youtube.com/channel/UCfixture")
         );
         assert!(!rendered.channel_subscribed);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn project_history_opens_offline_then_merges_and_caches_newer_commits() {
+        let (_temporary, mut controller, requests) = controller_with_project_history();
+
+        controller.dispatch(UiAction::OpenProjectHistory);
+
+        let popup = controller
+            .view
+            .project_history_popup
+            .as_ref()
+            .expect("embedded popup opens immediately");
+        assert_eq!(popup.remote_state, ProjectHistoryRemoteState::Checking);
+        assert!(!popup.commits.is_empty());
+        assert!(!popup.executable_path.is_empty());
+        assert!(!popup.started_in.is_empty());
+        let (generation, base_sha) = match requests.try_recv().expect("one GitHub comparison") {
+            ProviderRequest::ProjectHistory {
+                generation,
+                base_sha,
+            } => (generation, base_sha),
+            _ => panic!("unexpected provider request"),
+        };
+        assert_eq!(base_sha, build_info::current_build_sha());
+
+        let newer = GitHubCommit {
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            committed_at: "2026-08-01T10:30:00Z".to_owned(),
+            message: "History popup fixture\n\nComplete multiline body.".to_owned(),
+        };
+        controller.handle_provider_response(ProviderResponse::ProjectHistory {
+            generation,
+            result: Ok(vec![newer.clone()]),
+        });
+
+        let popup = controller
+            .view
+            .project_history_popup
+            .as_ref()
+            .expect("updated popup remains open");
+        assert_eq!(popup.remote_state, ProjectHistoryRemoteState::Updated);
+        assert_eq!(popup.commits[0].hash, newer.sha);
+        assert_eq!(popup.commits[0].message, newer.message);
+
+        controller.dispatch(UiAction::DismissProjectHistory);
+        controller.dispatch(UiAction::OpenProjectHistory);
+        assert_eq!(
+            controller
+                .view
+                .project_history_popup
+                .as_ref()
+                .map(|popup| &popup.remote_state),
+            Some(&ProjectHistoryRemoteState::Updated)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "a successful result must prevent another process-local request"
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn project_history_failure_stays_inline_and_retries_after_reopen() {
+        let (_temporary, mut controller, requests) = controller_with_project_history();
+        controller.dispatch(UiAction::OpenProjectHistory);
+        let generation = match requests.try_recv().expect("first GitHub comparison") {
+            ProviderRequest::ProjectHistory { generation, .. } => generation,
+            _ => panic!("unexpected provider request"),
+        };
+
+        controller.handle_provider_response(ProviderResponse::ProjectHistory {
+            generation,
+            result: Err("offline fixture".to_owned()),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .project_history_popup
+                .as_ref()
+                .map(|popup| &popup.remote_state),
+            Some(&ProjectHistoryRemoteState::Unavailable(
+                "offline fixture".to_owned()
+            ))
+        );
+        assert!(controller.view.error_popup.is_none());
+
+        controller.dispatch(UiAction::DismissProjectHistory);
+        controller.dispatch(UiAction::OpenProjectHistory);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(ProviderRequest::ProjectHistory { .. })
+        ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn project_history_completion_after_close_populates_cache_without_reopening() {
+        let (_temporary, mut controller, requests) = controller_with_project_history();
+        controller.dispatch(UiAction::OpenProjectHistory);
+        let generation = match requests.try_recv().expect("GitHub comparison") {
+            ProviderRequest::ProjectHistory { generation, .. } => generation,
+            _ => panic!("unexpected provider request"),
+        };
+        controller.dispatch(UiAction::DismissProjectHistory);
+
+        controller.handle_provider_response(ProviderResponse::ProjectHistory {
+            generation,
+            result: Ok(Vec::new()),
+        });
+
+        assert!(controller.view.project_history_popup.is_none());
+        controller.dispatch(UiAction::OpenProjectHistory);
+        assert_eq!(
+            controller
+                .view
+                .project_history_popup
+                .as_ref()
+                .map(|popup| &popup.remote_state),
+            Some(&ProjectHistoryRemoteState::UpToDate)
+        );
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]

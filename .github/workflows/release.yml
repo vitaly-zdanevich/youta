@@ -147,6 +147,8 @@ jobs:
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 10
 
       - name: Install the release Rust toolchain
         run: |

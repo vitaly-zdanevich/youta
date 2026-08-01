@@ -1218,6 +1218,54 @@ pub struct VideoCommentsPopupView {
     pub scroll_offset: usize,
 }
 
+/// One source-control commit rendered in the offline-first project-history popup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectCommitView {
+    /// Complete hexadecimal object identifier.
+    pub hash: String,
+    /// ISO-8601 commit timestamp retained from the build or GitHub response.
+    pub committed_at: String,
+    /// Complete multiline commit message, including its body and trailers.
+    pub message: String,
+}
+
+/// State of the one-per-process GitHub history check.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProjectHistoryRemoteState {
+    /// Only deterministic build-time history is available.
+    #[default]
+    Embedded,
+    /// A background comparison against the repository's main branch is active.
+    Checking,
+    /// GitHub confirmed that no newer commits exist.
+    UpToDate,
+    /// Newer commits were merged into the process-local view.
+    Updated,
+    /// The online check failed; embedded history remains usable.
+    Unavailable(String),
+}
+
+/// Scrollable recent-project-history popup and runtime installation facts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectHistoryPopupView {
+    /// Newest-first embedded and optionally fetched commits, bounded to ten.
+    pub commits: Vec<ProjectCommitView>,
+    /// Full commit hash that produced this binary, when known.
+    pub current_hash: Option<String>,
+    /// Human-readable package/build origin.
+    pub installation: String,
+    /// Absolute executable path resolved by the running process.
+    pub executable_path: String,
+    /// Directory from which this process was launched.
+    pub started_in: String,
+    /// Optional source directory retained only for local builds.
+    pub build_source: Option<String>,
+    /// Status of the lazy online comparison.
+    pub remote_state: ProjectHistoryRemoteState,
+    /// Zero-based wrapped-line offset at the top of the viewport.
+    pub scroll_offset: usize,
+}
+
 /// Editable setup shown when a YouTube search needs provider credentials.
 ///
 /// The API key remains in controller-owned memory while the popup is open.
@@ -1437,6 +1485,8 @@ pub struct ViewModel {
     pub transient_footer_notice: Option<String>,
     /// Whether the help overlay is open.
     pub help_open: bool,
+    /// Offline-first recent commit history and runtime provenance.
+    pub project_history_popup: Option<ProjectHistoryPopupView>,
     /// Whether this terminal attachment can launch a graphical external opener.
     pub external_opener_available: bool,
     /// Whether output is attached directly to a Linux virtual console.
@@ -1527,6 +1577,7 @@ impl Default for ViewModel {
             status_line: "Press / to search or ? for help".to_owned(),
             transient_footer_notice: None,
             help_open: false,
+            project_history_popup: None,
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
@@ -1596,6 +1647,12 @@ pub enum UiAction {
     },
     /// Open or close the help overlay.
     ToggleHelp,
+    /// Open the offline-first recent project-history popup.
+    OpenProjectHistory,
+    /// Set the exact renderer-clamped project-history line offset.
+    SetProjectHistoryScroll(usize),
+    /// Close the project-history popup without changing the active screen.
+    DismissProjectHistory,
     /// Switch to a top-level screen.
     ShowScreen(Screen),
     /// Enter search-query editing mode.
@@ -3324,6 +3381,16 @@ struct HitMap {
     video_comments_scroll_maximum: usize,
     /// Number of wrapped comment lines visible on one page.
     video_comments_page_lines: usize,
+    /// Close control rendered inside the recent-project-history popup.
+    project_history_buttons: Vec<(UiAction, Rect)>,
+    /// Wrapped commit/provenance viewport inside the project-history popup.
+    project_history_text_area: Rect,
+    /// Actual first wrapped project-history line rendered in the viewport.
+    project_history_scroll_offset: usize,
+    /// Largest wrapped-line offset that changes the project-history viewport.
+    project_history_scroll_maximum: usize,
+    /// Number of project-history lines visible on one page.
+    project_history_page_lines: usize,
     youtube_setup_fields: Vec<(YouTubeSetupField, Rect)>,
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
     yandex_music_setup_field: Option<Rect>,
@@ -3785,6 +3852,7 @@ fn render_frame(
         .split(frame.area());
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
+        || view.project_history_popup.is_some()
         || view.youtube_setup_popup.is_some()
         || view.yandex_music_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
@@ -3866,6 +3934,14 @@ fn render_frame(
     }
     if view.help_open {
         render_help(frame, view, &theme);
+    }
+    hit_map.project_history_buttons.clear();
+    hit_map.project_history_text_area = Rect::default();
+    hit_map.project_history_scroll_offset = 0;
+    hit_map.project_history_scroll_maximum = 0;
+    hit_map.project_history_page_lines = 0;
+    if let Some(popup) = view.project_history_popup.as_ref() {
+        render_project_history_popup(frame, popup, &theme, hit_map);
     }
     hit_map.youtube_setup_fields.clear();
     hit_map.youtube_setup_buttons.clear();
@@ -7864,6 +7940,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         "  F2 offline     F3 history     Backspace back",
         "  F4 playlists     F5 stats     p preferences",
+        "  F9 recent commits and installation details",
         search_kind_help(view),
         "  j/k select     Enter open/play",
         "  ↪ internal video: click the marker after a YouTube URL",
@@ -7911,6 +7988,191 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Renders deterministic build history immediately and optional newer GitHub commits.
+fn render_project_history_popup(
+    frame: &mut Frame<'_>,
+    popup: &ProjectHistoryPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(92, 90, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Recent Youta commits ", theme), area);
+
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let content_area = sections[0];
+    let (text_area, scrollbar_area) = if content_area.width > 1 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(content_area);
+        (columns[0], columns[1])
+    } else {
+        (content_area, Rect::default())
+    };
+
+    let mut content = Vec::<Line<'static>>::new();
+    append_project_history_field(
+        &mut content,
+        "Installation",
+        &popup.installation,
+        text_area.width,
+        theme,
+    );
+    append_project_history_field(
+        &mut content,
+        "Executable",
+        &popup.executable_path,
+        text_area.width,
+        theme,
+    );
+    append_project_history_field(
+        &mut content,
+        "Started in",
+        &popup.started_in,
+        text_area.width,
+        theme,
+    );
+    if let Some(source) = popup.build_source.as_deref() {
+        append_project_history_field(&mut content, "Build source", source, text_area.width, theme);
+    }
+    let current_hash = popup.current_hash.as_deref().unwrap_or("unknown");
+    content.push(Line::styled(
+        format!("Current build: {}", short_project_commit_hash(current_hash)),
+        theme.selected,
+    ));
+    content.push(Line::raw(""));
+    let remote_status = match &popup.remote_state {
+        ProjectHistoryRemoteState::Embedded => "Showing history embedded at build time.".to_owned(),
+        ProjectHistoryRemoteState::Checking => "Checking GitHub for newer commits…".to_owned(),
+        ProjectHistoryRemoteState::UpToDate => "GitHub: embedded history is up to date.".to_owned(),
+        ProjectHistoryRemoteState::Updated => {
+            "GitHub: newer commits are cached in RAM for this process.".to_owned()
+        }
+        ProjectHistoryRemoteState::Unavailable(error) => {
+            format!("GitHub check unavailable: {error}. Showing embedded history.")
+        }
+    };
+    content.extend(
+        wrap_text_lines(&remote_status, text_area.width)
+            .into_iter()
+            .map(|line| Line::styled(line, theme.muted)),
+    );
+    content.push(Line::raw(""));
+
+    for (index, commit) in popup.commits.iter().take(10).enumerate() {
+        if index > 0 {
+            content.push(Line::raw(""));
+        }
+        let current = popup
+            .current_hash
+            .as_deref()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(&commit.hash));
+        let date = commit
+            .committed_at
+            .get(..10)
+            .unwrap_or(&commit.committed_at);
+        let header = format!(
+            "{} · {date}{}",
+            short_project_commit_hash(&commit.hash),
+            if current { " · current version" } else { "" }
+        );
+        let style = if current {
+            theme.selected
+        } else {
+            theme.heading
+        };
+        content.push(Line::styled(header, style));
+        content.extend(
+            wrap_text_lines(&commit.message, text_area.width)
+                .into_iter()
+                .map(|line| Line::styled(line, if current { theme.selected } else { theme.base })),
+        );
+    }
+    if popup.commits.is_empty() {
+        content.push(Line::styled("No embedded commit history.", theme.muted));
+    }
+
+    let content_len = content.len();
+    let visible_lines = usize::from(text_area.height);
+    let maximum_offset = content_len.saturating_sub(visible_lines);
+    let offset = popup.scroll_offset.min(maximum_offset);
+    hit_map.project_history_text_area = text_area;
+    hit_map.project_history_scroll_offset = offset;
+    hit_map.project_history_scroll_maximum = maximum_offset;
+    hit_map.project_history_page_lines = visible_lines.max(1);
+    frame.render_widget(
+        Paragraph::new(
+            content
+                .into_iter()
+                .skip(offset)
+                .take(visible_lines)
+                .collect::<Vec<_>>(),
+        ),
+        text_area,
+    );
+    if maximum_offset > 0 && scrollbar_area.width > 0 && scrollbar_area.height > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.muted)
+            .thumb_symbol("█")
+            .thumb_style(theme.accent);
+        let mut state = ScrollbarState::new(maximum_offset.saturating_add(1))
+            .position(offset)
+            .viewport_content_length(visible_lines);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+    }
+
+    let label = "[Esc] Close";
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[1],
+    );
+    let width = terminal_text_width(label).min(sections[1].width);
+    let x = sections[1]
+        .x
+        .saturating_add(sections[1].width.saturating_sub(width) / 2);
+    hit_map.project_history_buttons.push((
+        UiAction::DismissProjectHistory,
+        Rect::new(x, sections[1].y, width, 1),
+    ));
+}
+
+/// Appends one wrapping provenance field without losing long filesystem paths.
+fn append_project_history_field(
+    content: &mut Vec<Line<'static>>,
+    label: &str,
+    value: &str,
+    width: u16,
+    theme: &Theme,
+) {
+    let field = format!("{label}: {value}");
+    content.extend(
+        wrap_text_lines(&field, width)
+            .into_iter()
+            .map(|line| Line::styled(line, theme.base)),
+    );
+}
+
+/// Returns the conventional twelve-character display form of a full hash.
+fn short_project_commit_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 fn render_error_popup(
@@ -10291,6 +10553,17 @@ fn key_action_with_page_rows(
     hit_map: Option<&HitMap>,
 ) -> Option<UiAction> {
     if view.error_popup.is_none()
+        && view.project_history_popup.is_some()
+        && let Some(hit_map) = hit_map
+    {
+        return project_history_key_action(
+            key,
+            hit_map.project_history_scroll_offset,
+            hit_map.project_history_scroll_maximum,
+            hit_map.project_history_page_lines,
+        );
+    }
+    if view.error_popup.is_none()
         && view.video_comments_popup.is_some()
         && let Some(hit_map) = hit_map
     {
@@ -10303,6 +10576,34 @@ fn key_action_with_page_rows(
     }
     key_action_with_page_rows_unfiltered(key, view, page_rows)
         .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps modal project-history navigation to one resize-aware wrapped-line offset.
+fn project_history_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    let page_lines = page_lines.max(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::F(9) => Some(UiAction::DismissProjectHistory),
+        KeyCode::Up | KeyCode::Char('k') => {
+            Some(UiAction::SetProjectHistoryScroll(offset.saturating_sub(1)))
+        }
+        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetProjectHistoryScroll(
+            offset.saturating_add(1).min(maximum),
+        )),
+        KeyCode::PageUp => Some(UiAction::SetProjectHistoryScroll(
+            offset.saturating_sub(page_lines),
+        )),
+        KeyCode::PageDown => Some(UiAction::SetProjectHistoryScroll(
+            offset.saturating_add(page_lines).min(maximum),
+        )),
+        KeyCode::Home => Some(UiAction::SetProjectHistoryScroll(0)),
+        KeyCode::End => Some(UiAction::SetProjectHistoryScroll(maximum)),
+        _ => None,
+    }
 }
 
 /// Maps modal comments navigation to one resize-aware wrapped-line offset.
@@ -10364,6 +10665,9 @@ fn key_action_with_page_rows_unfiltered(
             KeyCode::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
             _ => None,
         };
+    }
+    if let Some(popup) = view.project_history_popup.as_ref() {
+        return project_history_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
     if let Some(popup) = view.video_comments_popup.as_ref() {
         return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
@@ -10631,6 +10935,7 @@ fn key_action_with_page_rows_unfiltered(
     if view.help_open {
         return match key.code {
             KeyCode::Char('?') | KeyCode::Esc => Some(UiAction::ToggleHelp),
+            KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
             KeyCode::Char('q') => Some(UiAction::Quit),
             _ => None,
         };
@@ -10690,6 +10995,7 @@ fn key_action_with_page_rows_unfiltered(
     match key.code {
         KeyCode::Char('q') => Some(UiAction::Quit),
         KeyCode::Char('?') => Some(UiAction::ToggleHelp),
+        KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
         KeyCode::Char('/') => Some(UiAction::BeginSearch),
         KeyCode::Char('p') | KeyCode::F(7) => Some(UiAction::OpenPreferences),
         KeyCode::Tab if reverse_tab_modifiers(key.modifiers) => {
@@ -11074,6 +11380,33 @@ fn mouse_action_unfiltered(
             }
             MouseEventKind::ScrollUp => {
                 Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
+            }
+            _ => None,
+        };
+    }
+    if view.project_history_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .project_history_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown
+                if contains(hit_map.project_history_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetProjectHistoryScroll(
+                    hit_map
+                        .project_history_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.project_history_scroll_maximum),
+                ))
+            }
+            MouseEventKind::ScrollUp
+                if contains(hit_map.project_history_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetProjectHistoryScroll(
+                    hit_map.project_history_scroll_offset.saturating_sub(3),
+                ))
             }
             _ => None,
         };
@@ -13867,6 +14200,7 @@ mod tests {
         assert!(!rendered.contains("M/F6 MOD/tracker music"));
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
+        assert!(rendered.contains("F9 recent commits and installation details"));
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         for border in ['┌', '┐', '└', '┘'] {
             assert!(

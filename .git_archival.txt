@@ -1,0 +1,4 @@
+hash: $Format:%H$
+committed-at: $Format:%cI$
+message:
+$Format:%B$

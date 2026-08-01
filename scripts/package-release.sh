@@ -77,6 +77,7 @@ trap cleanup EXIT
 
 package_name="youta-${version}-${operating_system}-${architecture}${archive_suffix}"
 package_root="${staging_directory}/${package_name}"
+export YOUTA_BUILD_ORIGIN=github-release
 
 if [[ ${variant} == text ]]; then
 	cargo build \

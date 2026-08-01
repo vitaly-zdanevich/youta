@@ -169,6 +169,7 @@ fn release_script_builds_both_portable_non_sqlite_variants() {
     assert!(script.contains("archive_suffix=-text"));
     assert!(script.contains("images)"));
     assert!(script.contains("text)"));
+    assert!(script.contains("YOUTA_BUILD_ORIGIN=github-release"));
     assert!(!script.contains("install -D"));
     assert!(script.contains("x86_64-unknown-linux-gnu"));
     assert!(script.contains("aarch64-unknown-linux-gnu"));
@@ -191,6 +192,7 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     }
     assert!(release.contains("dist images"));
     assert!(release.contains("dist text"));
+    assert!(release.contains("fetch-depth: 10"));
     assert!(release.contains("brew install gnu-tar"));
 
     let ci = read_repository_file(".github/workflows/ci.yml");
