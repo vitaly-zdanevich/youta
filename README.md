@@ -124,8 +124,6 @@ implement the same playback interface without changing screens or history.
 
 ## Current foundation
 
-The current pre-alpha foundation includes:
-
 - configuration-file plus `YOUTA_` environment overrides;
 - a source-neutral domain model for media, channels, queues, positions, notes,
   and provider capabilities;
@@ -155,7 +153,6 @@ The current pre-alpha foundation includes:
 - `doctor` and configuration inspection commands;
 - parsing foundations for optional SponsorBlock and DeArrow data.
 
-Exact commands and enabled adapters may change while the pre-alpha CLI settles.
 Run `youta --help` for the binary's authoritative command list.
 
 ### Additional provider boundaries
@@ -526,7 +523,7 @@ YOUTA_UI__THEME=dark youta
 YOUTA_PROVIDERS__YOUTUBE_API_KEY='...' youta search 'query'
 ```
 
-Do not place tokens in shell history. The current pre-alpha configuration
+Do not place tokens in shell history. The configuration
 layer accepts token fields as plain strings in `secrets/credentials.toml`. The
 TUI provider popup says where it will save the key and applies user-only Unix
 permissions. Environment injection avoids storing it on disk. A system-keyring
