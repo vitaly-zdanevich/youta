@@ -21,14 +21,6 @@ communicates with it over JSON IPC, and can use `yt-dlp` as an explicitly
 enabled media resolver and downloader. The terminal UI remains the only visible
 interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
 
-> **Project status: pre-alpha foundation.** The repository contains the first
-> working TUI and core state model, human-readable TOML persistence, optional
-> SQLite persistence, OPML import/export, configuration loading, official
-> YouTube Data API v3 and Invidious discovery, and supervised `mpv`/`yt-dlp`
-> integration. The larger provider, upload, remote sync, scrobbling, and
-> audiophile feature set described in the roadmap is not implemented yet.
-> Do not treat an existing Cargo feature name as a support claim.
-
 ## Why this design
 
 - The UI stays responsive while network, metadata, and playback work happen
