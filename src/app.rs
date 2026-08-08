@@ -1254,7 +1254,46 @@ struct LocalFingerprintCacheKey {
 #[derive(Clone)]
 struct CachedLocalFingerprint {
     candidates: Arc<Vec<MusicBrainzCandidate>>,
+    lastfm: CachedLocalFingerprintLastFm,
 }
+
+/// Delayed Last.fm enrichment retained with one exact fingerprint identity.
+#[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+#[derive(Clone, Default)]
+enum CachedLocalFingerprintLastFm {
+    /// Wikidata has not exposed an artist Last.fm identifier yet.
+    #[default]
+    NotRequested,
+    /// One generation-owned artist lookup is running on the provider worker.
+    Pending {
+        generation: u64,
+        recording_item_id: String,
+    },
+    /// A successful biography, confirmed absence, or failed best-effort fetch.
+    Complete {
+        recording_item_id: String,
+        biography: Option<Arc<LocalFingerprintLastFmBiography>>,
+    },
+}
+
+/// Render-safe artist biography joined from Wikidata and Last.fm.
+#[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalFingerprintLastFmBiography {
+    artist_item_id: String,
+    artist_label: String,
+    lastfm_id: String,
+    wiki_url: url::Url,
+    description: String,
+}
+
+/// Feature-neutral placeholder omitted from builds that cannot enrich artists.
+#[cfg(all(
+    feature = "acoustid",
+    not(all(feature = "lastfm", feature = "wikidata"))
+))]
+#[derive(Clone, Default)]
+struct CachedLocalFingerprintLastFm;
 
 /// Sole generation-owned fingerprint request visible to the controller.
 #[cfg(feature = "acoustid")]
@@ -1973,6 +2012,12 @@ enum ProviderRequest {
     WikidataStatements {
         item_id: String,
     },
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    LocalFingerprintLastFm {
+        generation: u64,
+        key: LocalFingerprintCacheKey,
+        recording_item_id: String,
+    },
     #[cfg(feature = "radio")]
     RadioNowPlaying {
         generation: u64,
@@ -2312,6 +2357,13 @@ enum ProviderResponse {
     WikidataStatements {
         item_id: String,
         result: Result<crate::providers::wikidata::WikidataEntityStatements, String>,
+    },
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    LocalFingerprintLastFm {
+        generation: u64,
+        key: LocalFingerprintCacheKey,
+        recording_item_id: String,
+        result: Result<Option<LocalFingerprintLastFmBiography>, String>,
     },
     #[cfg(feature = "radio")]
     RadioNowPlaying {
@@ -10590,17 +10642,20 @@ impl AppController {
                     self.pending_yandex_music_wikidata = None;
                 }
                 #[cfg(feature = "acoustid")]
-                if self
+                let fingerprint_property =
+                    crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                        .property_id();
+                #[cfg(feature = "acoustid")]
+                let local_fingerprint_lookup = self
                     .pending_local_fingerprint_wikidata
                     .as_ref()
                     .is_some_and(|pending| {
                         pending.generation == generation
                             && pending.recording_id == external_id
-                            && property_id
-                                == crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
-                                    .property_id()
-                    })
-                {
+                            && property_id == fingerprint_property
+                    });
+                #[cfg(feature = "acoustid")]
+                if local_fingerprint_lookup {
                     self.pending_local_fingerprint_wikidata = None;
                 }
                 if generation != self.wikidata_generation {
@@ -10640,6 +10695,12 @@ impl AppController {
                                 }
                                 apply_wikidata_links(details, &cached.items)
                             });
+                        #[cfg(all(feature = "acoustid", feature = "lastfm"))]
+                        if local_fingerprint_lookup {
+                            self.request_local_fingerprint_lastfm(
+                                cached.items.first().map(|item| item.item_id.as_str()),
+                            );
+                        }
                     }
                     Err(error) => {
                         if let Some(details) = self.view.details.as_mut() {
@@ -10682,6 +10743,63 @@ impl AppController {
                         } else {
                             "Wikidata properties are unavailable".to_owned()
                         };
+                    }
+                }
+            }
+            #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+            ProviderResponse::LocalFingerprintLastFm {
+                generation,
+                key,
+                recording_item_id,
+                result,
+            } => {
+                let matching_request =
+                    self.local_fingerprint_cache
+                        .get(&key)
+                        .is_some_and(|cached| {
+                            matches!(
+                                &cached.lastfm,
+                                CachedLocalFingerprintLastFm::Pending {
+                                    generation: pending_generation,
+                                    recording_item_id: pending_item,
+                                } if *pending_generation == generation
+                                    && pending_item == &recording_item_id
+                            )
+                        });
+                if !matching_request {
+                    return;
+                }
+                let biography = result.ok().flatten().map(Arc::new);
+                if let Some(cached) = self.local_fingerprint_cache.get_mut(&key) {
+                    cached.lastfm = CachedLocalFingerprintLastFm::Complete {
+                        recording_item_id,
+                        biography: biography.clone(),
+                    };
+                }
+                if self
+                    .selected_local_fingerprint_target()
+                    .is_some_and(|(_, selected_key)| selected_key == key)
+                    && let Some(biography) = biography
+                    && let Some(details) = self.view.details.as_mut()
+                {
+                    // Wikidata rendered before this follow-up started. Merge
+                    // only Last.fm-owned fields so a concurrent same-recording
+                    // refresh cannot hide the already-visible Wikidata link.
+                    details.lastfm_artist_description = biography.description.clone();
+                    let link = DetailLinkView {
+                        label: format!("Last.fm artist wiki · {}", biography.artist_label),
+                        url: biography.wiki_url.to_string(),
+                        wikidata_item_id: None,
+                        ..DetailLinkView::default()
+                    };
+                    if let Some(index) = details
+                        .links
+                        .iter()
+                        .position(|link| link.label.starts_with("Last.fm artist wiki · "))
+                    {
+                        details.links[index] = link;
+                    } else {
+                        details.links.push(link);
                     }
                 }
             }
@@ -16311,6 +16429,7 @@ impl AppController {
             key.clone(),
             CachedLocalFingerprint {
                 candidates: Arc::new(candidates),
+                lastfm: CachedLocalFingerprintLastFm::default(),
             },
         );
         self.local_fingerprint_cache_order.push_back(key);
@@ -16326,19 +16445,32 @@ impl AppController {
             if let Some(details) = self.view.details.as_mut() {
                 details.local_fingerprint_available = false;
                 details.local_fingerprint_pending = false;
+                details.lastfm_artist_description.clear();
                 details.links.clear();
             }
             return None;
         };
+        let retained_wikidata_links = (self.displayed_local_fingerprint.as_ref() == Some(&key))
+            .then(|| {
+                self.view
+                    .details
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|details| details.links.iter())
+                    .filter(|link| link.wikidata_item_id.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let pending = self
             .pending_local_fingerprint
             .as_ref()
             .is_some_and(|pending| pending.key == key);
-        let candidates = self
+        let cached = self
             .local_fingerprint_cache
             .get(&key)
-            .map(|cached| Arc::clone(&cached.candidates));
-        let fingerprinted = candidates.is_some();
+            .map(|cached| (Arc::clone(&cached.candidates), cached.lastfm.clone()));
+        let fingerprinted = cached.is_some();
         if fingerprinted {
             self.promote_local_fingerprint_cache_key(&key);
             self.displayed_local_fingerprint = Some(key.clone());
@@ -16354,8 +16486,11 @@ impl AppController {
         };
         details.local_fingerprint_available = !fingerprinted;
         details.local_fingerprint_pending = pending;
+        details.lastfm_artist_description.clear();
         details.links.clear();
-        let candidates = candidates?;
+        let (candidates, lastfm) = cached?;
+        #[cfg(not(all(feature = "lastfm", feature = "wikidata")))]
+        let _ = lastfm;
         details
             .links
             .extend(
@@ -16373,6 +16508,23 @@ impl AppController {
                         ..DetailLinkView::default()
                     }),
             );
+        #[cfg(all(feature = "lastfm", feature = "wikidata"))]
+        if let CachedLocalFingerprintLastFm::Complete {
+            biography: Some(biography),
+            ..
+        } = lastfm
+        {
+            details.lastfm_artist_description = biography.description.clone();
+            details.links.push(DetailLinkView {
+                label: format!("Last.fm artist wiki · {}", biography.artist_label),
+                url: biography.wiki_url.to_string(),
+                wikidata_item_id: None,
+                ..DetailLinkView::default()
+            });
+        }
+        // A same-file metadata refresh must not make already-visible Wikidata
+        // identity disappear while its identical lookup is still pending.
+        details.links.extend(retained_wikidata_links);
         candidates
             .first()
             .map(|candidate| candidate.recording_id().to_owned())
@@ -16506,6 +16658,15 @@ impl AppController {
         let generation = self.wikidata_generation;
         let kind = crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording;
         if self.apply_fresh_cached_wikidata(kind, recording_id) {
+            let now = unix_time();
+            let item_id = self
+                .store
+                .cached_wikidata(kind.property_id(), recording_id)
+                .ok()
+                .flatten()
+                .filter(|cached| cached.is_fresh_at(now))
+                .and_then(|cached| cached.items.first().map(|item| item.item_id.clone()));
+            self.request_local_fingerprint_lastfm(item_id.as_deref());
             return;
         }
         if self.send_wikidata_request(generation, kind, recording_id) {
@@ -16515,6 +16676,61 @@ impl AppController {
             });
         }
     }
+
+    /// Starts best-effort artist biography enrichment after Wikidata is visible.
+    ///
+    /// The exact local file identity owns the request and its RAM result. A
+    /// slow response can therefore populate only the fingerprint cache entry
+    /// that initiated it, never whichever track happens to be selected later.
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    fn request_local_fingerprint_lastfm(&mut self, recording_item_id: Option<&str>) {
+        let Some(recording_item_id) = recording_item_id else {
+            return;
+        };
+        let Some((_, key)) = self.selected_local_fingerprint_target() else {
+            return;
+        };
+        let already_resolved = self
+            .local_fingerprint_cache
+            .get(&key)
+            .is_some_and(|cached| match &cached.lastfm {
+                CachedLocalFingerprintLastFm::Pending {
+                    recording_item_id: pending,
+                    ..
+                }
+                | CachedLocalFingerprintLastFm::Complete {
+                    recording_item_id: pending,
+                    ..
+                } => pending == recording_item_id,
+                CachedLocalFingerprintLastFm::NotRequested => false,
+            });
+        if already_resolved {
+            return;
+        }
+        let generation = self.wikidata_generation;
+        let request = ProviderRequest::LocalFingerprintLastFm {
+            generation,
+            key: key.clone(),
+            recording_item_id: recording_item_id.to_owned(),
+        };
+        if !self
+            .provider_requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(request).is_ok())
+        {
+            return;
+        }
+        if let Some(cached) = self.local_fingerprint_cache.get_mut(&key) {
+            cached.lastfm = CachedLocalFingerprintLastFm::Pending {
+                generation,
+                recording_item_id: recording_item_id.to_owned(),
+            };
+        }
+    }
+
+    /// Omits optional Last.fm enrichment from builds without its provider.
+    #[cfg(all(feature = "acoustid", feature = "wikidata", not(feature = "lastfm")))]
+    fn request_local_fingerprint_lastfm(&mut self, _recording_item_id: Option<&str>) {}
 
     /// Keeps Local fingerprint links functional in builds without Wikidata.
     #[cfg(all(feature = "acoustid", not(feature = "wikidata")))]
@@ -26199,6 +26415,8 @@ fn provider_worker(
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    let lastfm = crate::providers::lastfm::LastFmProvider::new();
     #[cfg(feature = "radio")]
     let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
     #[cfg(feature = "bbc-radio")]
@@ -26937,6 +27155,41 @@ fn provider_worker(
                     .map_err(|error| error.to_string());
                 if responses
                     .send(ProviderResponse::WikidataStatements { item_id, result })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+            ProviderRequest::LocalFingerprintLastFm {
+                generation,
+                key,
+                recording_item_id,
+            } => {
+                let result = wikidata
+                    .lookup_lastfm_artist(&recording_item_id)
+                    .and_then(|artist| {
+                        let Some(artist) = artist else {
+                            return Ok(None);
+                        };
+                        lastfm.artist_biography(&artist.lastfm_id).map(|biography| {
+                            biography.map(|biography| LocalFingerprintLastFmBiography {
+                                artist_item_id: artist.item_id,
+                                artist_label: artist.label,
+                                lastfm_id: artist.lastfm_id,
+                                wiki_url: biography.wiki_url,
+                                description: biography.description,
+                            })
+                        })
+                    })
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::LocalFingerprintLastFm {
+                        generation,
+                        key,
+                        recording_item_id,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -44408,6 +44661,26 @@ mod tests {
             .expect("valid fingerprint candidate fixture")
     }
 
+    /// Creates one exact full-wiki result without contacting Last.fm.
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    fn local_fingerprint_lastfm_biography() -> LocalFingerprintLastFmBiography {
+        LocalFingerprintLastFmBiography {
+            artist_item_id: "Q654321".to_owned(),
+            artist_label: "тема креста".to_owned(),
+            lastfm_id: "тема+креста".to_owned(),
+            wiki_url: url::Url::parse(
+                "https://www.last.fm/music/%D1%82%D0%B5%D0%BC%D0%B0+%D0%BA%D1%80%D0%B5%D1%81%D1%82%D0%B0/+wiki",
+            )
+            .expect("Last.fm fixture URL"),
+            description: concat!(
+                "самая конфликтная, самая нищебродская и самая сексистская группа.\n",
+                "новейший дип-хоп - местами абстракт хип-хоп\n",
+                "калька на весь бомонд авангардного хип-хопа с примесью женской страдальческой эстетики"
+            )
+            .to_owned(),
+        }
+    }
+
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
@@ -44809,6 +45082,347 @@ mod tests {
             result: Ok(Vec::new()),
         });
         assert!(controller.pending_local_fingerprint_wikidata.is_none());
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn fingerprint_wikidata_is_visible_before_lastfm_artist_description_arrives() {
+        const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm enrichment fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("selected fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                RECORDING_ID,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        let first_recording = controller.apply_local_fingerprint_details();
+        controller.request_local_fingerprint_wikidata(first_recording.as_deref());
+        let (generation, external_id) = provider_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Wikidata {
+                    generation,
+                    kind: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording,
+                    external_id,
+                } if external_id == RECORDING_ID => Some((generation, external_id)),
+                _ => None,
+            })
+            .expect("MusicBrainz Wikidata request");
+
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                .property_id()
+                .to_owned(),
+            external_id,
+            result: Ok(vec![crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: Some("musical recording".to_owned()),
+                url: url::Url::parse(&format!("https://www.wikidata.org/wiki/{RECORDING_ITEM}"))
+                    .expect("Wikidata fixture URL"),
+            }]),
+        });
+
+        let details = controller.view.details.as_ref().expect("Local Details");
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM)),
+            "the recording Wikidata link must render before Last.fm finishes"
+        );
+        assert!(details.lastfm_artist_description.is_empty());
+        let (generation, requested_key, recording_item_id) = provider_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::LocalFingerprintLastFm {
+                    generation,
+                    key,
+                    recording_item_id,
+                } => Some((generation, key, recording_item_id)),
+                _ => None,
+            })
+            .expect("deferred Last.fm request");
+        assert_eq!(requested_key, key);
+        assert_eq!(recording_item_id, RECORDING_ITEM);
+
+        let biography = local_fingerprint_lastfm_biography();
+        let description = biography.description.clone();
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation,
+            key,
+            recording_item_id,
+            result: Ok(Some(biography)),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("enriched Local Details");
+        assert_eq!(details.lastfm_artist_description, description);
+        assert!(details.links.iter().any(|link| {
+            link.label == "Last.fm artist wiki · тема креста" && link.url.ends_with("/+wiki")
+        }));
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| { link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM) })
+        );
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn late_lastfm_artist_description_cannot_replace_another_local_track() {
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary stale Last.fm fixture");
+        let first = media.path().join("first.flac");
+        let second = media.path().join("second.flac");
+        std::fs::write(&first, b"first audio fixture").expect("write first fixture");
+        std::fs::write(&second, b"second audio fixture").expect("write second fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &first);
+        let first_key = controller
+            .selected_local_fingerprint_target()
+            .expect("first fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            first_key.clone(),
+            vec![local_fingerprint_candidate(
+                "11111111-1111-4111-8111-111111111111",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller
+            .local_fingerprint_cache
+            .get_mut(&first_key)
+            .expect("first fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        select_local_fingerprint_fixture(&mut controller, media.path(), &second);
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key: first_key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Ok(Some(local_fingerprint_lastfm_biography())),
+        });
+
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("second Local Details")
+                .lastfm_artist_description
+                .is_empty(),
+            "a late result must not appear on the newly selected file"
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &first);
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("revisited first Details");
+        assert!(
+            details
+                .lastfm_artist_description
+                .contains("самая конфликтная")
+        );
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.label.starts_with("Last.fm artist wiki"))
+                .count(),
+            1,
+            "cached metadata rebuilds must not duplicate the source link"
+        );
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn lastfm_failure_keeps_the_already_visible_wikidata_link() {
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm failure fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                "11111111-1111-4111-8111-111111111111",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller.apply_local_fingerprint_details();
+        apply_wikidata_links(
+            controller.view.details.as_mut().expect("Local Details"),
+            &[crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: None,
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q123456")
+                    .expect("Wikidata fixture URL"),
+            }],
+        );
+        controller
+            .local_fingerprint_cache
+            .get_mut(&key)
+            .expect("fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Err("Last.fm returned HTTP 406".to_owned()),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details remain");
+        assert!(details.lastfm_artist_description.is_empty());
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM))
+        );
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn lastfm_success_keeps_visible_wikidata_during_same_recording_refresh() {
+        const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm refresh fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                RECORDING_ID,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller.apply_local_fingerprint_details();
+        apply_wikidata_links(
+            controller.view.details.as_mut().expect("Local Details"),
+            &[crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: None,
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q123456")
+                    .expect("Wikidata fixture URL"),
+            }],
+        );
+        let old_lastfm_index = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details")
+            .links
+            .len();
+        let details = controller.view.details.as_mut().expect("Local Details");
+        details.lastfm_artist_description = "obsolete biography".to_owned();
+        details.links.push(DetailLinkView {
+            label: "Last.fm artist wiki · obsolete artist".to_owned(),
+            url: "https://www.last.fm/music/obsolete/+wiki".to_owned(),
+            wikidata_item_id: None,
+            ..DetailLinkView::default()
+        });
+        controller.pending_local_fingerprint_wikidata = Some(PendingLocalFingerprintWikidata {
+            generation: controller.wikidata_generation,
+            recording_id: RECORDING_ID.to_owned(),
+        });
+        controller
+            .local_fingerprint_cache
+            .get_mut(&key)
+            .expect("fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        let biography = local_fingerprint_lastfm_biography();
+        let description = biography.description.clone();
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Ok(Some(biography)),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details remain");
+        assert_eq!(details.lastfm_artist_description, description);
+        assert!(details.links.iter().any(|link| {
+            link.label == "Last.fm artist wiki · тема креста" && link.url.ends_with("/+wiki")
+        }));
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.label.starts_with("Last.fm artist wiki · "))
+                .count(),
+            1,
+            "a refreshed biography must replace the obsolete Last.fm link"
+        );
+        assert_eq!(
+            details.links[old_lastfm_index].label, "Last.fm artist wiki · тема креста",
+            "the refreshed Last.fm link should preserve its display position"
+        );
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM)),
+            "Last.fm success must not hide the already-visible Wikidata link"
+        );
+        assert!(controller.pending_local_fingerprint_wikidata.is_some());
     }
 
     #[cfg(feature = "acoustid")]

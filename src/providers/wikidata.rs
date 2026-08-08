@@ -113,6 +113,22 @@ pub struct WikidataExternalLookup {
     pub items: Vec<WikidataLink>,
 }
 
+/// One artist identity suitable for a Last.fm biography lookup.
+///
+/// The artist normally comes from a recording's performer statement (P175).
+/// When the supplied Wikidata item itself carries P3192, the resolver can use
+/// that exact item only after Wikidata classifies it as a musical ensemble or
+/// as a human with a musician occupation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WikidataLastFmArtist {
+    /// Stable Wikidata Q identifier for the resolved artist item.
+    pub item_id: String,
+    /// Best available localized artist label, or [`Self::item_id`] when absent.
+    pub label: String,
+    /// Exact Last.fm external identifier stored in Wikidata property P3192.
+    pub lastfm_id: String,
+}
+
 /// Human-facing statements loaded for one exact Wikidata item.
 ///
 /// Claims are grouped by property while preserving the order of values within
@@ -290,6 +306,33 @@ impl WikidataProvider {
         let response: SparqlResponse =
             get_bounded_json(&self.agent, &url, self.max_response_bytes)?;
         normalize_response(kind, external_id, response)
+    }
+
+    /// Resolves one recording item's preferred performer with a Last.fm ID.
+    ///
+    /// One bounded SPARQL request first follows performer (P175) to Last.fm ID
+    /// (P3192). The exact supplied item is a lower-priority fallback only when
+    /// Wikidata classifies it as a musical ensemble or as a human with a
+    /// musician occupation. This also supports callers that already hold an
+    /// artist Q identifier without adding a second request. Multiple P3192
+    /// statements are ordered deterministically by source, URL-path safety,
+    /// statement rank, identifier text, and artist Q identifier. Slash-free
+    /// identifiers win because Last.fm otherwise interprets a slash as an
+    /// additional path segment rather than part of an artist identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid Wikidata Q identifier, a failed or
+    /// oversized response, more than one result despite the query bound, or
+    /// malformed artist and Last.fm identifiers.
+    pub fn lookup_lastfm_artist(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<WikidataLastFmArtist>, ProviderError> {
+        let url = build_lastfm_artist_url(&self.formatter_query_endpoint, item_id)?;
+        let response: LastFmArtistSparqlResponse =
+            get_bounded_json(&self.agent, &url, self.max_response_bytes)?;
+        normalize_lastfm_artist_response(response)
     }
 
     /// Lazily loads bounded, human-facing statements for one Wikidata item.
@@ -578,6 +621,53 @@ LIMIT {MAX_RESULTS}"#,
     url.query_pairs_mut()
         .append_pair("query", &query)
         .append_pair("format", "json");
+    Ok(url)
+}
+
+/// Builds one injection-safe query for a recording performer or direct artist.
+fn build_lastfm_artist_url(endpoint: &Url, item_id: &str) -> Result<Url, ProviderError> {
+    validate_item_id(item_id)?;
+    let query = format!(
+        r#"SELECT ?artist ?artistLabel ?lastFmId ?sourcePriority ?pathPriority ?rankPriority WHERE {{
+  VALUES ?recording {{ wd:{item_id} }}
+  {{
+    ?recording wdt:P175 ?artist .
+    BIND(0 AS ?sourcePriority)
+  }}
+  UNION
+  {{
+    {{
+      ?recording wdt:P31/wdt:P279* wd:Q2088357 .
+    }}
+    UNION
+    {{
+      ?recording wdt:P31 wd:Q5 ;
+                 wdt:P106/wdt:P279* wd:Q639669 .
+    }}
+    BIND(?recording AS ?artist)
+    BIND(1 AS ?sourcePriority)
+  }}
+  ?artist p:P3192 ?lastFmStatement .
+  ?lastFmStatement ps:P3192 ?lastFmId ;
+                   wikibase:rank ?lastFmRank .
+  BIND(IF(CONTAINS(STR(?lastFmId), "/"), 1, 0) AS ?pathPriority)
+  BIND(IF(
+    ?lastFmRank = wikibase:PreferredRank,
+    0,
+    IF(?lastFmRank = wikibase:NormalRank, 1, 2)
+  ) AS ?rankPriority)
+  SERVICE wikibase:label {{
+    bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en" .
+  }}
+}}
+ORDER BY ?sourcePriority ?pathPriority ?rankPriority LCASE(STR(?lastFmId)) STR(?lastFmId) ?artist
+LIMIT 1"#
+    );
+    let mut url = endpoint.clone();
+    url.query_pairs_mut()
+        .append_pair("query", &query)
+        .append_pair("format", "json")
+        .append_pair("maxlag", "5");
     Ok(url)
 }
 
@@ -2191,6 +2281,53 @@ fn normalize_response(
     })
 }
 
+/// Validates the one-row Last.fm artist response returned by the bounded query.
+fn normalize_lastfm_artist_response(
+    response: LastFmArtistSparqlResponse,
+) -> Result<Option<WikidataLastFmArtist>, ProviderError> {
+    if response.results.bindings.len() > 1 {
+        return Err(ProviderError::InvalidResponse(
+            "Wikidata returned more than one Last.fm artist despite LIMIT 1".to_owned(),
+        ));
+    }
+    let Some(binding) = response.results.bindings.into_iter().next() else {
+        return Ok(None);
+    };
+    let item_id = wikidata_item_id(&binding.artist.value)?;
+    let lastfm_id = binding.lastfm_id.value;
+    if !valid_lastfm_id(&lastfm_id) {
+        return Err(ProviderError::InvalidResponse(
+            "Wikidata returned an invalid Last.fm ID".to_owned(),
+        ));
+    }
+    let label = binding
+        .artist_label
+        .map(|value| value.value)
+        .filter(|value| valid_artist_label(value) && value != &item_id)
+        .unwrap_or_else(|| item_id.clone());
+    Ok(Some(WikidataLastFmArtist {
+        item_id,
+        label,
+        lastfm_id,
+    }))
+}
+
+/// Accepts Wikidata external IDs without changing URL-significant text.
+fn valid_lastfm_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_VALUE_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+/// Bounds an optional display label before it reaches controller-owned views.
+fn valid_artist_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_VALUE_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 fn wikidata_item_id(uri: &str) -> Result<String, ProviderError> {
     wikidata_entity_id(uri, 'Q', "item")
 }
@@ -2368,6 +2505,26 @@ struct SparqlValue {
 }
 
 #[derive(Debug, Deserialize)]
+struct LastFmArtistSparqlResponse {
+    results: LastFmArtistSparqlResults,
+}
+
+#[derive(Debug, Deserialize)]
+struct LastFmArtistSparqlResults {
+    #[serde(default)]
+    bindings: Vec<LastFmArtistSparqlBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LastFmArtistSparqlBinding {
+    artist: SparqlValue,
+    #[serde(rename = "artistLabel")]
+    artist_label: Option<SparqlValue>,
+    #[serde(rename = "lastFmId")]
+    lastfm_id: SparqlValue,
+}
+
+#[derive(Debug, Deserialize)]
 struct FormatterSparqlResponse {
     results: FormatterSparqlResults,
 }
@@ -2541,6 +2698,189 @@ mod tests {
         assert!(query.contains(&format!("VALUES ?externalId {{ \"{RECORDING_ID}\" }}")));
         assert!(query.contains("wdt:P4404 ?externalId"));
         assert!(query.contains("LIMIT 20"));
+    }
+
+    #[test]
+    fn lastfm_artist_query_prefers_p175_and_proves_the_direct_item_is_an_artist() {
+        let endpoint =
+            Url::parse("https://query.wikidata.org/sparql").expect("Wikidata query endpoint");
+        let url = build_lastfm_artist_url(&endpoint, "Q1747485").expect("Last.fm artist query URL");
+        let query = url
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .expect("SPARQL query");
+
+        assert!(query.contains("VALUES ?recording { wd:Q1747485 }"));
+        assert!(query.contains("?recording wdt:P175 ?artist"));
+        assert!(query.contains("?artist p:P3192 ?lastFmStatement"));
+        assert!(query.contains("?lastFmStatement ps:P3192 ?lastFmId"));
+        assert!(query.contains("wikibase:rank ?lastFmRank"));
+        assert!(query.contains("BIND(?recording AS ?artist)"));
+        assert!(query.contains("wdt:P31/wdt:P279* wd:Q2088357"));
+        assert!(query.contains("wdt:P31 wd:Q5"));
+        assert!(query.contains("wdt:P106/wdt:P279* wd:Q639669"));
+        assert!(query.contains("BIND(IF(CONTAINS(STR(?lastFmId), \"/\"), 1, 0) AS ?pathPriority)"));
+        assert!(query.contains("ORDER BY ?sourcePriority ?pathPriority ?rankPriority"));
+        assert!(query.contains("LCASE(STR(?lastFmId)) STR(?lastFmId) ?artist"));
+        assert!(query.contains("LIMIT 1"));
+    }
+
+    #[test]
+    fn lastfm_artist_lookup_resolves_one_performer_in_one_request() {
+        let fixture = serde_json::json!({
+            "results": {
+                "bindings": [{
+                    "artist": {
+                        "type": "uri",
+                        "value": "http://www.wikidata.org/entity/Q216337"
+                    },
+                    "artistLabel": {"type": "literal", "value": "G-Unit"},
+                    "lastFmId": {"type": "literal", "value": "G-Unit"}
+                }]
+            }
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![json_response("200 OK", &fixture)]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        let result = provider
+            .lookup_lastfm_artist("Q1747485")
+            .expect("Last.fm artist lookup")
+            .expect("performer with a Last.fm ID");
+        let requests = server.finish();
+
+        assert_eq!(
+            result,
+            WikidataLastFmArtist {
+                item_id: "Q216337".to_owned(),
+                label: "G-Unit".to_owned(),
+                lastfm_id: "G-Unit".to_owned(),
+            }
+        );
+        assert_eq!(requests.len(), 1, "the resolver must use one network call");
+        let request_url = server_url(&requests[0]);
+        assert_eq!(request_url.path(), "/sparql");
+        assert_eq!(
+            request_url
+                .query_pairs()
+                .find(|(key, _)| key == "format")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn lastfm_artist_lookup_accepts_the_artist_constrained_direct_item_fallback() {
+        let fixture = serde_json::json!({
+            "results": {
+                "bindings": [{
+                    "artist": {
+                        "type": "uri",
+                        "value": "http://www.wikidata.org/entity/Q15862"
+                    },
+                    "artistLabel": {"type": "literal", "value": "Queen"},
+                    "lastFmId": {"type": "literal", "value": "Queen"}
+                }]
+            }
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![json_response("200 OK", &fixture)]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        let result = provider
+            .lookup_lastfm_artist("Q15862")
+            .expect("direct Last.fm artist lookup")
+            .expect("direct artist fallback");
+
+        assert_eq!(result.item_id, "Q15862");
+        assert_eq!(result.label, "Queen");
+        assert_eq!(result.lastfm_id, "Queen");
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn lastfm_artist_lookup_returns_none_for_an_empty_result() {
+        let server = MockServer::spawn(vec![json_response(
+            "200 OK",
+            r#"{"results":{"bindings":[]}}"#,
+        )]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        assert_eq!(
+            provider
+                .lookup_lastfm_artist("Q1747485")
+                .expect("empty Last.fm artist lookup"),
+            None
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn lastfm_artist_lookup_rejects_invalid_qids_before_network() {
+        let provider = WikidataProvider::new();
+
+        for invalid in ["", "Q0", "Q01", "q42", "Q42 } UNION { ?x ?y ?z"] {
+            assert!(matches!(
+                provider.lookup_lastfm_artist(invalid),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn lastfm_artist_lookup_rejects_untrusted_bindings() {
+        for fixture in [
+            serde_json::json!({
+                "results": {
+                    "bindings": [{
+                        "artist": {"type": "uri", "value": "https://evil.test/entity/Q15862"},
+                        "artistLabel": {"type": "literal", "value": "Queen"},
+                        "lastFmId": {"type": "literal", "value": "Queen"}
+                    }]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "results": {
+                    "bindings": [{
+                        "artist": {
+                            "type": "uri",
+                            "value": "http://www.wikidata.org/entity/Q15862"
+                        },
+                        "artistLabel": {"type": "literal", "value": "Queen"},
+                        "lastFmId": {"type": "literal", "value": "\n"}
+                    }]
+                }
+            })
+            .to_string(),
+        ] {
+            let server = MockServer::spawn(vec![json_response("200 OK", &fixture)]);
+            let provider = WikidataProvider::with_statement_endpoints(
+                server.base_url.join("w/api.php").expect("entity API URL"),
+                MAX_ENTITY_RESPONSE_BYTES,
+                MAX_LABEL_RESPONSE_BYTES,
+            );
+
+            assert!(matches!(
+                provider.lookup_lastfm_artist("Q1747485"),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert_eq!(server.finish().len(), 1);
+        }
     }
 
     #[test]

@@ -601,6 +601,11 @@ pub struct DetailView {
     pub length: String,
     /// Description text.
     pub description: String,
+    /// Full Last.fm artist biography discovered after local fingerprinting.
+    ///
+    /// This enrichment is kept separate from [`Self::description`] so a late
+    /// network completion cannot duplicate or overwrite rebuilt local metadata.
+    pub lastfm_artist_description: String,
     /// Parsed timecode spans that can seek or start the selected media.
     pub timecodes: Vec<DetailTimecodeView>,
     /// Parsed `YouTube` video URLs that may replace Details internally.
@@ -6642,8 +6647,23 @@ fn render_information_panel(
             |entity| entity.text.as_str(),
         )
     });
+    let lastfm_description = (!details.lastfm_artist_description.is_empty()).then(|| {
+        if details.description.is_empty() {
+            format!(
+                "Last.fm artist description:\n{}",
+                details.lastfm_artist_description
+            )
+        } else {
+            format!(
+                "{}\n\nLast.fm artist description:\n{}",
+                details.description, details.lastfm_artist_description
+            )
+        }
+    });
     let body_is_wikidata = expanded_wikidata_text.is_some();
-    let body_source = expanded_wikidata_text.unwrap_or(&details.description);
+    let body_source = expanded_wikidata_text
+        .or_else(|| lastfm_description.as_deref())
+        .unwrap_or(&details.description);
     let wikidata_value_links = expanded_wikidata_entity
         .map(|entity| entity.value_links.as_slice())
         .unwrap_or_default();
@@ -6724,6 +6744,7 @@ fn render_information_panel(
                         } else {
                             append_description_source_spans(
                                 details,
+                                body_source,
                                 start_byte,
                                 end_byte,
                                 active_line,
@@ -6936,6 +6957,7 @@ fn append_wikidata_source_spans<'a>(
 )]
 fn append_description_source_spans<'a>(
     details: &'a DetailView,
+    source: &'a str,
     start_byte: usize,
     end_byte: usize,
     active_line: bool,
@@ -6955,11 +6977,11 @@ fn append_description_source_spans<'a>(
         let start = timecode.start_byte.max(start_byte);
         let end = timecode.end_byte.min(end_byte);
         if source_cursor < start {
-            let plain = &details.description[source_cursor..start];
+            let plain = &source[source_cursor..start];
             *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
             spans.push(Span::raw(plain));
         }
-        let linked = &details.description[start..end];
+        let linked = &source[start..end];
         let linked_width = terminal_text_width(linked);
         spans.push(Span::styled(
             linked,
@@ -6991,7 +7013,7 @@ fn append_description_source_spans<'a>(
         source_cursor = end;
     }
     if source_cursor < end_byte {
-        let plain = &details.description[source_cursor..end_byte];
+        let plain = &source[source_cursor..end_byte];
         *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
         spans.push(Span::raw(plain));
     }
@@ -26975,6 +26997,39 @@ prose 07:25 remains clickable but is not a chapter";
             ),
             Some(UiAction::FingerprintLocalAudio)
         );
+    }
+
+    #[test]
+    fn local_fingerprint_lastfm_description_joins_the_scrollable_details_body() {
+        let backend = TestBackend::new(110, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                title: "Track.flac".to_owned(),
+                source: "Local audio".to_owned(),
+                description: "Full path: /music/Track.flac".to_owned(),
+                lastfm_artist_description: concat!(
+                    "самая конфликтная, самая нищебродская и самая сексистская группа.\n",
+                    "новейший дип-хоп - местами абстракт хип-хоп\n",
+                    "калька на весь бомонд авангардного хип-хопа с примесью женской страдальческой эстетики"
+                )
+                .to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Last.fm artist description");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Full path: /music/Track.flac"));
+        assert!(rendered.contains("Last.fm artist description:"));
+        assert!(rendered.contains("самая конфликтная"));
+        assert!(hit_map.details_scroll_maximum > 0);
     }
 
     #[cfg(feature = "local-trash")]

@@ -55,8 +55,15 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   and duration to [AcoustID](https://acoustid.org/). Ranked
   [MusicBrainz](https://musicbrainz.org/) recording links are cached in bounded
   RAM by file identity; the best match is also offered to Wikidata enrichment
-  when that feature is enabled. Changing the selection cancels obsolete work,
-  and Youta never scans or uploads local media automatically.
+  through [MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404)
+  when that feature is enabled. Once the recording's Wikidata link is visible,
+  the optional `lastfm` adapter follows its performer to
+  [Last.fm ID (P3192)](https://www.wikidata.org/wiki/Property:P3192) and requests
+  the artist's full public `/+wiki` biography as a separate best-effort step.
+  Biography text and its attribution link remain in the same identity-bound
+  RAM cache; Last.fm errors do not delay or remove the Wikidata result.
+  Changing the selection cancels obsolete fingerprint work, and Youta never
+  scans or uploads local media automatically.
   A conservative display-only fallback repairs strong Windows-1251 text that
   legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
   are never rewritten.
@@ -340,6 +347,7 @@ No Wikidata request is made at startup. The current mappings are:
 | SoundCloud account or track path | [SoundCloud ID (P3040)](https://www.wikidata.org/wiki/Property:P3040) |
 | Bilibili video | [Bilibili video ID (P6456)](https://www.wikidata.org/wiki/Property:P6456) |
 | Bilibili channel/user | [Bilibili user ID (P6455)](https://www.wikidata.org/wiki/Property:P6455) |
+| Fingerprinted local recording | [MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404) |
 
 Each response is limited to 512 KiB and 20 matches. Successful lookups are
 cached in the selected persistence backend for seven days; successful empty
@@ -1185,7 +1193,7 @@ The roadmap is intentionally tiered:
    discovery, Wikimedia Commons, Internet Archive, LibriVox, Podcast Index,
    and gpodder.net.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
-   bidirectional local/YouTube subscription sync, Last.fm, Discord,
+   bidirectional local/YouTube subscription sync, Last.fm scrobbling, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
 4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex Disk,
    VK, cloud.mail.ru, 4duk, knizhnyvoz, archive files, and

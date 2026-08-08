@@ -67,6 +67,7 @@ app-core = [
     "bandcamp",
     "apple-podcasts",
     "litres",
+    "lastfm",
     "sponsorblock",
     "dearrow",
     "wikidata",
