@@ -4477,6 +4477,18 @@ fn watched_marker(watched_percent: u8, playback_started: bool) -> &'static str {
     }
 }
 
+/// Whether a row carries complete YouTube-video presentation metadata.
+///
+/// YouTube and `YouTube Music` share [`SourceKind::YouTube`] identities. The
+/// live video row constructor supplies the exact `YouTube` presentation label
+/// together with orientation, while restored rows without that semantic detail
+/// retain the source-neutral progress presentation instead of being guessed.
+fn uses_youtube_video_title_style(row: &RowView) -> bool {
+    row.media_id
+        .as_ref()
+        .is_some_and(|media_id| media_id.source == SourceKind::YouTube && row.source == "YouTube")
+}
+
 /// Returns the end of the first standalone duration field in row metadata.
 ///
 /// Subtitles retain their source-specific text and ordering. This recognizes
@@ -4677,7 +4689,16 @@ fn render_row_list(
             };
             let has_playback_progress = row.media_id.is_some() && !row.hide_watched_marker;
             let playback_started = row.playback_started || row.watched_percent > 0;
-            let mut title_style = if !selected && row.vertical {
+            let youtube_video_title = uses_youtube_video_title_style(row);
+            let mut title_style = if selected {
+                row_style
+            } else if youtube_video_title && playback_started {
+                if row.vertical {
+                    theme.vertical_video_started
+                } else {
+                    theme.muted
+                }
+            } else if row.vertical {
                 let style = theme.vertical_video;
                 if playing {
                     style.add_modifier(Modifier::BOLD)
@@ -4687,9 +4708,22 @@ fn render_row_list(
             } else {
                 row_style
             };
-            if has_playback_progress && playback_started && allow_started_title_italics {
+            if youtube_video_title && !selected {
+                if playback_started {
+                    title_style = title_style
+                        .remove_modifier(Modifier::BOLD)
+                        .remove_modifier(Modifier::ITALIC);
+                } else {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+            } else if !youtube_video_title
+                && has_playback_progress
+                && playback_started
+                && allow_started_title_italics
+            {
                 title_style = title_style.add_modifier(Modifier::ITALIC);
             }
+            let show_watched_marker = has_playback_progress && !youtube_video_title;
             let marker = if row.subscribed { "◆" } else { " " };
             let progress = if !has_playback_progress || row.watched_percent == 0 {
                 String::new()
@@ -4729,11 +4763,6 @@ fn render_row_list(
                 })
             });
             let recording_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-            let watched_marker = if has_playback_progress {
-                watched_marker(row.watched_percent, playback_started)
-            } else {
-                " "
-            };
             let mut title_spans = if row.compact {
                 let mut spans = Vec::with_capacity(3);
                 if playing {
@@ -4748,8 +4777,11 @@ fn render_row_list(
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
-                if has_playback_progress {
-                    spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                if show_watched_marker {
+                    spans.push(Span::styled(
+                        format!("{} ", watched_marker(row.watched_percent, playback_started)),
+                        watched_style,
+                    ));
                 }
                 spans
             } else if show_source {
@@ -4763,21 +4795,36 @@ fn render_row_list(
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
-                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                if show_watched_marker {
+                    spans.push(Span::styled(
+                        format!("{} ", watched_marker(row.watched_percent, playback_started)),
+                        watched_style,
+                    ));
+                }
                 spans
             } else if playing {
                 let mut spans = vec![Span::styled(format!("{playing_symbol} "), row_style)];
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
-                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                if show_watched_marker {
+                    spans.push(Span::styled(
+                        format!("{} ", watched_marker(row.watched_percent, playback_started)),
+                        watched_style,
+                    ));
+                }
                 spans
             } else {
                 let mut spans = Vec::with_capacity(2);
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
-                spans.push(Span::styled(format!("{watched_marker} "), watched_style));
+                if show_watched_marker {
+                    spans.push(Span::styled(
+                        format!("{} ", watched_marker(row.watched_percent, playback_started)),
+                        watched_style,
+                    ));
+                }
                 spans
             };
             title_spans.push(Span::styled(&row.title, title_style));
@@ -12360,6 +12407,8 @@ struct Theme {
     /// Restrained terminal-palette pink used by the playing description chapter.
     active_chapter: Style,
     vertical_video: Style,
+    /// Dimmed vertical-video title after playback is accepted by the backend.
+    vertical_video_started: Style,
     muted: Style,
     cached: Style,
     progress: Style,
@@ -12370,12 +12419,12 @@ impl Theme {
     ///
     /// A Linux virtual console has no dependable true-color or italic text,
     /// so its vertical-video accent uses the closest named ANSI color. The
-    /// watched-state renderer separately suppresses italics while retaining
-    /// the explicit playback marker.
+    /// video-title renderer uses weight and named colors instead of italics.
     fn for_terminal(funny_mode: bool, physical_linux_console: bool) -> Self {
         let mut theme = Self::new(funny_mode);
         if physical_linux_console && !funny_mode {
             theme.vertical_video = Style::default().fg(Color::LightMagenta);
+            theme.vertical_video_started = Style::default().fg(Color::Magenta);
         }
         theme
     }
@@ -12395,6 +12444,7 @@ impl Theme {
                 accent: Style::default().fg(Color::LightMagenta),
                 active_chapter: Style::default().fg(Color::LightMagenta),
                 vertical_video: Style::default().fg(Color::LightCyan),
+                vertical_video_started: Style::default().fg(Color::Cyan),
                 muted: Style::default().fg(Color::DarkGray),
                 cached: Style::default().fg(Color::DarkGray).bg(Color::Reset),
                 progress: Style::default().fg(Color::LightMagenta).bg(Color::Black),
@@ -12413,6 +12463,9 @@ impl Theme {
                 // remains available without true-color support.
                 active_chapter: Style::default().fg(Color::Magenta),
                 vertical_video: Style::default().fg(Color::Rgb(255, 105, 180)),
+                vertical_video_started: Style::default()
+                    .fg(Color::Rgb(255, 105, 180))
+                    .add_modifier(Modifier::DIM),
                 muted: Style::default().fg(Color::DarkGray),
                 cached: Style::default().fg(Color::DarkGray).bg(Color::Reset),
                 progress: Style::default().fg(Color::Cyan),
@@ -13952,7 +14005,7 @@ mod tests {
     }
 
     #[test]
-    fn vertical_video_titles_keep_playing_and_selection_precedence() {
+    fn vertical_video_titles_keep_playing_and_selection_visibility() {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let playing = MediaId::new(SourceKind::YouTube, "playing-vertical");
@@ -14008,22 +14061,135 @@ mod tests {
             })
             .expect("draw vertical-video colors");
         let buffer = terminal.backend().buffer();
-        let playing_title = &buffer[(6, 1)];
+        let playing_title = &buffer[(4, 1)];
         assert_eq!(playing_title.symbol(), "P");
         assert_eq!(playing_title.fg, Color::Rgb(255, 105, 180));
-        assert!(playing_title.modifier.contains(Modifier::BOLD));
-        assert!(playing_title.modifier.contains(Modifier::ITALIC));
-        let idle_title = &buffer[(6, 3)];
+        assert!(!playing_title.modifier.contains(Modifier::BOLD));
+        assert!(playing_title.modifier.contains(Modifier::DIM));
+        assert!(!playing_title.modifier.contains(Modifier::ITALIC));
+        let idle_title = &buffer[(4, 3)];
         assert_eq!(idle_title.symbol(), "V");
         assert_eq!(idle_title.fg, Color::Rgb(255, 105, 180));
-        assert!(!idle_title.modifier.contains(Modifier::BOLD));
+        assert!(idle_title.modifier.contains(Modifier::BOLD));
+        assert!(!idle_title.modifier.contains(Modifier::DIM));
         assert!(!idle_title.modifier.contains(Modifier::ITALIC));
-        let selected_title = &buffer[(6, 5)];
+        let selected_title = &buffer[(4, 5)];
         assert_eq!(selected_title.symbol(), "S");
         assert_eq!(selected_title.fg, Color::Black);
         assert_eq!(selected_title.bg, Color::Cyan);
-        assert!(selected_title.modifier.contains(Modifier::ITALIC));
+        assert!(selected_title.modifier.contains(Modifier::BOLD));
+        assert!(!selected_title.modifier.contains(Modifier::DIM));
+        assert!(!selected_title.modifier.contains(Modifier::ITALIC));
         assert_eq!(buffer[(0, 1)].symbol(), "▶");
+    }
+
+    #[test]
+    fn youtube_titles_replace_watched_markers_with_weight_and_brightness() {
+        let backend = TestBackend::new(120, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            rows: vec![
+                RowView {
+                    title: "Selected channel source".to_owned(),
+                    source: "YouTube channel".to_owned(),
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "regular-unplayed")),
+                    title: "Regular unplayed".to_owned(),
+                    source: "YouTube".to_owned(),
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "regular-started")),
+                    title: "Regular started".to_owned(),
+                    source: "YouTube".to_owned(),
+                    playback_started: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "short-unplayed")),
+                    title: "Short unplayed".to_owned(),
+                    source: "YouTube".to_owned(),
+                    vertical: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "short-started")),
+                    title: "Short started".to_owned(),
+                    source: "YouTube".to_owned(),
+                    playback_started: true,
+                    vertical: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "music-started")),
+                    title: "Music started".to_owned(),
+                    source: "YouTube Music".to_owned(),
+                    watched_percent: 50,
+                    playback_started: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "restored-started")),
+                    title: "Restored without video metadata".to_owned(),
+                    source: SourceKind::YouTube.to_string(),
+                    watched_percent: 50,
+                    playback_started: true,
+                    ..RowView::default()
+                },
+            ],
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_body(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                );
+            })
+            .expect("draw YouTube title playback states");
+        let buffer = terminal.backend().buffer();
+        let regular_unplayed = &buffer[(4, 3)];
+        let regular_started = &buffer[(4, 5)];
+        let short_unplayed = &buffer[(4, 7)];
+        let short_started = &buffer[(4, 9)];
+
+        assert_eq!(regular_unplayed.symbol(), "R");
+        assert!(regular_unplayed.modifier.contains(Modifier::BOLD));
+        assert_eq!(regular_started.symbol(), "R");
+        assert_eq!(regular_started.fg, Color::DarkGray);
+        assert!(!regular_started.modifier.contains(Modifier::BOLD));
+        assert!(!regular_started.modifier.contains(Modifier::ITALIC));
+        assert_eq!(short_unplayed.symbol(), "S");
+        assert_eq!(short_unplayed.fg, Color::Rgb(255, 105, 180));
+        assert!(short_unplayed.modifier.contains(Modifier::BOLD));
+        assert!(!short_unplayed.modifier.contains(Modifier::DIM));
+        assert_eq!(short_started.symbol(), "S");
+        assert_eq!(short_started.fg, Color::Rgb(255, 105, 180));
+        assert!(!short_started.modifier.contains(Modifier::BOLD));
+        assert!(short_started.modifier.contains(Modifier::DIM));
+        assert!(!short_started.modifier.contains(Modifier::ITALIC));
+        for row in [3_u16, 5, 7, 9] {
+            assert!(
+                (0..4).all(|column| !matches!(buffer[(column, row)].symbol(), "●" | "◐" | "○")),
+                "YouTube video row {row} must not reserve a watched-state circle"
+            );
+        }
+        assert_eq!(buffer[(4, 11)].symbol(), "◐");
+        assert_eq!(buffer[(6, 11)].symbol(), "M");
+        assert!(buffer[(6, 11)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buffer[(4, 13)].symbol(), "◐");
+        assert_eq!(buffer[(6, 13)].symbol(), "R");
+        assert!(buffer[(6, 13)].modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -14042,6 +14208,18 @@ mod tests {
             Theme::for_terminal(false, true).vertical_video.fg,
             Some(Color::LightMagenta),
             "the physical Linux console must not receive a true-color text style"
+        );
+        assert_eq!(
+            Theme::for_terminal(false, true).vertical_video_started.fg,
+            Some(Color::Magenta),
+            "a started Short needs a visibly darker Linux-console pink"
+        );
+        assert!(
+            !Theme::for_terminal(false, true)
+                .vertical_video_started
+                .add_modifier
+                .contains(Modifier::DIM),
+            "the Linux console strips DIM, so its started Short style must use color"
         );
     }
 
@@ -14083,7 +14261,7 @@ mod tests {
     }
 
     #[test]
-    fn list_rows_show_subscription_and_watched_state_independently() {
+    fn list_rows_show_subscription_and_video_title_state_independently() {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
@@ -14162,14 +14340,17 @@ mod tests {
         );
         assert_eq!(
             buffer[(4, 1)].symbol(),
-            "●",
-            "an unwatched row has a playback marker regardless of subscription"
+            "U",
+            "an unplayed video title reclaims the watched-marker column"
         );
+        assert!(buffer[(4, 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(
             buffer[(4, 3)].symbol(),
-            "◐",
-            "a partially watched row has a playback marker regardless of subscription"
+            "U",
+            "a partially watched video title starts in the reclaimed column"
         );
+        assert_eq!(buffer[(4, 3)].fg, Color::DarkGray);
+        assert!(!buffer[(4, 3)].modifier.contains(Modifier::BOLD));
         assert_eq!(
             buffer[(2, 5)].symbol(),
             "◆",
@@ -14177,38 +14358,40 @@ mod tests {
         );
         assert_eq!(
             buffer[(4, 5)].symbol(),
-            "○",
-            "more than 90 percent watched uses the completed marker"
+            "S",
+            "a completed video title follows its subscription marker directly"
         );
+        assert_eq!(buffer[(4, 5)].fg, Color::DarkGray);
+        assert!(!buffer[(4, 5)].modifier.contains(Modifier::BOLD));
         assert_eq!(
             buffer[(4, 7)].symbol(),
-            " ",
-            "a non-playable channel source has no watched-state marker"
+            "S",
+            "a non-playable channel title follows the subscription column directly"
         );
         assert_eq!(
             buffer[(4, 9)].symbol(),
-            " ",
-            "a live item suppresses watched-state presentation"
+            "L",
+            "a live item suppresses watched-state spacing as well as its marker"
         );
         assert!(
-            !buffer[(6, 1)].modifier.contains(Modifier::ITALIC),
-            "unwatched titles remain roman"
-        );
-        assert!(
-            buffer[(6, 3)].modifier.contains(Modifier::ITALIC),
-            "partially watched titles are italic"
-        );
-        assert!(
-            buffer[(6, 5)].modifier.contains(Modifier::ITALIC),
-            "completed titles are italic"
+            !buffer[(4, 1)].modifier.contains(Modifier::ITALIC),
+            "unplayed titles remain roman"
         );
         assert!(
             !buffer[(4, 3)].modifier.contains(Modifier::ITALIC),
-            "only the title, not its progress marker, is italic"
+            "partially watched video titles use brightness rather than italics"
         );
         assert!(
-            !buffer[(6, 9)].modifier.contains(Modifier::ITALIC),
+            !buffer[(4, 5)].modifier.contains(Modifier::ITALIC),
+            "completed video titles use brightness rather than italics"
+        );
+        assert!(
+            !buffer[(4, 9)].modifier.contains(Modifier::ITALIC),
             "suppressed live progress cannot italicize a title"
+        );
+        assert!(
+            !rendered.contains(['●', '◐', '○']),
+            "YouTube video rows must not expose watched-state circles"
         );
         assert!(
             rendered.contains(" 90%"),
@@ -14225,7 +14408,7 @@ mod tests {
         let width = 80;
         let backend = TestBackend::new(width, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let full_width_title = "T".repeat(usize::from(width.saturating_sub(6)));
+        let full_width_title = "T".repeat(usize::from(width.saturating_sub(4)));
         let rows = vec![
             RowView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, "duration-last")),
@@ -14360,17 +14543,24 @@ mod tests {
     }
 
     #[test]
-    fn accepted_zero_position_start_is_partial_and_italic_without_zero_percent() {
+    fn accepted_zero_position_start_dims_title_without_zero_percent() {
         let backend = TestBackend::new(100, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
-            rows: vec![RowView {
-                media_id: Some(MediaId::new(SourceKind::YouTube, "accepted-start")),
-                title: "Accepted at zero".to_owned(),
-                source: "YouTube".to_owned(),
-                playback_started: true,
-                ..RowView::default()
-            }],
+            rows: vec![
+                RowView {
+                    title: "Selected channel source".to_owned(),
+                    source: "YouTube channel".to_owned(),
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "accepted-start")),
+                    title: "Accepted at zero".to_owned(),
+                    source: "YouTube".to_owned(),
+                    playback_started: true,
+                    ..RowView::default()
+                },
+            ],
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -14396,8 +14586,11 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert_eq!(buffer[(4, 1)].symbol(), "◐");
-        assert!(buffer[(6, 1)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buffer[(4, 3)].symbol(), "A");
+        assert_eq!(buffer[(4, 3)].fg, Color::DarkGray);
+        assert!(!buffer[(4, 3)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(4, 3)].modifier.contains(Modifier::ITALIC));
+        assert!(!rendered.contains(['●', '◐', '○']));
         assert!(
             !rendered.contains("   0%"),
             "accepted playback must not fabricate a visible percentage"
@@ -14405,18 +14598,40 @@ mod tests {
     }
 
     #[test]
-    fn physical_linux_console_keeps_started_titles_roman_and_color_stable() {
-        let backend = TestBackend::new(100, 8);
+    fn physical_linux_console_uses_weight_and_named_colors_for_video_states() {
+        let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             physical_linux_console: true,
-            rows: vec![RowView {
-                media_id: Some(MediaId::new(SourceKind::YouTube, "tty-started")),
-                title: "Started on a Linux console".to_owned(),
-                source: "YouTube".to_owned(),
-                playback_started: true,
-                ..RowView::default()
-            }],
+            rows: vec![
+                RowView {
+                    title: "Selected channel source".to_owned(),
+                    source: "YouTube channel".to_owned(),
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "tty-started")),
+                    title: "Started on a Linux console".to_owned(),
+                    source: "YouTube".to_owned(),
+                    playback_started: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "tty-short-unplayed")),
+                    title: "Unplayed Short on a Linux console".to_owned(),
+                    source: "YouTube".to_owned(),
+                    vertical: true,
+                    ..RowView::default()
+                },
+                RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "tty-short-started")),
+                    title: "Started Short on a Linux console".to_owned(),
+                    source: "YouTube".to_owned(),
+                    playback_started: true,
+                    vertical: true,
+                    ..RowView::default()
+                },
+            ],
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -14429,7 +14644,7 @@ mod tests {
                     &view,
                     true,
                     DEFAULT_THUMBNAIL_HEIGHT,
-                    &Theme::new(false),
+                    &Theme::for_terminal(false, true),
                     &mut hit_map,
                     None,
                 );
@@ -14437,10 +14652,28 @@ mod tests {
             .expect("draw physical-console playback state");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(4, 1)].symbol(), "◐");
+        let regular_started = &buffer[(4, 3)];
+        assert_eq!(regular_started.symbol(), "S");
+        assert_eq!(regular_started.fg, Color::DarkGray);
+        assert!(!regular_started.modifier.contains(Modifier::BOLD));
         assert!(
-            !buffer[(6, 1)].modifier.contains(Modifier::ITALIC),
-            "the Linux console simulates italic with color, so its state marker must carry progress"
+            !regular_started.modifier.contains(Modifier::ITALIC),
+            "the Linux console must use title brightness instead of unsupported italics"
+        );
+        let short_unplayed = &buffer[(4, 5)];
+        assert_eq!(short_unplayed.symbol(), "U");
+        assert_eq!(short_unplayed.fg, Color::LightMagenta);
+        assert!(short_unplayed.modifier.contains(Modifier::BOLD));
+        let short_started = &buffer[(4, 7)];
+        assert_eq!(short_started.symbol(), "S");
+        assert_eq!(short_started.fg, Color::Magenta);
+        assert!(!short_started.modifier.contains(Modifier::BOLD));
+        assert!(!short_started.modifier.contains(Modifier::DIM));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| { !matches!(cell.symbol(), "●" | "◐" | "○") })
         );
     }
 
@@ -17220,8 +17453,8 @@ mod tests {
             "subscription videos must omit the redundant channel marker"
         );
         assert!(
-            rendered.contains("▶ ● Fixture video"),
-            "playing subscription videos keep one compact separator before the watched marker"
+            rendered.contains("▶ Fixture video"),
+            "playing subscription videos keep only the active-playback marker"
         );
         assert!(rendered.contains("Expanded fixture description"));
         assert!(rendered.contains("[R] Refresh videos"));
@@ -17269,8 +17502,8 @@ mod tests {
             "split subscription rows must also omit the repeated source"
         );
         assert!(
-            rendered.contains("▶ ● Fixture video"),
-            "split subscription rows keep the same compact marker spacing"
+            rendered.contains("▶ Fixture video"),
+            "split subscription rows keep only the active-playback marker"
         );
         assert!(rendered.contains("[R] Refresh videos"));
         assert!(rendered.contains("[i] Details"));
