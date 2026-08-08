@@ -1642,10 +1642,10 @@ pub const STATIONS: &[RadioStationPreset] = &[
         id: "radiosega",
         name: "RadioSEGA",
         homepage: "https://www.radiosega.net/",
-        stream: "https://icecast.radiosega.net/rs-flac.ogg",
-        summary: "SEGA video-game music around the clock in lossless audio.",
-        codec: Some(RadioCodec::Flac),
-        bitrate_kbps: None,
+        stream: "https://icecast.radiosega.net/rs-opus.ogg",
+        summary: "SEGA video-game music around the clock.",
+        codec: Some(RadioCodec::Opus),
+        bitrate_kbps: Some(128),
         sample_rate_hz: Some(48_000),
         channels: Some(2),
         stream_kind: RadioStreamKind::Direct,
@@ -2055,7 +2055,6 @@ mod tests {
                 "radio-bergeijk-flac",
                 "radio-calico-flac",
                 "radio-campus-grenoble-flac",
-                "radiosega",
                 "rlocale-radio-flac",
                 "sector-radio-progressive-flac",
             ],
@@ -2304,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_lossless_catalogue_has_ten_distinct_verified_flac_stations() {
+    fn curated_lossless_catalogue_has_ten_distinct_verified_flac_stations() {
         let expected = [
             (
                 "kalx-berkeley-flac",
@@ -2342,11 +2341,11 @@ mod tests {
                 Some(48_000),
             ),
             (
-                "radiosega",
-                "https://www.radiosega.net/",
-                "https://icecast.radiosega.net/rs-flac.ogg",
+                "sector-radio-progressive-flac",
+                "https://www.sectorradio.com/",
+                "http://89.223.45.5:8000/progressive-flac",
                 None,
-                Some(48_000),
+                Some(44_100),
             ),
             (
                 "pure-classix-radio-flac",
@@ -2395,6 +2394,21 @@ mod tests {
                 "FLAC presets should represent distinct broadcasters"
             );
         }
+    }
+
+    #[test]
+    fn radiosega_uses_working_high_quality_opus_mount() {
+        let station = station_by_id("radiosega").expect("RadioSEGA preset should exist");
+
+        assert_eq!(station.homepage, "https://www.radiosega.net/");
+        assert_eq!(station.stream, "https://icecast.radiosega.net/rs-opus.ogg");
+        assert_eq!(station.summary, "SEGA video-game music around the clock.");
+        assert_eq!(station.codec, Some(RadioCodec::Opus));
+        assert_eq!(station.bitrate_kbps, Some(128));
+        assert_eq!(station.sample_rate_hz, Some(48_000));
+        assert_eq!(station.channels, Some(2));
+        assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+        assert_eq!(station.now_playing, None);
     }
 
     #[test]
