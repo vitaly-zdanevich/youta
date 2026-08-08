@@ -641,7 +641,7 @@ fn yandex_music_mixed_search_keeps_spoken_word_results() {
     );
 }
 
-/// Decodes public regional, playlist, and FLAC streams, then parses station metadata.
+/// Decodes public regional, playlist, and curated-codec streams, then parses station metadata.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 #[test]
 #[ignore = "requires public radio streams, metadata endpoints, mpv, and ffprobe"]
@@ -727,79 +727,79 @@ fn radio_stream_and_passive_metadata_are_usable() {
         "Radio Palitra's official stream no longer serves MP3 audio"
     );
 
-    for station_id in [
-        "kalx-berkeley-flac",
-        "radio-calico-flac",
-        "intense-radio-flac",
-        "openbroadcast-flac",
-        "radio-bergeijk-flac",
-        "pure-classix-radio-flac",
-        "radio-campus-grenoble-flac",
-        "radiosega",
-        "rlocale-radio-flac",
-        "1zwolle-flac",
+    for (station_id, expected_codec) in [
+        ("kalx-berkeley-flac", "flac"),
+        ("radio-calico-flac", "flac"),
+        ("intense-radio-flac", "flac"),
+        ("openbroadcast-flac", "flac"),
+        ("radio-bergeijk-flac", "flac"),
+        ("pure-classix-radio-flac", "flac"),
+        ("radio-campus-grenoble-flac", "flac"),
+        ("sector-radio-progressive-flac", "flac"),
+        ("rlocale-radio-flac", "flac"),
+        ("1zwolle-flac", "flac"),
+        ("radiosega", "opus"),
     ] {
-        let lossless = station_by_id(station_id).expect("public FLAC radio fixture");
+        let station = station_by_id(station_id).expect("public curated-codec radio fixture");
         assert_eq!(
-            probe_live_audio_codec(station_id, lossless.stream),
-            "flac",
-            "{station_id} no longer serves FLAC audio"
+            probe_live_audio_codec(station_id, station.stream),
+            expected_codec,
+            "{station_id} no longer serves its declared {expected_codec} audio"
         );
-        let fixture_title = format!("Youta live FLAC smoke: {station_id}");
-        let mut input = PlaybackInput::new(lossless.stream);
+        let fixture_title = format!("Youta live codec smoke: {station_id}");
+        let mut input = PlaybackInput::new(station.stream);
         input.title = Some(fixture_title.clone());
         backend
             .play(&input)
             .unwrap_or_else(|error| panic!("open {station_id} through Youta: {error}"));
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut lossless_active = false;
-        let mut lossless_baseline = None;
-        let mut lossless_advance = Duration::ZERO;
-        let mut lossless_diagnostic = None;
+        let mut audio_active = false;
+        let mut audio_baseline = None;
+        let mut audio_advance = Duration::ZERO;
+        let mut audio_diagnostic = None;
         while Instant::now() < deadline {
             match backend.status() {
                 Ok(status) => {
-                    let is_lossless_fixture =
-                        status.title.as_deref() == Some(fixture_title.as_str());
-                    lossless_active |= is_lossless_fixture && !status.idle;
-                    if is_lossless_fixture && !status.idle {
-                        if let Some(baseline) = lossless_baseline {
+                    let is_audio_fixture = status.title.as_deref() == Some(fixture_title.as_str());
+                    audio_active |= is_audio_fixture && !status.idle;
+                    if is_audio_fixture && !status.idle {
+                        if let Some(baseline) = audio_baseline {
                             if status.position < baseline {
-                                lossless_baseline = Some(status.position);
-                                lossless_advance = Duration::ZERO;
+                                audio_baseline = Some(status.position);
+                                audio_advance = Duration::ZERO;
                             } else {
-                                lossless_advance =
-                                    lossless_advance.max(status.position.saturating_sub(baseline));
+                                audio_advance =
+                                    audio_advance.max(status.position.saturating_sub(baseline));
                             }
                         } else {
-                            lossless_baseline = Some(status.position);
+                            audio_baseline = Some(status.position);
                         }
                     }
                 }
                 Err(error) => {
-                    lossless_diagnostic = Some(error.to_string());
+                    audio_diagnostic = Some(error.to_string());
                     break;
                 }
             }
             match backend.poll_event() {
                 Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
                 | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
-                    lossless_diagnostic = Some(format!("{event:?}"));
+                    audio_diagnostic = Some(format!("{event:?}"));
                 }
                 Ok(_) => {}
-                Err(error) => lossless_diagnostic = Some(error.to_string()),
+                Err(error) => audio_diagnostic = Some(error.to_string()),
             }
-            if lossless_active && lossless_advance >= Duration::from_secs(1) {
+            if audio_active && audio_advance >= Duration::from_secs(1) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
         assert!(
-            lossless_active && lossless_advance >= Duration::from_secs(1),
-            "{station_id} FLAC audio did not advance after its first current-title timestamp; \
-             baseline: {lossless_baseline:?}; advance: {lossless_advance:?}; backend \
+            audio_active && audio_advance >= Duration::from_secs(1),
+            "{station_id} {expected_codec} audio did not advance after its first current-title \
+             timestamp; baseline: {audio_baseline:?}; advance: {audio_advance:?}; backend \
              diagnostic: {}",
-            lossless_diagnostic.as_deref().unwrap_or("none")
+            audio_diagnostic.as_deref().unwrap_or("none")
         );
     }
     backend.shutdown().expect("stop Radio playback cleanly");
