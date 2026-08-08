@@ -5950,7 +5950,7 @@ dependencies = [
 
 [[package]]
 name = "youta"
-version = "0.26.2"
+version = "0.26.3"
 dependencies = [
  "aes",
  "anyhow",
@@ -5997,7 +5997,7 @@ dependencies = [
 
 [[package]]
 name = "youta-gui"
-version = "0.26.2"
+version = "0.26.3"
 dependencies = [
  "serde",
  "serde_json",

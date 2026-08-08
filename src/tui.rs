@@ -9682,8 +9682,12 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::Down => Some(UiAction::ChangeVolume(-5)),
         KeyCode::Char('<') | KeyCode::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
         KeyCode::Char('>') | KeyCode::Char('.') => Some(UiAction::ChangeSpeed(0.1)),
-        KeyCode::Char('[') if !view.playback.live => Some(UiAction::ChangeChapter(-1)),
-        KeyCode::Char(']') if !view.playback.live => Some(UiAction::ChangeChapter(1)),
+        KeyCode::Char('[') if view.playback.seeking_available() && !view.playback.live => {
+            Some(UiAction::ChangeChapter(-1))
+        }
+        KeyCode::Char(']') if view.playback.seeking_available() && !view.playback.live => {
+            Some(UiAction::ChangeChapter(1))
+        }
         KeyCode::Char('r') => Some(UiAction::ToggleRepeat),
         KeyCode::Char('w')
             if !key
@@ -10160,7 +10164,7 @@ fn mouse_action_unfiltered(
             if contains(hit_map.details_panel, mouse.column, mouse.row) {
                 return Some(UiAction::SetDetailsFocus(true));
             }
-            if !view.playback.live {
+            if view.playback.seeking_available() && !view.playback.live {
                 for (action, area) in &hit_map.seek_markers {
                     if contains(*area, mouse.column, mouse.row) {
                         return Some(action.clone());
@@ -12653,7 +12657,13 @@ mod tests {
 
     #[test]
     fn key_map_separates_seek_controls_from_details_history() {
-        let view = ViewModel::default();
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
         let alt_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
         let alt_right = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
         assert_eq!(key_action(alt_left, &view), Some(UiAction::GoBack));
@@ -12674,6 +12684,7 @@ mod tests {
         assert_eq!(key_action(five, &view), Some(UiAction::SeekPercent(50.0)));
         let mut live = ViewModel {
             playback: PlaybackStatus {
+                idle: false,
                 live: true,
                 ..PlaybackStatus::default()
             },
@@ -24853,7 +24864,13 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn mouse_seek_maps_horizontal_position_to_percent() {
-        let view = ViewModel::default();
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
         let hit_map = HitMap {
             seek_bar: Rect::new(10, 20, 101, 2),
             now_playing: Some(Rect::new(10, 21, 20, 1)),
@@ -24872,9 +24889,47 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn idle_playback_ignores_stale_keyboard_and_mouse_seek_targets() {
+        let view = ViewModel::default();
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('5'),
+            KeyCode::Char('['),
+            KeyCode::Char(']'),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(code, KeyModifiers::NONE), &view),
+                None
+            );
+        }
+        let hit_map = HitMap {
+            seek_bar: Rect::new(10, 20, 101, 1),
+            seek_markers: vec![(UiAction::SeekPercent(25.0), Rect::new(35, 19, 1, 1))],
+            ..HitMap::default()
+        };
+        for (column, row) in [(35, 19), (60, 20)] {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn live_playback_ignores_stale_mouse_seek_targets() {
         let mut view = ViewModel {
             playback: PlaybackStatus {
+                idle: false,
                 live: true,
                 ..PlaybackStatus::default()
             },

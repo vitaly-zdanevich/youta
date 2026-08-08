@@ -15903,9 +15903,11 @@ impl AppController {
                 .filter(|(candidate, _)| candidate == &media_id)
                 .cloned()
         {
-            self.seek_back.pop_back();
-            self.player_command(PlayerCommand::SeekAbsolute(position));
-            self.view.status_line = format!("Returned to {}", format_seconds(position.as_secs()));
+            if self.seek_player_command(PlayerCommand::SeekAbsolute(position)) {
+                self.seek_back.pop_back();
+                self.view.status_line =
+                    format!("Returned to {}", format_seconds(position.as_secs()));
+            }
             return;
         }
         if let Some(previous) = self.previous_detail.take() {
@@ -15927,7 +15929,7 @@ impl AppController {
     /// Seeks by seconds while constraining live Radio to mpv's cached window.
     fn seek_relative(&mut self, seconds: i64) {
         if !self.current_media_is_radio() {
-            self.player_command(PlayerCommand::SeekRelative(seconds));
+            self.seek_player_command(PlayerCommand::SeekRelative(seconds));
             return;
         }
         let Some(range) = self.live_radio_seek_range() else {
@@ -15945,7 +15947,7 @@ impl AppController {
             current.saturating_add(distance)
         }
         .clamp(range.start, range.end);
-        self.player_command(PlayerCommand::SeekAbsolute(
+        self.seek_player_command(PlayerCommand::SeekAbsolute(
             target.min(live_seek_upper_bound(range)),
         ));
     }
@@ -15953,7 +15955,7 @@ impl AppController {
     /// Seeks by bar percentage while preserving a live Radio cache origin.
     fn seek_percent(&mut self, percent: f64) {
         if !self.current_media_is_radio() {
-            self.player_command(PlayerCommand::SeekPercent(percent));
+            self.seek_player_command(PlayerCommand::SeekPercent(percent));
             return;
         }
         let Some(range) = self.live_radio_seek_range() else {
@@ -15968,7 +15970,7 @@ impl AppController {
             .end
             .saturating_sub(range.start)
             .mul_f64(percent.clamp(0.0, 100.0) / 100.0);
-        self.player_command(PlayerCommand::SeekAbsolute(
+        self.seek_player_command(PlayerCommand::SeekAbsolute(
             range
                 .start
                 .saturating_add(offset)
@@ -16044,6 +16046,9 @@ impl AppController {
             return;
         }
         let previous = self.view.playback.position;
+        if !self.seek_player_command(PlayerCommand::SeekAbsolute(target)) {
+            return;
+        }
         if previous != target {
             const MAX_SEEK_BACK_ENTRIES: usize = 32;
             if self.seek_back.len() == MAX_SEEK_BACK_ENTRIES {
@@ -16051,7 +16056,6 @@ impl AppController {
             }
             self.seek_back.push_back((media_id, previous));
         }
-        self.player_command(PlayerCommand::SeekAbsolute(target));
         self.view.status_line = format!("Seeking to {}", format_seconds(seconds));
     }
 
@@ -17256,7 +17260,7 @@ impl AppController {
             return;
         }
         if self.view.playback_chapters.is_empty() {
-            self.player_command(PlayerCommand::ChangeChapter(delta));
+            self.seek_player_command(PlayerCommand::ChangeChapter(delta));
             return;
         }
         let navigable = self
@@ -17990,6 +17994,45 @@ impl AppController {
         }
     }
 
+    /// Sends one timeline command only while a media item owns the reusable backend.
+    ///
+    /// mpv stays alive after `end-file`, so the existence of a backend does not
+    /// imply that it still has a seekable file. Lifecycle events are drained
+    /// both before the command and after a rejected command: this closes the
+    /// input-before-tick race without applying a stale seek to an autoplay
+    /// successor or replacing the authoritative end event with a command
+    /// error popup.
+    fn seek_player_command(&mut self, command: PlayerCommand) -> bool {
+        if self.playback_phase == PlaybackPhase::Idle || self.current_media.is_none() {
+            return false;
+        }
+        let elapsed = Instant::now().saturating_duration_since(self.last_tick);
+        if self.drain_player_events(elapsed)
+            || self.playback_phase == PlaybackPhase::Idle
+            || self.current_media.is_none()
+        {
+            return false;
+        }
+        let Some(player) = self.player.as_mut() else {
+            self.view.status_line = "Nothing is playing".to_owned();
+            return false;
+        };
+        match player.command(command) {
+            Ok(()) => true,
+            Err(error) => {
+                if self.drain_player_events(elapsed) {
+                    return false;
+                }
+                if matches!(error, PlaybackError::DirectProfileRestriction(_)) {
+                    self.view.status_line = error.to_string();
+                } else {
+                    self.show_error("Playback command failed", &error);
+                }
+                false
+            }
+        }
+    }
+
     /// Applies source-level playback semantics that a backend cannot infer reliably.
     ///
     /// Some live transports expose large synthetic `time-pos` and `duration`
@@ -18072,7 +18115,15 @@ impl AppController {
                 }
                 if self.playback_phase == PlaybackPhase::Playing {
                     self.update_live_local_progress_view();
+                    let playback_owner = self.current_media.clone();
                     self.skip_current_advertisement_chapter();
+                    if self.playback_phase != PlaybackPhase::Playing
+                        || self.current_media != playback_owner
+                    {
+                        // The timeline command may have observed `end-file`
+                        // and loaded a successor that has not started yet.
+                        return;
+                    }
                     self.account_listen_time(elapsed);
                     if self.unflushed_listen_time >= Duration::from_secs(30)
                         || self.last_position_save.elapsed()
@@ -18125,8 +18176,10 @@ impl AppController {
             return;
         };
         self.skipped_advertisement_chapter = Some(key);
-        self.player_command(PlayerCommand::SeekAbsolute(Duration::from_secs(end)));
-        self.view.status_line = format!("Skipped advertisement section to {}", format_seconds(end));
+        if self.seek_player_command(PlayerCommand::SeekAbsolute(Duration::from_secs(end))) {
+            self.view.status_line =
+                format!("Skipped advertisement section to {}", format_seconds(end));
+        }
     }
 
     fn drain_player_events(&mut self, elapsed: Duration) -> bool {
@@ -48259,6 +48312,7 @@ mod tests {
     struct MockPlaybackState {
         played: Vec<PlaybackInput>,
         commands: Vec<PlayerCommand>,
+        end_before_command_error: bool,
     }
 
     struct MockPlaybackBackend {
@@ -48641,11 +48695,25 @@ mod tests {
         }
 
         fn command(&mut self, command: PlayerCommand) -> PlaybackResult<()> {
-            self.state
-                .lock()
-                .expect("mock state")
-                .commands
-                .push(command);
+            let reject_after_end = {
+                let mut state = self.state.lock().expect("mock state");
+                state.commands.push(command);
+                state.end_before_command_error
+            };
+            if reject_after_end {
+                self.events
+                    .lock()
+                    .expect("mock events")
+                    .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                        reason: PlaybackEndReason::Eof,
+                        error: None,
+                        file_error: None,
+                        diagnostic: None,
+                    }));
+                return Err(PlaybackError::Protocol(
+                    "mock seek raced with end-file".to_owned(),
+                ));
+            }
             Ok(())
         }
 
@@ -49078,6 +49146,64 @@ mod tests {
         controller.view.playback.position = Duration::from_secs(35);
         controller.skip_current_advertisement_chapter();
         assert_eq!(state.lock().expect("mock state").commands.len(), 2);
+    }
+
+    #[test]
+    fn advertisement_seek_racing_with_eof_does_not_checkpoint_the_loading_successor() {
+        let before_advertisement = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(20),
+            duration: Some(Duration::from_secs(120)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, statuses, _) = controller_with_mock_lifecycle(
+            [before_advertisement],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let mut first = fixture_direct_item("advertisement-eof");
+        first.media.duration_seconds = Some(120);
+        let mut successor = fixture_direct_item("loading-successor");
+        successor.media.duration_seconds = Some(120);
+        let successor_id = successor.media.id.clone();
+        controller.play_queue_item(first, false);
+        controller.playback_queue.push(successor);
+        controller.update_player();
+        controller.view.playback_chapters = vec![Chapter {
+            title: "Реклама".to_owned(),
+            start_seconds: 30,
+            end_seconds: Some(45),
+        }];
+        statuses
+            .lock()
+            .expect("mock statuses")
+            .push_back(PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(35),
+                duration: Some(Duration::from_secs(120)),
+                paused: false,
+                ..PlaybackStatus::default()
+            });
+        {
+            let mut state = state.lock().expect("mock state");
+            state.commands.clear();
+            state.end_before_command_error = true;
+        }
+        controller.last_position_save = Instant::now() - Duration::from_secs(31);
+
+        controller.update_player();
+
+        assert_eq!(controller.playback_phase, PlaybackPhase::Loading);
+        assert_eq!(controller.current_media.as_ref(), Some(&successor_id));
+        assert_eq!(
+            controller
+                .store
+                .progress(&successor_id)
+                .expect("successor progress lookup"),
+            None,
+            "a successor must not gain durable progress before PlaybackStarted"
+        );
+        assert!(controller.view.error_popup.is_none());
     }
 
     /// Avoids external diagnostic probes in controller error-path tests.
@@ -49819,6 +49945,9 @@ mod tests {
                 .expect("mock playback factory")()
             .expect("mock playback backend"),
         );
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.current_media = Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"));
+        controller.view.playback.idle = false;
         controller.view.details = Some(DetailView {
             title: "Fixture".to_owned(),
             wikidata: "loading P1651 lazily…".to_owned(),
@@ -51878,6 +52007,177 @@ mod tests {
             "the default must never start a second list item"
         );
         assert_eq!(controller.view.status_line, "Playback queue finished");
+    }
+
+    #[test]
+    fn seeking_after_playback_finishes_does_not_command_the_idle_backend() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let video = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.play_queue_item(queue_item_from_video(&video, None), false);
+        controller.update_player();
+        state.lock().expect("mock state").commands.clear();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        controller.dispatch(UiAction::SeekPercent(50.0));
+
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "a finished item must not seek mpv after its timeline was cleared"
+        );
+        assert!(
+            controller.view.error_popup.is_none(),
+            "seeking after EOF must not open a backend-error diagnostic"
+        );
+    }
+
+    #[test]
+    fn seeking_drains_a_pending_end_event_before_commanding_mpv() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let video = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.play_queue_item(queue_item_from_video(&video, None), false);
+        controller.update_player();
+        state.lock().expect("mock state").commands.clear();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.dispatch(UiAction::SeekPercent(50.0));
+
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "a pending end-file event must win over stale seek input"
+        );
+        assert_eq!(controller.view.status_line, "Playback queue finished");
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[test]
+    fn a_stale_seek_does_not_apply_to_the_successor_started_by_pending_eof() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Queued successor".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(second.clone()),
+        ];
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&second, None));
+        controller.update_player();
+        state.lock().expect("mock state").commands.clear();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+
+        controller.dispatch(UiAction::SeekPercent(50.0));
+
+        let state = state.lock().expect("mock state");
+        assert!(
+            state.commands.is_empty(),
+            "the old seek must not reach the newly loaded queue item"
+        );
+        assert_eq!(
+            state
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            [first.title.as_str(), second.title.as_str()]
+        );
+        drop(state);
+        assert_eq!(
+            controller.current_media.as_ref(),
+            Some(&MediaId::new(SourceKind::YouTube, second.video_id))
+        );
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[test]
+    fn an_end_event_observed_during_a_failed_seek_suppresses_the_command_popup() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(41),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let video = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.play_queue_item(queue_item_from_video(&video, None), false);
+        controller.update_player();
+        {
+            let mut state = state.lock().expect("mock state");
+            state.commands.clear();
+            state.end_before_command_error = true;
+        }
+
+        controller.dispatch(UiAction::SeekPercent(50.0));
+
+        assert_eq!(controller.view.status_line, "Playback queue finished");
+        assert!(
+            controller.view.error_popup.is_none(),
+            "the lifecycle end event is the authoritative outcome of the raced seek"
+        );
     }
 
     #[test]

@@ -305,12 +305,13 @@ pub struct PlaybackStatus {
 impl PlaybackStatus {
     /// Returns whether keyboard or mouse seeking has a usable timeline.
     ///
-    /// Finite media keeps its historical behavior even while duration is
-    /// unknown. A live stream becomes seekable only after its backend reports
-    /// an exact cached interval.
+    /// An idle reusable backend owns no media timeline. Active finite media
+    /// remains seekable while duration is unknown, and an active live stream
+    /// becomes seekable only after its backend reports an exact cached
+    /// interval.
     #[must_use]
     pub const fn seeking_available(&self) -> bool {
-        !self.live || self.live_seekable_range.is_some()
+        !self.idle && (!self.live || self.live_seekable_range.is_some())
     }
 }
 
@@ -530,7 +531,9 @@ pub fn configured_playback_factory(config: &Config) -> Option<PlaybackFactory> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioOutputDriver, Config, PlaybackProfile, ProcessPlaybackConfig};
+    use super::{
+        AudioOutputDriver, Config, PlaybackProfile, PlaybackStatus, ProcessPlaybackConfig,
+    };
     use crate::config::AudioOutput as ConfiguredAudioOutput;
     use tempfile::tempdir;
 
@@ -542,6 +545,32 @@ mod tests {
         assert_eq!(AudioOutputDriver::Jack.mpv_name(), Some("jack"));
         assert_eq!(AudioOutputDriver::PulseAudio.mpv_name(), Some("pulse"));
         assert_eq!(AudioOutputDriver::PipeWire.mpv_name(), Some("pipewire"));
+    }
+
+    #[test]
+    fn seeking_requires_an_active_usable_timeline() {
+        let idle = PlaybackStatus::default();
+        let finite = PlaybackStatus {
+            idle: false,
+            ..PlaybackStatus::default()
+        };
+        let live_without_cache = PlaybackStatus {
+            idle: false,
+            live: true,
+            ..PlaybackStatus::default()
+        };
+        let live_with_cache = PlaybackStatus {
+            live_seekable_range: Some(super::BufferedRange {
+                start: std::time::Duration::from_secs(100),
+                end: std::time::Duration::from_secs(200),
+            }),
+            ..live_without_cache.clone()
+        };
+
+        assert!(!idle.seeking_available());
+        assert!(finite.seeking_available());
+        assert!(!live_without_cache.seeking_available());
+        assert!(live_with_cache.seeking_available());
     }
 
     #[test]

@@ -175,9 +175,17 @@ function renderDetails(view) {
   }
 }
 
-/** Whether the backend offers a usable timeline; mirrors `PlaybackStatus::seeking_available`. */
+/**
+ * Whether the backend offers a usable timeline.
+ *
+ * Mirrors `PlaybackStatus::seeking_available` in src/playback/mod.rs; keep the
+ * two in step. An idle reusable backend owns no timeline, and a live stream
+ * becomes seekable only once its backend reports a cached interval.
+ */
 function seekingAvailable(playback) {
-  return !playback.live || Boolean(playback.live_seekable_range);
+  return (
+    playback.idle === false && (!playback.live || Boolean(playback.live_seekable_range))
+  );
 }
 
 /** Paints the already-fetched spans behind the played fill. */
@@ -212,7 +220,7 @@ function renderPlayer(view) {
   const position = durationSeconds(playback.position);
   const duration = durationSeconds(playback.duration);
   const idle = playback.idle !== false;
-  const seekable = !idle && duration > 0 && seekingAvailable(playback);
+  const seekable = duration > 0 && seekingAvailable(playback);
 
   elements.position.textContent = formatSeconds(position);
   elements.duration.textContent = duration > 0 ? formatSeconds(duration) : "--:--";
