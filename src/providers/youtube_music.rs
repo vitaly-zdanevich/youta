@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use url::Url;
 
+use crate::playback::ytdlp::ADDITIONAL_JS_RUNTIME;
+
 const SEARCH_URL: &str = "https://music.youtube.com/search";
 const SEARCH_SECTION: &str = "songs";
 const MAX_QUERY_BYTES: usize = 512;
@@ -359,6 +361,8 @@ fn build_search_command(
         command.arg("--no-plugin-dirs");
     }
     command
+        .arg("--js-runtimes")
+        .arg(ADDITIONAL_JS_RUNTIME)
         .arg("--flat-playlist")
         .arg("--skip-download")
         .arg("--no-warnings")
@@ -685,6 +689,11 @@ mod tests {
                 .any(|argument| argument == "--no-plugin-dirs")
         );
         assert!(visible.iter().any(|argument| argument == "--flat-playlist"));
+        assert!(
+            visible
+                .windows(2)
+                .any(|pair| pair == ["--js-runtimes", "quickjs"])
+        );
         assert!(
             !visible
                 .iter()

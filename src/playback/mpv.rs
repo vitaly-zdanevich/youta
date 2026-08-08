@@ -674,7 +674,11 @@ mod unix {
                 "--script-opts=ytdl_hook-ytdl_path={}",
                 config.yt_dlp_executable.display()
             ))
-            .arg("--ytdl-format=bestaudio[acodec^=opus]/bestaudio");
+            .arg("--ytdl-format=bestaudio[acodec^=opus]/bestaudio")
+            .arg(format!(
+                "--ytdl-raw-options=js-runtimes={}",
+                super::super::ytdlp::ADDITIONAL_JS_RUNTIME
+            ));
 
         if let Some(driver) = config.audio_output.mpv_name() {
             command.arg(format!("--ao={driver}"));
@@ -1754,6 +1758,7 @@ mod unix {
             assert!(
                 arguments.contains(&"--ytdl-format=bestaudio[acodec^=opus]/bestaudio".to_owned())
             );
+            assert!(arguments.contains(&"--ytdl-raw-options=js-runtimes=quickjs".to_owned()));
         }
 
         #[cfg(not(feature = "yt-dlp"))]

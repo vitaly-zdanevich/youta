@@ -31,7 +31,7 @@ use std::os::unix::process::CommandExt;
 use thiserror::Error;
 use url::Url;
 
-use super::PlaybackHttpHeaders;
+use super::{PlaybackHttpHeaders, ytdlp::ADDITIONAL_JS_RUNTIME};
 
 const DEFAULT_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
 const PRINT_TEMPLATE: &str = "%(.{url,http_headers,acodec,vcodec,protocol})j";
@@ -534,6 +534,8 @@ fn build_command(config: &YouTubePrewarmConfig, source_url: &Url) -> Command {
         command.arg("--no-plugin-dirs");
     }
     command
+        .arg("--js-runtimes")
+        .arg(ADDITIONAL_JS_RUNTIME)
         .arg("--no-warnings")
         .arg("--no-playlist")
         .arg("--skip-download")
@@ -1067,6 +1069,11 @@ mod tests {
         );
         assert!(arguments.contains(&"--ignore-config".to_owned()));
         assert!(arguments.contains(&"--no-plugin-dirs".to_owned()));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--js-runtimes", "quickjs"])
+        );
         assert_eq!(
             &arguments[arguments.len() - 2..],
             ["--", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"]

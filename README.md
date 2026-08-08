@@ -804,8 +804,10 @@ availability depends on the public release and the installed extractor.
 Youta passes validated URLs and an allowlisted argument set directly to
 `yt-dlp`; it does not construct a shell command. It does not import browser
 cookies automatically. Cookie files can expose logged-in sessions and must be
-treated as secrets. Keep `yt-dlp` updated because extractor fixes and security
-fixes ship frequently. See the upstream [FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ)
+treated as secrets. In addition to yt-dlp's default Deno JavaScript runtime,
+Youta enables QuickJS-ng as a lightweight fallback for platforms where Deno is
+unavailable. Keep `yt-dlp` updated because extractor fixes and security fixes
+ship frequently. See the upstream [FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ)
 and [supported-sites warning](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
 
 If YouTube rejects the initial media URL with HTTP 403 before audio starts,

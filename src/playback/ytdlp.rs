@@ -18,6 +18,12 @@ const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
 const DOWNLOAD_OPUS_FORMAT: &str = "bestaudio[acodec^=opus]";
 
+/// Lightweight JavaScript runtime enabled in addition to yt-dlp's default Deno.
+///
+/// QuickJS-ng is available on 32-bit Gentoo x86, where the Deno binary is not.
+/// Enabling it here preserves Deno's higher priority on platforms that have it.
+pub(crate) const ADDITIONAL_JS_RUNTIME: &str = "quickjs";
+
 /// Configuration for invoking yt-dlp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YtDlpConfig {
@@ -503,6 +509,7 @@ fn build_base_command(config: &YtDlpConfig) -> Command {
     if !config.allow_plugins {
         command.arg("--no-plugin-dirs");
     }
+    command.arg("--js-runtimes").arg(ADDITIONAL_JS_RUNTIME);
     command
 }
 
@@ -658,7 +665,15 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(arguments, ["--ignore-config", "--no-plugin-dirs"]);
+        assert_eq!(
+            arguments,
+            [
+                "--ignore-config",
+                "--no-plugin-dirs",
+                "--js-runtimes",
+                "quickjs"
+            ]
+        );
     }
 
     #[test]
@@ -673,7 +688,7 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(arguments, ["--ignore-config"]);
+        assert_eq!(arguments, ["--ignore-config", "--js-runtimes", "quickjs"]);
     }
 
     #[test]

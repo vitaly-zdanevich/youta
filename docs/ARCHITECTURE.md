@@ -645,6 +645,12 @@ postprocessor commands, and user-supplied output templates are outside the safe
 default. The command is for media a user is allowed to access; it is not a
 rights or policy bypass.
 
+Youta explicitly enables QuickJS-ng as an additional JavaScript runtime for
+every YouTube-capable `yt-dlp` path and mpv's fallback hook. Deno remains
+yt-dlp's higher-priority default where installed; QuickJS-ng keeps the same
+extractor path available on platforms such as 32-bit Gentoo x86 where Deno is
+not packaged.
+
 ### Bandcamp on-demand resolution
 
 Pressing Enter on a Bandcamp result sends its canonical page and the configured
