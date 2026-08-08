@@ -1393,6 +1393,51 @@ upload. `YOUTA_LIVE_YOUTUBE_URL` can select another public YouTube URL.
 
 Youta is licensed under the [MIT License](LICENSE).
 
+## My other Wikimedia-related projects
+
+### GitHub
+
+- **[wikimedia_commons_pwa_viewer](https://github.com/vitaly-zdanevich/wikimedia_commons_pwa_viewer)** —
+  minimal PWA for browsing Wikimedia Commons images by feed, category, search, or
+  location ([open the app](https://vitaly-zdanevich.github.io/wikimedia_commons_pwa_viewer/))
+- [bot_telegram_wikimedia_commons_uploader](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader) —
+  Telegram bot that uploads images and media to Wikimedia Commons under each
+  user's own account
+- [bot_telegram_wikimedia_commons](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons) —
+  Telegram and CLI bot for searching Wikimedia Commons media
+- [bot_telegram_wikipedia](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia) —
+  Telegram bot for Wikipedia search
+- [gthumb-copy-wikimedia-commons-link](https://github.com/vitaly-zdanevich/gthumb-copy-wikimedia-commons-link) —
+  gThumb extension that copies the Wikimedia Commons link for a local file
+- [wikipedia_diffs_to_evernote](https://github.com/vitaly-zdanevich/wikipedia_diffs_to_evernote) —
+  daily synchronization of a Wikipedia user's edits to Evernote
+- [wikipedia-userstyle-dark-minimum](https://github.com/vitaly-zdanevich/wikipedia-userstyle-dark-minimum) —
+  dark, minimal Wikipedia userstyle that does not require a browser extension
+- [PWAWikimediaCommonsUploader](https://github.com/vitaly-zdanevich/PWAWikimediaCommonsUploader) —
+  PWA that uploads photos and videos (with automatic conversion) to Wikimedia Commons
+
+### GitLab
+
+- [wiki2man_on_rust](https://gitlab.com/vitaly_zdanevich_wikimedia/wiki2man_on_rust) —
+  converts official Wikipedia XML dumps into roff man pages for offline reading
+  in a terminal
+- [gthumb-wikimedia-commons-extension](https://gitlab.com/vitaly_zdanevich_wikimedia/gthumb-wikimedia-commons-extension) —
+  gThumb extension for viewing Wikimedia Commons images
+- [commons-fuse](https://gitlab.com/vitaly_zdanevich_wikimedia/commons-fuse) —
+  read-only FUSE filesystem for Wikimedia Commons
+- [upload_to_commons_with_categories_from_iptc](https://gitlab.com/vitaly_zdanevich_wikimedia/upload_to_commons_with_categories_from_iptc) —
+  Python script for uploading images from gThumb with IPTC categories
+- [pwb_wrapper_for_simpler_uploading_to_commons](https://gitlab.com/vitaly_zdanevich_wikimedia/pwb_wrapper_for_simpler_uploading_to_commons) —
+  stateless CLI wrapper around Pywikibot for single-file and batch uploads
+- [web-extension-uploading-to-wikimedia-commons](https://gitlab.com/vitaly-zdanevich-extensions/uploading-to-wikimedia-commons) —
+  browser extension for uploading images to Wikimedia Commons
+- [commons-wikimedia-find-by-hash](https://gitlab.com/vitaly-zdanevich/commons-wikimedia-find-by-hash) —
+  CLI tool that finds a Wikimedia Commons file with the same SHA-1 as a local file
+- [webextension_find_by_hash](https://gitlab.com/vitaly_zdanevich_wikimedia/webextension_find_by_hash) —
+  browser extension for finding Wikimedia Commons files by hash
+- [video-to-webm-av1-opus](https://gitlab.com/vitaly-zdanevich/video-to-webm-av1-opus) —
+  file-manager script that converts video to Commons-compatible AV1/Opus WebM
+
 ## Similar terminal YouTube projects
 
 - [youtube-tui](https://github.com/Siriusmart/youtube-tui) is a Rust TUI for
