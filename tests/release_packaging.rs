@@ -200,6 +200,10 @@ fn release_script_builds_four_portable_non_sqlite_variants() {
     assert!(script.contains("YOUTA_BUILD_ORIGIN=github-release"));
     assert!(!script.contains("install -D"));
     assert!(script.contains("x86_64-unknown-linux-gnu"));
+    assert!(
+        script
+            .contains("i686-unknown-linux-gnu)\n\t\toperating_system=linux\n\t\tarchitecture=i686")
+    );
     assert!(script.contains("aarch64-unknown-linux-gnu"));
     assert!(script.contains("x86_64-apple-darwin"));
     assert!(script.contains("aarch64-apple-darwin"));
@@ -212,6 +216,7 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     let release = read_repository_file(".github/workflows/release.yml");
     for target in [
         "x86_64-unknown-linux-gnu",
+        "i686-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
@@ -224,8 +229,41 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(release.contains("dist text-no-qr"));
     assert!(release.contains("fetch-depth: 10"));
     assert!(release.contains("brew install gnu-tar"));
+    assert!(release.contains("architecture: i686"));
+    assert!(release.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
+    for contract in [
+        "platforms=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64)",
+        "suffixes=('' -text -no-qr -text-no-qr)",
+        "readonly expected_asset_count=42",
+        "archive=\"youta-${version}-${platform}${suffix}.tar.gz\"",
+        "vendor_archive=\"youta-${version}-vendor.tar.xz\"",
+        "--label expected-assets",
+        "--label downloaded-assets",
+        "sha256sum --check --strict -- *.sha256",
+    ] {
+        assert!(
+            release.contains(contract),
+            "release workflow omits asset contract `{contract}`"
+        );
+    }
+    assert!(
+        release
+            .find("Validate the complete release asset set")
+            .expect("release workflow validates assets")
+            < release
+                .find("Create or update the tagged release")
+                .expect("release workflow publishes assets"),
+        "release assets must be validated before publication"
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("Linux compile (i686)"));
+    assert!(ci.contains("i686-unknown-linux-gnu"));
+    assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
+    assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
+    assert!(ci.contains("ELF 32-bit"));
+    assert!(ci.contains("/lib/ld-linux.so.2"));
+    assert!(ci.contains("target/i686-unknown-linux-gnu/release/youta --version"));
     assert!(ci.contains("x86_64-pc-windows-msvc"));
     assert!(ci.contains("aarch64-pc-windows-msvc"));
     assert!(ci.contains("x86_64-unknown-freebsd"));

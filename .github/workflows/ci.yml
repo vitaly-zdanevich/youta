@@ -180,6 +180,48 @@ jobs:
           cargo check --locked --no-default-features --features app,images
           cargo check --locked --no-default-features --features app,qr
 
+  linux-i686-compile:
+    name: Linux compile (i686)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add i686-unknown-linux-gnu
+
+      - name: Install the Linux i686 linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib libc6-dev-i386
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: linux-i686-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # Build every published feature combination on ordinary pushes so a
+      # tagged release cannot be the first attempt to link the 32-bit target.
+      - name: Compile all release variants
+        run: |
+          cargo build --locked --release --target i686-unknown-linux-gnu
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,images
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app
+
+      - name: Validate and start the i686 executable
+        run: |
+          file target/i686-unknown-linux-gnu/release/youta | grep --fixed-strings 'ELF 32-bit'
+          readelf --program-headers target/i686-unknown-linux-gnu/release/youta | grep --fixed-strings '/lib/ld-linux.so.2'
+          target/i686-unknown-linux-gnu/release/youta --version
+
   windows-compile:
     name: Windows compile (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}

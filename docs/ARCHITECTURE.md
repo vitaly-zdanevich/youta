@@ -946,9 +946,10 @@ builds omit that dependency and shortcut. Distribution/minimal builds can use
 `sqlite-state` adds optional system-SQLite persistence, while `bundled-sqlite`
 adds the same backend with vendored SQLite.
 
-Tagged releases are produced natively for Linux and macOS on amd64 and arm64.
-Every pair has four artifacts covering the independent `images` and `qr`
-capabilities: the unsuffixed archive enables both, `-text` omits images,
+Tagged releases are produced for Linux on amd64, i686, and arm64, and natively
+for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2 or newer
+processor. Every pair has four artifacts covering the independent `images` and
+`qr` capabilities: the unsuffixed archive enables both, `-text` omits images,
 `-no-qr` omits QR support, and `-text-no-qr` omits both. None opts into SQLite.
 Windows amd64/arm64 and the portable FreeBSD x86_64 boundary are compile-checked,
 but are not release targets until their runtime playback paths can be

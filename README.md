@@ -1293,9 +1293,10 @@ Apple metadata through its RSS enclosure and silent audio decode. YouTube Music
 is checked through yt-dlp's public songs search with a 15-second process bound
 and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
-failure fails CI. Tagged releases build natively for Linux and macOS on amd64
-and arm64. Each operating-system/architecture pair publishes archives for all
-four combinations of the default-on `images` and `qr` capabilities. The
+failure fails CI. Tagged releases build for Linux on amd64, i686, and arm64,
+and natively for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2
+or newer processor. Each operating-system/architecture pair publishes archives
+for all four combinations of the default-on `images` and `qr` capabilities. The
 `-text` suffix omits images, while the `-no-qr` suffix omits QR support. The
 release also publishes one Cargo vendor archive for offline/external build
 systems. No binary archive enables SQLite; human-readable TOML remains the
@@ -1377,6 +1378,10 @@ scripts/package-release.sh x86_64-unknown-linux-gnu dist images
 scripts/package-release.sh x86_64-unknown-linux-gnu dist text
 scripts/package-release.sh x86_64-unknown-linux-gnu dist images-no-qr
 scripts/package-release.sh x86_64-unknown-linux-gnu dist text-no-qr
+scripts/package-release.sh i686-unknown-linux-gnu dist images
+scripts/package-release.sh i686-unknown-linux-gnu dist text
+scripts/package-release.sh i686-unknown-linux-gnu dist images-no-qr
+scripts/package-release.sh i686-unknown-linux-gnu dist text-no-qr
 scripts/package-vendor.sh
 ```
 
