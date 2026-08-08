@@ -806,11 +806,21 @@ jobs:
       - name: Install the pinned coverage runner
         run: cargo install cargo-llvm-cov --locked --version 0.8.7
 
+      # `youta-gui` is excluded deliberately. It links Tauri, whose Linux
+      # backend needs the WebKitGTK and glib development packages, and pulling
+      # that toolchain into the coverage runner to measure a thin window shell
+      # is out of proportion to this gate.
+      #
+      # This is the only workspace-wide invocation in CI, and the desktop crate
+      # is not a default workspace member, so nothing here builds or tests the
+      # window. Giving it a lane needs a runner with the WebKitGTK development
+      # packages installed.
       - name: Generate LCOV report
         run: |
           cargo llvm-cov \
             --locked \
             --workspace \
+            --exclude youta-gui \
             --all-features \
             --lib \
             --bins \
