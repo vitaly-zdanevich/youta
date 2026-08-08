@@ -5,10 +5,11 @@
 //! the same encoded data without depending on the encoder's rendering APIs.
 
 use qrcode::{Color, QrCode};
+use serde::Serialize;
 use thiserror::Error;
 
 /// A square QR-code module matrix stored in row-major order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QrMatrix {
     width: usize,
     modules: Vec<bool>,

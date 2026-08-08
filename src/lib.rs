@@ -45,8 +45,11 @@ pub mod tracker_media;
 #[cfg(feature = "images")]
 pub mod thumbnails;
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 pub mod app;
 
 #[cfg(feature = "tui")]
 pub mod tui;
+
+#[cfg(feature = "controller")]
+pub mod view;

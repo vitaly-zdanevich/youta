@@ -8,10 +8,17 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::Serialize;
 use thiserror::Error;
+
+use crate::config::{
+    AudioOutput as ConfiguredAudioOutput, Config, PlaybackBackend as ConfiguredBackend,
+};
 
 #[cfg(feature = "backend-mpv")]
 pub mod mpv;
+
+pub mod threaded;
 
 #[cfg(feature = "yt-dlp")]
 pub mod ytdlp;
@@ -245,7 +252,7 @@ pub enum PlayerCommand {
 }
 
 /// Current state reported by a playback backend.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlaybackStatus {
     /// Whether the backend is alive but has no media loaded.
     ///
@@ -308,7 +315,7 @@ impl PlaybackStatus {
 }
 
 /// A half-open media-time interval available without another network fetch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct BufferedRange {
     /// First buffered media timestamp, inclusive.
     pub start: Duration,
@@ -448,9 +455,84 @@ pub struct ProcessPlaybackConfig {
     pub audiophile: AudiophilePlaybackOptions,
 }
 
+impl ProcessPlaybackConfig {
+    /// Derives process-backend settings from the user's configuration.
+    ///
+    /// Every front-end starts the same engine, so this mapping belongs beside
+    /// the backend rather than inside one executable.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let audio_output = match config.playback.output {
+            ConfiguredAudioOutput::Auto => AudioOutputDriver::Auto,
+            ConfiguredAudioOutput::Alsa => AudioOutputDriver::Alsa,
+            ConfiguredAudioOutput::Jack => AudioOutputDriver::Jack,
+            ConfiguredAudioOutput::PulseAudio => AudioOutputDriver::PulseAudio,
+            ConfiguredAudioOutput::PipeWire => AudioOutputDriver::PipeWire,
+        };
+        Self {
+            mpv_executable: config.providers.mpv_executable.clone(),
+            yt_dlp_executable: config.providers.yt_dlp_executable.clone(),
+            runtime_dir: config.config_dir().join("runtime"),
+            audio_output,
+            audio_device: config.playback.device.clone(),
+            profile: if config.playback.audiophile.enabled {
+                PlaybackProfile::Direct
+            } else {
+                PlaybackProfile::Balanced
+            },
+            audiophile: AudiophilePlaybackOptions {
+                exclusive_device: config.playback.audiophile.exclusive_device,
+                avoid_resampling: config.playback.audiophile.avoid_resampling,
+                output_sample_rate_hz: config.playback.audiophile.output_sample_rate_hz,
+            },
+        }
+    }
+}
+
+/// Factory used to start a playback engine only when the user presses Play.
+///
+/// Delaying process creation keeps startup fast and avoids an idle decoder for
+/// users who only browse subscriptions or metadata.
+pub type PlaybackFactory = Box<dyn FnMut() -> Result<Box<dyn PlaybackBackend>> + Send + 'static>;
+
+/// Builds the playback factory selected by the user's configuration.
+///
+/// Returns [`None`] when the configured engine is absent from this build. A
+/// controller without a factory stays completely browsable and reports the
+/// missing engine when the user presses Play, so callers should not treat this
+/// as a startup failure.
+#[must_use]
+pub fn configured_playback_factory(config: &Config) -> Option<PlaybackFactory> {
+    match config.playback.backend {
+        ConfiguredBackend::Mpv => {
+            #[cfg(feature = "backend-mpv")]
+            {
+                let process_config = ProcessPlaybackConfig::from_config(config);
+                let factory: PlaybackFactory = Box::new(move || {
+                    // Spawning stays synchronous so a missing mpv or an unusable
+                    // runtime directory is still reported to the caller. Only the
+                    // per-tick IPC polling moves off the caller's thread.
+                    let player = mpv::MpvBackend::spawn(&process_config)?;
+                    let supervised: Box<dyn PlaybackBackend> =
+                        Box::new(threaded::ThreadedBackend::new(player));
+                    Ok(supervised)
+                });
+                Some(factory)
+            }
+            #[cfg(not(feature = "backend-mpv"))]
+            {
+                None
+            }
+        }
+        ConfiguredBackend::Native => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AudioOutputDriver;
+    use super::{AudioOutputDriver, Config, PlaybackProfile, ProcessPlaybackConfig};
+    use crate::config::AudioOutput as ConfiguredAudioOutput;
+    use tempfile::tempdir;
 
     #[test]
     fn audio_output_names_match_mpv_drivers() {
@@ -460,5 +542,57 @@ mod tests {
         assert_eq!(AudioOutputDriver::Jack.mpv_name(), Some("jack"));
         assert_eq!(AudioOutputDriver::PulseAudio.mpv_name(), Some("pulse"));
         assert_eq!(AudioOutputDriver::PipeWire.mpv_name(), Some("pipewire"));
+    }
+
+    #[test]
+    fn process_config_maps_every_audio_output_driver() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        for (configured, expected) in [
+            (ConfiguredAudioOutput::Auto, AudioOutputDriver::Auto),
+            (ConfiguredAudioOutput::Alsa, AudioOutputDriver::Alsa),
+            (ConfiguredAudioOutput::Jack, AudioOutputDriver::Jack),
+            (
+                ConfiguredAudioOutput::PulseAudio,
+                AudioOutputDriver::PulseAudio,
+            ),
+            (ConfiguredAudioOutput::PipeWire, AudioOutputDriver::PipeWire),
+        ] {
+            config.playback.output = configured;
+            assert_eq!(
+                ProcessPlaybackConfig::from_config(&config).audio_output,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn process_config_preserves_audiophile_tuning() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.playback.audiophile.enabled = true;
+        config.playback.audiophile.exclusive_device = true;
+        config.playback.audiophile.avoid_resampling = true;
+        config.playback.audiophile.output_sample_rate_hz = Some(96_000);
+
+        let process = ProcessPlaybackConfig::from_config(&config);
+        assert_eq!(process.profile, PlaybackProfile::Direct);
+        assert!(process.audiophile.exclusive_device);
+        assert!(process.audiophile.avoid_resampling);
+        assert_eq!(process.audiophile.output_sample_rate_hz, Some(96_000));
+    }
+
+    /// The native backend is a configuration placeholder with no adapter, so a
+    /// controller must be told there is nothing to spawn rather than be handed
+    /// a factory that fails at the moment the user presses Play.
+    #[test]
+    fn the_native_backend_yields_no_factory() {
+        use crate::config::PlaybackBackend as ConfiguredBackend;
+
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.playback.backend = ConfiguredBackend::Native;
+
+        assert!(super::configured_playback_factory(&config).is_none());
     }
 }

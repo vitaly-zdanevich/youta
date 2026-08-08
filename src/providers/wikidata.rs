@@ -4224,7 +4224,16 @@ mod tests {
                 for response in responses {
                     let mut stream = loop {
                         match listener.accept() {
-                            Ok((stream, _)) => break stream,
+                            // BSD and macOS let an accepted socket inherit the
+                            // listener's non-blocking flag, while Linux does
+                            // not. Clearing it keeps the blocking reads below
+                            // identical on every platform.
+                            Ok((stream, _)) => {
+                                stream
+                                    .set_nonblocking(false)
+                                    .expect("mock stream should become blocking");
+                                break stream;
+                            }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                 if thread_stop.load(Ordering::Relaxed) {
                                     return;

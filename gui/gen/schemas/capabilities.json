@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"This application's own commands plus event subscription, which the window needs to receive view snapshots. No filesystem, shell, process, or HTTP permission is granted, because the window renders untrusted provider text.","local":true,"windows":["main"],"permissions":["core:event:allow-listen"]}}

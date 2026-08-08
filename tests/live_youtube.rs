@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use youta::playback::mpv::MpvBackend;
+use youta::playback::threaded::ThreadedBackend;
 use youta::playback::{
     AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackEvent, PlaybackInput,
     PlaybackProfile, ProcessPlaybackConfig,
@@ -54,7 +55,10 @@ fn youtube_audio_playback_advances_and_shuts_down() {
         audiophile: AudiophilePlaybackOptions::default(),
     };
 
-    let mut backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    // Youta runs the adapter off the reducer thread, so the live check must
+    // exercise that supervised path rather than the bare adapter.
+    let mut backend =
+        ThreadedBackend::new(MpvBackend::spawn(&config).expect("start Youta's mpv backend"));
     let mut input = PlaybackInput::new(url);
     input.title = Some("Youta live YouTube smoke test".to_owned());
     input.start_at = RESUME_AT;

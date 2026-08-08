@@ -4289,6 +4289,13 @@ impl StateBackend for SqliteStateStore {
 /// Alias emphasizing that [`StateStore`] is the persistence boundary.
 pub type Store = StateStore;
 
+/// What every front-end tells a user whose second Youta was refused the lock.
+///
+/// One process owns durable state, so a second start is an expected outcome
+/// with one correct wording. Keeping it here stops the terminal and the window
+/// from explaining the same situation differently.
+pub const ANOTHER_INSTANCE_MESSAGE: &str = "Another instance of Youta is already running";
+
 /// Errors raised by the local state store.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -4348,6 +4355,9 @@ pub enum PersistenceError {
     )]
     PartialFilePublicationRequiresRestart,
     /// Another process already holds the human-readable state lock.
+    ///
+    /// Front-ends should report [`ANOTHER_INSTANCE_MESSAGE`] instead of this
+    /// technical text: a second Youta is an ordinary outcome, not a fault.
     #[error("human-readable state is already open by another Youta process")]
     FileStateAlreadyOpen,
     /// A JSON payload could not be encoded or decoded.

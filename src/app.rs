@@ -183,20 +183,20 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
-use crate::tui::DetailLinkView;
+use crate::view::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
-use crate::tui::DownloadView;
+use crate::view::DownloadView;
 #[cfg(feature = "local-move")]
-use crate::tui::LocalMoveDestinationView;
+use crate::view::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
-use crate::tui::RadioRecordingView;
+use crate::view::RadioRecordingView;
 #[cfg(feature = "radio")]
-use crate::tui::RadioSort;
+use crate::view::RadioSort;
 #[cfg(feature = "qr")]
-use crate::tui::VideoQrPopupView;
+use crate::view::VideoQrPopupView;
 #[cfg(feature = "yandex-music")]
-use crate::tui::{DetailLinkInternalTarget, DetailLinkPresentation};
-use crate::tui::{
+use crate::view::{DetailLinkInternalTarget, DetailLinkPresentation};
+use crate::view::{
     DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
     DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
     INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
@@ -210,11 +210,11 @@ use crate::tui::{
     YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
-use crate::tui::{
+use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
 };
 #[cfg(feature = "yandex-music")]
-use crate::tui::{
+use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
     YandexMusicSetupPopupView,
 };
@@ -542,10 +542,9 @@ fn moved_private_note_cursor_vertically(
 
 /// Factory used to start a playback engine only when the user presses Play.
 ///
-/// Delaying process creation keeps startup fast and avoids an idle decoder for
-/// users who only browse subscriptions or metadata.
-pub type PlaybackFactory =
-    Box<dyn FnMut() -> PlaybackResult<Box<dyn PlaybackBackend>> + Send + 'static>;
+/// This alias lives beside the backends in [`crate::playback`] and is re-exported
+/// here because a controller is what consumes it.
+pub use crate::playback::PlaybackFactory;
 
 trait YouTubeProviderBuilder: Send {
     fn official(&self, api_key: String) -> Result<Box<dyn Provider>, String>;
@@ -50278,8 +50277,8 @@ mod tests {
             calls: Arc::clone(&calls),
             gh_available: false,
         });
-        let anchor = crate::tui::DetailsTextPosition { row: 0, column: 0 };
-        let focus = crate::tui::DetailsTextPosition { row: 1, column: 3 };
+        let anchor = crate::view::DetailsTextPosition { row: 0, column: 0 };
+        let focus = crate::view::DetailsTextPosition { row: 1, column: 3 };
 
         controller.dispatch(UiAction::BeginDetailsTextSelection(anchor));
         controller.dispatch(UiAction::UpdateDetailsTextSelection(focus));

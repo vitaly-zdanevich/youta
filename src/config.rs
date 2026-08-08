@@ -23,7 +23,7 @@ use directories::BaseDirs;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
@@ -74,7 +74,7 @@ pub const DEFAULT_THUMBNAIL_HEIGHT: u16 = 20;
 /// Smallest thumbnail height that the terminal renderer can use.
 pub const MIN_THUMBNAIL_HEIGHT: u16 = 4;
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
 const YOUTA_GITIGNORE_BEGIN: &str = "# BEGIN YOUTA PRIVATE AND GENERATED FILES";
@@ -376,7 +376,7 @@ impl Config {
     /// Returns an error when a relevant environment override is active, the
     /// value is invalid, the existing file is too large or malformed, or an
     /// atomic private-file update fails.
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     pub fn save_youtube_provider(
         &mut self,
         setting: YouTubeProviderSetting,
@@ -465,7 +465,7 @@ impl Config {
     /// Returns an error when the token is empty, contains surrounding
     /// whitespace or control characters, exceeds 4096 bytes, an environment
     /// override is active, or either TOML file cannot be updated atomically.
-    #[cfg(all(feature = "tui", feature = "yandex-music"))]
+    #[cfg(all(feature = "controller", feature = "yandex-music"))]
     pub fn save_yandex_music_token(&mut self, token: String) -> Result<(), ConfigError> {
         if std::env::var_os(YANDEX_MUSIC_TOKEN_ENV).is_some() {
             return Err(ConfigError::Invalid(format!(
@@ -510,7 +510,7 @@ impl Config {
     ///
     /// Returns an error when an environment override is active, the existing
     /// file is too large or malformed, or an atomic private-file update fails.
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     pub fn save_subscriptions_layout(
         &mut self,
         layout: SubscriptionsLayout,
@@ -562,7 +562,7 @@ impl Config {
     /// Returns an error when any relevant environment override is active, the
     /// existing file is too large or malformed, or an atomic private-file
     /// update fails.
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     pub fn save_tui_preferences(
         &mut self,
         layout: SubscriptionsLayout,
@@ -652,7 +652,7 @@ impl Config {
     ///
     /// Returns an error when the environment override is active, the existing
     /// file is too large or malformed, or the private atomic update fails.
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     pub fn save_autoplay(&mut self, autoplay: bool) -> Result<(), ConfigError> {
         if std::env::var_os(AUTOPLAY_ENV).is_some() {
             return Err(ConfigError::Invalid(format!(
@@ -689,7 +689,7 @@ impl Config {
     ///
     /// Returns an error when the environment override is active, the existing
     /// file is too large or malformed, or the private atomic update fails.
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     pub fn save_bandcamp_audio_format(
         &mut self,
         format: BandcampAudioFormat,
@@ -1553,7 +1553,7 @@ fn ensure_youta_gitignore(path: &Path) -> Result<(), ConfigError> {
     write_private_config(path, contents.as_bytes())
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn validate_provider_url(mut url: Url) -> Result<Url, ConfigError> {
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -1574,12 +1574,12 @@ fn validate_provider_url(mut url: Url) -> Result<Url, ConfigError> {
     Ok(url)
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn read_editable_config(path: &Path) -> Result<DocumentMut, ConfigError> {
     read_editable_toml(path, MAX_CONFIG_BYTES, "config.toml")
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn read_editable_credentials(path: &Path) -> Result<DocumentMut, ConfigError> {
     if path.is_file() {
         validate_credentials_file(path)?;
@@ -1587,7 +1587,7 @@ fn read_editable_credentials(path: &Path) -> Result<DocumentMut, ConfigError> {
     read_editable_toml(path, MAX_CREDENTIALS_BYTES, "credentials.toml")
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn read_editable_toml(path: &Path, limit: u64, label: &str) -> Result<DocumentMut, ConfigError> {
     let contents = match fs::metadata(path) {
         Ok(_) => read_limited_utf8_file(path, limit, label)?,
@@ -1603,7 +1603,7 @@ fn read_editable_toml(path: &Path, limit: u64, label: &str) -> Result<DocumentMu
     })
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn editable_table<'a>(
     document: &'a mut DocumentMut,
     name: &str,
@@ -1620,7 +1620,7 @@ fn editable_table<'a>(
         })
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 fn migrate_legacy_provider_credentials(
     config: &mut DocumentMut,
     credentials: &mut DocumentMut,
@@ -1978,7 +1978,7 @@ bandcamp_audio_format = "alac"
         );
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn subscriptions_layout_save_preserves_unrelated_toml_and_comments() {
         let directory = tempdir().expect("temporary directory");
@@ -2012,7 +2012,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn tui_preferences_save_both_tables_atomically_and_preserve_unrelated_content() {
         let directory = tempdir().expect("temporary directory");
@@ -2089,7 +2089,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!reloaded.playback.skip_advertisement_chapters);
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn autoplay_save_preserves_unrelated_configuration() {
         let directory = tempdir().expect("temporary directory");
@@ -2121,7 +2121,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(reloaded.playback.autoplay);
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn bandcamp_audio_format_save_preserves_unrelated_configuration() {
         let directory = tempdir().expect("temporary directory");
@@ -2148,7 +2148,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn autoplay_environment_override_prevents_file_and_memory_mutation() {
         const CHILD_MARKER: &str = "YOUTA_AUTOPLAY_SAVE_TEST_CHILD";
@@ -2190,7 +2190,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn tui_preferences_environment_overrides_prevent_any_partial_write() {
         const CHILD_MARKER: &str = "YOUTA_PREFERENCES_SAVE_TEST_CHILD";
@@ -2253,7 +2253,7 @@ youtube_api_key = "keep-this-existing-secret"
         }
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn subscriptions_layout_environment_override_locks_in_app_save() {
         const CHILD_MARKER: &str = "YOUTA_LAYOUT_SAVE_TEST_CHILD";
@@ -2608,7 +2608,7 @@ youtube_api_key = "keep-this-existing-secret"
         }
     }
 
-    #[cfg(all(feature = "tui", feature = "yandex-music"))]
+    #[cfg(all(feature = "controller", feature = "yandex-music"))]
     #[test]
     fn yandex_music_token_saves_privately_and_preserves_unrelated_content() {
         let directory = tempdir().expect("temporary directory");
@@ -2658,7 +2658,7 @@ youtube_api_key = "keep-this-existing-secret"
         }
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn youtube_provider_save_preserves_unrelated_toml_and_switchable_credentials() {
         let directory = tempdir().expect("temporary directory");
@@ -2723,7 +2723,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert_eq!(restored.playback.volume_percent, 35);
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn youtube_provider_environment_overrides_prevent_file_and_memory_mutation() {
         const CHILD_MARKER: &str = "YOUTA_PROVIDER_SAVE_TEST_CHILD";
@@ -2815,7 +2815,7 @@ youtube_api_key = "keep-this-existing-secret"
         }
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn youtube_provider_save_migrates_legacy_provider_credentials() {
         let directory = tempdir().expect("temporary directory");
@@ -2858,7 +2858,7 @@ jamendo_client_id = "legacy-jamendo-id"
         }
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn youtube_provider_save_rejects_unsafe_values_without_creating_a_file() {
         let directory = tempdir().expect("temporary directory");
@@ -2889,7 +2889,7 @@ jamendo_client_id = "legacy-jamendo-id"
         assert!(!config.config_file().exists());
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(feature = "controller")]
     #[test]
     fn youtube_provider_save_refuses_malformed_or_oversized_existing_config() {
         let directory = tempdir().expect("temporary directory");
@@ -2921,7 +2921,7 @@ jamendo_client_id = "legacy-jamendo-id"
         ));
     }
 
-    #[cfg(all(unix, feature = "tui"))]
+    #[cfg(all(unix, feature = "controller"))]
     #[test]
     fn youtube_provider_save_uses_private_file_and_directory_modes() {
         use std::os::unix::fs::PermissionsExt;

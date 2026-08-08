@@ -232,7 +232,7 @@ impl PrewarmedYouTubeAudio {
     }
 
     /// Constructs a resolved stream for controller state-machine tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, feature = "controller"))]
     pub(crate) fn for_test(media_url: Url, expires_at_unix: Option<u64>) -> Self {
         Self {
             media_url,
@@ -268,7 +268,7 @@ pub struct YouTubePrewarmResult {
 
 impl YouTubePrewarmResult {
     /// Constructs a completion for controller generation tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, feature = "controller"))]
     pub(crate) const fn for_test(
         generation: u64,
         outcome: Result<PrewarmedYouTubeAudio, YouTubePrewarmError>,

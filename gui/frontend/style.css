@@ -1,0 +1,397 @@
+/* Design tokens for the "media player" direction: dark ground, one warm
+   accent spent only on the current item, generous chrome around a dense list. */
+:root {
+  --ground: #0c0b10;
+  --surface: #16151d;
+  --raised: #1e1c27;
+  --ink: #f1eff5;
+  --ink-dim: #a29db1;
+  --ink-faint: #6f6a80;
+  --line: #26242f;
+  --line-strong: #383544;
+  --accent: #e4744f;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+
+/* Tabs get their own band so they never sit directly on the content. */
+.tabs {
+  display: flex;
+  gap: 3px;
+  padding: 9px 13px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.tabs button {
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink-faint);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  padding: 5px 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tabs button:hover {
+  color: var(--ink);
+}
+
+.tabs button[aria-selected="true"] {
+  color: var(--ink);
+  font-weight: 620;
+  background: var(--raised);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.tabs button:focus-visible,
+.list button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.list {
+  overflow-y: auto;
+  padding: 8px 10px 12px 16px;
+}
+
+.list button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.list button[aria-current="true"] {
+  background: var(--raised);
+}
+
+.list button[aria-current="true"] .title {
+  color: var(--accent);
+}
+
+.list .marker {
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.list .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 520;
+}
+
+.list .subtitle {
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list .duration {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.details {
+  border-left: 1px solid var(--line);
+  padding: 14px 18px;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.details h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+}
+
+.details dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 12px;
+  font-size: 12px;
+}
+
+.details dt {
+  color: var(--ink-faint);
+}
+
+.details dd {
+  margin: 0;
+}
+
+.details .description {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+}
+
+.details .empty {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.player {
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 10px 18px 11px;
+}
+
+.player .bar {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--line-strong);
+  position: relative;
+}
+
+.player .bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+/* Buffered spans sit between the empty track and the played fill, so what is
+   already fetched reads at a glance without competing with the accent. */
+.player .buffered {
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.player .buffered span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--line-strong);
+  filter: brightness(1.7);
+}
+
+/* The scrubber is invisible but keyboard-reachable, and its hit area is taller
+   than the 3px bar so pointing at it does not demand precision. */
+.player .scrub {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  top: -7px;
+  height: 17px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  cursor: pointer;
+  appearance: none;
+  background: transparent;
+}
+
+.player .scrub:disabled {
+  cursor: default;
+}
+
+.player .bar:has(.scrub:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.player .times {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.player #now-playing {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--sans);
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 9px;
+  flex-wrap: wrap;
+}
+
+.transport .group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.transport button {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 7px;
+  cursor: pointer;
+}
+
+.transport button:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.transport button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.transport button:focus-visible,
+.transport input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.transport .primary {
+  color: var(--ground);
+  background: var(--accent);
+  border-color: var(--accent);
+  min-width: 32px;
+  font-size: 13px;
+}
+
+.transport .primary:hover:not(:disabled) {
+  color: var(--ground);
+  filter: brightness(1.08);
+}
+
+.transport .toggles button[aria-pressed="true"] {
+  color: var(--ink);
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.transport .speed,
+.transport .level,
+.transport .chapter {
+  font-size: 11px;
+  color: var(--ink-faint);
+  min-width: 34px;
+  text-align: center;
+}
+
+.transport .chapter {
+  font-family: var(--sans);
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transport .volume {
+  margin-left: auto;
+}
+
+.transport .volume input {
+  appearance: none;
+  width: 88px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--line-strong);
+  cursor: pointer;
+}
+
+.transport .volume input::-webkit-slider-thumb {
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--ink-dim);
+}
+
+.transport .volume input:hover::-webkit-slider-thumb {
+  background: var(--accent);
+}
+
+.transport .output {
+  font-size: 11px;
+  color: var(--ink-faint);
+  padding-left: 14px;
+  border-left: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.status {
+  margin: 0;
+  padding: 5px 18px 7px;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--ink-faint);
+  min-height: 24px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

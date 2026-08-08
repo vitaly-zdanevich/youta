@@ -1,3 +1,7 @@
+[workspace]
+members = ["gui"]
+resolver = "3"
+
 [package]
 name = "youta"
 version = "0.26.2"
@@ -45,9 +49,13 @@ app = [
 ]
 
 # Complete application profile without the optional Yandex Music adapter.
-app-core = [
-    "tui",
-    "gpm",
+app-core = ["tui", "gpm", "sources"]
+
+# Every source adapter and playback helper, without any user interface.
+#
+# `app-core` is this set plus the terminal front-end. A different front-end
+# combines `sources` with `controller` and links no renderer at all.
+sources = [
     "acoustid",
     "local",
     "rss",
@@ -86,16 +94,25 @@ subscriptions = ["dep:opml", "dep:percent-encoding"]
 # Optional SQLite persistence for users who prefer one transactional database.
 sqlite-state = ["dep:rusqlite"]
 
-# User interface and playback backends.
-tui = [
-    "cli",
+# Interactive application state without any renderer.
+#
+# This carries the reducer in `app` and the frontend-agnostic vocabulary in
+# `view`. A non-terminal frontend depends on this feature alone and consumes
+# `view::ViewModel` and `view::UiAction` without linking Crossterm or Ratatui.
+controller = [
     "subscriptions",
     "dep:chrono",
     "dep:crossbeam-channel",
-    "dep:crossterm",
-    "dep:ratatui",
     "dep:toml_edit",
     "dep:unicode-segmentation",
+]
+
+# Terminal user interface and playback backends.
+tui = [
+    "controller",
+    "cli",
+    "dep:crossterm",
+    "dep:ratatui",
 ]
 # Offline QR codes for exact selected YouTube videos.
 qr = ["tui", "dep:qrcode"]
