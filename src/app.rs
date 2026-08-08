@@ -48807,20 +48807,21 @@ mod tests {
         }];
         let chapters = controller.view.playback_chapters.clone();
 
-        controller.dispatch(UiAction::ToggleChapterTimestamps);
         assert!(!controller.view.show_chapter_timestamps);
+        controller.dispatch(UiAction::ToggleChapterTimestamps);
+        assert!(controller.view.show_chapter_timestamps);
         assert_eq!(controller.view.playback_chapters, chapters);
-        assert_eq!(controller.view.status_line, "Chapter timestamps hidden");
+        assert_eq!(controller.view.status_line, "Chapter timestamps shown");
         controller.save_session();
         let config = controller.config.clone();
         drop(controller);
 
         let store = StateStore::open(&config).expect("reopen disk state");
         let mut restored = AppController::new(config, store, None, None);
-        assert!(!restored.view.show_chapter_timestamps);
-        restored.dispatch(UiAction::ToggleChapterTimestamps);
         assert!(restored.view.show_chapter_timestamps);
-        assert_eq!(restored.view.status_line, "Chapter timestamps shown");
+        restored.dispatch(UiAction::ToggleChapterTimestamps);
+        assert!(!restored.view.show_chapter_timestamps);
+        assert_eq!(restored.view.status_line, "Chapter timestamps hidden");
     }
 
     #[cfg(feature = "radio")]

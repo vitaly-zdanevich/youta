@@ -1586,7 +1586,7 @@ impl Default for ViewModel {
             radio_now_playing: None,
             radio_recording: None,
             playback_chapters: Vec::new(),
-            show_chapter_timestamps: true,
+            show_chapter_timestamps: false,
             skip_advertisement_chapters: true,
             local_size_sort: LocalSizeSort::Off,
             show_all_local_files: false,
@@ -12552,6 +12552,11 @@ mod tests {
     }
 
     #[test]
+    fn view_model_hides_chapter_timestamps_by_default() {
+        assert!(!ViewModel::default().show_chapter_timestamps);
+    }
+
+    #[test]
     fn view_model_applies_tty_image_preference_to_the_live_renderer() {
         let mut renderer = MockThumbnailRenderer::default();
         let hidden = ViewModel {
@@ -23273,6 +23278,7 @@ mod tests {
                 ..PlaybackStatus::default()
             },
             playback_chapters: chapters,
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
 
@@ -23308,6 +23314,7 @@ mod tests {
                     end_seconds: None,
                 },
             ],
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
 
@@ -23344,6 +23351,7 @@ mod tests {
                     end_seconds: Some(1_000),
                 },
             ],
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
 
@@ -23427,6 +23435,7 @@ mod tests {
                     end_seconds: Some(100),
                 },
             ],
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -23510,6 +23519,7 @@ prose 07:25 remains clickable but is not a chapter";
             },
             playing_media_id: Some(MediaId::new(SourceKind::YouTube, "abcdefghijk")),
             playback_chapters: chapters,
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -23732,6 +23742,7 @@ prose 07:25 remains clickable but is not a chapter";
                 start_seconds: 10,
                 end_seconds: Some(100),
             }],
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
         let backend = TestBackend::new(80, 4);
@@ -23991,6 +24002,7 @@ prose 07:25 remains clickable but is not a chapter";
             },
             playing_media_id: Some(MediaId::new(SourceKind::YouTube, "abcdefghijk")),
             playback_chapters: chapters.clone(),
+            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
 
