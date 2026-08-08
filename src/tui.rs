@@ -5872,9 +5872,9 @@ fn render_information_panel(
             button(
                 "H",
                 if view.show_all_local_files {
-                    "Media files only"
-                } else {
                     "Show all files"
+                } else {
+                    "Media files only"
                 },
                 show_hotkeys,
             ),
@@ -26501,9 +26501,9 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn local_details_expose_the_current_file_visibility_toggle() {
-        for (show_all_local_files, expected, unexpected) in [
-            (false, "[H] Show all files", "[H] Media files only"),
-            (true, "[H] Media files only", "[H] Show all files"),
+        for (show_all_local_files, expected, unexpected, highlighted) in [
+            (false, "[H] Media files only", "[H] Show all files", false),
+            (true, "[H] Show all files", "[H] Media files only", true),
         ] {
             let backend = TestBackend::new(100, 18);
             let mut terminal = Terminal::new(backend).expect("terminal");
@@ -26527,12 +26527,23 @@ prose 07:25 remains clickable but is not a chapter";
 
             assert!(rendered.contains(expected));
             assert!(!rendered.contains(unexpected));
-            assert!(
-                hit_map
-                    .detail_buttons
-                    .iter()
-                    .any(|(action, _)| action == &UiAction::ToggleLocalAllFiles)
-            );
+            let target = hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(action, target)| {
+                    (action == &UiAction::ToggleLocalAllFiles).then_some(*target)
+                })
+                .expect("Local file-visibility control hit target");
+            let label_cell = &terminal.backend().buffer()[(target.x, target.y)];
+            if highlighted {
+                assert_eq!(label_cell.fg, Color::Black);
+                assert_eq!(label_cell.bg, Color::Cyan);
+                assert!(label_cell.modifier.contains(Modifier::BOLD));
+            } else {
+                assert_eq!(label_cell.fg, Color::Cyan);
+                assert_eq!(label_cell.bg, Color::Reset);
+                assert!(!label_cell.modifier.contains(Modifier::BOLD));
+            }
         }
     }
 
