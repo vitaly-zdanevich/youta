@@ -42,6 +42,9 @@ pub(crate) mod gpm;
 #[cfg(feature = "tracker-music")]
 pub mod tracker_media;
 
+#[cfg(feature = "remote-artwork")]
+pub mod artwork;
+
 #[cfg(feature = "images")]
 pub mod thumbnails;
 
@@ -53,3 +56,6 @@ pub mod tui;
 
 #[cfg(feature = "controller")]
 pub mod view;
+
+#[cfg(feature = "controller")]
+pub mod keymap;

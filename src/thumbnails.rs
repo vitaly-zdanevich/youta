@@ -12,13 +12,15 @@
 //! filesystem fingerprint before reuse.
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek, Write};
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "local-video-thumbnails")]
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 #[cfg(feature = "local-video-thumbnails")]
 use std::time::Instant;
@@ -42,27 +44,30 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, ResizeEncodeRender};
 use sha2::{Digest, Sha256};
-use ureq::ResponseExt;
-use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
 use crate::config::ThumbnailMode;
-use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 use crate::terminal_environment::{TerminalAttachment, is_linux_virtual_console};
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
+use crate::artwork::{
+    HttpThumbnailTransport, ThumbnailCache, ThumbnailTransport, is_safe_thumbnail_source,
+};
+// The renderer's tests still exercise the pipeline end to end, so they reach
+// into the neutral half for its fetch entry points and guarded resolver.
+#[cfg(test)]
+use crate::artwork::{
+    ActiveCacheTemporary, ThumbnailCachePolicy, fetch_thumbnail, fetch_thumbnail_with_policy,
+    is_cache_entry_name, mock_thumbnail_agent, thumbnail_agent,
+};
+
+// `ThumbnailFailure` moved to the neutral half; keep its published path.
+pub use crate::artwork::ThumbnailFailure;
+
 const MAX_IMAGE_DIMENSION: u32 = 4_096;
 const MAX_DECODE_ALLOC_BYTES: u64 = 32 * 1024 * 1024;
 const REQUEST_DEBOUNCE: Duration = Duration::from_millis(150);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const FALLBACK_FONT_SIZE: (u16, u16) = (10, 20);
-const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-// Retain a complete maximum search prefetch unless the independent 64 MiB
-// budget requires byte-based eviction.
-const CACHE_MAX_ENTRIES: usize = 512;
-const CACHE_FILE_EXTENSION: &str = "image";
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
 const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 16;
@@ -89,9 +94,6 @@ const MAX_LOCAL_ARTWORK_TAG_ITEM_BYTES: usize = MAX_DOWNLOAD_BYTES + 64 * 1024;
 const MAX_LOCAL_ARTWORK_PICTURES: usize = 64;
 #[cfg(feature = "local-artwork")]
 const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
-static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_CACHE_TEMPORARIES: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 #[cfg(test)]
 static LOCAL_SOURCE_DECODE_COUNTS: std::sync::Mutex<Vec<(PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
@@ -129,43 +131,6 @@ pub enum ThumbnailCapability {
     Unsupported,
     /// Artwork can be encoded with the enclosed protocol.
     Supported(ThumbnailProtocol),
-}
-
-/// Safe, URL-free reason why selected artwork could not be displayed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThumbnailFailure {
-    /// The provider returned an unsupported or unsafe URL.
-    InvalidSource,
-    /// The image could not be downloaded before the bounded timeout.
-    DownloadFailed,
-    /// The response exceeded Youta's thumbnail byte limit.
-    ResponseTooLarge,
-    /// The response was not JPEG, PNG, or WebP.
-    UnsupportedFormat,
-    /// The image was malformed or exceeded decode limits.
-    InvalidImage,
-    /// FFmpeg could not extract a representative local-video frame.
-    LocalVideoFrameExtractionFailed,
-    /// The terminal protocol encoder rejected the image.
-    EncodingFailed,
-    /// The background thumbnail worker stopped unexpectedly.
-    WorkerStopped,
-}
-
-impl std::fmt::Display for ThumbnailFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::InvalidSource => "thumbnail source is not HTTP or HTTPS",
-            Self::DownloadFailed => "thumbnail download failed",
-            Self::ResponseTooLarge => "thumbnail exceeds the 4 MiB download limit",
-            Self::UnsupportedFormat => "thumbnail is not JPEG, PNG, or WebP",
-            Self::InvalidImage => "thumbnail is invalid or exceeds decode limits",
-            Self::LocalVideoFrameExtractionFailed => "video frame extraction failed",
-            Self::EncodingFailed => "terminal thumbnail encoding failed",
-            Self::WorkerStopped => "thumbnail worker stopped",
-        };
-        formatter.write_str(message)
-    }
 }
 
 /// Current state of the selected item's lazy thumbnail.
@@ -440,10 +405,6 @@ struct LocalPreviewTarget {
     height: u32,
 }
 
-trait ThumbnailTransport: Send + 'static {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
-}
-
 /// Cancellation token shared by one visible thumbnail request and its worker.
 #[derive(Clone)]
 struct RequestCancellation {
@@ -606,377 +567,6 @@ fn read_bounded_process_pipe(reader: impl Read, limit: usize) -> io::Result<Vec<
         .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)?;
     Ok(bytes)
-}
-
-struct HttpThumbnailTransport {
-    agent: ureq::Agent,
-}
-
-/// DNS resolver that pins thumbnail connections to public addresses only.
-#[derive(Debug, Default)]
-struct PublicThumbnailResolver {
-    resolver: DefaultResolver,
-    #[cfg(test)]
-    allow_non_public: bool,
-}
-
-impl Resolver for PublicThumbnailResolver {
-    fn resolve(
-        &self,
-        uri: &ureq::http::Uri,
-        config: &ureq::config::Config,
-        timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let resolved = self.resolver.resolve(uri, config, timeout)?;
-        #[cfg(test)]
-        if self.allow_non_public {
-            return Ok(resolved);
-        }
-        let mut public = self.empty();
-        for address in &resolved {
-            if !ip_address_is_non_public(address.ip()) {
-                public.push(*address);
-            }
-        }
-        if public.is_empty() {
-            Err(ureq::Error::HostNotFound)
-        } else {
-            Ok(public)
-        }
-    }
-}
-
-impl ThumbnailTransport for HttpThumbnailTransport {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
-        fetch_thumbnail(&self.agent, source)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ThumbnailCachePolicy {
-    max_age: Duration,
-    max_bytes: u64,
-    max_entries: usize,
-}
-
-impl Default for ThumbnailCachePolicy {
-    fn default() -> Self {
-        Self {
-            max_age: CACHE_MAX_AGE,
-            max_bytes: CACHE_MAX_BYTES,
-            max_entries: CACHE_MAX_ENTRIES,
-        }
-    }
-}
-
-struct ThumbnailCache {
-    directory: PathBuf,
-    policy: ThumbnailCachePolicy,
-}
-
-impl ThumbnailCache {
-    fn new(directory: PathBuf) -> Self {
-        Self {
-            directory,
-            policy: ThumbnailCachePolicy::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_policy(directory: PathBuf, policy: ThumbnailCachePolicy) -> Self {
-        Self { directory, policy }
-    }
-
-    fn read(&self, source: &Url) -> io::Result<Option<Vec<u8>>> {
-        self.read_key(source.as_str().as_bytes())
-    }
-
-    fn read_key(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if !self.directory.exists() {
-            return Ok(None);
-        }
-        self.secure_directory()?;
-        let path = self.entry_path_for_key(key);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if !metadata.file_type().is_file()
-            || metadata.len() == 0
-            || metadata.len() > MAX_DOWNLOAD_BYTES as u64
-            || self.is_expired(&metadata)
-        {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-        if !self.is_confined_entry(&path)? {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-
-        let file = fs::File::open(&path)?;
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(metadata.len())
-                .unwrap_or(MAX_DOWNLOAD_BYTES)
-                .min(MAX_DOWNLOAD_BYTES),
-        );
-        file.take(u64::try_from(MAX_DOWNLOAD_BYTES + 1).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
-        if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-        Ok(Some(bytes))
-    }
-
-    fn prepare(&self) -> io::Result<()> {
-        self.secure_directory()?;
-        self.evict()
-    }
-
-    fn store(&self, source: &Url, bytes: &[u8]) -> io::Result<()> {
-        self.store_key(source.as_str().as_bytes(), bytes)
-    }
-
-    fn store_key(&self, key: &[u8], bytes: &[u8]) -> io::Result<()> {
-        if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
-            return Ok(());
-        }
-        self.secure_directory()?;
-        let path = self.entry_path_for_key(key);
-        self.write_atomic(&path, bytes)?;
-        self.evict()
-    }
-
-    fn remove(&self, source: &Url) {
-        self.remove_key(source.as_str().as_bytes());
-    }
-
-    fn remove_key(&self, key: &[u8]) {
-        remove_cache_entry(&self.entry_path_for_key(key));
-    }
-
-    #[cfg(test)]
-    fn entry_path(&self, source: &Url) -> PathBuf {
-        self.entry_path_for_key(source.as_str().as_bytes())
-    }
-
-    fn entry_path_for_key(&self, key: &[u8]) -> PathBuf {
-        let digest = Sha256::digest(key);
-        self.directory
-            .join(format!("{digest:x}.{CACHE_FILE_EXTENSION}"))
-    }
-
-    fn secure_directory(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.directory)?;
-        let metadata = fs::symlink_metadata(&self.directory)?;
-        if !metadata.file_type().is_dir() {
-            return Err(io::Error::other("thumbnail cache path is not a directory"));
-        }
-        set_private_directory_permissions(&self.directory)
-    }
-
-    fn is_confined_entry(&self, path: &Path) -> io::Result<bool> {
-        let directory = fs::canonicalize(&self.directory)?;
-        let entry = fs::canonicalize(path)?;
-        Ok(entry.parent() == Some(directory.as_path()))
-    }
-
-    fn is_expired(&self, metadata: &fs::Metadata) -> bool {
-        metadata
-            .modified()
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > self.policy.max_age)
-    }
-
-    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.directory.join(format!(
-            ".thumbnail.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let active_temporary = ActiveCacheTemporary::register(temporary.clone());
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            set_private_file_permissions(&temporary)?;
-            fs::rename(&temporary, path)?;
-            set_private_file_permissions(path)?;
-            let _ = fs::File::open(&self.directory).and_then(|directory| directory.sync_all());
-            Ok(())
-        })();
-        drop(active_temporary);
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    fn evict(&self) -> io::Result<()> {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if is_cache_temp_name(&entry.file_name()) {
-                let path = entry.path();
-                if cache_temporary_is_active(&path) {
-                    continue;
-                }
-                if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
-                {
-                    remove_cache_entry(&path);
-                }
-                continue;
-            }
-            if !is_cache_entry_name(&entry.file_name()) {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if !metadata.file_type().is_file()
-                || metadata.len() == 0
-                || metadata.len() > MAX_DOWNLOAD_BYTES as u64
-                || self.is_expired(&metadata)
-            {
-                remove_cache_entry(&path);
-                continue;
-            }
-            entries.push(CacheEntry {
-                path,
-                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                bytes: metadata.len(),
-            });
-        }
-
-        entries.sort_by(|left, right| {
-            left.modified
-                .cmp(&right.modified)
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        let mut total_bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
-        let mut total_entries = entries.len();
-        for entry in entries {
-            if total_entries <= self.policy.max_entries && total_bytes <= self.policy.max_bytes {
-                break;
-            }
-            if fs::remove_file(&entry.path).is_ok() {
-                total_entries = total_entries.saturating_sub(1);
-                total_bytes = total_bytes.saturating_sub(entry.bytes);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Registration preventing concurrent cache eviction from deleting a live
-/// atomic-write temporary.
-struct ActiveCacheTemporary {
-    path: PathBuf,
-}
-
-impl ActiveCacheTemporary {
-    fn register(path: PathBuf) -> Self {
-        ACTIVE_CACHE_TEMPORARIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.clone());
-        Self { path }
-    }
-}
-
-impl Drop for ActiveCacheTemporary {
-    fn drop(&mut self) {
-        ACTIVE_CACHE_TEMPORARIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.path);
-    }
-}
-
-fn cache_temporary_is_active(path: &Path) -> bool {
-    ACTIVE_CACHE_TEMPORARIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(path)
-}
-
-struct CacheEntry {
-    path: PathBuf,
-    modified: SystemTime,
-    bytes: u64,
-}
-
-fn is_cache_entry_name(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(digest) = name.strip_suffix(&format!(".{CACHE_FILE_EXTENSION}")) else {
-        return false;
-    };
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn is_cache_temp_name(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(sequence) = name
-        .strip_prefix(".thumbnail.")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let mut components = sequence.split('.');
-    matches!(
-        (components.next(), components.next(), components.next()),
-        (Some(process), Some(sequence), None)
-            if !process.is_empty()
-                && !sequence.is_empty()
-                && process.bytes().all(|byte| byte.is_ascii_digit())
-                && sequence.bytes().all(|byte| byte.is_ascii_digit())
-    )
-}
-
-fn remove_cache_entry(path: &Path) {
-    let _ = fs::remove_file(path);
-}
-
-fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 /// Stable identity for one regular local image at a point in time.
@@ -2275,9 +1865,7 @@ fn spawn_visible_worker(
         picker,
         requests,
         results,
-        HttpThumbnailTransport {
-            agent: thumbnail_agent(),
-        },
+        HttpThumbnailTransport::new(),
         FfmpegVideoFrameExtractor,
         cache_directory.map(ThumbnailCache::new),
         REQUEST_DEBOUNCE,
@@ -2353,9 +1941,7 @@ fn spawn_visible_worker_with_transport_and_extractor<
 fn spawn_prefetch_worker(prefetch_updates: Receiver<Vec<Url>>, cache_directory: PathBuf) -> bool {
     spawn_prefetch_worker_with_transport(
         prefetch_updates,
-        HttpThumbnailTransport {
-            agent: thumbnail_agent(),
-        },
+        HttpThumbnailTransport::new(),
         ThumbnailCache::new(cache_directory),
     )
 }
@@ -2661,43 +2247,6 @@ fn prefetch_thumbnail(
         return Ok(());
     }
     cache.store(source, &bytes)
-}
-
-fn thumbnail_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .user_agent(concat!(
-            "youta/",
-            env!("CARGO_PKG_VERSION"),
-            " (+",
-            env!("CARGO_PKG_REPOSITORY"),
-            ")"
-        ))
-        .build();
-    ureq::Agent::with_parts(
-        config,
-        DefaultConnector::default(),
-        PublicThumbnailResolver::default(),
-    )
-}
-
-#[cfg(test)]
-fn mock_thumbnail_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build();
-    ureq::Agent::with_parts(
-        config,
-        DefaultConnector::default(),
-        PublicThumbnailResolver {
-            resolver: DefaultResolver::default(),
-            allow_non_public: true,
-        },
-    )
 }
 
 fn load_thumbnail(
@@ -3108,81 +2657,6 @@ fn encode_thumbnail(
         }),
         Some(Err(_)) | None => Err(ThumbnailFailure::EncodingFailed),
     }
-}
-
-fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
-    fetch_thumbnail_with_policy(agent, source, false)
-}
-
-/// Fetches one thumbnail, optionally allowing a loopback test fixture.
-fn fetch_thumbnail_with_policy(
-    agent: &ureq::Agent,
-    source: &Url,
-    allow_non_public_test_source: bool,
-) -> Result<Vec<u8>, ThumbnailFailure> {
-    if source.scheme() == "file" {
-        let path = source
-            .to_file_path()
-            .map_err(|()| ThumbnailFailure::InvalidSource)?;
-        let metadata = fs::symlink_metadata(&path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
-        if !metadata.file_type().is_file() {
-            return Err(ThumbnailFailure::InvalidSource);
-        }
-        if metadata.len() > MAX_DOWNLOAD_BYTES as u64 {
-            return Err(ThumbnailFailure::ResponseTooLarge);
-        }
-        return fs::read(path).map_err(|_| ThumbnailFailure::DownloadFailed);
-    }
-    if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
-        return Err(ThumbnailFailure::InvalidSource);
-    }
-    let mut response = agent
-        .get(source.as_str())
-        .header("Accept", "image/jpeg, image/png, image/webp")
-        .call()
-        .map_err(|_| ThumbnailFailure::DownloadFailed)?;
-    if !(200..300).contains(&response.status().as_u16()) {
-        return Err(ThumbnailFailure::DownloadFailed);
-    }
-    let final_url =
-        Url::parse(&response.get_uri().to_string()).map_err(|_| ThumbnailFailure::InvalidSource)?;
-    if !is_safe_remote_thumbnail_source(&final_url, allow_non_public_test_source) {
-        return Err(ThumbnailFailure::InvalidSource);
-    }
-    if response
-        .body()
-        .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
-    {
-        return Err(ThumbnailFailure::ResponseTooLarge);
-    }
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(u64::try_from(MAX_DOWNLOAD_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
-        .read_to_vec()
-        .map_err(|error| match error {
-            ureq::Error::BodyExceedsLimit(_) => ThumbnailFailure::ResponseTooLarge,
-            _ => ThumbnailFailure::DownloadFailed,
-        })?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        Err(ThumbnailFailure::ResponseTooLarge)
-    } else {
-        Ok(bytes)
-    }
-}
-
-fn is_safe_thumbnail_source(source: &Url) -> bool {
-    is_safe_remote_thumbnail_source(source, false)
-        || (source.scheme() == "file" && source.to_file_path().is_ok())
-}
-
-fn is_safe_remote_thumbnail_source(source: &Url, allow_non_public_test_source: bool) -> bool {
-    matches!(source.scheme(), "http" | "https")
-        && source.username().is_empty()
-        && source.password().is_none()
-        && source.host_str().is_some()
-        && (allow_non_public_test_source || !remote_url_has_non_public_host(source))
 }
 
 /// Converts one terminal-cell rectangle into the exact corresponding pixel

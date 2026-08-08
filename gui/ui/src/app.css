@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+/* Design tokens for the "media player" direction: dark ground, one warm accent
+   spent only on the current item, generous chrome around a dense list. The
+   window commits to this single dark world deliberately, so every colour is
+   painted rather than inherited from the host. */
+@theme {
+  --color-ground: #0c0b10;
+  --color-surface: #16151d;
+  --color-raised: #1e1c27;
+  --color-ink: #f1eff5;
+  --color-ink-dim: #a29db1;
+  --color-ink-faint: #6f6a80;
+  --color-line: #26242f;
+  --color-line-strong: #383544;
+  --color-accent: #e4744f;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ground);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  /* Chrome is not selectable; Details opts back in, because that is the one
+     place a user wants to copy provider text. */
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

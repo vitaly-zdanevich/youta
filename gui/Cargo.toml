@@ -15,9 +15,11 @@ unsafe_code = "forbid"
 # The reducer, the view contract, persistence, providers, and playback come
 # from the shared crate. `controller` deliberately excludes the terminal
 # renderer, so Crossterm and Ratatui never enter this binary.
-youta = { path = "..", default-features = false, features = ["controller", "sources"] }
+youta = { path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr"] }
 
+percent-encoding = "2.3"
 serde = { version = "1.0", features = ["derive"] }
+url = "2.5"
 serde_json = "1.0"
 tauri = { version = "2", features = [] }
 

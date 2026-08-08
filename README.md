@@ -499,6 +499,82 @@ generation. A custom
 `--no-default-features` build must list `images` explicitly when artwork is
 wanted.
 
+### The desktop window
+
+Youta also has a desktop window, in the `youta-gui` workspace crate. It is a
+second front-end to the same reducer the terminal drives: the same state, the
+same keyboard map, the same providers and playback engine. Neither front-end
+replaces the other.
+
+Its page is built with Vite, so it needs Node once before the Rust build:
+
+```sh
+npm --prefix gui/ui ci
+npm --prefix gui/ui run build
+cargo run --locked -p youta-gui
+```
+
+The page is embedded into the binary when the Rust crate compiles, so editing
+the front-end means running both commands again: `npm --prefix gui/ui run build`
+followed by `cargo build -p youta-gui`. Rebuilding only the page leaves the
+running binary serving the assets it was compiled with.
+
+The rest of the repository needs no JavaScript toolchain. `youta-gui` is not a
+default workspace member, so `cargo build`, `cargo test`, and the lint gates
+never touch it, and a Rust-only build of the window falls back to a placeholder
+page that says what to run.
+
+The window links no terminal code at all. It selects `controller` and `sources`
+rather than `tui`, which is checked by `cargo tree -p youta-gui -i ratatui`
+matching no package.
+
+Subscriptions keeps both navigation models the terminal offers, because which
+one is active is a saved preference the two front-ends share. Where the window
+differs is width: it shows the source list, the item list, and the information
+panel at once, which four terminal rows cannot. The panel follows the reducer —
+a channel or a feed while a source is being chosen, the selected item once one
+has been entered.
+
+Details text selects and copies natively, so Ctrl-C is left to the web view
+whenever something is selected rather than being claimed by Youta. Scrolling is
+native too, but the reducer still owns the offset, because Home, End, PageDown
+and Alt-u/d move it and only the reducer knows whether the panel has focus.
+
+Everything the window renders arrives as JSON except the waveform. A
+window-wide envelope is a few thousand sixteen-bit peaks, which JSON inflates by
+roughly an order of magnitude, and it changes once per file rather than once per
+frame — so the window asks for it as bytes, four per column, once per file and
+once per resize. Rust reduces it to exactly the number of device pixels the
+canvas will draw, using the same code the terminal draws its four rows with. The
+request names a generation, and a generation the reducer no longer holds is
+answered with nothing rather than with the current file's peaks: otherwise a
+reply that outlived the selection would paint one file's envelope where another
+belongs, and a click on those pixels would seek the wrong media.
+
+A search field appears on every screen that collects a query and nowhere else;
+both front-ends ask `Screen::search_verb` which those are, so a screen whose
+Enter would answer "search is not available" is never given a field. It is not
+a text input: clicking it asks the reducer to open its editor, and the typing,
+Enter, and Escape that follow travel through the shared keyboard map, exactly
+as `/` does in the terminal. The query, the insertion point, and the modal
+precedence stay in `src/app.rs`, so the window displays an editor it does not
+own.
+
+Four editors are terminal-only: the YouTube API key, the Yandex Music OAuth
+token, the RSS feed URL, and private notes. Their contents never leave the
+player process, so the window cannot draw them; it receives one bit saying an
+editor is open and shows a notice with a way out. Without that bit the window
+would look like an ordinary screen that had stopped responding, because those
+editors are modal and the keyboard map routes every key into them — and the
+YouTube one opens by itself the first time a search runs without credentials.
+Set those values in the terminal front-end or in the configuration files.
+
+`images` is terminal artwork: it adds decoding and the graphics protocols on
+top of `remote-artwork`, which is the fetching and private on-disk cache alone.
+A build that wants artwork bytes without a terminal renderer — a different
+front-end, or a tool — selects `remote-artwork` by itself and links no Ratatui.
+`qr` is likewise renderer-free: it encodes a module matrix and draws nothing.
+
 For a small TUI build containing only the curated Radio catalogue and `mpv`
 playback:
 

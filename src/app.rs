@@ -56468,6 +56468,30 @@ mod tests {
         assert_eq!(search_route(Screen::Subscriptions), SearchRoute::None);
     }
 
+    /// A screen offers a query editor exactly where submitting one does
+    /// something.
+    ///
+    /// Both front-ends label their editor from `Screen::search_verb`, while the
+    /// submit path dispatches on `search_route`. Radio is the one deliberate
+    /// difference: it filters the compiled catalogue in place instead of asking
+    /// a provider, so it carries a verb without a route.
+    #[test]
+    fn every_screen_with_a_search_verb_submits_somewhere() {
+        for screen in Screen::ALL {
+            let verb = screen.search_verb();
+            let expected = match screen {
+                Screen::Radio => Some("Filter"),
+                _ if search_route(screen) == SearchRoute::None => None,
+                _ => Some("Search"),
+            };
+            assert_eq!(
+                verb, expected,
+                "{screen:?} labels its search editor inconsistently with its \
+                 submit route"
+            );
+        }
+    }
+
     #[cfg(feature = "bandcamp")]
     #[test]
     fn canonical_bandcamp_url_opens_first_class_tab_without_searching() {

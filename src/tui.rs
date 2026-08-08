@@ -56,6 +56,8 @@ use crate::waveform::Peak;
 
 pub use crate::view::*;
 
+use crate::keymap::{Key, KeyPress, PopupGeometry, ScrollGeometry};
+
 /// Fixed-width marker rendered for the same actively playing Commons value.
 const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "⏸";
 
@@ -1947,30 +1949,6 @@ fn nearest_free_label_slot(
     best.map(|(_, _, row, start)| (row, start))
 }
 
-/// Reports whether expanded Details owns a renderable artwork source.
-fn expanded_thumbnail_available(view: &ViewModel) -> bool {
-    let Some(details) = view
-        .details
-        .as_ref()
-        .filter(|details| details.thumbnail_expanded)
-    else {
-        return false;
-    };
-    details.expanded_thumbnail_url.is_some()
-        || details.thumbnail_url.is_some()
-        || details.local_video_thumbnail.is_some()
-        || details
-            .expanded_wikidata_item
-            .as_deref()
-            .and_then(|item_id| {
-                details
-                    .wikidata_entities
-                    .iter()
-                    .find(|entity| entity.item_id == item_id)
-            })
-            .is_some_and(|entity| entity.image_url.is_some())
-}
-
 /// Renders expanded artwork as a modal once its terminal pixels are ready.
 ///
 /// While the enlarged target is loading, or while an image protocol advances
@@ -2091,7 +2069,7 @@ fn render_frame(
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
-        && expanded_thumbnail_available(view)
+        && view.expanded_thumbnail_available()
         && thumbnail_renderer
             .as_ref()
             .is_some_and(|renderer| renderer.is_enabled());
@@ -2447,21 +2425,15 @@ fn active_tab_window(
 /// therefore do not consume a second row for a duplicate title.
 fn search_panel_title(view: &ViewModel) -> String {
     if !view.search_editing {
-        match view.screen {
-            Screen::Radio if view.search_query.trim().is_empty() => return String::new(),
-            Screen::Radio => {}
-            Screen::Subscriptions
-            | Screen::Local
-            | Screen::Downloaded
-            | Screen::History
-            | Screen::Playlists
-            | Screen::Statistics => return String::new(),
-            Screen::Search
-            | Screen::YouTubeMusic
-            | Screen::YandexMusic
-            | Screen::Bandcamp
-            | Screen::ApplePodcasts
-            | Screen::TrackerMusic => {}
+        // Which screens collect a query is not restated here: the window asks
+        // the same question to decide whether it draws a search field.
+        if view.screen.search_verb().is_none() {
+            return String::new();
+        }
+        // Radio filters as the user types, so an idle empty filter says nothing
+        // the tab has not already said.
+        if view.screen == Screen::Radio && view.search_query.trim().is_empty() {
+            return String::new();
         }
     }
     let search_title = if view.search_editing {
@@ -3329,14 +3301,7 @@ fn render_details_with_terminal_window(
         hit_map,
         "",
         empty_message,
-        match view.screen {
-            Screen::Local => InformationPanelKind::Local,
-            Screen::ApplePodcasts => InformationPanelKind::Podcast,
-            Screen::Radio => InformationPanelKind::Radio,
-            Screen::YandexMusic => InformationPanelKind::YandexMusic,
-            Screen::Bandcamp | Screen::Playlists | Screen::History => InformationPanelKind::Generic,
-            _ => InformationPanelKind::Video,
-        },
+        view.screen.details_kind(),
         true,
         ThumbnailSizing::adaptive_youtube(configured_thumbnail_height, terminal_window),
         thumbnail_renderer,
@@ -3367,25 +3332,6 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         | Screen::History
         | Screen::Statistics => false,
     }
-}
-
-/// Source-specific metadata layout used by the shared information renderer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InformationPanelKind {
-    /// Media details with duration, likes, and views.
-    Video,
-    /// Podcast show or episode details without video-only statistics.
-    Podcast,
-    /// Channel details with subscriber metadata.
-    Channel,
-    /// Public live-radio metadata without finite-media statistics.
-    Radio,
-    /// Authenticated Yandex Music catalogue details and source-specific actions.
-    YandexMusic,
-    /// Local folder, media, or image metadata without remote statistics.
-    Local,
-    /// Persisted or aggregate rows without source-specific remote statistics.
-    Generic,
 }
 
 /// Returns a real YouTube `@handle` carried by a safe channel URL.
@@ -8931,11 +8877,73 @@ fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
     Some(usize::from((hit_map.rows.height / row_height).max(1)))
 }
 
-/// Returns whether one key is the editor-local Vim word-delete chord.
-fn is_delete_previous_word_key(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('w' | 'W'))
+/// Translates one Crossterm key event into the shared vocabulary.
+///
+/// Returns [`None`] for keys the shared map has no name for, such as media and
+/// keypad keys, which the terminal front-end has never bound.
+fn key_press(key: KeyEvent) -> Option<KeyPress> {
+    let named = match key.code {
+        KeyCode::Char(character) => Key::Char(character),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::F(number) => Key::F(number),
+        _ => return None,
+    };
+    Some(KeyPress {
+        key: named,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    })
+}
+
+/// Reports the rendered popup scroll state the shared map needs for paging.
+fn popup_geometry(hit_map: &HitMap) -> PopupGeometry {
+    PopupGeometry {
+        project_history: ScrollGeometry {
+            offset: hit_map.project_history_scroll_offset,
+            maximum: hit_map.project_history_scroll_maximum,
+            page_lines: hit_map.project_history_page_lines,
+        },
+        video_comments: ScrollGeometry {
+            offset: hit_map.video_comments_scroll_offset,
+            maximum: hit_map.video_comments_scroll_maximum,
+            page_lines: hit_map.video_comments_page_lines,
+        },
+    }
+}
+
+/// Crossterm-flavoured shims so the renderer's popup tests stay unchanged.
+#[cfg(test)]
+fn project_history_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    crate::keymap::project_history_key_action(key_press(key)?, offset, maximum, page_lines)
+}
+
+#[cfg(test)]
+fn video_comments_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    crate::keymap::video_comments_key_action(key_press(key)?, offset, maximum, page_lines)
 }
 
 #[cfg(test)]
@@ -8944,837 +8952,21 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
 }
 
 /// Maps one key using the current rendered main-list page capacity.
+///
+/// The mapping itself lives in [`crate::keymap`] so the window applies the
+/// same modal precedence. Only the translation from Crossterm is local.
 fn key_action_with_page_rows(
     key: KeyEvent,
     view: &ViewModel,
     page_rows: Option<usize>,
     hit_map: Option<&HitMap>,
 ) -> Option<UiAction> {
-    if view.error_popup.is_none()
-        && view.project_history_popup.is_some()
-        && let Some(hit_map) = hit_map
-    {
-        return project_history_key_action(
-            key,
-            hit_map.project_history_scroll_offset,
-            hit_map.project_history_scroll_maximum,
-            hit_map.project_history_page_lines,
-        );
-    }
-    if view.error_popup.is_none()
-        && view.video_comments_popup.is_some()
-        && let Some(hit_map) = hit_map
-    {
-        return video_comments_key_action(
-            key,
-            hit_map.video_comments_scroll_offset,
-            hit_map.video_comments_scroll_maximum,
-            hit_map.video_comments_page_lines,
-        );
-    }
-    key_action_with_page_rows_unfiltered(key, view, page_rows)
-        .filter(|action| view.external_opener_available || !action.requires_external_opener())
-}
-
-/// Maps modal project-history navigation to one resize-aware wrapped-line offset.
-fn project_history_key_action(
-    key: KeyEvent,
-    offset: usize,
-    maximum: usize,
-    page_lines: usize,
-) -> Option<UiAction> {
-    let page_lines = page_lines.max(1);
-    match key.code {
-        KeyCode::Esc | KeyCode::F(9) => Some(UiAction::DismissProjectHistory),
-        KeyCode::Up | KeyCode::Char('k') => {
-            Some(UiAction::SetProjectHistoryScroll(offset.saturating_sub(1)))
-        }
-        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_add(1).min(maximum),
-        )),
-        KeyCode::PageUp => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_sub(page_lines),
-        )),
-        KeyCode::PageDown => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_add(page_lines).min(maximum),
-        )),
-        KeyCode::Home => Some(UiAction::SetProjectHistoryScroll(0)),
-        KeyCode::End => Some(UiAction::SetProjectHistoryScroll(maximum)),
-        _ => None,
-    }
-}
-
-/// Maps modal comments navigation to one resize-aware wrapped-line offset.
-fn video_comments_key_action(
-    key: KeyEvent,
-    offset: usize,
-    maximum: usize,
-    page_lines: usize,
-) -> Option<UiAction> {
-    let page_lines = page_lines.max(1);
-    match key.code {
-        KeyCode::Esc | KeyCode::F(6) => Some(UiAction::DismissVideoComments),
-        KeyCode::Up | KeyCode::Char('k') => {
-            Some(UiAction::SetVideoCommentsScroll(offset.saturating_sub(1)))
-        }
-        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_add(1).min(maximum),
-        )),
-        KeyCode::PageUp => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_sub(page_lines),
-        )),
-        KeyCode::PageDown => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_add(page_lines).min(maximum),
-        )),
-        KeyCode::Home => Some(UiAction::SetVideoCommentsScroll(0)),
-        KeyCode::End => Some(UiAction::SetVideoCommentsScroll(maximum)),
-        _ => None,
-    }
-}
-
-/// Maps one key before applying terminal-capability policy.
-fn key_action_with_page_rows_unfiltered(
-    key: KeyEvent,
-    view: &ViewModel,
-    page_rows: Option<usize>,
-) -> Option<UiAction> {
-    if view.error_popup.is_some() {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissErrorPopup),
-            KeyCode::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
-            KeyCode::Char('g' | 'G')
-                if view
-                    .error_popup
-                    .as_ref()
-                    .is_some_and(|error| error.gh_available) =>
-            {
-                Some(UiAction::FillGitHubIssue)
-            }
-            KeyCode::Char('i' | 'I') => Some(UiAction::CopyAndOpenGitHubIssue),
-            KeyCode::Up | KeyCode::Left => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1)))
-            }
-            KeyCode::Down | KeyCode::Right => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(1)))
-            }
-            KeyCode::PageUp => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(-1))),
-            KeyCode::PageDown => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(1))),
-            KeyCode::Home => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Home)),
-            KeyCode::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
-            _ => None,
-        };
-    }
-    #[cfg(feature = "qr")]
-    {
-        if view.video_qr_popup.is_some() {
-            return match key.code {
-                KeyCode::Esc | KeyCode::Char('Q') => Some(UiAction::DismissVideoQr),
-                _ => None,
-            };
-        }
-    }
-    if let Some(popup) = view.project_history_popup.as_ref() {
-        return project_history_key_action(key, popup.scroll_offset, usize::MAX, 20);
-    }
-    if let Some(popup) = view.video_comments_popup.as_ref() {
-        return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
-    }
-    if let Some(popup) = view.private_note_popup.as_ref() {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissPrivateNotePopup),
-            KeyCode::Char('s' | 'S') if control => Some(UiAction::SavePrivateNote),
-            KeyCode::Delete => Some(UiAction::RequestPrivateNoteDelete),
-            KeyCode::Enter if popup.confirming_delete => Some(UiAction::RequestPrivateNoteDelete),
-            KeyCode::Enter => Some(UiAction::InsertPrivateNoteNewline),
-            KeyCode::Backspace => Some(UiAction::DeletePrivateNoteCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeletePrivateNoteWord)
-            }
-            KeyCode::Left => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Left,
-            )),
-            KeyCode::Right => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Right,
-            )),
-            KeyCode::Up => Some(UiAction::MovePrivateNoteCursor(PrivateNoteCursorMotion::Up)),
-            KeyCode::Down => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Down,
-            )),
-            KeyCode::Home => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Home,
-            )),
-            KeyCode::End => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::End,
-            )),
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendPrivateNoteCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(popup) = view.playlist_popup.as_ref() {
-        return match popup.mode {
-            PlaylistPopupMode::Choose => match key.code {
-                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
-                KeyCode::Enter => Some(UiAction::ToggleSelectedPlaylistMembership),
-                KeyCode::Up | KeyCode::Char('k') => Some(UiAction::MovePlaylistPopupSelection(-1)),
-                KeyCode::Down | KeyCode::Char('j') => Some(UiAction::MovePlaylistPopupSelection(1)),
-                KeyCode::Char('n')
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    Some(UiAction::BeginNewPlaylist)
-                }
-                _ => None,
-            },
-            PlaylistPopupMode::Create | PlaylistPopupMode::Edit => match key.code {
-                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
-                KeyCode::Enter if popup.mode == PlaylistPopupMode::Create => {
-                    Some(UiAction::CreatePlaylistAndAdd)
-                }
-                KeyCode::Enter => Some(UiAction::UpdatePlaylist),
-                KeyCode::Tab | KeyCode::BackTab => Some(UiAction::SelectPlaylistEditorField(
-                    match popup.editor_field {
-                        PlaylistEditorField::Name => PlaylistEditorField::Description,
-                        PlaylistEditorField::Description => PlaylistEditorField::Name,
-                    },
-                )),
-                KeyCode::Up => Some(UiAction::SelectPlaylistEditorField(
-                    PlaylistEditorField::Name,
-                )),
-                KeyCode::Down => Some(UiAction::SelectPlaylistEditorField(
-                    PlaylistEditorField::Description,
-                )),
-                KeyCode::Backspace => Some(UiAction::DeletePlaylistEditorCharacter),
-                KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                    Some(UiAction::DeletePlaylistEditorWord)
-                }
-                KeyCode::Char(character)
-                    if !character.is_control()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    Some(UiAction::AppendPlaylistEditorCharacter(character))
-                }
-                _ => None,
-            },
-        };
-    }
-    if let Some(popup) = view.local_file_popup.as_ref() {
-        return match (popup, key.code) {
-            (_, KeyCode::Esc) => Some(UiAction::DismissLocalFilePopup),
-            (LocalFilePopupView::Rename { .. }, KeyCode::Enter) => {
-                Some(UiAction::SubmitLocalRename)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Backspace) => {
-                Some(UiAction::DeleteLocalRenameCharacter)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Char('w' | 'W'))
-                if is_delete_previous_word_key(&key) =>
-            {
-                Some(UiAction::DeleteLocalRenameWord)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Left) => {
-                Some(UiAction::MoveLocalRenameCursor(-1))
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Right) => {
-                Some(UiAction::MoveLocalRenameCursor(1))
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Char(character))
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendLocalRenameCharacter(character))
-            }
-            (LocalFilePopupView::Trash { .. }, KeyCode::Enter) => Some(UiAction::ConfirmLocalTrash),
-            (LocalFilePopupView::DownloadedTrash { .. }, KeyCode::Enter) => {
-                Some(UiAction::ConfirmDownloadedTrash)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Enter) => {
-                Some(UiAction::ActivateLocalMoveDestination)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Char('m' | 'M')) => {
-                Some(UiAction::ConfirmLocalMoveHere)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Up | KeyCode::Char('k')) => {
-                Some(UiAction::MoveLocalMoveDestination(-1))
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Down | KeyCode::Char('j')) => {
-                Some(UiAction::MoveLocalMoveDestination(1))
-            }
-            _ => None,
-        };
-    }
-    if view.rss_subscription_popup.is_some() {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissRssSubscriptionPopup),
-            KeyCode::Enter => Some(UiAction::SubmitRssSubscription),
-            KeyCode::Backspace => Some(UiAction::DeleteRssSubscriptionCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteRssSubscriptionWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendRssSubscriptionCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(preferences) = view.preferences_popup.as_ref() {
-        let alternative = preferences.subscriptions_layout.toggled();
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('p') => Some(UiAction::DismissPreferences),
-            KeyCode::Enter => Some(UiAction::SubmitPreferences),
-            KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
-            KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
-            KeyCode::Char('t') if cfg!(feature = "images") => {
-                Some(UiAction::CycleYouTubeThumbnailSize)
-            }
-            KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
-            KeyCode::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
-            KeyCode::Char('b') if cfg!(feature = "bandcamp") => {
-                Some(UiAction::CycleBandcampAudioFormat)
-            }
-            KeyCode::Char('d') => Some(UiAction::SetSubscriptionsLayout(
-                SubscriptionsLayout::DrillDown,
-            )),
-            KeyCode::Char('s') => {
-                Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
-                Some(UiAction::SetSubscriptionsLayout(alternative))
-            }
-            _ => None,
-        };
-    }
-    if view.text_selection_mode
-        && !view
-            .details
-            .as_ref()
-            .is_some_and(|details| details.thumbnail_expanded)
-    {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
-            // Terminals normally consume Ctrl+Shift+C as their Copy command.
-            // If one forwards it, do not reinterpret that copy chord as Quit.
-            return (!shift).then_some(UiAction::Quit);
-        }
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('t') => Some(UiAction::ToggleTextSelectionMode),
-            KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
-            _ => None,
-        };
-    }
-    if let Some(setup) = view.yandex_music_setup_popup.as_ref() {
-        if setup.validating {
-            return match key.code {
-                KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
-                KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
-                _ => None,
-            };
-        }
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
-            KeyCode::Enter => Some(UiAction::SubmitYandexMusicSetup),
-            KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
-            KeyCode::Backspace => Some(UiAction::DeleteYandexMusicTokenCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteYandexMusicTokenWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendYandexMusicTokenCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(setup) = view.youtube_setup_popup.as_ref() {
-        let other_field = match setup.selected_field {
-            YouTubeSetupField::ApiKey => YouTubeSetupField::InvidiousUrl,
-            YouTubeSetupField::InvidiousUrl => YouTubeSetupField::ApiKey,
-        };
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissYouTubeSetup),
-            KeyCode::Enter => Some(UiAction::SubmitYouTubeSetup),
-            KeyCode::F(1) => Some(UiAction::OpenYouTubeApiKeyGuide),
-            KeyCode::F(2) => Some(UiAction::OpenGoogleCloudCredentials),
-            KeyCode::F(3) => Some(UiAction::OpenInvidiousInstances),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                Some(UiAction::SelectYouTubeSetupField(other_field))
-            }
-            KeyCode::Backspace => Some(UiAction::DeleteYouTubeSetupCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteYouTubeSetupWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendYouTubeSetupCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Some(UiAction::Quit);
-    }
-    if view.help_open {
-        return match key.code {
-            KeyCode::Char('?') | KeyCode::Esc => Some(UiAction::ToggleHelp),
-            KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
-            KeyCode::Char('q') => Some(UiAction::Quit),
-            _ => None,
-        };
-    }
-    let thumbnail_expanded = view
-        .details
-        .as_ref()
-        .is_some_and(|details| details.thumbnail_expanded);
-    if thumbnail_expanded && key.code == KeyCode::Esc {
-        return Some(UiAction::ToggleThumbnailExpansion);
-    }
-    if expanded_thumbnail_available(view) {
-        return None;
-    }
-    if view.search_editing {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::CancelSearch),
-            KeyCode::Enter => Some(UiAction::SubmitSearch),
-            KeyCode::Backspace => Some(UiAction::DeleteSearchCharacter),
-            KeyCode::Left => Some(UiAction::MoveSearchCursor(-1)),
-            KeyCode::Right => Some(UiAction::MoveSearchCursor(1)),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteSearchWord)
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendSearch(character))
-            }
-            _ => None,
-        };
-    }
-    if is_delete_previous_word_key(&key) {
-        return None;
-    }
-
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let detail_link_count = view
-        .details
-        .as_ref()
-        .map_or(0, |details| details.links.len());
-    let wikidata_media_count = view
-        .details
-        .as_ref()
-        .and_then(|details| {
-            let item_id = details.expanded_wikidata_item.as_deref()?;
-            details
-                .wikidata_entities
-                .iter()
-                .find(|entity| entity.item_id == item_id)
-        })
-        .map_or(0, |entity| entity.media_controls.len());
-    let details_line_scroll_available = details_accept_line_scroll(view);
-    let wikidata_link_index = keyboard_wikidata_link_index(view);
-    match key.code {
-        KeyCode::Char('q') => Some(UiAction::Quit),
-        #[cfg(feature = "qr")]
-        KeyCode::Char('Q')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-                }) =>
-        {
-            Some(UiAction::OpenVideoQr)
-        }
-        KeyCode::Char('?') => Some(UiAction::ToggleHelp),
-        KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
-        KeyCode::Char('/') => Some(UiAction::BeginSearch),
-        KeyCode::Char('p') | KeyCode::F(7) => Some(UiAction::OpenPreferences),
-        KeyCode::Tab if reverse_tab_modifiers(key.modifiers) => {
-            Some(UiAction::ShowScreen(view.screen.previous()))
-        }
-        KeyCode::Tab => Some(UiAction::ShowScreen(view.screen.next())),
-        KeyCode::BackTab => Some(UiAction::ShowScreen(view.screen.previous())),
-        KeyCode::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
-        KeyCode::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
-        KeyCode::F(3) => Some(UiAction::ShowScreen(Screen::History)),
-        KeyCode::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
-        KeyCode::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
-        KeyCode::Char('v') if view.screen == Screen::YandexMusic => {
-            Some(UiAction::CycleYandexMusicSearchKind)
-        }
-        KeyCode::Char('v') => Some(UiAction::ToggleSearchKind),
-        KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(UiAction::PlayNext)
-        }
-        KeyCode::Char('C') if view.screen != Screen::YandexMusic => {
-            Some(UiAction::ToggleYouTubeCreativeCommons)
-        }
-        KeyCode::Char('A') => Some(UiAction::ToggleAutoplay),
-        KeyCode::Char('l')
-            if view.playlist_item.is_some()
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::ToggleTodoPlaylist)
-        }
-        KeyCode::Char('P')
-            if view.playlist_item.is_some()
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(UiAction::OpenPlaylistPopup)
-        }
-        KeyCode::Char('e') if view.screen == Screen::Playlists && view.playlist_edit_available => {
-            Some(UiAction::EditSelectedPlaylist)
-        }
-        KeyCode::Char('Z') if view.screen == Screen::Local && view.local_folder_sizes_enabled => {
-            Some(UiAction::ToggleLocalSizeSort)
-        }
-        KeyCode::Char('H') if view.screen == Screen::Local => Some(UiAction::ToggleLocalAllFiles),
-        KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
-        KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
-        KeyCode::Char('L')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
-        {
-            Some(UiAction::ToggleYandexMusicLike)
-        }
-        KeyCode::Char('X')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
-        {
-            Some(UiAction::ToggleYandexMusicDislike)
-        }
-        KeyCode::Char('g')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.artist_available =>
-        {
-            Some(UiAction::OpenYandexMusicArtist)
-        }
-        KeyCode::Char('b')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_available =>
-        {
-            Some(UiAction::OpenYandexMusicAlbum)
-        }
-        KeyCode::Char('D')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_open =>
-        {
-            Some(UiAction::DownloadYandexMusicAlbum)
-        }
-        KeyCode::Char('R')
-            if view.screen == Screen::YandexMusic
-                && view.yandex_music_actions.twenty_recommendations_available =>
-        {
-            Some(UiAction::DownloadTwentyYandexMusicRecommendations)
-        }
-        KeyCode::Char('f')
-            if view.screen == Screen::Local
-                && view
-                    .details
-                    .as_ref()
-                    .is_some_and(|details| details.local_fingerprint_available) =>
-        {
-            Some(UiAction::FingerprintLocalAudio)
-        }
-        KeyCode::Char('r') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioRecording),
-        KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
-        #[cfg(feature = "local-rename")]
-        KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('m')
-            if view.screen == Screen::Local
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::BeginLocalMove)
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('J')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('K')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(-1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('j')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('k')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(-1))
-        }
-        #[cfg(feature = "local-trash")]
-        KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
-        #[cfg(feature = "local-trash")]
-        KeyCode::Char('x')
-            if view.screen == Screen::Downloaded
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::RequestDownloadedTrash)
-        }
-        KeyCode::Char('i')
-            if view.screen == Screen::Subscriptions
-                && view.subscriptions.layout == SubscriptionsLayout::Split
-                && !view.subscriptions.items.is_empty() =>
-        {
-            Some(UiAction::ToggleSubscriptionDescription)
-        }
-        KeyCode::Char('a')
-            if view.screen == Screen::Subscriptions
-                && view.subscriptions.route == SubscriptionRoute::Sources
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(UiAction::OpenRssSubscriptionPopup)
-        }
-        KeyCode::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
-        KeyCode::Char('R')
-            if view.screen == Screen::Subscriptions
-                && (view.subscriptions.route == SubscriptionRoute::Items
-                    || (view.subscriptions.layout == SubscriptionsLayout::Split
-                        && view.subscriptions.focus == SubscriptionPane::Items)) =>
-        {
-            Some(UiAction::RefreshSubscriptionVideos)
-        }
-        KeyCode::Char('t')
-            if view.details.is_some() && view.right_panel_mode == RightPanelMode::Details =>
-        {
-            Some(UiAction::ToggleTextSelectionMode)
-        }
-        KeyCode::Char('j') if alt && view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::MoveWikidataMedia(1))
-        }
-        KeyCode::Char('k') if alt && view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::MoveWikidataMedia(-1))
-        }
-        KeyCode::Char('j') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(1)),
-        KeyCode::Char('k') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(-1)),
-        KeyCode::Home if alt && detail_link_count > 0 => Some(UiAction::SelectDetailLink(0)),
-        KeyCode::End if alt && detail_link_count > 0 => {
-            Some(UiAction::SelectDetailLink(detail_link_count - 1))
-        }
-        KeyCode::Esc
-            if view.screen == Screen::Subscriptions
-                && (view.subscriptions.description_expanded
-                    || view.subscriptions.focus == SubscriptionPane::Items) =>
-        {
-            Some(UiAction::GoBack)
-        }
-        KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
-        KeyCode::Esc
-            if view.screen == Screen::YandexMusic
-                && matches!(
-                    view.yandex_music_route,
-                    YandexMusicRouteView::Search
-                        | YandexMusicRouteView::Album
-                        | YandexMusicRouteView::Artist
-                ) =>
-        {
-            Some(UiAction::GoBack)
-        }
-        KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
-        KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
-        KeyCode::Up if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
-        }
-        KeyCode::Down if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
-        }
-        KeyCode::Char('u') if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
-        }
-        KeyCode::Char('d') if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
-        }
-        KeyCode::Up | KeyCode::Down if alt => None,
-        KeyCode::Char('u' | 'd') if alt => None,
-        KeyCode::PageUp if view.details_focused => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Pages(-1)))
-        }
-        KeyCode::PageDown if view.details_focused => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
-        }
-        KeyCode::PageUp if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX))),
-        KeyCode::PageDown if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX))),
-        KeyCode::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
-        KeyCode::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
-        KeyCode::Char('j') => Some(UiAction::MoveSelection(1)),
-        KeyCode::Char('k') => Some(UiAction::MoveSelection(-1)),
-        KeyCode::F(6)
-            if view.video_comments_available
-                && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-                }) =>
-        {
-            Some(UiAction::OpenVideoComments)
-        }
-        KeyCode::Enter if alt && detail_link_count > 0 => {
-            let selected = view
-                .selected_detail_link
-                .unwrap_or_default()
-                .min(detail_link_count - 1);
-            Some(UiAction::ActivateDetailLink(selected))
-        }
-        KeyCode::Enter if view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::ActivateWikidataMedia(
-                view.selected_wikidata_media
-                    .unwrap_or_default()
-                    .min(wikidata_media_count - 1),
-            ))
-        }
-        KeyCode::Enter => Some(UiAction::ActivateSelection),
-        KeyCode::Char(' ') => Some(UiAction::TogglePause),
-        KeyCode::Left if alt => Some(UiAction::GoBack),
-        KeyCode::Right if alt => Some(UiAction::GoForward),
-        KeyCode::Left if view.playback.seeking_available() => Some(UiAction::SeekRelative(-5)),
-        KeyCode::Right if view.playback.seeking_available() => Some(UiAction::SeekRelative(5)),
-        KeyCode::Up => Some(UiAction::ChangeVolume(5)),
-        KeyCode::Down => Some(UiAction::ChangeVolume(-5)),
-        KeyCode::Char('<') | KeyCode::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
-        KeyCode::Char('>') | KeyCode::Char('.') => Some(UiAction::ChangeSpeed(0.1)),
-        KeyCode::Char('[') if view.playback.seeking_available() && !view.playback.live => {
-            Some(UiAction::ChangeChapter(-1))
-        }
-        KeyCode::Char(']') if view.playback.seeking_available() && !view.playback.live => {
-            Some(UiAction::ChangeChapter(1))
-        }
-        KeyCode::Char('r') => Some(UiAction::ToggleRepeat),
-        KeyCode::Char('w')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ToggleWaveform)
-        }
-        KeyCode::Char('c') => Some(UiAction::ShowChannel),
-        KeyCode::Char('s') => Some(UiAction::ToggleSubscription),
-        KeyCode::Backspace => Some(UiAction::GoBack),
-        KeyCode::Char('n')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::EditPrivateNote)
-        }
-        KeyCode::Char('a') => Some(UiAction::AddToQueue),
-        KeyCode::Char('d') => Some(UiAction::Download),
-        KeyCode::Char('o') => Some(UiAction::OpenInBrowser),
-        KeyCode::Char('O') if view.screen == Screen::Radio => Some(UiAction::OpenInBrowser),
-        KeyCode::Char('O') => Some(UiAction::OpenChannelInBrowser),
-        KeyCode::Char('y') => Some(UiAction::CopyLink),
-        KeyCode::Char('e') => Some(UiAction::OpenEqualizer),
-        KeyCode::Char(digit @ '0'..='9') if view.playback.seeking_available() => {
-            let percentage = f64::from(digit.to_digit(10).unwrap_or_default()) * 10.0;
-            Some(UiAction::SeekPercent(percentage))
-        }
-        _ => None,
-    }
-}
-
-/// Reports whether line-scrolling shortcuts can target the visible Details pane.
-///
-/// The default Linux virtual-console keymap binds `Alt+Up` to its
-/// `KeyboardSignal` action and emits `Alt+Down` like plain `Down`, so neither
-/// chord reaches Crossterm as an Alt-modified arrow. [`key_action`] retains
-/// modifier-aware arrows for terminal emulators and also accepts `Alt+u/d` as
-/// virtual-console-safe aliases. Both paths use this predicate so a failed
-/// `Alt+d` scroll never falls through to the unrelated Download action.
-fn details_accept_line_scroll(view: &ViewModel) -> bool {
-    view.details.is_some() && view.right_panel_mode == RightPanelMode::Details
-}
-
-/// Resolves the Wikidata disclosure owned by the global `W` shortcut.
-///
-/// An expanded item takes precedence so `W` always collapses the visible
-/// spoiler. Otherwise the explicitly selected Wikidata row wins, followed by
-/// the first Wikidata row when asynchronous enrichment has not selected one.
-fn keyboard_wikidata_link_index(view: &ViewModel) -> Option<usize> {
-    let details = view.details.as_ref()?;
-    let index_for_item = |item_id: &str| {
-        details
-            .links
-            .iter()
-            .position(|link| link.wikidata_item_id.as_deref() == Some(item_id))
-    };
-    details
-        .expanded_wikidata_item
-        .as_deref()
-        .and_then(index_for_item)
-        .or_else(|| {
-            view.selected_detail_link.filter(|index| {
-                details
-                    .links
-                    .get(*index)
-                    .is_some_and(|link| link.wikidata_item_id.is_some())
-            })
-        })
-        .or_else(|| {
-            details
-                .links
-                .iter()
-                .position(|link| link.wikidata_item_id.is_some())
-        })
-}
-
-/// Recognizes reverse-tab modifier encodings produced by terminal keyboards.
-///
-/// Modern terminals normally report either [`KeyCode::BackTab`] or
-/// `Shift+Tab`. The default Linux virtual-console keymap emits Backtab as
-/// `Escape` followed by `Tab`, which Crossterm exposes as `Alt+Tab`. That
-/// encoding cannot be distinguished from a literal Alt+Tab, so both forms are
-/// intentionally accepted as the previous-screen shortcut.
-fn reverse_tab_modifiers(modifiers: KeyModifiers) -> bool {
-    modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+    crate::keymap::key_action(
+        key_press(key)?,
+        view,
+        page_rows,
+        hit_map.map(popup_geometry),
+    )
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {

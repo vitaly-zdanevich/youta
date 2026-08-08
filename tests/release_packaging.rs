@@ -75,8 +75,11 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(!text_only.contains("qr"));
     assert!(!text_only.contains("dep:qrcode"));
     assert!(!tui.contains("dep:qrcode"));
-    assert_eq!(feature_entries(&manifest, "qr"), ["tui", "dep:qrcode"]);
-    assert!(qr.contains("tui"));
+    // QR encoding produces a module matrix and renders nothing, so it must not
+    // drag a front-end into a build that only wants the encoder.
+    assert_eq!(feature_entries(&manifest, "qr"), ["dep:qrcode"]);
+    assert!(!qr.contains("tui"));
+    assert!(!qr.contains("dep:ratatui"));
     assert!(qr.contains("dep:qrcode"));
     assert_eq!(
         manifest["dependencies"]["qrcode"]["optional"].as_bool(),
@@ -179,6 +182,34 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
             .all(|feature| feature.as_str() != Some("macros")),
         "the unused ratatui `macros` feature must stay disabled"
     );
+}
+
+/// Front-end-free capabilities must stay reachable without a front-end.
+///
+/// Each of these produces data rather than pixels, so a build that wants only
+/// the data must not be forced to link a renderer. The assertions are here
+/// because the coupling is easy to reintroduce by adding one entry to a feature
+/// list, and nothing else would notice.
+#[test]
+fn renderer_free_capabilities_never_require_a_front_end() {
+    let manifest = manifest();
+
+    for capability in ["remote-artwork", "qr"] {
+        let closure = feature_closure(&manifest, capability);
+        for renderer in ["tui", "dep:ratatui", "dep:crossterm", "dep:ratatui-image"] {
+            assert!(
+                !closure.contains(renderer),
+                "`{capability}` must not require `{renderer}`"
+            );
+        }
+    }
+
+    // Terminal artwork is that pipeline plus decoding and graphics protocols,
+    // so `images` keeps both halves.
+    let images = feature_closure(&manifest, "images");
+    assert!(images.contains("remote-artwork"));
+    assert!(images.contains("tui"));
+    assert!(images.contains("dep:ratatui-image"));
 }
 
 #[test]

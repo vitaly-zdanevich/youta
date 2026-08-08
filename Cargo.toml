@@ -115,7 +115,12 @@ tui = [
     "dep:ratatui",
 ]
 # Offline QR codes for exact selected YouTube videos.
-qr = ["tui", "dep:qrcode"]
+#
+# `src/qr_code.rs` encodes to a plain module matrix and renders nothing, so this
+# does not require a front-end. The terminal build reaches it through `tui`,
+# which is what every documented build variant selects; a window links the same
+# encoder without Ratatui.
+qr = ["dep:qrcode"]
 # Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
 # This links no system GPM library; F8 retries a missing daemon and retains its
 # keyboard pointer when physical input is unavailable.
@@ -128,9 +133,17 @@ pulseaudio = []
 pipewire = []
 # Lazy local-file peak extraction through the user's existing FFmpeg helper.
 waveform = ["local-browser"]
+# Remote artwork fetching and its private on-disk cache, with no renderer.
+#
+# `src/artwork.rs` turns a provider URL into bytes under Youta's network and
+# cache protections. A window links this without Ratatui; the terminal reaches
+# it through `images`, which adds decoding and graphics protocols on top.
+remote-artwork = ["network", "dep:sha2"]
+
 # Terminal artwork and thumbnail decoding and rendering.
 images = [
     "tui",
+    "remote-artwork",
     "network",
     "dep:image",
     "dep:jpeg-decoder",
@@ -285,6 +298,14 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+# The crate is compiled once per feature combination, and `app.rs` alone is
+# 58k lines, so full DWARF and per-combination incremental caches cost tens of
+# gigabytes in `target/`. Line tables keep `file:line` in panics and test
+# failures, which is what debugging here actually relies on.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
 
 [profile.release]
 codegen-units = 1

@@ -19,3 +19,7 @@
 /tarpaulin-report.html
 /perf.data*
 .DS_Store
+
+# Youta's window builds its page with Vite; the output is a build artifact.
+gui/frontend/
+gui/ui/node_modules/

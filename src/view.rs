@@ -10,10 +10,18 @@
 //! Most of this vocabulary derives [`Serialize`] so a frontend outside this
 //! process can consume it. Four popup views deliberately do not: they carry a
 //! `YouTube` API key, a Yandex OAuth token, a private note body, and a feed URL
-//! that may itself be a credential. Those values stay in this process, and
-//! [`ViewModel`] skips their fields. A frontend that must render those editors
-//! needs a redacting projection first — deriving [`Serialize`] on them would
-//! place secrets in another process's heap.
+//! that may itself be a credential. Those values stay in this process. A
+//! frontend that must render those editors needs a redacting projection first —
+//! deriving [`Serialize`] on them would place secrets in another process's heap.
+//!
+//! Their [`ViewModel`] fields serialize as a bare `open` boolean rather than
+//! being skipped outright, through `serialize_editor_presence`. One bit is
+//! not a leak, and withholding it is worse than useless: these editors are
+//! modal, so while one is open the keyboard map routes every key into it. A
+//! frontend that cannot see that an editor exists renders an ordinary screen
+//! that silently ignores input — and the `YouTube` setup editor opens by itself
+//! the first time a search runs without credentials, so that is the state a new
+//! user would meet first.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,6 +116,50 @@ impl Screen {
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
             Self::Radio => cfg!(feature = "radio"),
             _ => true,
+        }
+    }
+
+    /// Returns the Details layout this screen's selection is rendered with.
+    ///
+    /// This lives beside the screen rather than inside a renderer because both
+    /// front-ends have to agree on it: which facts a selected item exposes is a
+    /// property of the source, not of the surface drawing it.
+    #[must_use]
+    pub const fn details_kind(self) -> InformationPanelKind {
+        match self {
+            Self::Local => InformationPanelKind::Local,
+            Self::ApplePodcasts => InformationPanelKind::Podcast,
+            Self::Radio => InformationPanelKind::Radio,
+            Self::YandexMusic => InformationPanelKind::YandexMusic,
+            Self::Bandcamp | Self::Playlists | Self::History => InformationPanelKind::Generic,
+            _ => InformationPanelKind::Video,
+        }
+    }
+
+    /// Returns the verb this screen's query editor is spelled with.
+    ///
+    /// `None` means the screen collects no query at all, and neither front-end
+    /// should offer one. Radio filters its compiled catalogue as the user types;
+    /// every other searchable screen submits to a provider. Both front-ends ask
+    /// this exact question — the terminal to decide whether the result panel
+    /// carries a title, the window to decide whether it draws a search field —
+    /// so the answer lives beside the tab labels rather than in either renderer.
+    #[must_use]
+    pub const fn search_verb(self) -> Option<&'static str> {
+        match self {
+            Self::Search
+            | Self::YouTubeMusic
+            | Self::YandexMusic
+            | Self::Bandcamp
+            | Self::ApplePodcasts
+            | Self::TrackerMusic => Some("Search"),
+            Self::Radio => Some("Filter"),
+            Self::Subscriptions
+            | Self::Local
+            | Self::Downloaded
+            | Self::History
+            | Self::Playlists
+            | Self::Statistics => None,
         }
     }
 
@@ -472,6 +524,41 @@ pub struct LocalVideoThumbnailView {
     pub path: PathBuf,
     /// Midpoint seek position in milliseconds.
     pub midpoint_millis: u64,
+}
+
+/// Serializes a credential-bearing editor as the single bit that it is open.
+///
+/// The generic parameter is deliberately unconstrained: nothing about the
+/// editor is read, so no future field can accidentally become serializable by
+/// being added to one of them.
+fn serialize_editor_presence<T, S: serde::Serializer>(
+    editor: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(editor.is_some())
+}
+
+/// Source-specific metadata layout used by a front-end's information panel.
+///
+/// The variants differ in which facts they present, not in how they look:
+/// a Radio station has no like count and a local file has no publication date,
+/// so a single layout would either invent fields or hide real ones.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum InformationPanelKind {
+    /// Media details with duration, likes, and views.
+    Video,
+    /// Podcast show or episode details without video-only statistics.
+    Podcast,
+    /// Channel details with subscriber metadata.
+    Channel,
+    /// Public live-radio metadata without finite-media statistics.
+    Radio,
+    /// Authenticated Yandex Music catalogue details and source-specific actions.
+    YandexMusic,
+    /// Local folder, media, or image metadata without remote statistics.
+    Local,
+    /// Persisted or aggregate rows without source-specific remote statistics.
+    Generic,
 }
 
 /// Details for the selected media item.
@@ -1430,28 +1517,40 @@ pub struct ViewModel {
     #[cfg(feature = "qr")]
     pub video_qr_popup: Option<VideoQrPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
-    // Skipped: this editor holds a credential or private text. See the
-    // module header before exposing it to an out-of-process frontend.
-    #[serde(skip)]
+    // Redacted: this editor holds a credential or private text, so only the one
+    // bit saying it is open crosses. See the module header.
+    #[serde(
+        rename = "youtube_setup_open",
+        serialize_with = "serialize_editor_presence"
+    )]
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
     /// Editable OAuth-token setup for the optional Yandex Music source.
-    // Skipped: this editor holds a credential or private text. See the
-    // module header before exposing it to an out-of-process frontend.
-    #[serde(skip)]
+    // Redacted: this editor holds a credential or private text, so only the one
+    // bit saying it is open crosses. See the module header.
+    #[serde(
+        rename = "yandex_music_setup_open",
+        serialize_with = "serialize_editor_presence"
+    )]
     pub yandex_music_setup_popup: Option<YandexMusicSetupPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
-    // Skipped: this editor holds a credential or private text. See the
-    // module header before exposing it to an out-of-process frontend.
-    #[serde(skip)]
+    // Redacted: this editor holds a credential or private text, so only the one
+    // bit saying it is open crosses. See the module header.
+    #[serde(
+        rename = "rss_subscription_open",
+        serialize_with = "serialize_editor_presence"
+    )]
     pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
     /// Focused runtime preferences editor.
     pub preferences_popup: Option<PreferencesPopupView>,
     /// Focused local-playlist chooser or create/edit form.
     pub playlist_popup: Option<PlaylistPopupView>,
     /// Focused private-note editor.
-    // Skipped: this editor holds a credential or private text. See the
-    // module header before exposing it to an out-of-process frontend.
-    #[serde(skip)]
+    // Redacted: this editor holds a credential or private text, so only the one
+    // bit saying it is open crosses. See the module header.
+    #[serde(
+        rename = "private_note_open",
+        serialize_with = "serialize_editor_presence"
+    )]
     pub private_note_popup: Option<PrivateNotePopupView>,
     /// Whether the current selection resolves to a note-capable exact target.
     pub private_note_available: bool,
@@ -1463,6 +1562,36 @@ pub struct ViewModel {
     pub download: Option<DownloadView>,
     /// Whether the controller has requested application shutdown.
     pub quitting: bool,
+}
+
+impl ViewModel {
+    /// Reports whether expanded Details owns a renderable artwork source.
+    ///
+    /// Both front-ends need this to decide whether the expanded-artwork key is
+    /// live, so it belongs to the view rather than to either renderer.
+    #[must_use]
+    pub fn expanded_thumbnail_available(&self) -> bool {
+        let Some(details) = self
+            .details
+            .as_ref()
+            .filter(|details| details.thumbnail_expanded)
+        else {
+            return false;
+        };
+        details.expanded_thumbnail_url.is_some()
+            || details.thumbnail_url.is_some()
+            || details.local_video_thumbnail.is_some()
+            || details
+                .expanded_wikidata_item
+                .as_deref()
+                .and_then(|item_id| {
+                    details
+                        .wikidata_entities
+                        .iter()
+                        .find(|entity| entity.item_id == item_id)
+                })
+                .is_some_and(|entity| entity.image_url.is_some())
+    }
 }
 
 impl Default for ViewModel {
@@ -2017,6 +2146,52 @@ mod tests {
         }
     }
 
+    /// Measures what the whole-snapshot IPC protocol actually costs.
+    ///
+    /// The plan proposes a sectioned diff with per-section generations, and
+    /// requires this measurement before paying for that complexity. The numbers
+    /// are printed so the decision rests on them, and bounded so the contract
+    /// cannot quietly grow past the point where the answer changes.
+    #[test]
+    fn a_published_snapshot_stays_small_enough_to_send_whole() {
+        let mut view = ViewModel::default();
+        let empty = serde_json::to_vec(&view).expect("encode empty view").len();
+
+        // A full screen of YouTube results, with the string lengths providers
+        // actually return.
+        view.rows = (0..50)
+            .map(|index| RowView {
+                title: format!("A reasonably long provider video title, number {index}"),
+                subtitle: "Some Channel Name · 3 weeks ago · 1.2M views".to_owned(),
+                source: "YouTube".to_owned(),
+                thumbnail_url: url::Url::parse(&format!(
+                    "https://i.ytimg.com/vi/dQw4w9WgXcQ{index:03}/hqdefault.jpg"
+                ))
+                .ok(),
+                watched_percent: 42,
+                ..RowView::default()
+            })
+            .collect();
+        let listed = serde_json::to_vec(&view).expect("encode listed view").len();
+
+        // Playback republishes on every position tick, four times a second, and
+        // that is the protocol's worst realistic steady state.
+        let per_second = listed * 4;
+        println!(
+            "snapshot: empty {empty} B, 50 rows {listed} B ({} B/row); \
+             playback steady state ~{} KiB/s",
+            (listed - empty) / 50,
+            per_second / 1024
+        );
+
+        assert!(
+            listed < 64 * 1024,
+            "a 50-row snapshot grew to {listed} B; past roughly 64 KiB the \
+             whole-snapshot protocol stops being reasonable and the sectioned \
+             diff in the plan becomes necessary"
+        );
+    }
+
     #[test]
     fn serializing_the_view_never_carries_a_credential_or_private_note() {
         let serialized = serde_json::to_string(&view_holding_every_secret())
@@ -2027,10 +2202,49 @@ mod tests {
             "y0_TOTALLY_SECRET_OAUTH_TOKEN_111111",
             "SECRET_FEED_GUID",
             "TOTALLY_SECRET_PRIVATE_NOTE_BODY",
+            // Paths are not credentials, but they name the file that holds one,
+            // and an out-of-process frontend has no reason to learn either.
+            "/config/secrets/credentials.toml",
+            "/config/subscriptions.opml",
+            "/config/state/notes.toml",
+            "Nocturne",
         ] {
             assert!(
                 !serialized.contains(secret),
                 "a secret reached the serialized view model: {secret}"
+            );
+        }
+    }
+
+    /// The one bit a frontend needs is the one bit it gets.
+    ///
+    /// These editors are modal: while one is open the keyboard map sends every
+    /// key into it. A frontend that cannot see that would render an ordinary
+    /// screen that ignores input, so withholding this bit produces a worse
+    /// failure than publishing it — and it is a boolean, not a projection, so
+    /// no field of those editors can ever ride along with it.
+    #[test]
+    fn an_open_credential_editor_crosses_as_one_bit_and_nothing_else() {
+        let encoded = serde_json::to_value(view_holding_every_secret())
+            .expect("the view model must serialize");
+        let closed =
+            serde_json::to_value(ViewModel::default()).expect("the view model must serialize");
+
+        for marker in [
+            "youtube_setup_open",
+            "yandex_music_setup_open",
+            "rss_subscription_open",
+            "private_note_open",
+        ] {
+            assert_eq!(
+                encoded.get(marker),
+                Some(&serde_json::Value::Bool(true)),
+                "{marker} must report an open editor as a bare boolean"
+            );
+            assert_eq!(
+                closed.get(marker),
+                Some(&serde_json::Value::Bool(false)),
+                "{marker} must report a closed editor as a bare boolean"
             );
         }
     }

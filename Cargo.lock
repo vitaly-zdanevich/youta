@@ -5999,11 +5999,13 @@ dependencies = [
 name = "youta-gui"
 version = "0.27.2"
 dependencies = [
+ "percent-encoding",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
+ "url",
  "youta",
 ]
 

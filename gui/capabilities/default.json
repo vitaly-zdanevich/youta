@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "This application's own commands plus event subscription, which the window needs to receive view snapshots. No filesystem, shell, process, or HTTP permission is granted, because the window renders untrusted provider text.",
+  "description": "This application's own commands plus event subscription and its matching teardown, which the window needs to receive view snapshots and to stop receiving them. No filesystem, shell, process, or HTTP permission is granted, because the window renders untrusted provider text.",
   "windows": ["main"],
-  "permissions": ["core:event:allow-listen"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
 }
