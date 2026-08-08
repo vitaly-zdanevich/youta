@@ -137,6 +137,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - operating_system: Linux
             artifact_os: linux
+            architecture: i686
+            runner: ubuntu-24.04
+            target: i686-unknown-linux-gnu
+          - operating_system: Linux
+            artifact_os: linux
             architecture: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -167,6 +172,12 @@ jobs:
       - name: Install reproducible archive tooling on macOS
         if: runner.os == 'macOS'
         run: brew install gnu-tar
+
+      - name: Install Linux i686 linker support
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib libc6-dev-i386
 
       - name: Restore Cargo registry cache
         uses: actions/cache@v5
@@ -253,6 +264,55 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Validate the complete release asset set
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          version=${RELEASE_TAG#v}
+          platforms=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64)
+          suffixes=('' -text -no-qr -text-no-qr)
+          expected=()
+          for platform in "${platforms[@]}"; do
+            for suffix in "${suffixes[@]}"; do
+              archive="youta-${version}-${platform}${suffix}.tar.gz"
+              expected+=("${archive}" "${archive}.sha256")
+            done
+          done
+          vendor_archive="youta-${version}-vendor.tar.xz"
+          expected+=("${vendor_archive}" "${vendor_archive}.sha256")
+
+          readonly expected_asset_count=42
+          ((${#expected[@]} == expected_asset_count)) || {
+            echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
+            exit 1
+          }
+
+          mapfile -t actual < <(
+            find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+              LC_ALL=C sort
+          )
+          mapfile -t expected_sorted < <(
+            printf '%s\n' "${expected[@]}" |
+              LC_ALL=C sort
+          )
+          ((${#actual[@]} == expected_asset_count)) || {
+            echo "Downloaded ${#actual[@]} release assets; expected ${expected_asset_count}." >&2
+            printf 'Downloaded asset: %s\n' "${actual[@]}" >&2
+            exit 1
+          }
+          diff --unified \
+            --label expected-assets \
+            --label downloaded-assets \
+            <(printf '%s\n' "${expected_sorted[@]}") \
+            <(printf '%s\n' "${actual[@]}") || {
+              echo 'Downloaded release asset names do not match the release contract.' >&2
+              exit 1
+            }
+
+          (cd dist && sha256sum --check --strict -- *.sha256)
 
       # GitHub CLI is preinstalled on the hosted runner. Using it avoids a
       # third-party release action and keeps token permissions explicit.

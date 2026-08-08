@@ -1504,7 +1504,7 @@ impl Default for ViewModel {
             radio_now_playing: None,
             radio_recording: None,
             playback_chapters: Vec::new(),
-            show_chapter_timestamps: true,
+            show_chapter_timestamps: false,
             skip_advertisement_chapters: true,
             local_size_sort: LocalSizeSort::Off,
             show_all_local_files: false,

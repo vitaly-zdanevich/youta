@@ -1296,7 +1296,7 @@ pub enum PanelFocus {
 }
 
 /// Restart-safe terminal navigation and selection state.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionState {
     /// Currently visible screen.
     pub screen: Screen,
@@ -1358,10 +1358,41 @@ pub struct SessionState {
     pub waveform_visible: bool,
     /// Whether chapter timestamps are omitted from seek-bar labels.
     ///
-    /// The stored value is the inverse of the visible UI setting so older
-    /// session documents naturally retain the timestamped default.
+    /// The stored value is the inverse of the visible UI setting. Fresh
+    /// sessions hide timestamps, while older documents without this field
+    /// retain their historical visible behavior through Serde's `false`
+    /// boolean default.
     #[serde(default)]
     pub chapter_timestamps_hidden: bool,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            screen: Screen::default(),
+            back_stack: Vec::new(),
+            focus: PanelFocus::default(),
+            selected_media: None,
+            selected_row: 0,
+            youtube_selected_row: None,
+            youtube_music_selected_row: None,
+            yandex_music_selected_row: None,
+            bandcamp_selected_row: None,
+            apple_podcasts_selected_row: None,
+            radio_selected_row: None,
+            radio_selected_station_id: None,
+            radio_filter_text: String::new(),
+            details_scroll: 0,
+            search_text: String::new(),
+            youtube_music_search_text: String::new(),
+            yandex_music_search_text: String::new(),
+            bandcamp_search_text: String::new(),
+            apple_podcasts_search_text: String::new(),
+            local_path: None,
+            waveform_visible: false,
+            chapter_timestamps_hidden: true,
+        }
+    }
 }
 
 impl SessionState {

@@ -18,3 +18,4 @@
 *.profdata
 /tarpaulin-report.html
 /perf.data*
+.DS_Store

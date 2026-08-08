@@ -32,6 +32,10 @@ case "${target}" in
 		operating_system=linux
 		architecture=amd64
 		;;
+	i686-unknown-linux-gnu)
+		operating_system=linux
+		architecture=i686
+		;;
 	aarch64-unknown-linux-gnu)
 		operating_system=linux
 		architecture=arm64
@@ -46,7 +50,8 @@ case "${target}" in
 		;;
 	*)
 		echo "Unsupported release target: ${target}" >&2
-		echo 'Supported targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,' >&2
+		echo 'Supported targets: x86_64-unknown-linux-gnu, i686-unknown-linux-gnu,' >&2
+		echo 'aarch64-unknown-linux-gnu,' >&2
 		echo 'x86_64-apple-darwin, aarch64-apple-darwin' >&2
 		exit 1
 		;;
