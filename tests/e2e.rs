@@ -171,10 +171,31 @@ fn run_tui_session(
     child.wait_with_output().expect("wait for pseudo-terminal")
 }
 
+/// A Youta command whose environment the test sets rather than the shell.
+///
+/// Clearing it is what keeps a stray `YOUTA_`-prefixed variable out of the
+/// child, since an environment override always wins over the configuration
+/// file and would quietly change what these assertions describe. Windows needs
+/// three names put back: the account Youta restricts its private directories to
+/// is read from `USERNAME` and `USERDOMAIN`, and the ACL editor is resolved
+/// under `SystemRoot`, so a child without them cannot create its application
+/// directory at all and fails long before reaching the behaviour under test.
+/// Unix restricts by mode bits and needs nothing returned.
+fn youta_command() -> assert_cmd::Command {
+    let mut command = cargo_bin_cmd!("youta");
+    command.env_clear();
+    #[cfg(windows)]
+    for name in ["USERNAME", "USERDOMAIN", "SystemRoot"] {
+        if let Ok(value) = std::env::var(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
 #[test]
 fn help_identifies_youtube_and_ytdlp() {
-    cargo_bin_cmd!("youta")
-        .env_clear()
+    youta_command()
         .arg("--help")
         .assert()
         .success()
@@ -184,8 +205,7 @@ fn help_identifies_youtube_and_ytdlp() {
 
 #[test]
 fn version_comes_from_the_package_manifest() {
-    cargo_bin_cmd!("youta")
-        .env_clear()
+    youta_command()
         .arg("--version")
         .assert()
         .success()
@@ -204,8 +224,7 @@ fn config_command_reports_paths_and_redacts_credentials() {
     )
     .expect("configuration fixture");
 
-    cargo_bin_cmd!("youta")
-        .env_clear()
+    youta_command()
         .args(["--config-dir"])
         .arg(temporary.path())
         .arg("config")
@@ -230,8 +249,7 @@ fn fatal_configuration_error_prints_a_redacted_diagnostic_report() {
     )
     .expect("invalid configuration fixture");
 
-    cargo_bin_cmd!("youta")
-        .env_clear()
+    youta_command()
         .args(["--config-dir"])
         .arg(temporary.path())
         .arg("config")
@@ -255,8 +273,7 @@ fn second_tui_instance_exits_before_terminal_initialization_with_one_plain_line(
     let config = Config::for_dir(temporary.path());
     let _running_instance = StateStore::open(&config).expect("first Youta instance state lock");
 
-    let output = cargo_bin_cmd!("youta")
-        .env_clear()
+    let output = youta_command()
         .args(["--config-dir"])
         .arg(temporary.path())
         .arg("tui")
@@ -850,8 +867,7 @@ fn doctor_uses_configured_helpers_only_when_features_need_them() {
     )
     .expect("configuration fixture");
 
-    let output = cargo_bin_cmd!("youta")
-        .env_clear()
+    let output = youta_command()
         .args(["--config-dir"])
         .arg(temporary.path())
         .arg("doctor")
