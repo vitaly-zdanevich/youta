@@ -188,7 +188,9 @@ impl Screen {
         }
     }
 
-    pub(crate) const fn compact_label(self) -> &'static str {
+    /// Returns the shortened tab label used where the full one does not fit.
+    #[must_use]
+    pub const fn compact_label(self) -> &'static str {
         match self {
             Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
@@ -338,7 +340,7 @@ impl YandexMusicSearchKind {
 
     /// Returns the title-cased category label used in the search panel heading.
     #[must_use]
-    pub(crate) const fn title_label(self) -> &'static str {
+    pub const fn title_label(self) -> &'static str {
         match self {
             Self::All => "All",
             Self::Music => "Music",
@@ -480,7 +482,8 @@ pub enum SearchActivity {
 
 impl SearchActivity {
     /// Returns the result screen that owns this submitted search.
-    pub(crate) const fn screen(self) -> Screen {
+    #[must_use]
+    pub const fn screen(self) -> Screen {
         match self {
             Self::YouTube => Screen::Search,
             Self::YouTubeMusic => Screen::YouTubeMusic,
@@ -1136,7 +1139,8 @@ pub enum DetailLinkInternalTarget {
 
 impl DetailLinkInternalTarget {
     /// Builds the semantic controller action dispatched by its one-cell marker.
-    pub(crate) fn action(&self) -> UiAction {
+    #[must_use]
+    pub fn action(&self) -> UiAction {
         match self {
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),

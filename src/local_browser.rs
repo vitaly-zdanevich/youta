@@ -1101,6 +1101,32 @@ mod tests {
         fs::write(path, contents).expect("write fixture");
     }
 
+    /// Temporary directory whose root is canonicalized once, up front.
+    ///
+    /// Listings report canonical paths, so expectations have to be built from a
+    /// canonical root too. On Windows the raw [`TempDir`] path never compares
+    /// equal to one: canonicalization rewrites 8.3 short components
+    /// (`RUNNER~1` into `runneradmin`) and adds the `\\?\` verbatim prefix.
+    struct Fixture {
+        root: PathBuf,
+        _directory: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = TempDir::new().expect("temporary fixture");
+            let root = fs::canonicalize(directory.path()).expect("canonical fixture root");
+            Self {
+                root,
+                _directory: directory,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
     #[test]
     fn classifies_supported_media_and_image_extensions() {
         assert_eq!(
@@ -1138,7 +1164,7 @@ mod tests {
 
     #[test]
     fn lists_supported_entries_nonrecursively_with_directories_first() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let album = fixture.path().join("album");
         fs::create_dir(&album).expect("create album");
         write_file(&album.join("nested.mp3"), b"nested");
@@ -1181,7 +1207,7 @@ mod tests {
 
     #[test]
     fn show_all_files_adds_text_and_other_regular_files_without_changing_default() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let album = fixture.path().join("album");
         fs::create_dir(&album).expect("create album");
         write_file(&fixture.path().join("song.mp3"), b"audio");
@@ -1229,7 +1255,7 @@ mod tests {
 
     #[test]
     fn dot_prefixed_supported_entries_remain_visible_in_both_modes() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         fs::create_dir(fixture.path().join(".album")).expect("create hidden album");
         write_file(&fixture.path().join(".song.mp3"), b"audio");
         write_file(&fixture.path().join(".notes.txt"), b"notes");
@@ -1281,7 +1307,7 @@ mod tests {
         const EXPECTED_INSPECTED: usize = EXPECTED_VISIBLE + IGNORED_FILES;
         const INTERACTIVE_BUDGET: Duration = Duration::from_secs(1);
 
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         for (count, extension) in [
             (IMAGE_FILES, "jpg"),
             (AUDIO_FILES, "flac"),
@@ -1325,7 +1351,7 @@ mod tests {
 
     #[test]
     fn applies_visible_and_inspection_limits() {
-        let visible_fixture = TempDir::new().expect("temporary fixture");
+        let visible_fixture = Fixture::new();
         for index in 0..3 {
             write_file(
                 &visible_fixture.path().join(format!("{index}.mp3")),
@@ -1344,7 +1370,7 @@ mod tests {
         assert!(visible.truncated);
         assert_eq!(visible.inspected_entries, 3);
 
-        let inspected_fixture = TempDir::new().expect("temporary fixture");
+        let inspected_fixture = Fixture::new();
         for index in 0..3 {
             write_file(
                 &inspected_fixture.path().join(format!("{index}.txt")),
@@ -1366,7 +1392,7 @@ mod tests {
 
     #[test]
     fn preferred_direct_child_survives_tiny_listing_limits() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         write_file(&fixture.path().join("first.mp3"), b"first");
         write_file(&fixture.path().join("middle.mp3"), b"middle");
         let preferred = fixture.path().join("selected.mp3");
@@ -1390,7 +1416,7 @@ mod tests {
 
     #[test]
     fn show_all_files_can_reserve_an_unsupported_preferred_child() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         write_file(&fixture.path().join("first.mp3"), b"first");
         let preferred = fixture.path().join("notes.txt");
         write_file(&preferred, b"notes");
@@ -1420,7 +1446,7 @@ mod tests {
     fn show_all_files_still_ignores_symbolic_links() {
         use std::os::unix::fs::symlink;
 
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let target = fixture.path().join("target.bin");
         write_file(&target, b"target");
         symlink(&target, fixture.path().join("link.bin")).expect("create symlink");
@@ -1441,8 +1467,8 @@ mod tests {
 
     #[test]
     fn invalid_preferred_hints_do_not_reserve_a_visible_slot() {
-        let fixture = TempDir::new().expect("temporary fixture");
-        let outside = TempDir::new().expect("outside fixture");
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
         let playable = fixture.path().join("song.mp3");
         write_file(&playable, b"audio");
         let unsupported = fixture.path().join("notes.txt");
@@ -1482,8 +1508,8 @@ mod tests {
     fn preferred_symbolic_link_is_ignored_without_following_its_target() {
         use std::os::unix::fs::symlink;
 
-        let fixture = TempDir::new().expect("temporary fixture");
-        let outside = TempDir::new().expect("outside fixture");
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
         let playable = fixture.path().join("song.mp3");
         write_file(&playable, b"audio");
         let outside_file = outside.path().join("outside.mp3");
@@ -1508,7 +1534,7 @@ mod tests {
 
     #[test]
     fn measures_nested_folder_size_with_strict_resource_bounds() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let album = fixture.path().join("album");
         let disc = album.join("disc");
         fs::create_dir_all(&disc).expect("create nested directories");
@@ -1534,7 +1560,7 @@ mod tests {
 
     #[test]
     fn folder_size_returns_no_partial_value_after_limit_or_cancellation() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         write_file(&fixture.path().join("one.bin"), b"one");
         write_file(&fixture.path().join("two.bin"), b"two");
 
@@ -1565,8 +1591,8 @@ mod tests {
     fn folder_size_never_counts_or_traverses_symbolic_links() {
         use std::os::unix::fs::symlink;
 
-        let fixture = TempDir::new().expect("temporary fixture");
-        let outside = TempDir::new().expect("outside fixture");
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
         write_file(&fixture.path().join("inside.bin"), b"in");
         write_file(&outside.path().join("outside.bin"), b"outside");
         symlink(
@@ -1593,7 +1619,7 @@ mod tests {
 
     #[test]
     fn directory_identity_changes_when_the_path_is_replaced() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let selected = fixture.path().join("selected");
         let replacement = fixture.path().join("replacement");
         fs::create_dir(&selected).expect("create selected directory");
@@ -1608,7 +1634,7 @@ mod tests {
 
     #[test]
     fn listing_rejects_zero_limits() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let error = list_local_directory(
             fixture.path(),
             LocalBrowseLimits {
@@ -1622,7 +1648,7 @@ mod tests {
 
     #[test]
     fn rename_validation_rejects_components_and_existing_targets() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let source = fixture.path().join("source.mp3");
         let target = fixture.path().join("target.mp3");
         write_file(&source, b"source");
@@ -1644,7 +1670,7 @@ mod tests {
 
     #[test]
     fn explicit_actions_are_dispatched_only_after_validation() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let source = fixture.path().join("source.mp3");
         write_file(&source, b"source");
         let mut actions = FakeFileActions::default();
@@ -1663,8 +1689,8 @@ mod tests {
 
     #[test]
     fn trash_accepts_only_immediate_file_and_directory_children() {
-        let fixture = TempDir::new().expect("temporary fixture");
-        let outside = TempDir::new().expect("outside fixture");
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
         let file = fixture.path().join("song.mp3");
         let directory = fixture.path().join("album");
         let outside_file = outside.path().join("outside.mp3");
@@ -1687,7 +1713,7 @@ mod tests {
 
     #[test]
     fn backend_collision_is_preserved_as_no_overwrite_error() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let source = fixture.path().join("source.mp3");
         write_file(&source, b"source");
         let mut actions = FakeFileActions {
@@ -1709,7 +1735,7 @@ mod tests {
     fn skips_child_symlinks_and_rejects_a_symlink_root() {
         use std::os::unix::fs::symlink;
 
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let real = fixture.path().join("real");
         fs::create_dir(&real).expect("create real directory");
         write_file(&real.join("song.mp3"), b"audio");
@@ -1736,7 +1762,7 @@ mod tests {
     fn preserves_a_non_utf8_basename() {
         use std::os::unix::ffi::OsStringExt;
 
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let name = OsString::from_vec(b"song-\xff.mp3".to_vec());
         write_file(&fixture.path().join(&name), b"audio");
 
@@ -1749,7 +1775,7 @@ mod tests {
 
     #[test]
     fn listing_does_not_open_images_for_dimensions() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let path = fixture.path().join("cover.png");
         write_file(&path, b"not read by directory listing");
 
@@ -1760,7 +1786,7 @@ mod tests {
 
     #[test]
     fn folder_cover_discovery_is_case_insensitive_and_prefers_cover_jpg() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let album = fixture.path().join("album");
         fs::create_dir(&album).expect("create album");
         write_file(&album.join("cover.png"), b"png");
@@ -1775,7 +1801,7 @@ mod tests {
 
     #[test]
     fn folder_jpg_is_used_when_cover_jpg_is_absent() {
-        let fixture = TempDir::new().expect("temporary fixture");
+        let fixture = Fixture::new();
         let album = fixture.path().join("album");
         fs::create_dir(&album).expect("create album");
         write_file(&album.join("FOLDER.JPG"), b"folder");

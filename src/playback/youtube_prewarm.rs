@@ -1304,6 +1304,8 @@ exit 7"#,
             thread::sleep(Duration::from_millis(5));
         }
         assert!(marker.exists(), "mock child must start before cancellation");
+        // Only Linux can then confirm the reap through `/proc`.
+        #[cfg(target_os = "linux")]
         let pid = std::fs::read_to_string(&marker).expect("read mock child PID");
         cancellation.cancel();
         let completion = worker.join().expect("join cancellation worker");

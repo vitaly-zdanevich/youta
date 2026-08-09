@@ -1418,10 +1418,19 @@ mod tests {
         }
     }
 
+    /// Builds a fixture whose paths are all rooted at the *canonical* temporary
+    /// directory.
+    ///
+    /// Moves report canonical sources and destinations, so expectations have to
+    /// be built from a canonical root too. On Windows the raw [`TempDir`] path
+    /// never compares equal to one: canonicalization rewrites 8.3 short
+    /// components (`RUNNER~1` into `runneradmin`) and adds the `\\?\` verbatim
+    /// prefix.
     fn directories() -> (TempDir, PathBuf, PathBuf) {
         let fixture = tempfile::tempdir().expect("temporary fixture");
-        let source = fixture.path().join("source");
-        let destination = fixture.path().join("destination");
+        let root = fs::canonicalize(fixture.path()).expect("canonical fixture root");
+        let source = root.join("source");
+        let destination = root.join("destination");
         fs::create_dir(&source).expect("source folder");
         fs::create_dir(&destination).expect("destination folder");
         (fixture, source, destination)

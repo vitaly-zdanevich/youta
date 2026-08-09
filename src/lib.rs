@@ -4,6 +4,9 @@
 //! rendering behind separate interfaces so distribution builds can omit
 //! services they do not use.
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub mod build_info;
 pub mod child_process;
 pub mod config;

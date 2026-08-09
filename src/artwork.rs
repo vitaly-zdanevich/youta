@@ -96,7 +96,12 @@ impl std::fmt::Display for ThumbnailFailure {
     }
 }
 
-#[cfg(feature = "remote-artwork")]
+/// Indirection the terminal thumbnail workers are tested through.
+///
+/// Only [`crate::thumbnails`] fetches on a worker thread, so the abstraction —
+/// and the HTTP implementation of it below — belongs to `images` rather than to
+/// every build that can reach the network for artwork.
+#[cfg(feature = "images")]
 pub(crate) trait ThumbnailTransport: Send + 'static {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
 }
@@ -147,7 +152,7 @@ pub(crate) fn mock_thumbnail_agent() -> ureq::Agent {
     )
 }
 
-#[cfg(feature = "remote-artwork")]
+#[cfg(feature = "images")]
 pub(crate) struct HttpThumbnailTransport {
     agent: ureq::Agent,
 }
@@ -188,7 +193,7 @@ impl Resolver for PublicThumbnailResolver {
     }
 }
 
-#[cfg(feature = "remote-artwork")]
+#[cfg(feature = "images")]
 impl HttpThumbnailTransport {
     /// Builds a transport over the guarded agent.
     pub(crate) fn new() -> Self {
@@ -198,7 +203,7 @@ impl HttpThumbnailTransport {
     }
 }
 
-#[cfg(feature = "remote-artwork")]
+#[cfg(feature = "images")]
 impl ThumbnailTransport for HttpThumbnailTransport {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
         fetch_thumbnail(&self.agent, source)
@@ -306,7 +311,7 @@ impl ThumbnailCache {
         self.evict()
     }
 
-    #[cfg(feature = "remote-artwork")]
+    #[cfg(feature = "images")]
     pub(crate) fn remove(&self, source: &Url) {
         self.remove_key(source.as_str().as_bytes());
     }
@@ -582,7 +587,7 @@ pub(crate) fn fetch_thumbnail_with_policy(
     }
 }
 
-#[cfg(feature = "remote-artwork")]
+#[cfg(feature = "images")]
 pub(crate) fn is_safe_thumbnail_source(source: &Url) -> bool {
     is_safe_remote_thumbnail_source(source, false)
         || (source.scheme() == "file" && source.to_file_path().is_ok())

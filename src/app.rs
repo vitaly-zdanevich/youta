@@ -34802,7 +34802,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_stale_search_response_cannot_replace_newer_results() {
-        let temporary = tempfile::tempdir().expect("LibriVox stale-response root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox stale-response root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34841,7 +34841,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_owned_search_response_populates_rows_and_details() {
-        let temporary = tempfile::tempdir().expect("LibriVox search-response root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox search-response root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34883,7 +34883,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn first_librivox_catalogue_response_restores_the_saved_row() {
-        let temporary = tempfile::tempdir().expect("LibriVox restore root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox restore root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -34942,7 +34942,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_child_route_persists_its_parent_catalogue_row() {
-        let temporary = tempfile::tempdir().expect("LibriVox child-session root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox child-session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -35021,7 +35021,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn keyboard_detail_activation_opens_exact_librivox_author_inside_youta() {
-        let temporary = tempfile::tempdir().expect("LibriVox author-navigation root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox author-navigation root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35050,7 +35050,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_author_books_load_in_bounded_continuation_pages() {
-        let temporary = tempfile::tempdir().expect("LibriVox pagination root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox pagination root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35128,7 +35128,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_section_identity_autoplay_and_browser_url_remain_stable() {
-        let temporary = tempfile::tempdir().expect("LibriVox section-autoplay root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox section-autoplay root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35329,7 +35329,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_track_details_expose_distinct_artist_album_and_bare_source_links() {
-        let temporary = tempfile::tempdir().expect("Yandex details root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex details root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35399,7 +35399,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_artist_navigation_uses_exact_ids_and_restores_nested_pages_from_memory() {
-        let temporary = tempfile::tempdir().expect("Yandex artist-navigation root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex artist-navigation root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35501,7 +35501,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_spoken_word_rows_are_not_mislabeled_as_music_tracks_or_albums() {
-        let temporary = tempfile::tempdir().expect("Yandex spoken-word rows root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex spoken-word rows root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35527,7 +35527,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_details_reserve_native_artwork_for_click_expansion() {
-        let temporary = tempfile::tempdir().expect("Yandex artwork root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex artwork root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35555,7 +35555,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_preview_scales_at_full_hd_and_4k_terminal_thresholds() {
-        let temporary = tempfile::tempdir().expect("Yandex adaptive-artwork root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex adaptive-artwork root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35623,7 +35623,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_rejects_direct_yandex_album_urls_without_provider_state() {
-        let temporary = tempfile::tempdir().expect("minimal Yandex search state root");
+        let temporary = crate::test_support::canonical_tempdir("minimal Yandex search state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35639,7 +35639,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_refuses_persisted_yandex_music_playback() {
-        let temporary = tempfile::tempdir().expect("minimal-build state root");
+        let temporary = crate::test_support::canonical_tempdir("minimal-build state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35681,7 +35681,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_preserves_yandex_music_session_fields() {
-        let temporary = tempfile::tempdir().expect("minimal-build session root");
+        let temporary = crate::test_support::canonical_tempdir("minimal-build session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -35721,7 +35721,7 @@ mod tests {
                 '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
             )));
 
-        let temporary = tempfile::tempdir().expect("Yandex download directory");
+        let temporary = crate::test_support::canonical_tempdir("Yandex download directory");
         let existing = temporary.path().join("Fixture Track.flac");
         std::fs::write(&existing, b"existing").expect("existing download");
         let available =
@@ -35741,7 +35741,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_music_album_download_preserves_flattened_track_order_and_positions() {
-        let temporary = tempfile::tempdir().expect("Yandex album download root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex album download root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35802,7 +35802,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_music_recommendation_download_selects_exactly_the_first_twenty_in_order() {
-        let temporary = tempfile::tempdir().expect("Yandex recommendation download root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex recommendation download root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35884,7 +35884,7 @@ mod tests {
         assert!(!first.contains("track"));
         assert_ne!(first, changed);
 
-        let temporary = tempfile::tempdir().expect("Yandex playback cache");
+        let temporary = crate::test_support::canonical_tempdir("Yandex playback cache");
         let path = temporary.path().join(format!("{first}.flac"));
         std::fs::write(&path, b"bad").expect("partial cache fixture");
         assert!(!yandex_music_playback_cache_file_is_valid(&path, Some(4)));
@@ -35926,7 +35926,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_todo_note_and_history_restart_without_persisting_resolved_media() {
-        let temporary = tempfile::tempdir().expect("Yandex integration state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex integration state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let (factory, _playback, _statuses, events) = mock_playback_factory([], []);
@@ -36017,7 +36017,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn restored_yandex_music_screen_uses_its_own_search_query() {
-        let temporary = tempfile::tempdir().expect("Yandex session root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -36044,7 +36044,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_without_batch_ids_keeps_recommendations_usable() {
-        let temporary = tempfile::tempdir().expect("Yandex bootstrap root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex bootstrap root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36121,7 +36121,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_rate_limit_does_not_claim_that_the_token_expired() {
-        let temporary = tempfile::tempdir().expect("Yandex rate-limit root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex rate-limit root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36147,7 +36147,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_unauthorized_response_retains_token_replacement_guidance() {
-        let temporary = tempfile::tempdir().expect("Yandex unauthorized root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex unauthorized root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36172,7 +36172,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn first_yandex_search_without_a_token_opens_the_setup_editor() {
-        let temporary = tempfile::tempdir().expect("Yandex first-search root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex first-search root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36188,7 +36188,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn changing_yandex_search_scope_reruns_the_visible_query() {
-        let temporary = tempfile::tempdir().expect("Yandex scope-switch root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex scope-switch root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -36235,7 +36235,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn direct_yandex_album_url_opens_the_exact_catalogue_item() {
-        let temporary = tempfile::tempdir().expect("Yandex direct-album root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex direct-album root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -36269,7 +36269,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn failed_yandex_search_clears_actions_for_the_discarded_selection() {
-        let temporary = tempfile::tempdir().expect("Yandex failed-search root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex failed-search root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36320,7 +36320,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_search_back_restores_cached_my_wave_without_network_work() {
-        let temporary = tempfile::tempdir().expect("Yandex route root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex route root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36465,7 +36465,7 @@ mod tests {
     #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
     #[test]
     fn yandex_wikidata_waits_for_stable_selection_and_serializes_exact_ids() {
-        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex Wikidata root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36550,7 +36550,7 @@ mod tests {
     fn yandex_wikidata_merges_fresh_cache_before_scheduling_only_misses() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex Wikidata root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         store
@@ -36914,7 +36914,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn my_wave_bootstrap_never_sits_behind_offline_reaction_retries() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -36979,7 +36979,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn constructor_retries_and_retains_a_durable_offline_reaction() {
-        let temporary = tempfile::tempdir().expect("Yandex startup state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex startup state root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -37036,7 +37036,7 @@ mod tests {
             }
         }
 
-        let temporary = tempfile::tempdir().expect("Yandex shutdown state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex shutdown state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -37094,7 +37094,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn failed_shutdown_reaction_retry_remains_in_the_durable_outbox() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -37117,7 +37117,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn successful_reaction_response_acknowledges_the_exact_durable_intent() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -37138,7 +37138,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn stale_successful_reaction_response_cannot_acknowledge_a_newer_intent() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let stale = store
@@ -37163,7 +37163,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn unavailable_yandex_account_does_not_claim_a_reaction_was_saved() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37191,7 +37191,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_reaction_keeps_the_selected_track_and_synchronizes_saved_selection() {
-        let temporary = tempfile::tempdir().expect("Yandex reaction root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex reaction root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37280,7 +37280,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn newer_yandex_playback_supersedes_pending_resolution_and_ignores_late_result() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37343,7 +37343,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn starting_another_source_cancels_pending_yandex_playback() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37376,7 +37376,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn unvalidated_replacement_token_does_not_overwrite_the_working_credential() {
-        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex credential root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config
             .save_yandex_music_token("working-token".to_owned())
@@ -37450,7 +37450,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn validated_replacement_token_is_saved_and_adopted_atomically() {
-        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex credential root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config
             .save_yandex_music_token("working-token".to_owned())
@@ -37815,7 +37815,7 @@ mod tests {
     /// Builds a selected YouTube video with a captured provider request lane.
     fn controller_with_youtube_video_comments()
     -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37831,7 +37831,7 @@ mod tests {
     #[cfg(feature = "network")]
     fn controller_with_project_history()
     -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -38192,7 +38192,7 @@ mod tests {
 
     #[test]
     fn private_note_create_edit_delete_and_restart_preserve_one_exact_note() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
 
@@ -38613,7 +38613,7 @@ mod tests {
 
     #[test]
     fn cached_subscription_navigation_refreshes_playlist_state_without_provider_results() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -38688,7 +38688,7 @@ mod tests {
 
     #[test]
     fn downloaded_item_todo_membership_survives_restart_and_replays_locally() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let path = config.downloads_dir().join("fixture.opus");
@@ -38733,7 +38733,7 @@ mod tests {
     #[cfg(feature = "local-trash")]
     #[test]
     fn downloaded_trash_confirmation_revalidates_removes_and_refreshes_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let removed = config.downloads_dir().join("remove.opus");
         let retained = config.downloads_dir().join("retain.opus");
@@ -38784,7 +38784,7 @@ mod tests {
     #[cfg(feature = "local-trash")]
     #[test]
     fn downloaded_trash_failure_retains_context_and_full_diagnostic() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let downloaded = config.downloads_dir().join("offline.opus");
         let store = StateStore::open(&config).expect("disk state");
@@ -39035,7 +39035,7 @@ mod tests {
 
     #[test]
     fn playlist_index_and_exact_entry_route_survive_restart() {
-        let fixture = tempfile::tempdir().expect("temporary playlist state");
+        let fixture = crate::test_support::canonical_tempdir("temporary playlist state");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let snapshot = |video_id: &str, title: &str| {
@@ -39113,7 +39113,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn removed_local_playlist_entry_hides_actions_and_cannot_be_copied() {
-        let fixture = tempfile::tempdir().expect("temporary Local playlist");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local playlist");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let media_path = fixture.path().join("removed.flac");
@@ -39485,7 +39485,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn local_playlist_snapshot_uses_an_existing_absolute_file() {
-        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let temporary = crate::test_support::canonical_tempdir("temporary local folder");
         let path = temporary.path().join("fixture.opus");
         std::fs::write(&path, b"not decoded during playlist capture").expect("fixture file");
         let mut controller = controller_with_mock_statuses([]).0;
@@ -39523,7 +39523,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn local_mov_playlist_entry_waits_for_current_duration_before_thumbnail() {
-        let temporary = tempfile::tempdir().expect("temporary local playlist video");
+        let temporary = crate::test_support::canonical_tempdir("temporary local playlist video");
         let video = temporary.path().join("playlist.mov");
         std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
         let webpage_url = url::Url::from_file_path(&video).expect("absolute local file URL");
@@ -39598,7 +39598,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn asynchronous_local_listing_restores_playlist_actions_without_selection_movement() {
-        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let temporary = crate::test_support::canonical_tempdir("temporary local folder");
         let path = temporary.path().join("fixture.opus");
         std::fs::write(&path, b"fixture media").expect("fixture file");
         let webpage_url = url::Url::from_file_path(&path).expect("absolute local file URL");
@@ -39699,7 +39699,7 @@ mod tests {
     fn system_url_opener_task_reports_nonzero_exit_instead_of_false_success() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = tempfile::tempdir().expect("temporary opener directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary opener directory");
         let opener = temporary.path().join(system_url_opener_name());
         std::fs::write(&opener, "#!/bin/sh\nexit 23\n").expect("opener fixture");
         std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))
@@ -39996,7 +39996,7 @@ mod tests {
 
     #[test]
     fn watched_percentage_is_restored_from_disk_for_search_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
         {
@@ -40017,7 +40017,7 @@ mod tests {
 
     #[test]
     fn zero_position_progress_and_explicit_overrides_restore_distinct_row_states() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
         {
@@ -40066,7 +40066,7 @@ mod tests {
 
     #[test]
     fn downloaded_rows_bulk_hydrate_partial_progress_after_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = config.downloads_dir().join("restart fixture.opus");
         let media_id = local_media_id(&track);
@@ -40094,7 +40094,7 @@ mod tests {
 
     #[test]
     fn periodic_checkpoint_stays_runtime_only_until_clean_persistence_boundary() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "periodic-runtime-only");
         let store = StateStore::open(&config).expect("disk state");
@@ -40147,7 +40147,7 @@ mod tests {
 
     #[test]
     fn failed_periodic_checkpoint_keeps_unacknowledged_listening_time() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "failed-periodic-checkpoint");
         let store = StateStore::open(&config).expect("disk state");
@@ -40177,7 +40177,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_is_idempotent_across_explicit_call_and_drop() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let session_path = config.runtime_dir().join("session.toml");
         let store = StateStore::open(&config).expect("disk state");
@@ -40206,7 +40206,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_publishes_pending_checkpoint_without_active_media() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "shutdown-pending-checkpoint");
         let store = StateStore::open(&config).expect("disk state");
@@ -40247,7 +40247,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_reports_checkpoint_publication_failure() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "shutdown-checkpoint-failure");
         let store = StateStore::open(&config).expect("disk state");
@@ -40280,7 +40280,7 @@ mod tests {
 
     #[test]
     fn switching_media_flushes_the_previous_checkpoint_to_canonical_state() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let (factory, _state, _statuses, _events) = mock_playback_factory([], []);
@@ -40320,7 +40320,7 @@ mod tests {
 
     #[test]
     fn saved_youtube_search_restores_without_rerunning_and_keeps_details_lazy() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let mut request = SearchRequest::new("restored fixture", SearchTarget::Videos);
         request.page = 2;
@@ -40415,7 +40415,7 @@ mod tests {
     #[cfg(feature = "youtube-music")]
     #[test]
     fn saved_youtube_music_search_restores_screen_query_rows_selection_and_drops_streams() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let music_video = |video_id: &str, title: &str| {
             let mut video = subscription_video_summary();
@@ -41115,7 +41115,7 @@ mod tests {
 
     #[test]
     fn subscription_source_rows_shorten_opml_aliases_without_changing_feed_identity() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let handle =
             url::Url::parse("https://www.youtube.com/@myChanName").expect("fixture channel handle");
@@ -41222,7 +41222,7 @@ mod tests {
 
     #[test]
     fn subscription_source_row_restores_persisted_alias_before_provider_request() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let now = unix_time();
@@ -41579,7 +41579,7 @@ mod tests {
 
     #[test]
     fn description_video_navigation_restores_nested_details_and_clears_forward_history() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41728,7 +41728,7 @@ mod tests {
 
     #[test]
     fn description_video_navigation_history_is_bounded() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41756,7 +41756,7 @@ mod tests {
 
     #[test]
     fn forwarding_to_a_pending_link_reissues_details_and_rejects_the_stale_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41816,7 +41816,7 @@ mod tests {
 
     #[test]
     fn local_channel_subscription_persists_and_updates_details_and_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -41942,7 +41942,7 @@ mod tests {
 
     #[test]
     fn rss_subscription_popup_validates_and_persists_portable_feed() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -42071,7 +42071,7 @@ mod tests {
     #[cfg(feature = "rss")]
     #[test]
     fn rss_subscription_opens_plays_refreshes_and_restores_a_stale_snapshot() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let feed_url =
             url::Url::parse("https://podcasts.example/feed.xml").expect("valid fixture feed URL");
@@ -42243,7 +42243,7 @@ mod tests {
 
     #[test]
     fn drill_down_subscriptions_load_only_after_enter_and_tab_returns_to_sources() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42325,7 +42325,7 @@ mod tests {
 
     #[test]
     fn subscriptions_restore_disk_snapshot_before_refresh_and_reconcile_removed_videos() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let mut first_summary = subscription_video_summary();
@@ -42417,7 +42417,7 @@ mod tests {
 
     #[test]
     fn subscription_initial_empty_page_persists_first_later_playable_page() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open(&config).expect("initial disk state");
@@ -42487,7 +42487,7 @@ mod tests {
 
     #[test]
     fn subscription_disk_snapshot_survives_failure_and_clears_after_empty_success() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         {
@@ -42580,7 +42580,7 @@ mod tests {
 
     #[test]
     fn subscription_disk_cache_opens_without_provider_setup_interruption() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42634,7 +42634,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_bypasses_cache_and_preserves_video_identity() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42782,7 +42782,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_stages_filtered_empty_pages_without_blanking_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42868,7 +42868,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_keeps_a_selection_changed_while_loading() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43433,7 +43433,7 @@ mod tests {
     #[cfg(feature = "wikidata")]
     #[test]
     fn reopening_subscription_channel_reapplies_persisted_wikidata_link() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
         save_fixture_subscriptions(&config, &[channel_id]);
@@ -43488,7 +43488,7 @@ mod tests {
     fn late_wikidata_response_cannot_replace_reopened_cached_channel() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let cached_channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
         save_fixture_subscriptions(&config, &["UCfirst", cached_channel_id]);
@@ -43565,7 +43565,7 @@ mod tests {
     fn subscription_channel_panel_debounces_exact_lazy_wikidata_lookup() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43605,7 +43605,7 @@ mod tests {
 
     #[test]
     fn empty_subscription_pages_continue_boundedly_and_enter_resumes_pagination() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43657,7 +43657,7 @@ mod tests {
 
     #[test]
     fn subscription_feed_hides_zero_duration_non_live_placeholders() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43709,7 +43709,7 @@ mod tests {
 
     #[test]
     fn empty_later_subscription_page_reaches_the_next_playable_page() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43762,7 +43762,7 @@ mod tests {
 
     #[test]
     fn subscription_pages_reject_skipped_continuations() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43797,7 +43797,7 @@ mod tests {
 
     #[test]
     fn subscription_response_is_cached_without_mutating_another_screen() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -44036,7 +44036,7 @@ mod tests {
 
     #[test]
     fn subscription_channel_details_are_debounced_cached_and_applied_to_the_heading() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -44278,7 +44278,7 @@ mod tests {
 
     #[test]
     fn subscription_sources_restore_persisted_artwork_before_channel_switches() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
         let first_artwork =
@@ -44619,7 +44619,7 @@ mod tests {
 
     #[test]
     fn split_subscriptions_keep_independent_sources_videos_and_ram_cache() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.ui.subscriptions_layout = SubscriptionsLayout::Split;
         save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
@@ -44748,7 +44748,7 @@ mod tests {
 
     #[test]
     fn preferences_popup_saves_runtime_preferences_and_applies_them_live() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -44838,7 +44838,7 @@ mod tests {
     #[cfg(feature = "images")]
     #[test]
     fn preferences_cycle_the_complete_closed_youtube_thumbnail_size_set() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -45003,7 +45003,7 @@ mod tests {
     #[cfg(feature = "bandcamp")]
     #[test]
     fn preferences_cycle_the_complete_closed_bandcamp_format_set() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -45030,7 +45030,7 @@ mod tests {
 
     #[test]
     fn subscribe_reconciles_an_external_opml_add_without_unsubscribing_it() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -45072,7 +45072,7 @@ mod tests {
 
     #[test]
     fn channel_view_subscription_updates_the_video_back_snapshot() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -45176,7 +45176,7 @@ mod tests {
     #[cfg(feature = "local-rename")]
     #[test]
     fn local_rename_remaps_playlist_progress_and_history_across_restart() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let media_directory = fixture.path().join("media");
@@ -45321,7 +45321,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_extension_marks_real_rows_and_never_marks_parent_navigation() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let first = fixture.path().join("a.flac");
         let second = fixture.path().join("b.flac");
         std::fs::write(&first, b"a").expect("first fixture");
@@ -45367,7 +45367,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_chooser_keeps_rows_and_rejects_stale_destination_responses() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -45435,7 +45435,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_validation_error_keeps_sources_and_queues_no_mapping() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -45507,7 +45507,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_progress_collision_is_rejected_before_journal_or_worker() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45580,7 +45580,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn durable_progress_collision_is_rejected_before_journal_or_worker() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45646,7 +45646,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_intent_is_durable_before_the_worker_can_mutate_files() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45709,7 +45709,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_success_remaps_memory_and_refreshes_without_blank_rows() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45812,7 +45812,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn completed_local_move_mappings_are_persisted_as_one_batch() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("moved/source.flac");
         let source_id = local_media_id(&source);
@@ -45876,7 +45876,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_retains_the_complete_batch() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -45934,7 +45934,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_blocks_local_playlist_mutations() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         std::fs::write(&target, b"moved audio").expect("moved Local fixture");
@@ -45999,7 +45999,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_is_not_retried_by_repeated_ticks() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -46063,7 +46063,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_mapping_blocks_session_save_and_quit_until_explicit_retry_succeeds() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -46135,7 +46135,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_partial_failure_shows_every_recovery_path_and_keeps_remainder() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -46234,7 +46234,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_filesystem_worker_executes_moves_off_the_controller_thread() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -46279,7 +46279,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn shutdown_joins_and_drains_local_move_before_persisting_session() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -46399,7 +46399,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn startup_reconciles_completed_and_untouched_parts_of_a_move_intent() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("config"));
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
@@ -46466,7 +46466,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn durable_identity_collision_retains_journal_and_blocks_quit() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("config"));
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
@@ -46514,7 +46514,7 @@ mod tests {
 
     #[test]
     fn local_show_all_toggle_reloads_both_modes_and_preserves_supported_selection() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let track = fixture.path().join("song.flac");
         std::fs::write(&track, b"audio").expect("create Local audio fixture");
         std::fs::write(fixture.path().join("notes.txt"), b"notes")
@@ -46619,7 +46619,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn activating_a_local_text_entry_schedules_its_system_editor_plan() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let notes = fixture.path().join("notes.txt");
         std::fs::write(&notes, b"notes").expect("create Local text fixture");
         let listing = crate::local_browser::list_local_directory_with_options(
@@ -46662,7 +46662,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn activating_an_other_local_file_does_not_schedule_an_editor() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let binary = fixture.path().join("payload.bin");
         std::fs::write(&binary, b"binary").expect("create Local binary fixture");
         let listing = crate::local_browser::list_local_directory_with_options(
@@ -46696,7 +46696,7 @@ mod tests {
 
     #[test]
     fn local_browser_rows_and_folder_actions_are_source_specific() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let album = fixture.path().join("A long album folder");
         std::fs::create_dir(&album).expect("create album folder");
         std::fs::write(fixture.path().join("song.flac"), b"fixture")
@@ -46747,7 +46747,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn local_playback_updates_visible_progress_and_rehydrates_it() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let media_directory = fixture.path().join("Music");
         std::fs::create_dir(&media_directory).expect("create Local media folder");
         let track = media_directory.join("01 - Hello World.flac");
@@ -46966,7 +46966,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary local metadata fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary local metadata fixture");
         let media_path = fixture.path().join("mock.webm");
         std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
         let metadata = parse_local_ffprobe_output(
@@ -47052,7 +47052,7 @@ mod tests {
     fn local_mov_details_use_cached_metadata_without_requesting_audio_artwork() {
         use crossbeam_channel::TryRecvError;
 
-        let fixture = tempfile::tempdir().expect("temporary MOV fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary MOV fixture");
         let media_path = fixture.path().join("midpoint.MOV");
         std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -47101,7 +47101,7 @@ mod tests {
     ))]
     #[test]
     fn video_keeps_embedded_artwork_fallback_when_midpoint_extraction_is_omitted() {
-        let fixture = tempfile::tempdir().expect("temporary video-artwork fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary video-artwork fixture");
         let media_path = fixture.path().join("fallback.mov");
         std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -47132,7 +47132,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn downloaded_mov_details_reuse_cached_duration_for_midpoint_thumbnail() {
-        let fixture = tempfile::tempdir().expect("temporary downloaded MOV fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary downloaded MOV fixture");
         let media_path = fixture.path().join("downloaded.mov");
         std::fs::write(&media_path, b"mock downloaded MOV").expect("write MOV fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -47175,7 +47175,7 @@ mod tests {
     #[cfg(feature = "local-artwork")]
     #[test]
     fn downloaded_rows_carry_the_thumbnails_written_beside_them() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let downloads = config.downloads_dir();
@@ -47221,7 +47221,7 @@ mod tests {
     #[cfg(feature = "local-artwork")]
     #[test]
     fn a_downloaded_file_shows_the_thumbnail_written_beside_it() {
-        let fixture = tempfile::tempdir().expect("temporary downloads fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary downloads fixture");
         let media_path = fixture.path().join("Popular Monster [ydK1vjQBvp0].opus");
         let sidecar = fixture.path().join("Popular Monster [ydK1vjQBvp0].webp");
         std::fs::write(&media_path, b"mock downloaded audio").expect("write media fixture");
@@ -47317,7 +47317,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary Local browser fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local browser fixture");
         let media_path = fixture.path().join("mock.webm");
         std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
         let listing = crate::local_browser::list_local_directory(
@@ -47398,7 +47398,7 @@ mod tests {
     #[test]
     fn local_media_metadata_cache_has_a_fixed_lru_bound() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
-        let fixture = tempfile::tempdir().expect("temporary metadata cache fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary metadata cache fixture");
         for index in 0..=MAX_CACHED_LOCAL_MEDIA_ITEMS {
             let path = fixture.path().join(format!("{index}.flac"));
             std::fs::write(&path, [u8::try_from(index % 256).expect("bounded byte")])
@@ -47435,7 +47435,7 @@ mod tests {
     fn controller_with_local_fingerprint_config(
         client_key: Option<&str>,
     ) -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let fixture = tempfile::tempdir().expect("temporary fingerprint controller fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary fingerprint controller fixture");
         let mut config = Config::for_dir(fixture.path().join("youta"));
         config.providers.acoustid_client_key = client_key.map(str::to_owned);
         let store = StateStore::open_in_memory().expect("in-memory fingerprint state");
@@ -47560,7 +47560,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
-        let media = tempfile::tempdir().expect("temporary fingerprint eligibility fixture");
+        let media = crate::test_support::canonical_tempdir("temporary fingerprint eligibility fixture");
         let audio = media.path().join("track.flac");
         let video = media.path().join("clip.mp4");
         let image = media.path().join("cover.jpg");
@@ -47603,7 +47603,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_action_points_missing_keys_to_the_private_credentials_file() {
-        let media = tempfile::tempdir().expect("temporary missing-key fixture");
+        let media = crate::test_support::canonical_tempdir("temporary missing-key fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47638,7 +47638,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn missing_fpcalc_failure_reaches_local_error_popup_with_install_guidance() {
-        let media = tempfile::tempdir().expect("temporary missing-fpcalc fixture");
+        let media = crate::test_support::canonical_tempdir("temporary missing-fpcalc fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47677,7 +47677,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn disconnected_fingerprint_worker_cannot_accept_phantom_follow_up_work() {
-        let media = tempfile::tempdir().expect("temporary disconnected-worker fixture");
+        let media = crate::test_support::canonical_tempdir("temporary disconnected-worker fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47711,7 +47711,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_f_dispatch_animates_and_caches_an_empty_success() {
-        let media = tempfile::tempdir().expect("temporary empty fingerprint fixture");
+        let media = crate::test_support::canonical_tempdir("temporary empty fingerprint fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47775,7 +47775,7 @@ mod tests {
     fn local_fingerprint_completion_projects_ranked_musicbrainz_links() {
         const HIGH_RECORDING: &str = "11111111-1111-4111-8111-111111111111";
         const LOW_RECORDING: &str = "22222222-2222-4222-8222-222222222222";
-        let media = tempfile::tempdir().expect("temporary candidate projection fixture");
+        let media = crate::test_support::canonical_tempdir("temporary candidate projection fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47842,7 +47842,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn tick_reveals_fingerprint_action_after_selected_file_replacement() {
-        let media = tempfile::tempdir().expect("temporary fingerprint revalidation fixture");
+        let media = crate::test_support::canonical_tempdir("temporary fingerprint revalidation fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"original audio fixture")
             .expect("write original fingerprint fixture");
@@ -47895,7 +47895,7 @@ mod tests {
     #[test]
     fn cached_fingerprint_reuses_one_pending_musicbrainz_wikidata_lookup() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
-        let media = tempfile::tempdir().expect("temporary Wikidata dedup fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Wikidata dedup fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, provider_requests) =
@@ -47965,7 +47965,7 @@ mod tests {
     fn fingerprint_wikidata_is_visible_before_lastfm_artist_description_arrives() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm enrichment fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm enrichment fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, provider_requests) =
@@ -48065,7 +48065,7 @@ mod tests {
     #[test]
     fn late_lastfm_artist_description_cannot_replace_another_local_track() {
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary stale Last.fm fixture");
+        let media = crate::test_support::canonical_tempdir("temporary stale Last.fm fixture");
         let first = media.path().join("first.flac");
         let second = media.path().join("second.flac");
         std::fs::write(&first, b"first audio fixture").expect("write first fixture");
@@ -48138,7 +48138,7 @@ mod tests {
     #[test]
     fn lastfm_failure_keeps_the_already_visible_wikidata_link() {
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm failure fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm failure fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48203,7 +48203,7 @@ mod tests {
     fn lastfm_success_keeps_visible_wikidata_during_same_recording_refresh() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm refresh fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm refresh fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48304,7 +48304,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn replacement_identity_rejects_an_obsolete_fingerprint_completion() {
-        let media = tempfile::tempdir().expect("temporary replacement fingerprint fixture");
+        let media = crate::test_support::canonical_tempdir("temporary replacement fingerprint fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"old audio").expect("write original audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48356,7 +48356,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn stale_fingerprint_generation_cannot_replace_the_active_request() {
-        let media = tempfile::tempdir().expect("temporary stale-generation fixture");
+        let media = crate::test_support::canonical_tempdir("temporary stale-generation fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48411,7 +48411,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn changing_local_selection_cancels_the_exact_fingerprint_request() {
-        let media = tempfile::tempdir().expect("temporary selection cancellation fixture");
+        let media = crate::test_support::canonical_tempdir("temporary selection cancellation fixture");
         let first = media.path().join("first.flac");
         let second = media.path().join("second.flac");
         std::fs::write(&first, b"first audio").expect("write first audio fixture");
@@ -48440,7 +48440,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_ram_cache_is_lru_bounded() {
-        let media = tempfile::tempdir().expect("temporary fingerprint cache fixture");
+        let media = crate::test_support::canonical_tempdir("temporary fingerprint cache fixture");
         let (_config, mut controller, _provider_requests) =
             controller_with_local_fingerprint_config(None);
         let mut keys = Vec::new();
@@ -48485,7 +48485,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_worker_shutdown_cancels_and_joins_active_work() {
-        let media = tempfile::tempdir().expect("temporary fingerprint shutdown fixture");
+        let media = crate::test_support::canonical_tempdir("temporary fingerprint shutdown fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48595,7 +48595,7 @@ mod tests {
     #[cfg(not(feature = "waveform"))]
     #[test]
     fn omitted_waveform_feature_leaves_the_seek_bar_visible() {
-        let fixture = tempfile::tempdir().expect("temporary omitted-waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary omitted-waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"local audio").expect("write omitted-waveform fixture");
         let media_id = local_media_id(&media_path);
@@ -48633,7 +48633,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn restored_waveform_waits_for_delayed_initial_local_listing() {
-        let fixture = tempfile::tempdir().expect("temporary restored waveform folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary restored waveform folder");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"restored local audio")
             .expect("write restored waveform fixture");
@@ -48772,7 +48772,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_toggle_preserves_right_panel_and_cancels_request() {
-        let fixture = tempfile::tempdir().expect("temporary waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"mock local audio").expect("write local waveform fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -48825,7 +48825,7 @@ mod tests {
     #[test]
     fn local_waveform_request_keeps_fractional_and_subsecond_duration() {
         for duration in [Duration::from_millis(1_900), Duration::from_millis(900)] {
-            let fixture = tempfile::tempdir().expect("temporary duration fixture");
+            let fixture = crate::test_support::canonical_tempdir("temporary duration fixture");
             let media_path = fixture.path().join("short.flac");
             std::fs::write(&media_path, b"short local audio")
                 .expect("write short waveform fixture");
@@ -48864,7 +48864,7 @@ mod tests {
             (Duration::from_millis(1_900), 1),
             (Duration::from_millis(900), 0),
         ] {
-            let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+            let fixture = crate::test_support::canonical_tempdir("temporary active waveform fixture");
             let media_path = fixture.path().join("short.flac");
             std::fs::write(&media_path, b"short local audio")
                 .expect("write active waveform fixture");
@@ -48896,7 +48896,7 @@ mod tests {
             (Duration::from_millis(900), 0),
         ] {
             for play_another_local_file in [false, true] {
-                let fixture = tempfile::tempdir().expect("temporary inactive waveform fixture");
+                let fixture = crate::test_support::canonical_tempdir("temporary inactive waveform fixture");
                 let selected_path = fixture.path().join("selected.flac");
                 let other_path = fixture.path().join("other.flac");
                 std::fs::write(&selected_path, b"selected local audio")
@@ -48952,7 +48952,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_identity_bound_local_waveform_click_seeks_without_restarting() {
-        let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary active waveform fixture");
         let media_path = fixture.path().join("active.flac");
         std::fs::write(&media_path, b"active local audio").expect("write active waveform fixture");
         let duration = Duration::from_secs(42);
@@ -49003,7 +49003,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_local_waveform_accepts_subsecond_backend_duration_rounding() {
-        let fixture = tempfile::tempdir().expect("temporary rounded-duration fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary rounded-duration fixture");
         let media_path = fixture.path().join("rounded.flac");
         std::fs::write(&media_path, b"rounded local audio")
             .expect("write rounded-duration fixture");
@@ -49047,7 +49047,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_local_waveform_rejects_a_different_backend_duration() {
-        let fixture = tempfile::tempdir().expect("temporary duration-mismatch fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary duration-mismatch fixture");
         let media_path = fixture.path().join("active.flac");
         std::fs::write(&media_path, b"active local audio")
             .expect("write duration-mismatch fixture");
@@ -49093,7 +49093,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn generic_local_queue_start_captures_identity_for_waveform_seek() {
-        let fixture = tempfile::tempdir().expect("temporary generic Local queue fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary generic Local queue fixture");
         let media_path = fixture.path().join("queued.flac");
         std::fs::write(&media_path, b"queued local audio")
             .expect("write generic Local queue fixture");
@@ -49133,7 +49133,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn replaced_selected_file_waveform_restarts_instead_of_seeking_old_stream() {
-        let fixture = tempfile::tempdir().expect("temporary replacement-click fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary replacement-click fixture");
         let media_path = fixture.path().join("replaceable.flac");
         std::fs::write(&media_path, b"old local audio")
             .expect("write original replacement-click fixture");
@@ -49190,7 +49190,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn waveform_click_revalidates_replacement_after_render() {
-        let fixture = tempfile::tempdir().expect("temporary stale-click fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary stale-click fixture");
         let media_path = fixture.path().join("stale.flac");
         std::fs::write(&media_path, b"old local audio").expect("write stale-click fixture");
         let duration = Duration::from_secs(42);
@@ -49245,7 +49245,7 @@ mod tests {
     fn selected_local_waveform_uses_original_non_utf8_path() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 waveform fixture");
         let filename = std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec());
         let media_path = fixture.path().join(filename);
         std::fs::write(&media_path, b"non-UTF-8 local audio")
@@ -49271,7 +49271,7 @@ mod tests {
     fn non_utf8_local_media_ids_and_waveform_targets_remain_distinct() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 collision fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 collision fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -49336,7 +49336,7 @@ mod tests {
     fn non_utf8_local_files_keep_separate_progress_and_history() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 playback fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 playback fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -49398,7 +49398,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn hiding_waveform_cancels_local_waveform_request() {
-        let fixture = tempfile::tempdir().expect("temporary waveform visibility fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform visibility fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"local audio").expect("write waveform visibility fixture");
         let request = LocalWaveformRequest::from_path(media_path.clone())
@@ -49428,7 +49428,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn selecting_metadata_loading_file_cancels_previous_waveform() {
-        let fixture = tempfile::tempdir().expect("temporary waveform selection fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform selection fixture");
         let first_path = fixture.path().join("first.flac");
         let second_path = fixture.path().join("second.flac");
         std::fs::write(&first_path, b"first local audio").expect("write first waveform fixture");
@@ -49491,7 +49491,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn stale_local_waveform_response_cannot_replace_newer_owner() {
-        let fixture = tempfile::tempdir().expect("temporary waveform owner fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform owner fixture");
         let media_path = fixture.path().join("new-owner.flac");
         std::fs::write(&media_path, b"new owner").expect("write waveform owner fixture");
         let request =
@@ -49549,7 +49549,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn completed_waveform_is_revalidated_before_display_after_replacement() {
-        let fixture = tempfile::tempdir().expect("temporary completed replacement fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary completed replacement fixture");
         let media_path = fixture.path().join("completed.flac");
         std::fs::write(&media_path, b"old completed waveform")
             .expect("write completed replacement fixture");
@@ -49632,7 +49632,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn waveform_click_rejects_changed_duration_for_same_file_identity() {
-        let fixture = tempfile::tempdir().expect("temporary duration correction fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary duration correction fixture");
         let media_path = fixture.path().join("duration.flac");
         std::fs::write(&media_path, b"duration correction local audio")
             .expect("write duration correction fixture");
@@ -49693,7 +49693,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn replaced_local_file_retries_identity_scoped_waveform_failure() {
-        let fixture = tempfile::tempdir().expect("temporary failed waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary failed waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"old waveform").expect("write original waveform fixture");
         let media_id = local_media_id(&media_path);
@@ -49792,7 +49792,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn unavailable_local_waveform_retries_after_its_bounded_delay() {
-        let fixture = tempfile::tempdir().expect("temporary unkeyed retry fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary unkeyed retry fixture");
         let media_path = fixture.path().join("retry.flac");
         std::fs::write(&media_path, b"retry local audio").expect("write unkeyed retry fixture");
         let duration = Duration::from_secs(42);
@@ -49862,7 +49862,7 @@ mod tests {
     fn failed_non_utf8_path_does_not_delay_a_distinct_selection() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary retry collision fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary retry collision fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"retry-\xFF.flac".to_vec()));
@@ -49921,7 +49921,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn ready_local_waveform_revalidates_periodically_but_clicks_immediately() {
-        let fixture = tempfile::tempdir().expect("temporary revalidation fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary revalidation fixture");
         let media_path = fixture.path().join("revalidate.flac");
         std::fs::write(&media_path, b"revalidation local audio")
             .expect("write revalidation fixture");
@@ -49971,7 +49971,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_ram_cache_enforces_entry_and_byte_limits() {
-        let fixture = tempfile::tempdir().expect("temporary waveform cache fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform cache fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
         let one_peak = Arc::new(crate::waveform::PeakPyramid::from_peaks(
             vec![crate::waveform::Peak {
@@ -50061,7 +50061,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_ram_cache_counts_retained_peak_capacity() {
-        let fixture = tempfile::tempdir().expect("temporary waveform capacity fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform capacity fixture");
         let media_path = fixture.path().join("capacity.flac");
         std::fs::write(&media_path, b"capacity").expect("write waveform capacity fixture");
         let request =
@@ -50095,7 +50095,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_is_scoped_to_exact_timeline_duration() {
-        let fixture = tempfile::tempdir().expect("temporary waveform duration-cache fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform duration-cache fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"duration-sensitive waveform")
             .expect("write waveform duration-cache fixture");
@@ -50142,7 +50142,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_replaces_stale_file_identity_for_same_path() {
-        let fixture = tempfile::tempdir().expect("temporary waveform replacement fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform replacement fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"old").expect("write original waveform fixture");
         let original =
@@ -50207,7 +50207,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_media_metadata_cache_rejects_same_size_path_replacement() {
-        let fixture = tempfile::tempdir().expect("temporary replacement fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary replacement fixture");
         let media_path = fixture.path().join("track.flac");
         let replacement_path = fixture.path().join("replacement.flac");
         std::fs::write(&media_path, b"old!").expect("write original fixture");
@@ -50246,7 +50246,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary worker race fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary worker race fixture");
         let media_path = fixture.path().join("track.flac");
         let replacement_path = fixture.path().join("replacement.flac");
         std::fs::write(&media_path, b"old!").expect("write original fixture");
@@ -50503,7 +50503,7 @@ mod tests {
 
     #[test]
     fn navigating_to_parent_reselects_the_folder_just_left() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         let child_listing = crate::local_browser::list_local_directory(
@@ -50562,7 +50562,7 @@ mod tests {
 
     #[test]
     fn local_parent_action_ascends_from_any_selected_row_and_reselects_the_child() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         std::fs::write(child.join("track.flac"), b"fixture").expect("create Local media fixture");
@@ -50669,7 +50669,7 @@ mod tests {
 
     #[test]
     fn pending_local_navigation_keeps_rows_visible_but_noninteractive() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         let listing = crate::local_browser::list_local_directory(
@@ -50738,7 +50738,7 @@ mod tests {
 
     #[test]
     fn trash_refresh_preserves_rows_and_reuses_unchanged_sibling_size() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let removed = fixture.path().join("remove-me");
         let sibling = fixture.path().join("sibling");
         std::fs::create_dir(&removed).expect("create removed folder");
@@ -50865,7 +50865,7 @@ mod tests {
     #[cfg(feature = "local-artwork")]
     #[test]
     fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let album = fixture.path().join("album");
         std::fs::create_dir(&album).expect("create album");
         let cover = album.join("CoVeR.JpG");
@@ -51023,7 +51023,7 @@ mod tests {
     fn local_size_sort_keeps_unknown_folders_last_and_preserves_selected_path() {
         use crate::local_browser::LocalEntryKind;
 
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let small = fixture.path().join("small");
         let large = fixture.path().join("large");
         let unknown = fixture.path().join("unknown");
@@ -51166,7 +51166,7 @@ mod tests {
 
     #[test]
     fn lazy_folder_size_response_reorders_without_moving_selection() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let measured = fixture.path().join("measured");
         let selected = fixture.path().join("selected");
         std::fs::create_dir(&measured).expect("create measured folder");
@@ -51226,7 +51226,7 @@ mod tests {
 
     #[test]
     fn local_subscription_save_failure_rolls_back_cache_and_view() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let blocked_root = temporary.path().join("not-a-directory");
         std::fs::write(&blocked_root, b"fixture").expect("blocking file");
         let config = Config::for_dir(&blocked_root);
@@ -51273,7 +51273,7 @@ mod tests {
 
     #[test]
     fn malformed_existing_opml_is_never_replaced_by_subscribe() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         config
             .ensure_directories()
@@ -51332,7 +51332,7 @@ mod tests {
 
     #[test]
     fn selecting_a_channel_invalidates_a_late_video_detail_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52286,7 +52286,7 @@ mod tests {
 
     #[test]
     fn chapter_timestamp_toggle_changes_only_labels_and_survives_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52317,7 +52317,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_screen_and_selected_station_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -52339,7 +52339,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn bitrate_sorted_radio_selection_restores_by_stable_station_id() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -52389,7 +52389,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_filter_and_filtered_selection_survive_restart_by_station_id() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -52709,7 +52709,7 @@ mod tests {
 
     #[test]
     fn submitted_youtube_search_animates_until_its_terminal_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52797,7 +52797,7 @@ mod tests {
 
     #[test]
     fn accumulated_youtube_search_stops_at_the_restart_safe_result_limit() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52855,7 +52855,7 @@ mod tests {
 
     #[test]
     fn newest_toggle_restarts_page_one_and_keeps_order_on_later_pages() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52915,7 +52915,7 @@ mod tests {
 
     #[test]
     fn creative_commons_toggle_restarts_and_survives_pagination_and_sort_changes() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52989,7 +52989,7 @@ mod tests {
 
     #[test]
     fn creative_commons_toggle_does_not_apply_a_video_filter_to_channel_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53011,7 +53011,7 @@ mod tests {
 
     #[test]
     fn superseded_generation_cannot_leave_or_clear_the_wrong_animation() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53040,7 +53040,7 @@ mod tests {
 
     #[test]
     fn tracker_search_stops_only_on_matching_completion_even_after_navigation() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53081,7 +53081,7 @@ mod tests {
 
     #[test]
     fn failed_send_and_provider_disconnect_restore_idle_search_state() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53113,7 +53113,7 @@ mod tests {
 
     #[test]
     fn missing_youtube_provider_opens_setup_popup_with_exact_storage_paths() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let expected_api_key_path = config.credentials_file().display().to_string();
         let expected_invidious_path = config.config_file().display().to_string();
@@ -53143,7 +53143,7 @@ mod tests {
 
     #[test]
     fn setup_input_is_bounded_and_cancel_keeps_the_pending_query() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53172,7 +53172,7 @@ mod tests {
     #[cfg(feature = "youtube-official")]
     #[test]
     fn invalid_official_key_stays_in_setup_and_is_not_persisted() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -53206,7 +53206,7 @@ mod tests {
     #[cfg(feature = "youtube-official")]
     #[test]
     fn saved_official_setup_replaces_provider_and_retries_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let credentials_file = config.credentials_file();
@@ -53275,7 +53275,7 @@ mod tests {
     #[cfg(feature = "invidious")]
     #[test]
     fn saved_invidious_setup_replaces_provider_and_retries_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -53753,7 +53753,7 @@ mod tests {
 
     #[test]
     fn selecting_another_item_restores_the_configured_artwork_height() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -54196,7 +54196,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn a_dropped_path_opens_where_it_lives_and_selects_it() {
-        let temporary = tempfile::tempdir().expect("temporary media directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary media directory");
         // Canonical from the start: macOS resolves `/var` to `/private/var`,
         // and the controller compares the canonical form.
         let folder = std::fs::canonicalize(temporary.path()).expect("canonical media directory");
@@ -54288,7 +54288,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn download_controller_supervises_progress_and_refreshes_completed_file() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.subscriptions.download_thumbnails = false;
         let download_dir = config.downloads_dir();
@@ -54383,7 +54383,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn second_download_is_refused_and_shutdown_cancels_the_running_child() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let cancelled = Arc::new(AtomicBool::new(false));
         let process = MockRunningDownload {
@@ -54419,7 +54419,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn generic_ytdlp_selection_uses_its_canonical_remote_url() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(Vec::new())),
@@ -54450,7 +54450,7 @@ mod tests {
     #[cfg(all(feature = "yandex-music", feature = "yt-dlp"))]
     #[test]
     fn selected_yandex_download_uses_native_media_pipeline_instead_of_ytdlp() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(Vec::new())),
@@ -54482,7 +54482,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn failed_download_opens_the_complete_diagnostic_popup() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(
@@ -54535,7 +54535,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn download_paths_and_output_buffers_remain_confined_and_bounded() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let destination =
             prepare_download_destination(&config).expect("confined download destination");
@@ -54840,7 +54840,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn history_waits_for_current_local_mov_duration_before_thumbnail() {
-        let temporary = tempfile::tempdir().expect("temporary History video directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary History video directory");
         let video = temporary.path().join("history.MOV");
         std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -54894,7 +54894,7 @@ mod tests {
 
     #[test]
     fn history_enter_replays_existing_local_media_from_saved_progress() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let track = temporary.path().join("history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
         let media_id = local_media_id(&track);
@@ -54939,7 +54939,7 @@ mod tests {
 
     #[test]
     fn local_history_playlist_actions_persist_membership_and_replay_after_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = temporary.path().join("playlist history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
@@ -55144,7 +55144,7 @@ mod tests {
 
     #[test]
     fn missing_local_history_is_marked_removed_and_opens_a_recoverable_error() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let removed = temporary.path().join("removed.opus");
         let (mut controller, state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
@@ -55203,7 +55203,7 @@ mod tests {
 
     #[test]
     fn removed_and_unreplayable_history_rows_expose_no_playlist_actions() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let removed = temporary.path().join("removed playlist fixture.opus");
         let unsafe_remote = "https://media.example.test/private.opus?token=fixture";
         let (mut controller, _) = controller_with_mock_statuses([]);
@@ -56075,7 +56075,7 @@ mod tests {
 
     #[test]
     fn autoplay_advances_local_browser_files_in_listing_order() {
-        let directory = tempfile::tempdir().expect("temporary local folder");
+        let directory = crate::test_support::canonical_tempdir("temporary local folder");
         let first_path = directory.path().join("first.mp3");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first").expect("first fixture");
@@ -56143,7 +56143,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_confirmed_autoplay_transition() {
-        let directory = tempfile::tempdir().expect("temporary Local waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary Local waveform folder");
         let first_path = directory.path().join("first.mp3");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first waveform fixture").expect("first waveform fixture");
@@ -56237,7 +56237,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_confirmed_explicit_queue_transition() {
-        let directory = tempfile::tempdir().expect("temporary queued waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary queued waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("queued.flac");
         std::fs::write(&first_path, b"first queued waveform fixture")
@@ -56306,7 +56306,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_a_cross_directory_queue_transition() {
-        let root = tempfile::tempdir().expect("temporary cross-directory waveform root");
+        let root = crate::test_support::canonical_tempdir("temporary cross-directory waveform root");
         let first_directory = root.path().join("first-album");
         let second_directory = root.path().join("second-album");
         std::fs::create_dir(&first_directory).expect("first album folder");
@@ -56414,7 +56414,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_after_an_intervening_non_local_queue_item() {
-        let directory = tempfile::tempdir().expect("temporary mixed-queue waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary mixed-queue waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first mixed-queue waveform fixture")
@@ -56516,7 +56516,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_transition_preserves_a_manual_selection() {
-        let directory = tempfile::tempdir().expect("temporary manual waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary manual waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("second.flac");
         let inspected_path = directory.path().join("third-inspected.flac");
@@ -56607,7 +56607,7 @@ mod tests {
 
     #[test]
     fn autoplay_advances_prepared_tracker_modules_and_skips_metadata_rows() {
-        let directory = tempfile::tempdir().expect("temporary tracker folder");
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
         let first_path = directory.path().join("first.mod");
         let second_path = directory.path().join("second.xm");
         std::fs::write(&first_path, b"first").expect("first fixture");
@@ -58513,7 +58513,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_favorite_action_persists_and_rehydrates_starred_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("file state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -59073,7 +59073,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_station_note_survives_restart_and_keeps_one_source_target_across_routes() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let station = station_by_id("radio-swiss-classic").expect("Radio station");
         let source_id = MediaId::new(SourceKind::Radio, station.id);
@@ -60618,7 +60618,7 @@ mod tests {
     #[cfg(feature = "bandcamp")]
     #[test]
     fn bandcamp_query_rows_and_selection_are_independent_and_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let mut first_youtube = subscription_video_summary();
         first_youtube.title = "First YouTube fixture".to_owned();
@@ -61436,7 +61436,7 @@ mod tests {
     #[cfg(feature = "apple-podcasts")]
     #[test]
     fn apple_podcasts_query_selection_and_show_rows_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -61753,7 +61753,7 @@ mod tests {
 
     #[test]
     fn local_paths_expand_home_and_scan_supported_media_only() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let home = temporary.path().join("home");
         let album = home.join("Music").join("meanna");
         std::fs::create_dir_all(album.join("disc")).expect("album directories");
@@ -61785,7 +61785,7 @@ mod tests {
 
     #[test]
     fn direct_local_file_and_file_url_are_accepted() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let media = temporary.path().join("spoken episode.m4a");
         std::fs::write(&media, b"fixture").expect("media fixture");
 
@@ -62119,7 +62119,7 @@ mod tests {
         };
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("provider storage");
+        let storage = crate::test_support::canonical_tempdir("provider storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -62203,7 +62203,7 @@ mod tests {
         };
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("provider storage");
+        let storage = crate::test_support::canonical_tempdir("provider storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -62276,7 +62276,7 @@ mod tests {
     fn provider_worker_reports_missing_jamendo_configuration_without_network() {
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("tracker storage");
+        let storage = crate::test_support::canonical_tempdir("tracker storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -62374,7 +62374,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_starts_only_for_the_playing_station_in_private_runtime() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
 
         controller.dispatch(UiAction::ToggleRadioRecording);
@@ -62423,7 +62423,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_stop_finalizes_and_downloaded_lists_only_the_final_file() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller
@@ -62461,7 +62461,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_collision_preserves_the_existing_download() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let config = Config::for_dir(temporary.path().join("youta"));
         config.ensure_directories().expect("Youta directories");
         let started_at = Local::now();
@@ -62503,7 +62503,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn cross_filesystem_recording_publish_removes_private_and_hidden_staging_files() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let source = temporary.path().join("private.aac");
         let downloads = temporary.path().join("downloads");
         std::fs::create_dir(&downloads).expect("download directory");
@@ -62582,7 +62582,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_rejects_wrong_screen_and_missing_live_station() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, _) = radio_recording_controller(&temporary);
         controller.view.playing_media_id = None;
         controller.toggle_radio_recording();
@@ -62608,7 +62608,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_stops_after_the_radio_selection_moves() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller
@@ -62647,7 +62647,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn shutdown_finalizes_an_active_radio_recording() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, _) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller

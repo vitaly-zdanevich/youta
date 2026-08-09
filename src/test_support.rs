@@ -1,0 +1,55 @@
+//! Test-only fixtures shared by the module test suites.
+//!
+//! Declared `#[cfg(test)]` in the crate root, so nothing here reaches a
+//! distribution build.
+
+use std::path::PathBuf;
+
+use tempfile::TempDir;
+
+/// Creates a temporary directory whose own path is already canonical.
+///
+/// Local listings, moves, and media identifiers report paths that came back
+/// from [`std::fs::canonicalize`], so a fixture path has to be canonical too or
+/// it never compares equal to them. A plain [`TempDir`] is not: macOS resolves
+/// `/var` to `/private/var`, and Windows resolves 8.3 components (`RUNNER~1`
+/// into `runneradmin`) and reports the result behind a `\\?\` verbatim prefix.
+/// Canonicalizing the *parent* first makes every path derived from the fixture
+/// canonical, without each test having to convert its own expectations.
+///
+/// `context` names the fixture in the panic message.
+pub(crate) fn canonical_tempdir(context: &str) -> TempDir {
+    let root = canonical_temporary_root();
+    TempDir::new_in(&root).unwrap_or_else(|error| {
+        panic!("{context} under {}: {error}", root.display());
+    })
+}
+
+/// Canonical form of the platform temporary directory.
+fn canonical_temporary_root() -> PathBuf {
+    let root = std::env::temp_dir();
+    std::fs::canonicalize(&root).unwrap_or_else(|error| {
+        panic!("canonical temporary root {}: {error}", root.display());
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_paths_survive_canonicalization_unchanged() {
+        let fixture = canonical_tempdir("canonicalization fixture");
+        let nested = fixture.path().join("album");
+        std::fs::create_dir(&nested).expect("nested fixture directory");
+
+        assert_eq!(
+            std::fs::canonicalize(fixture.path()).expect("canonical fixture root"),
+            fixture.path()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&nested).expect("canonical nested directory"),
+            nested
+        );
+    }
+}
