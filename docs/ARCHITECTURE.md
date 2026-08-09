@@ -724,6 +724,17 @@ Thumbnail support is a separate feature and runtime capability:
   from background prefetch;
 - cache has byte and entry limits and can be disabled.
 
+Finding a local file's cover is a separate capability from rendering one, and
+it belongs to the reducer rather than to a renderer: a picture embedded in the
+media file is extracted under bounded tag limits into the private artwork cache
+under an opaque hashed name, and an image beside the file — the sidecar
+`yt-dlp --write-thumbnail` writes, or a folder cover — is published where it
+lies. Both are identified by their leading bytes and neither is decoded there,
+so the same discovery serves a terminal that renders through `ratatui-image`
+and a window that renders through a web view. A build with `local-artwork` and
+without `images` performs the discovery and links no renderer and no HTTP
+client.
+
 Mouse regions are derived from the same layout rectangles used to render
 widgets, avoiding invisible or stale click targets. Every mouse action has a
 keyboard equivalent. Buttons can include their hotkey, and `?` opens the

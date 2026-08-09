@@ -22,6 +22,11 @@ serde = { version = "1.0", features = ["derive"] }
 url = "2.5"
 serde_json = "1.0"
 tauri = { version = "2", features = [] }
+# The platform clipboard, used from Rust on the reducer thread rather than from
+# the web view: a copy is decided by the controller, so nothing is gained by
+# routing the text out to JavaScript and back, and the window's capability list
+# stays as small as it is.
+tauri-plugin-clipboard-manager = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

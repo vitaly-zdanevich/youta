@@ -863,6 +863,42 @@ pub enum PrivateNoteCursorMotion {
     End,
 }
 
+/// One entry of the playback queue, as a front-end should present it.
+///
+/// This is deliberately a projection rather than a borrow of
+/// [`crate::domain::QueueItem`]: that type carries `playback_location`, which
+/// for several providers is a signed, short-lived media URL. A signed URL must
+/// not reach durable state, diagnostics, or — since the desktop window renders
+/// this view — another process. Queue actions therefore address entries by
+/// position, and the location never leaves the controller.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueueRowView {
+    /// Stable media identity, for correlating with the playing item.
+    pub media_id: MediaId,
+    /// Primary label.
+    pub title: String,
+    /// Channel, artist, author, or station name.
+    pub subtitle: String,
+    /// Preformatted running time, or an empty string when the provider has none.
+    ///
+    /// The provider is named by [`Self::media_id`] rather than repeated here,
+    /// so no front-end has to keep its own copy of the source-label mapping.
+    pub length: String,
+}
+
+/// The playback queue and its cursor.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct QueuePopupView {
+    /// Ordered entries, in play order.
+    pub items: Vec<QueueRowView>,
+    /// Entry the cursor is on, or `None` once the queue has been exhausted.
+    pub current: Option<usize>,
+    /// Highlighted row, which starts on the current entry.
+    pub selected: usize,
+    /// Whether the current entry repeats instead of advancing.
+    pub repeat_one: bool,
+}
+
 /// One local playlist shown in the membership chooser.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PlaylistChoiceView {
@@ -1544,6 +1580,8 @@ pub struct ViewModel {
     pub preferences_popup: Option<PreferencesPopupView>,
     /// Focused local-playlist chooser or create/edit form.
     pub playlist_popup: Option<PlaylistPopupView>,
+    /// Focused playback-queue list.
+    pub queue_popup: Option<QueuePopupView>,
     /// Focused private-note editor.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -1661,6 +1699,7 @@ impl Default for ViewModel {
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
+            queue_popup: None,
             private_note_popup: None,
             private_note_available: false,
             yandex_music_actions: YandexMusicActionsView::default(),
@@ -1935,8 +1974,20 @@ pub enum UiAction {
     RequestPrivateNoteDelete,
     /// Close the private-note editor without saving.
     DismissPrivateNotePopup,
-    /// Open equalizer controls.
-    OpenEqualizer,
+    /// Open the playback queue.
+    OpenQueuePopup,
+    /// Move the queue selection by a signed row count.
+    MoveQueuePopupSelection(i32),
+    /// Select one exact queue row without playing it.
+    SelectQueuePopupRow(usize),
+    /// Move the queue cursor to one exact row and start playing it.
+    ActivateQueuePopupRow(usize),
+    /// Drop one exact queue row.
+    RemoveQueuePopupRow(usize),
+    /// Drop every queue entry that has not started playing.
+    ClearQueue,
+    /// Close the playback queue.
+    DismissQueuePopup,
     /// Close the diagnostic error popup without changing the underlying screen.
     DismissErrorPopup,
     /// Open public top-level comments for the selected YouTube video.
@@ -2083,6 +2134,35 @@ impl UiAction {
     }
 }
 
+/// What one clipboard copy was about, so the controller can report it.
+///
+/// The wording stays in the controller because both front-ends show the same
+/// status line; only the transport differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardSubject {
+    /// The canonical link of the selected item.
+    Link,
+    /// A range of Details text, measured in Unicode scalar values.
+    DetailsText(usize),
+}
+
+/// Text the controller decided to copy but deliberately does not copy itself.
+///
+/// The clipboard belongs to the front-end. A terminal reaches it through a
+/// native helper or an OSC 52 escape written to its own tty; a desktop window
+/// has the platform clipboard directly and has no tty to write an escape into,
+/// so an escape there would be written into nothing and reported as success.
+/// Routing every copy through this seam puts the choice where the knowledge is
+/// and keeps the reducer free of platform code — the same split
+/// [`TextFileOpenPlan`] already uses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardRequest {
+    /// Exact text to place on the clipboard.
+    pub text: String,
+    /// What was copied, used only to compose the status line.
+    pub subject: ClipboardSubject,
+}
+
 /// Controller used by the generic terminal event loop.
 pub trait UiController {
     /// Returns the view for the next frame.
@@ -2093,6 +2173,14 @@ pub trait UiController {
 
     /// Polls background workers and playback state.
     fn tick(&mut self);
+
+    /// Takes one copy the front-end must place on the platform clipboard.
+    fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        None
+    }
+
+    /// Reports the transport that accepted the copy, or why none did.
+    fn report_clipboard_result(&mut self, _result: Result<String, String>) {}
 
     /// Takes one text-file command after an activation action planned it.
     #[cfg(feature = "local-browser")]

@@ -194,21 +194,21 @@ use crate::view::RadioRecordingView;
 use crate::view::RadioSort;
 #[cfg(feature = "qr")]
 use crate::view::VideoQrPopupView;
+use crate::view::{
+    ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
+    DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
+    GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort,
+    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField,
+    PlaylistItemView, PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView,
+    PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView,
+    ProjectHistoryRemoteState, QueuePopupView, QueueRowView, RightPanelMode, RowView,
+    RssSubscriptionPopupView, Screen, SearchActivity, SearchKind, SubscriptionPane,
+    SubscriptionRoute, UiAction, UiController, VideoCommentView, VideoCommentsPopupState,
+    VideoCommentsPopupView, ViewModel, WaveformView, YANDEX_OAUTH_GUIDE_URL,
+    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
+};
 #[cfg(feature = "yandex-music")]
 use crate::view::{DetailLinkInternalTarget, DetailLinkPresentation};
-use crate::view::{
-    DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
-    DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
-    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
-    MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView,
-    PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
-    PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState,
-    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
-    SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
-    VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
-    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
-};
 #[cfg(feature = "wikidata")]
 use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
@@ -1403,11 +1403,21 @@ struct LocalFolderSizeWorkerResult {
     reused: bool,
 }
 
+/// Whether this build can draw a midpoint frame for a local video.
+///
+/// Extraction and rendering are separate capabilities: a window links the
+/// extractor's crate but draws no frames, so a video there falls back to the
+/// artwork inside or beside the file rather than showing nothing at all.
+#[cfg(feature = "local-artwork")]
+const LOCAL_VIDEO_FRAMES_RENDERED: bool =
+    cfg!(all(feature = "local-video-thumbnails", feature = "images"));
+
 /// Lazy artwork lookup selected for one Local Details target.
-#[cfg(all(feature = "local-artwork", feature = "images"))]
+#[cfg(feature = "local-artwork")]
 #[derive(Clone, Copy)]
 enum LocalArtworkKind {
-    /// Extracts bounded embedded artwork from a playable media file.
+    /// Extracts bounded embedded artwork from a playable media file, or finds
+    /// the image a downloader left beside it.
     EmbeddedMedia,
     /// Discovers a conventional cover file without opening image contents.
     FolderCover,
@@ -1949,7 +1959,7 @@ enum ProviderRequest {
         generation: u64,
         root: PathBuf,
     },
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -1977,6 +1987,13 @@ enum ProviderRequest {
         generation: u64,
         station_id: String,
         endpoint: RadioNowPlayingEndpoint,
+    },
+    /// Resolve the selected station's logotype through its Wikidata item.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    RadioArtwork {
+        generation: u64,
+        station_id: String,
+        item_ids: Vec<String>,
     },
     #[cfg(feature = "bbc-radio")]
     ResolveBbcLive {
@@ -2289,7 +2306,7 @@ enum ProviderResponse {
         root: PathBuf,
         result: Result<Vec<LocalMediaItem>, String>,
     },
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -2317,6 +2334,12 @@ enum ProviderResponse {
         generation: u64,
         station_id: String,
         result: Result<RadioNowPlaying, String>,
+    },
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    RadioArtwork {
+        generation: u64,
+        station_id: String,
+        artwork: Option<url::Url>,
     },
     #[cfg(feature = "bbc-radio")]
     BbcLive {
@@ -2918,8 +2941,14 @@ const MAX_LAZY_LOCAL_FOLDER_SIZES: usize = 256;
 /// Maximum completed directory sizes retained across Local navigation.
 const MAX_CACHED_LOCAL_FOLDER_SIZES: usize = 512;
 /// Maximum positive or negative embedded-artwork lookups retained in RAM.
-#[cfg(all(feature = "local-artwork", feature = "images"))]
+#[cfg(feature = "local-artwork")]
 const MAX_CACHED_LOCAL_ARTWORK: usize = 256;
+/// Maximum positive or negative station logotypes retained in RAM.
+///
+/// The curated catalogue is a few hundred stations, so this holds effectively
+/// all of them for a session and the bound exists only to stay finite.
+#[cfg(all(feature = "radio", feature = "wikidata"))]
+const MAX_CACHED_RADIO_ARTWORK: usize = 1_024;
 /// Maximum time a traversal can be reused when nested changes may be invisible.
 const LOCAL_FOLDER_SIZE_CACHE_TTL: Duration = Duration::from_mins(1);
 /// Retry delay for inaccessible or resource-limited directory trees.
@@ -3538,6 +3567,10 @@ pub struct AppController {
     /// One selected text-file command awaiting safe TUI lifecycle handling.
     #[cfg(feature = "local-browser")]
     pending_text_file_open: Option<TextFileOpenPlan>,
+    /// One copy awaiting the front-end that owns the platform clipboard.
+    pending_clipboard_request: Option<ClipboardRequest>,
+    /// Subject of the copy a front-end has taken but not yet reported on.
+    awaiting_clipboard_subject: Option<ClipboardSubject>,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -3686,17 +3719,30 @@ pub struct AppController {
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
     local_move_journal_pending: bool,
     /// Monotonic owner for the sole embedded-artwork extraction request.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_generation: u64,
     /// Media path currently being inspected by the provider worker.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     pending_local_artwork: Option<(u64, PathBuf)>,
     /// Process-local positive and negative artwork results by exact path.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_cache: HashMap<PathBuf, Option<url::Url>>,
     /// Insertion order bounding the process-local artwork result cache.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_cache_order: VecDeque<PathBuf>,
+    /// Monotonic owner for the sole station-logotype lookup.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    radio_artwork_generation: u64,
+    /// Station whose logotype the provider worker is resolving.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    pending_radio_artwork: Option<(u64, String)>,
+    /// Process-local positive and negative logotype results by station ID.
+    ///
+    /// A station that has no image is remembered as `None`, because the whole
+    /// catalogue is compiled in and re-asking Wikidata every time the selection
+    /// passes over the same station would be a request per keystroke.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    radio_artwork_cache: HashMap<String, Option<url::Url>>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
     /// Current OPML leaves in stable folder order.
@@ -4542,6 +4588,8 @@ impl AppController {
             local_listing: None,
             #[cfg(feature = "local-browser")]
             pending_text_file_open: None,
+            pending_clipboard_request: None,
+            awaiting_clipboard_subject: None,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
@@ -4634,14 +4682,20 @@ impl AppController {
             local_move_persistence_failure: None,
             #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_journal_pending,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_generation: 0,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             pending_local_artwork: None,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_cache: HashMap::new(),
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_cache_order: VecDeque::new(),
+            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            radio_artwork_generation: 0,
+            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            pending_radio_artwork: None,
+            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            radio_artwork_cache: HashMap::new(),
             tracker_results: Vec::new(),
             subscription_tree,
             subscription_entries: Vec::new(),
@@ -10516,7 +10570,7 @@ impl AppController {
                     }
                 }
             }
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             ProviderResponse::LocalArtwork {
                 generation,
                 path,
@@ -10690,6 +10744,12 @@ impl AppController {
                 station_id,
                 result,
             } => self.handle_radio_now_playing(generation, station_id, result),
+            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            ProviderResponse::RadioArtwork {
+                generation,
+                station_id,
+                artwork,
+            } => self.handle_radio_artwork(generation, station_id, artwork),
             #[cfg(feature = "bbc-radio")]
             ProviderResponse::BbcLive {
                 generation,
@@ -11490,7 +11550,7 @@ impl AppController {
     }
 
     /// Starts one lazy artwork lookup for selected Local media or a folder.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn request_selected_local_artwork(&mut self) {
         let selected = if self.view.screen == Screen::Local {
             self.local_entry_index()
@@ -11503,10 +11563,8 @@ impl AppController {
                     | crate::local_browser::LocalEntryKind::TrackerModule => {
                         Some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
                     }
-                    crate::local_browser::LocalEntryKind::Video => {
-                        (!cfg!(feature = "local-video-thumbnails"))
-                            .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
-                    }
+                    crate::local_browser::LocalEntryKind::Video => (!LOCAL_VIDEO_FRAMES_RENDERED)
+                        .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia)),
                     crate::local_browser::LocalEntryKind::Image
                     | crate::local_browser::LocalEntryKind::Text
                     | crate::local_browser::LocalEntryKind::Other => None,
@@ -11518,7 +11576,7 @@ impl AppController {
                 .and_then(|details| details.media_id.as_ref())
                 .and_then(local_path_from_media_id)
                 .and_then(|path| {
-                    (cfg!(not(feature = "local-video-thumbnails"))
+                    (!LOCAL_VIDEO_FRAMES_RENDERED
                         || crate::local_browser::classify_local_file(&path)
                             != Some(crate::local_browser::LocalEntryKind::Video))
                     .then_some((path, LocalArtworkKind::EmbeddedMedia))
@@ -11562,7 +11620,7 @@ impl AppController {
     }
 
     /// Stores one process-local artwork result with deterministic FIFO eviction.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn cache_local_artwork(&mut self, path: PathBuf, artwork: Option<url::Url>) {
         self.local_artwork_cache.insert(path.clone(), artwork);
         self.local_artwork_cache_order
@@ -11577,7 +11635,7 @@ impl AppController {
     }
 
     /// Applies a cached cover only when the same Local path still owns Details.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn apply_cached_local_artwork(&mut self, path: &Path) {
         let Some(artwork) = self.local_artwork_cache.get(path) else {
             return;
@@ -12396,7 +12454,7 @@ impl AppController {
             let first_recording = self.apply_local_fingerprint_details();
             self.request_local_fingerprint_wikidata(first_recording.as_deref());
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         self.request_selected_local_artwork();
     }
 
@@ -12603,7 +12661,7 @@ impl AppController {
                 ),
                 ..DetailView::default()
             });
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             self.request_selected_local_artwork();
         } else if self.view.screen == Screen::TrackerMusic
             && let Some(item) = self.tracker_results.get(self.view.selected)
@@ -14172,6 +14230,139 @@ impl AppController {
             self.playback_queue.push(item);
             self.view.status_line = format!("{title} added to the queue");
         }
+    }
+
+    /// Opens the queue, positioned on the entry playback is currently on.
+    fn open_queue_popup(&mut self) {
+        if self.playback_queue.items.is_empty() {
+            self.view.status_line =
+                "The queue is empty; press a to add the selected item".to_owned();
+            return;
+        }
+        let selected = self.playback_queue.current_index.unwrap_or_default();
+        self.view.queue_popup = Some(self.queue_popup_view(selected));
+    }
+
+    /// Rebuilds an open queue without moving the highlight off its entry.
+    ///
+    /// This runs once per [`Self::tick`] rather than at each of the eleven
+    /// places the queue changes, because those places include ones the user did
+    /// not touch: reaching the end of a track advances the cursor, starting
+    /// playback inserts an entry beside it, and a Local move rewrites every
+    /// identity in the queue. A missed site would not merely show a stale
+    /// list — it would show one whose row indices no longer match the indices
+    /// the next click sends back, which is worse than showing nothing.
+    ///
+    /// It costs nothing while the queue is closed, which is almost always.
+    fn refresh_open_queue_popup(&mut self) {
+        if self.view.queue_popup.is_none() {
+            return;
+        }
+        if self.playback_queue.items.is_empty() {
+            self.view.queue_popup = None;
+            return;
+        }
+        let selected = self
+            .view
+            .queue_popup
+            .as_ref()
+            .map_or(0, |popup| popup.selected)
+            .min(self.playback_queue.items.len().saturating_sub(1));
+        self.view.queue_popup = Some(self.queue_popup_view(selected));
+    }
+
+    /// Projects the queue into the credential-free rows a front-end may hold.
+    fn queue_popup_view(&self, selected: usize) -> QueuePopupView {
+        QueuePopupView {
+            items: self
+                .playback_queue
+                .items
+                .iter()
+                .map(|item| QueueRowView {
+                    media_id: item.media.id.clone(),
+                    title: item.media.title.clone(),
+                    subtitle: item.media.creator.clone().unwrap_or_default(),
+                    length: item
+                        .media
+                        .duration_seconds
+                        .map(format_seconds)
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            current: self.playback_queue.current_index,
+            selected,
+            repeat_one: self.playback_queue.repeat_one,
+        }
+    }
+
+    /// Moves the queue cursor to one exact entry and starts it.
+    fn activate_queue_row(&mut self, row: usize) {
+        let Some(item) = self.playback_queue.items.get(row).cloned() else {
+            return;
+        };
+        self.playback_queue.current_index = Some(row);
+        // The cursor is already where this item lives, so the playback path
+        // must not insert a second copy of it beside itself.
+        self.play_queue_item(item, true);
+    }
+
+    /// Drops one entry, keeping the cursor on the item that is still playing.
+    fn remove_queue_row(&mut self, row: usize) {
+        if row >= self.playback_queue.items.len() {
+            return;
+        }
+        if self.playback_queue.current_index == Some(row) {
+            self.view.status_line =
+                "Stop the current item before removing it from the queue".to_owned();
+            return;
+        }
+        let removed = self.playback_queue.items.remove(row);
+        // Entries before the cursor shift, so the cursor shifts with them.
+        // Without this, removing an earlier entry would silently repoint the
+        // cursor at the wrong item and the next EOF would skip a track.
+        if let Some(current) = self.playback_queue.current_index
+            && current > row
+        {
+            self.playback_queue.current_index = Some(current.saturating_sub(1));
+        }
+        self.view.status_line = format!("Removed {} from the queue", removed.media.title);
+    }
+
+    /// Drops every entry except the one playback is on.
+    fn clear_queue(&mut self) {
+        let retained = self
+            .playback_queue
+            .current_index
+            .and_then(|index| self.playback_queue.items.get(index).cloned());
+        let removed = self
+            .playback_queue
+            .items
+            .len()
+            .saturating_sub(usize::from(retained.is_some()));
+        match retained {
+            Some(item) => {
+                self.playback_queue.items = vec![item];
+                self.playback_queue.current_index = Some(0);
+            }
+            None => {
+                self.playback_queue.items.clear();
+                self.playback_queue.current_index = None;
+            }
+        }
+        self.view.status_line = match removed {
+            0 => "The queue held nothing to clear".to_owned(),
+            1 => "Cleared one queued item".to_owned(),
+            count => format!("Cleared {count} queued items"),
+        };
+    }
+
+    /// Hands one copy to the front-end that owns the platform clipboard.
+    fn request_clipboard_copy(&mut self, text: String, subject: ClipboardSubject) {
+        self.pending_clipboard_request = Some(ClipboardRequest { text, subject });
+        self.view.status_line = match subject {
+            ClipboardSubject::Link => "Copying the link…".to_owned(),
+            ClipboardSubject::DetailsText(count) => format!("Copying {count} characters…"),
+        };
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -19571,6 +19762,10 @@ impl AppController {
             .collect();
         #[cfg(not(feature = "wikidata"))]
         let links = Vec::new();
+        #[cfg(feature = "wikidata")]
+        let thumbnail_url = self.radio_artwork_cache.get(station.id).cloned().flatten();
+        #[cfg(not(feature = "wikidata"))]
+        let thumbnail_url = None;
         let mut details = DetailView {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
             title: station.name.to_owned(),
@@ -19579,10 +19774,80 @@ impl AppController {
             description,
             radio_favorite: self.radio_favorite_station_ids.contains(station.id),
             links,
+            thumbnail_url,
             ..DetailView::default()
         };
         preserve_same_media_wikidata_state(self.view.details.as_ref(), &mut details);
         self.view.details = Some(details);
+        #[cfg(feature = "wikidata")]
+        self.request_selected_radio_artwork(station.id);
+    }
+
+    /// Starts one lazy logotype lookup for the selected Radio station.
+    ///
+    /// Only a station Youta has already matched to a Wikidata item is asked
+    /// about, and each answer — including "this station has no image" — is
+    /// remembered, so moving through the catalogue costs at most one request per
+    /// station rather than one per selection. A single request is in flight at a
+    /// time: the catalogue filters as the user types, and a lookup per keystroke
+    /// would be a burst of traffic for artwork nobody has looked at yet.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    fn request_selected_radio_artwork(&mut self, station_id: &str) {
+        if self.radio_artwork_cache.contains_key(station_id) || self.pending_radio_artwork.is_some()
+        {
+            return;
+        }
+        let item_ids = wikidata_item_ids_for_station(station_id);
+        if item_ids.is_empty() {
+            return;
+        }
+        let Some(sender) = self.provider_requests.as_ref() else {
+            return;
+        };
+        self.radio_artwork_generation = self.radio_artwork_generation.wrapping_add(1);
+        let generation = self.radio_artwork_generation;
+        let request = ProviderRequest::RadioArtwork {
+            generation,
+            station_id: station_id.to_owned(),
+            item_ids: item_ids.iter().map(|item| (*item).to_owned()).collect(),
+        };
+        if sender.send(request).is_ok() {
+            self.pending_radio_artwork = Some((generation, station_id.to_owned()));
+        }
+    }
+
+    /// Applies one station logotype, or remembers that the station has none.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    fn handle_radio_artwork(
+        &mut self,
+        generation: u64,
+        station_id: String,
+        artwork: Option<url::Url>,
+    ) {
+        if self.pending_radio_artwork.as_ref() != Some(&(generation, station_id.clone())) {
+            return;
+        }
+        self.pending_radio_artwork = None;
+        if self.radio_artwork_cache.len() >= MAX_CACHED_RADIO_ARTWORK {
+            self.radio_artwork_cache.clear();
+        }
+        self.radio_artwork_cache
+            .insert(station_id.clone(), artwork.clone());
+        // The selection may have moved on while the lookup was in flight, and a
+        // logotype belongs to exactly one station.
+        let selected = self.selected_radio_station().map(|station| station.id);
+        if selected == Some(station_id.as_str())
+            && let Some(details) = self.view.details.as_mut()
+        {
+            details.thumbnail_url = artwork;
+        }
+        // Only one lookup runs at a time, so every station passed over while
+        // this one was in flight was refused its own. The station actually on
+        // screen now asks again, which is what makes moving quickly through the
+        // catalogue converge instead of leaving a gap.
+        if let Some(selected) = selected {
+            self.request_selected_radio_artwork(selected);
+        }
     }
 
     /// Selects at most one station whose passive metadata may be refreshed.
@@ -21304,7 +21569,7 @@ impl AppController {
         if metadata_pending {
             self.request_local_media_metadata(path);
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         self.request_selected_local_artwork();
     }
 
@@ -23133,7 +23398,7 @@ impl AppController {
         {
             self.local_folder_size_pending = None;
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         {
             self.local_artwork_cache.retain(|path, _| !affected(path));
             self.local_artwork_cache_order
@@ -24378,13 +24643,8 @@ impl UiController for AppController {
                 if text.is_empty() {
                     self.view.status_line = "No Details text selected".to_owned();
                 } else {
-                    let character_count = text.chars().count();
-                    self.view.status_line = match self.report_actions.copy_report(&text) {
-                        Ok(transport) => {
-                            format!("Copied {character_count} characters with {transport}")
-                        }
-                        Err(error) => format!("Could not copy Details text: {error}"),
-                    };
+                    let subject = ClipboardSubject::DetailsText(text.chars().count());
+                    self.request_clipboard_copy(text, subject);
                 }
             }
             UiAction::ToggleSubscription => {
@@ -24486,12 +24746,10 @@ impl UiController for AppController {
             UiAction::GoForward => self.go_forward(),
             UiAction::OpenInBrowser => self.open_current_in_browser(),
             UiAction::OpenChannelInBrowser => self.open_current_channel_in_browser(),
-            UiAction::CopyLink => {
-                self.view.status_line = self.current_url().map_or_else(
-                    || "No link is selected".to_owned(),
-                    |url| format!("Link: {url}"),
-                );
-            }
+            UiAction::CopyLink => match self.current_url() {
+                Some(url) => self.request_clipboard_copy(url, ClipboardSubject::Link),
+                None => self.view.status_line = "No link is selected".to_owned(),
+            },
             UiAction::PlayNext => self.queue_selected(true),
             UiAction::AddToQueue => self.queue_selected(false),
             UiAction::ToggleTodoPlaylist => self.toggle_selected_todo(),
@@ -24558,10 +24816,28 @@ impl UiController for AppController {
             UiAction::SavePrivateNote => self.save_private_note(),
             UiAction::RequestPrivateNoteDelete => self.request_private_note_delete(),
             UiAction::DismissPrivateNotePopup => self.dismiss_private_note_popup(),
-            UiAction::OpenEqualizer => {
-                self.view.status_line =
-                    "Equalizer is disabled in direct audiophile mode".to_owned();
+            UiAction::OpenQueuePopup => self.open_queue_popup(),
+            UiAction::MoveQueuePopupSelection(delta) => {
+                if let Some(popup) = self.view.queue_popup.as_mut()
+                    && let Some(selected) = moved_index(popup.selected, popup.items.len(), delta)
+                {
+                    popup.selected = selected;
+                }
             }
+            UiAction::SelectQueuePopupRow(row) => {
+                if let Some(popup) = self
+                    .view
+                    .queue_popup
+                    .as_mut()
+                    .filter(|popup| row < popup.items.len())
+                {
+                    popup.selected = row;
+                }
+            }
+            UiAction::ActivateQueuePopupRow(row) => self.activate_queue_row(row),
+            UiAction::RemoveQueuePopupRow(row) => self.remove_queue_row(row),
+            UiAction::ClearQueue => self.clear_queue(),
+            UiAction::DismissQueuePopup => self.view.queue_popup = None,
             UiAction::DismissErrorPopup => {
                 self.view.error_popup = None;
                 if self.quit_on_error_dismiss {
@@ -24743,6 +25019,29 @@ impl UiController for AppController {
         }
     }
 
+    fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        let request = self.pending_clipboard_request.take()?;
+        // The subject stays here rather than travelling out and back: the
+        // front-end reports only what its clipboard did, and a subject that
+        // made a round trip through another process could come back changed.
+        self.awaiting_clipboard_subject = Some(request.subject);
+        Some(request)
+    }
+
+    fn report_clipboard_result(&mut self, result: Result<String, String>) {
+        let subject = self.awaiting_clipboard_subject.take();
+        self.view.status_line = match (result, subject) {
+            (Ok(transport), Some(ClipboardSubject::DetailsText(count))) => {
+                format!("Copied {count} characters with {transport}")
+            }
+            (Ok(transport), _) => format!("Copied the link with {transport}"),
+            (Err(error), Some(ClipboardSubject::DetailsText(_))) => {
+                format!("Could not copy Details text: {error}")
+            }
+            (Err(error), _) => format!("Could not copy the link: {error}"),
+        };
+    }
+
     #[cfg(feature = "local-browser")]
     fn take_text_file_open_plan(&mut self) -> Option<TextFileOpenPlan> {
         self.pending_text_file_open.take()
@@ -24766,6 +25065,7 @@ impl UiController for AppController {
         if self.diagnostic_only {
             return;
         }
+        self.refresh_open_queue_popup();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
         #[cfg(feature = "yandex-music")]
@@ -26827,7 +27127,7 @@ fn provider_worker(
                     break;
                 }
             }
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             ProviderRequest::LocalArtwork {
                 generation,
                 path,
@@ -26836,7 +27136,7 @@ fn provider_worker(
             } => {
                 let result = match kind {
                     LocalArtworkKind::EmbeddedMedia => {
-                        crate::thumbnails::cached_local_artwork(&path, &cache_directory)
+                        crate::local_artwork::local_media_artwork(&path, &cache_directory)
                             .map_err(|error| error.to_string())
                     }
                     LocalArtworkKind::FolderCover => {
@@ -26955,6 +27255,29 @@ fn provider_worker(
                         generation,
                         station_id,
                         result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            ProviderRequest::RadioArtwork {
+                generation,
+                station_id,
+                item_ids,
+            } => {
+                // A station may legitimately map to more than one item, and a
+                // failed lookup is not worth reporting: artwork is decoration,
+                // so the station simply stays without a logotype.
+                let artwork = item_ids
+                    .iter()
+                    .find_map(|item_id| wikidata.item_artwork(item_id).ok().flatten());
+                if responses
+                    .send(ProviderResponse::RadioArtwork {
+                        generation,
+                        station_id,
+                        artwork,
                     })
                     .is_err()
                 {
@@ -34909,6 +35232,44 @@ mod tests {
         controller.view.selected = index;
         controller.update_radio_detail();
         index
+    }
+
+    /// Receives the next provider request that is not a station logotype.
+    ///
+    /// Opening Radio or moving to another station starts one bounded, cached
+    /// Wikidata artwork lookup. That is deliberate, and it is not what these
+    /// tests are about.
+    #[cfg(feature = "radio")]
+    fn next_request_ignoring_radio_artwork(
+        captured: &crossbeam_channel::Receiver<ProviderRequest>,
+    ) -> Option<ProviderRequest> {
+        loop {
+            match captured.recv_timeout(Duration::from_secs(1)) {
+                #[cfg(feature = "wikidata")]
+                Ok(ProviderRequest::RadioArtwork { .. }) => {}
+                Ok(request) => return Some(request),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Answers the logotype lookup that opening Radio starts for its first row.
+    ///
+    /// One lookup runs at a time, so a test that wants to observe the request
+    /// for a station it selects has to let the initial one finish first.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    fn settle_initial_radio_artwork(
+        controller: &mut AppController,
+        captured: &crossbeam_channel::Receiver<ProviderRequest>,
+    ) {
+        if let Ok(ProviderRequest::RadioArtwork {
+            generation,
+            station_id,
+            ..
+        }) = captured.try_recv()
+        {
+            controller.handle_radio_artwork(generation, station_id, None);
+        }
     }
 
     #[test]
@@ -43887,7 +44248,7 @@ mod tests {
         assert!(rehydrated.playback_started);
     }
 
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     #[test]
     fn local_artwork_worker_response_updates_only_the_matching_details_path() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -44145,6 +44506,69 @@ mod tests {
             })
         );
         assert!(controller.pending_local_media_metadata.is_none());
+    }
+
+    /// A download carries no embedded picture: `yt-dlp` writes the thumbnail
+    /// beside it. Selecting one therefore has to ask for artwork, and the
+    /// answer has to reach Details, or the Downloaded screen shows covers for
+    /// nothing at all.
+    #[cfg(feature = "local-artwork")]
+    #[test]
+    fn a_downloaded_file_shows_the_thumbnail_written_beside_it() {
+        let fixture = tempfile::tempdir().expect("temporary downloads fixture");
+        let media_path = fixture.path().join("Popular Monster [ydK1vjQBvp0].opus");
+        let sidecar = fixture.path().join("Popular Monster [ydK1vjQBvp0].webp");
+        std::fs::write(&media_path, b"mock downloaded audio").expect("write media fixture");
+        std::fs::write(&sidecar, b"RIFF\0\0\0\0WEBPVP8 body").expect("write sidecar fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.screen = Screen::Downloaded;
+        controller.view.rows = vec![RowView {
+            media_id: Some(MediaId::new(
+                SourceKind::Local,
+                media_path.display().to_string(),
+            )),
+            title: "Popular Monster".to_owned(),
+            ..RowView::default()
+        }];
+
+        controller.update_downloaded_detail();
+
+        let ProviderRequest::LocalArtwork {
+            generation,
+            path,
+            cache_directory,
+            kind,
+        } = captured.try_recv().expect("downloaded artwork request")
+        else {
+            panic!("expected a Local artwork request");
+        };
+        assert_eq!(path, media_path);
+        assert!(matches!(kind, LocalArtworkKind::EmbeddedMedia));
+
+        // The worker runs the same discovery the provider thread would.
+        let artwork = crate::local_artwork::local_media_artwork(&path, &cache_directory)
+            .expect("discover downloaded artwork");
+        assert_eq!(
+            artwork.as_ref().and_then(|url| url.to_file_path().ok()),
+            Some(sidecar),
+            "the sidecar thumbnail is the cover a download actually has"
+        );
+        controller.handle_provider_response(ProviderResponse::LocalArtwork {
+            generation,
+            path,
+            result: Ok(artwork.clone()),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.clone()),
+            artwork
+        );
     }
 
     #[test]
@@ -47371,7 +47795,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     #[test]
     fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
         let fixture = tempfile::tempdir().expect("temporary Local folder");
@@ -50393,8 +50817,15 @@ mod tests {
         assert!(controller.view.status_line.contains("No Details text"));
     }
 
+    /// A finished drag hands bounded text to the front-end's clipboard.
+    ///
+    /// The controller does not copy: it produces a request and composes the
+    /// status line from whatever transport the front-end reports back. What has
+    /// to stay true here is the bound — a runaway drag must not hand an
+    /// unbounded payload across that seam, and the payload must stay valid
+    /// UTF-8 when it is cut.
     #[test]
-    fn finished_details_selection_uses_injectable_bounded_clipboard_action() {
+    fn finished_details_selection_hands_bounded_text_to_the_front_end() {
         let (mut controller, _) =
             controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
         controller.view.details = Some(DetailView {
@@ -50402,11 +50833,6 @@ mod tests {
             ..DetailView::default()
         });
         controller.view.text_selection_mode = true;
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        controller.report_actions = Box::new(MockDiagnosticActions {
-            calls: Arc::clone(&calls),
-            gh_available: false,
-        });
         let anchor = crate::view::DetailsTextPosition { row: 0, column: 0 };
         let focus = crate::view::DetailsTextPosition { row: 1, column: 3 };
 
@@ -50417,10 +50843,11 @@ mod tests {
             text: "Title\nmeta".to_owned(),
         });
 
-        assert_eq!(
-            calls.lock().expect("clipboard calls").as_slice(),
-            [DiagnosticCall::Copy("Title\nmeta".to_owned())]
-        );
+        let request = controller
+            .take_clipboard_request()
+            .expect("a finished selection asks the front-end to copy");
+        assert_eq!(request.text, "Title\nmeta");
+        assert_eq!(request.subject, ClipboardSubject::DetailsText(10));
         assert_eq!(
             controller.view.details_text_selection,
             Some(DetailsTextSelection {
@@ -50429,19 +50856,185 @@ mod tests {
                 dragging: false,
             })
         );
-        assert!(controller.view.status_line.contains("mock clipboard"));
+        controller.report_clipboard_result(Ok("mock clipboard".to_owned()));
+        assert_eq!(
+            controller.view.status_line,
+            "Copied 10 characters with mock clipboard"
+        );
 
         controller.dispatch(UiAction::BeginDetailsTextSelection(anchor));
         controller.dispatch(UiAction::FinishDetailsTextSelection {
             focus,
             text: "é".repeat(MAX_DETAILS_SELECTION_BYTES),
         });
-        let calls = calls.lock().expect("bounded clipboard calls");
-        let DiagnosticCall::Copy(bounded) = calls.last().expect("second clipboard call") else {
-            panic!("unexpected diagnostic action")
-        };
+        let bounded = controller
+            .take_clipboard_request()
+            .expect("the second selection also asks to copy")
+            .text;
         assert!(bounded.len() <= MAX_DETAILS_SELECTION_BYTES);
         assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    /// The queue must be visible, and it must never carry a playable location.
+    ///
+    /// `QueueItem::playback_location` is a signed, short-lived media URL for
+    /// several providers. The desktop window renders this projection in another
+    /// process, so a location that leaked into it would be a credential leaving
+    /// the controller — the same boundary `src/diagnostics.rs` guards.
+    #[test]
+    fn the_queue_is_shown_without_exposing_any_playable_location() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.dispatch(UiAction::OpenQueuePopup);
+        assert!(
+            controller.view.queue_popup.is_none(),
+            "an empty queue opens nothing"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "The queue is empty; press a to add the selected item"
+        );
+
+        let mut first = fixture_direct_item("signed-first");
+        first.media.creator = Some("A Creator".to_owned());
+        first.media.duration_seconds = Some(125);
+        // The identity and the playable location are deliberately different
+        // here, as they are for every provider that signs its media URLs. A
+        // direct remote file is the one case where they are the same string,
+        // and using that fixture would make this assertion unprovable.
+        first.media.id = MediaId::new(SourceKind::RemoteFiles, "opaque-identity-42");
+        first.playback_location =
+            "https://cdn.example/opaque-identity-42?sig=SIGNATURE_THAT_MUST_STAY_HERE".to_owned();
+        let location = first.playback_location.clone();
+        controller.playback_queue.push(first);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("signed-second"));
+
+        controller.dispatch(UiAction::OpenQueuePopup);
+        let popup = controller
+            .view
+            .queue_popup
+            .clone()
+            .expect("the queue opens");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.current, Some(0));
+        assert_eq!(popup.selected, 0, "the highlight starts on what is playing");
+        assert_eq!(popup.items[0].title, "signed-first");
+        assert_eq!(popup.items[0].subtitle, "A Creator");
+        assert_eq!(popup.items[0].length, "2:05");
+        assert_eq!(
+            popup.items[1].length, "",
+            "an unknown running time is empty rather than invented"
+        );
+
+        let published = serde_json::to_string(&controller.view).expect("encode the snapshot");
+        assert!(
+            !published.contains(&location),
+            "the playable location must not reach a front-end"
+        );
+    }
+
+    /// Removing an entry must move the cursor with it.
+    ///
+    /// Without that, dropping an earlier entry silently repoints the cursor at
+    /// its neighbour and the next end-of-file skips a track.
+    #[test]
+    fn removing_a_queue_entry_keeps_the_cursor_on_the_same_item() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        for name in ["first", "second", "third"] {
+            controller.playback_queue.push(fixture_direct_item(name));
+        }
+        controller.playback_queue.current_index = Some(2);
+        controller.dispatch(UiAction::OpenQueuePopup);
+
+        controller.dispatch(UiAction::RemoveQueuePopupRow(0));
+        controller.tick();
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        let popup = controller.view.queue_popup.clone().expect("still open");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.items[1].title, "third");
+        assert_eq!(popup.current, Some(1));
+
+        // The playing entry is refused rather than removed, because dropping it
+        // would leave the queue describing something other than what is playing.
+        controller.dispatch(UiAction::RemoveQueuePopupRow(1));
+        assert_eq!(
+            controller.view.status_line,
+            "Stop the current item before removing it from the queue"
+        );
+        assert_eq!(controller.playback_queue.items.len(), 2);
+
+        controller.dispatch(UiAction::ClearQueue);
+        controller.tick();
+        assert_eq!(controller.playback_queue.items.len(), 1);
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.view.status_line, "Cleared one queued item",
+            "clearing keeps what is playing and says how much it dropped"
+        );
+    }
+
+    /// An index sent back by a front-end must never address a row that moved.
+    ///
+    /// The window addresses queue rows by position, so a list rebuilt only when
+    /// the user acts would go stale the moment playback advanced on its own.
+    #[test]
+    fn an_open_queue_follows_changes_the_user_did_not_make() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller
+            .playback_queue
+            .push(fixture_direct_item("playing-now"));
+        controller.dispatch(UiAction::OpenQueuePopup);
+
+        // Something other than the user changes the queue: an item starts and
+        // is recorded beside the cursor.
+        controller
+            .playback_queue
+            .begin_now(fixture_direct_item("started-elsewhere"), false);
+        controller.tick();
+
+        let popup = controller.view.queue_popup.clone().expect("still open");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.items[0].title, "started-elsewhere");
+        assert_eq!(popup.current, Some(0));
+    }
+
+    /// `y` must reach a clipboard rather than print the URL and stop.
+    ///
+    /// It printed `Link: {url}` into the status line for the whole life of the
+    /// project, which looks like a copy and is not one.
+    #[test]
+    fn copying_a_link_asks_the_front_end_and_reports_its_transport() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        // Nothing selected: no request may be produced at all, or the front-end
+        // would put an empty string on the user's clipboard.
+        controller.dispatch(UiAction::CopyLink);
+        assert!(controller.take_clipboard_request().is_none());
+        assert_eq!(controller.view.status_line, "No link is selected");
+
+        controller.active_description_video = Some(ActiveDescriptionVideo {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            start_seconds: None,
+        });
+
+        controller.dispatch(UiAction::CopyLink);
+        let request = controller
+            .take_clipboard_request()
+            .expect("a selected link is handed to the front-end");
+        assert!(request.text.contains("dQw4w9WgXcQ"), "{}", request.text);
+        assert_eq!(request.subject, ClipboardSubject::Link);
+
+        controller.report_clipboard_result(Err("no clipboard helper".to_owned()));
+        assert_eq!(
+            controller.view.status_line, "Could not copy the link: no clipboard helper",
+            "a failed copy must say so rather than look like a success"
+        );
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -53945,6 +54538,7 @@ mod tests {
         let (requests, captured_requests) = unbounded();
         controller.provider_requests = Some(requests);
         controller.show_screen(Screen::Radio);
+        settle_initial_radio_artwork(&mut controller, &captured_requests);
 
         select_radio_station(&mut controller, "kexp");
 
@@ -53958,11 +54552,17 @@ mod tests {
                 ..DetailLinkView::default()
             }]
         );
+        // The same verified QID also resolves the station's logotype, which is
+        // the one request selecting a station makes on its own.
+        assert!(matches!(
+            captured_requests.try_recv().expect("station logotype request"),
+            ProviderRequest::RadioArtwork { station_id, item_ids, .. }
+                if station_id == "kexp" && item_ids == ["Q761627"]
+        ));
         controller.dispatch(UiAction::ToggleWikidataStatements(0));
 
         assert!(matches!(
-            captured_requests
-                .recv_timeout(Duration::from_secs(1))
+            next_request_ignoring_radio_artwork(&captured_requests)
                 .expect("lazy Wikidata statement request"),
             ProviderRequest::WikidataStatements { item_id } if item_id == "Q761627"
         ));
@@ -53991,8 +54591,7 @@ mod tests {
         select_radio_station(&mut controller, "france-musique");
         controller.dispatch(UiAction::ToggleWikidataStatements(0));
         assert!(matches!(
-            captured_requests
-                .recv_timeout(Duration::from_secs(1))
+            next_request_ignoring_radio_artwork(&captured_requests)
                 .expect("explicit Wikidata request"),
             ProviderRequest::WikidataStatements { item_id } if item_id == "Q19909"
         ));
@@ -54206,9 +54805,7 @@ mod tests {
         let ProviderRequest::ResolveBbcLive {
             generation: first_generation,
             station_id,
-        } = captured_requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("BBC manifest request")
+        } = next_request_ignoring_radio_artwork(&captured_requests).expect("BBC manifest request")
         else {
             panic!("expected a BBC live request");
         };

@@ -194,7 +194,7 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
 fn renderer_free_capabilities_never_require_a_front_end() {
     let manifest = manifest();
 
-    for capability in ["remote-artwork", "qr"] {
+    for capability in ["remote-artwork", "local-artwork", "qr"] {
         let closure = feature_closure(&manifest, capability);
         for renderer in ["tui", "dep:ratatui", "dep:crossterm", "dep:ratatui-image"] {
             assert!(
@@ -210,6 +210,13 @@ fn renderer_free_capabilities_never_require_a_front_end() {
     assert!(images.contains("remote-artwork"));
     assert!(images.contains("tui"));
     assert!(images.contains("dep:ratatui-image"));
+
+    // Local covers are found by reading tags and directory entries, so that
+    // capability must not drag in the HTTP client either: a text-only local
+    // build stays offline.
+    let local_artwork = feature_closure(&manifest, "local-artwork");
+    assert!(!local_artwork.contains("network"));
+    assert!(!local_artwork.contains("dep:ureq"));
 }
 
 #[test]

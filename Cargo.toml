@@ -183,7 +183,12 @@ local-trash = ["local-browser", "dep:trash"]
 local-move = ["local-browser", "dep:rustix"]
 # Embedded and sidecar artwork discovery. Rendering additionally requires
 # `images`, so `local` remains usable in text-only builds.
-local-artwork = ["local-metadata"]
+#
+# Extraction publishes its result through the same private artwork cache as
+# `remote-artwork`, so it selects that half of `src/artwork.rs` — the hashed,
+# confined cache — without selecting the network half. A window renders these
+# covers while linking no terminal renderer at all.
+local-artwork = ["local-metadata", "dep:sha2"]
 # Lazy midpoint-frame thumbnails for local video files. Rendering additionally
 # requires `images`; extraction uses the user's existing FFmpeg executable.
 local-video-thumbnails = ["local-browser"]

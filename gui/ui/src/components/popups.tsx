@@ -16,6 +16,7 @@ import type {
   PlaylistPopupView,
   PreferencesPopupView,
   ProjectHistoryPopupView,
+  QueuePopupView,
   VideoCommentsPopupView,
   VideoQrPopupView,
 } from "../contract";
@@ -31,9 +32,10 @@ export const LAYER = {
   preferences: 3,
   localFile: 4,
   playlist: 5,
-  videoComments: 6,
-  videoQr: 7,
-  error: 8,
+  queue: 6,
+  videoComments: 7,
+  videoQr: 8,
+  error: 9,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -80,7 +82,7 @@ export function HelpPopup() {
     [
       "Actions",
       [
-        ["Ctrl+n · a", "play next · add to queue"],
+        ["Ctrl+n · a · u", "play next · add to queue · show the queue"],
         ["d · o · y", "download · open page · copy link"],
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
@@ -450,6 +452,95 @@ export function PlaylistPopup({ popup }: { popup: PlaylistPopupView }) {
 }
 
 /** Rename, Trash, and Move — the explicit filesystem mutations. */
+/**
+ * The playback queue.
+ *
+ * Youta has always kept a queue and never shown one: `a` and `Ctrl+n` fill it,
+ * and until now nothing could look at it, jump inside it, or empty it.
+ *
+ * Rows are addressed by position, not by identity, because the entry the
+ * reducer holds carries a playable location that for several providers is a
+ * signed URL — so it is never sent here. That makes the index the contract, and
+ * the reducer rebuilds this list on every tick so an index this window sends
+ * back always describes the list the reducer currently has.
+ */
+export function QueuePopup({ popup }: { popup: QueuePopupView }) {
+  const total = popup.items.length;
+  const position =
+    popup.current === null
+      ? `${total} queued · played through`
+      : `Playing ${popup.current + 1} of ${total}`;
+  return (
+    <Popup
+      title="Playback queue"
+      subtitle={popup.repeat_one ? `${position} · repeating` : position}
+      layer={LAYER.queue}
+      width="620px"
+      onDismiss={() => void dispatch("DismissQueuePopup")}
+      footer={
+        <>
+          <PopupButton
+            emphasis
+            onClick={() => void dispatch({ ActivateQueuePopupRow: popup.selected })}
+          >
+            Play from here
+          </PopupButton>
+          <PopupButton
+            disabled={popup.current === popup.selected}
+            onClick={() => void dispatch({ RemoveQueuePopupRow: popup.selected })}
+          >
+            Remove
+          </PopupButton>
+          <PopupButton onClick={() => void dispatch("ClearQueue")}>Clear</PopupButton>
+          <span>The playing entry stays; everything else is dropped.</span>
+        </>
+      }
+    >
+      <div className="h-full overflow-y-auto py-[6px]">
+        {popup.items.map((item, index) => {
+          const playing = popup.current === index;
+          const selected = popup.selected === index;
+          return (
+            <div
+              key={`${item.media_id.source}:${item.media_id.external_id}:${index}`}
+              className={`flex items-baseline gap-[8px] px-[18px] py-[5px] ${
+                selected ? "bg-line/60" : ""
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => void dispatch({ SelectQueuePopupRow: index })}
+                onDoubleClick={() => void dispatch({ ActivateQueuePopupRow: index })}
+                className="flex min-w-0 grow items-baseline gap-[8px] text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              >
+                <span
+                  aria-hidden
+                  className={`w-[10px] shrink-0 text-[11px] ${playing ? "text-accent" : "text-ink-faint"}`}
+                >
+                  {playing ? "▶" : selected ? "›" : ""}
+                </span>
+                <span
+                  className={`min-w-0 truncate text-xs ${playing ? "text-accent" : "text-ink"}`}
+                >
+                  {item.title}
+                </span>
+                {item.subtitle === "" ? null : (
+                  <span className="min-w-0 shrink truncate text-[11px] text-ink-faint">
+                    {item.subtitle}
+                  </span>
+                )}
+              </button>
+              <span className="shrink-0 text-[11px] tabular-nums text-ink-faint">
+                {item.length}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </Popup>
+  );
+}
+
 export function LocalFilePopup({ popup }: { popup: LocalFilePopupView }) {
   const dismiss = () => void dispatch("DismissLocalFilePopup");
 

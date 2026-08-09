@@ -24,7 +24,7 @@ use tauri::Manager;
 use tauri::http::{Request, Response};
 use url::Url;
 
-use youta::artwork::remote_artwork;
+use youta::artwork::{local_artwork, remote_artwork};
 use youta::config::{Config, PlaybackBackend as ConfiguredBackend};
 use youta::keymap::{KeyPress, PopupGeometry};
 use youta::playback::{AudioOutputDriver, ProcessPlaybackConfig};
@@ -187,7 +187,19 @@ fn key(
 /// the network in this process, so the provider sees Youta's guarded agent
 /// rather than a request from the web view, and every protection in
 /// [`youta::artwork`] still applies.
-fn serve_artwork(cache_directory: &Path, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+///
+/// Two kinds of source arrive here and they are trusted differently. A remote
+/// one is fetched through the guarded agent, which needs no permission because
+/// it applies its own rules to any URL. A local one names a real file — the
+/// cover extracted out of a download, or the image `yt-dlp` left beside it — and
+/// is served only when `published_local_artwork` recognizes it as something the
+/// reducer put in a snapshot. Without that question this endpoint would read any
+/// path a provider could name; see `reducer::PublishedArtwork`.
+fn serve_artwork(
+    cache_directory: &Path,
+    published_local_artwork: &dyn Fn(&Url) -> bool,
+    request: &Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
     /// Refusals are deliberately bodyless and identical, so a caller cannot use
     /// this endpoint to probe what exists.
     fn refuse(status: u16) -> Response<Vec<u8>> {
@@ -220,7 +232,16 @@ fn serve_artwork(cache_directory: &Path, request: &Request<Vec<u8>>) -> Response
         return refuse(400);
     };
 
-    match remote_artwork(cache_directory, &source) {
+    let served = if source.scheme() == "file" {
+        if !published_local_artwork(&source) {
+            return refuse(404);
+        }
+        local_artwork(&source)
+    } else {
+        remote_artwork(cache_directory, &source)
+    };
+
+    match served {
         Ok(artwork) => Response::builder()
             .status(200)
             .header("Content-Type", artwork.format.media_type())
@@ -245,8 +266,20 @@ fn main() {
     let artwork_cache: PathBuf = config.thumbnail_cache_dir();
 
     tauri::Builder::default()
-        .register_uri_scheme_protocol("youta", move |_app, request| {
-            serve_artwork(&artwork_cache, &request)
+        // Used from the reducer thread rather than from the web view, so no
+        // clipboard permission is added to the window's capability list.
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .register_uri_scheme_protocol("youta", move |app, request| {
+            // The reducer is managed by `setup`, which has run long before a
+            // page can ask for an image; an absent handle simply means no local
+            // artwork has been published, so none may be read.
+            let reducer = app.app_handle().try_state::<ReducerHandle>();
+            let published = |source: &Url| {
+                reducer
+                    .as_ref()
+                    .is_some_and(|reducer| reducer.published_local_artwork(source))
+            };
+            serve_artwork(&artwork_cache, &published, &request)
         })
         .setup(move |app| {
             app.manage(AudioOutputView::from_config(&config));
@@ -291,7 +324,8 @@ mod tests {
 
     use std::path::Path;
 
-    use tauri::http::Request;
+    use tauri::http::{Request, Response};
+    use url::Url;
 
     /// Builds a protocol request the way a web view would.
     fn request(uri: &str) -> Request<Vec<u8>> {
@@ -299,6 +333,20 @@ mod tests {
             .uri(uri)
             .body(Vec::new())
             .expect("build protocol request")
+    }
+
+    /// Serves a request against a window that has published no local artwork.
+    fn serve(cache: &Path, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+        serve_artwork(cache, &|_| false, request)
+    }
+
+    /// Builds the request a window makes for one local artwork file.
+    fn artwork_request(path: &Path) -> (Url, Request<Vec<u8>>) {
+        let url = Url::from_file_path(path).expect("absolute artwork path");
+        let encoded =
+            percent_encoding::utf8_percent_encode(url.as_str(), percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        (url, request(&format!("youta://artwork/{encoded}")))
     }
 
     /// Platforms shape the custom-scheme URI differently, and both forms must
@@ -314,7 +362,7 @@ mod tests {
             "youta://artwork/not%20a%20url",
             "http://youta.localhost/artwork/not%20a%20url",
         ] {
-            assert_eq!(serve_artwork(cache, &request(uri)).status(), 400, "{uri}");
+            assert_eq!(serve(cache, &request(uri)).status(), 400, "{uri}");
         }
     }
 
@@ -330,22 +378,74 @@ mod tests {
             ("youta://artwork/", 400),
             ("youta://artwork/not%20a%20url", 400),
         ] {
-            assert_eq!(
-                serve_artwork(cache, &request(uri)).status(),
-                expected,
-                "{uri}"
-            );
+            assert_eq!(serve(cache, &request(uri)).status(), expected, "{uri}");
         }
     }
 
     /// Refusals carry no body, so the endpoint cannot be used to probe.
     #[test]
     fn a_refusal_reveals_nothing() {
-        let response = serve_artwork(
+        let response = serve(
             Path::new("/nonexistent"),
             &request("youta://artwork/file%3A%2F%2F%2Fetc%2Fpasswd"),
         );
         assert_eq!(response.status(), 404);
         assert!(response.body().is_empty());
+    }
+
+    /// A local file is served only because a snapshot named it.
+    ///
+    /// This is the whole boundary: the same request against a window that never
+    /// published that URL must be refused, and it must be refused for a readable
+    /// image rather than only for a missing one — otherwise the test would pass
+    /// on an unrelated failure.
+    #[test]
+    fn local_artwork_is_served_only_when_the_reducer_published_it() {
+        let directory = tempfile::tempdir().expect("temporary artwork directory");
+        let cover = directory.path().join("Track [id].webp");
+        std::fs::write(&cover, b"RIFF\0\0\0\0WEBPVP8 body").expect("write sidecar cover");
+        let (published_url, request) = artwork_request(&cover);
+
+        let refused = serve(directory.path(), &request);
+        assert_eq!(refused.status(), 404);
+        assert!(refused.body().is_empty());
+
+        let served = serve_artwork(
+            directory.path(),
+            &|source: &Url| source == &published_url,
+            &request,
+        );
+        assert_eq!(served.status(), 200);
+        assert_eq!(
+            served
+                .headers()
+                .get("Content-Type")
+                .map(|value| value.to_str().expect("ASCII media type")),
+            Some("image/webp"),
+            "the media type comes from the bytes, not from the extension"
+        );
+        assert_eq!(served.body(), b"RIFF\0\0\0\0WEBPVP8 body");
+    }
+
+    /// Publishing one local file must not make its neighbours readable.
+    #[test]
+    fn a_published_cover_does_not_open_the_directory_around_it() {
+        let directory = tempfile::tempdir().expect("temporary artwork directory");
+        let cover = directory.path().join("cover.png");
+        let private = directory.path().join("notes.png");
+        std::fs::write(&cover, b"\x89PNG\r\n\x1a\ncover").expect("write published cover");
+        std::fs::write(&private, b"\x89PNG\r\n\x1a\nprivate").expect("write neighbour file");
+        let (published_url, _) = artwork_request(&cover);
+        let (_, neighbour) = artwork_request(&private);
+
+        assert_eq!(
+            serve_artwork(
+                directory.path(),
+                &|source: &Url| source == &published_url,
+                &neighbour
+            )
+            .status(),
+            404
+        );
     }
 }

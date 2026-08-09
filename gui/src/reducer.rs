@@ -12,14 +12,18 @@
 //! discipline the terminal event loop follows, with the renderer replaced by a
 //! serialized snapshot.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use url::Url;
+
 // The runtime is a type parameter so the reducer can be driven by Tauri's mock
 // runtime in tests. Nothing here depends on the real windowing backend.
 use tauri::{AppHandle, Emitter, Runtime};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use serde::Serialize;
 
@@ -29,6 +33,7 @@ use youta::keymap::{KeyPress, PopupGeometry, key_action};
 use youta::persistence::{ANOTHER_INSTANCE_MESSAGE, PersistenceError, StateStore};
 use youta::playback::configured_playback_factory;
 use youta::providers::configured_youtube_provider;
+use youta::text_file_open::{TextFileOpenLifecycle, spawn_detached_text_file_open};
 use youta::view::{UiAction, UiController, ViewModel, WaveformView};
 use youta::waveform::Peak;
 
@@ -133,6 +138,77 @@ fn peaks_for(view: &ViewModel, generation: u64, columns: usize) -> Vec<u8> {
     encode_peaks(&pyramid.reduced_for_width(columns))
 }
 
+/// Local artwork URLs remembered from recently published snapshots.
+///
+/// One selection publishes at most a handful — the panel's cover and the rows
+/// around it — so this holds several screens' worth of movement.
+const MAX_PUBLISHED_LOCAL_ARTWORK: usize = 64;
+
+/// The local artwork a published snapshot named, newest last.
+///
+/// A local cover is a real file: an opaque entry in Youta's private artwork
+/// cache, or the image a downloader left beside the media. The window renders it
+/// with an ordinary `<img src>`, so the artwork endpoint has to be able to read
+/// those files — and there is no path pattern that separates the user's own
+/// `cover.jpg` from the rest of their filesystem.
+///
+/// This is that separation, and it is an allowlist rather than a rule: the
+/// endpoint serves a file only when the reducer itself published its URL in a
+/// snapshot the window was given. A `file:` URL that arrives from a provider is
+/// therefore refused, because no snapshot ever named it.
+///
+/// It remembers several selections rather than only the current one, since an
+/// image request can arrive after the selection that produced it has moved on.
+#[derive(Default)]
+pub struct PublishedArtwork {
+    recent: Mutex<VecDeque<Url>>,
+}
+
+impl PublishedArtwork {
+    /// Records every local artwork URL one snapshot names.
+    fn record(&self, view: &ViewModel) {
+        let mut recent = self.recent.lock().unwrap_or_else(PoisonError::into_inner);
+        for url in local_artwork_urls(view) {
+            if recent.contains(url) {
+                continue;
+            }
+            recent.push_back(url.clone());
+            while recent.len() > MAX_PUBLISHED_LOCAL_ARTWORK {
+                recent.pop_front();
+            }
+        }
+    }
+
+    /// Whether a published snapshot named this exact artwork.
+    fn published(&self, source: &Url) -> bool {
+        self.recent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(source)
+    }
+}
+
+/// Yields the local artwork one snapshot names, wherever it appears.
+///
+/// Remote artwork is left out because it needs no permission: the endpoint
+/// fetches an `http`/`https` source through Youta's guarded agent, which applies
+/// its own rules to any URL at all.
+fn local_artwork_urls(view: &ViewModel) -> impl Iterator<Item = &Url> {
+    let details = view.details.iter().flat_map(|details| {
+        details
+            .thumbnail_url
+            .iter()
+            .chain(details.expanded_thumbnail_url.iter())
+    });
+    view.rows
+        .iter()
+        .chain(&view.subscriptions.sources)
+        .chain(&view.subscriptions.items)
+        .filter_map(|row| row.thumbnail_url.as_ref())
+        .chain(details)
+        .filter(|url| url.scheme() == "file")
+}
+
 /// Reducer wake-up period.
 ///
 /// The reducer also wakes immediately for every dispatched action, so this only
@@ -178,6 +254,7 @@ enum Message {
 pub struct ReducerHandle {
     actions: Sender<Message>,
     latest: Arc<Mutex<ViewModel>>,
+    artwork: Arc<PublishedArtwork>,
     /// A `Receiver` is `Send` but not `Sync`, and Tauri shares managed state
     /// across threads, so the exit path takes this lock to wait on it.
     finished: Mutex<Receiver<()>>,
@@ -222,6 +299,15 @@ impl ReducerHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Whether this local artwork URL appeared in a snapshot the window was
+    /// given.
+    ///
+    /// See [`PublishedArtwork`] for why the artwork endpoint asks.
+    #[must_use]
+    pub fn published_local_artwork(&self, source: &Url) -> bool {
+        self.artwork.published(source)
     }
 
     /// Returns the waveform envelope reduced to exactly `columns` columns.
@@ -269,6 +355,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHan
     let (finished_sender, finished) = channel::<()>();
     let latest = Arc::new(Mutex::new(ViewModel::default()));
     let published = Arc::clone(&latest);
+    let artwork = Arc::new(PublishedArtwork::default());
+    let published_artwork = Arc::clone(&artwork);
 
     thread::Builder::new()
         .name("youta-reducer".to_owned())
@@ -297,12 +385,19 @@ pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHan
             let playback = configured_playback_factory(&config);
             let mut controller = AppController::new(config, store, provider, playback);
 
+            published_artwork.record(controller.view());
             *published.lock().unwrap_or_else(PoisonError::into_inner) = controller.view().clone();
             if ready_sender.send(Ok(())).is_err() {
                 return;
             }
 
-            run(&app, &mut controller, &action_receiver, &published);
+            run(
+                &app,
+                &mut controller,
+                &action_receiver,
+                &published,
+                &published_artwork,
+            );
             // Every exit from `run` lands here, so the player process is killed
             // and durable state is flushed whether the user quit, closed the
             // window, or the window itself went away.
@@ -318,6 +413,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHan
     Ok(ReducerHandle {
         actions: action_sender,
         latest,
+        artwork,
         finished: Mutex::new(finished),
     })
 }
@@ -412,12 +508,46 @@ impl TrafficMeter {
     }
 }
 
+/// Performs the side effects the controller planned but cannot carry out.
+///
+/// Both of these are deliberately not the reducer's to do. The controller
+/// decides *that* a link should be copied and *which* command opens a text
+/// file; how a clipboard is reached and how a child process is started differ
+/// between a terminal and a window, so each front-end supplies its own half.
+///
+/// The terminal's half is in `youta::tui`: a native helper or an OSC 52 escape
+/// written to its own tty. Neither exists here — a window has the platform
+/// clipboard directly, and an escape sequence would be written into a stdout
+/// nobody reads and then reported as a successful copy.
+fn serve_side_effects<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController) {
+    if let Some(request) = controller.take_clipboard_request() {
+        controller.report_clipboard_result(
+            app.clipboard()
+                .write_text(request.text)
+                .map(|()| "the system clipboard".to_owned())
+                .map_err(|error| error.to_string()),
+        );
+    }
+    // `local-browser` is always on in this binary — `sources` selects it — so
+    // the text-file half of `UiController` is always present here.
+    if let Some(plan) = controller.take_text_file_open_plan() {
+        // A window is never a Linux virtual console, so the controller always
+        // plans the detached system opener here. `spawn_detached_text_file_open`
+        // refuses anything else rather than launching a terminal editor into a
+        // process that has no terminal.
+        controller.report_text_file_open_result(
+            spawn_detached_text_file_open(&plan).map(|()| TextFileOpenLifecycle::Detached),
+        );
+    }
+}
+
 /// Applies actions, pumps workers, and publishes the view when it changes.
 fn run<R: Runtime>(
     app: &AppHandle<R>,
     controller: &mut AppController,
     actions: &Receiver<Message>,
     published: &Arc<Mutex<ViewModel>>,
+    artwork: &Arc<PublishedArtwork>,
 ) {
     let mut last = controller.view().clone();
     let mut traffic = TrafficMeter::new();
@@ -444,6 +574,7 @@ fn run<R: Runtime>(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
+        serve_side_effects(app, controller);
         controller.tick();
 
         // `ViewModel` derives `PartialEq`, so an unchanged frame costs one
@@ -460,6 +591,9 @@ fn run<R: Runtime>(
             let only_playback_moved = probe == *current;
 
             last = current.clone();
+            // Recorded before the snapshot leaves, so the artwork endpoint can
+            // never be asked about a URL it has not seen yet.
+            artwork.record(&last);
             *published.lock().unwrap_or_else(PoisonError::into_inner) = last.clone();
 
             let emitted = if only_playback_moved {
@@ -664,6 +798,81 @@ mod tests {
             super::MAX_WAVEFORM_COLUMNS * 4,
             "an unbounded column count must be clamped, not honoured"
         );
+    }
+
+    /// The artwork endpoint's permission is exactly "the reducer published
+    /// this", so a `file:` URL that never appeared in a snapshot must not be
+    /// recognized — and a remote one must not be recorded at all, because it
+    /// needs no permission and would only crowd the set.
+    #[test]
+    fn only_local_artwork_from_a_published_snapshot_is_recognized() {
+        use super::PublishedArtwork;
+        use youta::view::{DetailView, RowView};
+
+        let cover = url("file:///music/album/.cache/9f2c.image");
+        let sidecar = url("file:///music/album/Track.webp");
+        let remote = url("https://images.example/cover.jpg");
+        let never_published = url("file:///etc/passwd");
+
+        let published = PublishedArtwork::default();
+        let mut view = ViewModel::default();
+        view.details = Some(DetailView {
+            thumbnail_url: Some(cover.clone()),
+            ..DetailView::default()
+        });
+        view.rows = vec![
+            RowView {
+                thumbnail_url: Some(sidecar.clone()),
+                ..RowView::default()
+            },
+            RowView {
+                thumbnail_url: Some(remote.clone()),
+                ..RowView::default()
+            },
+        ];
+        published.record(&view);
+
+        assert!(published.published(&cover));
+        assert!(published.published(&sidecar));
+        assert!(!published.published(&remote));
+        assert!(!published.published(&never_published));
+    }
+
+    /// An image request can arrive after the selection that produced it moved
+    /// on, so a covered selection stays readable for a while — but not forever.
+    #[test]
+    fn a_recent_selection_stays_readable_within_a_bounded_history() {
+        use super::{MAX_PUBLISHED_LOCAL_ARTWORK, PublishedArtwork};
+        use youta::view::DetailView;
+
+        let published = PublishedArtwork::default();
+        let first = url("file:///music/first.webp");
+        for index in 0..MAX_PUBLISHED_LOCAL_ARTWORK {
+            let mut view = ViewModel::default();
+            view.details = Some(DetailView {
+                thumbnail_url: Some(url(&format!("file:///music/{index}.webp"))),
+                ..DetailView::default()
+            });
+            published.record(&view);
+        }
+        assert!(
+            published.published(&url("file:///music/0.webp")),
+            "a selection this recent must still be readable"
+        );
+
+        // One more selection than the history holds evicts the oldest.
+        let mut view = ViewModel::default();
+        view.details = Some(DetailView {
+            thumbnail_url: Some(first.clone()),
+            ..DetailView::default()
+        });
+        published.record(&view);
+        assert!(published.published(&first));
+        assert!(!published.published(&url("file:///music/0.webp")));
+    }
+
+    fn url(value: &str) -> super::Url {
+        super::Url::parse(value).expect("parse artwork URL fixture")
     }
 
     /// An action from the window has to reach the controller, which is the whole

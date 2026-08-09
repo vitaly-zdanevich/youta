@@ -302,6 +302,29 @@ export interface PreferencesPopupView {
   validation_error: string | null;
 }
 
+/**
+ * One entry of the playback queue.
+ *
+ * The playable location is deliberately absent. For several providers it is a
+ * signed, short-lived media URL, and queue actions address entries by position
+ * so it never has to leave the reducer. The provider is read from `media_id`
+ * rather than repeated, so this window keeps no copy of the source-label map.
+ */
+export interface QueueRowView {
+  media_id: MediaId;
+  title: string;
+  subtitle: string;
+  length: string;
+}
+
+/** The playback queue and its cursor. */
+export interface QueuePopupView {
+  items: QueueRowView[];
+  current: number | null;
+  selected: number;
+  repeat_one: boolean;
+}
+
 /** One playlist row in the chooser, with the selected item's membership. */
 export interface PlaylistChoiceView {
   playlist_id: string;
@@ -472,6 +495,7 @@ export interface ViewModel {
   video_qr_popup: VideoQrPopupView | null;
   preferences_popup: PreferencesPopupView | null;
   playlist_popup: PlaylistPopupView | null;
+  queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
   // The four credential-bearing editors cross as a single bit each: enough to
   // know the reducer is modal and every key is going into an editor this window

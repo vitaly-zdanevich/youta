@@ -26,8 +26,8 @@ use youta::domain::{MediaId, SourceKind};
 use youta::view::{
     DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
     DownloadView, ErrorPopupView, LocalMoveDestinationView, PlaylistChoiceView, PlaylistPopupView,
-    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, RowView, SubscriptionsView,
-    VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView,
+    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
+    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -195,6 +195,18 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         "SubscriptionsView",
         emitted_keys(&SubscriptionsView::default()),
     );
+    emitted.insert("QueuePopupView", emitted_keys(&QueuePopupView::default()));
+    // `QueueRowView` has no `Default` because `MediaId` has none, and giving it
+    // one would invent an identity that means nothing.
+    emitted.insert(
+        "QueueRowView",
+        emitted_keys(&QueueRowView {
+            media_id: MediaId::new(SourceKind::Local, "/music/a.flac"),
+            title: String::new(),
+            subtitle: String::new(),
+            length: String::new(),
+        }),
+    );
     emitted.insert("WaveformReady", variant_keys(&ready_waveform(), "Ready"));
     // Not a view type: the source catalogue is assembled here, and the window
     // reads it to label tabs and to decide which screens get a search field.
@@ -254,6 +266,8 @@ fn every_checked_interface_is_actually_declared() {
         "LocalMoveDestinationView",
         "DownloadView",
         "SubscriptionsView",
+        "QueuePopupView",
+        "QueueRowView",
         "WaveformReady",
         "ScreenEntry",
     ] {

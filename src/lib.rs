@@ -42,8 +42,11 @@ pub(crate) mod gpm;
 #[cfg(feature = "tracker-music")]
 pub mod tracker_media;
 
-#[cfg(feature = "remote-artwork")]
+#[cfg(any(feature = "remote-artwork", feature = "local-artwork"))]
 pub mod artwork;
+
+#[cfg(feature = "local-artwork")]
+pub(crate) mod local_artwork;
 
 #[cfg(feature = "images")]
 pub mod thumbnails;

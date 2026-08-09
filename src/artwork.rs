@@ -1,4 +1,4 @@
-//! Remote artwork fetching and its private on-disk cache.
+//! Artwork bytes and their private on-disk cache.
 //!
 //! This is the half of Youta's artwork pipeline that no renderer needs: it
 //! turns a provider URL into bytes, guarding the request, and keeps those bytes
@@ -11,6 +11,11 @@
 //! followed to a different safety class, responses are size-capped, and cache
 //! files are private, hashed, and written atomically. A window that rendered
 //! artwork by fetching it itself would lose all of that.
+//!
+//! The cache and the format sniffer are shared with `crate::local_artwork`,
+//! which finds covers inside and beside local media files. That half needs no
+//! network, so everything that reaches one is behind `remote-artwork` and a
+//! text-only local build links no HTTP client.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -21,16 +26,21 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
+#[cfg(feature = "remote-artwork")]
 use ureq::ResponseExt;
+#[cfg(feature = "remote-artwork")]
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+#[cfg(feature = "remote-artwork")]
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
+#[cfg(feature = "remote-artwork")]
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 
 /// Largest artwork response accepted from a provider.
-const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded wait for one artwork request.
+#[cfg(feature = "remote-artwork")]
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Age after which a cached entry is discarded.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -86,6 +96,7 @@ impl std::fmt::Display for ThumbnailFailure {
     }
 }
 
+#[cfg(feature = "remote-artwork")]
 pub(crate) trait ThumbnailTransport: Send + 'static {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
 }
@@ -94,6 +105,7 @@ pub(crate) trait ThumbnailTransport: Send + 'static {
 ///
 /// Redirects are refused outright rather than followed, because a redirect can
 /// cross from a public host to a private one after the first check passed.
+#[cfg(feature = "remote-artwork")]
 pub(crate) fn thumbnail_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
@@ -118,7 +130,7 @@ pub(crate) fn thumbnail_agent() -> ureq::Agent {
 ///
 /// It keeps every other guard — no redirects, bounded timeout — and relaxes
 /// only the public-address pin, which no production path can do.
-#[cfg(test)]
+#[cfg(all(test, feature = "remote-artwork"))]
 pub(crate) fn mock_thumbnail_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
@@ -135,11 +147,13 @@ pub(crate) fn mock_thumbnail_agent() -> ureq::Agent {
     )
 }
 
+#[cfg(feature = "remote-artwork")]
 pub(crate) struct HttpThumbnailTransport {
     agent: ureq::Agent,
 }
 
 /// DNS resolver that pins thumbnail connections to public addresses only.
+#[cfg(feature = "remote-artwork")]
 #[derive(Debug, Default)]
 pub(crate) struct PublicThumbnailResolver {
     resolver: DefaultResolver,
@@ -147,6 +161,7 @@ pub(crate) struct PublicThumbnailResolver {
     allow_non_public: bool,
 }
 
+#[cfg(feature = "remote-artwork")]
 impl Resolver for PublicThumbnailResolver {
     fn resolve(
         &self,
@@ -173,6 +188,7 @@ impl Resolver for PublicThumbnailResolver {
     }
 }
 
+#[cfg(feature = "remote-artwork")]
 impl HttpThumbnailTransport {
     /// Builds a transport over the guarded agent.
     pub(crate) fn new() -> Self {
@@ -182,6 +198,7 @@ impl HttpThumbnailTransport {
     }
 }
 
+#[cfg(feature = "remote-artwork")]
 impl ThumbnailTransport for HttpThumbnailTransport {
     fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
         fetch_thumbnail(&self.agent, source)
@@ -218,11 +235,13 @@ impl ThumbnailCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote-artwork"))]
     pub(crate) fn with_policy(directory: PathBuf, policy: ThumbnailCachePolicy) -> Self {
         Self { directory, policy }
     }
 
+    /// Reads the entry a remote source is cached under.
+    #[cfg(feature = "remote-artwork")]
     pub(crate) fn read(&self, source: &Url) -> io::Result<Option<Vec<u8>>> {
         self.read_key(source.as_str().as_bytes())
     }
@@ -266,11 +285,13 @@ impl ThumbnailCache {
         Ok(Some(bytes))
     }
 
+    #[cfg(feature = "remote-artwork")]
     pub(crate) fn prepare(&self) -> io::Result<()> {
         self.secure_directory()?;
         self.evict()
     }
 
+    #[cfg(feature = "remote-artwork")]
     pub(crate) fn store(&self, source: &Url, bytes: &[u8]) -> io::Result<()> {
         self.store_key(source.as_str().as_bytes(), bytes)
     }
@@ -285,6 +306,7 @@ impl ThumbnailCache {
         self.evict()
     }
 
+    #[cfg(feature = "remote-artwork")]
     pub(crate) fn remove(&self, source: &Url) {
         self.remove_key(source.as_str().as_bytes());
     }
@@ -293,7 +315,7 @@ impl ThumbnailCache {
         remove_cache_entry(&self.entry_path_for_key(key));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote-artwork"))]
     pub(crate) fn entry_path(&self, source: &Url) -> PathBuf {
         self.entry_path_for_key(source.as_str().as_bytes())
     }
@@ -515,6 +537,7 @@ pub(crate) fn set_private_file_permissions(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "remote-artwork")]
 pub(crate) fn fetch_thumbnail(
     agent: &ureq::Agent,
     source: &Url,
@@ -523,6 +546,7 @@ pub(crate) fn fetch_thumbnail(
 }
 
 /// Fetches one thumbnail, optionally allowing a loopback test fixture.
+#[cfg(feature = "remote-artwork")]
 pub(crate) fn fetch_thumbnail_with_policy(
     agent: &ureq::Agent,
     source: &Url,
@@ -580,11 +604,13 @@ pub(crate) fn fetch_thumbnail_with_policy(
     }
 }
 
+#[cfg(feature = "remote-artwork")]
 pub(crate) fn is_safe_thumbnail_source(source: &Url) -> bool {
     is_safe_remote_thumbnail_source(source, false)
         || (source.scheme() == "file" && source.to_file_path().is_ok())
 }
 
+#[cfg(feature = "remote-artwork")]
 pub(crate) fn is_safe_remote_thumbnail_source(
     source: &Url,
     allow_non_public_test_source: bool,
@@ -663,6 +689,7 @@ pub struct Artwork {
 /// # Errors
 ///
 /// Returns why the artwork is unavailable, without echoing the URL.
+#[cfg(feature = "remote-artwork")]
 pub fn remote_artwork(cache_directory: &Path, source: &Url) -> Result<Artwork, ThumbnailFailure> {
     if !is_safe_remote_thumbnail_source(source, false) {
         return Err(ThumbnailFailure::InvalidSource);
@@ -686,7 +713,116 @@ pub fn remote_artwork(cache_directory: &Path, source: &Url) -> Result<Artwork, T
     Ok(Artwork { bytes, format })
 }
 
-#[cfg(test)]
+/// Returns artwork Youta itself discovered in or beside a local media file.
+///
+/// This is the local counterpart of [`remote_artwork`], and it exists because
+/// a window cannot read the file with an ordinary `<img src>`: local covers are
+/// either an opaque entry in Youta's private cache or a sidecar image next to
+/// the user's media, and neither is a URL a web view may be handed.
+///
+/// The read is bounded exactly as a download is — a regular file, never a
+/// symlink, never larger than the artwork limit — and the media type comes from
+/// the leading bytes rather than the file extension.
+///
+/// SECURITY: this deliberately performs no confinement check, because there is
+/// no path pattern that distinguishes the user's own `cover.jpg` from any other
+/// file. The caller must therefore accept only a URL the reducer published in a
+/// view it rendered — see `youta-gui`'s `PublishedArtwork` — so that a string
+/// arriving from a provider can never select the file. A caller that cannot
+/// prove that must use [`remote_artwork`], which refuses `file:` outright.
+///
+/// # Errors
+///
+/// Returns why the artwork is unavailable, without echoing the path.
+#[cfg(feature = "local-artwork")]
+pub fn local_artwork(source: &Url) -> Result<Artwork, ThumbnailFailure> {
+    if source.scheme() != "file" {
+        return Err(ThumbnailFailure::InvalidSource);
+    }
+    let path = source
+        .to_file_path()
+        .map_err(|()| ThumbnailFailure::InvalidSource)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+    if !metadata.file_type().is_file() {
+        return Err(ThumbnailFailure::InvalidSource);
+    }
+    if metadata.len() > MAX_DOWNLOAD_BYTES as u64 {
+        return Err(ThumbnailFailure::ResponseTooLarge);
+    }
+    let bytes = fs::read(&path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+    if bytes.len() > MAX_DOWNLOAD_BYTES {
+        return Err(ThumbnailFailure::ResponseTooLarge);
+    }
+    let format = ArtworkFormat::sniff(&bytes).ok_or(ThumbnailFailure::UnsupportedFormat)?;
+    Ok(Artwork { bytes, format })
+}
+
+#[cfg(all(test, feature = "local-artwork"))]
+mod local_surface_tests {
+    use super::{ArtworkFormat, ThumbnailFailure, local_artwork};
+
+    use url::Url;
+
+    /// The type is decided by the bytes here too: a sidecar written by another
+    /// program can carry any extension at all.
+    #[test]
+    fn a_sidecar_is_served_by_its_leading_bytes_and_not_its_extension() {
+        let directory = tempfile::tempdir().expect("temporary artwork directory");
+        let path = directory.path().join("cover.jpg");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nbody").expect("write mislabelled sidecar");
+        let url = Url::from_file_path(&path).expect("absolute sidecar URL");
+
+        let artwork = local_artwork(&url).expect("serve mislabelled sidecar");
+        assert_eq!(artwork.format, ArtworkFormat::Png);
+    }
+
+    /// Everything that is not one regular image file is refused identically.
+    #[test]
+    fn directories_missing_files_and_non_images_are_refused() {
+        let directory = tempfile::tempdir().expect("temporary artwork directory");
+        let text = directory.path().join("notes.txt");
+        std::fs::write(&text, b"<!doctype html>").expect("write non-image file");
+
+        for (url, expected) in [
+            (
+                Url::from_directory_path(directory.path()).expect("directory URL"),
+                ThumbnailFailure::InvalidSource,
+            ),
+            (
+                Url::from_file_path(directory.path().join("absent.png")).expect("absent URL"),
+                ThumbnailFailure::DownloadFailed,
+            ),
+            (
+                Url::from_file_path(&text).expect("text URL"),
+                ThumbnailFailure::UnsupportedFormat,
+            ),
+            (
+                Url::parse("https://images.example/cover.png").expect("remote URL"),
+                ThumbnailFailure::InvalidSource,
+            ),
+        ] {
+            assert_eq!(local_artwork(&url), Err(expected), "{url}");
+        }
+    }
+
+    /// A symlink is never followed, so a cover cannot stand in for another file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused_even_when_its_target_is_an_image() {
+        let directory = tempfile::tempdir().expect("temporary artwork directory");
+        let target = directory.path().join("real.png");
+        let link = directory.path().join("cover.png");
+        std::fs::write(&target, b"\x89PNG\r\n\x1a\nbody").expect("write symlink target");
+        std::os::unix::fs::symlink(&target, &link).expect("create artwork symlink");
+
+        assert_eq!(
+            local_artwork(&Url::from_file_path(&link).expect("symlink URL")),
+            Err(ThumbnailFailure::InvalidSource)
+        );
+    }
+}
+
+#[cfg(all(test, feature = "remote-artwork"))]
 mod public_surface_tests {
     use super::{ArtworkFormat, ThumbnailFailure, remote_artwork};
 

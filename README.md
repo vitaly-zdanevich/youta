@@ -103,6 +103,22 @@ with **Play next** or **Add to queue** always run first; Youta then resumes the
 original source list. Replacing a live search stops that list's continuation
 instead of accidentally playing an unrelated new result.
 
+`u` opens that queue. It lists the entries in play order, marks the one
+playback is on, and starts the selected entry from where it sits, drops a
+single entry, or clears everything except what is playing. The entry that is
+playing cannot be removed — stop it first — because the queue would otherwise
+stop describing what you are listening to. The list is rebuilt on every tick,
+so it keeps up with entries the user did not add: reaching the end of a track
+moves the cursor, and starting playback records an entry beside it.
+
+`y` copies the selected item's link to the system clipboard. The controller
+only decides *what* to copy; each front-end reaches its own clipboard, because
+the two are genuinely different. The terminal uses a native helper
+(`wl-copy`, `xclip`, `xsel`, `pbcopy`) and falls back to an OSC 52 escape
+written to its own tty; the window uses the platform clipboard directly, since
+it has no tty and an escape there would be written into nothing and then
+reported as a successful copy.
+
 Description timecodes become exact chapter split and mouse-seek targets. Dense
 chapter labels grow to as many as four rows when the terminal has spare height;
 `T` toggles between timestamps plus names and names only without moving those
@@ -353,6 +369,21 @@ expands them in the scrollable Details pane. Statement values and Wikipedia
 rows retain validated clickable targets. Activating `[W] ▾` collapses the
 spoiler again. Entity data is not fetched for items the user never expands.
 
+Radio stations use the same items for a second purpose: artwork. A station that
+the checked-in [verified mapping](src/providers/radio_wikidata.rs) already links
+to a Wikidata item has its logotype resolved when it is selected, from
+[logo image (P154)](https://www.wikidata.org/wiki/Property:P154), falling back
+to [image (P18)](https://www.wikidata.org/wiki/Property:P18) — a broadcaster's
+logotype identifies the station, while its representative image is as likely to
+be a transmitter mast. That takes two bounded requests rather than one, because
+Commons' stable file address is a redirect and Youta's artwork agent refuses
+redirects on purpose; the second asks Commons for the raster URL itself at a
+bounded width, which also rasterizes an SVG logotype to PNG. One lookup runs at
+a time and every answer is remembered for the session, including "this station
+has no image", so moving through the catalogue costs at most one request per
+station rather than one per selection. Stations without a verified item, and
+builds without `wikidata`, simply show no artwork.
+
 This is exact-ID enrichment, not title, name, or arbitrary-URL matching.
 YouTube video IDs come from validated links, bare IDs, or search results;
 channel lookup requires the 24-character `UC…` ID and does not resolve handles
@@ -551,6 +582,28 @@ answered with nothing rather than with the current file's peaks: otherwise a
 reply that outlived the selection would paint one file's envelope where another
 belongs, and a click on those pixels would seek the wrong media.
 
+Artwork is the other exception, and it never enters a snapshot either: the
+window asks for it with an ordinary `<img src>` pointing at `youta://artwork/`,
+and Rust answers with the bytes. That keeps the network in the player process,
+so a provider sees Youta's guarded agent — public addresses only, no redirects,
+size-capped — rather than a request from a web view.
+
+Local covers reach the same endpoint but are trusted differently, because they
+are real files: the cover extracted out of a download, or the image `yt-dlp`
+left beside it. No path pattern separates the user's own `cover.jpg` from the
+rest of their filesystem, so the endpoint does not try to invent one. It serves
+a file only when the reducer itself published that URL in a snapshot the window
+was given, remembering the last several selections so an image request that
+outlives its selection still resolves. A `file:` URL arriving from a provider is
+refused, because no snapshot ever named it.
+
+Two things the reducer decides but cannot do itself are done here rather than
+in it: copying to the clipboard, and opening a local text file. The window
+reaches the platform clipboard directly and starts the system opener detached;
+the terminal reaches a native helper or writes an OSC 52 escape to its own tty,
+and can suspend itself so a terminal editor may take the console. The
+controller supplies the text and the command, never the transport.
+
 A search field appears on every screen that collects a query and nowhere else;
 both front-ends ask `Screen::search_verb` which those are, so a screen whose
 Enter would answer "search is not available" is never given a field. It is not
@@ -574,6 +627,22 @@ top of `remote-artwork`, which is the fetching and private on-disk cache alone.
 A build that wants artwork bytes without a terminal renderer — a different
 front-end, or a tool — selects `remote-artwork` by itself and links no Ratatui.
 `qr` is likewise renderer-free: it encodes a module matrix and draws nothing.
+
+`local-artwork` is renderer-free for the same reason, and it is also offline:
+finding a cover means reading tags and directory entries, so it links neither
+Ratatui nor an HTTP client and a text-only local build stays exactly as
+network-free as it was. It looks in two places. A picture embedded in the media
+file is extracted under bounded limits and copied into the private artwork cache
+under an opaque hashed name, so a renderer is never handed a byte range inside
+the user's media. An image beside the file — `Track.webp` next to `Track.opus`,
+which is what `yt-dlp --write-thumbnail` leaves behind, or `cover.jpg` in an
+album folder — is published where it lies, because copying a large scan into a
+4 MiB cache would only lose it. The embedded picture wins when a file has both:
+it belongs to that file, while a sidecar may describe a whole download batch.
+Both are identified by their leading bytes rather than by a file extension or a
+tag's claimed MIME type, and neither is decoded here — pixel and allocation
+limits belong to whichever renderer actually decodes, which is the only side
+that knows what those limits are.
 
 For a small TUI build containing only the curated Radio catalogue and `mpv`
 playback:

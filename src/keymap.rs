@@ -420,6 +420,20 @@ fn unfiltered_key_action(
             },
         };
     }
+    if let Some(popup) = view.queue_popup.as_ref() {
+        return match key.key {
+            Key::Esc | Key::Char('u') => Some(UiAction::DismissQueuePopup),
+            Key::Up | Key::Char('k') => Some(UiAction::MoveQueuePopupSelection(-1)),
+            Key::Down | Key::Char('j') => Some(UiAction::MoveQueuePopupSelection(1)),
+            Key::Enter => Some(UiAction::ActivateQueuePopupRow(popup.selected)),
+            // `x` rather than Delete alone: Delete is the Local trash key, and a
+            // key that destroys a file on one screen must not be the reflex for
+            // dropping a queue entry on another.
+            Key::Char('x') | Key::Delete => Some(UiAction::RemoveQueuePopupRow(popup.selected)),
+            Key::Char('C') => Some(UiAction::ClearQueue),
+            _ => None,
+        };
+    }
     if let Some(popup) = view.local_file_popup.as_ref() {
         return match (popup, key.key) {
             (_, Key::Esc) => Some(UiAction::DismissLocalFilePopup),
@@ -886,7 +900,7 @@ fn unfiltered_key_action(
         Key::Char('O') if view.screen == Screen::Radio => Some(UiAction::OpenInBrowser),
         Key::Char('O') => Some(UiAction::OpenChannelInBrowser),
         Key::Char('y') => Some(UiAction::CopyLink),
-        Key::Char('e') => Some(UiAction::OpenEqualizer),
+        Key::Char('u') if !key.modified() => Some(UiAction::OpenQueuePopup),
         Key::Char(digit @ '0'..='9') if view.playback.seeking_available() => {
             let percentage = f64::from(digit.to_digit(10).unwrap_or_default()) * 10.0;
             Some(UiAction::SeekPercent(percentage))

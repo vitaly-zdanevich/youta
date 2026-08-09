@@ -17,6 +17,7 @@ import {
   PlaylistPopup,
   PreferencesPopup,
   ProjectHistoryPopup,
+  QueuePopup,
   VideoCommentsPopup,
   VideoQrPopup,
 } from "./components/popups";
@@ -171,6 +172,7 @@ export function App() {
       {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} /> : null}
       {view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} /> : null}
       {view.playlist_popup ? <PlaylistPopup popup={view.playlist_popup} /> : null}
+      {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}
       {view.video_comments_popup ? (
         <VideoCommentsPopup popup={view.video_comments_popup} />

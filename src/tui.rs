@@ -45,11 +45,13 @@ use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "qr")]
 use crate::qr_code::QrMatrix;
-use crate::report_actions::system_url_opener_name;
+use crate::report_actions::{SystemReportActions, system_url_opener_name};
 use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
 #[cfg(feature = "local-browser")]
-use crate::text_file_open::{TextFileOpenLifecycle, TextFileOpenPlan};
+use crate::text_file_open::{
+    TextFileOpenLifecycle, TextFileOpenPlan, spawn_detached_text_file_open,
+};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::Peak;
@@ -867,6 +869,9 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
     let mut hit_map = HitMap::default();
     let mut virtual_cursor = VirtualCursor::default();
+    // Discovery reads filesystem metadata once and runs nothing, so the
+    // terminal owns its clipboard transport for the whole session.
+    let clipboard = SystemReportActions::new();
     loop {
         let mut renderer = thumbnail_renderer.take();
         if let Some(renderer) = renderer.as_mut() {
@@ -954,6 +959,17 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 }
                 _ => {}
             }
+        }
+        // A terminal copies through a native helper, or through an OSC 52
+        // escape written to its own tty when there is no helper — which is why
+        // the copy happens here and not in the controller: neither transport
+        // exists in a window, and the escape one would be written into nothing.
+        if let Some(request) = controller.take_clipboard_request() {
+            controller.report_clipboard_result(
+                clipboard
+                    .copy_report(&request.text)
+                    .map_err(|error| error.to_string()),
+            );
         }
         #[cfg(feature = "local-browser")]
         if let Some(plan) = controller.take_text_file_open_plan() {
@@ -1464,26 +1480,15 @@ fn execute_text_file_open_plan(
     session: &mut TerminalSession,
     plan: TextFileOpenPlan,
 ) -> Result<TextFileOpenLifecycle, String> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     let lifecycle = plan.lifecycle;
     let mut command = Command::new(&plan.executable);
     command.args(&plan.arguments);
     match lifecycle {
-        TextFileOpenLifecycle::Detached => {
-            let mut child = command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|error| format!("cannot start {}: {error}", plan.executable.display()))?;
-            let _ = std::thread::Builder::new()
-                .name("youta-text-file-opener".to_owned())
-                .spawn(move || {
-                    let _ = child.wait();
-                });
-            Ok(lifecycle)
-        }
+        // Shared with the window, which reaches the same graphical opener and
+        // must not grow a second copy of the spawn-and-reap dance.
+        TextFileOpenLifecycle::Detached => spawn_detached_text_file_open(&plan).map(|()| lifecycle),
         TextFileOpenLifecycle::SuspendTuiAndWait => {
             session
                 .suspend()
@@ -1632,6 +1637,11 @@ struct HitMap {
     playlist_popup_first_index: usize,
     playlist_popup_fields: Vec<(PlaylistEditorField, Rect)>,
     playlist_popup_buttons: Vec<(UiAction, Rect)>,
+    /// Visible queue rows inside the queue popup.
+    queue_popup_rows: Rect,
+    /// First queue model row represented by [`Self::queue_popup_rows`].
+    queue_popup_first_index: usize,
+    queue_popup_buttons: Vec<(UiAction, Rect)>,
     private_note_buttons: Vec<(UiAction, Rect)>,
     /// Visible wrapped-text cells inside the private-note editor.
     private_note_text_area: Rect,
@@ -2192,6 +2202,12 @@ fn render_frame(
     hit_map.playlist_popup_buttons.clear();
     if let Some(popup) = view.playlist_popup.as_ref() {
         render_playlist_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+    }
+    hit_map.queue_popup_rows = Rect::default();
+    hit_map.queue_popup_first_index = 0;
+    hit_map.queue_popup_buttons.clear();
+    if let Some(popup) = view.queue_popup.as_ref() {
+        render_queue_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.private_note_buttons.clear();
     hit_map.private_note_text_area = Rect::default();
@@ -6183,9 +6199,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         local_help.clear();
     }
     #[cfg(feature = "qr")]
-    let private_note_help = "  n private note     e equalizer     t Details-only text selection\n  Q selected YouTube video QR code";
+    let private_note_help =
+        "  n private note     t Details-only text selection\n  Q selected YouTube video QR code";
     #[cfg(not(feature = "qr"))]
-    let private_note_help = "  n private note     e equalizer     t Details-only text selection";
+    let private_note_help = "  n private note     t Details-only text selection";
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -6210,7 +6227,8 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
         "",
         "Actions",
-        "  Ctrl+n play next     a add to queue     d download     o video page",
+        "  Ctrl+n play next     a add to queue     u show queue     d download",
+        "  o video page",
         "  l toggle todo     P choose playlist",
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
@@ -7715,6 +7733,161 @@ fn render_playlist_editor(
     );
 }
 
+/// Renders the playback queue.
+///
+/// The queue is the one piece of state Youta has always maintained and never
+/// shown: `a` and `Ctrl+n` have always been able to fill it, and nothing could
+/// display, reorder, or empty it afterwards.
+fn render_queue_popup(
+    frame: &mut Frame<'_>,
+    popup: &QueuePopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(82, 20, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Playback queue ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let position = match popup.current {
+        Some(current) => format!(
+            "Playing {} of {}",
+            current.saturating_add(1),
+            popup.items.len()
+        ),
+        None => format!(
+            "{} queued; the queue has been played through",
+            popup.items.len()
+        ),
+    };
+    let repeat = if popup.repeat_one {
+        " · repeating the current item"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{position}{repeat}\nEnter plays the selected entry from here."
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    hit_map.queue_popup_rows = sections[1];
+    let visible_rows = usize::from(sections[1].height).max(1);
+    let selected = popup.selected.min(popup.items.len().saturating_sub(1));
+    let first = selected.saturating_add(1).saturating_sub(visible_rows).min(
+        popup
+            .items
+            .len()
+            .saturating_sub(visible_rows.min(popup.items.len())),
+    );
+    hit_map.queue_popup_first_index = first;
+    let width = usize::from(sections[1].width);
+    let items = popup
+        .items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+        .map(|(index, item)| {
+            let is_selected = index == selected;
+            let is_current = popup.current == Some(index);
+            let marker = if is_current {
+                "▶"
+            } else if is_selected {
+                "›"
+            } else {
+                " "
+            };
+            let mut label = format!("{marker} {}", item.title);
+            if !item.subtitle.is_empty() {
+                label.push_str(" · ");
+                label.push_str(&item.subtitle);
+            }
+            if !item.length.is_empty() {
+                label.push_str(" · ");
+                label.push_str(&item.length);
+            }
+            ListItem::new(truncate_terminal_text(&label, width)).style(if is_selected {
+                theme.selected
+            } else if is_current {
+                theme.accent
+            } else {
+                theme.base
+            })
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), sections[1]);
+
+    let mut buttons = vec![(
+        button("Enter", "Play", show_hotkeys),
+        UiAction::ActivateQueuePopupRow(selected),
+    )];
+    // Removing the entry that is playing is refused by the controller, so the
+    // control that would ask for it is not offered.
+    if popup.current != Some(selected) {
+        buttons.push((
+            button("x", "Remove", show_hotkeys),
+            UiAction::RemoveQueuePopupRow(selected),
+        ));
+    }
+    buttons.push((button("C", "Clear", show_hotkeys), UiAction::ClearQueue));
+    buttons.push((
+        button("Esc", "Close", show_hotkeys),
+        UiAction::DismissQueuePopup,
+    ));
+    render_queue_popup_buttons(frame, sections[2], buttons, theme, hit_map);
+}
+
+/// Lays the queue controls out on one centered row and records their hit areas.
+fn render_queue_popup_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: Vec<(String, UiAction)>,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let mut x = centered_line_x(area, terminal_text_width(&controls));
+    for (label, action) in buttons {
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
+        if width > 0 {
+            hit_map
+                .queue_popup_buttons
+                .push((action, Rect::new(x, area.y, width, area.height.min(1))));
+        }
+        x = x
+            .saturating_add(terminal_text_width(&label))
+            .saturating_add(3);
+    }
+}
+
 fn render_playlist_popup_buttons<const N: usize>(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -9140,6 +9313,27 @@ fn mouse_action_unfiltered(
                     hit_map.private_note_scroll_offset.saturating_sub(3),
                 ))
             }
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.queue_popup.as_ref() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(hit_map.queue_popup_rows, mouse.column, mouse.row) {
+                    let index = hit_map.queue_popup_first_index.saturating_add(usize::from(
+                        mouse.row.saturating_sub(hit_map.queue_popup_rows.y),
+                    ));
+                    (index < popup.items.len()).then_some(UiAction::SelectQueuePopupRow(index))
+                } else {
+                    hit_map
+                        .queue_popup_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            MouseEventKind::ScrollDown => Some(UiAction::MoveQueuePopupSelection(1)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveQueuePopupSelection(-1)),
             _ => None,
         };
     }
@@ -14297,8 +14491,15 @@ mod tests {
         );
     }
 
+    /// `e` belongs to the Playlists screen alone.
+    ///
+    /// It used to be shared with an equalizer shortcut that only ever answered
+    /// "the equalizer is disabled in direct audiophile mode" — a permanent
+    /// refusal, because `docs/AUDIOPHILE.md` lists equalization among the DSP
+    /// Youta deliberately does not apply. The key is now unbound everywhere
+    /// else, and this test is what says so.
     #[test]
-    fn playlists_screen_edit_shortcut_overrides_equalizer_only_on_that_screen() {
+    fn the_edit_shortcut_exists_only_on_an_editable_playlists_row() {
         let playlists = ViewModel {
             screen: Screen::Playlists,
             playlist_edit_available: true,
@@ -14321,15 +14522,93 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 &playlist_entries
             ),
-            Some(UiAction::OpenEqualizer),
-            "playlist entries without an editable playlist row retain the equalizer shortcut"
+            None,
+            "playlist entries without an editable row leave the key unbound"
         );
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 &ViewModel::default()
             ),
-            Some(UiAction::OpenEqualizer)
+            None
+        );
+    }
+
+    /// The queue draws its entries, marks what is playing, and offers the
+    /// controls whose keys the shared map accepts.
+    ///
+    /// The Remove control is deliberately absent for the playing entry: the
+    /// controller refuses that removal, and offering a control that can only
+    /// answer "no" is what the equalizer key used to do.
+    #[test]
+    fn the_queue_popup_marks_the_playing_entry_and_offers_only_valid_controls() {
+        let queue = crate::view::QueuePopupView {
+            items: vec![
+                crate::view::QueueRowView {
+                    media_id: MediaId::new(SourceKind::Local, "/music/a.flac"),
+                    title: "First queued track".to_owned(),
+                    subtitle: "An Artist".to_owned(),
+                    length: "3:03".to_owned(),
+                },
+                crate::view::QueueRowView {
+                    media_id: MediaId::new(SourceKind::Local, "/music/b.flac"),
+                    title: "Second queued track".to_owned(),
+                    subtitle: String::new(),
+                    length: "4:10".to_owned(),
+                },
+            ],
+            current: Some(0),
+            selected: 0,
+            repeat_one: false,
+        };
+        let view = ViewModel {
+            queue_popup: Some(queue),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("queue terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw the queue");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("Playback queue"));
+        assert!(rendered.contains("Playing 1 of 2"));
+        assert!(rendered.contains("▶ First queued track · An Artist · 3:03"));
+        assert!(rendered.contains("Second queued track · 4:10"));
+        assert!(rendered.contains("[C] Clear"));
+        assert!(
+            !rendered.contains("[x] Remove"),
+            "the playing entry cannot be removed, so no control offers it"
+        );
+        assert!(
+            hit_map
+                .queue_popup_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::ClearQueue),
+            "the controls must be clickable, not only readable"
+        );
+        assert!(!hit_map.queue_popup_rows.is_empty());
+    }
+
+    /// `u` opens the queue, and must not shadow the Alt-chord that scrolls
+    /// Details — the two differ only by a modifier.
+    #[test]
+    fn the_queue_shortcut_is_unmodified_and_leaves_the_details_chord_alone() {
+        let view = ViewModel {
+            details: Some(crate::view::DetailView::default()),
+            details_focused: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenQueuePopup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT), &view),
+            Some(UiAction::ScrollDetails(crate::view::DetailsScroll::Lines(
+                -1
+            )))
         );
     }
 
