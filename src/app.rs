@@ -21077,10 +21077,10 @@ impl AppController {
             .collect();
         #[cfg(not(feature = "wikidata"))]
         let links = Vec::new();
-        #[cfg(feature = "wikidata")]
+        // Artwork is not a Wikidata feature: the item is one of two sources for
+        // it, and the homepage that answers for the rest of the catalogue is
+        // compiled in beside the station itself.
         let thumbnail_url = self.radio_artwork_cache.get(station.id).cloned().flatten();
-        #[cfg(not(feature = "wikidata"))]
-        let thumbnail_url = None;
         let mut details = DetailView {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
             title: station.name.to_owned(),
@@ -21094,7 +21094,6 @@ impl AppController {
         };
         preserve_same_media_wikidata_state(self.view.details.as_ref(), &mut details);
         self.view.details = Some(details);
-        #[cfg(feature = "wikidata")]
         self.request_selected_radio_artwork(station.id);
     }
 
@@ -35802,7 +35801,8 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_music_recommendation_download_selects_exactly_the_first_twenty_in_order() {
-        let temporary = crate::test_support::canonical_tempdir("Yandex recommendation download root");
+        let temporary =
+            crate::test_support::canonical_tempdir("Yandex recommendation download root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -47435,7 +47435,8 @@ mod tests {
     fn controller_with_local_fingerprint_config(
         client_key: Option<&str>,
     ) -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let fixture = crate::test_support::canonical_tempdir("temporary fingerprint controller fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary fingerprint controller fixture");
         let mut config = Config::for_dir(fixture.path().join("youta"));
         config.providers.acoustid_client_key = client_key.map(str::to_owned);
         let store = StateStore::open_in_memory().expect("in-memory fingerprint state");
@@ -47560,7 +47561,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
-        let media = crate::test_support::canonical_tempdir("temporary fingerprint eligibility fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint eligibility fixture");
         let audio = media.path().join("track.flac");
         let video = media.path().join("clip.mp4");
         let image = media.path().join("cover.jpg");
@@ -47775,7 +47777,8 @@ mod tests {
     fn local_fingerprint_completion_projects_ranked_musicbrainz_links() {
         const HIGH_RECORDING: &str = "11111111-1111-4111-8111-111111111111";
         const LOW_RECORDING: &str = "22222222-2222-4222-8222-222222222222";
-        let media = crate::test_support::canonical_tempdir("temporary candidate projection fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary candidate projection fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47842,7 +47845,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn tick_reveals_fingerprint_action_after_selected_file_replacement() {
-        let media = crate::test_support::canonical_tempdir("temporary fingerprint revalidation fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint revalidation fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"original audio fixture")
             .expect("write original fingerprint fixture");
@@ -48304,7 +48308,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn replacement_identity_rejects_an_obsolete_fingerprint_completion() {
-        let media = crate::test_support::canonical_tempdir("temporary replacement fingerprint fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary replacement fingerprint fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"old audio").expect("write original audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48411,7 +48416,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn changing_local_selection_cancels_the_exact_fingerprint_request() {
-        let media = crate::test_support::canonical_tempdir("temporary selection cancellation fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary selection cancellation fixture");
         let first = media.path().join("first.flac");
         let second = media.path().join("second.flac");
         std::fs::write(&first, b"first audio").expect("write first audio fixture");
@@ -48485,7 +48491,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_worker_shutdown_cancels_and_joins_active_work() {
-        let media = crate::test_support::canonical_tempdir("temporary fingerprint shutdown fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint shutdown fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -48864,7 +48871,8 @@ mod tests {
             (Duration::from_millis(1_900), 1),
             (Duration::from_millis(900), 0),
         ] {
-            let fixture = crate::test_support::canonical_tempdir("temporary active waveform fixture");
+            let fixture =
+                crate::test_support::canonical_tempdir("temporary active waveform fixture");
             let media_path = fixture.path().join("short.flac");
             std::fs::write(&media_path, b"short local audio")
                 .expect("write active waveform fixture");
@@ -48896,7 +48904,8 @@ mod tests {
             (Duration::from_millis(900), 0),
         ] {
             for play_another_local_file in [false, true] {
-                let fixture = crate::test_support::canonical_tempdir("temporary inactive waveform fixture");
+                let fixture =
+                    crate::test_support::canonical_tempdir("temporary inactive waveform fixture");
                 let selected_path = fixture.path().join("selected.flac");
                 let other_path = fixture.path().join("other.flac");
                 std::fs::write(&selected_path, b"selected local audio")
@@ -49093,7 +49102,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn generic_local_queue_start_captures_identity_for_waveform_seek() {
-        let fixture = crate::test_support::canonical_tempdir("temporary generic Local queue fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary generic Local queue fixture");
         let media_path = fixture.path().join("queued.flac");
         std::fs::write(&media_path, b"queued local audio")
             .expect("write generic Local queue fixture");
@@ -49245,7 +49255,8 @@ mod tests {
     fn selected_local_waveform_uses_original_non_utf8_path() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 waveform fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 waveform fixture");
         let filename = std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec());
         let media_path = fixture.path().join(filename);
         std::fs::write(&media_path, b"non-UTF-8 local audio")
@@ -49271,7 +49282,8 @@ mod tests {
     fn non_utf8_local_media_ids_and_waveform_targets_remain_distinct() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 collision fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 collision fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -49336,7 +49348,8 @@ mod tests {
     fn non_utf8_local_files_keep_separate_progress_and_history() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = crate::test_support::canonical_tempdir("temporary non-UTF-8 playback fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 playback fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -49398,7 +49411,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn hiding_waveform_cancels_local_waveform_request() {
-        let fixture = crate::test_support::canonical_tempdir("temporary waveform visibility fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform visibility fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"local audio").expect("write waveform visibility fixture");
         let request = LocalWaveformRequest::from_path(media_path.clone())
@@ -49428,7 +49442,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn selecting_metadata_loading_file_cancels_previous_waveform() {
-        let fixture = crate::test_support::canonical_tempdir("temporary waveform selection fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform selection fixture");
         let first_path = fixture.path().join("first.flac");
         let second_path = fixture.path().join("second.flac");
         std::fs::write(&first_path, b"first local audio").expect("write first waveform fixture");
@@ -49549,7 +49564,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn completed_waveform_is_revalidated_before_display_after_replacement() {
-        let fixture = crate::test_support::canonical_tempdir("temporary completed replacement fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary completed replacement fixture");
         let media_path = fixture.path().join("completed.flac");
         std::fs::write(&media_path, b"old completed waveform")
             .expect("write completed replacement fixture");
@@ -49632,7 +49648,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn waveform_click_rejects_changed_duration_for_same_file_identity() {
-        let fixture = crate::test_support::canonical_tempdir("temporary duration correction fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary duration correction fixture");
         let media_path = fixture.path().join("duration.flac");
         std::fs::write(&media_path, b"duration correction local audio")
             .expect("write duration correction fixture");
@@ -50095,7 +50112,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_is_scoped_to_exact_timeline_duration() {
-        let fixture = crate::test_support::canonical_tempdir("temporary waveform duration-cache fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform duration-cache fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"duration-sensitive waveform")
             .expect("write waveform duration-cache fixture");
@@ -50142,7 +50160,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_replaces_stale_file_identity_for_same_path() {
-        let fixture = crate::test_support::canonical_tempdir("temporary waveform replacement fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform replacement fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"old").expect("write original waveform fixture");
         let original =
@@ -56306,7 +56325,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_a_cross_directory_queue_transition() {
-        let root = crate::test_support::canonical_tempdir("temporary cross-directory waveform root");
+        let root =
+            crate::test_support::canonical_tempdir("temporary cross-directory waveform root");
         let first_directory = root.path().join("first-album");
         let second_directory = root.path().join("second-album");
         std::fs::create_dir(&first_directory).expect("first album folder");
@@ -56414,7 +56434,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_after_an_intervening_non_local_queue_item() {
-        let directory = crate::test_support::canonical_tempdir("temporary mixed-queue waveform folder");
+        let directory =
+            crate::test_support::canonical_tempdir("temporary mixed-queue waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first mixed-queue waveform fixture")

@@ -470,7 +470,9 @@ mod tests {
     use youta::domain::{MediaId, SourceKind};
     use youta::view::{NowPlayingView, UiAction, ViewModel};
 
-    use super::{Announced, MediaCommand, MediaFacts, MediaState, announce, command_for};
+    use super::{
+        Announced, MediaCommand, MediaFacts, MediaState, POSITION_RESYNC, announce, command_for,
+    };
 
     /// Builds a snapshot of one identified item, held by a live backend.
     fn playing(id: &str, title: &str, artist: &str) -> ViewModel {
@@ -492,7 +494,11 @@ mod tests {
     fn a_surface_that_is_already_right_is_told_nothing() {
         let mut state = Announced::default();
         let start = Instant::now();
-        let view = playing("a", "First", "Creator");
+        let mut view = playing("a", "First", "Creator");
+        // A fraction of a second in, so the tick below lands on a whole second
+        // the surface was never handed and it is the extrapolation that answers
+        // rather than the two numbers happening to match.
+        view.playback.position = Duration::from_millis(700);
 
         let first =
             announce(&view, start, &mut state).expect("the first snapshot states everything");
@@ -507,20 +513,25 @@ mod tests {
         assert_eq!(first.state, Some(MediaState::Playing(Duration::ZERO)));
         assert!(announce(&view, start, &mut state).is_none());
 
-        // Time passing is not news: the surface extrapolates, and where it does
-        // not, the resync below covers it.
+        // Time passing is not news for as long as the surface extrapolates it,
+        // which is one resync window — a window that is two orders of magnitude
+        // apart between MPRIS and the rest, so the tick is taken from it rather
+        // than written down. Past it the interval speaks whatever the position
+        // says, which `a_running_transport_is_resynchronised_on_its_own_interval`
+        // covers.
+        let tick = POSITION_RESYNC / 2;
         let mut moved = view.clone();
-        moved.playback.position = Duration::from_millis(1_400);
+        moved.playback.position = view.playback.position + tick;
         assert!(
-            announce(&moved, start + Duration::from_millis(1_400), &mut state).is_none(),
+            announce(&moved, start + tick, &mut state).is_none(),
             "a position exactly where the surface expects it says nothing"
         );
 
         // Pausing is, and it carries the clock with it.
         let mut held = moved.clone();
         held.playback.paused = true;
-        let update = announce(&held, start + Duration::from_millis(1_500), &mut state)
-            .expect("the transport changed");
+        held.playback.position = Duration::from_millis(1_400);
+        let update = announce(&held, start + tick, &mut state).expect("the transport changed");
         assert_eq!(update.facts, None);
         assert_eq!(
             update.state,
@@ -543,15 +554,19 @@ mod tests {
         let start = Instant::now();
         let mut view = playing("a", "First", "");
         view.playback.duration = Some(Duration::from_secs(600));
+        view.playback.position = Duration::from_millis(700);
         announce(&view, start, &mut state).expect("the first snapshot");
 
-        // Ten seconds later, ten seconds in: exactly where it was expected.
-        view.playback.position = Duration::from_secs(10);
-        assert!(announce(&view, start + Duration::from_secs(10), &mut state).is_none());
+        // Half a resync window later, half a window in: exactly where it was
+        // expected. Half, because a whole one is resent on the interval alone
+        // and this is the extrapolation being tested, not the interval.
+        let tick = POSITION_RESYNC / 2;
+        view.playback.position += tick;
+        assert!(announce(&view, start + tick, &mut state).is_none());
 
-        // Ten seconds later, sixty seconds in: somebody sought.
+        // That same moment, a minute in: somebody sought.
         view.playback.position = Duration::from_secs(60);
-        let update = announce(&view, start + Duration::from_secs(20), &mut state)
+        let update = announce(&view, start + tick, &mut state)
             .expect("a seek must reach the surface at once");
         assert_eq!(
             update.state,
@@ -561,8 +576,8 @@ mod tests {
         // A doubled rate moves twice as far in the same time, and that is not a
         // seek either.
         view.playback.speed = 2.0;
-        view.playback.position = Duration::from_secs(80);
-        assert!(announce(&view, start + Duration::from_secs(30), &mut state).is_none());
+        view.playback.position = Duration::from_secs(60) + tick * 2;
+        assert!(announce(&view, start + tick * 2, &mut state).is_none());
     }
 
     /// A stopped player left alone must not restate itself.
@@ -622,7 +637,7 @@ mod tests {
         let mut view = playing("a", "First", "");
         announce(&view, start, &mut state).expect("the first snapshot");
 
-        let resync = super::POSITION_RESYNC;
+        let resync = POSITION_RESYNC;
         view.playback.position = resync - Duration::from_millis(1);
         assert!(
             announce(&view, start + resync - Duration::from_millis(1), &mut state).is_none(),
