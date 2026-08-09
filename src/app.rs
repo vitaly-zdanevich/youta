@@ -33777,13 +33777,45 @@ fn local_media_id(path: &Path) -> MediaId {
 
 /// Recovers an exact Local path from a current file-URL or legacy path locator.
 fn local_path_from_locator(locator: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(locator)
+    let path = if let Ok(url) = url::Url::parse(locator)
         && url.scheme() == "file"
     {
-        return url.to_file_path().ok();
-    }
-    let path = PathBuf::from(locator);
-    path.is_absolute().then_some(path)
+        url.to_file_path().ok()?
+    } else {
+        let path = PathBuf::from(locator);
+        if !path.is_absolute() {
+            return None;
+        }
+        path
+    };
+    Some(settled_local_path(path))
+}
+
+/// Returns `path` in the one spelling the rest of the Local code compares to.
+///
+/// Windows spells one file two ways: [`std::fs::canonicalize`] answers with a
+/// `\\?\` verbatim prefix, and a file URL cannot carry that prefix, so a path
+/// that has been through a locator arrives in the other spelling and stops
+/// comparing equal to the canonical paths every other Local seam holds. Settling
+/// it here is what keeps one identity comparable to itself.
+///
+/// A path naming nothing cannot be settled and is returned exactly as it
+/// decoded — remapping a move that has already happened is that case, and it
+/// still needs the old path to look up.
+#[cfg(windows)]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Returns `path` unchanged, because this platform spells a file one way.
+///
+/// A file URL round trip is already lossless here, so canonicalising would buy
+/// nothing and would additionally resolve symbolic links — which Local browsing
+/// deliberately does not follow, and which would silently merge a link with its
+/// target into one identity.
+#[cfg(not(windows))]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Recovers the exact path carried by a Local media identity.

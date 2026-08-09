@@ -604,13 +604,43 @@ pub enum LocalIdentityRemapError {
 
 /// Decodes a current file-URL or legacy absolute-path Local locator.
 fn local_locator_path(locator: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(locator)
+    let path = if let Ok(url) = url::Url::parse(locator)
         && url.scheme() == "file"
     {
-        return url.to_file_path().ok();
-    }
-    let path = PathBuf::from(locator);
-    path.is_absolute().then_some(path)
+        url.to_file_path().ok()?
+    } else {
+        let path = PathBuf::from(locator);
+        if !path.is_absolute() {
+            return None;
+        }
+        path
+    };
+    Some(settled_local_path(path))
+}
+
+/// Returns `path` in the one spelling the mappings below are stated in.
+///
+/// Windows spells one file two ways: [`std::fs::canonicalize`] answers with a
+/// `\\?\` verbatim prefix, and a file URL cannot carry that prefix, so a locator
+/// decodes into the other spelling while a mapping holds the canonical one and
+/// the prefix match never fires.
+///
+/// A path naming nothing is returned exactly as it decoded. That is the ordinary
+/// case here — remapping runs after the file has already moved away — so the
+/// source side of a mapping still has to be matched by the caller in whatever
+/// spelling it was stated.
+#[cfg(windows)]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Returns `path` unchanged, because this platform spells a file one way.
+///
+/// A file URL round trip is already lossless here, and canonicalising would
+/// additionally resolve symbolic links, which this module never follows.
+#[cfg(not(windows))]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 trait NoReplaceRenamer {
