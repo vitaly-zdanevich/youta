@@ -142,6 +142,14 @@ pub enum ThumbnailState {
     reason = "these independently observed terminal facts are not a state machine"
 )]
 pub struct TerminalInfo {
+    /// Whether this binary is running on Linux.
+    ///
+    /// An observed fact like every other field here rather than a `cfg!` read
+    /// at the point of use, because the virtual-console policy below is
+    /// ordinary logic that every platform's build should be able to exercise.
+    /// Deciding it from the compilation target instead left the Linux console
+    /// rules untested anywhere but Linux.
+    pub linux: bool,
     /// Whether standard input is attached to a terminal.
     pub stdin_is_terminal: bool,
     /// Whether standard output is attached to a terminal.
@@ -182,6 +190,7 @@ impl TerminalInfo {
             .into_iter()
             .any(|name| std::env::var_os(name).is_some());
         Self {
+            linux: cfg!(target_os = "linux"),
             stdin_is_terminal: io::stdin().is_terminal(),
             stdout_is_terminal: io::stdout().is_terminal(),
             term,
@@ -199,7 +208,7 @@ impl TerminalInfo {
     /// Returns whether output is a directly attached Linux virtual console.
     fn confirmed_linux_virtual_console(&self) -> bool {
         TerminalAttachment {
-            linux: cfg!(target_os = "linux"),
+            linux: self.linux,
             stdin_is_terminal: self.stdin_is_terminal,
             stdout_is_terminal: self.stdout_is_terminal,
             term: self.term.clone(),
@@ -2549,6 +2558,10 @@ pub(crate) mod tests {
 
     fn graphical_terminal() -> TerminalInfo {
         TerminalInfo {
+            // The console rules are what several of these tests are about, so
+            // the base fixture claims Linux and the build target is not
+            // allowed to decide the answer for them.
+            linux: true,
             stdin_is_terminal: true,
             stdout_is_terminal: true,
             term: Some("xterm-kitty".to_owned()),

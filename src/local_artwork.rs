@@ -711,7 +711,9 @@ mod tests {
         let url = cached_local_artwork(&media_path, &cache_directory)
             .expect("extract embedded artwork")
             .expect("embedded artwork");
-        let cache_path = url.to_file_path().expect("absolute cache file URL");
+        let cache_path = crate::test_support::one_path_shape(
+            &url.to_file_path().expect("absolute cache file URL"),
+        );
 
         assert_eq!(read_file_url(&url), artwork);
         assert_eq!(
@@ -848,7 +850,9 @@ mod tests {
     /// downloads carry no embedded picture at all.
     #[test]
     fn a_sidecar_image_covers_media_that_has_no_embedded_picture() {
-        let directory = tempfile::tempdir().expect("temporary local-media directory");
+        // The sidecar is compared against the path the published URL names, so
+        // the fixture has to stand in the same shape that URL settles on.
+        let directory = crate::test_support::canonical_tempdir("temporary local-media directory");
         let cache_directory = directory.path().join("thumbnail-cache");
         let media_path = directory.path().join("Popular Monster [ydK1vjQBvp0].mp3");
         let sidecar = directory.path().join("Popular Monster [ydK1vjQBvp0].webp");
@@ -858,7 +862,12 @@ mod tests {
         let url = local_media_artwork(&media_path, &cache_directory)
             .expect("discover sidecar artwork")
             .expect("sidecar artwork must exist");
-        assert_eq!(url.to_file_path().as_deref(), Ok(sidecar.as_path()));
+        assert_eq!(
+            url.to_file_path()
+                .as_deref()
+                .map(crate::test_support::one_path_shape),
+            Ok(sidecar.clone())
+        );
         assert!(
             !cache_directory.exists(),
             "a sidecar is published where it lies rather than copied"

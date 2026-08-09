@@ -1693,7 +1693,11 @@ mod tests {
 
     #[test]
     fn raw_module_is_cached_privately_and_reused_without_transport() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        // The cache root below is compared against this path by prefix, and the
+        // preparer reports a canonical one, so the fixture has to be canonical
+        // too — macOS resolves `/var` to `/private/var` and Windows answers
+        // behind a `\\?\` prefix.
+        let temporary = crate::test_support::canonical_tempdir("temporary tracker cache root");
         let url = "https://modules.example/music?id=42";
         let transport = MockTransport::once(url, s3m_fixture());
         let mut preparer =

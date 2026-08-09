@@ -47208,7 +47208,9 @@ mod tests {
         assert_eq!(
             row("Popular Monster [ydK1vjQBvp0].opus")
                 .as_ref()
-                .and_then(|url| url.to_file_path().ok()),
+                .and_then(|url| url.to_file_path().ok())
+                .as_deref()
+                .map(crate::test_support::one_path_shape),
             Some(cover)
         );
         assert_eq!(row("Ronald [RAoirYYwPgU].opus"), None);
@@ -47257,7 +47259,11 @@ mod tests {
         let artwork = crate::local_artwork::local_media_artwork(&path, &cache_directory)
             .expect("discover downloaded artwork");
         assert_eq!(
-            artwork.as_ref().and_then(|url| url.to_file_path().ok()),
+            artwork
+                .as_ref()
+                .and_then(|url| url.to_file_path().ok())
+                .as_deref()
+                .map(crate::test_support::one_path_shape),
             Some(sidecar),
             "the sidecar thumbnail is the cover a download actually has"
         );
