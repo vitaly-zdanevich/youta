@@ -72,6 +72,8 @@ pub enum Screen {
     Bandcamp,
     /// Podcast-show discovery through Apple's public catalogue.
     ApplePodcasts,
+    /// Public-domain audiobook discovery through `LibriVox`.
+    LibriVox,
     /// Curated public live-radio stations.
     Radio,
     /// Aggregated tracker-module search across dedicated archives.
@@ -91,12 +93,13 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::YandexMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
+        Self::LibriVox,
         Self::Radio,
         Self::TrackerMusic,
         Self::Subscriptions,
@@ -114,6 +117,7 @@ impl Screen {
             Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
+            Self::LibriVox => cfg!(feature = "librivox"),
             Self::Radio => cfg!(feature = "radio"),
             _ => true,
         }
@@ -129,6 +133,7 @@ impl Screen {
         match self {
             Self::Local => InformationPanelKind::Local,
             Self::ApplePodcasts => InformationPanelKind::Podcast,
+            Self::LibriVox => InformationPanelKind::Audiobook,
             Self::Radio => InformationPanelKind::Radio,
             Self::YandexMusic => InformationPanelKind::YandexMusic,
             Self::Bandcamp | Self::Playlists | Self::History => InformationPanelKind::Generic,
@@ -152,6 +157,7 @@ impl Screen {
             | Self::YandexMusic
             | Self::Bandcamp
             | Self::ApplePodcasts
+            | Self::LibriVox
             | Self::TrackerMusic => Some("Search"),
             Self::Radio => Some("Filter"),
             Self::Subscriptions
@@ -165,11 +171,12 @@ impl Screen {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Search => "YouTube",
-            Self::YouTubeMusic => "YouTube Music",
+            Self::Search => "YT",
+            Self::YouTubeMusic => "YT Music",
             Self::YandexMusic => "YandexMusic",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple Podcasts",
+            Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD/tracker",
             Self::Local => "Local",
@@ -183,11 +190,12 @@ impl Screen {
 
     pub(crate) const fn compact_label(self) -> &'static str {
         match self {
-            Self::Search => "YouTube",
+            Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple",
+            Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
@@ -464,6 +472,8 @@ pub enum SearchActivity {
     Bandcamp,
     /// A show search through Apple's public podcast catalogue.
     ApplePodcasts,
+    /// A public-domain audiobook search through `LibriVox`.
+    LibriVox,
     /// An aggregate search through the enabled MOD/tracker archives.
     TrackerArchives,
 }
@@ -477,6 +487,7 @@ impl SearchActivity {
             Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
             Self::ApplePodcasts => Screen::ApplePodcasts,
+            Self::LibriVox => Screen::LibriVox,
             Self::TrackerArchives => Screen::TrackerMusic,
         }
     }
@@ -549,6 +560,8 @@ pub enum InformationPanelKind {
     Video,
     /// Podcast show or episode details without video-only statistics.
     Podcast,
+    /// Public-domain audiobook or section details without video-only statistics.
+    Audiobook,
     /// Channel details with subscriber metadata.
     Channel,
     /// Public live-radio metadata without finite-media statistics.
@@ -594,6 +607,11 @@ pub struct DetailView {
     pub length: String,
     /// Description text.
     pub description: String,
+    /// Full Last.fm artist biography discovered after local fingerprinting.
+    ///
+    /// This enrichment is kept separate from [`Self::description`] so a late
+    /// network completion cannot duplicate or overwrite rebuilt local metadata.
+    pub lastfm_artist_description: String,
     /// Parsed timecode spans that can seek or start the selected media.
     pub timecodes: Vec<DetailTimecodeView>,
     /// Parsed `YouTube` video URLs that may replace Details internally.
@@ -1112,6 +1130,8 @@ pub enum DetailLinkInternalTarget {
     YandexMusicArtist(String),
     /// One stable Yandex Music album, show, or audiobook identifier.
     YandexMusicAlbum(String),
+    /// One stable numeric `LibriVox` author identifier.
+    LibriVoxAuthor(String),
 }
 
 impl DetailLinkInternalTarget {
@@ -1120,6 +1140,7 @@ impl DetailLinkInternalTarget {
         match self {
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
+            Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
         }
     }
 }
@@ -1132,6 +1153,8 @@ pub enum DetailLinkPresentation {
     LabelAndUrl,
     /// Render the human label and URL, then reserve one non-clickable row.
     LabelAndUrlSpaced,
+    /// Render only the human-readable label.
+    LabelOnly,
     /// Render only the label and reserve one non-clickable row after it.
     LabelOnlySpaced,
     /// Render only the URL.
@@ -1832,6 +1855,8 @@ pub enum UiAction {
     OpenYandexMusicArtistById(String),
     /// Open one exact Yandex Music album selected from a Details link.
     OpenYandexMusicAlbumById(String),
+    /// Open one exact `LibriVox` author selected from a Details link.
+    OpenLibriVoxAuthorById(String),
     /// Download every track in the currently opened or selected album.
     DownloadYandexMusicAlbum,
     /// Download the first twenty current My Wave recommendations.

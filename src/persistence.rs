@@ -24,12 +24,16 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::{Config, ConfigError, PersistenceBackend};
+#[cfg(all(test, feature = "sqlite-state"))]
+use crate::domain::librivox_section_external_id;
 use crate::domain::{
     BandcampReleaseKind, BandcampSearchSummary, Bookmark, CommentTarget, HistoryEntry, MediaId,
     MediaItem, MediaKind, PlaybackProgress, Playlist, PlaylistEntry, PlaylistId,
     PlaylistMediaSnapshot, PlaylistMembership, PlaylistSummary, PodcastShowSummary, PrivateComment,
     RADIO_FAVORITES_PLAYLIST_ID, RADIO_FAVORITES_PLAYLIST_NAME, SessionState, SourceKind,
-    TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink, remote_url_has_non_public_host,
+    TODO_PLAYLIST_ID, TODO_PLAYLIST_NAME, WikidataLink, is_canonical_librivox_audio_url,
+    is_canonical_librivox_book_url, parse_librivox_section_external_id,
+    remote_url_has_non_public_host,
 };
 #[cfg(feature = "yandex-music")]
 use crate::domain::{
@@ -4817,6 +4821,7 @@ fn validate_playlist_replay_locator(media: &PlaylistMediaSnapshot) -> Result<(),
         SourceKind::YouTube => validate_youtube_playlist_snapshot(media)?,
         SourceKind::ApplePodcasts => validate_apple_playlist_snapshot(media)?,
         SourceKind::Bandcamp => validate_bandcamp_playlist_snapshot(media)?,
+        SourceKind::LibriVox => validate_librivox_playlist_snapshot(media)?,
         _ => {
             if media.replay_locator != media.webpage_url.as_str()
                 || media.webpage_url.query().is_some()
@@ -4826,6 +4831,31 @@ fn validate_playlist_replay_locator(media: &PlaylistMediaSnapshot) -> Result<(),
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_librivox_playlist_snapshot(
+    media: &PlaylistMediaSnapshot,
+) -> Result<(), PersistenceError> {
+    if media.kind != MediaKind::Audio
+        || parse_librivox_section_external_id(&media.id.external_id).is_none()
+    {
+        return Err(invalid_playlist(
+            "LibriVox playlist items must identify one book section",
+        ));
+    }
+    let replay_url = Url::parse(&media.replay_locator)
+        .map_err(|_| invalid_playlist("LibriVox playlist audio URL is malformed"))?;
+    if !is_canonical_librivox_audio_url(&replay_url) {
+        return Err(invalid_playlist(
+            "LibriVox playlist replay must use a stable Archive.org MP3 download",
+        ));
+    }
+    if !is_canonical_librivox_book_url(&media.webpage_url) && media.webpage_url != replay_url {
+        return Err(invalid_playlist(
+            "LibriVox playlist webpages must use the book page or matching stable chapter audio",
+        ));
     }
     Ok(())
 }
@@ -7231,6 +7261,13 @@ fn validate_history_replay_locator(
                 ));
             }
         }
+        SourceKind::LibriVox => {
+            if !is_canonical_librivox_audio_url(&url) {
+                return Err(invalid(
+                    "LibriVox replay URLs must use a stable Archive.org MP3 download",
+                ));
+            }
+        }
         _ if !query.is_empty() => {
             return Err(invalid(
                 "query parameters are not trusted for this replay source",
@@ -7743,6 +7780,28 @@ mod tests {
             ),
             duration_seconds: Some(240),
             replay_locator: webpage_url.to_string(),
+        }
+    }
+
+    fn librivox_playlist_media() -> PlaylistMediaSnapshot {
+        PlaylistMediaSnapshot {
+            id: MediaId::new(
+                SourceKind::LibriVox,
+                librivox_section_external_id(5_936, 77_736),
+            ),
+            kind: MediaKind::Audio,
+            title: "Introduction and Chapter I".to_owned(),
+            creator: Some("Alexander Aaronsohn".to_owned()),
+            webpage_url: Url::parse(
+                "https://librivox.org/with-the-turks-in-palestine-by-alexander-aaronsohn/",
+            )
+            .expect("valid LibriVox book URL"),
+            thumbnail_url: Some(
+                Url::parse("https://archive.org/download/fixture/cover.jpg")
+                    .expect("valid LibriVox artwork URL"),
+            ),
+            duration_seconds: Some(667),
+            replay_locator: "https://archive.org/download/fixture/chapter_01.mp3".to_owned(),
         }
     }
 
@@ -8867,6 +8926,47 @@ mod tests {
     }
 
     #[test]
+    fn librivox_playlist_keeps_book_page_and_exact_stable_chapter_audio() {
+        let store = StateStore::open_in_memory().expect("open store");
+        let media = librivox_playlist_media();
+        store.add_to_todo(&media, 1).expect("save LibriVox item");
+        assert_eq!(
+            store
+                .playlist(TODO_PLAYLIST_ID)
+                .expect("load todo")
+                .expect("todo exists")
+                .entries[0]
+                .media,
+            media
+        );
+        let mut history_derived = librivox_playlist_media();
+        history_derived.webpage_url =
+            Url::parse(&history_derived.replay_locator).expect("stable chapter audio URL");
+        validate_playlist_snapshot(&history_derived)
+            .expect("History-derived LibriVox snapshot remains playlist-safe");
+
+        let mut invalid = librivox_playlist_media();
+        for replay_locator in [
+            "https://example.org/download/fixture/chapter_01.mp3",
+            "https://archive.org/details/fixture",
+            "https://archive.org/download/fixture/chapter_01.ogg",
+            "https://archive.org/download/fixture/chapter_01.mp3?token=secret",
+        ] {
+            invalid.replay_locator = replay_locator.to_owned();
+            assert!(matches!(
+                store.add_to_todo(&invalid, 2),
+                Err(PersistenceError::InvalidPlaylist { .. })
+            ));
+        }
+        invalid = librivox_playlist_media();
+        invalid.id.external_id = "section:77736".to_owned();
+        assert!(matches!(
+            store.add_to_todo(&invalid, 2),
+            Err(PersistenceError::InvalidPlaylist { .. })
+        ));
+    }
+
+    #[test]
     fn playlist_read_rejects_snapshot_identity_corruption() {
         let store = StateStore::open_in_memory().expect("open store");
         let media = youtube_playlist_media("dQw4w9WgXcQ", "Original");
@@ -9061,6 +9161,19 @@ mod tests {
             "https://podcasts.apple.com/us/podcast/show/id1756129194?i=1000719462606".to_owned(),
         );
         assert!(store.insert_history(&entry).is_ok());
+
+        entry.media_id = MediaId::new(
+            SourceKind::LibriVox,
+            librivox_section_external_id(5_936, 77_736),
+        );
+        entry.replay_locator =
+            Some("https://archive.org/download/fixture/chapter_01.mp3".to_owned());
+        assert!(store.insert_history(&entry).is_ok());
+        entry.replay_locator = Some("https://archive.org/details/fixture".to_owned());
+        assert!(matches!(
+            store.insert_history(&entry),
+            Err(PersistenceError::InvalidHistoryReplayLocator { .. })
+        ));
     }
 
     #[test]

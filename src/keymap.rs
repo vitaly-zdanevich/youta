@@ -816,6 +816,7 @@ fn unfiltered_key_action(
             Some(UiAction::GoBack)
         }
         Key::Esc if view.playlist_back_available => Some(UiAction::GoBack),
+        Key::Esc if view.screen == Screen::LibriVox => Some(UiAction::GoBack),
         Key::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         Key::Up if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
@@ -837,12 +838,26 @@ fn unfiltered_key_action(
         Key::PageDown if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
         }
-        Key::PageUp if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX))),
-        Key::PageDown if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX))),
+        Key::PageUp
+            if matches!(
+                view.screen,
+                Screen::LibriVox | Screen::Local | Screen::Radio
+            ) =>
+        {
+            page_rows
+                .filter(|rows| *rows > 0)
+                .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX)))
+        }
+        Key::PageDown
+            if matches!(
+                view.screen,
+                Screen::LibriVox | Screen::Local | Screen::Radio
+            ) =>
+        {
+            page_rows
+                .filter(|rows| *rows > 0)
+                .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX)))
+        }
         Key::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
         Key::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
         Key::Char('j') => Some(UiAction::MoveSelection(1)),

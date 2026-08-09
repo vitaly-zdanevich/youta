@@ -27,6 +27,10 @@ pub mod github;
 pub mod invidious;
 #[cfg(feature = "jamendo")]
 pub mod jamendo;
+#[cfg(feature = "lastfm")]
+pub mod lastfm;
+#[cfg(feature = "librivox")]
+pub mod librivox;
 #[cfg(feature = "litres")]
 pub mod litres;
 #[cfg(feature = "tracker-music")]
@@ -1123,6 +1127,7 @@ pub fn validate_youtube_video_id(video_id: &str) -> Result<(), ProviderError> {
     feature = "funkwhale",
     feature = "invidious",
     feature = "jamendo",
+    feature = "lastfm",
     feature = "litres",
     feature = "peertube",
     feature = "radio",

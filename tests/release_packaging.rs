@@ -92,6 +92,15 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
         "QR encoding must not pull the crate's image renderer into text builds"
     );
     assert!(!yandex_free.contains("yandex-music"));
+    assert!(
+        yandex_free.contains("librivox"),
+        "the complete application profile must expose LibriVox by default"
+    );
+    assert_eq!(
+        feature_entries(&manifest, "librivox"),
+        ["network"],
+        "LibriVox must remain independently removable without source-specific dependencies"
+    );
     for yandex_only_dependency in ["dep:aes", "dep:ctr", "dep:hmac"] {
         assert!(
             !yandex_free.contains(yandex_only_dependency),
@@ -332,6 +341,18 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
             workflow.contains("--features tui,yandex-music\n"),
             "workflow omits the standalone Yandex Music lane without Wikidata"
         );
+        assert!(
+            workflow.contains("--features tui,librivox\n"),
+            "workflow omits the standalone LibriVox lane without Wikidata"
+        );
+        assert!(
+            workflow.contains("--features librivox\n"),
+            "workflow omits the isolated LibriVox provider boundary"
+        );
+        assert!(
+            workflow.contains("--features tui,librivox,wikidata"),
+            "workflow omits the LibriVox and Wikidata composition boundary"
+        );
     }
 }
 
@@ -513,6 +534,24 @@ fn live_radio_workflow_retries_each_provider_independently() {
             "`{step_name}` chains another live Radio test inside its retry boundary"
         );
     }
+}
+
+#[test]
+fn live_librivox_workflow_guards_api_html_and_audio_contracts() {
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    let job = ci
+        .split_once("  live-librivox:\n")
+        .expect("CI retains the live LibriVox job")
+        .1
+        .split_once("\n  live-wikidata:\n")
+        .expect("live LibriVox remains before live Wikidata")
+        .0;
+
+    assert!(job.contains("timeout-minutes: 360"));
+    assert!(job.contains("YOUTA_RUN_LIVE_LIBRIVOX_TEST: '1'"));
+    assert!(job.contains("--features librivox"));
+    assert!(job.contains("--exact librivox_catalogue_book_author_and_audio_are_usable"));
+    assert!(job.contains("for attempt in 1 2; do"));
 }
 
 #[test]

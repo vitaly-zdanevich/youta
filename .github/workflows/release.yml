@@ -81,6 +81,9 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features app-core
           cargo test --locked --all-targets --no-default-features --features app-core,images
           cargo test --locked --all-targets --no-default-features --features app-core,images,qr
+          cargo test --locked --lib --no-default-features --features librivox
+          cargo test --locked --all-targets --no-default-features --features tui,librivox
+          cargo test --locked --all-targets --no-default-features --features tui,librivox,wikidata
           cargo test --locked --all-targets --no-default-features --features app
           cargo test --locked --all-targets --no-default-features --features app,images
           cargo test --locked --all-targets --no-default-features --features app,qr
@@ -108,6 +111,9 @@ jobs:
           cargo test --locked --doc --no-default-features --features app-core
           cargo test --locked --doc --no-default-features --features app-core,images
           cargo test --locked --doc --no-default-features --features app-core,images,qr
+          cargo test --locked --doc --no-default-features --features librivox
+          cargo test --locked --doc --no-default-features --features tui,librivox
+          cargo test --locked --doc --no-default-features --features tui,librivox,wikidata
           cargo test --locked --doc --no-default-features --features app
           cargo test --locked --doc --no-default-features --features app,images
           cargo test --locked --doc --no-default-features --features app,qr

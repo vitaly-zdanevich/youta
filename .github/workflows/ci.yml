@@ -98,6 +98,12 @@ jobs:
             feature_arguments: --no-default-features --features tui,acoustid,wikidata
           - feature_set: TUI with Apple Podcasts
             feature_arguments: --no-default-features --features tui,apple-podcasts
+          - feature_set: standalone LibriVox provider
+            feature_arguments: --no-default-features --features librivox
+          - feature_set: TUI with LibriVox
+            feature_arguments: --no-default-features --features tui,librivox
+          - feature_set: TUI with LibriVox and Wikidata
+            feature_arguments: --no-default-features --features tui,librivox,wikidata
           - feature_set: TUI with Bandcamp
             feature_arguments: --no-default-features --features tui,bandcamp
           - feature_set: TUI with Radio
@@ -172,6 +178,9 @@ jobs:
           cargo check --locked --no-default-features --features tui,local-move
           cargo check --locked --no-default-features --features images,local-artwork
           cargo check --locked --no-default-features --features tui,local
+          cargo check --locked --no-default-features --features librivox --lib
+          cargo check --locked --no-default-features --features tui,librivox
+          cargo check --locked --no-default-features --features tui,librivox,wikidata
           cargo check --locked --no-default-features --features app-core
           cargo check --locked --no-default-features --features app-core,images
           cargo check --locked --no-default-features --features app-core,images,qr
@@ -722,6 +731,50 @@ jobs:
               -- \
               --ignored \
               --exact apple_podcasts_lookup_rss_and_audio_are_usable \
+              --nocapture
+            then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 2 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+  live-librivox:
+    name: Live LibriVox API and pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Validate the public API, HTML selectors, and chapter endpoint
+        env:
+          YOUTA_RUN_LIVE_LIBRIVOX_TEST: '1'
+        run: |
+          for attempt in 1 2; do
+            if cargo test \
+              --locked \
+              --test live_services \
+              --no-default-features \
+              --features librivox \
+              -- \
+              --ignored \
+              --exact librivox_catalogue_book_author_and_audio_are_usable \
               --nocapture
             then
               exit 0

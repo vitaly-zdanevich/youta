@@ -20,6 +20,7 @@ use std::sync::Mutex;
 #[cfg(any(
     feature = "apple-podcasts",
     feature = "bandcamp",
+    feature = "librivox",
     feature = "rss",
     feature = "yandex-music",
     feature = "youtube-music"
@@ -34,6 +35,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 #[cfg(any(
     feature = "acoustid",
     feature = "apple-podcasts",
+    feature = "librivox",
     feature = "rss",
     feature = "waveform",
     feature = "yandex-music",
@@ -67,6 +69,8 @@ use crate::domain::{
     MediaStatistics, PanelFocus, PlaybackProgress, PlaybackQueue, Playlist, PlaylistEntry,
     PlaylistMediaSnapshot, PlaylistSummary, PodcastShowSummary, QueueItem, Screen as StoredScreen,
     SessionState, SourceKind, TODO_PLAYLIST_ID, decode_url_path_segment_once,
+    is_canonical_librivox_audio_url, librivox_section_external_id,
+    parse_librivox_section_external_id,
 };
 #[cfg(feature = "yandex-music")]
 use crate::domain::{PendingYandexMusicReaction, YandexMusicReaction};
@@ -137,6 +141,11 @@ use crate::providers::bbc::{
 };
 #[cfg(feature = "network")]
 use crate::providers::github::{GitHubCommit, GitHubCommitClient};
+#[cfg(feature = "librivox")]
+use crate::providers::librivox::{
+    LibrivoxAuthor, LibrivoxAuthorDetails, LibrivoxBook, LibrivoxClient, LibrivoxSearchPage,
+    LibrivoxSearchRequest, LibrivoxSection,
+};
 #[cfg(any(feature = "bbc-radio", all(feature = "radio", test)))]
 use crate::providers::radio::RadioStreamKind;
 #[cfg(all(feature = "radio", test))]
@@ -183,6 +192,9 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
+use crate::view::DetailLinkInternalTarget;
+#[cfg(any(feature = "librivox", feature = "yandex-music"))]
+use crate::view::DetailLinkPresentation;
 use crate::view::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
 use crate::view::DownloadView;
@@ -208,8 +220,6 @@ use crate::view::{
     YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
     YouTubeSetupPopupView,
 };
-#[cfg(feature = "yandex-music")]
-use crate::view::{DetailLinkInternalTarget, DetailLinkPresentation};
 #[cfg(feature = "wikidata")]
 use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
@@ -234,6 +244,18 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
 
 /// Maximum UTF-8 payload stored for one private local note.
 pub const MAX_PRIVATE_NOTE_BYTES: usize = 16 * 1024;
+
+/// Maximum LibriVox books retained for one public catalogue location.
+#[cfg(feature = "librivox")]
+const LIBRIVOX_PAGE_SIZE: usize = 20;
+
+/// Books requested for each bounded LibriVox author-bibliography page.
+#[cfg(feature = "librivox")]
+const LIBRIVOX_AUTHOR_PAGE_SIZE: usize = 20;
+
+/// Maximum LibriVox parent locations retained for Escape navigation.
+#[cfg(feature = "librivox")]
+const MAX_LIBRIVOX_NAVIGATION_DEPTH: usize = 16;
 
 /// Maximum rolling live-cache interval exposed by the TUI.
 ///
@@ -604,6 +626,8 @@ pub enum SearchRoute {
     Bandcamp,
     /// The podcast tab queries Apple's public, storefront-specific catalogue.
     ApplePodcasts,
+    /// The audiobook tab queries LibriVox's public-domain catalogue.
+    LibriVox,
     /// The dedicated tracker screen queries only module archives.
     TrackerArchives,
     /// The screen does not perform remote search.
@@ -779,6 +803,55 @@ enum ApplePodcastsRoute {
     Episodes,
     /// One public Apple Podcasts URL resolved independently of search.
     Direct,
+}
+
+/// Current level inside the independent LibriVox catalogue tab.
+#[cfg(feature = "librivox")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LibrivoxRoute {
+    /// Search results or the initial public-domain catalogue.
+    #[default]
+    Books,
+    /// Playable sections belonging to one opened audiobook.
+    Book,
+    /// Books belonging to one explicitly opened author.
+    Author,
+}
+
+/// One bounded in-tab location restored by Escape after child navigation.
+#[cfg(feature = "librivox")]
+#[derive(Clone, Debug)]
+struct LibrivoxNavigationSnapshot {
+    /// Navigation level represented by the retained data.
+    route: LibrivoxRoute,
+    /// Book rows represented by the parent location.
+    books: Vec<LibrivoxBook>,
+    /// Open book represented by section rows, when applicable.
+    active_book: Option<LibrivoxBook>,
+    /// Open author represented by book rows, when applicable.
+    active_author: Option<LibrivoxAuthorDetails>,
+    /// Row selected before entering the child location.
+    selected: usize,
+    /// Search text displayed at the parent location.
+    query: String,
+}
+
+/// Exact LibriVox request allowed to mutate the current in-tab location.
+#[cfg(feature = "librivox")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingLibrivoxRequest {
+    /// Search or initial-catalogue request.
+    Books { generation: u64, query: String },
+    /// Full metadata and sections for one stable book ID.
+    Book { generation: u64, book_id: u64 },
+    /// Public biography and books for one stable author ID.
+    Author { generation: u64, author_id: u64 },
+    /// One later bounded bibliography page for the active author.
+    AuthorBooks {
+        generation: u64,
+        author_id: u64,
+        offset: usize,
+    },
 }
 
 /// Current level inside the persistent local Playlists screen.
@@ -1236,7 +1309,46 @@ struct LocalFingerprintCacheKey {
 #[derive(Clone)]
 struct CachedLocalFingerprint {
     candidates: Arc<Vec<MusicBrainzCandidate>>,
+    lastfm: CachedLocalFingerprintLastFm,
 }
+
+/// Delayed Last.fm enrichment retained with one exact fingerprint identity.
+#[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+#[derive(Clone, Default)]
+enum CachedLocalFingerprintLastFm {
+    /// Wikidata has not exposed an artist Last.fm identifier yet.
+    #[default]
+    NotRequested,
+    /// One generation-owned artist lookup is running on the provider worker.
+    Pending {
+        generation: u64,
+        recording_item_id: String,
+    },
+    /// A successful biography, confirmed absence, or failed best-effort fetch.
+    Complete {
+        recording_item_id: String,
+        biography: Option<Arc<LocalFingerprintLastFmBiography>>,
+    },
+}
+
+/// Render-safe artist biography joined from Wikidata and Last.fm.
+#[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalFingerprintLastFmBiography {
+    artist_item_id: String,
+    artist_label: String,
+    lastfm_id: String,
+    wiki_url: url::Url,
+    description: String,
+}
+
+/// Feature-neutral placeholder omitted from builds that cannot enrich artists.
+#[cfg(all(
+    feature = "acoustid",
+    not(all(feature = "lastfm", feature = "wikidata"))
+))]
+#[derive(Clone, Default)]
+struct CachedLocalFingerprintLastFm;
 
 /// Sole generation-owned fingerprint request visible to the controller.
 #[cfg(feature = "acoustid")]
@@ -1543,8 +1655,10 @@ fn classify_known_host(host: &str, path: &str) -> SourceKind {
         SourceKind::Vk
     } else if host_matches(host, "archive.org") {
         SourceKind::ArchiveOrg
+    // A LibriVox book page is a container, not a playable chapter identity.
+    // Keep direct pages generic until a first-class book resolver exists.
     } else if host_matches(host, "librivox.org") {
-        SourceKind::LibriVox
+        SourceKind::GenericYtDlp
     } else if host == "commons.wikimedia.org" {
         SourceKind::WikimediaCommons
     } else if host_matches(host, "music.yandex.ru") || host_matches(host, "music.yandex.com") {
@@ -1847,6 +1961,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::YandexMusic => SearchRoute::YandexMusic,
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
+        Screen::LibriVox => SearchRoute::LibriVox,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
         Screen::Radio
         | Screen::Subscriptions
@@ -1887,6 +2002,28 @@ enum ProviderRequest {
         generation: u64,
         country: String,
         collection_id: u64,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxSearch {
+        generation: u64,
+        query: String,
+        request: LibrivoxSearchRequest,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxBook {
+        generation: u64,
+        book_id: u64,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxAuthor {
+        generation: u64,
+        author_id: u64,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxAuthorBooks {
+        generation: u64,
+        author: LibrivoxAuthor,
+        offset: usize,
     },
     #[cfg(feature = "rss")]
     RssFeed {
@@ -1965,6 +2102,12 @@ enum ProviderRequest {
     WikidataStatements {
         item_id: String,
     },
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    LocalFingerprintLastFm {
+        generation: u64,
+        key: LocalFingerprintCacheKey,
+        recording_item_id: String,
+    },
     #[cfg(feature = "radio")]
     RadioNowPlaying {
         generation: u64,
@@ -2008,6 +2151,72 @@ enum AppleProviderRequest {
         country: String,
         collection_id: u64,
     },
+}
+
+/// LibriVox operations isolated from YouTube and every other catalogue.
+#[cfg(feature = "librivox")]
+enum LibrivoxProviderRequest {
+    /// Loads one bounded book catalogue page.
+    Search {
+        generation: u64,
+        query: String,
+        request: LibrivoxSearchRequest,
+    },
+    /// Loads sections, genres, keywords, and full book metadata.
+    Book { generation: u64, book_id: u64 },
+    /// Loads one author biography and their bounded bibliography.
+    Author { generation: u64, author_id: u64 },
+    /// Loads one later bounded bibliography page without refetching biography.
+    AuthorBooks {
+        generation: u64,
+        author: LibrivoxAuthor,
+        offset: usize,
+    },
+}
+
+/// Blocking LibriVox API surface owned by the latest-only catalogue worker.
+#[cfg(feature = "librivox")]
+trait LibrivoxProviderClient: Send {
+    /// Searches one bounded public catalogue page.
+    fn search(&self, request: &LibrivoxSearchRequest) -> Result<LibrivoxSearchPage, String>;
+
+    /// Loads complete metadata and playable sections for one book.
+    fn book_details(&self, book_id: u64) -> Result<LibrivoxBook, String>;
+
+    /// Loads one author biography and a bounded book list.
+    fn author_details(&self, author_id: u64) -> Result<LibrivoxAuthorDetails, String>;
+
+    /// Loads one later bounded book page for an already resolved author.
+    fn author_books(
+        &self,
+        author: &LibrivoxAuthor,
+        offset: usize,
+    ) -> Result<LibrivoxSearchPage, String>;
+}
+
+#[cfg(feature = "librivox")]
+impl LibrivoxProviderClient for LibrivoxClient {
+    fn search(&self, request: &LibrivoxSearchRequest) -> Result<LibrivoxSearchPage, String> {
+        LibrivoxClient::search(self, request).map_err(|error| error.to_string())
+    }
+
+    fn book_details(&self, book_id: u64) -> Result<LibrivoxBook, String> {
+        LibrivoxClient::book_details(self, book_id).map_err(|error| error.to_string())
+    }
+
+    fn author_details(&self, author_id: u64) -> Result<LibrivoxAuthorDetails, String> {
+        LibrivoxClient::author_details(self, author_id, LIBRIVOX_AUTHOR_PAGE_SIZE, 0)
+            .map_err(|error| error.to_string())
+    }
+
+    fn author_books(
+        &self,
+        author: &LibrivoxAuthor,
+        offset: usize,
+    ) -> Result<LibrivoxSearchPage, String> {
+        LibrivoxClient::author_books(self, author, LIBRIVOX_AUTHOR_PAGE_SIZE, offset)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Blocking Apple API surface owned by the latest-only catalogue worker.
@@ -2228,6 +2437,31 @@ enum ProviderResponse {
         collection_id: u64,
         result: Result<ResolvedApplePodcastShow, String>,
     },
+    #[cfg(feature = "librivox")]
+    LibrivoxSearch {
+        generation: u64,
+        query: String,
+        result: Result<LibrivoxSearchPage, String>,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxBook {
+        generation: u64,
+        book_id: u64,
+        result: Result<Box<LibrivoxBook>, String>,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxAuthor {
+        generation: u64,
+        author_id: u64,
+        result: Result<Box<LibrivoxAuthorDetails>, String>,
+    },
+    #[cfg(feature = "librivox")]
+    LibrivoxAuthorBooks {
+        generation: u64,
+        author_id: u64,
+        offset: usize,
+        result: Result<LibrivoxSearchPage, String>,
+    },
     #[cfg(feature = "rss")]
     RssFeed {
         generation: u64,
@@ -2317,6 +2551,13 @@ enum ProviderResponse {
     WikidataStatements {
         item_id: String,
         result: Result<crate::providers::wikidata::WikidataEntityStatements, String>,
+    },
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    LocalFingerprintLastFm {
+        generation: u64,
+        key: LocalFingerprintCacheKey,
+        recording_item_id: String,
+        result: Result<Option<LocalFingerprintLastFmBiography>, String>,
     },
     #[cfg(feature = "radio")]
     RadioNowPlaying {
@@ -2705,6 +2946,12 @@ enum AutoplayOrigin {
     #[cfg(feature = "yandex-music")]
     YandexMusic {
         /// Credential-free tracks captured from the activated provider list.
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
+    #[cfg(feature = "librivox")]
+    Librivox {
+        /// Credential-free audiobook sections captured when playback starts.
         items: Arc<[QueueItem]>,
         index: usize,
     },
@@ -3528,6 +3775,34 @@ pub struct AppController {
     apple_podcast_episode_origin: ApplePodcastEpisodeOrigin,
     /// Selected episode retained while Details receives focus.
     apple_podcast_episode_selected: usize,
+    /// Query retained independently for the LibriVox tab.
+    librivox_search_query: String,
+    /// Selected LibriVox row retained while another tab is visible.
+    librivox_selected: usize,
+    /// Whether the first restored catalogue response should retain its row.
+    #[cfg(feature = "librivox")]
+    restore_librivox_selection: bool,
+    /// Books represented by catalogue or author rows.
+    #[cfg(feature = "librivox")]
+    librivox_books: Vec<LibrivoxBook>,
+    /// Navigation level represented by the current LibriVox rows.
+    #[cfg(feature = "librivox")]
+    librivox_route: LibrivoxRoute,
+    /// Complete book owning the current playable section rows.
+    #[cfg(feature = "librivox")]
+    active_librivox_book: Option<LibrivoxBook>,
+    /// Complete author owning the current author-book rows.
+    #[cfg(feature = "librivox")]
+    active_librivox_author: Option<LibrivoxAuthorDetails>,
+    /// Bounded parent locations restored by Escape.
+    #[cfg(feature = "librivox")]
+    librivox_navigation_back: VecDeque<LibrivoxNavigationSnapshot>,
+    /// Monotonic owner rejecting stale LibriVox responses.
+    #[cfg(feature = "librivox")]
+    librivox_generation: u64,
+    /// Exact request allowed to replace the visible LibriVox location.
+    #[cfg(feature = "librivox")]
+    pending_librivox_request: Option<PendingLibrivoxRequest>,
     direct_item: Option<DirectSourceInput>,
     resolved_direct: Option<ResolvedDirectMedia>,
     local_results: Vec<LocalMediaItem>,
@@ -4018,6 +4293,8 @@ impl AppController {
         #[cfg(feature = "bandcamp")]
         let bandcamp_search_client: Box<dyn BandcampSearchProvider> =
             Box::new(BandcampSearchClient::new());
+        #[cfg(feature = "librivox")]
+        let librivox_client: Box<dyn LibrivoxProviderClient> = Box::new(LibrivoxClient::new());
         #[cfg(feature = "rss")]
         let rss_client: Box<dyn RssFeedClient> = Box::new(RssPodcastProvider::new());
         #[cfg(feature = "youtube-music")]
@@ -4094,6 +4371,8 @@ impl AppController {
                     apple_client,
                     #[cfg(feature = "bandcamp")]
                     bandcamp_search_client,
+                    #[cfg(feature = "librivox")]
+                    librivox_client,
                     #[cfg(feature = "rss")]
                     rss_client,
                     #[cfg(feature = "youtube-music")]
@@ -4211,6 +4490,7 @@ impl AppController {
                 #[cfg(feature = "bandcamp")]
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
+                StoredScreen::LibriVox => saved.librivox_search_text.clone(),
                 #[cfg(feature = "radio")]
                 StoredScreen::Radio => saved.radio_filter_text.clone(),
                 _ => saved.search_text.clone(),
@@ -4378,6 +4658,17 @@ impl AppController {
         });
         if view.screen == Screen::ApplePodcasts {
             view.selected = apple_podcasts_selected;
+        }
+        let librivox_search_query = saved.librivox_search_text.clone();
+        let librivox_selected = saved.librivox_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::LibriVox {
+                view.selected
+            } else {
+                0
+            }
+        });
+        if view.screen == Screen::LibriVox {
+            view.selected = librivox_selected;
         }
         let radio_selected_row = saved.radio_selected_row.unwrap_or_else(|| {
             if view.screen == Screen::Radio {
@@ -4566,6 +4857,25 @@ impl AppController {
             pending_apple_podcast_episodes: None,
             apple_podcast_episode_origin: ApplePodcastEpisodeOrigin::Shows(apple_podcasts_selected),
             apple_podcast_episode_selected: 0,
+            librivox_search_query,
+            librivox_selected,
+            #[cfg(feature = "librivox")]
+            restore_librivox_selection: saved.librivox_selected_row.is_some()
+                || saved.screen == StoredScreen::LibriVox,
+            #[cfg(feature = "librivox")]
+            librivox_books: Vec::new(),
+            #[cfg(feature = "librivox")]
+            librivox_route: LibrivoxRoute::Books,
+            #[cfg(feature = "librivox")]
+            active_librivox_book: None,
+            #[cfg(feature = "librivox")]
+            active_librivox_author: None,
+            #[cfg(feature = "librivox")]
+            librivox_navigation_back: VecDeque::new(),
+            #[cfg(feature = "librivox")]
+            librivox_generation: 0,
+            #[cfg(feature = "librivox")]
+            pending_librivox_request: None,
             direct_item: None,
             resolved_direct: None,
             local_results: Vec::new(),
@@ -5493,6 +5803,13 @@ impl AppController {
                 Ok(None) => self.submit_apple_podcasts_search(query),
                 Err(error) => self.view.status_line = error.to_owned(),
             },
+            SearchRoute::LibriVox => {
+                #[cfg(feature = "librivox")]
+                {
+                    self.restore_librivox_selection = false;
+                }
+                self.submit_librivox_search(query);
+            }
             SearchRoute::TrackerArchives => self.submit_tracker_search(query),
             SearchRoute::None => {
                 self.view.status_line = "Search is not available on this screen".to_owned();
@@ -7495,6 +7812,45 @@ impl AppController {
     fn submit_apple_podcasts_search(&mut self, _query: String) {
         self.view.status_line =
             "This build omits the `apple-podcasts` feature; rebuild with it enabled".to_owned();
+    }
+
+    /// Starts one latest-only public LibriVox catalogue request.
+    #[cfg(feature = "librivox")]
+    fn submit_librivox_search(&mut self, query: String) {
+        let query = query.trim().to_owned();
+        self.librivox_generation = self.librivox_generation.wrapping_add(1);
+        let generation = self.librivox_generation;
+        self.librivox_search_query.clone_from(&query);
+        self.pending_librivox_request = Some(PendingLibrivoxRequest::Books {
+            generation,
+            query: query.clone(),
+        });
+        let request = LibrivoxSearchRequest {
+            title: (!query.is_empty()).then(|| query.clone()),
+            author: None,
+            limit: LIBRIVOX_PAGE_SIZE,
+            offset: 0,
+        };
+        if !self.send_provider_request(
+            ProviderRequest::LibrivoxSearch {
+                generation,
+                query,
+                request,
+            },
+            "Could not start the LibriVox catalogue request",
+        ) {
+            self.pending_librivox_request = None;
+            return;
+        }
+        self.begin_search_activity(SearchActivity::LibriVox);
+        self.view.status_line = "Searching LibriVox’s public-domain catalogue…".to_owned();
+    }
+
+    /// Reports that LibriVox support is absent in a minimal build.
+    #[cfg(not(feature = "librivox"))]
+    fn submit_librivox_search(&mut self, _query: String) {
+        self.view.status_line =
+            "This build omits the `librivox` feature; rebuild with it enabled".to_owned();
     }
 
     fn submit_youtube_search(&mut self, page: u32) {
@@ -9680,6 +10036,233 @@ impl AppController {
                     }
                 }
             }
+            #[cfg(feature = "librivox")]
+            ProviderResponse::LibrivoxSearch {
+                generation,
+                query,
+                result,
+            } => {
+                let owns = matches!(
+                    self.pending_librivox_request.as_ref(),
+                    Some(PendingLibrivoxRequest::Books {
+                        generation: pending_generation,
+                        query: pending_query,
+                    }) if *pending_generation == generation && pending_query == &query
+                );
+                if !owns || generation != self.librivox_generation {
+                    return;
+                }
+                self.pending_librivox_request = None;
+                self.finish_search_activity(SearchActivity::LibriVox);
+                match result {
+                    Ok(page) => {
+                        self.librivox_search_query = query;
+                        self.librivox_books = page.books;
+                        self.librivox_route = LibrivoxRoute::Books;
+                        self.active_librivox_book = None;
+                        self.active_librivox_author = None;
+                        self.librivox_navigation_back.clear();
+                        let selected = if std::mem::take(&mut self.restore_librivox_selection) {
+                            self.librivox_selected
+                                .min(self.librivox_books.len().saturating_sub(1))
+                        } else {
+                            0
+                        };
+                        self.librivox_selected = selected;
+                        if self.view.screen == Screen::LibriVox {
+                            self.view.selected = selected;
+                            self.refresh_librivox_rows();
+                            self.update_librivox_detail();
+                            self.view.status_line = if self.librivox_books.is_empty() {
+                                "Nothing found".to_owned()
+                            } else {
+                                format!(
+                                    "{} LibriVox book{} loaded",
+                                    self.librivox_books.len(),
+                                    plural_s(self.librivox_books.len())
+                                )
+                            };
+                            self.refresh_selected_playlist_state();
+                        }
+                    }
+                    Err(error) => {
+                        if self.view.screen == Screen::LibriVox {
+                            self.show_error_message("LibriVox search failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderResponse::LibrivoxBook {
+                generation,
+                book_id,
+                result,
+            } => {
+                let owns = matches!(
+                    self.pending_librivox_request.as_ref(),
+                    Some(PendingLibrivoxRequest::Book {
+                        generation: pending_generation,
+                        book_id: pending_book_id,
+                    }) if *pending_generation == generation && *pending_book_id == book_id
+                );
+                if !owns || generation != self.librivox_generation {
+                    return;
+                }
+                self.pending_librivox_request = None;
+                self.finish_search_activity(SearchActivity::LibriVox);
+                match result {
+                    Ok(book) if book.book_id == book_id => {
+                        self.active_librivox_book = Some(*book);
+                        self.active_librivox_author = None;
+                        self.librivox_route = LibrivoxRoute::Book;
+                        self.librivox_selected = 0;
+                        if self.view.screen == Screen::LibriVox {
+                            self.view.selected = 0;
+                            self.populate_librivox();
+                            self.refresh_selected_playlist_state();
+                        }
+                    }
+                    Ok(_) => {
+                        self.librivox_navigation_back.pop_back();
+                        self.show_error_message(
+                            "LibriVox book failed",
+                            "LibriVox returned a different book",
+                        );
+                    }
+                    Err(error) => {
+                        self.librivox_navigation_back.pop_back();
+                        if self.view.screen == Screen::LibriVox {
+                            self.show_error_message("LibriVox book failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderResponse::LibrivoxAuthor {
+                generation,
+                author_id,
+                result,
+            } => {
+                let owns = matches!(
+                    self.pending_librivox_request.as_ref(),
+                    Some(PendingLibrivoxRequest::Author {
+                        generation: pending_generation,
+                        author_id: pending_author_id,
+                    }) if *pending_generation == generation && *pending_author_id == author_id
+                );
+                if !owns || generation != self.librivox_generation {
+                    return;
+                }
+                self.pending_librivox_request = None;
+                self.finish_search_activity(SearchActivity::LibriVox);
+                match result {
+                    Ok(author) if author.author.author_id == author_id => {
+                        self.librivox_books = author.books.clone();
+                        self.active_librivox_author = Some(*author);
+                        self.active_librivox_book = None;
+                        self.librivox_route = LibrivoxRoute::Author;
+                        self.librivox_selected = 0;
+                        if self.view.screen == Screen::LibriVox {
+                            self.view.selected = 0;
+                            self.populate_librivox();
+                            self.refresh_selected_playlist_state();
+                        }
+                    }
+                    Ok(_) => {
+                        self.librivox_navigation_back.pop_back();
+                        self.show_error_message(
+                            "LibriVox author failed",
+                            "LibriVox returned a different author",
+                        );
+                    }
+                    Err(error) => {
+                        self.librivox_navigation_back.pop_back();
+                        if self.view.screen == Screen::LibriVox {
+                            self.show_error_message("LibriVox author failed", error);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderResponse::LibrivoxAuthorBooks {
+                generation,
+                author_id,
+                offset,
+                result,
+            } => {
+                let owns = matches!(
+                    self.pending_librivox_request.as_ref(),
+                    Some(PendingLibrivoxRequest::AuthorBooks {
+                        generation: pending_generation,
+                        author_id: pending_author_id,
+                        offset: pending_offset,
+                    }) if *pending_generation == generation
+                        && *pending_author_id == author_id
+                        && *pending_offset == offset
+                );
+                if !owns || generation != self.librivox_generation {
+                    return;
+                }
+                self.pending_librivox_request = None;
+                self.finish_search_activity(SearchActivity::LibriVox);
+                match result {
+                    Ok(page) if page.offset == offset => {
+                        let Some(details) = self
+                            .active_librivox_author
+                            .as_mut()
+                            .filter(|details| details.author.author_id == author_id)
+                        else {
+                            return;
+                        };
+                        let old_len = self.librivox_books.len();
+                        let mut known = self
+                            .librivox_books
+                            .iter()
+                            .map(|book| book.book_id)
+                            .collect::<HashSet<_>>();
+                        self.librivox_books.extend(
+                            page.books
+                                .into_iter()
+                                .filter(|book| known.insert(book.book_id)),
+                        );
+                        details.books.clone_from(&self.librivox_books);
+                        details.next_offset = page.next_offset.filter(|next| *next > offset);
+                        let added = self.librivox_books.len().saturating_sub(old_len);
+                        self.view.selected = if added > 0 {
+                            old_len
+                        } else if details.next_offset.is_some() {
+                            self.librivox_books.len()
+                        } else {
+                            self.librivox_books.len().saturating_sub(1)
+                        };
+                        self.librivox_selected = self.view.selected;
+                        if self.view.screen == Screen::LibriVox {
+                            self.populate_librivox();
+                            self.view.status_line = if added == 0 {
+                                "No additional books were found on this LibriVox page".to_owned()
+                            } else {
+                                format!(
+                                    "Added {added} LibriVox book{}; {} loaded",
+                                    plural_s(added),
+                                    self.librivox_books.len()
+                                )
+                            };
+                            self.refresh_selected_playlist_state();
+                        }
+                    }
+                    Ok(_) => {
+                        self.show_error_message(
+                            "LibriVox author failed",
+                            "LibriVox returned a different bibliography page",
+                        );
+                    }
+                    Err(error) => {
+                        if self.view.screen == Screen::LibriVox {
+                            self.show_error_message("LibriVox author failed", error);
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "rss")]
             ProviderResponse::RssFeed {
                 generation,
@@ -10642,17 +11225,20 @@ impl AppController {
                     self.pending_yandex_music_wikidata = None;
                 }
                 #[cfg(feature = "acoustid")]
-                if self
+                let fingerprint_property =
+                    crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                        .property_id();
+                #[cfg(feature = "acoustid")]
+                let local_fingerprint_lookup = self
                     .pending_local_fingerprint_wikidata
                     .as_ref()
                     .is_some_and(|pending| {
                         pending.generation == generation
                             && pending.recording_id == external_id
-                            && property_id
-                                == crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
-                                    .property_id()
-                    })
-                {
+                            && property_id == fingerprint_property
+                    });
+                #[cfg(feature = "acoustid")]
+                if local_fingerprint_lookup {
                     self.pending_local_fingerprint_wikidata = None;
                 }
                 if generation != self.wikidata_generation {
@@ -10692,6 +11278,12 @@ impl AppController {
                                 }
                                 apply_wikidata_links(details, &cached.items)
                             });
+                        #[cfg(all(feature = "acoustid", feature = "lastfm"))]
+                        if local_fingerprint_lookup {
+                            self.request_local_fingerprint_lastfm(
+                                cached.items.first().map(|item| item.item_id.as_str()),
+                            );
+                        }
                     }
                     Err(error) => {
                         if let Some(details) = self.view.details.as_mut() {
@@ -10734,6 +11326,63 @@ impl AppController {
                         } else {
                             "Wikidata properties are unavailable".to_owned()
                         };
+                    }
+                }
+            }
+            #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+            ProviderResponse::LocalFingerprintLastFm {
+                generation,
+                key,
+                recording_item_id,
+                result,
+            } => {
+                let matching_request =
+                    self.local_fingerprint_cache
+                        .get(&key)
+                        .is_some_and(|cached| {
+                            matches!(
+                                &cached.lastfm,
+                                CachedLocalFingerprintLastFm::Pending {
+                                    generation: pending_generation,
+                                    recording_item_id: pending_item,
+                                } if *pending_generation == generation
+                                    && pending_item == &recording_item_id
+                            )
+                        });
+                if !matching_request {
+                    return;
+                }
+                let biography = result.ok().flatten().map(Arc::new);
+                if let Some(cached) = self.local_fingerprint_cache.get_mut(&key) {
+                    cached.lastfm = CachedLocalFingerprintLastFm::Complete {
+                        recording_item_id,
+                        biography: biography.clone(),
+                    };
+                }
+                if self
+                    .selected_local_fingerprint_target()
+                    .is_some_and(|(_, selected_key)| selected_key == key)
+                    && let Some(biography) = biography
+                    && let Some(details) = self.view.details.as_mut()
+                {
+                    // Wikidata rendered before this follow-up started. Merge
+                    // only Last.fm-owned fields so a concurrent same-recording
+                    // refresh cannot hide the already-visible Wikidata link.
+                    details.lastfm_artist_description = biography.description.clone();
+                    let link = DetailLinkView {
+                        label: format!("Last.fm artist wiki · {}", biography.artist_label),
+                        url: biography.wiki_url.to_string(),
+                        wikidata_item_id: None,
+                        ..DetailLinkView::default()
+                    };
+                    if let Some(index) = details
+                        .links
+                        .iter()
+                        .position(|link| link.label.starts_with("Last.fm artist wiki · "))
+                    {
+                        details.links[index] = link;
+                    } else {
+                        details.links.push(link);
                     }
                 }
             }
@@ -11295,6 +11944,307 @@ impl AppController {
             "This build omits the `apple-podcasts` feature; rebuild with it enabled".to_owned();
     }
 
+    /// Captures the current LibriVox location before entering a child page.
+    #[cfg(feature = "librivox")]
+    fn push_librivox_navigation_snapshot(&mut self) {
+        if self.librivox_navigation_back.len() == MAX_LIBRIVOX_NAVIGATION_DEPTH {
+            self.librivox_navigation_back.pop_front();
+        }
+        self.librivox_navigation_back
+            .push_back(LibrivoxNavigationSnapshot {
+                route: self.librivox_route,
+                books: self.librivox_books.clone(),
+                active_book: self.active_librivox_book.clone(),
+                active_author: self.active_librivox_author.clone(),
+                selected: self.view.selected,
+                query: self.view.search_query.clone(),
+            });
+    }
+
+    /// Restores one exact parent LibriVox location.
+    #[cfg(feature = "librivox")]
+    fn close_librivox_child(&mut self) -> bool {
+        let Some(snapshot) = self.librivox_navigation_back.pop_back() else {
+            return false;
+        };
+        self.librivox_generation = self.librivox_generation.wrapping_add(1);
+        self.pending_librivox_request = None;
+        self.finish_search_activity(SearchActivity::LibriVox);
+        self.librivox_route = snapshot.route;
+        self.librivox_books = snapshot.books;
+        self.active_librivox_book = snapshot.active_book;
+        self.active_librivox_author = snapshot.active_author;
+        self.librivox_selected = snapshot.selected;
+        self.view.selected = snapshot.selected;
+        self.view.search_query = snapshot.query;
+        self.populate_librivox();
+        self.refresh_selected_playlist_state();
+        self.view.status_line = "Returned to the previous LibriVox page".to_owned();
+        true
+    }
+
+    /// Requests complete metadata for one selected LibriVox book.
+    #[cfg(feature = "librivox")]
+    fn open_librivox_book(&mut self, book: LibrivoxBook) {
+        self.push_librivox_navigation_snapshot();
+        self.librivox_generation = self.librivox_generation.wrapping_add(1);
+        let generation = self.librivox_generation;
+        self.pending_librivox_request = Some(PendingLibrivoxRequest::Book {
+            generation,
+            book_id: book.book_id,
+        });
+        if !self.send_provider_request(
+            ProviderRequest::LibrivoxBook {
+                generation,
+                book_id: book.book_id,
+            },
+            "Could not load the LibriVox book",
+        ) {
+            self.pending_librivox_request = None;
+            self.librivox_navigation_back.pop_back();
+            return;
+        }
+        self.begin_search_activity(SearchActivity::LibriVox);
+        self.view.status_line = format!("Loading {}…", book.title);
+    }
+
+    /// Opens one exact LibriVox author through a Details internal link.
+    #[cfg(feature = "librivox")]
+    fn open_librivox_author(&mut self, author_id: String) {
+        let Ok(author_id) = author_id.parse::<u64>() else {
+            self.show_error_message(
+                "LibriVox author failed",
+                "the selected author identifier is invalid",
+            );
+            return;
+        };
+        self.push_librivox_navigation_snapshot();
+        self.librivox_generation = self.librivox_generation.wrapping_add(1);
+        let generation = self.librivox_generation;
+        self.pending_librivox_request = Some(PendingLibrivoxRequest::Author {
+            generation,
+            author_id,
+        });
+        if !self.send_provider_request(
+            ProviderRequest::LibrivoxAuthor {
+                generation,
+                author_id,
+            },
+            "Could not load the LibriVox author",
+        ) {
+            self.pending_librivox_request = None;
+            self.librivox_navigation_back.pop_back();
+            return;
+        }
+        self.begin_search_activity(SearchActivity::LibriVox);
+        self.view.status_line = "Loading LibriVox author and books…".to_owned();
+    }
+
+    /// Requests the next bounded bibliography page for the active author.
+    #[cfg(feature = "librivox")]
+    fn load_more_librivox_author_books(&mut self) {
+        if self.pending_librivox_request.is_some() {
+            self.view.status_line = "A LibriVox request is already running".to_owned();
+            return;
+        }
+        let Some((author, offset)) = self.active_librivox_author.as_ref().and_then(|details| {
+            details
+                .next_offset
+                .map(|offset| (details.author.clone(), offset))
+        }) else {
+            self.view.status_line = "All books for this LibriVox author are loaded".to_owned();
+            return;
+        };
+        self.librivox_generation = self.librivox_generation.wrapping_add(1);
+        let generation = self.librivox_generation;
+        self.pending_librivox_request = Some(PendingLibrivoxRequest::AuthorBooks {
+            generation,
+            author_id: author.author_id,
+            offset,
+        });
+        if !self.send_provider_request(
+            ProviderRequest::LibrivoxAuthorBooks {
+                generation,
+                author,
+                offset,
+            },
+            "Could not load more LibriVox books",
+        ) {
+            self.pending_librivox_request = None;
+            return;
+        }
+        self.begin_search_activity(SearchActivity::LibriVox);
+        self.view.status_line = "Loading more books by this LibriVox author…".to_owned();
+    }
+
+    /// Reports the omitted LibriVox provider for internal-link actions.
+    #[cfg(not(feature = "librivox"))]
+    fn open_librivox_author(&mut self, _author_id: String) {
+        self.view.status_line = "This build omits the `librivox` feature".to_owned();
+    }
+
+    /// Rebuilds rows for the current LibriVox catalogue level.
+    #[cfg(feature = "librivox")]
+    fn refresh_librivox_rows(&mut self) {
+        self.view.rows = match self.librivox_route {
+            LibrivoxRoute::Books => self.librivox_books.iter().map(librivox_book_row).collect(),
+            LibrivoxRoute::Author => {
+                let mut rows = self
+                    .librivox_books
+                    .iter()
+                    .map(librivox_book_row)
+                    .collect::<Vec<_>>();
+                if self
+                    .active_librivox_author
+                    .as_ref()
+                    .is_some_and(|details| details.next_offset.is_some())
+                {
+                    rows.push(RowView {
+                        title: "Load more books…".to_owned(),
+                        subtitle: "Next bounded LibriVox author page".to_owned(),
+                        source: "LibriVox".to_owned(),
+                        compact: true,
+                        ..RowView::default()
+                    });
+                }
+                rows
+            }
+            LibrivoxRoute::Book => self
+                .active_librivox_book
+                .as_ref()
+                .map(|book| {
+                    book.sections
+                        .iter()
+                        .map(|section| librivox_section_row(book, section))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        hydrate_row_playback_progress(&self.store, &mut self.view.rows);
+        self.view.selected = self
+            .view
+            .selected
+            .min(self.view.rows.len().saturating_sub(1));
+        self.librivox_selected = self.view.selected;
+    }
+
+    /// Projects the selected book or section into the Details panel.
+    #[cfg(feature = "librivox")]
+    fn update_librivox_detail(&mut self) {
+        let details = match self.librivox_route {
+            LibrivoxRoute::Books => self
+                .librivox_books
+                .get(self.view.selected)
+                .map(|book| librivox_book_detail(book, None)),
+            LibrivoxRoute::Book => self.active_librivox_book.as_ref().and_then(|book| {
+                book.sections
+                    .get(self.view.selected)
+                    .map(|section| librivox_section_detail(book, section))
+            }),
+            LibrivoxRoute::Author => self
+                .librivox_books
+                .get(self.view.selected)
+                .map(|book| librivox_book_detail(book, self.active_librivox_author.as_ref()))
+                .or_else(|| {
+                    self.active_librivox_author.as_ref().and_then(|details| {
+                        details.next_offset.map(|_| DetailView {
+                            title: "Load more books…".to_owned(),
+                            source: "LibriVox".to_owned(),
+                            channel_name: details.author.display_name.clone(),
+                            description:
+                                "Press Enter to request the next bounded bibliography page."
+                                    .to_owned(),
+                            ..DetailView::default()
+                        })
+                    })
+                }),
+        };
+        self.view.details = details;
+        #[cfg(feature = "wikidata")]
+        if let Some(author) = self.selected_librivox_author() {
+            self.request_wikidata(
+                crate::providers::wikidata::WikidataExternalKind::LibriVoxAuthor,
+                &author.author_id.to_string(),
+            );
+        }
+    }
+
+    /// Returns the author identity nearest to the visible LibriVox selection.
+    #[cfg(all(feature = "librivox", feature = "wikidata"))]
+    fn selected_librivox_author(&self) -> Option<LibrivoxAuthor> {
+        self.active_librivox_author
+            .as_ref()
+            .filter(|_| self.librivox_route == LibrivoxRoute::Author)
+            .map(|details| details.author.clone())
+            .or_else(|| match self.librivox_route {
+                LibrivoxRoute::Book => self
+                    .active_librivox_book
+                    .as_ref()
+                    .and_then(|book| book.authors.first().cloned()),
+                LibrivoxRoute::Books | LibrivoxRoute::Author => self
+                    .librivox_books
+                    .get(self.view.selected)
+                    .and_then(|book| book.authors.first().cloned()),
+            })
+    }
+
+    /// Populates the current LibriVox route or starts its initial catalogue.
+    #[cfg(feature = "librivox")]
+    fn populate_librivox(&mut self) {
+        if self.librivox_books.is_empty()
+            && self.active_librivox_book.is_none()
+            && self.pending_librivox_request.is_none()
+        {
+            self.submit_librivox_search(self.librivox_search_query.clone());
+            return;
+        }
+        self.refresh_librivox_rows();
+        self.update_librivox_detail();
+        self.view.status_line = match self.librivox_route {
+            LibrivoxRoute::Books => format!(
+                "{} LibriVox book{}; press / to search",
+                self.librivox_books.len(),
+                plural_s(self.librivox_books.len())
+            ),
+            LibrivoxRoute::Book => self.active_librivox_book.as_ref().map_or_else(
+                || "No LibriVox book is open".to_owned(),
+                |book| {
+                    format!(
+                        "{} section{} in {}",
+                        book.sections.len(),
+                        plural_s(book.sections.len()),
+                        book.title
+                    )
+                },
+            ),
+            LibrivoxRoute::Author => self.active_librivox_author.as_ref().map_or_else(
+                || "No LibriVox author is open".to_owned(),
+                |details| {
+                    format!(
+                        "{} book{} by {}",
+                        self.librivox_books.len(),
+                        plural_s(self.librivox_books.len()),
+                        details.author.display_name
+                    )
+                },
+            ),
+        };
+    }
+
+    /// Reports the omitted LibriVox provider in minimal builds.
+    #[cfg(not(feature = "librivox"))]
+    fn populate_librivox(&mut self) {
+        self.view.rows.clear();
+        self.view.details = None;
+        self.view.status_line = "This build omits the `librivox` feature".to_owned();
+    }
+
+    /// Clears LibriVox details in minimal builds.
+    #[cfg(not(feature = "librivox"))]
+    fn update_librivox_detail(&mut self) {
+        self.view.details = None;
+    }
+
     fn refresh_local_rows(&mut self) {
         self.view.rows = self
             .local_results
@@ -11452,6 +12402,7 @@ impl AppController {
             | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
+            | Screen::LibriVox
             | Screen::Radio
             | Screen::Subscriptions
             | Screen::TrackerMusic
@@ -11485,6 +12436,7 @@ impl AppController {
                         | Screen::YandexMusic
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
+                        | Screen::LibriVox
                         | Screen::Radio
                         | Screen::Subscriptions
                         | Screen::TrackerMusic
@@ -11520,6 +12472,7 @@ impl AppController {
                 | Screen::YandexMusic
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
+                | Screen::LibriVox
                 | Screen::Radio
                 | Screen::Subscriptions
                 | Screen::TrackerMusic
@@ -12615,6 +13568,10 @@ impl AppController {
                 }
                 return;
             }
+            Screen::LibriVox => {
+                self.update_librivox_detail();
+                return;
+            }
             Screen::Radio => {
                 self.update_radio_detail();
                 return;
@@ -12810,6 +13767,9 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::LibriVox {
+            self.librivox_selected = self.view.selected;
+            self.update_librivox_detail();
         } else if self.view.screen == Screen::Radio {
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
@@ -12866,6 +13826,9 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::LibriVox {
+            self.librivox_selected = self.view.selected;
+            self.update_librivox_detail();
         } else if self.view.screen == Screen::Radio {
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
@@ -12949,6 +13912,27 @@ impl AppController {
             #[cfg(not(feature = "yandex-music"))]
             {
                 return Err("This build omits Yandex Music support".to_owned());
+            }
+        }
+        if self.view.screen == Screen::LibriVox {
+            #[cfg(feature = "librivox")]
+            {
+                if self.librivox_route != LibrivoxRoute::Book {
+                    return Err("Open a LibriVox book and select one of its sections".to_owned());
+                }
+                let book = self
+                    .active_librivox_book
+                    .as_ref()
+                    .ok_or_else(|| "No LibriVox book is open".to_owned())?;
+                let section = book
+                    .sections
+                    .get(self.view.selected)
+                    .ok_or_else(|| "No LibriVox section is selected".to_owned())?;
+                return Ok(queue_item_from_librivox_section(book, section));
+            }
+            #[cfg(not(feature = "librivox"))]
+            {
+                return Err("This build omits LibriVox support".to_owned());
             }
         }
         if self.view.screen == Screen::Subscriptions {
@@ -13291,6 +14275,23 @@ impl AppController {
             }
         }
 
+        if self.view.screen == Screen::LibriVox {
+            #[cfg(feature = "librivox")]
+            {
+                if self.librivox_route != LibrivoxRoute::Book {
+                    return None;
+                }
+                let book = self.active_librivox_book.as_ref()?;
+                let section = book.sections.get(self.view.selected)?;
+                return Some((
+                    librivox_section_media_id(book.book_id, section.section_id),
+                    section.title.clone(),
+                ));
+            }
+            #[cfg(not(feature = "librivox"))]
+            return None;
+        }
+
         if self.view.screen == Screen::Local {
             let listing = self.local_listing.as_ref()?;
             let entry = listing.entries.get(self.local_entry_index()?)?;
@@ -13510,6 +14511,14 @@ impl AppController {
                 {
                     None
                 }
+            }
+            Screen::LibriVox => {
+                let details = self.view.details.as_ref()?;
+                let media_id = details.media_id.clone()?;
+                Some(PrivateNoteSelection {
+                    target: CommentTarget::Media { media_id },
+                    label: details.title.clone(),
+                })
             }
             Screen::Bandcamp => {
                 #[cfg(feature = "bandcamp")]
@@ -14675,6 +15684,10 @@ impl AppController {
             self.activate_apple_podcasts_selection();
             return;
         }
+        if self.view.screen == Screen::LibriVox {
+            self.activate_librivox_selection();
+            return;
+        }
         if self.view.screen == Screen::Subscriptions {
             match (
                 self.view.subscriptions.layout,
@@ -15101,6 +16114,57 @@ impl AppController {
                 self.request_apple_podcast_episodes(show, ApplePodcastEpisodeOrigin::Direct);
             }
         }
+    }
+
+    /// Opens one LibriVox container or starts a selected audiobook section.
+    #[cfg(feature = "librivox")]
+    fn activate_librivox_selection(&mut self) {
+        match self.librivox_route {
+            LibrivoxRoute::Books => {
+                let Some(book) = self.librivox_books.get(self.view.selected).cloned() else {
+                    self.view.status_line = "No LibriVox book is selected".to_owned();
+                    return;
+                };
+                self.open_librivox_book(book);
+            }
+            LibrivoxRoute::Author => {
+                if let Some(book) = self.librivox_books.get(self.view.selected).cloned() {
+                    self.open_librivox_book(book);
+                } else {
+                    self.load_more_librivox_author_books();
+                }
+            }
+            LibrivoxRoute::Book => {
+                let Some(book) = self.active_librivox_book.as_ref() else {
+                    self.view.status_line = "No LibriVox book is open".to_owned();
+                    return;
+                };
+                let queue = book
+                    .sections
+                    .iter()
+                    .map(|section| queue_item_from_librivox_section(book, section))
+                    .collect::<Vec<_>>();
+                let Some(item) = queue.get(self.view.selected).cloned() else {
+                    self.view.status_line = "No LibriVox section is selected".to_owned();
+                    return;
+                };
+                let origin = self
+                    .config
+                    .playback
+                    .autoplay
+                    .then(|| AutoplayOrigin::Librivox {
+                        items: Arc::from(queue),
+                        index: self.view.selected,
+                    });
+                self.play_queue_item_with_origin(item, false, origin);
+            }
+        }
+    }
+
+    /// Reports omitted LibriVox playback support in minimal builds.
+    #[cfg(not(feature = "librivox"))]
+    fn activate_librivox_selection(&mut self) {
+        self.view.status_line = "This build omits the `librivox` feature".to_owned();
     }
 
     /// Reports that Apple Podcasts support is absent in a minimal build.
@@ -16108,6 +17172,10 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        #[cfg(feature = "librivox")]
+        if self.view.screen == Screen::LibriVox && self.close_librivox_child() {
+            return;
+        }
         #[cfg(feature = "yandex-music")]
         if self.view.screen == Screen::YandexMusic && self.close_yandex_music_child() {
             return;
@@ -16621,6 +17689,7 @@ impl AppController {
             key.clone(),
             CachedLocalFingerprint {
                 candidates: Arc::new(candidates),
+                lastfm: CachedLocalFingerprintLastFm::default(),
             },
         );
         self.local_fingerprint_cache_order.push_back(key);
@@ -16636,19 +17705,32 @@ impl AppController {
             if let Some(details) = self.view.details.as_mut() {
                 details.local_fingerprint_available = false;
                 details.local_fingerprint_pending = false;
+                details.lastfm_artist_description.clear();
                 details.links.clear();
             }
             return None;
         };
+        let retained_wikidata_links = (self.displayed_local_fingerprint.as_ref() == Some(&key))
+            .then(|| {
+                self.view
+                    .details
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|details| details.links.iter())
+                    .filter(|link| link.wikidata_item_id.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let pending = self
             .pending_local_fingerprint
             .as_ref()
             .is_some_and(|pending| pending.key == key);
-        let candidates = self
+        let cached = self
             .local_fingerprint_cache
             .get(&key)
-            .map(|cached| Arc::clone(&cached.candidates));
-        let fingerprinted = candidates.is_some();
+            .map(|cached| (Arc::clone(&cached.candidates), cached.lastfm.clone()));
+        let fingerprinted = cached.is_some();
         if fingerprinted {
             self.promote_local_fingerprint_cache_key(&key);
             self.displayed_local_fingerprint = Some(key.clone());
@@ -16664,8 +17746,11 @@ impl AppController {
         };
         details.local_fingerprint_available = !fingerprinted;
         details.local_fingerprint_pending = pending;
+        details.lastfm_artist_description.clear();
         details.links.clear();
-        let candidates = candidates?;
+        let (candidates, lastfm) = cached?;
+        #[cfg(not(all(feature = "lastfm", feature = "wikidata")))]
+        let _ = lastfm;
         details
             .links
             .extend(
@@ -16683,6 +17768,23 @@ impl AppController {
                         ..DetailLinkView::default()
                     }),
             );
+        #[cfg(all(feature = "lastfm", feature = "wikidata"))]
+        if let CachedLocalFingerprintLastFm::Complete {
+            biography: Some(biography),
+            ..
+        } = lastfm
+        {
+            details.lastfm_artist_description = biography.description.clone();
+            details.links.push(DetailLinkView {
+                label: format!("Last.fm artist wiki · {}", biography.artist_label),
+                url: biography.wiki_url.to_string(),
+                wikidata_item_id: None,
+                ..DetailLinkView::default()
+            });
+        }
+        // A same-file metadata refresh must not make already-visible Wikidata
+        // identity disappear while its identical lookup is still pending.
+        details.links.extend(retained_wikidata_links);
         candidates
             .first()
             .map(|candidate| candidate.recording_id().to_owned())
@@ -16816,6 +17918,15 @@ impl AppController {
         let generation = self.wikidata_generation;
         let kind = crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording;
         if self.apply_fresh_cached_wikidata(kind, recording_id) {
+            let now = unix_time();
+            let item_id = self
+                .store
+                .cached_wikidata(kind.property_id(), recording_id)
+                .ok()
+                .flatten()
+                .filter(|cached| cached.is_fresh_at(now))
+                .and_then(|cached| cached.items.first().map(|item| item.item_id.clone()));
+            self.request_local_fingerprint_lastfm(item_id.as_deref());
             return;
         }
         if self.send_wikidata_request(generation, kind, recording_id) {
@@ -16825,6 +17936,61 @@ impl AppController {
             });
         }
     }
+
+    /// Starts best-effort artist biography enrichment after Wikidata is visible.
+    ///
+    /// The exact local file identity owns the request and its RAM result. A
+    /// slow response can therefore populate only the fingerprint cache entry
+    /// that initiated it, never whichever track happens to be selected later.
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    fn request_local_fingerprint_lastfm(&mut self, recording_item_id: Option<&str>) {
+        let Some(recording_item_id) = recording_item_id else {
+            return;
+        };
+        let Some((_, key)) = self.selected_local_fingerprint_target() else {
+            return;
+        };
+        let already_resolved = self
+            .local_fingerprint_cache
+            .get(&key)
+            .is_some_and(|cached| match &cached.lastfm {
+                CachedLocalFingerprintLastFm::Pending {
+                    recording_item_id: pending,
+                    ..
+                }
+                | CachedLocalFingerprintLastFm::Complete {
+                    recording_item_id: pending,
+                    ..
+                } => pending == recording_item_id,
+                CachedLocalFingerprintLastFm::NotRequested => false,
+            });
+        if already_resolved {
+            return;
+        }
+        let generation = self.wikidata_generation;
+        let request = ProviderRequest::LocalFingerprintLastFm {
+            generation,
+            key: key.clone(),
+            recording_item_id: recording_item_id.to_owned(),
+        };
+        if !self
+            .provider_requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(request).is_ok())
+        {
+            return;
+        }
+        if let Some(cached) = self.local_fingerprint_cache.get_mut(&key) {
+            cached.lastfm = CachedLocalFingerprintLastFm::Pending {
+                generation,
+                recording_item_id: recording_item_id.to_owned(),
+            };
+        }
+    }
+
+    /// Omits optional Last.fm enrichment from builds without its provider.
+    #[cfg(all(feature = "acoustid", feature = "wikidata", not(feature = "lastfm")))]
+    fn request_local_fingerprint_lastfm(&mut self, _recording_item_id: Option<&str>) {}
 
     /// Keeps Local fingerprint links functional in builds without Wikidata.
     #[cfg(all(feature = "acoustid", not(feature = "wikidata")))]
@@ -17861,6 +19027,18 @@ impl AppController {
                 .map(|item| AutoplayStep::Play {
                     item: Box::new(item),
                     origin: AutoplayOrigin::YandexMusic {
+                        items: Arc::clone(items),
+                        index: index.saturating_add(1),
+                    },
+                })
+                .unwrap_or(AutoplayStep::Exhausted),
+            #[cfg(feature = "librivox")]
+            AutoplayOrigin::Librivox { items, index } => items
+                .get(index.saturating_add(1))
+                .cloned()
+                .map(|item| AutoplayStep::Play {
+                    item: Box::new(item),
+                    origin: AutoplayOrigin::Librivox {
                         items: Arc::clone(items),
                         index: index.saturating_add(1),
                     },
@@ -19022,6 +20200,11 @@ impl AppController {
                     ApplePodcastsRoute::Direct => {}
                 }
             }
+            Screen::LibriVox => {
+                self.librivox_search_query
+                    .clone_from(&self.view.search_query);
+                self.librivox_selected = self.view.selected;
+            }
             Screen::Radio => {
                 self.radio_filter_query.clone_from(&self.view.search_query);
                 #[cfg(feature = "radio")]
@@ -19096,6 +20279,12 @@ impl AppController {
                     ApplePodcastsRoute::Direct => 0,
                 };
             }
+            Screen::LibriVox => {
+                self.view
+                    .search_query
+                    .clone_from(&self.librivox_search_query);
+                self.view.selected = self.librivox_selected;
+            }
             Screen::Radio => {
                 self.view.search_query.clone_from(&self.radio_filter_query);
                 #[cfg(feature = "radio")]
@@ -19163,6 +20352,8 @@ impl AppController {
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
                 ApplePodcastsRoute::Shows => {}
             }
+        } else if screen == Screen::LibriVox {
+            self.populate_librivox();
         }
         self.refresh_selected_playlist_state();
     }
@@ -19311,6 +20502,7 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             },
+            Screen::LibriVox => self.populate_librivox(),
             Screen::Radio => self.populate_radio(),
             Screen::TrackerMusic => {
                 self.refresh_tracker_rows();
@@ -21855,6 +23047,9 @@ impl AppController {
         if self.view.screen == Screen::ApplePodcasts {
             return self.current_apple_podcasts_url();
         }
+        if self.view.screen == Screen::LibriVox {
+            return self.current_librivox_url();
+        }
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
             {
@@ -21937,6 +23132,27 @@ impl AppController {
         None
     }
 
+    /// Returns the public LibriVox page represented by the visible row.
+    #[cfg(feature = "librivox")]
+    fn current_librivox_url(&self) -> Option<String> {
+        match self.librivox_route {
+            LibrivoxRoute::Books | LibrivoxRoute::Author => self
+                .librivox_books
+                .get(self.view.selected)
+                .map(|book| book.webpage_url.to_string()),
+            LibrivoxRoute::Book => self
+                .active_librivox_book
+                .as_ref()
+                .map(|book| book.webpage_url.to_string()),
+        }
+    }
+
+    /// Returns no LibriVox URL when that provider was omitted at build time.
+    #[cfg(not(feature = "librivox"))]
+    fn current_librivox_url(&self) -> Option<String> {
+        None
+    }
+
     fn current_channel_url(&self) -> Option<String> {
         self.view
             .details
@@ -21993,6 +23209,26 @@ impl AppController {
             return;
         };
         self.view.selected_detail_link = Some(index);
+        if let Some(target) = link.internal_target {
+            match target {
+                DetailLinkInternalTarget::YandexMusicArtist(artist_id) => {
+                    #[cfg(feature = "yandex-music")]
+                    self.open_yandex_music_artist(artist_id);
+                    #[cfg(not(feature = "yandex-music"))]
+                    {
+                        let _ = artist_id;
+                        self.open_external_url(&link.url);
+                    }
+                }
+                DetailLinkInternalTarget::YandexMusicAlbum(album_id) => {
+                    self.open_yandex_music_album(album_id);
+                }
+                DetailLinkInternalTarget::LibriVoxAuthor(author_id) => {
+                    self.open_librivox_author(author_id);
+                }
+            }
+            return;
+        }
         self.open_external_url(&link.url);
     }
 
@@ -24291,6 +25527,10 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => {}
             }
+        } else if self.view.screen == Screen::LibriVox {
+            self.librivox_search_query
+                .clone_from(&self.view.search_query);
+            self.librivox_selected = self.view.selected;
         } else if self.view.screen == Screen::Radio {
             self.radio_filter_query.clone_from(&self.view.search_query);
             #[cfg(feature = "radio")]
@@ -24320,6 +25560,18 @@ impl AppController {
         let radio_selected_station_id = selected_radio_station_id.map(str::to_owned);
         #[cfg(not(feature = "radio"))]
         let radio_selected_station_id = None;
+        #[cfg(feature = "librivox")]
+        let persisted_librivox_selected_row = match self.librivox_route {
+            LibrivoxRoute::Books => self.librivox_selected,
+            LibrivoxRoute::Book | LibrivoxRoute::Author => self
+                .librivox_navigation_back
+                .iter()
+                .rev()
+                .find(|snapshot| snapshot.route == LibrivoxRoute::Books)
+                .map_or(0, |snapshot| snapshot.selected),
+        };
+        #[cfg(not(feature = "librivox"))]
+        let persisted_librivox_selected_row = self.librivox_selected;
         let state = SessionState {
             screen: stored_session_screen(self.view.screen, &self.playlists_route),
             focus: if self.view.details_focused {
@@ -24335,6 +25587,7 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
+            librivox_selected_row: Some(persisted_librivox_selected_row),
             radio_selected_row: Some(persisted_radio_selected_row),
             radio_selected_station_id,
             radio_filter_text: self.radio_filter_query.clone(),
@@ -24345,6 +25598,7 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
             apple_podcasts_search_text: self.apple_podcasts_search_query.clone(),
+            librivox_search_text: self.librivox_search_query.clone(),
             local_path: (!self.view.local_path.is_empty()).then(|| self.view.local_path.clone()),
             waveform_visible: self.view.waveform_visible,
             chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
@@ -24656,6 +25910,9 @@ impl UiController for AppController {
                     let _ = album_id;
                     self.view.status_line = "This build omits Yandex Music".to_owned();
                 }
+            }
+            UiAction::OpenLibriVoxAuthorById(author_id) => {
+                self.open_librivox_author(author_id);
             }
             UiAction::DownloadYandexMusicAlbum => self.download_yandex_music_album(),
             UiAction::DownloadTwentyYandexMusicRecommendations => {
@@ -25715,6 +26972,7 @@ fn remap_local_autoplay_origin(origin: &mut AutoplayOrigin, mappings: &[LocalMov
 #[cfg(any(
     feature = "apple-podcasts",
     feature = "bandcamp",
+    feature = "librivox",
     feature = "rss",
     feature = "youtube-music"
 ))]
@@ -25804,6 +27062,61 @@ fn apple_provider_worker(
                     result,
                 }
             }
+        };
+        if responses.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+/// Runs bounded LibriVox catalogue calls independently of general providers.
+#[cfg(feature = "librivox")]
+fn librivox_provider_worker(
+    requests: Receiver<LibrivoxProviderRequest>,
+    responses: Sender<ProviderResponse>,
+    stopping: Arc<AtomicBool>,
+    client: Box<dyn LibrivoxProviderClient>,
+) {
+    while let Ok(request) = requests.recv() {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let response = match request {
+            LibrivoxProviderRequest::Search {
+                generation,
+                query,
+                request,
+            } => ProviderResponse::LibrivoxSearch {
+                generation,
+                query,
+                result: client.search(&request),
+            },
+            LibrivoxProviderRequest::Book {
+                generation,
+                book_id,
+            } => ProviderResponse::LibrivoxBook {
+                generation,
+                book_id,
+                result: client.book_details(book_id).map(Box::new),
+            },
+            LibrivoxProviderRequest::Author {
+                generation,
+                author_id,
+            } => ProviderResponse::LibrivoxAuthor {
+                generation,
+                author_id,
+                result: client.author_details(author_id).map(Box::new),
+            },
+            LibrivoxProviderRequest::AuthorBooks {
+                generation,
+                author,
+                offset,
+            } => ProviderResponse::LibrivoxAuthorBooks {
+                generation,
+                author_id: author.author_id,
+                offset,
+                result: client.author_books(&author, offset),
+            },
         };
         if responses.send(response).is_err() {
             break;
@@ -26491,6 +27804,7 @@ fn provider_worker(
     jamendo_client_id: Option<String>,
     #[cfg(feature = "apple-podcasts")] apple_client: Box<dyn AppleProviderClient>,
     #[cfg(feature = "bandcamp")] bandcamp_search_client: Box<dyn BandcampSearchProvider>,
+    #[cfg(feature = "librivox")] librivox_client: Box<dyn LibrivoxProviderClient>,
     #[cfg(feature = "rss")] rss_client: Box<dyn RssFeedClient>,
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
     provider_storage_root: PathBuf,
@@ -26543,6 +27857,45 @@ fn provider_worker(
                 None,
             ),
             Err(error) => (None, None, apple_stopping, None, Some(error.to_string())),
+        }
+    };
+    #[cfg(feature = "librivox")]
+    let (
+        librivox_requests,
+        librivox_pending,
+        librivox_stopping,
+        librivox_thread,
+        librivox_start_error,
+    ) = {
+        let (catalogue_requests, catalogue_receiver) = bounded(1);
+        let catalogue_pending = catalogue_receiver.clone();
+        let catalogue_stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&catalogue_stopping);
+        let catalogue_responses = responses.clone();
+        match thread::Builder::new()
+            .name("youta-librivox".to_owned())
+            .spawn(move || {
+                librivox_provider_worker(
+                    catalogue_receiver,
+                    catalogue_responses,
+                    worker_stopping,
+                    librivox_client,
+                );
+            }) {
+            Ok(handle) => (
+                Some(catalogue_requests),
+                Some(catalogue_pending),
+                catalogue_stopping,
+                Some(handle),
+                None,
+            ),
+            Err(error) => (
+                None,
+                None,
+                catalogue_stopping,
+                None,
+                Some(error.to_string()),
+            ),
         }
     };
     #[cfg(feature = "bandcamp")]
@@ -26644,6 +27997,8 @@ fn provider_worker(
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    let lastfm = crate::providers::lastfm::LastFmProvider::new();
     #[cfg(feature = "radio")]
     let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
     #[cfg(feature = "radio")]
@@ -26835,6 +28190,158 @@ fn provider_worker(
                         .send(ProviderResponse::ApplePodcastEpisodes {
                             generation,
                             collection_id,
+                            result: Err(error),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderRequest::LibrivoxSearch {
+                generation,
+                query,
+                request,
+            } => {
+                let dispatch = librivox_requests
+                    .as_ref()
+                    .zip(librivox_pending.as_ref())
+                    .map_or_else(
+                        || {
+                            Err(librivox_start_error
+                                .clone()
+                                .unwrap_or_else(|| "LibriVox worker is unavailable".to_owned()))
+                        },
+                        |(sender, pending)| {
+                            replace_latest_provider_request(
+                                sender,
+                                pending,
+                                LibrivoxProviderRequest::Search {
+                                    generation,
+                                    query: query.clone(),
+                                    request,
+                                },
+                            )
+                            .map_err(|()| "LibriVox worker stopped".to_owned())
+                        },
+                    );
+                if let Err(error) = dispatch
+                    && responses
+                        .send(ProviderResponse::LibrivoxSearch {
+                            generation,
+                            query,
+                            result: Err(error),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderRequest::LibrivoxBook {
+                generation,
+                book_id,
+            } => {
+                let dispatch = librivox_requests
+                    .as_ref()
+                    .zip(librivox_pending.as_ref())
+                    .ok_or_else(|| {
+                        librivox_start_error
+                            .clone()
+                            .unwrap_or_else(|| "LibriVox worker is unavailable".to_owned())
+                    })
+                    .and_then(|(sender, pending)| {
+                        replace_latest_provider_request(
+                            sender,
+                            pending,
+                            LibrivoxProviderRequest::Book {
+                                generation,
+                                book_id,
+                            },
+                        )
+                        .map_err(|()| "LibriVox worker stopped".to_owned())
+                    });
+                if let Err(error) = dispatch
+                    && responses
+                        .send(ProviderResponse::LibrivoxBook {
+                            generation,
+                            book_id,
+                            result: Err(error),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderRequest::LibrivoxAuthor {
+                generation,
+                author_id,
+            } => {
+                let dispatch = librivox_requests
+                    .as_ref()
+                    .zip(librivox_pending.as_ref())
+                    .ok_or_else(|| {
+                        librivox_start_error
+                            .clone()
+                            .unwrap_or_else(|| "LibriVox worker is unavailable".to_owned())
+                    })
+                    .and_then(|(sender, pending)| {
+                        replace_latest_provider_request(
+                            sender,
+                            pending,
+                            LibrivoxProviderRequest::Author {
+                                generation,
+                                author_id,
+                            },
+                        )
+                        .map_err(|()| "LibriVox worker stopped".to_owned())
+                    });
+                if let Err(error) = dispatch
+                    && responses
+                        .send(ProviderResponse::LibrivoxAuthor {
+                            generation,
+                            author_id,
+                            result: Err(error),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "librivox")]
+            ProviderRequest::LibrivoxAuthorBooks {
+                generation,
+                author,
+                offset,
+            } => {
+                let author_id = author.author_id;
+                let dispatch = librivox_requests
+                    .as_ref()
+                    .zip(librivox_pending.as_ref())
+                    .ok_or_else(|| {
+                        librivox_start_error
+                            .clone()
+                            .unwrap_or_else(|| "LibriVox worker is unavailable".to_owned())
+                    })
+                    .and_then(|(sender, pending)| {
+                        replace_latest_provider_request(
+                            sender,
+                            pending,
+                            LibrivoxProviderRequest::AuthorBooks {
+                                generation,
+                                author,
+                                offset,
+                            },
+                        )
+                        .map_err(|()| "LibriVox worker stopped".to_owned())
+                    });
+                if let Err(error) = dispatch
+                    && responses
+                        .send(ProviderResponse::LibrivoxAuthorBooks {
+                            generation,
+                            author_id,
+                            offset,
                             result: Err(error),
                         })
                         .is_err()
@@ -27389,6 +28896,41 @@ fn provider_worker(
                     break;
                 }
             }
+            #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+            ProviderRequest::LocalFingerprintLastFm {
+                generation,
+                key,
+                recording_item_id,
+            } => {
+                let result = wikidata
+                    .lookup_lastfm_artist(&recording_item_id)
+                    .and_then(|artist| {
+                        let Some(artist) = artist else {
+                            return Ok(None);
+                        };
+                        lastfm.artist_biography(&artist.lastfm_id).map(|biography| {
+                            biography.map(|biography| LocalFingerprintLastFmBiography {
+                                artist_item_id: artist.item_id,
+                                artist_label: artist.label,
+                                lastfm_id: artist.lastfm_id,
+                                wiki_url: biography.wiki_url,
+                                description: biography.description,
+                            })
+                        })
+                    })
+                    .map_err(|error| error.to_string());
+                if responses
+                    .send(ProviderResponse::LocalFingerprintLastFm {
+                        generation,
+                        key,
+                        recording_item_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             #[cfg(feature = "radio")]
             ProviderRequest::RadioNowPlaying {
                 generation,
@@ -27485,6 +29027,12 @@ fn provider_worker(
         drop(rss_requests);
         drop(rss_pending);
     }
+    #[cfg(feature = "librivox")]
+    {
+        librivox_stopping.store(true, AtomicOrdering::Release);
+        drop(librivox_requests);
+        drop(librivox_pending);
+    }
     #[cfg(feature = "bandcamp")]
     {
         bandcamp_search_stopping.store(true, AtomicOrdering::Release);
@@ -27503,6 +29051,10 @@ fn provider_worker(
     }
     #[cfg(feature = "rss")]
     if let Some(handle) = rss_thread {
+        let _ = handle.join();
+    }
+    #[cfg(feature = "librivox")]
+    if let Some(handle) = librivox_thread {
         let _ = handle.join();
     }
     #[cfg(feature = "bandcamp")]
@@ -27599,6 +29151,304 @@ fn resolved_apple_media(
             status_line: "Apple podcast resolved to its public RSS feed; select an episode to play"
                 .to_owned(),
         }
+    }
+}
+
+/// Builds one compact LibriVox book row without discarding provider identity.
+#[cfg(feature = "librivox")]
+fn librivox_book_row(book: &LibrivoxBook) -> RowView {
+    let mut metadata = Vec::new();
+    if !book.authors.is_empty() {
+        metadata.push(
+            book.authors
+                .iter()
+                .map(|author| author.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if let Some(language) = book.language.as_deref().filter(|value| !value.is_empty()) {
+        metadata.push(language.to_owned());
+    }
+    if let Some(duration) = book.duration_seconds {
+        metadata.push(format_seconds(duration));
+    }
+    RowView {
+        media_id: Some(librivox_book_media_id(book.book_id)),
+        title: book.title.clone(),
+        subtitle: metadata.join(" · "),
+        source: "LibriVox".to_owned(),
+        thumbnail_url: book
+            .covers
+            .thumbnail_url
+            .clone()
+            .or_else(|| book.covers.jpeg_url.clone()),
+        compact: true,
+        ..RowView::default()
+    }
+}
+
+/// Builds one compact playable LibriVox section row.
+#[cfg(feature = "librivox")]
+fn librivox_section_row(book: &LibrivoxBook, section: &LibrivoxSection) -> RowView {
+    let mut metadata = Vec::new();
+    if !section.readers.is_empty() {
+        metadata.push(
+            section
+                .readers
+                .iter()
+                .map(|reader| reader.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if let Some(duration) = section.duration_seconds {
+        metadata.push(format_seconds(duration));
+    }
+    RowView {
+        media_id: Some(librivox_section_media_id(book.book_id, section.section_id)),
+        title: section.title.clone(),
+        subtitle: metadata.join(" · "),
+        source: "LibriVox".to_owned(),
+        thumbnail_url: book
+            .covers
+            .thumbnail_url
+            .clone()
+            .or_else(|| book.covers.jpeg_url.clone()),
+        compact: true,
+        ..RowView::default()
+    }
+}
+
+/// Creates a stable identity for a non-playable LibriVox book container.
+#[cfg(feature = "librivox")]
+fn librivox_book_media_id(book_id: u64) -> MediaId {
+    MediaId::new(SourceKind::LibriVox, format!("book:{book_id}"))
+}
+
+/// Creates a stable identity for one playable LibriVox section.
+#[cfg(feature = "librivox")]
+fn librivox_section_media_id(book_id: u64, section_id: u64) -> MediaId {
+    MediaId::new(
+        SourceKind::LibriVox,
+        librivox_section_external_id(book_id, section_id),
+    )
+}
+
+/// Formats a book description while keeping genres explicit and searchable.
+#[cfg(feature = "librivox")]
+fn librivox_book_description(
+    book: &LibrivoxBook,
+    author_details: Option<&LibrivoxAuthorDetails>,
+) -> String {
+    let mut blocks = Vec::new();
+    if let Some(details) = author_details
+        && let Some(description) = details
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+    {
+        blocks.push(format!(
+            "About {}:\n{description}",
+            details.author.display_name
+        ));
+    }
+    if let Some(genres) = librivox_genres_line(book.genres.iter().map(|genre| genre.name.as_str()))
+    {
+        blocks.push(genres);
+    }
+    if let Some(description) = book
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        blocks.push(description.to_owned());
+    }
+    blocks.join("\n\n")
+}
+
+/// Formats provider genres as one explicit book-description block.
+#[cfg(feature = "librivox")]
+fn librivox_genres_line<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let names = names
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| format!("Genres: {}", names.join(", ")))
+}
+
+/// Builds author, keyword, and source links for one LibriVox book.
+#[cfg(feature = "librivox")]
+fn librivox_book_links(
+    book: &LibrivoxBook,
+    author_details: Option<&LibrivoxAuthorDetails>,
+) -> Vec<DetailLinkView> {
+    let mut links = book
+        .authors
+        .iter()
+        .map(|author| DetailLinkView {
+            prefix: "Author: ".to_owned(),
+            label: author.display_name.clone(),
+            url: author.webpage_url.to_string(),
+            presentation: DetailLinkPresentation::LabelOnlySpaced,
+            internal_target: Some(DetailLinkInternalTarget::LibriVoxAuthor(
+                author.author_id.to_string(),
+            )),
+            ..DetailLinkView::default()
+        })
+        .collect::<Vec<_>>();
+    if let Some(wikipedia_url) = author_details.and_then(|details| details.wikipedia_url.as_ref()) {
+        links.push(DetailLinkView {
+            prefix: "Wikipedia: ".to_owned(),
+            label: author_details
+                .map(|details| details.author.display_name.clone())
+                .unwrap_or_else(|| "Wikipedia".to_owned()),
+            url: wikipedia_url.to_string(),
+            presentation: DetailLinkPresentation::LabelOnlySpaced,
+            ..DetailLinkView::default()
+        });
+    }
+    links.extend(
+        book.keywords
+            .iter()
+            .enumerate()
+            .map(|(index, keyword)| DetailLinkView {
+                prefix: if index == 0 {
+                    "Keyword: ".to_owned()
+                } else {
+                    String::new()
+                },
+                label: keyword.name.clone(),
+                url: keyword.webpage_url.to_string(),
+                presentation: DetailLinkPresentation::LabelOnly,
+                ..DetailLinkView::default()
+            }),
+    );
+    links.push(DetailLinkView {
+        label: book.webpage_url.to_string(),
+        url: book.webpage_url.to_string(),
+        presentation: DetailLinkPresentation::UrlOnlySpaced,
+        ..DetailLinkView::default()
+    });
+    for (label, url) in [
+        ("Text source", book.text_source_url.as_ref()),
+        ("RSS", book.rss_url.as_ref()),
+        ("ZIP", book.zip_url.as_ref()),
+        ("Internet Archive", book.archive_url.as_ref()),
+    ] {
+        if let Some(url) = url {
+            links.push(DetailLinkView {
+                label: label.to_owned(),
+                url: url.to_string(),
+                ..DetailLinkView::default()
+            });
+        }
+    }
+    links
+}
+
+/// Builds Details for one selected LibriVox book.
+#[cfg(feature = "librivox")]
+fn librivox_book_detail(
+    book: &LibrivoxBook,
+    author_details: Option<&LibrivoxAuthorDetails>,
+) -> DetailView {
+    DetailView {
+        media_id: Some(librivox_book_media_id(book.book_id)),
+        title: book.title.clone(),
+        source: "LibriVox".to_owned(),
+        channel_name: book
+            .authors
+            .iter()
+            .map(|author| author.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        length: book
+            .duration_seconds
+            .map_or_else(String::new, format_seconds),
+        description: librivox_book_description(book, author_details),
+        published: book
+            .copyright_year
+            .map_or_else(String::new, |year| year.to_string()),
+        license: "Public domain in the United States".to_owned(),
+        links: librivox_book_links(book, author_details),
+        thumbnail_url: book
+            .covers
+            .thumbnail_url
+            .clone()
+            .or_else(|| book.covers.jpeg_url.clone()),
+        expanded_thumbnail_url: book.covers.jpeg_url.clone(),
+        ..DetailView::default()
+    }
+}
+
+/// Builds Details for one playable section while preserving book metadata.
+#[cfg(feature = "librivox")]
+fn librivox_section_detail(book: &LibrivoxBook, section: &LibrivoxSection) -> DetailView {
+    let readers = section
+        .readers
+        .iter()
+        .map(|reader| reader.display_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    DetailView {
+        media_id: Some(librivox_section_media_id(book.book_id, section.section_id)),
+        title: section.title.clone(),
+        source: "LibriVox".to_owned(),
+        channel_name: if readers.is_empty() {
+            book.authors
+                .iter()
+                .map(|author| author.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            readers
+        },
+        length: section
+            .duration_seconds
+            .map_or_else(String::new, format_seconds),
+        description: librivox_book_description(book, None),
+        license: "Public domain in the United States".to_owned(),
+        links: librivox_book_links(book, None),
+        thumbnail_url: book
+            .covers
+            .thumbnail_url
+            .clone()
+            .or_else(|| book.covers.jpeg_url.clone()),
+        expanded_thumbnail_url: book.covers.jpeg_url.clone(),
+        ..DetailView::default()
+    }
+}
+
+/// Builds one replayable LibriVox audiobook section.
+#[cfg(feature = "librivox")]
+fn queue_item_from_librivox_section(book: &LibrivoxBook, section: &LibrivoxSection) -> QueueItem {
+    QueueItem {
+        media: MediaItem {
+            id: librivox_section_media_id(book.book_id, section.section_id),
+            kind: MediaKind::Audio,
+            title: section.title.clone(),
+            creator: book
+                .authors
+                .first()
+                .map(|author| author.display_name.clone()),
+            description: book.description.clone(),
+            webpage_url: book.webpage_url.clone(),
+            thumbnail_url: book
+                .covers
+                .jpeg_url
+                .clone()
+                .or_else(|| book.covers.thumbnail_url.clone()),
+            duration_seconds: section.duration_seconds,
+            published_at: None,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::PublicDomain,
+            chapters: Vec::new(),
+            captions: Vec::new(),
+        },
+        playback_location: section.preferred_audio_url.to_string(),
+        start_at_seconds: None,
+        added_at: unix_time(),
     }
 }
 
@@ -30147,6 +31997,10 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::ApplePodcasts => StoredScreen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         Screen::ApplePodcasts => StoredScreen::Search,
+        #[cfg(feature = "librivox")]
+        Screen::LibriVox => StoredScreen::LibriVox,
+        #[cfg(not(feature = "librivox"))]
+        Screen::LibriVox => StoredScreen::Search,
         #[cfg(feature = "radio")]
         Screen::Radio => StoredScreen::Radio,
         #[cfg(not(feature = "radio"))]
@@ -30211,6 +32065,10 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         StoredScreen::ApplePodcasts => Screen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         StoredScreen::ApplePodcasts => Screen::Search,
+        #[cfg(feature = "librivox")]
+        StoredScreen::LibriVox => Screen::LibriVox,
+        #[cfg(not(feature = "librivox"))]
+        StoredScreen::LibriVox => Screen::Search,
         #[cfg(feature = "radio")]
         StoredScreen::Radio => Screen::Radio,
         #[cfg(not(feature = "radio"))]
@@ -30842,10 +32700,11 @@ enum HistoryReplayTarget {
     Remote(url::Url),
 }
 
-/// Selects a stable, credential-free locator without persisting resolved media.
+/// Selects a stable, credential-free locator without persisting signed media.
 ///
-/// The queue's playback location may be a signed CDN URL. History therefore
-/// derives replay state from canonical identity and webpage fields only.
+/// Most playback locations are transient CDN resolutions and are ignored.
+/// LibriVox is an explicit exception because its fixed-origin Archive.org MP3
+/// downloads are stable public chapter URLs.
 fn history_replay_locator(item: &QueueItem) -> Option<String> {
     // TODO: GenericYtDlp and RemoteFiles still use the original direct URL as
     // MediaId. The replay locator deliberately rejects untrusted queries, but
@@ -30858,6 +32717,11 @@ fn history_replay_locator(item: &QueueItem) -> Option<String> {
         SourceKind::YouTube => validate_youtube_video_id(&item.media.id.external_id)
             .is_ok()
             .then(|| youtube_video_url(&item.media.id.external_id)),
+        SourceKind::LibriVox => {
+            parse_librivox_section_external_id(&item.media.id.external_id)?;
+            let audio_url = url::Url::parse(&item.playback_location).ok()?;
+            stable_history_remote_url(&SourceKind::LibriVox, &audio_url).map(|url| url.to_string())
+        }
         SourceKind::ModArchive => None,
         _ => stable_history_remote_url(&item.media.id.source, &item.media.webpage_url)
             .map(|url| url.to_string()),
@@ -30866,8 +32730,8 @@ fn history_replay_locator(item: &QueueItem) -> Option<String> {
 
 /// Converts one queue entry into bounded, credential-free playlist metadata.
 ///
-/// Playback locations are deliberately ignored because they can contain
-/// signed CDN URLs or request-specific provider state. The same canonical
+/// Transient playback locations are ignored because they can contain signed
+/// CDN URLs or request-specific provider state. The same provider-specific
 /// locator policy used by History supplies the restart-safe replay target.
 fn playlist_snapshot_from_queue_item(item: &QueueItem) -> Result<PlaylistMediaSnapshot, String> {
     let replay_locator = history_replay_locator(item).ok_or_else(|| {
@@ -30876,11 +32740,22 @@ fn playlist_snapshot_from_queue_item(item: &QueueItem) -> Result<PlaylistMediaSn
             item.media.title
         )
     })?;
-    let webpage_url = if item.media.id.source == SourceKind::Local {
-        item.media.webpage_url.clone()
-    } else {
-        url::Url::parse(&replay_locator)
-            .map_err(|_| "The canonical playlist replay URL is invalid".to_owned())?
+    let webpage_url = match item.media.id.source {
+        SourceKind::Local => item.media.webpage_url.clone(),
+        SourceKind::LibriVox => {
+            let replay_url = url::Url::parse(&replay_locator)
+                .map_err(|_| "The canonical LibriVox chapter URL is invalid".to_owned())?;
+            let has_book_page =
+                crate::domain::is_canonical_librivox_book_url(&item.media.webpage_url);
+            let is_history_audio = item.media.webpage_url == replay_url
+                && is_canonical_librivox_audio_url(&item.media.webpage_url);
+            if !has_book_page && !is_history_audio {
+                return Err("The canonical LibriVox book URL is invalid".to_owned());
+            }
+            item.media.webpage_url.clone()
+        }
+        _ => url::Url::parse(&replay_locator)
+            .map_err(|_| "The canonical playlist replay URL is invalid".to_owned())?,
     };
     Ok(PlaylistMediaSnapshot {
         id: item.media.id.clone(),
@@ -30952,6 +32827,11 @@ fn stable_history_remote_url(source: &SourceKind, url: &url::Url) -> Option<url:
             validate_youtube_video_id(&video_id).ok()?;
             stable = url::Url::parse(&youtube_video_url(&video_id)).ok()?;
         }
+        SourceKind::LibriVox => {
+            if !is_canonical_librivox_audio_url(&stable) {
+                return None;
+            }
+        }
         _ if stable.query().is_some_and(|query| !query.is_empty()) => return None,
         _ => stable.set_query(None),
     }
@@ -30981,6 +32861,12 @@ fn history_replay_target(entry: &HistoryEntry) -> Result<HistoryReplayTarget, St
         return Ok(HistoryReplayTarget::Remote(url));
     }
 
+    if entry.media_id.source == SourceKind::LibriVox
+        && parse_librivox_section_external_id(&entry.media_id.external_id).is_none()
+    {
+        return Err("The saved LibriVox chapter identifier is invalid".to_owned());
+    }
+
     let locator = entry
         .replay_locator
         .as_deref()
@@ -31001,8 +32887,9 @@ fn history_replay_target(entry: &HistoryEntry) -> Result<HistoryReplayTarget, St
 
 /// Reconstructs one persisted playlist entry from its stable replay locator.
 ///
-/// The stored canonical page or absolute local path is revalidated before it
-/// reaches the player. Transient signed media URLs are never reconstructed.
+/// The stored canonical page, stable public media URL, or absolute local path
+/// is revalidated before it reaches the player. Signed media URLs are never
+/// reconstructed.
 fn queue_item_from_playlist_entry(entry: &PlaylistEntry) -> Result<QueueItem, String> {
     if let Some(segment) = entry.segment.as_ref()
         && segment.media_id != entry.media.id
@@ -31054,6 +32941,19 @@ fn queue_item_from_playlist_entry(entry: &PlaylistEntry) -> Result<QueueItem, St
             );
         }
         (expected.clone(), expected.to_string())
+    } else if entry.media.id.source == SourceKind::LibriVox {
+        parse_librivox_section_external_id(&entry.media.id.external_id)
+            .ok_or_else(|| "The saved LibriVox chapter identifier is invalid".to_owned())?;
+        let saved = url::Url::parse(&entry.media.replay_locator)
+            .map_err(|_| "The saved LibriVox chapter URL is invalid".to_owned())?;
+        let stable = stable_history_remote_url(&SourceKind::LibriVox, &saved)
+            .ok_or_else(|| "The saved LibriVox chapter URL is not canonical".to_owned())?;
+        let has_book_page = crate::domain::is_canonical_librivox_book_url(&entry.media.webpage_url);
+        let is_history_audio = entry.media.webpage_url == stable;
+        if entry.media.kind != MediaKind::Audio || (!has_book_page && !is_history_audio) {
+            return Err("The saved LibriVox book metadata is invalid".to_owned());
+        }
+        (entry.media.webpage_url.clone(), stable.to_string())
     } else {
         let saved = url::Url::parse(&entry.media.replay_locator)
             .map_err(|_| "The saved playlist replay URL is invalid".to_owned())?;
@@ -31664,7 +33564,7 @@ fn yandex_music_artist_detail_links(
         .collect()
 }
 
-#[cfg(feature = "yandex-music")]
+#[cfg(any(feature = "librivox", feature = "yandex-music"))]
 const fn plural_s(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -32719,6 +34619,598 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// Stable public author shared by LibriVox controller regression fixtures.
+    #[cfg(feature = "librivox")]
+    fn librivox_author_fixture() -> LibrivoxAuthor {
+        LibrivoxAuthor {
+            author_id: 3_595,
+            display_name: "Alexander Aaronsohn".to_owned(),
+            first_name: Some("Alexander".to_owned()),
+            last_name: Some("Aaronsohn".to_owned()),
+            birth_year: Some(1888),
+            death_year: Some(1948),
+            webpage_url: url::Url::parse("https://librivox.org/author/3595")
+                .expect("LibriVox author URL"),
+        }
+    }
+
+    /// One playable section with a distinct stable identity.
+    #[cfg(feature = "librivox")]
+    fn librivox_section_fixture(section_id: u64, number: u32, title: &str) -> LibrivoxSection {
+        LibrivoxSection {
+            section_id,
+            number,
+            title: title.to_owned(),
+            language: Some("English".to_owned()),
+            duration_seconds: Some(667),
+            readers: vec![crate::providers::librivox::LibrivoxReader {
+                reader_id: Some(6_798),
+                display_name: "Aesthete's Readings".to_owned(),
+            }],
+            preferred_audio_url: url::Url::parse(&format!(
+                "https://archive.org/download/fixture/section-{section_id}.mp3"
+            ))
+            .expect("LibriVox section URL"),
+            fallback_audio_url: Some(
+                url::Url::parse(&format!(
+                    "https://archive.org/download/fixture/section-{section_id}-64kb.mp3"
+                ))
+                .expect("LibriVox fallback URL"),
+            ),
+        }
+    }
+
+    /// Complete audiobook covering descriptions, genres, keywords, and audio.
+    #[cfg(feature = "librivox")]
+    fn librivox_book_fixture() -> LibrivoxBook {
+        LibrivoxBook {
+            book_id: 5_936,
+            title: "With the Turks in Palestine".to_owned(),
+            description: Some("A memoir of Palestine during wartime.".to_owned()),
+            language: Some("English".to_owned()),
+            copyright_year: Some(1916),
+            duration_seconds: Some(6_889),
+            webpage_url: url::Url::parse(
+                "https://librivox.org/with-the-turks-in-palestine-by-alexander-aaronsohn/",
+            )
+            .expect("LibriVox book URL"),
+            text_source_url: Some(
+                url::Url::parse("https://www.gutenberg.org/ebooks/10338").expect("source-text URL"),
+            ),
+            rss_url: Some(
+                url::Url::parse("https://librivox.org/rss/5936").expect("LibriVox RSS URL"),
+            ),
+            zip_url: Some(
+                url::Url::parse("https://archive.org/download/fixture/book.zip")
+                    .expect("LibriVox ZIP URL"),
+            ),
+            archive_url: Some(
+                url::Url::parse("https://archive.org/details/fixture")
+                    .expect("Internet Archive URL"),
+            ),
+            covers: crate::providers::librivox::LibrivoxCoverArt {
+                jpeg_url: Some(
+                    url::Url::parse("https://archive.org/download/fixture/cover.jpg")
+                        .expect("full LibriVox cover URL"),
+                ),
+                thumbnail_url: Some(
+                    url::Url::parse("https://archive.org/download/fixture/cover-thumb.jpg")
+                        .expect("LibriVox cover thumbnail URL"),
+                ),
+                pdf_url: None,
+            },
+            authors: vec![librivox_author_fixture()],
+            genres: vec![
+                crate::providers::librivox::LibrivoxGenre {
+                    genre_id: Some(73),
+                    name: "War & Military".to_owned(),
+                },
+                crate::providers::librivox::LibrivoxGenre {
+                    genre_id: Some(111),
+                    name: "Memoirs".to_owned(),
+                },
+                crate::providers::librivox::LibrivoxGenre {
+                    genre_id: Some(117),
+                    name: "Modern (20th C)".to_owned(),
+                },
+            ],
+            keywords: vec![crate::providers::librivox::LibrivoxKeyword {
+                name: "World War I".to_owned(),
+                webpage_url: url::Url::parse("https://librivox.org/keywords/631")
+                    .expect("LibriVox keyword URL"),
+            }],
+            sections: vec![
+                librivox_section_fixture(77_736, 1, "Introduction and Chapter I"),
+                librivox_section_fixture(77_737, 2, "Chapter II"),
+            ],
+        }
+    }
+
+    /// Author page fixture with a caller-selected continuation offset.
+    #[cfg(feature = "librivox")]
+    fn librivox_author_details_fixture(next_offset: Option<usize>) -> LibrivoxAuthorDetails {
+        LibrivoxAuthorDetails {
+            author: librivox_author_fixture(),
+            description: Some("A public-domain memoirist.".to_owned()),
+            wikipedia_url: Some(
+                url::Url::parse("https://en.wikipedia.org/wiki/Alexander_Aaronsohn")
+                    .expect("Wikipedia URL"),
+            ),
+            books: vec![librivox_book_fixture()],
+            next_offset,
+        }
+    }
+
+    /// Stops the real provider worker and returns a deterministic request tap.
+    #[cfg(feature = "librivox")]
+    fn capture_controller_provider_requests(
+        controller: &mut AppController,
+    ) -> Receiver<ProviderRequest> {
+        if let Some(sender) = controller.provider_requests.take() {
+            let _ = sender.send(ProviderRequest::Shutdown);
+        }
+        if let Some(handle) = controller.provider_thread.take() {
+            handle.join().expect("provider worker joined");
+        }
+        let (sender, receiver) = unbounded();
+        controller.provider_requests = Some(sender);
+        receiver
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_book_description_formats_every_nonempty_genre() {
+        assert_eq!(
+            librivox_genres_line(["War & Military", "", "Memoirs", "Modern (20th C)"]),
+            Some("Genres: War & Military, Memoirs, Modern (20th C)".to_owned())
+        );
+        assert_eq!(librivox_genres_line(["", ""]), None);
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_details_project_genres_keywords_authors_and_full_cover() {
+        let book = librivox_book_fixture();
+        let details = librivox_book_detail(&book, None);
+
+        assert_eq!(
+            details.description,
+            "Genres: War & Military, Memoirs, Modern (20th C)\n\n\
+             A memoir of Palestine during wartime."
+        );
+        assert_eq!(details.license, "Public domain in the United States");
+        assert_eq!(
+            details
+                .expanded_thumbnail_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some("https://archive.org/download/fixture/cover.jpg")
+        );
+        assert!(details.links.iter().any(|link| {
+            link.label == "Alexander Aaronsohn"
+                && link.internal_target
+                    == Some(DetailLinkInternalTarget::LibriVoxAuthor("3595".to_owned()))
+        }));
+        assert!(details.links.iter().any(|link| {
+            link.label == "World War I"
+                && link.url == "https://librivox.org/keywords/631"
+                && link.presentation == DetailLinkPresentation::LabelOnly
+        }));
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_stale_search_response_cannot_replace_newer_results() {
+        let temporary = tempfile::tempdir().expect("LibriVox stale-response root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::LibriVox;
+        let current = librivox_book_fixture();
+        controller.librivox_books = vec![current.clone()];
+        controller.librivox_generation = 9;
+        controller.pending_librivox_request = Some(PendingLibrivoxRequest::Books {
+            generation: 9,
+            query: "current".to_owned(),
+        });
+        let mut stale = current.clone();
+        stale.book_id = 8_888;
+        stale.title = "Stale result".to_owned();
+
+        controller.handle_provider_response(ProviderResponse::LibrivoxSearch {
+            generation: 8,
+            query: "stale".to_owned(),
+            result: Ok(LibrivoxSearchPage {
+                books: vec![stale],
+                offset: 0,
+                next_offset: None,
+            }),
+        });
+
+        assert_eq!(controller.librivox_books, vec![current]);
+        assert_eq!(
+            controller.pending_librivox_request,
+            Some(PendingLibrivoxRequest::Books {
+                generation: 9,
+                query: "current".to_owned(),
+            })
+        );
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_owned_search_response_populates_rows_and_details() {
+        let temporary = tempfile::tempdir().expect("LibriVox search-response root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::LibriVox;
+        controller.librivox_generation = 4;
+        controller.pending_librivox_request = Some(PendingLibrivoxRequest::Books {
+            generation: 4,
+            query: "Palestine".to_owned(),
+        });
+        controller.view.search_activity = Some(SearchActivity::LibriVox);
+        let book = librivox_book_fixture();
+
+        controller.handle_provider_response(ProviderResponse::LibrivoxSearch {
+            generation: 4,
+            query: "Palestine".to_owned(),
+            result: Ok(LibrivoxSearchPage {
+                books: vec![book.clone()],
+                offset: 0,
+                next_offset: None,
+            }),
+        });
+
+        assert_eq!(controller.librivox_books, vec![book]);
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "With the Turks in Palestine");
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("selected LibriVox details")
+                .description
+                .contains("Genres: War & Military, Memoirs, Modern (20th C)")
+        );
+        assert_eq!(controller.pending_librivox_request, None);
+        assert_eq!(controller.view.search_activity, None);
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn first_librivox_catalogue_response_restores_the_saved_row() {
+        let temporary = tempfile::tempdir().expect("LibriVox restore root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        store
+            .save_session(
+                &SessionState {
+                    screen: StoredScreen::LibriVox,
+                    selected_row: 2,
+                    librivox_selected_row: Some(2),
+                    librivox_search_text: "memoir".to_owned(),
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .expect("seed LibriVox session");
+        let mut controller = AppController::new(config, store, None, None);
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.pending_librivox_request = None;
+        controller.finish_search_activity(SearchActivity::LibriVox);
+        controller.populate_librivox();
+        let (generation, query) = match requests.try_recv().expect("restored LibriVox request") {
+            ProviderRequest::LibrivoxSearch {
+                generation, query, ..
+            } => (generation, query),
+            _ => panic!("unexpected provider request"),
+        };
+        let first = librivox_book_fixture();
+        let mut second = first.clone();
+        second.book_id = 5_937;
+        second.title = "Second restored book".to_owned();
+        let mut third = first.clone();
+        third.book_id = 5_938;
+        third.title = "Third restored book".to_owned();
+
+        controller.handle_provider_response(ProviderResponse::LibrivoxSearch {
+            generation,
+            query,
+            result: Ok(LibrivoxSearchPage {
+                books: vec![first, second, third],
+                offset: 0,
+                next_offset: None,
+            }),
+        });
+
+        assert_eq!(controller.view.selected, 2);
+        assert_eq!(controller.librivox_selected, 2);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Third restored book")
+        );
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_child_route_persists_its_parent_catalogue_row() {
+        let temporary = tempfile::tempdir().expect("LibriVox child-session root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        let book = librivox_book_fixture();
+        controller
+            .librivox_navigation_back
+            .push_back(LibrivoxNavigationSnapshot {
+                route: LibrivoxRoute::Books,
+                books: vec![book.clone(), book.clone(), book.clone()],
+                active_book: None,
+                active_author: None,
+                selected: 2,
+                query: "memoir".to_owned(),
+            });
+        controller.view.screen = Screen::LibriVox;
+        controller.librivox_route = LibrivoxRoute::Book;
+        controller.active_librivox_book = Some(book);
+        controller.librivox_selected = 1;
+        controller.view.selected = 1;
+
+        assert!(controller.save_session());
+        let saved = controller
+            .store
+            .session()
+            .expect("read LibriVox session")
+            .expect("saved LibriVox session");
+        assert_eq!(saved.librivox_selected_row, Some(2));
+
+        drop(controller);
+        let store = StateStore::open(&config).expect("reopen disk state");
+        let mut restarted = AppController::new(config, store, None, None);
+        let requests = capture_controller_provider_requests(&mut restarted);
+        restarted.pending_librivox_request = None;
+        restarted.finish_search_activity(SearchActivity::LibriVox);
+        restarted.populate_librivox();
+        let (generation, query) = match requests
+            .try_recv()
+            .expect("restarted LibriVox catalogue request")
+        {
+            ProviderRequest::LibrivoxSearch {
+                generation, query, ..
+            } => (generation, query),
+            _ => panic!("unexpected provider request"),
+        };
+        let first = librivox_book_fixture();
+        let mut second = first.clone();
+        second.book_id = 5_937;
+        second.title = "Second restarted book".to_owned();
+        let mut third = first.clone();
+        third.book_id = 5_938;
+        third.title = "Third restarted book".to_owned();
+
+        restarted.handle_provider_response(ProviderResponse::LibrivoxSearch {
+            generation,
+            query,
+            result: Ok(LibrivoxSearchPage {
+                books: vec![first, second, third],
+                offset: 0,
+                next_offset: None,
+            }),
+        });
+
+        assert_eq!(restarted.librivox_route, LibrivoxRoute::Books);
+        assert_eq!(restarted.view.selected, 2);
+        assert_eq!(restarted.librivox_selected, 2);
+        assert_eq!(
+            restarted
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Third restarted book")
+        );
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn keyboard_detail_activation_opens_exact_librivox_author_inside_youta() {
+        let temporary = tempfile::tempdir().expect("LibriVox author-navigation root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let requests = capture_controller_provider_requests(&mut controller);
+        let book = librivox_book_fixture();
+        controller.view.screen = Screen::LibriVox;
+        controller.librivox_books = vec![book.clone()];
+        controller.view.details = Some(librivox_book_detail(&book, None));
+
+        controller.activate_detail_link(0);
+
+        match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("LibriVox author request")
+        {
+            ProviderRequest::LibrivoxAuthor { author_id, .. } => assert_eq!(author_id, 3_595),
+            _ => panic!("unexpected provider request"),
+        }
+        assert_eq!(controller.librivox_navigation_back.len(), 1);
+        assert_eq!(
+            controller.view.search_activity,
+            Some(SearchActivity::LibriVox)
+        );
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_author_books_load_in_bounded_continuation_pages() {
+        let temporary = tempfile::tempdir().expect("LibriVox pagination root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.view.screen = Screen::LibriVox;
+        controller.open_librivox_author("3595".to_owned());
+        let (generation, author_id) = match requests
+            .try_recv()
+            .expect("initial LibriVox author request")
+        {
+            ProviderRequest::LibrivoxAuthor {
+                generation,
+                author_id,
+            } => (generation, author_id),
+            _ => panic!("unexpected provider request"),
+        };
+        controller.handle_provider_response(ProviderResponse::LibrivoxAuthor {
+            generation,
+            author_id,
+            result: Ok(Box::new(librivox_author_details_fixture(Some(20)))),
+        });
+        assert_eq!(controller.librivox_books.len(), 1);
+        assert_eq!(controller.view.rows.len(), 2, "book plus load-more row");
+        assert_eq!(controller.view.rows[1].title, "Load more books…");
+
+        controller.view.selected = 1;
+        controller.activate_librivox_selection();
+        let mut continuation = None;
+        while let Ok(request) = requests.try_recv() {
+            match request {
+                ProviderRequest::LibrivoxAuthorBooks {
+                    generation,
+                    author,
+                    offset,
+                } => continuation = Some((generation, author, offset)),
+                _ => {}
+            }
+        }
+        let (continuation_generation, author, offset) =
+            continuation.expect("LibriVox author continuation request");
+        assert_eq!(author.author_id, 3_595);
+        assert_eq!(offset, 20);
+        assert_eq!(controller.librivox_navigation_back.len(), 1);
+
+        let first = librivox_book_fixture();
+        let mut second = first.clone();
+        second.book_id = 6_000;
+        second.title = "A second memoir".to_owned();
+        second.webpage_url = url::Url::parse("https://librivox.org/a-second-memoir/")
+            .expect("second LibriVox book URL");
+        controller.handle_provider_response(ProviderResponse::LibrivoxAuthorBooks {
+            generation: continuation_generation,
+            author_id: author.author_id,
+            offset,
+            result: Ok(LibrivoxSearchPage {
+                books: vec![first, second.clone()],
+                offset,
+                next_offset: None,
+            }),
+        });
+
+        assert_eq!(controller.librivox_books.len(), 2);
+        assert_eq!(controller.librivox_books[1], second);
+        assert_eq!(controller.view.rows.len(), 2, "load-more row is gone");
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(
+            controller
+                .active_librivox_author
+                .as_ref()
+                .and_then(|details| details.next_offset),
+            None
+        );
+    }
+
+    #[cfg(feature = "librivox")]
+    #[test]
+    fn librivox_section_identity_autoplay_and_browser_url_remain_stable() {
+        let temporary = tempfile::tempdir().expect("LibriVox section-autoplay root");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let book = librivox_book_fixture();
+        let queue = book
+            .sections
+            .iter()
+            .map(|section| queue_item_from_librivox_section(&book, section))
+            .collect::<Vec<_>>();
+        assert_eq!(queue[0].media.id.source, SourceKind::LibriVox);
+        assert_eq!(queue[0].media.id.external_id, "book:5936:section:77736");
+        assert_eq!(queue[1].media.id.external_id, "book:5936:section:77737");
+
+        let chapter_url = "https://archive.org/download/fixture/section-77736.mp3";
+        assert_eq!(
+            history_replay_locator(&queue[0]).as_deref(),
+            Some(chapter_url)
+        );
+        let snapshot = playlist_snapshot_from_queue_item(&queue[0]).expect("playlist snapshot");
+        assert_eq!(snapshot.webpage_url, book.webpage_url);
+        assert_eq!(snapshot.replay_locator, chapter_url);
+        let playlist_item = queue_item_from_playlist_entry(&PlaylistEntry {
+            media: snapshot,
+            segment: None,
+            added_at: 1,
+        })
+        .expect("reconstructed LibriVox playlist item");
+        assert_eq!(playlist_item.media.webpage_url, book.webpage_url);
+        assert_eq!(playlist_item.playback_location, chapter_url);
+
+        let history = HistoryEntry {
+            id: 1,
+            media_id: queue[0].media.id.clone(),
+            title: queue[0].media.title.clone(),
+            replay_locator: Some(chapter_url.to_owned()),
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 90,
+            duration_seconds: queue[0].media.duration_seconds,
+            finished: false,
+        };
+        let target = history_replay_target(&history).expect("LibriVox History target");
+        let history_item =
+            queue_item_from_history(&history, &target).expect("LibriVox History queue item");
+        assert_eq!(history_item.playback_location, chapter_url);
+        let history_snapshot =
+            playlist_snapshot_from_queue_item(&history_item).expect("History playlist snapshot");
+        assert_eq!(history_snapshot.webpage_url.as_str(), chapter_url);
+        assert_eq!(history_snapshot.replay_locator, chapter_url);
+        assert_eq!(
+            queue_item_from_playlist_entry(&PlaylistEntry {
+                media: history_snapshot,
+                segment: None,
+                added_at: 2,
+            })
+            .expect("History-derived LibriVox playlist item")
+            .playback_location,
+            chapter_url
+        );
+        let mut legacy_broken = history.clone();
+        legacy_broken.replay_locator = Some(book.webpage_url.to_string());
+        assert!(history_replay_target(&legacy_broken).is_err());
+
+        match controller.next_autoplay_step(&AutoplayOrigin::Librivox {
+            items: Arc::from(queue),
+            index: 0,
+        }) {
+            AutoplayStep::Play { item, .. } => {
+                assert_eq!(item.media.id.external_id, "book:5936:section:77737");
+            }
+            _ => panic!("LibriVox autoplay did not advance to the next section"),
+        }
+
+        controller.view.screen = Screen::LibriVox;
+        controller.librivox_route = LibrivoxRoute::Book;
+        controller.active_librivox_book = Some(book.clone());
+        controller.view.selected = 1;
+        assert_eq!(
+            controller.current_url().as_deref(),
+            Some(book.webpage_url.as_str())
+        );
+    }
 
     /// Deterministic recoverable-Trash backend scoped to temporary test files.
     #[cfg(feature = "local-trash")]
@@ -45045,6 +47537,26 @@ mod tests {
             .expect("valid fingerprint candidate fixture")
     }
 
+    /// Creates one exact full-wiki result without contacting Last.fm.
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    fn local_fingerprint_lastfm_biography() -> LocalFingerprintLastFmBiography {
+        LocalFingerprintLastFmBiography {
+            artist_item_id: "Q654321".to_owned(),
+            artist_label: "тема креста".to_owned(),
+            lastfm_id: "тема+креста".to_owned(),
+            wiki_url: url::Url::parse(
+                "https://www.last.fm/music/%D1%82%D0%B5%D0%BC%D0%B0+%D0%BA%D1%80%D0%B5%D1%81%D1%82%D0%B0/+wiki",
+            )
+            .expect("Last.fm fixture URL"),
+            description: concat!(
+                "самая конфликтная, самая нищебродская и самая сексистская группа.\n",
+                "новейший дип-хоп - местами абстракт хип-хоп\n",
+                "калька на весь бомонд авангардного хип-хопа с примесью женской страдальческой эстетики"
+            )
+            .to_owned(),
+        }
+    }
+
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
@@ -45446,6 +47958,347 @@ mod tests {
             result: Ok(Vec::new()),
         });
         assert!(controller.pending_local_fingerprint_wikidata.is_none());
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn fingerprint_wikidata_is_visible_before_lastfm_artist_description_arrives() {
+        const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm enrichment fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("selected fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                RECORDING_ID,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        let first_recording = controller.apply_local_fingerprint_details();
+        controller.request_local_fingerprint_wikidata(first_recording.as_deref());
+        let (generation, external_id) = provider_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Wikidata {
+                    generation,
+                    kind: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording,
+                    external_id,
+                } if external_id == RECORDING_ID => Some((generation, external_id)),
+                _ => None,
+            })
+            .expect("MusicBrainz Wikidata request");
+
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: crate::providers::wikidata::WikidataExternalKind::MusicBrainzRecording
+                .property_id()
+                .to_owned(),
+            external_id,
+            result: Ok(vec![crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: Some("musical recording".to_owned()),
+                url: url::Url::parse(&format!("https://www.wikidata.org/wiki/{RECORDING_ITEM}"))
+                    .expect("Wikidata fixture URL"),
+            }]),
+        });
+
+        let details = controller.view.details.as_ref().expect("Local Details");
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM)),
+            "the recording Wikidata link must render before Last.fm finishes"
+        );
+        assert!(details.lastfm_artist_description.is_empty());
+        let (generation, requested_key, recording_item_id) = provider_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::LocalFingerprintLastFm {
+                    generation,
+                    key,
+                    recording_item_id,
+                } => Some((generation, key, recording_item_id)),
+                _ => None,
+            })
+            .expect("deferred Last.fm request");
+        assert_eq!(requested_key, key);
+        assert_eq!(recording_item_id, RECORDING_ITEM);
+
+        let biography = local_fingerprint_lastfm_biography();
+        let description = biography.description.clone();
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation,
+            key,
+            recording_item_id,
+            result: Ok(Some(biography)),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("enriched Local Details");
+        assert_eq!(details.lastfm_artist_description, description);
+        assert!(details.links.iter().any(|link| {
+            link.label == "Last.fm artist wiki · тема креста" && link.url.ends_with("/+wiki")
+        }));
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| { link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM) })
+        );
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn late_lastfm_artist_description_cannot_replace_another_local_track() {
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary stale Last.fm fixture");
+        let first = media.path().join("first.flac");
+        let second = media.path().join("second.flac");
+        std::fs::write(&first, b"first audio fixture").expect("write first fixture");
+        std::fs::write(&second, b"second audio fixture").expect("write second fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &first);
+        let first_key = controller
+            .selected_local_fingerprint_target()
+            .expect("first fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            first_key.clone(),
+            vec![local_fingerprint_candidate(
+                "11111111-1111-4111-8111-111111111111",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller
+            .local_fingerprint_cache
+            .get_mut(&first_key)
+            .expect("first fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        select_local_fingerprint_fixture(&mut controller, media.path(), &second);
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key: first_key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Ok(Some(local_fingerprint_lastfm_biography())),
+        });
+
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .expect("second Local Details")
+                .lastfm_artist_description
+                .is_empty(),
+            "a late result must not appear on the newly selected file"
+        );
+        select_local_fingerprint_fixture(&mut controller, media.path(), &first);
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("revisited first Details");
+        assert!(
+            details
+                .lastfm_artist_description
+                .contains("самая конфликтная")
+        );
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.label.starts_with("Last.fm artist wiki"))
+                .count(),
+            1,
+            "cached metadata rebuilds must not duplicate the source link"
+        );
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn lastfm_failure_keeps_the_already_visible_wikidata_link() {
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm failure fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                "11111111-1111-4111-8111-111111111111",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller.apply_local_fingerprint_details();
+        apply_wikidata_links(
+            controller.view.details.as_mut().expect("Local Details"),
+            &[crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: None,
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q123456")
+                    .expect("Wikidata fixture URL"),
+            }],
+        );
+        controller
+            .local_fingerprint_cache
+            .get_mut(&key)
+            .expect("fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Err("Last.fm returned HTTP 406".to_owned()),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details remain");
+        assert!(details.lastfm_artist_description.is_empty());
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM))
+        );
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[cfg(all(feature = "acoustid", feature = "lastfm", feature = "wikidata"))]
+    #[test]
+    fn lastfm_success_keeps_visible_wikidata_during_same_recording_refresh() {
+        const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const RECORDING_ITEM: &str = "Q123456";
+        let media = tempfile::tempdir().expect("temporary Last.fm refresh fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_config, mut controller, _provider_requests) =
+            controller_with_local_fingerprint_config(Some("fixture-key"));
+        select_local_fingerprint_fixture(&mut controller, media.path(), &audio);
+        let key = controller
+            .selected_local_fingerprint_target()
+            .expect("fingerprint target")
+            .1;
+        controller.cache_local_fingerprint(
+            key.clone(),
+            vec![local_fingerprint_candidate(
+                RECORDING_ID,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                0.95,
+            )],
+        );
+        controller.apply_local_fingerprint_details();
+        apply_wikidata_links(
+            controller.view.details.as_mut().expect("Local Details"),
+            &[crate::domain::WikidataLink {
+                item_id: RECORDING_ITEM.to_owned(),
+                label: "Fixture recording".to_owned(),
+                description: None,
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q123456")
+                    .expect("Wikidata fixture URL"),
+            }],
+        );
+        let old_lastfm_index = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details")
+            .links
+            .len();
+        let details = controller.view.details.as_mut().expect("Local Details");
+        details.lastfm_artist_description = "obsolete biography".to_owned();
+        details.links.push(DetailLinkView {
+            label: "Last.fm artist wiki · obsolete artist".to_owned(),
+            url: "https://www.last.fm/music/obsolete/+wiki".to_owned(),
+            wikidata_item_id: None,
+            ..DetailLinkView::default()
+        });
+        controller.pending_local_fingerprint_wikidata = Some(PendingLocalFingerprintWikidata {
+            generation: controller.wikidata_generation,
+            recording_id: RECORDING_ID.to_owned(),
+        });
+        controller
+            .local_fingerprint_cache
+            .get_mut(&key)
+            .expect("fingerprint cache")
+            .lastfm = CachedLocalFingerprintLastFm::Pending {
+            generation: 7,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+        };
+
+        let biography = local_fingerprint_lastfm_biography();
+        let description = biography.description.clone();
+        controller.handle_provider_response(ProviderResponse::LocalFingerprintLastFm {
+            generation: 7,
+            key,
+            recording_item_id: RECORDING_ITEM.to_owned(),
+            result: Ok(Some(biography)),
+        });
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local Details remain");
+        assert_eq!(details.lastfm_artist_description, description);
+        assert!(details.links.iter().any(|link| {
+            link.label == "Last.fm artist wiki · тема креста" && link.url.ends_with("/+wiki")
+        }));
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.label.starts_with("Last.fm artist wiki · "))
+                .count(),
+            1,
+            "a refreshed biography must replace the obsolete Last.fm link"
+        );
+        assert_eq!(
+            details.links[old_lastfm_index].label, "Last.fm artist wiki · тема креста",
+            "the refreshed Last.fm link should preserve its display position"
+        );
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some(RECORDING_ITEM)),
+            "Last.fm success must not hide the already-visible Wikidata link"
+        );
+        assert!(controller.pending_local_fingerprint_wikidata.is_some());
     }
 
     #[cfg(feature = "acoustid")]
@@ -58881,6 +61734,17 @@ mod tests {
         assert!(requires_first_class_direct_resolution(&jamendo.source));
         assert!(!requires_first_class_direct_resolution(&remote.source));
 
+        let librivox = parse_direct_source_input(
+            "https://librivox.org/with-the-turks-in-palestine-by-alexander-aaronsohn/",
+        )
+        .expect("LibriVox page should parse")
+        .expect("LibriVox page should be direct");
+        assert_eq!(
+            librivox.source,
+            SourceKind::GenericYtDlp,
+            "book pages must not masquerade as playable LibriVox section IDs"
+        );
+
         assert!(
             parse_direct_source_input("ordinary YouTube search").is_ok_and(|value| value.is_none())
         );
@@ -59268,6 +62132,8 @@ mod tests {
                 #[cfg(feature = "apple-podcasts")]
                 Box::new(SystemAppleProviderClient::new()),
                 Box::new(BlockingBandcampSearchProvider { state }),
+                #[cfg(feature = "librivox")]
+                Box::new(LibrivoxClient::new()),
                 #[cfg(feature = "rss")]
                 Box::new(RssPodcastProvider::new()),
                 #[cfg(feature = "youtube-music")]
@@ -59351,6 +62217,8 @@ mod tests {
                 Box::new(SystemAppleProviderClient::new()),
                 #[cfg(feature = "bandcamp")]
                 Box::new(BandcampSearchClient::new()),
+                #[cfg(feature = "librivox")]
+                Box::new(LibrivoxClient::new()),
                 #[cfg(feature = "rss")]
                 Box::new(RssPodcastProvider::new()),
                 Box::new(BlockingYouTubeMusicSearchProvider { state }),
@@ -59422,6 +62290,8 @@ mod tests {
                 Box::new(SystemAppleProviderClient::new()),
                 #[cfg(feature = "bandcamp")]
                 Box::new(BandcampSearchClient::new()),
+                #[cfg(feature = "librivox")]
+                Box::new(LibrivoxClient::new()),
                 #[cfg(feature = "rss")]
                 Box::new(RssPodcastProvider::new()),
                 #[cfg(feature = "youtube-music")]
