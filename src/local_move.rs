@@ -517,15 +517,58 @@ pub fn list_local_move_destinations(
 /// return `None`.
 #[must_use]
 pub fn remap_local_path_prefix(path: &Path, mappings: &[LocalMoveMapping]) -> Option<PathBuf> {
+    // The match must not hinge on which of Windows' two spellings each side
+    // arrived in. A mapping holds what `fs::canonicalize` said — a `\\?\`
+    // verbatim path — while a stored locator decodes flat, and the file it
+    // names has just been moved away, so no amount of asking the filesystem
+    // can settle the two onto each other. Comparing both sides flat is the
+    // only meeting point that still exists.
+    let path = flat_spelling(path);
     mappings
         .iter()
         .filter_map(|mapping| {
-            path.strip_prefix(&mapping.source)
+            let source = flat_spelling(&mapping.source);
+            path.strip_prefix(source.as_ref())
                 .ok()
-                .map(|suffix| (mapping.source.components().count(), mapping, suffix))
+                .map(|suffix| (source.components().count(), mapping, suffix))
         })
         .max_by_key(|(components, _, _)| *components)
-        .map(|(_, mapping, suffix)| join_relative(&mapping.target, suffix))
+        .map(|(_, mapping, suffix)| join_relative(&flat_spelling(&mapping.target), suffix))
+}
+
+/// Returns `path` without a Windows verbatim prefix, when it carries one.
+///
+/// `\\?\C:\x` and `C:\x` name the same file, so a comparison between them is a
+/// comparison between one file and itself and must succeed. Only the exact
+/// spellings [`std::fs::canonicalize`] produces are translated — a verbatim
+/// disk or a verbatim UNC share — and only when the path is UTF-8, which every
+/// persistable mapping and decoded locator here already is; anything else
+/// passes through untouched and compares exactly as it did before.
+#[cfg(windows)]
+fn flat_spelling(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    let Some(text) = path.to_str() else {
+        return Cow::Borrowed(path);
+    };
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return Cow::Borrowed(path);
+    };
+    if let Some(share) = rest.strip_prefix(r"UNC\") {
+        Cow::Owned(PathBuf::from(format!(r"\\{share}")))
+    } else if rest.as_bytes().get(1) == Some(&b':') {
+        Cow::Borrowed(Path::new(rest))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+/// Returns `path` unchanged: only Windows spells one file two ways.
+///
+/// On Unix a leading `\\?\` is not a prefix but four ordinary bytes a file is
+/// entitled to be named by, so stripping it here would corrupt a real name.
+#[cfg(not(windows))]
+fn flat_spelling(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
 }
 
 /// Applies completed move mappings to a provider-qualified media identity.
@@ -1997,41 +2040,87 @@ mod tests {
     fn remapping_uses_longest_prefix_and_only_changes_local_ids() {
         let mappings = vec![
             LocalMoveMapping {
-                source: PathBuf::from("/music"),
-                target: PathBuf::from("/archive"),
+                source: fixture_absolute("/music"),
+                target: fixture_absolute("/archive"),
             },
             LocalMoveMapping {
-                source: PathBuf::from("/music/album"),
-                target: PathBuf::from("/library/favourite"),
+                source: fixture_absolute("/music/album"),
+                target: fixture_absolute("/library/favourite"),
             },
         ];
         assert_eq!(
-            remap_local_path_prefix(Path::new("/music/album/disc/one.flac"), &mappings),
-            Some(PathBuf::from("/library/favourite/disc/one.flac"))
+            remap_local_path_prefix(&fixture_absolute("/music/album/disc/one.flac"), &mappings),
+            Some(fixture_absolute("/library/favourite/disc/one.flac"))
         );
         assert_eq!(
-            remap_local_path_prefix(Path::new("/music/album"), &mappings),
-            Some(PathBuf::from("/library/favourite"))
+            remap_local_path_prefix(&fixture_absolute("/music/album"), &mappings),
+            Some(fixture_absolute("/library/favourite"))
         );
         assert_eq!(
-            remap_local_path_prefix(Path::new("/musicology/one.flac"), &mappings),
+            remap_local_path_prefix(&fixture_absolute("/musicology/one.flac"), &mappings),
             None
         );
 
-        let mut local = MediaId::new(SourceKind::Local, "/music/album/one.flac");
+        let old_locator = fixture_absolute("/music/album/one.flac");
+        let old_locator = old_locator.to_str().expect("UTF-8 fixture locator");
+        let new_locator = fixture_absolute("/library/favourite/one.flac");
+        let new_locator = new_locator.to_str().expect("UTF-8 fixture locator");
+
+        let mut local = MediaId::new(SourceKind::Local, old_locator);
         assert!(remap_local_media_id(&mut local, &mappings).expect("UTF-8 remap"));
-        assert_eq!(local.external_id, "/library/favourite/one.flac");
+        assert_eq!(local.external_id, new_locator);
 
-        let mut current = MediaId::new(SourceKind::Local, "file:///music/album/one.flac");
+        let old_url = url::Url::from_file_path(fixture_absolute("/music/album/one.flac"))
+            .expect("absolute fixture URL");
+        let new_url = url::Url::from_file_path(fixture_absolute("/library/favourite/one.flac"))
+            .expect("absolute fixture URL");
+        let mut current = MediaId::new(SourceKind::Local, old_url.as_str());
         assert!(remap_local_media_id(&mut current, &mappings).expect("file-URL remap"));
-        assert_eq!(current.external_id, "file:///library/favourite/one.flac");
+        assert_eq!(current.external_id, new_url.as_str());
 
-        let mut youtube = MediaId::new(SourceKind::YouTube, "/music/album/one.flac");
+        let mut youtube = MediaId::new(SourceKind::YouTube, old_locator);
         assert!(!remap_local_media_id(&mut youtube, &mappings).expect("non-local unchanged"));
-        assert_eq!(youtube.external_id, "/music/album/one.flac");
+        assert_eq!(youtube.external_id, old_locator);
 
-        let mut locator = "/music/album/one.flac".to_owned();
+        let mut locator = old_locator.to_owned();
         assert!(remap_local_replay_locator(&mut locator, &mappings).expect("locator remap"));
-        assert_eq!(locator, "/library/favourite/one.flac");
+        assert_eq!(locator, new_locator);
+    }
+
+    /// Returns `path` as this platform spells an absolute path.
+    ///
+    /// `/music` is absolute only where the filesystem has one root; Windows
+    /// needs a drive letter or the decoders correctly answer that the fixture
+    /// names nothing.
+    fn fixture_absolute(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
+    /// A mapping written down verbatim still matches a locator that decoded
+    /// flat, because both spell the same file.
+    ///
+    /// This is the exact shape a completed move produces: the plan holds what
+    /// `fs::canonicalize` said — `\\?\C:\…` — while the stored identity made a
+    /// round trip through a file URL, which cannot carry that prefix, and the
+    /// file itself has already moved away, so nothing can be re-canonicalised.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_mapping_still_remaps_a_flat_locator() {
+        let mappings = vec![LocalMoveMapping {
+            source: PathBuf::from(r"\\?\C:\music"),
+            target: PathBuf::from(r"\\?\C:\archive"),
+        }];
+        assert_eq!(
+            remap_local_path_prefix(Path::new(r"C:\music\one.flac"), &mappings),
+            Some(PathBuf::from(r"C:\archive\one.flac"))
+        );
+
+        let mut current = MediaId::new(SourceKind::Local, "file:///C:/music/one.flac");
+        assert!(remap_local_media_id(&mut current, &mappings).expect("file-URL remap"));
+        assert_eq!(current.external_id, "file:///C:/archive/one.flac");
     }
 }
