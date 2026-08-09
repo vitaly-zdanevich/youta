@@ -325,6 +325,20 @@ export interface QueuePopupView {
   repeat_one: boolean;
 }
 
+/**
+ * What is playing, in Youta's own words rather than the engine's.
+ *
+ * `PlaybackStatus.title` is whatever the backend parsed out of the stream; this
+ * is the queue entry it came from. The window title, the tray tooltip, and the
+ * track-change notification are set from this in Rust — the page reads it only
+ * to label the player bar with the same words those surfaces use.
+ */
+export interface NowPlayingView {
+  media_id: MediaId;
+  title: string;
+  subtitle: string;
+}
+
 /** One playlist row in the chooser, with the selected item's membership. */
 export interface PlaylistChoiceView {
   playlist_id: string;
@@ -463,6 +477,7 @@ export interface ViewModel {
   rows: RowView[];
   selected: number;
   playing_media_id: MediaId | null;
+  now_playing: NowPlayingView | null;
   details: DetailView | null;
   details_focused: boolean;
   details_scroll: number;

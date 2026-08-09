@@ -609,6 +609,7 @@ fn run_helper_probe(
     timeout: Duration,
 ) -> ExternalHelperProbeStatus {
     let mut command = Command::new(executable);
+    crate::child_process::quiet(&mut command);
     command
         .args(kind.version_arguments())
         .stdin(Stdio::null())

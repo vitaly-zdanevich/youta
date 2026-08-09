@@ -15,13 +15,16 @@
 
 #[cfg(test)]
 mod contract_tests;
+mod desktop;
+mod media_keys;
 mod reducer;
 
 use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
-use tauri::Manager;
+use tauri::DragDropEvent;
 use tauri::http::{Request, Response};
+use tauri::{Manager, WindowEvent};
 use url::Url;
 
 use youta::artwork::{local_artwork, remote_artwork};
@@ -30,6 +33,7 @@ use youta::keymap::{KeyPress, PopupGeometry};
 use youta::playback::{AudioOutputDriver, ProcessPlaybackConfig};
 use youta::view::{InformationPanelKind, Screen, UiAction, ViewModel};
 
+use desktop::WindowFocus;
 use reducer::ReducerHandle;
 
 /// One selectable source, as the window should label it.
@@ -264,11 +268,32 @@ fn main() {
     };
 
     let artwork_cache: PathBuf = config.thumbnail_cache_dir();
+    let focus = WindowFocus::default();
+    let window_focus = focus.clone();
 
     tauri::Builder::default()
-        // Used from the reducer thread rather than from the web view, so no
-        // clipboard permission is added to the window's capability list.
+        // Both are used from the reducer thread rather than from the web view,
+        // so neither adds a permission to the window's capability list.
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
+        .menu(desktop::menu)
+        .on_menu_event(|app, event| desktop::on_menu_event(app, &event))
+        .on_window_event(move |window, event| match event {
+            // Whether a track change is worth a notification depends on this
+            // and on nothing else in the snapshot.
+            WindowEvent::Focused(focused) => window_focus.set(*focused),
+            // A drop is the desktop's own way of naming a file, and it means
+            // what typing that path into the input box means. The reducer is
+            // absent only if a drop lands during startup.
+            WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+                if let Some(reducer) = window.try_state::<ReducerHandle>()
+                    && let Err(error) = reducer.dispatch(UiAction::OpenDroppedPaths(paths.clone()))
+                {
+                    eprintln!("the Youta window could not open the dropped paths: {error}");
+                }
+            }
+            _ => {}
+        })
         .register_uri_scheme_protocol("youta", move |app, request| {
             // The reducer is managed by `setup`, which has run long before a
             // page can ask for an image; an absent handle simply means no local
@@ -283,7 +308,8 @@ fn main() {
         })
         .setup(move |app| {
             app.manage(AudioOutputView::from_config(&config));
-            match reducer::start(app.handle().clone(), config.clone()) {
+            desktop::install_tray(app.handle());
+            match reducer::start(app.handle().clone(), config.clone(), focus.clone()) {
                 Ok(handle) => {
                     app.manage(handle);
                     Ok(())

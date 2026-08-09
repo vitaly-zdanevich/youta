@@ -1503,33 +1503,12 @@ fn cached_display_name(file_name: &str, format: &str) -> String {
         .replace('-', " ")
 }
 
+use crate::private_files::{set_private_directory_permissions, set_private_file_permissions};
+
 fn create_private_file(path: &Path) -> Result<File, io::Error> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn set_private_directory_permissions(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::private_files::open_privately(&mut options).open(path)
 }
 
 fn is_regular_nonsymlink(path: &Path) -> Result<bool, io::Error> {

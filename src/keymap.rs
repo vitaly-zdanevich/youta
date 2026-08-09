@@ -888,6 +888,12 @@ fn unfiltered_key_action(
         Key::Char(']') if view.playback.seeking_available() && !view.playback.live => {
             Some(UiAction::ChangeChapter(1))
         }
+        // Shifted neighbours of the chapter keys, for the next size up: `[`/`]`
+        // move within one item, `{`/`}` move between them. Unlike the chapter
+        // keys these carry no condition, because the queue is answerable even
+        // when the current item is a live stream that cannot be sought.
+        Key::Char('{') => Some(UiAction::PlayQueueNeighbour(-1)),
+        Key::Char('}') => Some(UiAction::PlayQueueNeighbour(1)),
         Key::Char('r') => Some(UiAction::ToggleRepeat),
         Key::Char('w') if !key.modified() => Some(UiAction::ToggleWaveform),
         Key::Char('c') => Some(UiAction::ShowChannel),

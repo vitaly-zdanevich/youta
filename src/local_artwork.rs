@@ -17,6 +17,7 @@
 //! That is what keeps this module free of both `image` and Ratatui, so a build
 //! with `local-artwork` and no `images` still shows covers.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -42,6 +43,8 @@ const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
 const SIDECAR_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
 /// Bytes read from a sidecar to identify its format.
 const SIDECAR_SNIFF_BYTES: usize = 16;
+/// Sidecars collected from one directory before the scan stops.
+const MAX_SIDECAR_COVERS: usize = 4_096;
 
 /// Failure while extracting and persisting optional artwork from local media.
 ///
@@ -104,45 +107,73 @@ fn sidecar_artwork_url(media_path: &Path) -> Option<Url> {
 /// Finds an image sharing a media file's name, such as `Track.webp` for
 /// `Track.opus`.
 ///
-/// Extensions are matched case-insensitively and only regular files count, so a
-/// symlink beside the media never becomes artwork. The leading bytes must
-/// identify a supported image, which keeps a stray `Track.jpg` that is really a
-/// text file from reaching a renderer as a broken picture.
-///
 /// An unreadable directory is not an error here: it means no sidecar, exactly
 /// as an absent one does.
 fn find_sidecar_cover(media_path: &Path) -> Option<PathBuf> {
-    let directory = media_path.parent()?;
     let stem = media_path.file_stem()?.to_str()?.to_ascii_lowercase();
-    let mut selected: Option<(usize, PathBuf)> = None;
-    for entry in fs::read_dir(directory).ok()?.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.eq_ignore_ascii_case(&stem) {
-            continue;
+    sidecar_covers_in(media_path.parent()?).remove(&stem)
+}
+
+/// Collects one directory's sidecar images, keyed by the media stem they cover.
+///
+/// A list asks about every file in the same directory at once, so this is one
+/// pass rather than one scan per row.
+///
+/// Extensions are matched case-insensitively and only regular files count, so a
+/// symlink beside the media never becomes artwork. The leading bytes must
+/// identify a supported image, which keeps a stray `Track.jpg` that is really a
+/// text file from reaching a renderer as a broken picture. A directory holding
+/// more sidecars than the bound is read until the bound, so an enormous folder
+/// costs a bounded scan rather than an unbounded one.
+pub(crate) fn sidecar_covers_in(directory: &Path) -> HashMap<String, PathBuf> {
+    let mut covers: HashMap<String, (usize, PathBuf)> = HashMap::new();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return HashMap::new();
+    };
+    for entry in entries.flatten() {
+        if covers.len() >= MAX_SIDECAR_COVERS {
+            break;
         }
-        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Some(priority) = SIDECAR_EXTENSIONS
-            .iter()
-            .position(|candidate| extension.eq_ignore_ascii_case(candidate))
+        let Some(priority) = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| {
+                SIDECAR_EXTENSIONS
+                    .iter()
+                    .position(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
         else {
             continue;
         };
-        if selected
-            .as_ref()
-            .is_some_and(|(selected_priority, _)| *selected_priority <= priority)
+        let stem = stem.to_ascii_lowercase();
+        if covers
+            .get(&stem)
+            .is_some_and(|(selected, _)| *selected <= priority)
         {
             continue;
         }
         if entry.file_type().is_ok_and(|file_type| file_type.is_file()) && sidecar_is_image(&path) {
-            selected = Some((priority, path));
+            covers.insert(stem, (priority, path));
         }
     }
-    selected.map(|(_, path)| path)
+    covers
+        .into_iter()
+        .map(|(stem, (_, path))| (stem, path))
+        .collect()
+}
+
+/// Returns the sidecar covering one media file from an already-scanned
+/// directory.
+pub(crate) fn sidecar_cover_for(
+    covers: &HashMap<String, PathBuf>,
+    media_path: &Path,
+) -> Option<Url> {
+    let stem = media_path.file_stem()?.to_str()?.to_ascii_lowercase();
+    Url::from_file_path(covers.get(&stem)?).ok()
 }
 
 /// Identifies a sidecar from its leading bytes without reading the whole file.

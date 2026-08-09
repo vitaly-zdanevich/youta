@@ -1,12 +1,14 @@
 //! Invisible mpv process controlled through its JSON IPC protocol.
+//!
+//! The protocol is the same on every platform Youta runs on; only the channel
+//! the lines travel through differs, and that lives in the private sibling
+//! module `mpv_ipc`: a Unix socket there, a named pipe on Windows. Everything
+//! here — request framing, event ordering, error redaction, the mpv command
+//! line — is written once and compiled everywhere.
 
-#[cfg(unix)]
-mod unix {
+mod backend {
     use std::collections::VecDeque;
     use std::fs;
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::thread;
@@ -14,6 +16,7 @@ mod unix {
 
     use serde_json::{Value, json};
 
+    use super::super::mpv_ipc::{self, IpcLink};
     use super::super::{
         AudioOutputDriver, BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason,
         PlaybackError, PlaybackEvent, PlaybackInput, PlaybackProfile, PlaybackStatus,
@@ -32,7 +35,7 @@ mod unix {
     const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
 
     struct MpvIpc {
-        reader: BufReader<UnixStream>,
+        link: IpcLink,
         request_id: u64,
         events: VecDeque<PlaybackEvent>,
         warnings: VecDeque<String>,
@@ -60,9 +63,7 @@ mod unix {
         /// invalid, mpv cannot start, or its private IPC socket is unavailable.
         pub fn spawn(config: &ProcessPlaybackConfig) -> Result<Self> {
             ensure_private_directory(&config.runtime_dir)?;
-            let socket_path = config
-                .runtime_dir
-                .join(format!("mpv-{}.sock", std::process::id()));
+            let socket_path = endpoint_path(&config.runtime_dir);
             remove_stale_socket(&socket_path)?;
 
             let mut command = mpv_command(config, &socket_path)?;
@@ -76,13 +77,11 @@ mod unix {
                 }
             })?;
 
-            let stream = wait_for_socket(&mut child, &socket_path)?;
-            stream.set_read_timeout(Some(IPC_TIMEOUT))?;
-            stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+            let link = wait_for_socket(&mut child, &socket_path)?;
 
             let mut backend = Self {
                 child,
-                ipc: MpvIpc::new(stream),
+                ipc: MpvIpc::new(link),
                 socket_path,
                 profile: config.profile,
                 process_exit_reported: false,
@@ -139,9 +138,9 @@ mod unix {
     }
 
     impl MpvIpc {
-        fn new(stream: UnixStream) -> Self {
+        fn new(link: IpcLink) -> Self {
             Self {
-                reader: BufReader::new(stream),
+                link,
                 request_id: 0,
                 events: VecDeque::new(),
                 warnings: VecDeque::new(),
@@ -156,13 +155,11 @@ mod unix {
                 "command": command,
                 "request_id": request_id,
             });
-            serde_json::to_writer(self.reader.get_mut(), &request)?;
-            self.reader.get_mut().write_all(b"\n")?;
-            self.reader.get_mut().flush()?;
+            self.link.write_line(&serde_json::to_vec(&request)?)?;
 
             for _ in 0..128 {
                 let mut line = String::new();
-                if self.reader.read_line(&mut line)? == 0 {
+                if self.link.read_line(&mut line)? == 0 {
                     return Err(PlaybackError::ProcessExited(String::new()));
                 }
                 let response: Value = serde_json::from_str(&line)?;
@@ -658,6 +655,7 @@ mod unix {
         }
 
         let mut command = Command::new(&config.mpv_executable);
+        crate::child_process::quiet(&mut command);
         command
             .arg("--no-config")
             .arg("--idle=yes")
@@ -907,39 +905,77 @@ mod unix {
         }
     }
 
-    fn ensure_private_directory(path: &Path) -> Result<()> {
-        fs::create_dir_all(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        Ok(())
-    }
-
-    fn remove_stale_socket(path: &Path) -> Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => {
-                fs::remove_file(path)?;
-                Ok(())
-            }
-            Ok(_) => Err(PlaybackError::Protocol(format!(
-                "refusing to replace non-socket path {}",
-                path.display()
-            ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+    /// Names the private control channel this process asks mpv to publish.
+    ///
+    /// On Unix that is a socket inside Youta's own runtime directory, which the
+    /// caller has already made private. On Windows a named pipe does not live
+    /// in the filesystem at all: it lives in the kernel's `\\.\pipe\` namespace,
+    /// so the runtime directory has nothing to do with it and the process
+    /// identifier alone keeps two copies of Youta apart.
+    fn endpoint_path(runtime_dir: &Path) -> PathBuf {
+        let pid = std::process::id();
+        #[cfg(unix)]
+        {
+            runtime_dir.join(format!("mpv-{pid}.sock"))
+        }
+        #[cfg(windows)]
+        {
+            let _ = runtime_dir;
+            PathBuf::from(format!(r"\\.\pipe\youta-mpv-{pid}"))
         }
     }
 
-    fn wait_for_socket(child: &mut Child, path: &Path) -> Result<UnixStream> {
+    fn ensure_private_directory(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Clears a leftover endpoint, refusing to delete anything that is not one.
+    ///
+    /// Only the Unix endpoint can be left behind: a named pipe is owned by the
+    /// process that created it and disappears when mpv exits, so there is
+    /// nothing on Windows to clean up and nothing to refuse.
+    fn remove_stale_socket(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_socket() => {
+                    fs::remove_file(path)?;
+                    Ok(())
+                }
+                Ok(_) => Err(PlaybackError::Protocol(format!(
+                    "refusing to replace non-socket path {}",
+                    path.display()
+                ))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            Ok(())
+        }
+    }
+
+    fn wait_for_socket(child: &mut Child, path: &Path) -> Result<IpcLink> {
         let deadline = Instant::now() + IPC_TIMEOUT;
         loop {
-            match UnixStream::connect(path) {
-                Ok(stream) => return Ok(stream),
+            match mpv_ipc::connect(path, IPC_TIMEOUT) {
+                Ok(link) => return Ok(link),
                 Err(error) if Instant::now() < deadline => {
                     if let Some(status) = child.try_wait()? {
                         return Err(PlaybackError::ProcessExited(format!(" ({status})")));
                     }
-                    if error.kind() != std::io::ErrorKind::NotFound
-                        && error.kind() != std::io::ErrorKind::ConnectionRefused
-                    {
+                    if !mpv_ipc::connection_is_pending(&error) {
                         return Err(error.into());
                     }
                     thread::sleep(Duration::from_millis(10));
@@ -953,11 +989,19 @@ mod unix {
         }
     }
 
-    #[cfg(test)]
+    // The mock IPC peer is a socket pair, which only Unix offers, so the
+    // protocol suite runs where that pair can be built. What it covers —
+    // framing, event order, redaction, the mpv command line — is the code both
+    // platforms share; only the pipe underneath it differs, and that lives in
+    // `mpv_ipc`.
+    #[cfg(all(test, unix))]
     mod tests {
         use std::collections::BTreeMap;
         use std::ffi::{OsStr, OsString};
+        use std::io::{BufRead, BufReader, Write};
         use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
         use std::sync::mpsc;
 
         use super::*;
@@ -1014,7 +1058,7 @@ mod unix {
                 reader.get_mut().flush().expect("flush mock response");
             });
 
-            let mut ipc = MpvIpc::new(client);
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
             ipc.send(&[json!("get_property"), json!("idle-active")])
                 .expect("mock IPC request");
             server_thread.join().expect("mock IPC server");
@@ -1108,7 +1152,7 @@ mod unix {
             (
                 MpvBackend {
                     child,
-                    ipc: MpvIpc::new(client),
+                    ipc: MpvIpc::new(IpcLink::over(client)),
                     socket_path: PathBuf::from("/tmp/youta-unused-buffer-status.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
@@ -1176,7 +1220,7 @@ mod unix {
             (
                 MpvBackend {
                     child,
-                    ipc: MpvIpc::new(client),
+                    ipc: MpvIpc::new(IpcLink::over(client)),
                     socket_path: PathBuf::from("/tmp/youta-unused-command-recorder.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
@@ -1425,7 +1469,7 @@ mod unix {
                 .expect("long-lived mock mpv");
             let mut backend = MpvBackend {
                 child,
-                ipc: MpvIpc::new(client),
+                ipc: MpvIpc::new(IpcLink::over(client)),
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
@@ -1654,7 +1698,7 @@ mod unix {
         #[test]
         fn icy_property_changes_are_normalized_bounded_and_clearable() {
             let (client, _server) = UnixStream::pair().expect("mock IPC pair");
-            let mut ipc = MpvIpc::new(client);
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
             ipc.handle_event(&json!({
                 "event": "property-change",
                 "id": ICY_TITLE_OBSERVER_ID,
@@ -1700,7 +1744,7 @@ mod unix {
         #[test]
         fn unrelated_property_events_cannot_replace_the_icy_title() {
             let (client, _server) = UnixStream::pair().expect("mock IPC pair");
-            let mut ipc = MpvIpc::new(client);
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
             ipc.stream_title = Some("retained".to_owned());
 
             for message in [
@@ -2040,7 +2084,7 @@ mod unix {
                 .expect("short-lived mock mpv");
             let mut backend = MpvBackend {
                 child,
-                ipc: MpvIpc::new(client),
+                ipc: MpvIpc::new(IpcLink::over(client)),
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
@@ -2075,47 +2119,4 @@ mod unix {
     }
 }
 
-#[cfg(unix)]
-pub use unix::MpvBackend;
-
-#[cfg(not(unix))]
-mod unsupported {
-    use super::super::{
-        PlaybackBackend, PlaybackError, PlaybackInput, PlaybackStatus, PlayerCommand,
-        ProcessPlaybackConfig, Result,
-    };
-
-    /// Placeholder returned on platforms where this initial IPC adapter is not
-    /// implemented.
-    pub struct MpvBackend;
-
-    impl MpvBackend {
-        /// Reports that the initial mpv adapter currently requires Unix sockets.
-        pub fn spawn(_config: &ProcessPlaybackConfig) -> Result<Self> {
-            Err(PlaybackError::Protocol(
-                "the mpv IPC adapter currently requires Unix sockets".to_owned(),
-            ))
-        }
-    }
-
-    impl PlaybackBackend for MpvBackend {
-        fn play(&mut self, _input: &PlaybackInput) -> Result<()> {
-            unreachable!("unsupported backend cannot be constructed")
-        }
-
-        fn command(&mut self, _command: PlayerCommand) -> Result<()> {
-            unreachable!("unsupported backend cannot be constructed")
-        }
-
-        fn status(&mut self) -> Result<PlaybackStatus> {
-            unreachable!("unsupported backend cannot be constructed")
-        }
-
-        fn shutdown(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub use unsupported::MpvBackend;
+pub use backend::MpvBackend;

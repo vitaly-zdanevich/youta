@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { AudioOutputView, Chapter, PlaybackStatus } from "../contract";
+import type { AudioOutputView, Chapter, NowPlayingView, PlaybackStatus } from "../contract";
 import { durationSeconds, formatSeconds } from "../format";
 import { dispatch } from "../ipc";
 import { Artwork } from "./Artwork";
@@ -93,7 +93,8 @@ export function Player({
   artwork,
   autoplay,
   repeating,
-  nowPlaying,
+  radioNowPlaying,
+  track,
   output,
 }: {
   playback: PlaybackStatus;
@@ -102,7 +103,8 @@ export function Player({
   artwork: string | null;
   autoplay: boolean;
   repeating: boolean;
-  nowPlaying: string | null;
+  radioNowPlaying: string | null;
+  track: NowPlayingView | null;
   output: AudioOutputView | null;
 }) {
   const position = durationSeconds(playback.position);
@@ -155,9 +157,14 @@ export function Player({
           <div className="mt-[5px] flex justify-between gap-3 text-[11px] text-ink-faint">
             <span className="font-mono tabular-nums">{formatSeconds(position)}</span>
             {/* Clicking the title jumps the list to whatever is playing, which
-                is the only way back to it after browsing elsewhere. Radio
-                metadata is preferred over the stream title, because the station
-                name does not change when the track does. */}
+                is the only way back to it after browsing elsewhere.
+
+                The order is most-specific first. Radio metadata names the song
+                a station is on right now, which the station name never does.
+                `track` is Youta's own answer, taken from the queue entry, and
+                it is the same text the window title, the tray, and a
+                track-change notification carry. `playback.title` is last
+                because it is whatever the engine parsed out of the stream. */}
             <button
               type="button"
               disabled={playback.idle}
@@ -165,7 +172,13 @@ export function Player({
               onClick={() => void dispatch("ShowNowPlaying")}
               className="min-w-0 truncate rounded-[3px] not-disabled:hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent"
             >
-              {nowPlaying ?? playback.stream_title ?? playback.title ?? ""}
+              {radioNowPlaying ??
+                playback.stream_title ??
+                (track === null
+                  ? (playback.title ?? "")
+                  : track.subtitle === ""
+                    ? track.title
+                    : `${track.title} — ${track.subtitle}`)}
             </button>
             <span className="font-mono tabular-nums">
               {duration > 0 ? formatSeconds(duration) : "--:--"}
@@ -183,6 +196,12 @@ export function Player({
 
       <div className="mt-[9px] flex flex-wrap items-center gap-[18px]">
         <div className="flex items-center gap-[6px]">
+          {/* Moving between queue entries, which is what a media key and a
+              tray menu mean by next and previous. The chapter pair below moves
+              within one item and is a different thing entirely. */}
+          <Control label="Previous track" disabled={playback.idle} onClick={() => void dispatch({ PlayQueueNeighbour: -1 })}>
+            ⏮
+          </Control>
           <Control label="Back 5 seconds" disabled={!seekable} onClick={() => void dispatch({ SeekRelative: -SEEK_STEP_SECONDS })}>
             ↶
           </Control>
@@ -197,6 +216,9 @@ export function Player({
           </button>
           <Control label="Forward 5 seconds" disabled={!seekable} onClick={() => void dispatch({ SeekRelative: SEEK_STEP_SECONDS })}>
             ↷
+          </Control>
+          <Control label="Next track" disabled={playback.idle} onClick={() => void dispatch({ PlayQueueNeighbour: 1 })}>
+            ⏭
           </Control>
         </div>
 

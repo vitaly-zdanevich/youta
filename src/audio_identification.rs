@@ -589,7 +589,7 @@ impl FpcalcProcess for SystemFpcalcProcess {
         if cancellation.is_cancelled() {
             return Err(FpcalcProcessError::cancelled());
         }
-        let mut child = Command::new(&invocation.executable)
+        let mut child = crate::child_process::quiet(&mut Command::new(&invocation.executable))
             .args(&invocation.arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

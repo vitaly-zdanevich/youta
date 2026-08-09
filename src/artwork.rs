@@ -360,19 +360,13 @@ impl ThumbnailCache {
         let result = (|| {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
+            let mut file = crate::private_files::open_privately(&mut options).open(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             set_private_file_permissions(&temporary)?;
             fs::rename(&temporary, path)?;
             set_private_file_permissions(path)?;
-            let _ = fs::File::open(&self.directory).and_then(|directory| directory.sync_all());
+            let _ = crate::durability::sync_directory(&self.directory);
             Ok(())
         })();
         drop(active_temporary);
@@ -517,25 +511,9 @@ pub(crate) fn remove_cache_entry(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-pub(crate) fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
+pub(crate) use crate::private_files::{
+    set_private_directory_permissions, set_private_file_permissions,
+};
 
 #[cfg(feature = "remote-artwork")]
 pub(crate) fn fetch_thumbnail(

@@ -23,11 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use rustix::process::{Pid, Signal, kill_process_group};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use url::Url;
 
 use crate::config::BandcampAudioFormat;
@@ -758,8 +754,7 @@ fn validate_resolver_limits(
 
 fn run_supervised(invocation: &YtDlpInvocation) -> PlaybackResult<SupervisedOutput> {
     let mut command = Command::new(&invocation.executable);
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::child_process::supervised(&mut command);
     command
         .args(&invocation.arguments)
         .stdin(Stdio::null())
@@ -877,19 +872,7 @@ fn join_bounded_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Playb
         .map_err(PlaybackError::Io)
 }
 
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        if kill_process_group(Pid::from_child(child), Signal::KILL).is_err() {
-            let _ = child.kill();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
+use crate::child_process::terminate_tree as terminate_child;
 
 fn parse_search_html(html: &str, max_results: usize) -> (Vec<BandcampSearchResult>, bool) {
     let mut results = Vec::new();

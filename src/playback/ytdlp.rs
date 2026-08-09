@@ -218,7 +218,7 @@ impl YtDlp {
     /// Returns a [`PlaybackError`] when `yt-dlp` is unavailable, cannot be
     /// executed, or exits unsuccessfully.
     pub fn version(&self) -> Result<String> {
-        let output = Command::new(&self.config.executable)
+        let output = crate::child_process::quiet(&mut Command::new(&self.config.executable))
             .arg("--version")
             .output()
             .map_err(|error| self.map_spawn_error(error))?;
@@ -505,6 +505,7 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
 
 fn build_base_command(config: &YtDlpConfig) -> Command {
     let mut command = Command::new(&config.executable);
+    crate::child_process::quiet(&mut command);
     command.arg("--ignore-config");
     if !config.allow_plugins {
         command.arg("--no-plugin-dirs");

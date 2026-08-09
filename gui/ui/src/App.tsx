@@ -148,7 +148,8 @@ export function App() {
           artwork={view.details?.thumbnail_url ?? null}
           autoplay={view.autoplay}
           repeating={view.repeating}
-          nowPlaying={view.radio_now_playing}
+          radioNowPlaying={view.radio_now_playing}
+          track={view.now_playing}
           output={output}
         />
 

@@ -198,14 +198,15 @@ use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
     GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort,
-    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField,
-    PlaylistItemView, PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView,
-    PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView,
-    ProjectHistoryRemoteState, QueuePopupView, QueueRowView, RightPanelMode, RowView,
-    RssSubscriptionPopupView, Screen, SearchActivity, SearchKind, SubscriptionPane,
-    SubscriptionRoute, UiAction, UiController, VideoCommentView, VideoCommentsPopupState,
-    VideoCommentsPopupView, ViewModel, WaveformView, YANDEX_OAUTH_GUIDE_URL,
-    YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField, YouTubeSetupPopupView,
+    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView,
+    PlaylistEditorField, PlaylistItemView, PlaylistPopupMode, PlaylistPopupView,
+    PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView,
+    ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView, QueueRowView,
+    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
+    SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
+    VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
+    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
+    YouTubeSetupPopupView,
 };
 #[cfg(feature = "yandex-music")]
 use crate::view::{DetailLinkInternalTarget, DetailLinkPresentation};
@@ -1091,13 +1092,15 @@ trait LocalMediaProbe {
     fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata>;
 }
 
-/// Shell-free probe using the installed `ffprobe` executable.
-#[derive(Clone, Copy, Debug, Default)]
-struct SystemLocalMediaProbe;
+/// Shell-free probe using the configured `ffprobe` executable.
+#[derive(Clone, Debug)]
+struct SystemLocalMediaProbe {
+    executable: PathBuf,
+}
 
 impl LocalMediaProbe for SystemLocalMediaProbe {
     fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata> {
-        let mut child = Command::new("ffprobe")
+        let mut child = crate::child_process::quiet(&mut Command::new(&self.executable))
             .args([
                 "-v",
                 "error",
@@ -1150,12 +1153,14 @@ trait LocalMediaLoader: Send + Sync {
 }
 
 /// System metadata loader combining Lofty tags with a bounded `ffprobe` call.
-#[derive(Debug, Default)]
-struct SystemLocalMediaLoader;
+#[derive(Debug)]
+struct SystemLocalMediaLoader {
+    ffprobe_executable: PathBuf,
+}
 
 impl LocalMediaLoader for SystemLocalMediaLoader {
     fn load(&self, path: PathBuf) -> LocalMediaItem {
-        local_media_item(path)
+        local_media_item(path, &self.ffprobe_executable)
     }
 }
 
@@ -1165,28 +1170,12 @@ fn local_file_identity(path: &Path) -> Option<LocalFileIdentity> {
     if !metadata.is_file() {
         return None;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        Some(LocalFileIdentity {
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Some(LocalFileIdentity {
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        })
-    }
+    Some(LocalFileIdentity {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        filesystem: crate::file_identity::filesystem_identity(path, &metadata),
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1217,14 +1206,8 @@ struct LocalFileIdentity {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 /// One identity-bound selected-file metadata record.
@@ -1988,12 +1971,18 @@ enum ProviderRequest {
         station_id: String,
         endpoint: RadioNowPlayingEndpoint,
     },
-    /// Resolve the selected station's logotype through its Wikidata item.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    /// Resolve the selected station's logotype.
+    ///
+    /// Both sources travel with the request so the worker can fall through
+    /// without a second round trip through the reducer.
+    #[cfg(feature = "radio")]
     RadioArtwork {
         generation: u64,
         station_id: String,
+        /// Verified Wikidata items for this station, empty for most of them.
         item_ids: Vec<String>,
+        /// The station's own homepage, which advertises its logo.
+        homepage: Option<url::Url>,
     },
     #[cfg(feature = "bbc-radio")]
     ResolveBbcLive {
@@ -2335,7 +2324,7 @@ enum ProviderResponse {
         station_id: String,
         result: Result<RadioNowPlaying, String>,
     },
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[cfg(feature = "radio")]
     RadioArtwork {
         generation: u64,
         station_id: String,
@@ -2947,7 +2936,7 @@ const MAX_CACHED_LOCAL_ARTWORK: usize = 256;
 ///
 /// The curated catalogue is a few hundred stations, so this holds effectively
 /// all of them for a session and the bound exists only to stay finite.
-#[cfg(all(feature = "radio", feature = "wikidata"))]
+#[cfg(feature = "radio")]
 const MAX_CACHED_RADIO_ARTWORK: usize = 1_024;
 /// Maximum time a traversal can be reused when nested changes may be invisible.
 const LOCAL_FOLDER_SIZE_CACHE_TTL: Duration = Duration::from_mins(1);
@@ -3731,17 +3720,17 @@ pub struct AppController {
     #[cfg(feature = "local-artwork")]
     local_artwork_cache_order: VecDeque<PathBuf>,
     /// Monotonic owner for the sole station-logotype lookup.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[cfg(feature = "radio")]
     radio_artwork_generation: u64,
     /// Station whose logotype the provider worker is resolving.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[cfg(feature = "radio")]
     pending_radio_artwork: Option<(u64, String)>,
     /// Process-local positive and negative logotype results by station ID.
     ///
     /// A station that has no image is remembered as `None`, because the whole
     /// catalogue is compiled in and re-asking Wikidata every time the selection
     /// passes over the same station would be a request per keystroke.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[cfg(feature = "radio")]
     radio_artwork_cache: HashMap<String, Option<url::Url>>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
@@ -4165,6 +4154,11 @@ impl AppController {
         let local_fingerprint_requests = local_fingerprint_thread
             .as_ref()
             .map(|_| local_fingerprint_request_sender);
+        // Both helper paths are read before `config` is moved into the
+        // controller, because the workers that use them outlive this scope.
+        let local_media_ffprobe = config.providers.ffprobe_executable.clone();
+        #[cfg(feature = "waveform")]
+        let waveform_ffmpeg = config.providers.ffmpeg_executable.clone();
         #[cfg(feature = "waveform")]
         let local_waveform_thread_result = thread::Builder::new()
             .name("youta-local-waveform".to_owned())
@@ -4172,7 +4166,7 @@ impl AppController {
                 local_waveform_worker(
                     local_waveform_request_receiver,
                     local_waveform_response_sender,
-                    Arc::new(FfmpegLocalWaveformExtractor::default()),
+                    Arc::new(FfmpegLocalWaveformExtractor::new(waveform_ffmpeg)),
                 );
             });
         #[cfg(feature = "waveform")]
@@ -4594,7 +4588,9 @@ impl AppController {
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
             pending_local_media_metadata: None,
-            local_media_loader: Arc::new(SystemLocalMediaLoader),
+            local_media_loader: Arc::new(SystemLocalMediaLoader {
+                ffprobe_executable: local_media_ffprobe,
+            }),
             local_media_metadata_sender,
             local_media_metadata_responses,
             #[cfg(feature = "acoustid")]
@@ -4690,11 +4686,11 @@ impl AppController {
             local_artwork_cache: HashMap::new(),
             #[cfg(feature = "local-artwork")]
             local_artwork_cache_order: VecDeque::new(),
-            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            #[cfg(feature = "radio")]
             radio_artwork_generation: 0,
-            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            #[cfg(feature = "radio")]
             pending_radio_artwork: None,
-            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            #[cfg(feature = "radio")]
             radio_artwork_cache: HashMap::new(),
             tracker_results: Vec::new(),
             subscription_tree,
@@ -5764,7 +5760,10 @@ impl AppController {
             }];
             self.view.status_line = format!("Scanning {} in the background…", local.path.display());
         } else {
-            self.local_results.push(local_media_item(local.path));
+            self.local_results.push(local_media_item(
+                local.path,
+                &self.config.providers.ffprobe_executable,
+            ));
             self.refresh_local_rows();
             self.view.status_line = "Local media file recognized; press Enter to play".to_owned();
             self.refresh_selected_playlist_state();
@@ -10744,7 +10743,7 @@ impl AppController {
                 station_id,
                 result,
             } => self.handle_radio_now_playing(generation, station_id, result),
-            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            #[cfg(feature = "radio")]
             ProviderResponse::RadioArtwork {
                 generation,
                 station_id,
@@ -12909,7 +12908,10 @@ impl AppController {
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen == Screen::Downloaded {
-            return queue_item_from_local(&local_media_item(self.selected_downloaded_path()?));
+            return queue_item_from_local(&local_media_item(
+                self.selected_downloaded_path()?,
+                &self.config.providers.ffprobe_executable,
+            ));
         }
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
@@ -13064,6 +13066,7 @@ impl AppController {
                 })?;
             return playlist_snapshot_from_queue_item(&queue_item_from_local(&local_media_item(
                 entry.path.clone(),
+                &self.config.providers.ffprobe_executable,
             ))?);
         }
 
@@ -14271,6 +14274,30 @@ impl AppController {
         self.view.queue_popup = Some(self.queue_popup_view(selected));
     }
 
+    /// Republishes the title and creator of the entry playback is on.
+    ///
+    /// This shares [`Self::refresh_open_queue_popup`]'s choke point for the same
+    /// reason: the current entry moves on end-of-file and on a Local move, not
+    /// only when the user asks for something. Unlike the queue it is published
+    /// unconditionally, because a window's title bar, its tray tooltip, and the
+    /// notification for a track change all read it whether or not any popup is
+    /// open. It costs two string clones per tick and, being compared before
+    /// publication, produces no traffic while it is unchanged.
+    fn refresh_now_playing(&mut self) {
+        let current = self
+            .playback_queue
+            .current_index
+            .and_then(|index| self.playback_queue.items.get(index))
+            .map(|item| NowPlayingView {
+                media_id: item.media.id.clone(),
+                title: item.media.title.clone(),
+                subtitle: item.media.creator.clone().unwrap_or_default(),
+            });
+        if self.view.now_playing != current {
+            self.view.now_playing = current;
+        }
+    }
+
     /// Projects the queue into the credential-free rows a front-end may hold.
     fn queue_popup_view(&self, selected: usize) -> QueuePopupView {
         QueuePopupView {
@@ -14304,6 +14331,37 @@ impl AppController {
         // The cursor is already where this item lives, so the playback path
         // must not insert a second copy of it beside itself.
         self.play_queue_item(item, true);
+    }
+
+    /// Starts the queue entry a signed number of steps from the current one.
+    ///
+    /// Repeat-one is deliberately not consulted. Repeat decides what happens
+    /// when an item *ends*; somebody who asked for the next track has already
+    /// said what they want, and replaying the same item in answer would look
+    /// like the key did nothing.
+    ///
+    /// The step stays inside the queue and does not continue into an autoplay
+    /// list. Autoplay's continuation belongs to end-of-file, where the resume
+    /// origin that survives a finished queue is established; a skip borrowing
+    /// that path would have to reproduce the same bookkeeping to be correct.
+    fn play_queue_neighbour(&mut self, step: i32) {
+        let Some(current) = self.playback_queue.current_index else {
+            self.view.status_line = "The queue holds nothing to move through".to_owned();
+            return;
+        };
+        let target = isize::try_from(step)
+            .ok()
+            .and_then(|step| current.checked_add_signed(step))
+            .filter(|target| *target < self.playback_queue.items.len());
+        let Some(target) = target else {
+            self.view.status_line = if step < 0 {
+                "This is the first item in the queue".to_owned()
+            } else {
+                "This is the last item in the queue".to_owned()
+            };
+            return;
+        };
+        self.activate_queue_row(target);
     }
 
     /// Drops one entry, keeping the cursor on the item that is still playing.
@@ -15239,7 +15297,7 @@ impl AppController {
                     "No default action is available for this file type".to_owned();
             }
             LocalEntryKind::Audio | LocalEntryKind::Video | LocalEntryKind::TrackerModule => {
-                let item = local_media_item(entry.path);
+                let item = local_media_item(entry.path, &self.config.providers.ffprobe_executable);
                 match queue_item_from_local(&item) {
                     Ok(item) => self.play_queue_item(item, false),
                     Err(error) => self.show_error_message("Local media could not be played", error),
@@ -15267,6 +15325,67 @@ impl AppController {
         };
         let child = listing.path.clone();
         self.browse_local_directory_with_reselection(parent, Some(child));
+    }
+
+    /// Shows paths a window received from a system drag-and-drop.
+    ///
+    /// One drop names one place to look: the dropped directory itself, or the
+    /// folder the dropped file lives in with that file reselected. Dropping
+    /// several files out of one folder therefore lands on all of them at once,
+    /// which is the selection a file manager actually hands over.
+    ///
+    /// Nothing here is per-path, which is why the batch needs no bound: only
+    /// the first path is inspected and the rest are counted. Local reads it in
+    /// place, exactly as when the same path is typed into the input box.
+    #[cfg(feature = "local-browser")]
+    fn open_dropped_paths(&mut self, paths: Vec<PathBuf>) {
+        let dropped = paths.len();
+        let Some(first) = paths.into_iter().next() else {
+            self.view.status_line = "That drop carried no paths".to_owned();
+            return;
+        };
+        // Canonicalizing doubles as the existence check and matches what the
+        // input box already does with a typed path.
+        let path = match std::fs::canonicalize(&first) {
+            Ok(path) => path,
+            Err(error) => {
+                self.view.status_line = format!("Cannot open {}: {error}", first.display());
+                return;
+            }
+        };
+        let directory = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) => {
+                self.view.status_line = format!("Cannot open {}: {error}", path.display());
+                return;
+            }
+        };
+        let (folder, reselect) = if directory {
+            (path, None)
+        } else if let Some(parent) = path.parent() {
+            (parent.to_path_buf(), Some(path))
+        } else {
+            self.view.status_line = format!("{} has no folder to open", path.display());
+            return;
+        };
+        if self.view.screen != Screen::Local {
+            self.show_screen(Screen::Local);
+        }
+        self.browse_local_directory_with_reselection(folder, reselect);
+        if dropped > 1 {
+            // The browse just wrote "Reading …", which the count replaces
+            // rather than joins: the interesting fact is that the other paths
+            // were not forgotten, and the folder name is already on screen.
+            self.view.status_line =
+                format!("{dropped} paths dropped; showing the folder the first one is in");
+        }
+    }
+
+    #[cfg(not(feature = "local-browser"))]
+    fn open_dropped_paths(&mut self, _paths: Vec<PathBuf>) {
+        self.view.status_line =
+            "This build omits the `local-browser` feature; dropped paths cannot be opened"
+                .to_owned();
     }
 
     /// Starts bounded background preparation for a selected remote module.
@@ -16366,7 +16485,8 @@ impl AppController {
             .cached_local_media_item(&path, size_bytes)
             .filter(|item| item.technical_metadata_probed)
             .unwrap_or_else(|| {
-                let item = local_media_item(path.clone());
+                let item =
+                    local_media_item(path.clone(), &self.config.providers.ffprobe_executable);
                 if let Some(identity) = local_file_identity(&path) {
                     self.cache_local_media_item(identity, item.clone());
                 }
@@ -17782,16 +17902,19 @@ impl AppController {
                 .enumerate()
                 .skip(index.saturating_add(1))
                 .find_map(|(index, path)| {
-                    queue_item_from_local(&local_media_item(path.clone()))
-                        .ok()
-                        .map(|item| AutoplayStep::Play {
-                            item: Box::new(item),
-                            origin: AutoplayOrigin::LocalBrowser {
-                                directory: directory.clone(),
-                                entries: Arc::clone(entries),
-                                index,
-                            },
-                        })
+                    queue_item_from_local(&local_media_item(
+                        path.clone(),
+                        &self.config.providers.ffprobe_executable,
+                    ))
+                    .ok()
+                    .map(|item| AutoplayStep::Play {
+                        item: Box::new(item),
+                        origin: AutoplayOrigin::LocalBrowser {
+                            directory: directory.clone(),
+                            entries: Arc::clone(entries),
+                            index,
+                        },
+                    })
                 })
                 .unwrap_or(AutoplayStep::Exhausted),
             AutoplayOrigin::LocalScan { generation, index } => {
@@ -19785,20 +19908,26 @@ impl AppController {
 
     /// Starts one lazy logotype lookup for the selected Radio station.
     ///
-    /// Only a station Youta has already matched to a Wikidata item is asked
-    /// about, and each answer — including "this station has no image" — is
-    /// remembered, so moving through the catalogue costs at most one request per
-    /// station rather than one per selection. A single request is in flight at a
-    /// time: the catalogue filters as the user types, and a lookup per keystroke
-    /// would be a burst of traffic for artwork nobody has looked at yet.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    /// Each answer — including "this station has no image" — is remembered, so
+    /// moving through the catalogue costs at most one lookup per station rather
+    /// than one per selection. A single lookup is in flight at a time: the
+    /// catalogue filters as the user types, and a request per keystroke would be
+    /// a burst of traffic for artwork nobody has looked at yet.
+    #[cfg(feature = "radio")]
     fn request_selected_radio_artwork(&mut self, station_id: &str) {
         if self.radio_artwork_cache.contains_key(station_id) || self.pending_radio_artwork.is_some()
         {
             return;
         }
-        let item_ids = wikidata_item_ids_for_station(station_id);
-        if item_ids.is_empty() {
+        #[cfg(feature = "wikidata")]
+        let item_ids = wikidata_item_ids_for_station(station_id)
+            .iter()
+            .map(|item| (*item).to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "wikidata"))]
+        let item_ids = Vec::new();
+        let homepage = station_by_id(station_id).and_then(|station| station.homepage_url().ok());
+        if item_ids.is_empty() && homepage.is_none() {
             return;
         }
         let Some(sender) = self.provider_requests.as_ref() else {
@@ -19809,7 +19938,8 @@ impl AppController {
         let request = ProviderRequest::RadioArtwork {
             generation,
             station_id: station_id.to_owned(),
-            item_ids: item_ids.iter().map(|item| (*item).to_owned()).collect(),
+            item_ids,
+            homepage,
         };
         if sender.send(request).is_ok() {
             self.pending_radio_artwork = Some((generation, station_id.to_owned()));
@@ -19817,7 +19947,7 @@ impl AppController {
     }
 
     /// Applies one station logotype, or remembers that the station has none.
-    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[cfg(feature = "radio")]
     fn handle_radio_artwork(
         &mut self,
         generation: u64,
@@ -20319,7 +20449,10 @@ impl AppController {
                 );
                 return;
             }
-            let item = match queue_item_from_local(&local_media_item(path)) {
+            let item = match queue_item_from_local(&local_media_item(
+                path,
+                &self.config.providers.ffprobe_executable,
+            )) {
                 Ok(item) => item,
                 Err(error) => {
                     self.show_error_message("Playlist item is unavailable", error);
@@ -21461,6 +21594,11 @@ impl AppController {
                 return;
             }
         };
+        // Downloads carry no embedded picture — `yt-dlp` writes the thumbnail
+        // beside the media — so the covers for this whole list come from one
+        // extra pass over the same directory rather than one lookup per row.
+        #[cfg(feature = "local-artwork")]
+        let sidecars = crate::local_artwork::sidecar_covers_in(&path);
         let mut read_failures = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -21491,11 +21629,16 @@ impl AppController {
                     continue;
                 }
             };
+            #[cfg(feature = "local-artwork")]
+            let thumbnail_url = crate::local_artwork::sidecar_cover_for(&sidecars, &entry_path);
+            #[cfg(not(feature = "local-artwork"))]
+            let thumbnail_url = None;
             self.view.rows.push(RowView {
                 media_id: Some(local_media_id(&entry_path)),
                 title: entry.file_name().to_string_lossy().into_owned(),
                 subtitle: human_bytes(size),
                 source: "Local download".to_owned(),
+                thumbnail_url,
                 ..RowView::default()
             });
         }
@@ -24752,6 +24895,7 @@ impl UiController for AppController {
             },
             UiAction::PlayNext => self.queue_selected(true),
             UiAction::AddToQueue => self.queue_selected(false),
+            UiAction::PlayQueueNeighbour(step) => self.play_queue_neighbour(step),
             UiAction::ToggleTodoPlaylist => self.toggle_selected_todo(),
             UiAction::OpenPlaylistPopup => self.open_playlist_popup(),
             UiAction::MovePlaylistPopupSelection(delta) => {
@@ -25003,6 +25147,7 @@ impl UiController for AppController {
             UiAction::RefreshSubscriptionVideos => {
                 self.refresh_selected_subscription_videos();
             }
+            UiAction::OpenDroppedPaths(paths) => self.open_dropped_paths(paths),
         }
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
@@ -25066,6 +25211,7 @@ impl UiController for AppController {
             return;
         }
         self.refresh_open_queue_popup();
+        self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
         #[cfg(feature = "yandex-music")]
@@ -26500,6 +26646,8 @@ fn provider_worker(
     let wikidata = crate::providers::wikidata::WikidataProvider::new();
     #[cfg(feature = "radio")]
     let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
+    #[cfg(feature = "radio")]
+    let station_icon = crate::providers::station_icon::StationIconResolver::new();
     #[cfg(feature = "bbc-radio")]
     let bbc_live = BbcLiveResolver::new();
     #[cfg(feature = "network")]
@@ -27261,18 +27409,33 @@ fn provider_worker(
                     break;
                 }
             }
-            #[cfg(all(feature = "radio", feature = "wikidata"))]
+            #[cfg(feature = "radio")]
             ProviderRequest::RadioArtwork {
                 generation,
                 station_id,
                 item_ids,
+                homepage,
             } => {
                 // A station may legitimately map to more than one item, and a
                 // failed lookup is not worth reporting: artwork is decoration,
                 // so the station simply stays without a logotype.
-                let artwork = item_ids
+                #[cfg(feature = "wikidata")]
+                let wikidata_artwork = item_ids
                     .iter()
                     .find_map(|item_id| wikidata.item_artwork(item_id).ok().flatten());
+                #[cfg(not(feature = "wikidata"))]
+                let wikidata_artwork = {
+                    let _ = &item_ids;
+                    None
+                };
+                // Wikidata knows only the broadcasters notable enough to have
+                // an item; the rest of the catalogue advertises its logo on its
+                // own homepage.
+                let artwork = wikidata_artwork.or_else(|| {
+                    homepage
+                        .as_ref()
+                        .and_then(|homepage| station_icon.fetch(homepage).ok().flatten())
+                });
                 if responses
                     .send(ProviderResponse::RadioArtwork {
                         generation,
@@ -28002,9 +28165,14 @@ fn set_local_media_duration(item: &mut LocalMediaItem, duration: Duration) {
         .filter(|seconds| *seconds > 0);
 }
 
-/// Reads one local item and enriches it through the installed media probe.
-fn local_media_item(path: PathBuf) -> LocalMediaItem {
-    local_media_item_with_probe(path, &mut SystemLocalMediaProbe)
+/// Reads one local item and enriches it through the configured media probe.
+fn local_media_item(path: PathBuf, ffprobe_executable: &Path) -> LocalMediaItem {
+    local_media_item_with_probe(
+        path,
+        &mut SystemLocalMediaProbe {
+            executable: ffprobe_executable.to_path_buf(),
+        },
+    )
 }
 
 /// Reads one local item through an injectable technical-metadata probe.
@@ -35239,12 +35407,12 @@ mod tests {
     /// Opening Radio or moving to another station starts one bounded, cached
     /// Wikidata artwork lookup. That is deliberate, and it is not what these
     /// tests are about.
-    #[cfg(feature = "radio")]
+    #[cfg(all(feature = "radio", any(feature = "wikidata", feature = "bbc-radio")))]
     fn next_request_ignoring_radio_artwork(
         captured: &crossbeam_channel::Receiver<ProviderRequest>,
     ) -> Option<ProviderRequest> {
         loop {
-            match captured.recv_timeout(Duration::from_secs(1)) {
+            match captured.try_recv() {
                 #[cfg(feature = "wikidata")]
                 Ok(ProviderRequest::RadioArtwork { .. }) => {}
                 Ok(request) => return Some(request),
@@ -36459,7 +36627,7 @@ mod tests {
         let media_path = fixture.path().join("removed.flac");
         std::fs::write(&media_path, b"fixture audio").expect("Local media fixture");
         let snapshot = playlist_snapshot_from_queue_item(
-            &queue_item_from_local(&local_media_item(media_path.clone()))
+            &queue_item_from_local(&local_media_item(media_path.clone(), Path::new("ffprobe")))
                 .expect("Local queue item"),
         )
         .expect("stable Local snapshot");
@@ -42527,7 +42695,8 @@ mod tests {
         let source_id = local_media_id(&source);
         let target_id = local_media_id(&target);
         let snapshot = playlist_snapshot_from_queue_item(
-            &queue_item_from_local(&local_media_item(source.clone())).expect("local queue item"),
+            &queue_item_from_local(&local_media_item(source.clone(), Path::new("ffprobe")))
+                .expect("local queue item"),
         )
         .expect("stable Local snapshot");
         let store = StateStore::open(&config).expect("disk state");
@@ -44506,6 +44675,51 @@ mod tests {
             })
         );
         assert!(controller.pending_local_media_metadata.is_none());
+    }
+
+    /// Every downloaded row carries its own cover, not just the selected one:
+    /// the list is where a user looks for it, and the thumbnails are sitting in
+    /// the same directory the rows were just read from.
+    #[cfg(feature = "local-artwork")]
+    #[test]
+    fn downloaded_rows_carry_the_thumbnails_written_beside_them() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let downloads = config.downloads_dir();
+        let covered = downloads.join("Popular Monster [ydK1vjQBvp0].opus");
+        let cover = downloads.join("Popular Monster [ydK1vjQBvp0].webp");
+        let bare = downloads.join("Ronald [RAoirYYwPgU].opus");
+        std::fs::write(&covered, b"covered download").expect("covered download fixture");
+        std::fs::write(&cover, b"RIFF\0\0\0\0WEBPVP8 body").expect("sidecar fixture");
+        std::fs::write(&bare, b"bare download").expect("bare download fixture");
+        // A thumbnail that is not really an image must not reach a renderer.
+        std::fs::write(
+            downloads.join("Ronald [RAoirYYwPgU].png"),
+            b"<!doctype html>",
+        )
+        .expect("mislabelled sidecar fixture");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.show_screen(Screen::Downloaded);
+
+        let row = |title: &str| {
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == title)
+                .expect("downloaded row")
+                .thumbnail_url
+                .clone()
+        };
+        assert_eq!(
+            row("Popular Monster [ydK1vjQBvp0].opus")
+                .as_ref()
+                .and_then(|url| url.to_file_path().ok()),
+            Some(cover)
+        );
+        assert_eq!(row("Ronald [RAoirYYwPgU].opus"), None);
     }
 
     /// A download carries no embedded picture: `yt-dlp` writes the thumbnail
@@ -50936,6 +51150,62 @@ mod tests {
         );
     }
 
+    /// A media key means "the next entry", not "the next entry unless repeat".
+    ///
+    /// Repeat-one governs what happens when an item ends. Consulting it here
+    /// would answer a deliberate press by replaying the same track, which is
+    /// indistinguishable from a key that does nothing.
+    #[test]
+    fn stepping_through_the_queue_moves_by_one_entry_and_stops_at_the_ends() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        for name in ["first", "second", "third"] {
+            controller.playback_queue.push(fixture_direct_item(name));
+        }
+        controller.playback_queue.current_index = Some(0);
+        controller.playback_queue.repeat_one = true;
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(2));
+
+        // The end is a stated refusal, not a wrap-around: wrapping would restart
+        // a finished queue from a key meant to advance it.
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(2));
+        assert_eq!(
+            controller.view.status_line,
+            "This is the last item in the queue"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.view.status_line,
+            "This is the first item in the queue"
+        );
+    }
+
+    /// Nothing playing is answered, not ignored.
+    ///
+    /// A media key is pressed out of sight of the window, so a silent no-op is
+    /// the one outcome that leaves the person with no idea what happened.
+    #[test]
+    fn stepping_an_empty_queue_says_so_rather_than_doing_nothing() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(
+            controller.view.status_line,
+            "The queue holds nothing to move through"
+        );
+        assert!(controller.playback_queue.items.is_empty());
+    }
+
     /// Removing an entry must move the cursor with it.
     ///
     /// Without that, dropping an earlier entry silently repoints the cursor at
@@ -51001,6 +51271,131 @@ mod tests {
         assert_eq!(popup.items.len(), 2);
         assert_eq!(popup.items[0].title, "started-elsewhere");
         assert_eq!(popup.current, Some(0));
+    }
+
+    /// A window title, a tray tooltip, and a track-change notification all read
+    /// one field, and it must follow the queue rather than the visible list.
+    ///
+    /// Deriving it from `rows` is the tempting shortcut and the wrong one: the
+    /// playing item leaves `rows` as soon as the user browses anywhere else,
+    /// and the announcement would then follow the cursor instead of the sound.
+    #[test]
+    fn what_is_playing_is_published_for_the_surfaces_outside_the_list() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.tick();
+        assert!(
+            controller.view.now_playing.is_none(),
+            "an empty queue announces nothing"
+        );
+
+        let mut first = fixture_direct_item("First Track");
+        first.media.creator = Some("A Creator".to_owned());
+        controller.playback_queue.push(first);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("Second Track"));
+        controller.tick();
+        let playing = controller
+            .view
+            .now_playing
+            .clone()
+            .expect("a queued entry is announced");
+        assert_eq!(playing.title, "First Track");
+        assert_eq!(playing.subtitle, "A Creator");
+
+        // Browsing elsewhere empties `rows` of the playing item; the
+        // announcement must not follow the user out of the list.
+        controller.dispatch(UiAction::ShowScreen(Screen::History));
+        controller.tick();
+        assert_eq!(
+            controller
+                .view
+                .now_playing
+                .as_ref()
+                .map(|it| it.title.clone()),
+            Some("First Track".to_owned())
+        );
+
+        controller.playback_queue.current_index = Some(1);
+        controller.tick();
+        let advanced = controller
+            .view
+            .now_playing
+            .clone()
+            .expect("the next entry is announced");
+        assert_eq!(advanced.title, "Second Track");
+        assert_eq!(
+            advanced.subtitle, "",
+            "an unknown creator stays empty rather than being invented"
+        );
+        assert_ne!(
+            advanced.media_id, playing.media_id,
+            "identity is what marks a change of track, so it must move too"
+        );
+    }
+
+    /// Dropping media on the window must land on it in Local.
+    ///
+    /// A terminal cannot receive a drop, so this action exists only for the
+    /// window — but the navigation it performs is the Local browser's own, so a
+    /// dropped path can reach nothing the arrow keys could not already reach.
+    #[cfg(feature = "local-browser")]
+    #[test]
+    fn a_dropped_path_opens_where_it_lives_and_selects_it() {
+        let temporary = tempfile::tempdir().expect("temporary media directory");
+        // Canonical from the start: macOS resolves `/var` to `/private/var`,
+        // and the controller compares the canonical form.
+        let folder = std::fs::canonicalize(temporary.path()).expect("canonical media directory");
+        let track = folder.join("Track.opus");
+        std::fs::write(&track, b"audio").expect("media fixture");
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![track.clone()]));
+        assert_eq!(
+            controller.view.screen,
+            Screen::Local,
+            "a drop switches to the browser that shows it"
+        );
+        assert_eq!(controller.view.local_path, folder.display().to_string());
+        assert_eq!(
+            controller
+                .pending_local_reselection
+                .as_ref()
+                .map(|(_, child)| child.clone()),
+            Some(track.clone()),
+            "the dropped file is reselected when its folder arrives"
+        );
+
+        // A dropped folder is the place itself, with nothing to reselect.
+        let nested = folder.join("Album");
+        std::fs::create_dir(&nested).expect("nested folder fixture");
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![nested.clone()]));
+        assert_eq!(controller.view.local_path, nested.display().to_string());
+        assert!(controller.pending_local_reselection.is_none());
+
+        // Several paths still name one place, and the count is reported so the
+        // rest are not silently forgotten.
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![
+            track.clone(),
+            folder.join("Other.opus"),
+        ]));
+        assert_eq!(controller.view.local_path, folder.display().to_string());
+        assert_eq!(
+            controller.view.status_line,
+            "2 paths dropped; showing the folder the first one is in"
+        );
+
+        // A path that is gone by the time it arrives must say so and move
+        // nothing, rather than leaving Local pointing at a folder it never read.
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![folder.join("Gone.opus")]));
+        assert!(
+            controller.view.status_line.starts_with("Cannot open "),
+            "{}",
+            controller.view.status_line
+        );
+        assert_eq!(controller.view.local_path, folder.display().to_string());
     }
 
     /// `y` must reach a clipboard rather than print the URL and stop.
@@ -54579,6 +54974,122 @@ mod tests {
         assert_eq!(details.loading_wikidata_item.as_deref(), Some("Q761627"));
     }
 
+    /// A resolved logotype has to reach Details, and only the station it
+    /// belongs to: one lookup is in flight at a time, so a reply routinely
+    /// outlives the selection that asked for it.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[test]
+    fn a_station_logotype_reaches_details_and_survives_a_passive_refresh() {
+        let config = Config::for_dir("/tmp/youta-radio-logotype-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        settle_initial_radio_artwork(&mut controller, &captured_requests);
+        select_radio_station(&mut controller, "kexp");
+        let ProviderRequest::RadioArtwork { generation, .. } = captured_requests
+            .try_recv()
+            .expect("station logotype request")
+        else {
+            panic!("expected a station logotype request");
+        };
+        let logotype =
+            url::Url::parse("https://upload.wikimedia.org/wikipedia/commons/f/fd/Kexp_logo.png")
+                .expect("logotype URL");
+
+        // A reply for a station that is no longer selected must not paint the
+        // one that is.
+        controller.handle_radio_artwork(
+            generation,
+            "france-musique".to_owned(),
+            Some(logotype.clone()),
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            None,
+            "a stale reply must not paint the selected station"
+        );
+
+        controller.handle_radio_artwork(generation, "kexp".to_owned(), Some(logotype.clone()));
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&logotype)
+        );
+
+        // Passive now-playing refreshes rebuild Details several times a minute,
+        // and the artwork has to survive every one of them without a second
+        // lookup.
+        controller.update_radio_detail();
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&logotype)
+        );
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "a remembered logotype must not be looked up again"
+        );
+    }
+
+    /// Most of the catalogue has no Wikidata item and never will — a hobby FLAC
+    /// stream is not a notable broadcaster. Those stations have to ask their own
+    /// homepage, or artwork would exist for a tenth of the list.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn a_station_without_a_wikidata_item_asks_its_own_homepage() {
+        let config = Config::for_dir("/tmp/youta-radio-homepage-icon-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        // Opening the tab starts a lookup for its first row, and one runs at a
+        // time, so it is answered before this test asks for another.
+        while let Ok(ProviderRequest::RadioArtwork {
+            generation,
+            station_id,
+            ..
+        }) = captured_requests.try_recv()
+        {
+            controller.handle_radio_artwork(generation, station_id, None);
+        }
+
+        select_radio_station(&mut controller, "sector-radio-progressive-flac");
+
+        let ProviderRequest::RadioArtwork {
+            station_id,
+            item_ids,
+            homepage,
+            ..
+        } = captured_requests.try_recv().expect("station icon request")
+        else {
+            panic!("expected a station logotype request");
+        };
+        assert_eq!(station_id, "sector-radio-progressive-flac");
+        assert!(
+            item_ids.is_empty(),
+            "this station has no verified Wikidata item"
+        );
+        assert_eq!(
+            homepage,
+            station_by_id("sector-radio-progressive-flac")
+                .and_then(|station| station.homepage_url().ok()),
+            "the worker needs the homepage to find the station's own logo"
+        );
+    }
+
     #[cfg(all(feature = "radio", feature = "wikidata"))]
     #[test]
     fn passive_radio_refresh_preserves_only_same_station_wikidata_state() {
@@ -54764,7 +55275,12 @@ mod tests {
         );
         assert!(controller.resolved_direct.is_none());
         assert!(controller.pending_bbc_playback.is_none());
-        assert!(captured_requests.try_recv().is_err());
+        // Selecting the station starts its logotype lookup, and nothing else:
+        // a pasted link must not resolve a manifest or begin playback.
+        assert!(
+            next_request_ignoring_radio_artwork(&captured_requests).is_none(),
+            "a pasted station link must not resolve a manifest"
+        );
         assert!(playback.lock().expect("mock playback").played.is_empty());
     }
 

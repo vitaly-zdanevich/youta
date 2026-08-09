@@ -86,14 +86,8 @@ pub struct LocalDirectoryIdentity {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 /// A complete recursive folder-size measurement.
@@ -782,29 +776,12 @@ fn directory_identity_from_metadata(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> LocalDirectoryIdentity {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        LocalDirectoryIdentity {
-            path: path.to_owned(),
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        LocalDirectoryIdentity {
-            path: path.to_owned(),
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        }
+    LocalDirectoryIdentity {
+        path: path.to_owned(),
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        filesystem: crate::file_identity::filesystem_identity(path, metadata),
     }
 }
 

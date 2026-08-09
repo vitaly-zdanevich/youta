@@ -7332,20 +7332,8 @@ fn bookmark_from_row(row: &Row<'_>) -> rusqlite::Result<Bookmark> {
     })
 }
 
-#[cfg(unix)]
 #[cfg(feature = "sqlite-state")]
-fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-#[cfg(feature = "sqlite-state")]
-fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
+use crate::private_files::set_private_file_permissions;
 
 #[cfg(all(test, feature = "yandex-music"))]
 pub(crate) fn assert_yandex_music_reaction_backend_contract(store: &dyn StateBackend) {

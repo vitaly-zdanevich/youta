@@ -1154,6 +1154,19 @@ pub struct ProviderConfig {
     pub mpv_executable: PathBuf,
     /// Chromaprint `fpcalc` executable name or path.
     pub fpcalc_executable: PathBuf,
+    /// `FFmpeg` executable name or path.
+    ///
+    /// Used for waveform extraction, local video thumbnails, and tracker
+    /// replay. A bare name is resolved through `PATH`, which is how most Unix
+    /// installations arrive; Windows installations usually do not put `FFmpeg`
+    /// on `PATH` at all, so this is where the full path goes.
+    pub ffmpeg_executable: PathBuf,
+    /// `FFprobe` executable name or path.
+    ///
+    /// Used to read codec, bitrate, and exact duration for local media. It
+    /// ships beside `FFmpeg` and is configured separately because a build that
+    /// omits it is common enough to be worth pointing elsewhere.
+    pub ffprobe_executable: PathBuf,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -1189,6 +1202,8 @@ impl fmt::Debug for ProviderConfig {
             .field("yt_dlp_executable", &self.yt_dlp_executable)
             .field("mpv_executable", &self.mpv_executable)
             .field("fpcalc_executable", &self.fpcalc_executable)
+            .field("ffmpeg_executable", &self.ffmpeg_executable)
+            .field("ffprobe_executable", &self.ffprobe_executable)
             .finish()
     }
 }
@@ -1210,6 +1225,8 @@ impl Default for ProviderConfig {
             yt_dlp_executable: PathBuf::from("yt-dlp"),
             mpv_executable: PathBuf::from("mpv"),
             fpcalc_executable: PathBuf::from("fpcalc"),
+            ffmpeg_executable: PathBuf::from("ffmpeg"),
+            ffprobe_executable: PathBuf::from("ffprobe"),
         }
     }
 }
@@ -1401,16 +1418,7 @@ fn default_config_dir() -> PathBuf {
     )
 }
 
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
+use crate::private_files::{create_private_directory, set_private_file_permissions};
 
 fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
     let contents = read_limited_utf8_file(path, MAX_CREDENTIALS_BYTES, "credentials.toml")?;
@@ -1665,37 +1673,19 @@ fn write_private_config(path: &Path, contents: &[u8]) -> Result<(), ConfigError>
     let result = (|| -> Result<(), ConfigError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = crate::private_files::open_privately(&mut options).open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         set_private_file_permissions(&temporary)?;
         fs::rename(&temporary, path)?;
         set_private_file_permissions(path)?;
-        if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
+        crate::durability::sync_parent_directory(path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

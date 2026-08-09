@@ -299,6 +299,13 @@ sha2 = { version = "0.10.9", optional = true }
 ureq = { version = "3.3.0", features = ["json"], optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"], optional = true }
 
+# Windows has no stable `std` route to a file's identity: the volume serial
+# number and file index sit behind the unstable `windows_by_handle` feature.
+# Unix needs nothing here, so this is compiled only where it is the difference
+# between noticing a replaced file and not.
+[target.'cfg(windows)'.dependencies]
+file-id = "0.2.3"
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"

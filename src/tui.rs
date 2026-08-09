@@ -108,6 +108,8 @@ pub struct UiSettings {
     pub prefetch_search_thumbnails: bool,
     /// Persistent thumbnail byte cache selected by the loaded configuration.
     pub thumbnail_cache_dir: Option<PathBuf>,
+    /// `FFmpeg` used to extract the one frame a local video is previewed by.
+    pub ffmpeg_executable: PathBuf,
     /// Redraw period while playback is active.
     pub playing_tick: Duration,
     /// Redraw period while idle or paused.
@@ -131,6 +133,7 @@ impl Default for UiSettings {
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
             thumbnail_cache_dir: None,
+            ffmpeg_executable: PathBuf::from("ffmpeg"),
             playing_tick: Duration::from_millis(250),
             idle_tick: Duration::from_secs(1),
         }
@@ -193,6 +196,7 @@ struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
     mode: ThumbnailMode,
     cache_directory: Option<PathBuf>,
+    ffmpeg_executable: PathBuf,
     tty_images_enabled: bool,
     tty_image_policy_applies: bool,
     suspended_tty_manager: Option<ThumbnailManager>,
@@ -216,6 +220,7 @@ impl TerminalThumbnailRenderer {
             manager,
             ThumbnailMode::Auto,
             None,
+            PathBuf::from("ffmpeg"),
             true,
             tty_image_policy_applies,
         )
@@ -226,6 +231,7 @@ impl TerminalThumbnailRenderer {
         manager: ThumbnailManager,
         mode: ThumbnailMode,
         cache_directory: Option<PathBuf>,
+        ffmpeg_executable: PathBuf,
         tty_images_enabled: bool,
         tty_image_policy_applies: bool,
     ) -> Self {
@@ -233,6 +239,7 @@ impl TerminalThumbnailRenderer {
             manager,
             mode,
             cache_directory,
+            ffmpeg_executable,
             tty_images_enabled,
             tty_image_policy_applies,
             suspended_tty_manager: None,
@@ -254,16 +261,19 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.tty_images_enabled = enabled;
         if enabled {
             self.manager = self.suspended_tty_manager.take().unwrap_or_else(|| {
-                self.cache_directory.as_ref().map_or_else(
-                    || ThumbnailManager::from_current_terminal_with_tty_images(self.mode, true),
-                    |cache_directory| {
-                        ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
-                            self.mode,
-                            cache_directory.clone(),
-                            true,
-                        )
-                    },
-                )
+                self.cache_directory
+                    .as_ref()
+                    .map_or_else(
+                        || ThumbnailManager::from_current_terminal_with_tty_images(self.mode, true),
+                        |cache_directory| {
+                            ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
+                                self.mode,
+                                cache_directory.clone(),
+                                true,
+                            )
+                        },
+                    )
+                    .with_video_frame_program(self.ffmpeg_executable.clone())
             });
         } else {
             let disabled = ThumbnailManager::from_current_terminal(ThumbnailMode::Off);
@@ -602,26 +612,31 @@ fn create_thumbnail_renderer(
     settings: &UiSettings,
     show_images_in_tty: bool,
 ) -> Option<Box<dyn ThumbnailRenderer>> {
-    let manager = settings.thumbnail_cache_dir.as_ref().map_or_else(
-        || {
-            ThumbnailManager::from_current_terminal_with_tty_images(
-                settings.thumbnails,
-                show_images_in_tty,
-            )
-        },
-        |cache_dir| {
-            ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
-                settings.thumbnails,
-                cache_dir.clone(),
-                show_images_in_tty,
-            )
-        },
-    );
+    let manager = settings
+        .thumbnail_cache_dir
+        .as_ref()
+        .map_or_else(
+            || {
+                ThumbnailManager::from_current_terminal_with_tty_images(
+                    settings.thumbnails,
+                    show_images_in_tty,
+                )
+            },
+            |cache_dir| {
+                ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
+                    settings.thumbnails,
+                    cache_dir.clone(),
+                    show_images_in_tty,
+                )
+            },
+        )
+        .with_video_frame_program(settings.ffmpeg_executable.clone());
     Some(Box::new(
         TerminalThumbnailRenderer::new_with_runtime_policy(
             manager,
             settings.thumbnails,
             settings.thumbnail_cache_dir.clone(),
+            settings.ffmpeg_executable.clone(),
             show_images_in_tty,
             current_terminal_attachment().is_physical_linux_virtual_console(),
         ),
@@ -6223,6 +6238,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
+        "  {/} previous / next item in the queue",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
         "",
@@ -10097,6 +10113,7 @@ mod tests {
             manager,
             ThumbnailMode::Auto,
             Some(cache_directory.clone()),
+            PathBuf::from("ffmpeg"),
             true,
             true,
         );

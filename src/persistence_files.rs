@@ -456,19 +456,10 @@ fn file_generation(path: &Path) -> Result<Option<FileGeneration>, PersistenceErr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
     Ok(Some(FileGeneration {
         len: metadata.len(),
         modified: metadata.modified().ok(),
-        #[cfg(unix)]
-        device: metadata.dev(),
-        #[cfg(unix)]
-        inode: metadata.ino(),
-        #[cfg(unix)]
-        modified_seconds: metadata.mtime(),
-        #[cfg(unix)]
-        modified_nanoseconds: metadata.mtime_nsec(),
+        filesystem: crate::file_identity::filesystem_identity(path, &metadata),
     }))
 }
 
@@ -705,14 +696,8 @@ impl Drop for FileStateStore {
 struct FileGeneration {
     len: u64,
     modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 impl FileStateStore {
@@ -3688,7 +3673,7 @@ fn quarantine_and_reset_regenerable(
     let quarantine = create_regenerable_quarantine(path, document)?;
     set_private_file_permissions(&quarantine)?;
     File::open(&quarantine)?.sync_all()?;
-    File::open(parent)?.sync_all()?;
+    crate::durability::sync_directory(parent)?;
     write_document(path, document, maximum_bytes, replacement)
 }
 
@@ -3864,17 +3849,12 @@ fn write_document(
     let result = (|| -> Result<(), PersistenceError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = crate::private_files::open_privately(&mut options).open(&temporary)?;
         file.write_all(encoded.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         set_private_file_permissions(path)?;
-        File::open(parent)?.sync_all()?;
+        crate::durability::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -3883,26 +3863,7 @@ fn write_document(
     result
 }
 
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
+use crate::private_files::{create_private_directory, set_private_file_permissions};
 
 #[cfg(any(feature = "local-rename", feature = "local-move"))]
 fn remap_media_id(

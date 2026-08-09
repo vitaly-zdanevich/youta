@@ -111,6 +111,15 @@ stop describing what you are listening to. The list is rebuilt on every tick,
 so it keeps up with entries the user did not add: reaching the end of a track
 moves the cursor, and starting playback records an entry beside it.
 
+`{` and `}` step to the previous and next entry without opening it, the way a
+media key or a tray menu does. They are the shifted neighbours of `[` and `]`
+for the next size up: those move within one item, these move between them.
+Repeat-one is not consulted, because somebody who asked for the next track has
+already said what they want, and the step stays inside the queue rather than
+continuing into an autoplay list — autoplay's continuation belongs to
+end-of-file, where the origin that survives a finished queue is established.
+Either end is a stated refusal rather than a wrap-around.
+
 `y` copies the selected item's link to the system clipboard. The controller
 only decides *what* to copy; each front-end reaches its own clipboard, because
 the two are genuinely different. The terminal uses a native helper
@@ -380,9 +389,22 @@ Commons' stable file address is a redirect and Youta's artwork agent refuses
 redirects on purpose; the second asks Commons for the raster URL itself at a
 bounded width, which also rasterizes an SVG logotype to PNG. One lookup runs at
 a time and every answer is remembered for the session, including "this station
-has no image", so moving through the catalogue costs at most one request per
-station rather than one per selection. Stations without a verified item, and
-builds without `wikidata`, simply show no artwork.
+has no image", so moving through the catalogue costs at most one lookup per
+station rather than one per selection.
+
+Wikidata knows only the broadcasters notable enough to have an item, which is
+about a tenth of Youta's catalogue: a hobby FLAC stream has no item to link to
+and never will. The rest ask the station's own homepage, which already
+advertises its logo to browsers and messaging apps. Youta reads one bounded page
+and takes the first of `apple-touch-icon`, `og:image`, and a `rel="icon"` that
+is a PNG, JPEG, or WebP — an ICO or SVG favicon is skipped because the artwork
+pipeline cannot render one. The address requested is the compile-time homepage
+from Youta's own curated catalogue, never anything a provider or a user
+supplied; the address the page returns is untrusted and is validated exactly
+like any other remote artwork URL — public host, no credentials, size-capped,
+identified by its bytes — before it is fetched. Selecting a station therefore
+contacts that station's website once per session. Builds without `wikidata`
+simply start from the homepage.
 
 This is exact-ID enrichment, not title, name, or arbitrary-URL matching.
 YouTube video IDs come from validated links, bare IDs, or search results;
@@ -513,7 +535,14 @@ acoustid_client_key = '...'
 back to `invidious_base_url`. `official` and `invidious` select only that
 backend. Both the TUI and `youta search` use this selection. The AcoustID key
 enables the Local Details `[f] Fingerprint` action; `fpcalc_executable` in
-`config.toml` can select a non-default Chromaprint helper path. The Yandex
+`config.toml` can select a non-default Chromaprint helper path. `FFmpeg` and
+`FFprobe` are named the same way, by `ffmpeg_executable` and
+`ffprobe_executable`: the first draws local waveforms, extracts the midpoint
+frame a local video is previewed by, and decodes tracker modules; the second
+reads codec, bitrate, and exact duration for local media. Both default to the
+bare name, which a Unix installation puts on `PATH`; a Windows build of FFmpeg
+is usually unpacked rather than installed, so a full path is the normal setting
+there. The Yandex
 Music credential can instead be supplied for one process with
 `YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN`; environment values take precedence over
 the private credentials file.
@@ -544,6 +573,39 @@ npm --prefix gui/ui ci
 npm --prefix gui/ui run build
 cargo run --locked -p youta-gui
 ```
+
+On Linux the window is WebKitGTK, so building it additionally needs
+`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev` for the
+tray, and `libdbus-1-dev` for the media keys. WebKitGTK 2.40 is the floor —
+that is the release that introduced the 4.1 API this depends on. Some
+Nvidia and older Mesa configurations render the window as a blank or torn
+surface until WebKitGTK's DMA-BUF path is turned off:
+
+```sh
+WEBKIT_DISABLE_DMABUF_RENDERER=1 youta-desktop
+```
+
+That is a WebKitGTK workaround rather than a Youta setting, and it is worth
+trying first whenever the window appears but shows nothing.
+
+Installers are built by `scripts/package-desktop.sh`, which produces whatever
+the host platform's bundler can make — `.deb`, `.rpm` and AppImage on Linux,
+`.dmg` on macOS, an NSIS installer on Windows — and writes a `.sha256` beside
+each. It does not cross-compile, because none of those bundlers do; the release
+workflow runs it once per operating system instead.
+
+The installers are **not signed**, on any platform. macOS will refuse a
+downloaded `.dmg` until it is opened through the right-click "Open" menu, and
+Windows SmartScreen will warn about an unrecognised publisher. Signing is wired
+into the release workflow and turns itself on the moment the maintainer adds
+the certificate secrets; until then, unsigned is the honest state and this is
+where it is written down. For the same reason the window carries **no automatic
+updater**: an updater needs a signing key pair whose private half only the
+maintainer can hold, and an endpoint to publish manifests to. Neither exists,
+and shipping an update channel that nobody can sign for would be worse than
+shipping none. Deep links — opening a `youta://` address from a browser — are
+not registered either; they need the bundle that now exists plus a decision
+about handing a URL to an already-running copy, which is its own change.
 
 The page is embedded into the binary when the Rust crate compiles, so editing
 the front-end means running both commands again: `npm --prefix gui/ui run build`
@@ -604,6 +666,72 @@ the terminal reaches a native helper or writes an OSC 52 escape to its own tty,
 and can suspend itself so a terminal editor may take the console. The
 controller supplies the text and the command, never the transport.
 
+The window carries a menu bar, a tray icon, and a drop target — the three ways
+of reaching Youta from outside its page. Every entry in the menu and the tray is
+a semantic action: a menu item's identity *is* its serialized `UiAction`, so an
+entry cannot name a command that does not exist and there is no second table to
+drift. None of them carries a keyboard accelerator, because an accelerator is
+resolved by the operating system before the page sees the key, while the shared
+keyboard map resolves the same key against live modal state — `Space` as an
+accelerator would pause playback while a space was typed into the search field.
+The Edit submenu is the exception and is not decoration: its predefined items
+are what give the web view working cut, copy, paste, and select-all, which is
+how the natively selected Details text is actually copied.
+
+The tray does not keep Youta alive. Closing the window still ends the process,
+stops the player, and releases the durable-state lock; a tray that outlived its
+window would be a second, invisible way to hold that lock. Its menu opens on an
+ordinary click on every platform, because it exists to carry controls — and
+every entry on it has to mean something with no list in sight, which is why it
+carries the queue's neighbours rather than "queue the selected item next".
+
+Dropping files or folders on the window shows them in Local: the folder itself
+when a folder was dropped, otherwise the folder the first file lives in with
+that file selected. Several files out of one folder therefore land on all of
+them at once. Nothing is read per path — only the first is inspected and the
+rest are counted — and the folder it opens is one the arrow keys could already
+reach, so a drop opens no door Local does not already open.
+
+The window title, the tray tooltip, and a track-change notification all read one
+field, `now_playing`, which is the queue entry playback is on rather than
+whatever the engine parsed out of the stream. Deriving it from the visible rows
+would follow the cursor instead of the sound, since the playing item leaves the
+list as soon as the user browses elsewhere. A notification is raised only when
+the track changes while the window is *not* focused, and never for the first
+snapshot after startup: a queue restored from durable state is not a track that
+started. Titles reaching an operating system are bounded like every other piece
+of provider text Youta shows.
+
+The keyboard's media keys work too, through whatever the desktop uses for them:
+MPRIS on Linux, the System Media Transport Controls on Windows, Now Playing on
+macOS. Play and Pause name a destination rather than a change, so both are
+answered against the reducer's live state instead of the last snapshot — a Play
+arriving at something already playing does nothing rather than pausing it. Next
+and Previous step through the *queue*, which is also what those entries mean in
+the tray, where there is no cursor for "queue the selected item" to refer to.
+Youta has no stop, so the Stop button holds the item where it is; a dragged
+position is refused rather than approximated while the running time is unknown;
+and a URI arriving from the session bus is ignored, because Youta plays what its
+providers resolved.
+
+No cover art is published there. Every one of the three hands the URL to the
+platform's own image loader, which would fetch a provider's thumbnail without
+the guarded agent that the `youta://artwork/` endpoint exists to keep in front
+of it. On Linux the media surface is MPRIS, which is to say any process on the
+user's session bus can then ask Youta to pause or quit — the bargain every MPRIS
+player makes, and no reach that running as the same user did not already grant.
+
+The position is not pushed on every tick. macOS and Windows extrapolate elapsed
+time from the last value and the rate, so they are told again only when playback
+*jumps*; MPRIS answers `Position` with exactly what it was last told, so there
+it is refreshed every second as well. Getting this wrong is measurable rather
+than theoretical: souvlaki's macOS backend rebuilds and re-copies the whole
+now-playing dictionary per call from a thread with no autorelease pool, and a
+call costs 0.9 KiB that is never returned.
+
+On Linux this needs `libdbus-1-dev` at build time, next to the WebKitGTK
+development packages the window already requires.
+
 A search field appears on every screen that collects a query and nowhere else;
 both front-ends ask `Screen::search_verb` which those are, so a screen whose
 Enter would answer "search is not available" is never given a field. It is not
@@ -643,6 +771,12 @@ Both are identified by their leading bytes rather than by a file extension or a
 tag's claimed MIME type, and neither is decoded here — pixel and allocation
 limits belong to whichever renderer actually decodes, which is the only side
 that knows what those limits are.
+
+Downloaded rows carry their covers in the list itself, not only in the
+information panel, because that is where a sidecar thumbnail is cheap: the whole
+list comes from one directory, so one extra pass over it covers every row
+instead of one lookup per row. Embedded pictures stay lazy and per selection,
+since reading them means parsing each media file's tags.
 
 For a small TUI build containing only the curated Radio catalogue and `mpv`
 playback:
@@ -1447,12 +1581,36 @@ release also publishes one Cargo vendor archive for offline/external build
 systems. No binary archive enables SQLite; human-readable TOML remains the
 standard release persistence backend.
 
-Windows amd64 and arm64 are compile-checked in CI, but Youta does not publish
-Windows binaries yet: the current `mpv` adapter uses Unix-domain-socket IPC and
-the external-link opener is Unix-specific. FreeBSD x86_64 receives a
-cross-target compile check of the portable TUI/local-browser boundary. It is
-not advertised as a release target until a native or validated cross-build can
-also run playback tests.
+The desktop window is published beside those archives as installers rather than
+tarballs, because that is what its platforms expect: `.deb`, `.rpm` and
+AppImage for Linux amd64 and arm64, a `.dmg` for macOS amd64 and arm64, and an
+NSIS installer for Windows amd64. `scripts/package-desktop.sh` builds whichever
+of those the host can make and writes a `.sha256` beside each, and the release
+workflow runs it once per operating system — a bundler cannot cross-compile an
+installer. The complete asset list is asserted before anything is published, so
+a bundler that quietly produced one format fewer fails the release instead of
+shrinking it.
+
+The window has its own CI lane on Linux, macOS, and Windows, which compiles it,
+runs its tests, lints it, type-checks its page, and proves by `cargo tree` that
+it links no terminal renderer. It is deliberately left out of the coverage gate:
+measuring it would mean installing the WebKitGTK toolchain on the coverage
+runner to instrument a thin shell over the reducer that gate already covers.
+
+Windows amd64 and arm64 are compile-checked in CI. The platform work is done:
+`mpv` is driven over a named pipe rather than a Unix socket, directory
+durability and private-file access ask the platform instead of assuming POSIX,
+helper trees are ended with `taskkill /T`, helper processes get no console
+window of their own, and a file's identity is read from the volume serial
+number and file index rather than given up. The desktop window ships a Windows
+installer. What is still missing before a Windows *terminal* binary is
+advertised is evidence: no part of the test suite has ever been executed on
+Windows. The `windows-test` job runs it and reports without gating, precisely so
+that evidence exists to work through.
+
+FreeBSD x86_64 receives a cross-target compile check of the portable
+TUI/local-browser boundary. It is not advertised as a release target until a
+native or validated cross-build can also run playback tests.
 
 Live YouTube playback is temporarily excluded from automatic hosted CI because
 YouTube returns `LOGIN_REQUIRED` for GitHub-hosted runner addresses even with

@@ -37,6 +37,9 @@ use youta::text_file_open::{TextFileOpenLifecycle, spawn_detached_text_file_open
 use youta::view::{UiAction, UiController, ViewModel, WaveformView};
 use youta::waveform::Peak;
 
+use crate::desktop::{Announced, WindowFocus};
+use crate::media_keys::MediaCommand;
+
 /// Event name carrying a changed snapshot to the window.
 pub const VIEW_EVENT: &str = "youta://view";
 
@@ -246,6 +249,12 @@ enum Message {
         /// Rendered scroll state of the scrollable popups.
         popups: Option<PopupGeometry>,
     },
+    /// A press on the desktop's own media surface.
+    ///
+    /// Carried rather than resolved for the same reason a key press is: Play
+    /// and Pause name a destination, so answering them anywhere but here would
+    /// answer them against a snapshot that may already have moved past.
+    Media(souvlaki::MediaControlEvent),
     /// Stop the engine, flush durable state, and release the state lock.
     Stop,
 }
@@ -289,6 +298,17 @@ impl ReducerHandle {
                 page_rows,
                 popups,
             })
+            .map_err(|_| "the Youta reducer stopped".to_owned())
+    }
+
+    /// Queues one media-surface event for the reducer to resolve and apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the reducer thread is no longer running.
+    pub fn media(&self, event: souvlaki::MediaControlEvent) -> Result<(), String> {
+        self.actions
+            .send(Message::Media(event))
             .map_err(|_| "the Youta reducer stopped".to_owned())
     }
 
@@ -347,7 +367,11 @@ impl ReducerHandle {
 ///
 /// Returns the startup failure text when durable state cannot be opened, which
 /// includes the case of a second Youta process already holding the state lock.
-pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHandle, String> {
+pub fn start<R: Runtime>(
+    app: AppHandle<R>,
+    config: Config,
+    focus: WindowFocus,
+) -> Result<ReducerHandle, String> {
     let (action_sender, action_receiver) = channel();
     let (ready_sender, ready_receiver) = channel();
     // Never sent on: the thread drops this sender as its last act, which is what
@@ -397,6 +421,7 @@ pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHan
                 &action_receiver,
                 &published,
                 &published_artwork,
+                &focus,
             );
             // Every exit from `run` lands here, so the player process is killed
             // and durable state is flushed whether the user quit, closed the
@@ -422,8 +447,11 @@ pub fn start<R: Runtime>(app: AppHandle<R>, config: Config) -> Result<ReducerHan
 ///
 /// A key is resolved here rather than in the window, against the view the
 /// controller holds right now, which is what makes the seventeen-level modal
-/// precedence in [`youta::keymap`] mean the same thing in both front-ends.
-fn apply(controller: &mut AppController, message: Message) -> bool {
+/// precedence in [`youta::keymap`] mean the same thing in both front-ends. A
+/// media key is resolved here for the narrower version of the same reason: it
+/// arrives from outside the process entirely, and Play means "resume" rather
+/// than "toggle".
+fn apply<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController, message: Message) -> bool {
     match message {
         Message::Action(action) => controller.dispatch(action),
         Message::Key {
@@ -437,6 +465,13 @@ fn apply(controller: &mut AppController, message: Message) -> bool {
                 controller.dispatch(action);
             }
         }
+        Message::Media(event) => match crate::media_keys::command_for(&event, controller.view()) {
+            Some(MediaCommand::Act(action)) => controller.dispatch(action),
+            // Showing a hidden window is a window-manager operation, which is
+            // why the reducer has no word for it. See `desktop::show_window`.
+            Some(MediaCommand::Show) => crate::desktop::show_window(app),
+            None => {}
+        },
         Message::Stop => return false,
     }
     true
@@ -548,13 +583,27 @@ fn run<R: Runtime>(
     actions: &Receiver<Message>,
     published: &Arc<Mutex<ViewModel>>,
     artwork: &Arc<PublishedArtwork>,
+    focus: &WindowFocus,
 ) {
     let mut last = controller.view().clone();
     let mut traffic = TrafficMeter::new();
+    let mut announced = Announced::default();
+    // Registered here rather than in `setup`, because reading a native window
+    // handle asks the main thread for it and the main thread is inside `setup`
+    // waiting for this thread to report that durable state opened. The surface
+    // is dropped with this function, which is what detaches it from the desktop.
+    let mut media = crate::media_keys::Surface::install(app);
+    // Said once before the loop, because the loop only speaks when the snapshot
+    // *changes* and the surface has to be right before anything happens: a
+    // player that has registered but stated nothing shows a desktop panel full
+    // of whatever the platform defaults to.
+    if let Some(media) = media.as_mut() {
+        media.publish(&last);
+    }
     loop {
         match actions.recv_timeout(TICK) {
-            Ok(message @ (Message::Action(_) | Message::Key { .. })) => {
-                if !apply(controller, message) {
+            Ok(message @ (Message::Action(_) | Message::Key { .. } | Message::Media(_))) => {
+                if !apply(app, controller, message) {
                     return;
                 }
                 // Drain the rest of a burst before publishing, so holding a key
@@ -562,7 +611,7 @@ fn run<R: Runtime>(
                 for _ in 1..MAX_ACTIONS_PER_TICK {
                     match actions.try_recv() {
                         Ok(message) => {
-                            if !apply(controller, message) {
+                            if !apply(app, controller, message) {
                                 return;
                             }
                         }
@@ -596,6 +645,20 @@ fn run<R: Runtime>(
             artwork.record(&last);
             *published.lock().unwrap_or_else(PoisonError::into_inner) = last.clone();
 
+            // The window title, the tray, and a track-change notification read
+            // the same published snapshot the page does, so they cannot show
+            // something the page never showed.
+            if let Some(announcement) =
+                crate::desktop::announce(&last, focus.focused(), &mut announced)
+            {
+                crate::desktop::perform(app, &announcement);
+            }
+            // The desktop's own media panel reads the same snapshot, so what it
+            // shows can never be something the window never showed either.
+            if let Some(media) = media.as_mut() {
+                media.publish(&last);
+            }
+
             let emitted = if only_playback_moved {
                 traffic.record_tick(&tick);
                 app.emit(PLAYBACK_EVENT, &tick)
@@ -620,7 +683,7 @@ fn run<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ANOTHER_INSTANCE_MESSAGE, ReducerHandle, StateStore, start};
+    use super::{ANOTHER_INSTANCE_MESSAGE, ReducerHandle, StateStore, WindowFocus, start};
 
     use super::{PlaybackTick, ViewModel};
 
@@ -635,7 +698,7 @@ mod tests {
     /// long as the reducer publishes through its handle.
     fn reducer(config: &Config) -> (App<MockRuntime>, Result<ReducerHandle, String>) {
         let app = mock_app();
-        let handle = start(app.handle().clone(), config.clone());
+        let handle = start(app.handle().clone(), config.clone(), WindowFocus::default());
         (app, handle)
     }
 

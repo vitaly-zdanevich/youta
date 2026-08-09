@@ -222,6 +222,95 @@ jobs:
           readelf --program-headers target/i686-unknown-linux-gnu/release/youta | grep --fixed-strings '/lib/ld-linux.so.2'
           target/i686-unknown-linux-gnu/release/youta --version
 
+  desktop:
+    name: Desktop window (${{ matrix.operating_system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - operating_system: Linux
+            runner: ubuntu-24.04
+          - operating_system: macOS
+            runner: macos-15
+          - operating_system: Windows
+            runner: windows-2025
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" \
+            --profile minimal \
+            --component clippy
+          rustup default "${RUST_VERSION}"
+
+      # Node ships with every hosted runner image, and this workflow avoids
+      # setup actions on purpose, exactly as the Rust toolchain step does.
+      - name: Report the Node used to build the window page
+        run: |
+          node --version
+          npm --version
+
+      # WebKitGTK is the Linux web view; D-Bus is what the media keys speak
+      # there. Without these the desktop crate cannot be compiled at all, which
+      # is why it had no lane until now.
+      - name: Install the Linux desktop toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: desktop-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the window page
+        run: |
+          npm --prefix gui/ui ci
+          npm --prefix gui/ui run build
+
+      - name: Check the window page types
+        run: npm --prefix gui/ui run typecheck
+
+      - name: Test the desktop crate
+        run: cargo test --locked -p youta-gui --all-targets
+
+      - name: Run blocking Clippy lint groups on the desktop crate
+        run: >-
+          cargo clippy --locked -p youta-gui --all-targets --
+          -D unused
+          -D future-incompatible
+          -D clippy::correctness
+          -D clippy::suspicious
+          -D clippy::perf
+
+      # The desktop window exists to prove the reducer is renderer-free. That
+      # claim was checked by hand until now, and a single line in `gui`'s
+      # feature list could quietly undo it.
+      - name: Prove the window links no terminal renderer
+        run: |
+          set -Eeuo pipefail
+          for renderer in ratatui crossterm ratatui-image; do
+            if cargo tree --locked -p youta-gui -i "${renderer}" > /dev/null 2>&1; then
+              echo "The desktop window links ${renderer}." >&2
+              exit 1
+            fi
+          done
+
   windows-compile:
     name: Windows compile (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
@@ -257,8 +346,11 @@ jobs:
             ~/.cargo/git
           key: windows-compile-${{ matrix.architecture }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
-      # Windows remains compile-only until the mpv backend has named-pipe IPC
-      # and the platform opener replaces the Unix-only runtime adapters.
+      # The runtime adapters are no longer the reason this lane is compile-only:
+      # mpv now speaks its protocol over a named pipe, directory durability and
+      # private-file access ask the platform rather than assuming POSIX, and
+      # helper trees are ended with `taskkill`. What is still unproven is the
+      # *test suite* on Windows, which `windows-test` reports without gating.
       - name: Check the standard application
         run: cargo check --locked --target "${{ matrix.target }}"
 
@@ -271,6 +363,39 @@ jobs:
         run: >-
           cargo check --locked --target "${{ matrix.target }}"
           --no-default-features --features app
+
+  # Reporting, not gating. No part of this suite has ever been executed on
+  # Windows, so a red result here is information about the tests rather than a
+  # regression in them. It gates nothing until the list of failures is known and
+  # has been worked through; that is the next step after this phase, and it
+  # cannot start without the data this lane produces.
+  windows-test:
+    name: Windows deterministic tests (reporting only)
+    runs-on: windows-2025
+    continue-on-error: true
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-test-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run the deterministic suite
+        run: cargo test --locked --all-targets --no-fail-fast
 
   freebsd-compile:
     name: FreeBSD compile feasibility
@@ -848,15 +973,15 @@ jobs:
       - name: Install the pinned coverage runner
         run: cargo install cargo-llvm-cov --locked --version 0.8.7
 
-      # `youta-gui` is excluded deliberately. It links Tauri, whose Linux
-      # backend needs the WebKitGTK and glib development packages, and pulling
-      # that toolchain into the coverage runner to measure a thin window shell
-      # is out of proportion to this gate.
+      # `youta-gui` is excluded deliberately, and the exclusion now means
+      # something narrower than it used to: the `desktop` job compiles, tests,
+      # and lints the window on all three platforms, so it is no longer
+      # unchecked — it is only unmeasured.
       #
-      # This is the only workspace-wide invocation in CI, and the desktop crate
-      # is not a default workspace member, so nothing here builds or tests the
-      # window. Giving it a lane needs a runner with the WebKitGTK development
-      # packages installed.
+      # Measuring it would mean installing the WebKitGTK and glib development
+      # packages on the coverage runner and instrumenting a crate that is a
+      # thin shell over the reducer this gate already covers. The line
+      # percentage would move without telling anyone anything.
       - name: Generate LCOV report
         run: |
           cargo llvm-cov \

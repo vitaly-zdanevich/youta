@@ -202,3 +202,12 @@ mpv_executable = 'mpv'
 # `fpcalc -version`. AcoustID receives the fingerprint and duration, never the
 # local path or media bytes.
 fpcalc_executable = 'fpcalc'
+
+# FFmpeg draws local waveforms, extracts the midpoint frame used as a local
+# video thumbnail, and decodes tracker modules through libopenmpt. FFprobe
+# reads codec, bitrate, and exact duration for local media. Both are optional:
+# without them those features report themselves unavailable and nothing else
+# changes. Windows builds of FFmpeg are usually unpacked rather than installed,
+# so a full path is the normal setting there.
+ffmpeg_executable = 'ffmpeg'
+ffprobe_executable = 'ffprobe'

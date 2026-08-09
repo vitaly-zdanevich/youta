@@ -869,23 +869,12 @@ where
 
 /// Persists link creation or removal in the destination directory.
 ///
-/// The media bytes are synchronized before publication. On Unix,
-/// synchronizing the directory after each link operation makes both the
-/// published name and staging-name cleanup durable across a host crash.
+/// The media bytes are synchronized before publication. Synchronizing the
+/// directory after each link operation makes both the published name and
+/// staging-name cleanup durable across a host crash, on the platforms that
+/// expose it — see [`crate::durability`].
 fn sync_destination_directory(destination: &Path) -> io::Result<()> {
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    #[cfg(unix)]
-    {
-        File::open(parent)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
-        Ok(())
-    }
+    crate::durability::sync_parent_directory(destination)
 }
 
 fn media_payload_matches_codec(codec: YandexMusicCodec, prefix: &[u8]) -> bool {

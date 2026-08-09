@@ -899,6 +899,31 @@ pub struct QueuePopupView {
     pub repeat_one: bool,
 }
 
+/// What is playing right now, in the words a front-end should announce it with.
+///
+/// The player bar already shows what the backend reports, which is whatever the
+/// engine parsed out of the stream. This is Youta's own answer instead, taken
+/// from the queue entry that is playing, and it exists because three desktop
+/// surfaces have to agree on it: the window title, the tray tooltip, and the
+/// notification raised when a track changes while the window is behind
+/// something else. Deriving it three times from `rows` would be three chances
+/// to disagree, and `rows` does not even contain the playing item once the user
+/// has browsed elsewhere.
+///
+/// It carries no location for the same reason [`QueueRowView`] carries none.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NowPlayingView {
+    /// Stable media identity, which is what marks a *change* of track.
+    ///
+    /// A title can repeat across entries, so the identity is what a front-end
+    /// compares to decide that something new started.
+    pub media_id: MediaId,
+    /// Primary label.
+    pub title: String,
+    /// Channel, artist, author, or station name; empty when the provider has none.
+    pub subtitle: String,
+}
+
 /// One local playlist shown in the membership chooser.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PlaylistChoiceView {
@@ -1459,6 +1484,11 @@ pub struct ViewModel {
     pub playback_start_animation_frame: usize,
     /// Media whose backend emitted `PlaybackStarted`, including while paused.
     pub playing_media_id: Option<MediaId>,
+    /// Title and creator of the queue entry playback is on.
+    ///
+    /// Present whenever the queue has a current entry, which includes the
+    /// moment before the backend has started it. See [`NowPlayingView`].
+    pub now_playing: Option<NowPlayingView>,
     /// Rows on the active screen.
     pub rows: Vec<RowView>,
     /// Selected row index.
@@ -1653,6 +1683,7 @@ impl Default for ViewModel {
             playback_starting: false,
             playback_start_animation_frame: 0,
             playing_media_id: None,
+            now_playing: None,
             rows: Vec::new(),
             selected: 0,
             details: None,
@@ -1918,6 +1949,13 @@ pub enum UiAction {
     PlayNext,
     /// Add the selected item to the current queue.
     AddToQueue,
+    /// Start the queue entry a signed number of steps from the current one.
+    ///
+    /// This is the transport "next track", and it is about the queue rather
+    /// than about the list on screen: [`Self::PlayNext`] queues whatever the
+    /// cursor is on, which is a different act and has no meaning at all on a
+    /// surface that shows no list — a tray menu, or a keyboard's media keys.
+    PlayQueueNeighbour(i32),
     /// Toggle the selected playable item in the reserved `todo` playlist.
     ToggleTodoPlaylist,
     /// Open the general playlist-membership chooser for the selected item.
@@ -2114,6 +2152,16 @@ pub enum UiAction {
     ToggleSubscriptionDescription,
     /// Refresh page one for the active subscribed channel.
     RefreshSubscriptionVideos,
+    /// Show paths a system drag-and-drop delivered, in the Local browser.
+    ///
+    /// Only a windowed front-end can emit this: a terminal is not a drop
+    /// target. The paths are the user's own selection from a file manager, so
+    /// they are trusted exactly as far as a path typed into the input box is —
+    /// and no further. They name a directory to *list*, which the Local browser
+    /// would let the same user reach by walking there with the arrow keys, so
+    /// this opens no door that Local does not already open. The controller
+    /// still bounds the batch and reads nothing but directory entries.
+    OpenDroppedPaths(Vec<PathBuf>),
 }
 
 impl UiAction {

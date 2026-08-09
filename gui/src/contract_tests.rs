@@ -25,9 +25,10 @@ use serde::Serialize;
 use youta::domain::{MediaId, SourceKind};
 use youta::view::{
     DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadView, ErrorPopupView, LocalMoveDestinationView, PlaylistChoiceView, PlaylistPopupView,
-    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView,
+    DownloadView, ErrorPopupView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
+    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
+    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
+    VideoCommentsPopupView, ViewModel, WaveformView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -207,6 +208,16 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             length: String::new(),
         }),
     );
+    // `NowPlayingView` has no `Default` for the same reason `QueueRowView`
+    // has none: its identity is the field that means something.
+    emitted.insert(
+        "NowPlayingView",
+        emitted_keys(&NowPlayingView {
+            media_id: MediaId::new(SourceKind::Local, "/music/a.flac"),
+            title: String::new(),
+            subtitle: String::new(),
+        }),
+    );
     emitted.insert("WaveformReady", variant_keys(&ready_waveform(), "Ready"));
     // Not a view type: the source catalogue is assembled here, and the window
     // reads it to label tabs and to decide which screens get a search field.
@@ -268,6 +279,7 @@ fn every_checked_interface_is_actually_declared() {
         "SubscriptionsView",
         "QueuePopupView",
         "QueueRowView",
+        "NowPlayingView",
         "WaveformReady",
         "ScreenEntry",
     ] {
@@ -276,6 +288,114 @@ fn every_checked_interface_is_actually_declared() {
             "contract.ts no longer declares {interface}"
         );
     }
+}
+
+/// Collects every action the window names inline at a `dispatch` call.
+///
+/// The grammar accepted is the one the window is written in: `dispatch("Name")`
+/// for an action without a payload and `dispatch({ Name: … })` for one with one,
+/// the argument possibly starting on the next line. A call whose argument is a
+/// variable is skipped, because the name is then not in this file to check.
+fn dispatched_actions(source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut rest = source;
+    while let Some(index) = rest.find("dispatch(") {
+        rest = &rest[index + "dispatch(".len()..];
+        let argument = rest.trim_start();
+        let name = if let Some(quoted) = argument.strip_prefix('"') {
+            quoted.split('"').next()
+        } else if let Some(object) = argument.strip_prefix('{') {
+            object.split(':').next()
+        } else {
+            None
+        };
+        let Some(name) = name.map(str::trim) else {
+            continue;
+        };
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    names
+}
+
+/// Yields every TypeScript source the window is built from.
+fn window_sources() -> Vec<(PathBuf, String)> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src");
+    let mut sources = Vec::new();
+    let mut directories = vec![root.clone()];
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+        for entry in entries {
+            let path = entry.expect("read a window source entry").path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if matches!(
+                path.extension().and_then(std::ffi::OsStr::to_str),
+                Some("ts" | "tsx")
+            ) {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                sources.push((path, text));
+            }
+        }
+    }
+    assert!(
+        !sources.is_empty(),
+        "no window sources found under {}",
+        root.display()
+    );
+    sources
+}
+
+/// Whether the reducer's vocabulary contains an action by this name.
+///
+/// A variant that carries a payload cannot be built here without knowing what
+/// the payload is, so the question asked is the narrower one this test is
+/// about: does the name exist at all? Serde answers that distinctly — an
+/// unrecognised name is an "unknown variant", a recognised one with the wrong
+/// payload is anything else.
+fn reducer_knows_action(name: &str) -> bool {
+    match serde_json::from_str::<youta::view::UiAction>(&format!("{{\"{name}\":null}}")) {
+        Ok(_) => true,
+        Err(error) => !error.to_string().contains("unknown variant"),
+    }
+}
+
+/// Every action the window names by hand must be one the reducer answers.
+///
+/// The reducer rejects a misspelled action rather than acting on it, and the
+/// only symptom is a control that does nothing when it is clicked — which is
+/// how the window first shipped a timecode that dispatched `SeekAbsoluteSeconds`,
+/// a name that has never existed. Nothing in either toolchain relates the two
+/// vocabularies, so this does.
+#[test]
+fn the_window_dispatches_only_actions_the_reducer_declares() {
+    let mut checked = 0_usize;
+    let mut problems = Vec::new();
+    for (path, source) in window_sources() {
+        for name in dispatched_actions(&source) {
+            checked += 1;
+            if !reducer_knows_action(&name) {
+                problems.push(format!("{}: dispatches {name}", path.display()));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    // A scanner that silently stopped matching would leave this test passing
+    // while checking nothing at all, which is the failure mode it exists to
+    // prevent elsewhere.
+    assert!(
+        checked >= 20,
+        "only {checked} dispatch sites were found; the scanner has stopped matching"
+    );
 }
 
 /// The four credential-bearing editors must stay out of the window's vocabulary.

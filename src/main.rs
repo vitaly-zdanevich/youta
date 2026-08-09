@@ -160,6 +160,7 @@ fn run_tui(config: Config) -> Result<()> {
         thumbnail_height: config.ui.thumbnail_height,
         prefetch_search_thumbnails: config.ui.prefetch_search_thumbnails,
         thumbnail_cache_dir: Some(config.thumbnail_cache_dir()),
+        ffmpeg_executable: config.providers.ffmpeg_executable.clone(),
         ..UiSettings::default()
     };
     let shutdown_git_sync = config
@@ -398,13 +399,13 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
     checks.extend([
         HelperCheck {
             name: "ffmpeg",
-            executable: Path::new("ffmpeg"),
+            executable: &config.providers.ffmpeg_executable,
             arguments: &["-version"],
             required: false,
         },
         HelperCheck {
             name: "ffprobe",
-            executable: Path::new("ffprobe"),
+            executable: &config.providers.ffprobe_executable,
             arguments: &["-version"],
             required: false,
         },
@@ -472,16 +473,17 @@ fn run_doctor(config: &Config) -> Result<()> {
 
     #[cfg(feature = "tracker-music")]
     {
-        let tracker_decoder = Command::new("ffmpeg")
-            .args(["-hide_banner", "-demuxers"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .is_some_and(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .to_ascii_lowercase()
-                    .contains("libopenmpt")
-            });
+        let tracker_decoder =
+            youta::child_process::quiet(&mut Command::new(&config.providers.ffmpeg_executable))
+                .args(["-hide_banner", "-demuxers"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .to_ascii_lowercase()
+                        .contains("libopenmpt")
+                });
         println!(
             "tracker replay through FFmpeg/libopenmpt: {}",
             if tracker_decoder {
@@ -509,7 +511,7 @@ fn run_doctor(config: &Config) -> Result<()> {
 }
 
 fn helper_version(executable: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new(executable)
+    let output = youta::child_process::quiet(&mut Command::new(executable))
         .args(arguments)
         .output()
         .with_context(|| format!("cannot start {}", executable.display()))?;

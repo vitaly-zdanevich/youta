@@ -18,6 +18,9 @@ use crate::config::{
 #[cfg(feature = "backend-mpv")]
 pub mod mpv;
 
+#[cfg(feature = "backend-mpv")]
+mod mpv_ipc;
+
 pub mod threaded;
 
 #[cfg(feature = "yt-dlp")]

@@ -5,13 +5,17 @@
 //! services they do not use.
 
 pub mod build_info;
+pub mod child_process;
 pub mod config;
 pub mod diagnostics;
 pub mod domain;
+pub mod durability;
+pub mod file_identity;
 pub mod links;
 pub mod local_browser;
 pub mod persistence;
 pub mod playback;
+pub mod private_files;
 pub mod providers;
 #[cfg(feature = "qr")]
 pub mod qr_code;

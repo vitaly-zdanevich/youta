@@ -414,7 +414,22 @@ trait LocalVideoFrameExtractor: Send + 'static {
 }
 
 /// Shell-free FFmpeg process used by the production local-video worker.
-struct FfmpegVideoFrameExtractor;
+struct FfmpegVideoFrameExtractor {
+    program: PathBuf,
+}
+
+impl Default for FfmpegVideoFrameExtractor {
+    fn default() -> Self {
+        Self::new(PathBuf::from("ffmpeg"))
+    }
+}
+
+impl FfmpegVideoFrameExtractor {
+    /// Extracts frames with a specific `FFmpeg` build.
+    const fn new(program: PathBuf) -> Self {
+        Self { program }
+    }
+}
 
 #[cfg(not(feature = "local-video-thumbnails"))]
 impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
@@ -439,7 +454,7 @@ impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
         if cancellation.is_cancelled() {
             return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
         }
-        let mut child = local_video_frame_command(path, midpoint)
+        let mut child = local_video_frame_command(&self.program, path, midpoint)
             .spawn()
             .map_err(|_| ThumbnailFailure::LocalVideoFrameExtractionFailed)?;
         let Some(stdout) = child.stdout.take() else {
@@ -501,8 +516,9 @@ impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
 
 /// Builds a shell-free, one-frame FFmpeg invocation with bounded output size.
 #[cfg(feature = "local-video-thumbnails")]
-fn local_video_frame_command(path: &Path, midpoint: LocalVideoMidpoint) -> Command {
-    let mut command = Command::new("ffmpeg");
+fn local_video_frame_command(program: &Path, path: &Path, midpoint: LocalVideoMidpoint) -> Command {
+    let mut command = Command::new(program);
+    crate::child_process::quiet(&mut command);
     command
         .arg("-nostdin")
         .arg("-hide_banner")
@@ -564,18 +580,8 @@ struct LocalThumbnailFingerprint {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 impl LocalThumbnailFingerprint {
@@ -601,26 +607,12 @@ impl LocalThumbnailFingerprint {
     }
 
     fn from_metadata(canonical_path: PathBuf, metadata: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
         Self {
+            filesystem: crate::file_identity::filesystem_identity(&canonical_path, metadata),
             canonical_path,
             length: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
-            #[cfg(unix)]
-            modified_seconds: metadata.mtime(),
-            #[cfg(unix)]
-            modified_nanoseconds: metadata.mtime_nsec(),
         }
     }
 
@@ -669,14 +661,20 @@ impl LocalThumbnailFingerprint {
         digest.update(self.length.to_le_bytes());
         hash_local_thumbnail_system_time(digest, self.modified);
         hash_local_thumbnail_system_time(digest, self.created);
-        #[cfg(unix)]
-        {
-            digest.update(self.device.to_le_bytes());
-            digest.update(self.inode.to_le_bytes());
-            digest.update(self.change_seconds.to_le_bytes());
-            digest.update(self.change_nanoseconds.to_le_bytes());
-            digest.update(self.modified_seconds.to_le_bytes());
-            digest.update(self.modified_nanoseconds.to_le_bytes());
+        // A cache key is only as sharp as the identity behind it, so the
+        // filesystem's own numbers go in whenever the platform supplies them.
+        // The tag keeps "no identity" from colliding with an identity of zeros.
+        match self.filesystem {
+            Some(filesystem) => {
+                digest.update([1]);
+                digest.update(filesystem.volume.to_le_bytes());
+                digest.update(filesystem.file.to_le_bytes());
+                let (seconds, nanoseconds) = filesystem.changed.unwrap_or((0, 0));
+                digest.update([u8::from(filesystem.changed.is_some())]);
+                digest.update(seconds.to_le_bytes());
+                digest.update(nanoseconds.to_le_bytes());
+            }
+            None => digest.update([0]),
         }
     }
 }
@@ -825,6 +823,7 @@ pub struct ThumbnailManager {
     prepared_decoded_bytes: usize,
     picker: Option<Picker>,
     cache_directory: Option<PathBuf>,
+    video_frame_program: PathBuf,
     request_sender: Option<Sender<WorkerRequest>>,
     request_discarder: Option<Receiver<WorkerRequest>>,
     prefetch_sender: Option<Sender<Vec<Url>>>,
@@ -834,6 +833,19 @@ pub struct ThumbnailManager {
 }
 
 impl ThumbnailManager {
+    /// Points local video-frame extraction at a specific `FFmpeg`.
+    ///
+    /// Applied after construction rather than through every constructor: the
+    /// worker that reads it is started lazily, on the first local video, so a
+    /// manager configured at any point before then is configured in time. The
+    /// default is the bare name, which is what a Unix installation puts on
+    /// `PATH`; Windows installations usually need the full path.
+    #[must_use]
+    pub fn with_video_frame_program(mut self, program: PathBuf) -> Self {
+        self.video_frame_program = program;
+        self
+    }
+
     /// Detects the current terminal and starts a worker only when useful.
     ///
     /// `Auto` relies only on environment variables and terminal ioctls. `On`
@@ -945,6 +957,7 @@ impl ThumbnailManager {
             prepared_decoded_bytes: 0,
             picker: Some(picker),
             cache_directory,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: None,
             request_discarder: None,
             prefetch_sender: None,
@@ -974,6 +987,7 @@ impl ThumbnailManager {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: None,
             request_discarder: None,
             prefetch_sender: None,
@@ -1154,6 +1168,7 @@ impl ThumbnailManager {
             request_receiver,
             result_sender,
             self.cache_directory.clone(),
+            self.video_frame_program.clone(),
             Arc::clone(&self.current_generation),
         );
         if !spawned {
@@ -1417,6 +1432,7 @@ fn spawn_visible_worker(
     requests: Receiver<WorkerRequest>,
     results: Sender<WorkerResult>,
     cache_directory: Option<PathBuf>,
+    video_frame_program: PathBuf,
     current_generation: Arc<AtomicU64>,
 ) -> bool {
     spawn_visible_worker_with_transport_and_extractor(
@@ -1424,7 +1440,7 @@ fn spawn_visible_worker(
         requests,
         results,
         HttpThumbnailTransport::new(),
-        FfmpegVideoFrameExtractor,
+        FfmpegVideoFrameExtractor::new(video_frame_program),
         cache_directory.map(ThumbnailCache::new),
         REQUEST_DEBOUNCE,
         current_generation,
@@ -1445,7 +1461,7 @@ fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
         requests,
         results,
         transport,
-        FfmpegVideoFrameExtractor,
+        FfmpegVideoFrameExtractor::default(),
         cache,
         debounce,
         Arc::new(AtomicU64::new(0)),
@@ -1555,7 +1571,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
             let mut prefetch_cache_ready =
                 cache.as_ref().is_some_and(|cache| cache.prepare().is_ok());
             let mut prefetch_backlog = VecDeque::new();
-            let mut extractor = FfmpegVideoFrameExtractor;
+            let mut extractor = FfmpegVideoFrameExtractor::default();
             let current_generation = Arc::new(AtomicU64::new(0));
             loop {
                 match latest_worker_request(&requests) {
@@ -3012,7 +3028,8 @@ pub(crate) mod tests {
         use std::ffi::{OsStr, OsString};
 
         let path = Path::new("/tmp/a movie;not-a-command.MOV");
-        let command = local_video_frame_command(path, LocalVideoMidpoint(60_500));
+        let command =
+            local_video_frame_command(Path::new("ffmpeg"), path, LocalVideoMidpoint(60_500));
         let expected = [
             "-nostdin",
             "-hide_banner",
@@ -3095,7 +3112,7 @@ pub(crate) mod tests {
             generation: 7,
             current_generation: generation,
         };
-        let bytes = FfmpegVideoFrameExtractor
+        let bytes = FfmpegVideoFrameExtractor::default()
             .extract(&movie, LocalVideoMidpoint(2_000), &cancellation)
             .expect("extract real MOV midpoint");
         let image = decode_thumbnail(&bytes)
@@ -3566,6 +3583,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(request_sender),
             request_discarder: Some(request_discarder),
             prefetch_sender: None,
@@ -4287,6 +4305,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: Some(cache_directory),
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(visible_request_sender),
             request_discarder: Some(visible_request_discarder),
             prefetch_sender: Some(prefetch_sender),
@@ -4593,6 +4612,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(request_sender),
             request_discarder: None,
             prefetch_sender: None,
@@ -4723,6 +4743,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 picker: None,
                 cache_directory,
+                video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
                 prefetch_sender: Some(prefetch_sender),
@@ -4781,6 +4802,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 picker: None,
                 cache_directory,
+                video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
                 prefetch_sender: None,

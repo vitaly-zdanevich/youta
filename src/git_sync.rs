@@ -334,6 +334,7 @@ impl GitRunner<'_> {
         }
 
         let mut command = Command::new(self.executable);
+        crate::child_process::quiet(&mut command);
         command
             .args(self.executable_prefix)
             .args(arguments)

@@ -5,7 +5,7 @@
   "identifier": "org.youta.desktop",
   "build": {
     "frontendDist": "./frontend",
-    "beforeBuildCommand": "npm --prefix ui run build"
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -24,7 +24,8 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["deb", "rpm", "appimage", "app", "dmg", "nsis"],
     "icon": [
       "icons/icon.png",
       "icons/32x32.png",
@@ -32,6 +33,33 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "category": "Music",
+    "shortDescription": "Low-resource player and subscription manager for YouTube and local media",
+    "longDescription": "Youta plays YouTube, podcasts, radio, tracker modules, and local media through an invisible mpv process, and keeps subscriptions and listening progress in plain files you own. The desktop window and the terminal interface are the same program: they share one reducer, one keymap, and one state directory.",
+    "copyright": "Copyright (c) Youta contributors",
+    "licenseFile": "../LICENSE",
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"],
+        "recommends": ["mpv", "yt-dlp", "ffmpeg"]
+      },
+      "rpm": {
+        "depends": ["webkit2gtk4.1", "gtk3"],
+        "recommends": ["mpv", "yt-dlp", "ffmpeg"]
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"]
+      }
+    }
   }
 }

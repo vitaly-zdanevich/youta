@@ -74,6 +74,7 @@ export function HelpPopup() {
         ["↑ · ↓", "volume"],
         ["< · >", "speed"],
         ["[ · ]", "chapter"],
+        ["{ · }", "previous · next item in the queue"],
         ["T", "chapter timestamps"],
         ["r · A", "repeat · autoplay"],
         ["w", "waveform"],
@@ -88,6 +89,17 @@ export function HelpPopup() {
         ["P · F6 · Q", "playlist · comments · QR code"],
         ["i", "expand artwork"],
         ["? · Esc", "this help · close"],
+      ],
+    ],
+    // Not keys, and the only place a user would look for them. The menu and
+    // the tray carry the same actions as the rows above; the drop target has
+    // no key at all, so nothing else would ever mention it.
+    [
+      "This window",
+      [
+        ["drop files", "show them in Local"],
+        ["menu · tray", "the same actions, without the keys"],
+        ["media keys", "play, pause, and step through the queue"],
       ],
     ],
   ];

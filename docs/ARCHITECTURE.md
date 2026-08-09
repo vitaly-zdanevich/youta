@@ -334,6 +334,14 @@ open a popup, and use station-scoped 1/2/5/10-minute capped backoff. Successful
 responses reset that station's failure history. The static catalogue and the
 separate BBC URL/RSS adapter have independent build features.
 
+Station artwork is a second, independent lookup with the same shape: one in
+flight at a time, one answer per station remembered for the session, and a
+failure that leaves the station without a logotype rather than reporting
+anything. It reads the verified Wikidata item where the catalogue has one and
+otherwise the station's own compile-time homepage, whose declared icon is
+validated as an ordinary remote artwork URL before use. The catalogue itself
+stays zero-network: nothing is requested until a station is selected.
+
 Retries are bounded and use jittered backoff. Each adapter has explicit
 timeouts, a user agent, pagination limits, and a concurrency budget. Search
 results are cached with provider-specific expiry; errors do not overwrite good
@@ -600,6 +608,18 @@ placed in a shared writable directory. The child is terminated and reaped on
 shutdown. Youta detects exit, broken IPC, malformed messages, and stalled
 startup separately.
 
+The channel itself is the only part of this that differs per platform, and it
+is the only part written twice. On Unix it is that filesystem socket; on
+Windows it is a named pipe in the kernel's `\\.\pipe\` namespace, which has
+no filesystem presence, no mode bits, and nothing to clean up because it dies
+with the process that created it. Everything above the channel — request
+framing, event ordering, error redaction, the constructed `mpv` command line —
+is one implementation compiled everywhere. A Unix socket answers a read timeout
+directly; a named pipe opened as a file cannot without either overlapped I/O or
+`PeekNamedPipe`, both of which need `unsafe`, so the Windows side buys the same
+bounded read with a reader thread feeding a bounded channel and a
+`recv_timeout`.
+
 User `mpv.conf` is bypassed by default for reproducibility. A configuration
 switch may allow it, but Youta still appends safety-critical IPC and terminal
 options after user options. Audio output, device, and decoder choices are
@@ -635,7 +655,12 @@ Youta:
 - rejects unexpected output paths and path traversal;
 - downloads into a Youta-owned staging directory and atomically promotes a
   completed file;
-- cancels the child on user request and application shutdown;
+- cancels the child, and every process the child started, on user request and
+  application shutdown — through a dedicated process group on Unix and
+  `taskkill /T` on Windows, since a Job Object cannot be reached without
+  `unsafe`;
+- gives the child no console window of its own on Windows, so an invisible
+  helper stays invisible;
 - does not read browser cookies unless the user explicitly configures a cookie
   file;
 - records tool version and stderr in redacted diagnostics.
@@ -866,6 +891,16 @@ environment overrides have the highest precedence and avoid the persistent
 copy. System-keyring and explicit secret-reference backends remain roadmap
 work.
 
+Keeping those files to their owner is a per-platform mechanism behind one
+interface. Unix sets `0o600` on each file and `0o700` on each directory, at the
+moment of creation and again afterwards. Windows has no mode bits — its
+`set_permissions` can only toggle read-only — so the directory is given an
+inheritable access control entry once, through `icacls`, and every file written
+into it is born private. Restricting each file individually there would cost a
+process per save; restricting the directory costs one at startup. The
+consequence is deliberate and stated in the code: the per-file call does
+nothing on Windows rather than pretending to.
+
 Diagnostics redact tokens, cookies, authorization headers, signed URLs, and
 provider query secrets. API credentials do not enter durable media state,
 OPML, crash-state snapshots, logs, LLM prompts, or child command lines when a
@@ -962,9 +997,16 @@ for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2 or newer
 processor. Every pair has four artifacts covering the independent `images` and
 `qr` capabilities: the unsuffixed archive enables both, `-text` omits images,
 `-no-qr` omits QR support, and `-text-no-qr` omits both. None opts into SQLite.
-Windows amd64/arm64 and the portable FreeBSD x86_64 boundary are compile-checked,
-but are not release targets until their runtime playback paths can be
-validated. The release also contains a `cargo vendor` archive and matching
+Windows amd64/arm64 and the portable FreeBSD x86_64 boundary are
+compile-checked. The Windows runtime paths are implemented rather than
+stubbed — named-pipe IPC, platform-appropriate durability and file access,
+tree-killing of helpers, real file identity — but the terminal binary is not
+advertised for Windows until the deterministic suite has been run there; a
+non-gating job reports it. The desktop window is a separate artifact with its
+own contract: installable bundles per platform (`.deb`, `.rpm`, AppImage,
+`.dmg`, NSIS) built by `scripts/package-desktop.sh`, unsigned until signing
+material exists, and with no automatic updater, because an update channel needs
+a key pair and an endpoint a repository cannot manufacture for itself. The release also contains a `cargo vendor` archive and matching
 Cargo source configuration so Gentoo and other external/offline builders use
 the exact locked dependency graph. The Gentoo ebuild exposes positive
 default-on `images` and `qr` USE flags, which can be disabled independently.
