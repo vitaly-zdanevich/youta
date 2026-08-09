@@ -107,6 +107,8 @@ pub enum Screen {
     Bandcamp,
     /// Podcast-show discovery through Apple's public catalogue.
     ApplePodcasts,
+    /// Public-domain audiobook discovery through `LibriVox`.
+    LibriVox,
     /// Curated public live-radio stations.
     Radio,
     /// Aggregated tracker-module search across dedicated archives.
@@ -126,12 +128,13 @@ pub enum Screen {
 }
 
 impl Screen {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::YandexMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
+        Self::LibriVox,
         Self::Radio,
         Self::TrackerMusic,
         Self::Subscriptions,
@@ -149,6 +152,7 @@ impl Screen {
             Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
+            Self::LibriVox => cfg!(feature = "librivox"),
             Self::Radio => cfg!(feature = "radio"),
             _ => true,
         }
@@ -156,11 +160,12 @@ impl Screen {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Search => "YouTube",
-            Self::YouTubeMusic => "YouTube Music",
+            Self::Search => "YT",
+            Self::YouTubeMusic => "YT Music",
             Self::YandexMusic => "YandexMusic",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple Podcasts",
+            Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD/tracker",
             Self::Local => "Local",
@@ -174,11 +179,12 @@ impl Screen {
 
     const fn compact_label(self) -> &'static str {
         match self {
-            Self::Search => "YouTube",
+            Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple",
+            Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
@@ -460,6 +466,8 @@ pub enum SearchActivity {
     Bandcamp,
     /// A show search through Apple's public podcast catalogue.
     ApplePodcasts,
+    /// A public-domain audiobook search through `LibriVox`.
+    LibriVox,
     /// An aggregate search through the enabled MOD/tracker archives.
     TrackerArchives,
 }
@@ -473,6 +481,7 @@ impl SearchActivity {
             Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
             Self::ApplePodcasts => Screen::ApplePodcasts,
+            Self::LibriVox => Screen::LibriVox,
             Self::TrackerArchives => Screen::TrackerMusic,
         }
     }
@@ -1063,6 +1072,8 @@ pub enum DetailLinkInternalTarget {
     YandexMusicArtist(String),
     /// One stable Yandex Music album, show, or audiobook identifier.
     YandexMusicAlbum(String),
+    /// One stable numeric `LibriVox` author identifier.
+    LibriVoxAuthor(String),
 }
 
 impl DetailLinkInternalTarget {
@@ -1071,6 +1082,7 @@ impl DetailLinkInternalTarget {
         match self {
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
+            Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
         }
     }
 }
@@ -1083,6 +1095,8 @@ pub enum DetailLinkPresentation {
     LabelAndUrl,
     /// Render the human label and URL, then reserve one non-clickable row.
     LabelAndUrlSpaced,
+    /// Render only the human-readable label.
+    LabelOnly,
     /// Render only the label and reserve one non-clickable row after it.
     LabelOnlySpaced,
     /// Render only the URL.
@@ -1720,6 +1734,8 @@ pub enum UiAction {
     OpenYandexMusicArtistById(String),
     /// Open one exact Yandex Music album selected from a Details link.
     OpenYandexMusicAlbumById(String),
+    /// Open one exact `LibriVox` author selected from a Details link.
+    OpenLibriVoxAuthorById(String),
     /// Download every track in the currently opened or selected album.
     DownloadYandexMusicAlbum,
     /// Download the first twenty current My Wave recommendations.
@@ -4391,6 +4407,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
+            | Screen::LibriVox
             | Screen::TrackerMusic => {}
         }
     }
@@ -4444,6 +4461,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             Screen::YouTubeMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
+            | Screen::LibriVox
             | Screen::TrackerMusic => " Search ".to_owned(),
             Screen::YandexMusic => {
                 unreachable!("Yandex Music returned with its search scope above")
@@ -5309,6 +5327,7 @@ fn render_details_with_terminal_window(
         match view.screen {
             Screen::Local => InformationPanelKind::Local,
             Screen::ApplePodcasts => InformationPanelKind::Podcast,
+            Screen::LibriVox => InformationPanelKind::Audiobook,
             Screen::Radio => InformationPanelKind::Radio,
             Screen::YandexMusic => InformationPanelKind::YandexMusic,
             Screen::Bandcamp | Screen::Playlists | Screen::History => InformationPanelKind::Generic,
@@ -5335,6 +5354,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         | Screen::YouTubeMusic
         | Screen::Bandcamp
         | Screen::ApplePodcasts
+        | Screen::LibriVox
         | Screen::TrackerMusic
         | Screen::Radio => true,
         Screen::Subscriptions
@@ -5353,6 +5373,8 @@ enum InformationPanelKind {
     Video,
     /// Podcast show or episode details without video-only statistics.
     Podcast,
+    /// Public-domain audiobook or section details without video-only statistics.
+    Audiobook,
     /// Channel details with subscriber metadata.
     Channel,
     /// Public live-radio metadata without finite-media statistics.
@@ -5817,6 +5839,7 @@ fn render_information_panel(
             kind,
             InformationPanelKind::Video
                 | InformationPanelKind::Podcast
+                | InformationPanelKind::Audiobook
                 | InformationPanelKind::Radio
                 | InformationPanelKind::YandexMusic
         )
@@ -5824,6 +5847,7 @@ fn render_information_panel(
         let opener_name = system_url_opener_name();
         let action_text = match kind {
             InformationPanelKind::Podcast => format!("{opener_name} podcast"),
+            InformationPanelKind::Audiobook => format!("{opener_name} audiobook"),
             InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
                 || format!("{opener_name} station website"),
                 |url| format!("{opener_name} · {url}"),
@@ -6185,7 +6209,7 @@ fn render_information_panel(
                 lines.push(Line::from(spans));
             }
         }
-        InformationPanelKind::Podcast => {
+        InformationPanelKind::Podcast | InformationPanelKind::Audiobook => {
             if !details.length.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled("Length: ", theme.muted),
@@ -6251,7 +6275,9 @@ fn render_information_panel(
                 .map(Line::raw),
         );
     }
-    if is_creative_commons_license(&details.license) {
+    if is_creative_commons_license(&details.license)
+        || is_librivox_public_domain_license(&details.source, &details.license)
+    {
         lines.push(Line::from(vec![
             Span::styled("License: ", theme.muted),
             Span::styled(display_license_label(&details.license), theme.accent),
@@ -6571,7 +6597,7 @@ fn render_information_panel(
                             .saturating_add(terminal_text_width(" — "))
                             .saturating_add(terminal_text_width(&link.url))
                     }
-                    DetailLinkPresentation::LabelOnlySpaced => {
+                    DetailLinkPresentation::LabelOnly | DetailLinkPresentation::LabelOnlySpaced => {
                         spans.push(Span::styled(
                             &link.label,
                             if view.external_opener_available {
@@ -7199,6 +7225,14 @@ fn highlight_details_text_selection(
 fn is_creative_commons_license(label: &str) -> bool {
     let normalized = label.trim().to_ascii_lowercase();
     normalized.contains("creative commons") || normalized.contains("creativecommons.org")
+}
+
+/// Returns whether Details contains `LibriVox`'s exact, jurisdiction-qualified license label.
+fn is_librivox_public_domain_license(source: &str, label: &str) -> bool {
+    source.eq_ignore_ascii_case("LibriVox")
+        && label
+            .trim()
+            .eq_ignore_ascii_case("Public domain in the United States")
 }
 
 /// Formats one non-negative count with comma-separated thousands groups.
@@ -11613,6 +11647,7 @@ fn key_action_with_page_rows_unfiltered(
             Some(UiAction::GoBack)
         }
         KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
+        KeyCode::Esc if view.screen == Screen::LibriVox => Some(UiAction::GoBack),
         KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         KeyCode::Up if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
@@ -11634,12 +11669,26 @@ fn key_action_with_page_rows_unfiltered(
         KeyCode::PageDown if view.details_focused => {
             Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
         }
-        KeyCode::PageUp if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX))),
-        KeyCode::PageDown if matches!(view.screen, Screen::Local | Screen::Radio) => page_rows
-            .filter(|rows| *rows > 0)
-            .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX))),
+        KeyCode::PageUp
+            if matches!(
+                view.screen,
+                Screen::LibriVox | Screen::Local | Screen::Radio
+            ) =>
+        {
+            page_rows
+                .filter(|rows| *rows > 0)
+                .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX)))
+        }
+        KeyCode::PageDown
+            if matches!(
+                view.screen,
+                Screen::LibriVox | Screen::Local | Screen::Radio
+            ) =>
+        {
+            page_rows
+                .filter(|rows| *rows > 0)
+                .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX)))
+        }
         KeyCode::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
         KeyCode::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
         KeyCode::Char('j') => Some(UiAction::MoveSelection(1)),
@@ -13307,6 +13356,9 @@ mod tests {
         view.screen = Screen::ApplePodcasts;
         view.search_activity = Some(SearchActivity::ApplePodcasts);
         assert_eq!(search_panel_title(&view), " | ambient ");
+        view.screen = Screen::LibriVox;
+        view.search_activity = Some(SearchActivity::LibriVox);
+        assert_eq!(search_panel_title(&view), " | ambient ");
     }
 
     #[test]
@@ -13320,6 +13372,7 @@ mod tests {
             Screen::YouTubeMusic,
             Screen::Bandcamp,
             Screen::ApplePodcasts,
+            Screen::LibriVox,
             Screen::TrackerMusic,
         ] {
             view.screen = screen;
@@ -20163,6 +20216,230 @@ mod tests {
     }
 
     #[test]
+    fn librivox_book_details_render_audiobook_metadata_links_and_cover() {
+        let cover_url = url::Url::parse("https://archive.org/download/fixture/cover.jpg")
+            .expect("LibriVox cover URL");
+        let author_url = "https://librivox.org/author/4517";
+        let keyword_url = "https://librivox.org/search?primary_key=Palestine";
+        let media_id = MediaId::new(SourceKind::LibriVox, "123/456");
+        let mut view = ViewModel {
+            screen: Screen::LibriVox,
+            external_opener_available: true,
+            rows: vec![RowView {
+                media_id: Some(media_id.clone()),
+                title: "With the Turks in Palestine".to_owned(),
+                subtitle: "Alexander Aaronsohn · 6:03".to_owned(),
+                source: "LibriVox".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(media_id.clone()),
+                title: "With the Turks in Palestine".to_owned(),
+                source: "LibriVox".to_owned(),
+                length: "6:03".to_owned(),
+                description: "Genres: Travel, Memoir\nA public-domain audiobook description."
+                    .to_owned(),
+                license: "Public domain in the United States".to_owned(),
+                likes: "must not render".to_owned(),
+                views: "must not render".to_owned(),
+                links: vec![
+                    DetailLinkView {
+                        prefix: "Author: ".to_owned(),
+                        label: "Alexander Aaronsohn".to_owned(),
+                        url: author_url.to_owned(),
+                        presentation: DetailLinkPresentation::LabelOnlySpaced,
+                        internal_target: Some(DetailLinkInternalTarget::LibriVoxAuthor(
+                            "4517".to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        prefix: "Keywords: ".to_owned(),
+                        label: "Palestine".to_owned(),
+                        url: keyword_url.to_owned(),
+                        presentation: DetailLinkPresentation::LabelOnly,
+                        ..DetailLinkView::default()
+                    },
+                ],
+                thumbnail_url: Some(cover_url.clone()),
+                thumbnail_dimensions: Some((1200, 1200)),
+                ..DetailView::default()
+            }),
+            playlist_item: Some(PlaylistItemView {
+                media_id,
+                title: "With the Turks in Palestine".to_owned(),
+                in_todo: false,
+            }),
+            private_note_available: true,
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 54)).expect("LibriVox terminal");
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(18, 8)),
+            ..MockThumbnailRenderer::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw LibriVox book details");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains(&format!("[o] {} audiobook", system_url_opener_name())));
+        assert!(rendered.contains("Length: 6:03"));
+        assert!(rendered.contains("Genres: Travel, Memoir"));
+        assert!(rendered.contains("License: Public domain in the United States"));
+        assert!(rendered.contains("Author: Alexander Aaronsohn"));
+        assert!(rendered.contains("Keywords: Palestine"));
+        assert!(!rendered.contains(author_url));
+        assert!(!rendered.contains(keyword_url));
+        assert!(!rendered.contains("Likes:"));
+        assert!(!rendered.contains("Views:"));
+        assert!(rendered.contains("[l] Add to todo"));
+        assert!(rendered.contains("[P] Playlist…"));
+        assert!(rendered.contains("[n] Add private note"));
+        assert!(rendered.contains("THUMBNAIL IMAGE"));
+        assert!(hit_map.thumbnail_area.is_some());
+        assert_eq!(thumbnails.synchronized.len(), 1);
+        assert_eq!(thumbnails.synchronized[0].0.as_ref(), Some(&cover_url));
+
+        let keyword_area = hit_map
+            .detail_links
+            .iter()
+            .find_map(|(index, area)| (*index == 1).then_some(*area))
+            .expect("compact keyword link target");
+        assert_eq!(keyword_area.width, terminal_text_width("Palestine"));
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: keyword_area.x,
+                    row: keyword_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateDetailLink(1))
+        );
+
+        view.external_opener_available = false;
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .expect("draw LibriVox details without a browser");
+        assert!(hit_map.detail_links.is_empty());
+        let author_action = UiAction::OpenLibriVoxAuthorById("4517".to_owned());
+        let author_marker = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &author_action).then_some(*area))
+            .expect("LibriVox author internal marker");
+        assert_eq!(author_marker.width, terminal_text_width("↪"));
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: author_marker.x,
+                    row: author_marker.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(author_action)
+        );
+    }
+
+    #[test]
+    fn librivox_search_list_and_child_navigation_keep_shared_controls() {
+        let media_id = MediaId::new(SourceKind::LibriVox, "123/456");
+        let mut view = ViewModel {
+            screen: Screen::LibriVox,
+            details: Some(DetailView {
+                media_id: Some(media_id.clone()),
+                ..DetailView::default()
+            }),
+            playlist_item: Some(PlaylistItemView {
+                media_id,
+                title: "Fixture section".to_owned(),
+                in_todo: false,
+            }),
+            private_note_available: true,
+            ..ViewModel::default()
+        };
+
+        for (key, expected) in [
+            (KeyCode::Char('/'), UiAction::BeginSearch),
+            (KeyCode::Char('j'), UiAction::MoveSelection(1)),
+            (KeyCode::Char('k'), UiAction::MoveSelection(-1)),
+            (KeyCode::Enter, UiAction::ActivateSelection),
+            (KeyCode::Char('l'), UiAction::ToggleTodoPlaylist),
+            (KeyCode::Char('P'), UiAction::OpenPlaylistPopup),
+            (KeyCode::Char('n'), UiAction::EditPrivateNote),
+            (KeyCode::Esc, UiAction::GoBack),
+            (KeyCode::Backspace, UiAction::GoBack),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                Some(expected),
+                "LibriVox omitted {key:?} from its shared control surface"
+            );
+        }
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                &view,
+                Some(6),
+                None,
+            ),
+            Some(UiAction::MoveSelection(-6))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &view,
+                Some(6),
+                None,
+            ),
+            Some(UiAction::MoveSelection(6))
+        );
+
+        view.search_editing = true;
+        view.search_query = "public domain".to_owned();
+        view.search_cursor_byte = "public".len();
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveSearchCursor(-1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveSearchCursor(1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitSearch)
+        );
+    }
+
+    #[test]
     fn details_keep_text_selection_on_the_keyboard_without_a_panel_button() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -20327,19 +20604,22 @@ mod tests {
 
     #[test]
     fn details_render_license_row_only_for_recognized_creative_commons_labels() {
-        for hidden_license in [
-            "",
-            "unknown",
-            "not applicable",
-            "Standard YouTube License",
-            "youtube",
+        for (source, hidden_license) in [
+            ("YouTube", ""),
+            ("YouTube", "unknown"),
+            ("YouTube", "not applicable"),
+            ("YouTube", "publisher terms"),
+            ("YouTube", "Standard YouTube License"),
+            ("YouTube", "youtube"),
+            ("LibriVox", "publisher terms"),
+            ("LibriVox", "public domain"),
         ] {
             let backend = TestBackend::new(120, 28);
             let mut terminal = Terminal::new(backend).expect("terminal");
             let view = ViewModel {
                 details: Some(DetailView {
                     title: "Standard-license fixture".to_owned(),
-                    source: "YouTube".to_owned(),
+                    source: source.to_owned(),
                     license: hidden_license.to_owned(),
                     wikidata: "not loaded (lazy)".to_owned(),
                     ..DetailView::default()
@@ -27280,6 +27560,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Bandcamp,
                 #[cfg(feature = "apple-podcasts")]
                 Screen::ApplePodcasts,
+                #[cfg(feature = "librivox")]
+                Screen::LibriVox,
                 #[cfg(feature = "radio")]
                 Screen::Radio,
                 Screen::TrackerMusic,
@@ -27393,6 +27675,23 @@ prose 07:25 remains clickable but is not a chapter";
                 assert_eq!(mouse_action(divider_click, &compact_hit_map, &view), None);
             }
         }
+    }
+
+    #[test]
+    fn source_tabs_use_space_saving_labels_and_keep_librivox_order() {
+        assert_eq!(Screen::Search.label(), "YT");
+        assert_eq!(Screen::Search.compact_label(), "YT");
+        assert_eq!(Screen::YouTubeMusic.label(), "YT Music");
+        assert_eq!(Screen::YouTubeMusic.compact_label(), "YT Music");
+        assert_eq!(Screen::LibriVox.label(), "LibriVox");
+        assert_eq!(Screen::LibriVox.compact_label(), "LibriVox");
+        let librivox_index = Screen::ALL
+            .iter()
+            .position(|screen| *screen == Screen::LibriVox)
+            .expect("LibriVox tab");
+        assert_eq!(Screen::ALL[librivox_index - 1], Screen::ApplePodcasts);
+        assert_eq!(Screen::ALL[librivox_index + 1], Screen::Radio);
+        assert_eq!(SourceKind::YouTube.to_string(), "youtube");
     }
 
     #[test]

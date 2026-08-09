@@ -151,10 +151,12 @@ implement the same playback interface without changing screens or history.
   resolves only the selected release for explicit playback through `yt-dlp`;
 - an independent Apple Podcasts tab that searches the public, unauthenticated
   Apple catalogue by storefront and lazily loads playable episode metadata;
+- an independent LibriVox tab for public-domain audiobook discovery, book and
+  author navigation, chapter playback, genres, and public-page keywords;
 - an account-free Radio tab backed by a static, zero-startup-network catalogue
   of direct public streams;
-- lazy Wikidata enrichment for exact YouTube, SoundCloud, and Bilibili
-  external identifiers;
+- lazy Wikidata enrichment for exact YouTube, SoundCloud, Bilibili, LibriVox
+  author, and fingerprint-derived MusicBrainz external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
   commands;
 - `doctor` and configuration inspection commands;
@@ -217,6 +219,29 @@ resolver:
   but Youta never derives downloads from file IDs or framework state and never
   bypasses login, payment, DRM, or signed-link controls. This follows the
   [LitRes public offer](https://www.litres.ru/pages/litres_oferta/).
+- **LibriVox** is a credential-free first-class source backed by the public
+  [LibriVox API](https://librivox.org/api/info). The default tab shows one
+  bounded catalogue page, while `/` searches books independently from
+  the other providers. Enter opens one book and its playable chapter list;
+  author links open that exact LibriVox author's books inside Youta. Large
+  bibliographies use explicit 20-book continuation pages, so opening a prolific
+  author never starts one unbounded catalogue download. Book descriptions,
+  genres, readers, duration, chapter metadata, and cover art come from the
+  bounded API response. The API does not expose a book's public
+  keywords, so Youta enriches only the selected book from its bounded canonical
+  LibriVox page and renders those readable keyword links without making a
+  request for every result row.
+
+  LibriVox describes its recordings as public domain in the United States.
+  Copyright terms differ by country, and a catalog entry is not a blanket
+  claim that its source text or recording may be redistributed everywhere;
+  Youta preserves the canonical book and recording links rather than extending
+  that status to another jurisdiction. The `librivox` Cargo feature is included
+  in the normal `app`/`app-core` profiles and can be omitted from a custom
+  `--no-default-features` build. When `wikidata` is also enabled, author
+  enrichment uses only the exact
+  [LibriVox author ID (P1899)](https://www.wikidata.org/wiki/Property:P1899),
+  never a name or book-title guess.
 - **Generic `yt-dlp`** accepts a direct URL handled by any built-in extractor
   present in the installed `yt-dlp`. It provides resolution, metadata, and
   permitted downloads, not universal search or subscriptions. Extractor
@@ -347,6 +372,7 @@ No Wikidata request is made at startup. The current mappings are:
 | SoundCloud account or track path | [SoundCloud ID (P3040)](https://www.wikidata.org/wiki/Property:P3040) |
 | Bilibili video | [Bilibili video ID (P6456)](https://www.wikidata.org/wiki/Property:P6456) |
 | Bilibili channel/user | [Bilibili user ID (P6455)](https://www.wikidata.org/wiki/Property:P6455) |
+| LibriVox author | [LibriVox author ID (P1899)](https://www.wikidata.org/wiki/Property:P1899) |
 | Fingerprinted local recording | [MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404) |
 
 Each response is limited to 512 KiB and 20 matches. Successful lookups are
@@ -370,6 +396,8 @@ or custom names. SoundCloud accepts only one- or two-segment canonical
 are not resolved. Bilibili accepts canonical `[www.]bilibili.com/video/{BV…}`
 or `/video/{av…}` links and `space.bilibili.com/{numeric-UID}` links. It does
 not resolve `b23.tv` or other redirect hosts before Wikidata lookup.
+LibriVox enrichment accepts only the positive numeric author ID carried by the
+catalogue; book titles and author display names are never used as entity keys.
 
 ## Build and run
 
@@ -993,7 +1021,7 @@ remote stream URL.
 
 Playlist actions appear only when the current selection can be replayed. This
 includes YouTube videos, YouTube Music and Bandcamp tracks, Apple Podcasts
-episodes, and supported local media:
+episodes, LibriVox chapters, and supported local media:
 
 | Key | Action |
 | --- | --- |
@@ -1187,11 +1215,12 @@ The roadmap is intentionally tiered:
 1. **Core:** local audio/video, RSS and OPML, radio/BBC feeds, official
    YouTube metadata, Invidious, PeerTube, Funkwhale, direct
    Vimeo/RuTube/SoundCloud URLs, Apple Podcasts catalogue search, Bandcamp
-   public track/album discovery and playback, tracker modules, generic
+   public track/album discovery and playback, LibriVox public-domain audiobook
+   discovery and chapter playback, tracker modules, generic
    `yt-dlp`, `mpv`, and search/history/queue/download state.
 2. **Open-data integrations:** SponsorBlock, DeArrow, broader Wikidata
-   discovery, Wikimedia Commons, Internet Archive, LibriVox, Podcast Index,
-   and gpodder.net.
+   discovery, Wikimedia Commons, Internet Archive, Podcast Index, and
+   gpodder.net.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
    bidirectional local/YouTube subscription sync, Last.fm scrobbling, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
@@ -1341,6 +1370,15 @@ Run the same keyless YouTube Music search check locally with:
 
 ```sh
 YOUTA_RUN_LIVE_YOUTUBE_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features youtube-music -- --ignored --exact youtube_music_keyless_search_returns_playable_tracks_before_timeout --nocapture
+```
+
+The credential-free LibriVox smoke checks a stable public-domain book against
+the production API adapter, book-page keywords and full-quality chapter link,
+author biography, and a bounded Archive.org audio request. CI runs this check
+on every push; run it locally with:
+
+```sh
+YOUTA_RUN_LIVE_LIBRIVOX_TEST=1 cargo test --locked --test live_services --no-default-features --features librivox -- --ignored --exact librivox_catalogue_book_author_and_audio_are_usable --nocapture
 ```
 
 The authenticated Yandex Music smoke is intentionally local and opt-in because

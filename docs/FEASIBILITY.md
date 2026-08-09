@@ -127,6 +127,7 @@ statements in the public [Wikidata Query Service
 | SoundCloud account/track | [P3040](https://www.wikidata.org/wiki/Property:P3040), the exact account or `account/track` path |
 | Bilibili video | [P6456](https://www.wikidata.org/wiki/Property:P6456), an exact lowercase `av` number or 12-character `BV…` ID |
 | Bilibili channel/user | [P6455](https://www.wikidata.org/wiki/Property:P6455), a positive numeric UID |
+| LibriVox author | [P1899](https://www.wikidata.org/wiki/Property:P1899), a positive numeric LibriVox author ID |
 
 The request is lazy: selecting a YouTube video/channel result, or opening a
 recognized SoundCloud/Bilibili direct link, triggers it. Startup does not.
@@ -145,8 +146,9 @@ resolved for enrichment. YouTube channel handles and custom names are not
 substitutes for P2397 IDs.
 
 There is no title/name matching, fuzzy ranking, generic canonical-URL matching,
-or claim that Wikidata covers every selected item. Podcast and audiobook
-catalog discovery remains separate from this exact-ID enrichment.
+or claim that Wikidata covers every selected item. LibriVox book discovery
+remains separate from enrichment: only its exact author ID participates, and
+no book entity is guessed from a title, genre, or author display name.
 
 ### Wikimedia Commons transfer
 
@@ -194,7 +196,7 @@ YouTube does not guarantee Internet Archive scope or ownership.
 | gpodder.net | Tier 1 | Device/subscription APIs plus JSON episode actions (`started`, `position`, `total`, and `timestamp`) fit optional import/export/sync; TOML state remains authoritative. |
 | Podcast Index | Tier 1 | Broad search with API credentials and attribution requirements. |
 | Wikidata | Enrichment | Useful linked-data search, not complete enough as the only catalog. |
-| LibriVox | Tier 1 | Open catalog and public-domain recordings; retain author/reader/license metadata. |
+| LibriVox | Implemented core | Credential-free public API search, a bounded catalogue, author navigation, chapter playback, descriptions, genres, covers, and selected-page keyword links. |
 | Wikimedia Commons | Tier 1 | Category/API search plus structured-data enrichment. |
 | Internet Archive | Tier 1 | Advanced search and metadata APIs; stream formats vary. |
 | Online radio | Implemented core | The account-free `radio` feature uses a static, zero-startup-network catalogue of reviewed direct streams and M3U entry points. A dynamic Radio Browser adapter remains optional future discovery work. |
@@ -214,6 +216,29 @@ and capture the per-play start offset for `started`, without forcing
 non-podcast media into a podcast protocol. See the
 [gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
 and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
+
+### LibriVox boundary
+
+The `librivox` feature uses LibriVox's bounded public JSON API without an
+account or key. It is included in the normal `app` and `app-core` profiles but
+remains independently omittable from custom `--no-default-features` builds.
+The default route loads one bounded catalogue page; text search, exact book
+loading, and bounded author lookup run on a latest-only provider lane. Enter
+opens a book's chapters, and starting one chapter allows normal autoplay to
+continue within that book. Exact author links list that author's books in
+explicit 20-book continuation pages and may start lazy P1899 Wikidata
+enrichment when the `wikidata` feature is present.
+
+Descriptions and genres come from the primary API response. LibriVox's API
+does not include the public keyword list, so Youta reads only the selected
+canonical book page under a separate HTML response limit and accepts only
+validated `/keywords/{id}` links. A failed keyword request does not hide the
+description, genres, chapter list, or playback controls.
+
+LibriVox describes its recordings as public domain in the United States. That
+does not establish the copyright status of every source text or recording in
+another jurisdiction, and Youta does not treat catalogue inclusion as blanket
+permission to redistribute it.
 
 Additional good targets are Audiobookshelf, OpenSubsonic, ListenBrainz,
 MusicBrainz, and public-library OPDS catalogs. Every catalog result still needs
@@ -402,11 +427,11 @@ description links, external `mpv` IPC, `yt-dlp` supervision, and diagnostics.
 
 Queue/history/download screens, position persistence, local media scan, RSS,
 chapters, notes/bookmarks/segments, search filters, keyboard/mouse coverage,
-and robust offline behavior.
+robust offline behavior, and LibriVox book/author/chapter navigation.
 
 ### Phase 2 — open ecosystem
 
-SponsorBlock, DeArrow, Wikidata, Commons/Internet Archive/LibriVox discovery,
+SponsorBlock, DeArrow, broader Wikidata, Commons/Internet Archive discovery,
 gpodder.net, Podcast Index, radio catalogs, and Last.fm/ListenBrainz.
 
 ### Phase 3 — reviewed remote writes

@@ -27,6 +27,9 @@ const DEFAULT_APPLE_URL: &str =
 #[cfg(feature = "apple-podcasts")]
 const APPLE_SEARCH_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_APPLE_PODCASTS_SEARCH_TEST";
 
+#[cfg(feature = "librivox")]
+const LIBRIVOX_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_LIBRIVOX_TEST";
+
 #[cfg(feature = "network")]
 const YOUTUBE_CHANNEL_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_YOUTUBE_CHANNEL_TEST";
 #[cfg(feature = "network")]
@@ -235,6 +238,101 @@ fn apple_podcasts_public_search_returns_normalized_shows() {
             .iter()
             .any(|episode| episode.media_url.is_some()),
         "Apple returned no playable episode URL"
+    );
+}
+
+/// Exercises LibriVox's public API, canonical book and author HTML, and one
+/// chapter endpoint through the same provider used by the application.
+#[cfg(feature = "librivox")]
+#[test]
+#[ignore = "requires the public LibriVox API, pages, and Archive.org audio"]
+fn librivox_catalogue_book_author_and_audio_are_usable() {
+    use std::time::Duration;
+
+    use youta::providers::librivox::{LibrivoxClient, LibrivoxSearchRequest};
+
+    assert_eq!(
+        std::env::var(LIBRIVOX_TEST_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {LIBRIVOX_TEST_OPT_IN}=1 when invoking this live test"
+    );
+
+    let client = LibrivoxClient::new();
+    let search = client
+        .search(&LibrivoxSearchRequest::for_text(
+            "With the Turks in Palestine",
+            10,
+            0,
+        ))
+        .expect("search the live LibriVox catalogue");
+    assert!(
+        search.books.iter().any(|book| book.book_id == 5936),
+        "the stable public-domain fixture disappeared from catalogue search"
+    );
+
+    let book = client
+        .book_details(5936)
+        .expect("load live API metadata and canonical book HTML");
+    assert_eq!(book.title, "With the Turks in Palestine");
+    assert!(
+        book.description
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert!(
+        ["War & Military", "Memoirs", "Modern (20th C)"]
+            .iter()
+            .all(|expected| book.genres.iter().any(|genre| genre.name == *expected)),
+        "the live API no longer exposes the fixture's expected genres: {:?}",
+        book.genres
+    );
+    assert!(
+        !book.keywords.is_empty(),
+        "the canonical book-page keyword selector no longer yields links"
+    );
+    let section = book
+        .sections
+        .first()
+        .expect("the fixture retains at least one chapter");
+    assert!(
+        section.fallback_audio_url.is_some(),
+        "the canonical book page no longer upgrades the API's 64 kbps chapter URL"
+    );
+
+    let audio_agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .into();
+    let audio_response = audio_agent
+        .get(section.preferred_audio_url.as_str())
+        .header("Range", "bytes=0-4095")
+        .call()
+        .expect("open the live preferred chapter endpoint");
+    assert!(
+        matches!(audio_response.status().as_u16(), 200 | 206),
+        "the live chapter endpoint rejected a bounded range request"
+    );
+
+    let author = client
+        .author_details(3595, 20, 0)
+        .expect("load live author API data and canonical author HTML");
+    assert_eq!(author.author.display_name, "Alexander Aaronsohn");
+    assert!(
+        author
+            .description
+            .as_deref()
+            .is_some_and(|text| !text.is_empty()),
+        "the canonical author-page biography selector no longer yields text"
+    );
+    assert!(
+        author.wikipedia_url.is_some(),
+        "the canonical author page no longer yields its Wikipedia link"
+    );
+    assert!(
+        author
+            .books
+            .iter()
+            .any(|candidate| candidate.book_id == 5936)
     );
 }
 

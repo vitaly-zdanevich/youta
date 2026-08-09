@@ -166,6 +166,38 @@ pins DNS to public addresses and rejects redirects. Episode enclosures are
 handed to the external playback backend; later media DNS and redirects belong
 to that backend and are not presented as Youta-side SSRF containment.
 
+LibriVox discovery follows the same isolated, capacity-one worker pattern but
+uses the credential-free public [LibriVox API](https://librivox.org/api/info).
+The tab opens one bounded catalogue page and retains independent search,
+route, and selection state. Catalogue search requests extended metadata for its
+20 visible rows, while author bibliography pages deliberately omit chapter
+arrays. Enter refreshes one book's complete metadata and chapter list. Author
+navigation uses the exact numeric LibriVox author ID and exposes explicit
+20-book continuation rows rather than requesting a prolific author's complete
+bibliography at once. Because the API filters authors by surname, Youta filters
+every returned book back to that exact author ID before exposing it.
+
+Extended book responses supply the description, genres, authors, readers,
+duration, cover art, and public chapter media. The public API omits keywords,
+so only the selected book may receive a second bounded read of its canonical
+LibriVox HTML page. That parser accepts exact `/keywords/{positive-id}` links
+and terminal-safe readable labels; it does not scrape every result row. Genres
+are part of the primary book description and do not wait for this optional
+keyword enrichment. Starting one chapter establishes a same-book autoplay
+origin so normal end-of-file handling can advance through later chapters.
+LibriVox chapter downloads are an explicit persistence exception: Youta accepts
+only credential-free, queryless HTTPS MP3 paths on the fixed Archive.org
+download origin. History and playlists retain that stable chapter URL together
+with a contextual `book:{id}:section:{id}` identity. A chapter added directly
+to a playlist also retains its readable canonical LibriVox book page; a later
+History-derived playlist addition can retain only the stable Archive URL that
+History owns. Signed or arbitrary media URLs remain ineligible for persistence.
+
+LibriVox states that its recordings are public domain in the United States.
+Youta displays that source status but does not infer that the source text or
+recording is free of copyright in every jurisdiction, or that a user has an
+unrestricted right to redistribute it.
+
 Bandcamp discovery has its own restart snapshot containing the trimmed query,
 current page, advertised next page, compact canonical track/album summaries,
 and selected row. Search never stores or resolves direct stream URLs. Those
@@ -276,9 +308,10 @@ filesystem operation succeeds.
 
 - Tier 0 adapters are expected to be dependable without an account: local
   media, RSS/OPML, radio, Invidious, configurable PeerTube/Funkwhale
-  instances, Apple Podcasts catalogue search, direct URLs, and `yt-dlp`.
+  instances, Apple Podcasts and LibriVox catalogue search, direct URLs, and
+  `yt-dlp`.
 - Tier 1 uses public/open data: SponsorBlock, DeArrow, Wikidata, Commons,
-  Internet Archive, LibriVox, Podcast Index, gpodder.net, Jamendo with a
+  Internet Archive, Podcast Index, gpodder.net, Jamendo with a
   user-provided application client ID, and official YouTube public metadata
   with a user-provided API key.
 - Tier 2 needs OAuth, a token, or account policy review: YouTube account
@@ -428,11 +461,12 @@ detail fields independently:
 Each request carries the selected media ID and generation number. A late result
 for an old selection is cached but not painted over the new selection.
 
-Apple Podcasts and Bandcamp keep independent query, result, and selection
-state. Apple show search returns one bounded, storefront-specific ranked set
-because the documented Search API has no episode-search entity or pagination;
-Enter performs one documented lookup for the selected collection and renders
-Apple's returned order of at most 200 associated episodes. Bandcamp search
+Apple Podcasts, Bandcamp, and LibriVox keep independent query, result, and
+selection state. Apple show search returns one bounded, storefront-specific
+ranked set because the documented Search API has no episode-search entity or
+pagination; Enter performs one documented lookup for the selected collection
+and renders Apple's returned order of at most 200 associated episodes.
+Bandcamp search
 accepts bounded pages of canonical track and album URLs from the fixed public
 HTTPS endpoint and follows only the sequential next page advertised in its
 HTML. Neither tab performs per-row stream resolution while the user navigates.
@@ -440,6 +474,11 @@ Official Apple show/episode URLs and strict canonical Bandcamp release URLs
 enter these same first-class state machines instead of falling through to a
 generic extractor; direct pages retain Back navigation and canonical restart
 identity.
+LibriVox book search and catalogue discovery return compact book rows. Enter opens
+the selected book's API-supplied chapters; exact author links open that author's
+books, and Back restores the previous route and selection. Book description
+text includes API genres before optional, canonical-page keyword enrichment,
+so an HTML failure cannot remove the primary description or genre metadata.
 
 Description links, hashtags, timecodes, and YouTube IDs are parsed into typed
 spans. Following an internal media link pushes the current detail state onto a
@@ -460,6 +499,13 @@ artwork.
 Wikidata matching is advisory. Exact external-ID claims rank above URL and
 normalized-title matches. Ambiguous title matches are displayed as suggestions,
 not asserted links.
+
+LibriVox author enrichment is stricter: it uses only
+[LibriVox author ID (P1899)](https://www.wikidata.org/wiki/Property:P1899),
+validated as a bounded positive decimal. The book and author rows remain
+usable while this independent request is pending. LibriVox has no equivalent
+stable Wikidata property for each recording, so Youta does not guess a book
+entity from its title, genre, or author name.
 
 A matching entity is represented by one collapsed External links row rather
 than duplicated in the channel/video metadata body. Activating its `[W]`
@@ -938,8 +984,10 @@ branch and failure-path assertions matter more than a single percentage.
 Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
 include both official YouTube metadata and Invidious adapters, terminal images,
-and offline QR rendering; runtime `providers.youtube_backend` chooses the
-YouTube adapter. `images` and `qr` are independent default-on capabilities.
+offline QR rendering, and the credential-free LibriVox adapter; runtime
+`providers.youtube_backend` chooses the YouTube adapter. `librivox` is included
+through `app-core`, while `images` and `qr` are independent default-on
+capabilities.
 The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
 builds omit that dependency and shortcut. Distribution/minimal builds can use
 `--no-default-features`. Human-readable file persistence is part of the core;

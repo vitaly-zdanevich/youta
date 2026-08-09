@@ -66,6 +66,7 @@ app-core = [
     "youtube-music",
     "bandcamp",
     "apple-podcasts",
+    "librivox",
     "litres",
     "lastfm",
     "sponsorblock",

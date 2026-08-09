@@ -62,6 +62,8 @@ pub enum WikidataExternalKind {
     /// Wikidata names P2819 “Yandex Music release ID,” while the Yandex Music
     /// API and URLs expose the same identifier as an album ID.
     YandexMusicAlbum,
+    /// LibriVox author ID, represented by Wikidata property P1899.
+    LibriVoxAuthor,
 }
 
 impl WikidataExternalKind {
@@ -78,6 +80,7 @@ impl WikidataExternalKind {
             Self::YandexMusicTrack => "P13289",
             Self::YandexMusicArtist => "P1553",
             Self::YandexMusicAlbum => "P2819",
+            Self::LibriVoxAuthor => "P1899",
         }
     }
 
@@ -98,6 +101,7 @@ impl WikidataExternalKind {
             Self::YandexMusicTrack => "Yandex Music track ID",
             Self::YandexMusicArtist => "Yandex Music artist ID",
             Self::YandexMusicAlbum => "Yandex Music release ID",
+            Self::LibriVoxAuthor => "LibriVox author ID",
         }
     }
 }
@@ -502,6 +506,16 @@ fn validate_external_id(
             } else {
                 Err(ProviderError::InvalidRequest(
                     "Yandex Music ID must be a positive numeric identifier of at most 20 digits"
+                        .to_owned(),
+                ))
+            }
+        }
+        WikidataExternalKind::LibriVoxAuthor => {
+            if is_bounded_positive_decimal(external_id) {
+                Ok(())
+            } else {
+                Err(ProviderError::InvalidRequest(
+                    "LibriVox author ID must be a positive numeric identifier of at most 20 digits"
                         .to_owned(),
                 ))
             }
@@ -2909,6 +2923,45 @@ mod tests {
             WikidataExternalKind::YandexMusicAlbum.property_label(),
             "Yandex Music release ID"
         );
+    }
+
+    #[test]
+    fn librivox_author_kind_uses_p1899_and_strict_numeric_ids() {
+        let kind = WikidataExternalKind::LibriVoxAuthor;
+        assert_eq!(kind.property_id(), "P1899");
+        assert_eq!(kind.property_label(), "LibriVox author ID");
+
+        let url = build_query_url(kind, "150").expect("LibriVox author query URL");
+        let query = url
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .expect("SPARQL query");
+        assert!(query.contains("VALUES ?externalId { \"150\" }"));
+        assert!(query.contains("wdt:P1899 ?externalId"));
+
+        for valid in ["1", "150", "18446744073709551615"] {
+            assert!(
+                validate_external_id(kind, valid).is_ok(),
+                "LibriVox author ID unexpectedly rejected {valid:?}"
+            );
+        }
+        for invalid in [
+            "",
+            "0",
+            "01",
+            "-1",
+            "1.0",
+            " 150",
+            "150 ",
+            "author-150",
+            "123456789012345678901",
+        ] {
+            assert!(
+                validate_external_id(kind, invalid).is_err(),
+                "LibriVox author ID unexpectedly accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]

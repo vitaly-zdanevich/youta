@@ -290,10 +290,17 @@ impl SourceKind {
                 stream: true,
                 ..SourceCapabilities::default()
             },
+            Self::LibriVox => SourceCapabilities {
+                search: true,
+                video_details: true,
+                playlists: true,
+                chapters: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            },
             Self::PeerTube
             | Self::WikimediaCommons
             | Self::ArchiveOrg
-            | Self::LibriVox
             | Self::Bandcamp
             | Self::Odysee
             | Self::Rumble
@@ -511,6 +518,81 @@ impl MediaId {
             external_id: external_id.into(),
         }
     }
+}
+
+/// Builds the canonical persisted identity for one LibriVox book section.
+///
+/// Including both IDs keeps chapter progress distinct and lets persistence
+/// reject an audio locator that has lost its book/section context.
+#[must_use]
+pub(crate) fn librivox_section_external_id(book_id: u64, section_id: u64) -> String {
+    format!("book:{book_id}:section:{section_id}")
+}
+
+/// Parses one canonical LibriVox book-section identity.
+///
+/// Non-positive, non-decimal, padded, truncated, or extended forms are
+/// rejected instead of being normalized silently.
+#[must_use]
+pub(crate) fn parse_librivox_section_external_id(value: &str) -> Option<(u64, u64)> {
+    let mut parts = value.split(':');
+    let (Some("book"), Some(book), Some("section"), Some(section), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let book_id = book.parse::<u64>().ok().filter(|id| *id > 0)?;
+    let section_id = section.parse::<u64>().ok().filter(|id| *id > 0)?;
+    (librivox_section_external_id(book_id, section_id) == value).then_some((book_id, section_id))
+}
+
+/// Returns whether a URL is one canonical public LibriVox book page.
+///
+/// Playlist persistence keeps this separately from the chapter audio URL so
+/// browser actions still lead to the human-readable book page.
+#[must_use]
+pub(crate) fn is_canonical_librivox_book_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && matches!(url.host_str(), Some("librivox.org" | "www.librivox.org"))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path() != "/"
+}
+
+/// Returns whether a URL is a stable public Archive.org MP3 download.
+///
+/// LibriVox chapter files use credential-free Archive.org download URLs. They
+/// are stable media identities rather than signed CDN resolutions, so keeping
+/// one allows exact chapter replay without a blocking catalogue lookup.
+#[must_use]
+pub(crate) fn is_canonical_librivox_audio_url(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("archive.org" | "www.archive.org"))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments.collect::<Vec<_>>();
+    segments.len() >= 3
+        && segments.first() == Some(&"download")
+        && segments.iter().skip(1).all(|segment| !segment.is_empty())
+        && segments
+            .last()
+            .is_some_and(|filename| filename.to_ascii_lowercase().ends_with(".mp3"))
 }
 
 /// The kind of an item returned by discovery or stored in a playlist.
@@ -1094,9 +1176,10 @@ impl Segment {
 
 /// Bounded, restart-safe metadata retained for one playlist item.
 ///
-/// The replay locator is a canonical provider page or absolute local path,
-/// never a resolved CDN URL, signed stream, or provider credential. The
-/// persistence boundary validates those invariants before storing this value.
+/// The replay locator is a canonical provider page, a stable public media URL,
+/// or an absolute local path. It is never a signed CDN resolution or provider
+/// credential. The persistence boundary validates provider-specific invariants
+/// before storing this value.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlaylistMediaSnapshot {
     /// Provider-qualified stable media identity.
@@ -1113,8 +1196,8 @@ pub struct PlaylistMediaSnapshot {
     pub thumbnail_url: Option<Url>,
     /// Duration known when the item was added.
     pub duration_seconds: Option<u64>,
-    /// Credential-free canonical provider page or absolute local path used to
-    /// resolve the item again.
+    /// Credential-free provider page, stable public media URL, or absolute
+    /// local path used to play the item again.
     pub replay_locator: String,
 }
 
@@ -1256,6 +1339,8 @@ pub enum Screen {
     Bandcamp,
     /// `Apple Podcasts` show search results and details.
     ApplePodcasts,
+    /// `LibriVox` public-domain audiobook search and book navigation.
+    LibriVox,
     /// Curated public live-radio stations.
     Radio,
     /// Local folders and supported media files.
@@ -1323,6 +1408,9 @@ pub struct SessionState {
     /// Last selected row in the independent `Apple Podcasts` result list.
     #[serde(default)]
     pub apple_podcasts_selected_row: Option<usize>,
+    /// Last selected row in the independent `LibriVox` result list.
+    #[serde(default)]
+    pub librivox_selected_row: Option<usize>,
     /// Last selected row in the independent Radio station list.
     #[serde(default)]
     pub radio_selected_row: Option<usize>,
@@ -1351,6 +1439,9 @@ pub struct SessionState {
     /// Last search text entered on the independent `Apple Podcasts` tab.
     #[serde(default)]
     pub apple_podcasts_search_text: String,
+    /// Last search text entered on the independent `LibriVox` tab.
+    #[serde(default)]
+    pub librivox_search_text: String,
     /// Last canonical folder shown by the Local screen.
     #[serde(default)]
     pub local_path: Option<String>,
@@ -1379,6 +1470,7 @@ impl Default for SessionState {
             yandex_music_selected_row: None,
             bandcamp_selected_row: None,
             apple_podcasts_selected_row: None,
+            librivox_selected_row: None,
             radio_selected_row: None,
             radio_selected_station_id: None,
             radio_filter_text: String::new(),
@@ -1388,6 +1480,7 @@ impl Default for SessionState {
             yandex_music_search_text: String::new(),
             bandcamp_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
+            librivox_search_text: String::new(),
             local_path: None,
             waveform_visible: false,
             chapter_timestamps_hidden: true,
@@ -1432,6 +1525,48 @@ mod tests {
 
     fn id(value: &str) -> MediaId {
         MediaId::new(SourceKind::YouTube, value)
+    }
+
+    #[test]
+    fn librivox_section_identity_is_canonical_and_contextual() {
+        let identity = librivox_section_external_id(5_936, 77_736);
+        assert_eq!(identity, "book:5936:section:77736");
+        assert_eq!(
+            parse_librivox_section_external_id(&identity),
+            Some((5_936, 77_736))
+        );
+        for invalid in [
+            "section:77736",
+            "book:5936:section:0",
+            "book:0:section:77736",
+            "book:05936:section:77736",
+            "book:5936:section:77736:extra",
+        ] {
+            assert_eq!(parse_librivox_section_external_id(invalid), None);
+        }
+    }
+
+    #[test]
+    fn librivox_persisted_urls_are_fixed_origin_and_queryless() {
+        let book =
+            Url::parse("https://librivox.org/with-the-turks-in-palestine-by-alexander-aaronsohn/")
+                .expect("book URL");
+        let audio =
+            Url::parse("https://archive.org/download/fixture/chapter_01.mp3").expect("audio URL");
+        assert!(is_canonical_librivox_book_url(&book));
+        assert!(is_canonical_librivox_audio_url(&audio));
+
+        for invalid in [
+            "https://example.org/download/fixture/chapter_01.mp3",
+            "https://archive.org/details/fixture",
+            "https://archive.org/download/fixture/chapter_01.ogg",
+            "https://archive.org/download/fixture/chapter_01.mp3?token=secret",
+            "https://user@archive.org/download/fixture/chapter_01.mp3",
+        ] {
+            assert!(!is_canonical_librivox_audio_url(
+                &Url::parse(invalid).expect("syntactically valid fixture URL")
+            ));
+        }
     }
 
     #[cfg(any(feature = "invidious", feature = "subscriptions"))]
@@ -1684,6 +1819,32 @@ mod tests {
     }
 
     #[test]
+    fn librivox_screen_has_a_stable_restart_name() {
+        let encoded = serde_json::to_string(&Screen::LibriVox).expect("encode LibriVox screen");
+        let restored: Screen = serde_json::from_str(&encoded).expect("decode screen");
+
+        assert!(encoded.contains("libri-vox"));
+        assert_eq!(restored, Screen::LibriVox);
+    }
+
+    #[test]
+    fn older_sessions_default_independent_librivox_state() {
+        let mut encoded =
+            serde_json::to_value(SessionState::default()).expect("encode session fixture");
+        let object = encoded
+            .as_object_mut()
+            .expect("session must encode as an object");
+        object.remove("librivox_selected_row");
+        object.remove("librivox_search_text");
+
+        let restored: SessionState =
+            serde_json::from_value(encoded).expect("decode pre-LibriVox session");
+
+        assert_eq!(restored.librivox_selected_row, None);
+        assert!(restored.librivox_search_text.is_empty());
+    }
+
+    #[test]
     fn older_sessions_default_independent_radio_selection() {
         let mut encoded =
             serde_json::to_value(SessionState::default()).expect("encode session fixture");
@@ -1731,6 +1892,21 @@ mod tests {
                 search: true,
                 video_details: true,
                 download: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            }
+        );
+    }
+
+    #[test]
+    fn librivox_capabilities_describe_only_implemented_operations() {
+        assert_eq!(
+            SourceKind::LibriVox.capabilities(),
+            SourceCapabilities {
+                search: true,
+                video_details: true,
+                playlists: true,
+                chapters: true,
                 stream: true,
                 ..SourceCapabilities::default()
             }

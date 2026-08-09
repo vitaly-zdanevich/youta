@@ -29,6 +29,8 @@ pub mod invidious;
 pub mod jamendo;
 #[cfg(feature = "lastfm")]
 pub mod lastfm;
+#[cfg(feature = "librivox")]
+pub mod librivox;
 #[cfg(feature = "litres")]
 pub mod litres;
 #[cfg(feature = "tracker-music")]
