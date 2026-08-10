@@ -577,10 +577,11 @@ pub fn list_local_directory_with_preferred_child_and_options(
         return Err(LocalBrowserError::NotDirectory(path.to_owned()));
     }
 
-    let directory = fs::canonicalize(path).map_err(|source| LocalBrowserError::Inspect {
-        path: path.to_owned(),
-        source,
-    })?;
+    let directory =
+        crate::fs_path::canonicalize(path).map_err(|source| LocalBrowserError::Inspect {
+            path: path.to_owned(),
+            source,
+        })?;
     let preferred_entry = preferred_child
         .and_then(|path| direct_child_name(&directory, path))
         .and_then(|name| {
@@ -991,7 +992,7 @@ pub fn trash_local_entry<A: LocalFileActions + ?Sized>(
         .parent()
         .ok_or_else(|| LocalBrowserError::TrashTargetOutsideDirectory(path.to_owned()))?;
     let canonical_parent =
-        fs::canonicalize(parent).map_err(|source| LocalBrowserError::Inspect {
+        crate::fs_path::canonicalize(parent).map_err(|source| LocalBrowserError::Inspect {
             path: parent.to_owned(),
             source,
         })?;
@@ -1034,7 +1035,7 @@ fn validate_real_directory(path: &Path) -> Result<PathBuf, LocalBrowserError> {
     if !metadata.file_type().is_dir() {
         return Err(LocalBrowserError::NotDirectory(path.to_owned()));
     }
-    fs::canonicalize(path).map_err(|source| LocalBrowserError::Inspect {
+    crate::fs_path::canonicalize(path).map_err(|source| LocalBrowserError::Inspect {
         path: path.to_owned(),
         source,
     })
@@ -1115,7 +1116,8 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let directory = TempDir::new().expect("temporary fixture");
-            let root = fs::canonicalize(directory.path()).expect("canonical fixture root");
+            let root =
+                crate::fs_path::canonicalize(directory.path()).expect("canonical fixture root");
             Self {
                 root,
                 _directory: directory,
@@ -1177,7 +1179,10 @@ mod tests {
         let listing =
             list_local_directory(fixture.path(), LocalBrowseLimits::default()).expect("listing");
 
-        assert_eq!(listing.path, fs::canonicalize(fixture.path()).unwrap());
+        assert_eq!(
+            listing.path,
+            crate::fs_path::canonicalize(fixture.path()).unwrap()
+        );
         assert_eq!(listing.parent, listing.path.parent().map(Path::to_owned));
         assert!(!listing.truncated);
         assert_eq!(listing.inspected_entries, 6);

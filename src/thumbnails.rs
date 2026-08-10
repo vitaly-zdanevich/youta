@@ -601,7 +601,7 @@ impl LocalThumbnailFingerprint {
             return Err(ThumbnailFailure::InvalidSource);
         }
         let canonical_path =
-            fs::canonicalize(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+            crate::fs_path::canonicalize(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
         let canonical_metadata =
             fs::symlink_metadata(&canonical_path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
         if !canonical_metadata.file_type().is_file() {
@@ -2282,7 +2282,7 @@ fn decode_local_thumbnail_path(
 
 #[cfg(test)]
 fn record_local_source_decode(path: &Path) {
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = crate::fs_path::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut counts = LOCAL_SOURCE_DECODE_COUNTS
         .lock()
         .expect("local thumbnail decode counter");
@@ -3154,7 +3154,7 @@ pub(crate) mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe MOV extraction"),
             (
-                fs::canonicalize(&movie).expect("canonical MOV path"),
+                crate::fs_path::canonicalize(&movie).expect("canonical MOV path"),
                 60_500
             )
         );
@@ -3286,21 +3286,21 @@ pub(crate) mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe first extraction")
                 .0,
-            fs::canonicalize(&first).expect("canonical first MOV")
+            crate::fs_path::canonicalize(&first).expect("canonical first MOV")
         );
         assert!(manager.synchronize_local_video(&second, 2_000, area));
         assert_eq!(
             cancelled
                 .recv_timeout(Duration::from_secs(1))
                 .expect("first extraction cancellation"),
-            fs::canonicalize(&first).expect("canonical first MOV")
+            crate::fs_path::canonicalize(&first).expect("canonical first MOV")
         );
         assert_eq!(
             observed
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe replacement extraction"),
             (
-                fs::canonicalize(&second).expect("canonical second MOV"),
+                crate::fs_path::canonicalize(&second).expect("canonical second MOV"),
                 2_000
             )
         );
@@ -4957,7 +4957,7 @@ pub(crate) mod tests {
     }
 
     fn local_source_decode_count(path: &Path) -> usize {
-        let path = fs::canonicalize(path).expect("canonical local thumbnail fixture");
+        let path = crate::fs_path::canonicalize(path).expect("canonical local thumbnail fixture");
         LOCAL_SOURCE_DECODE_COUNTS
             .lock()
             .expect("local thumbnail decode counts")

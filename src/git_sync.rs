@@ -73,9 +73,8 @@ fn sync_config_root_with_prefix(
     executable_prefix: &[OsString],
     timeout: Duration,
 ) -> Result<GitSyncOutcome, GitSyncError> {
-    let config_root = config_root
-        .canonicalize()
-        .map_err(|source| GitSyncError::ConfigRoot {
+    let config_root =
+        crate::fs_path::canonicalize(config_root).map_err(|source| GitSyncError::ConfigRoot {
             path: config_root.to_path_buf(),
             source,
         })?;

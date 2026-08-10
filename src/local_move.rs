@@ -350,7 +350,7 @@ pub fn validate_local_move(
         let supplied_parent = supplied_source
             .parent()
             .ok_or_else(|| LocalMoveValidationError::UnsafeSource(supplied_source.clone()))?;
-        let canonical_parent = fs::canonicalize(supplied_parent).map_err(|source| {
+        let canonical_parent = crate::fs_path::canonicalize(supplied_parent).map_err(|source| {
             LocalMoveValidationError::Inspect {
                 path: supplied_parent.to_owned(),
                 source,
@@ -674,7 +674,7 @@ fn local_locator_path(locator: &str) -> Option<PathBuf> {
 /// spelling it was stated.
 #[cfg(windows)]
 fn settled_local_path(path: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&path).unwrap_or(path)
+    crate::fs_path::canonicalize(&path).unwrap_or(path)
 }
 
 /// Returns `path` unchanged, because this platform spells a file one way.
@@ -1326,7 +1326,7 @@ fn canonical_real_directory(path: &Path) -> Result<PathBuf, LocalMoveValidationE
     if !metadata.file_type().is_dir() {
         return Err(LocalMoveValidationError::UnsupportedEntry(path.to_owned()));
     }
-    fs::canonicalize(path).map_err(|source| LocalMoveValidationError::Inspect {
+    crate::fs_path::canonicalize(path).map_err(|source| LocalMoveValidationError::Inspect {
         path: path.to_owned(),
         source,
     })
@@ -1519,7 +1519,7 @@ mod tests {
     /// prefix.
     fn directories() -> (TempDir, PathBuf, PathBuf) {
         let fixture = tempfile::tempdir().expect("temporary fixture");
-        let root = fs::canonicalize(fixture.path()).expect("canonical fixture root");
+        let root = crate::fs_path::canonicalize(fixture.path()).expect("canonical fixture root");
         let source = root.join("source");
         let destination = root.join("destination");
         fs::create_dir(&source).expect("source folder");
@@ -1813,11 +1813,11 @@ mod tests {
                 .expect("destination-only listing");
         assert_eq!(
             listing.path,
-            fs::canonicalize(&destination).expect("canonical")
+            crate::fs_path::canonicalize(&destination).expect("canonical")
         );
         assert_eq!(
             listing.parent,
-            Some(fs::canonicalize(fixture.path()).expect("canonical parent"))
+            Some(crate::fs_path::canonicalize(fixture.path()).expect("canonical parent"))
         );
         assert_eq!(
             listing

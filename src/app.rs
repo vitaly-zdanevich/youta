@@ -1000,7 +1000,7 @@ fn parse_local_path_input_from(
             current.join(path)
         }
     };
-    let path = std::fs::canonicalize(&raw_path).map_err(|source| LocalInputError::Io {
+    let path = crate::fs_path::canonicalize(&raw_path).map_err(|source| LocalInputError::Io {
         path: raw_path.clone(),
         source,
     })?;
@@ -16410,7 +16410,7 @@ impl AppController {
         };
         // Canonicalizing doubles as the existence check and matches what the
         // input box already does with a typed path.
-        let path = match std::fs::canonicalize(&first) {
+        let path = match crate::fs_path::canonicalize(&first) {
             Ok(path) => path,
             Err(error) => {
                 self.view.status_line = format!("Cannot open {}: {error}", first.display());
@@ -32175,9 +32175,9 @@ fn prepare_download_destination(config: &Config) -> Result<PathBuf, String> {
         .ensure_directories()
         .map_err(|error| format!("cannot prepare Youta's private directories: {error}"))?;
     let destination = config.downloads_dir();
-    let root = std::fs::canonicalize(config.config_dir())
+    let root = crate::fs_path::canonicalize(config.config_dir())
         .map_err(|error| format!("cannot resolve the Youta config directory: {error}"))?;
-    let destination = std::fs::canonicalize(&destination)
+    let destination = crate::fs_path::canonicalize(&destination)
         .map_err(|error| format!("cannot resolve the downloads directory: {error}"))?;
     if destination == root || !destination.starts_with(&root) {
         return Err(format!(
@@ -32198,7 +32198,7 @@ fn validate_completed_download_path(
     } else {
         destination.join(reported_path)
     };
-    let candidate = std::fs::canonicalize(&candidate).map_err(|error| {
+    let candidate = crate::fs_path::canonicalize(&candidate).map_err(|error| {
         format!(
             "cannot resolve the completed media path `{}`: {error}",
             candidate.display()
@@ -33804,7 +33804,7 @@ fn local_path_from_locator(locator: &str) -> Option<PathBuf> {
 /// still needs the old path to look up.
 #[cfg(windows)]
 fn settled_local_path(path: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&path).unwrap_or(path)
+    crate::fs_path::canonicalize(&path).unwrap_or(path)
 }
 
 /// Returns `path` unchanged, because this platform spells a file one way.
@@ -54256,7 +54256,8 @@ mod tests {
         let temporary = crate::test_support::canonical_tempdir("temporary media directory");
         // Canonical from the start: macOS resolves `/var` to `/private/var`,
         // and the controller compares the canonical form.
-        let folder = std::fs::canonicalize(temporary.path()).expect("canonical media directory");
+        let folder =
+            crate::fs_path::canonicalize(temporary.path()).expect("canonical media directory");
         let track = folder.join("Track.opus");
         std::fs::write(&track, b"audio").expect("media fixture");
         let (mut controller, _) =
@@ -54394,7 +54395,7 @@ mod tests {
         assert!(!request.write_thumbnail);
         assert_eq!(
             request.destination,
-            std::fs::canonicalize(config.downloads_dir()).expect("canonical downloads")
+            crate::fs_path::canonicalize(config.downloads_dir()).expect("canonical downloads")
         );
 
         controller.dispatch(UiAction::ShowScreen(Screen::Downloaded));
@@ -61826,7 +61827,7 @@ mod tests {
         assert!(input.directory);
         assert_eq!(
             input.path,
-            std::fs::canonicalize(&album).expect("canonical album")
+            crate::fs_path::canonicalize(&album).expect("canonical album")
         );
 
         let scanned = scan_local_media(&input.path).expect("local scan");

@@ -718,8 +718,7 @@ impl<P: FpcalcProcess> FingerprintRunner for FpcalcFingerprintRunner<P> {
         if !metadata.is_file() {
             return Err(AudioIdentificationError::InvalidAudioPath);
         }
-        let canonical_path = audio_path
-            .canonicalize()
+        let canonical_path = crate::fs_path::canonicalize(audio_path)
             .map_err(|_| AudioIdentificationError::InvalidAudioPath)?;
         let invocation = FpcalcInvocation {
             executable: self.config.executable.clone(),
@@ -1574,7 +1573,7 @@ mod tests {
             &[
                 OsString::from("-json"),
                 OsString::from("--"),
-                path.canonicalize()
+                crate::fs_path::canonicalize(&path)
                     .expect("canonical mock path")
                     .into_os_string(),
             ]

@@ -42,13 +42,13 @@ pub(crate) fn canonical_tempdir(context: &str) -> TempDir {
 /// path, so the feature that produces it is what decides whether this exists.
 #[cfg(feature = "local-artwork")]
 pub(crate) fn one_path_shape(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+    crate::fs_path::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
 /// Canonical form of the platform temporary directory.
 fn canonical_temporary_root() -> PathBuf {
     let root = std::env::temp_dir();
-    std::fs::canonicalize(&root).unwrap_or_else(|error| {
+    crate::fs_path::canonicalize(&root).unwrap_or_else(|error| {
         panic!("canonical temporary root {}: {error}", root.display());
     })
 }
@@ -64,11 +64,11 @@ mod tests {
         std::fs::create_dir(&nested).expect("nested fixture directory");
 
         assert_eq!(
-            std::fs::canonicalize(fixture.path()).expect("canonical fixture root"),
+            crate::fs_path::canonicalize(fixture.path()).expect("canonical fixture root"),
             fixture.path()
         );
         assert_eq!(
-            std::fs::canonicalize(&nested).expect("canonical nested directory"),
+            crate::fs_path::canonicalize(&nested).expect("canonical nested directory"),
             nested
         );
     }

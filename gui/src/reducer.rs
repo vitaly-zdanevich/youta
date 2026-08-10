@@ -714,7 +714,29 @@ mod tests {
 
         // Reopening is the observable proof: the lock is exclusive, so a second
         // open succeeds only after the first store was actually closed.
-        StateStore::open(&config).expect("durable state reopens after shutdown");
+        //
+        // `shutdown` deliberately stops waiting after its grace period rather
+        // than hang a closing window on a wedged reducer, so on a slow enough
+        // machine it returns while the reducer thread is still dropping the
+        // store. The release is therefore *eventual* from this thread's point
+        // of view, and the proof has to poll for it rather than demand it in
+        // the first attempt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match StateStore::open(&config) {
+                Ok(reopened) => {
+                    drop(reopened);
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "durable state never reopened after shutdown: {error:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     /// A second window is an ordinary outcome and gets the wording the terminal

@@ -429,10 +429,10 @@ impl<T: TrackerTransport> TrackerMediaPreparer<T> {
     ) -> Result<Self, TrackerPrepareError> {
         let limits = limits.validate()?;
         fs::create_dir_all(storage_root.as_ref())?;
-        let storage_root = fs::canonicalize(storage_root.as_ref())?;
+        let storage_root = crate::fs_path::canonicalize(storage_root.as_ref())?;
         let cache_candidate = storage_root.join(CACHE_DIRECTORY_NAME);
         fs::create_dir_all(&cache_candidate)?;
-        let cache_root = fs::canonicalize(&cache_candidate)?;
+        let cache_root = crate::fs_path::canonicalize(&cache_candidate)?;
         if cache_root == storage_root || !cache_root.starts_with(&storage_root) {
             return Err(TrackerPrepareError::CacheEscapedRoot);
         }
@@ -1524,7 +1524,7 @@ fn ensure_owned_directory(cache_root: &Path, path: &Path) -> Result<(), TrackerP
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(TrackerPrepareError::InvalidCacheEntry);
     }
-    let canonical = fs::canonicalize(path)?;
+    let canonical = crate::fs_path::canonicalize(path)?;
     if canonical == cache_root || !canonical.starts_with(cache_root) {
         return Err(TrackerPrepareError::CacheEscapedRoot);
     }

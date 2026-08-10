@@ -185,7 +185,7 @@ fn contents_object_path(line: &str) -> Option<&str> {
 }
 
 fn canonicalize_or_original(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+    crate::fs_path::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(test)]

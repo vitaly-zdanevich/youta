@@ -264,7 +264,7 @@ fn cached_local_artwork_url(
     cache: &ThumbnailCache,
     cache_key: &[u8],
 ) -> Result<Url, LocalArtworkError> {
-    let path = fs::canonicalize(cache.entry_path_for_key(cache_key))
+    let path = crate::fs_path::canonicalize(cache.entry_path_for_key(cache_key))
         .map_err(LocalArtworkError::CacheIo)?;
     Url::from_file_path(path).map_err(|()| LocalArtworkError::CacheUrl)
 }
@@ -372,7 +372,8 @@ impl LocalMediaFingerprint {
         if !supplied_metadata.file_type().is_file() {
             return Err(LocalArtworkError::InvalidSource);
         }
-        let canonical_path = fs::canonicalize(path).map_err(LocalArtworkError::SourceIo)?;
+        let canonical_path =
+            crate::fs_path::canonicalize(path).map_err(LocalArtworkError::SourceIo)?;
         let canonical_metadata =
             fs::symlink_metadata(&canonical_path).map_err(LocalArtworkError::SourceIo)?;
         if !canonical_metadata.file_type().is_file() {
@@ -730,7 +731,7 @@ mod tests {
         assert_eq!(
             cache_path.parent(),
             Some(
-                fs::canonicalize(&cache_directory)
+                crate::fs_path::canonicalize(&cache_directory)
                     .expect("canonical cache directory")
                     .as_path()
             )

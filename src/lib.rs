@@ -7,6 +7,9 @@
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Canonical paths in the crate's one spelling; see the module's own account.
+pub(crate) mod fs_path;
+
 pub mod build_info;
 pub mod child_process;
 pub mod config;

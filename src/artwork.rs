@@ -341,8 +341,8 @@ impl ThumbnailCache {
     }
 
     fn is_confined_entry(&self, path: &Path) -> io::Result<bool> {
-        let directory = fs::canonicalize(&self.directory)?;
-        let entry = fs::canonicalize(path)?;
+        let directory = crate::fs_path::canonicalize(&self.directory)?;
+        let entry = crate::fs_path::canonicalize(path)?;
         Ok(entry.parent() == Some(directory.as_path()))
     }
 
