@@ -1576,7 +1576,7 @@ mod tests {
         assert!(matches!(
             validate_local_move(
                 &source,
-                &[source.join("../source/track.flac")],
+                &[spelled_under(&source, &["..", "source", "track.flac"])],
                 &destination,
                 LocalMoveLimits::default(),
             ),
@@ -2118,13 +2118,30 @@ mod tests {
         }
     }
 
+    /// Writes a traversal into the path's text, past `join`'s good manners.
+    ///
+    /// `PathBuf::push` onto a verbatim base *resolves* `.` and `..` and
+    /// re-separates what it is given — std keeps verbatim paths literal by
+    /// normalising at push time — so `join("../source/x")` quietly becomes the
+    /// clean path it points at and asserts nothing about validation. A hostile
+    /// locator does not arrive through `join`; it arrives as text. This builds
+    /// that text.
+    fn spelled_under(base: &Path, suffix_parts: &[&str]) -> PathBuf {
+        let mut spelled = base.as_os_str().to_owned();
+        for part in suffix_parts {
+            spelled.push(std::path::MAIN_SEPARATOR_STR);
+            spelled.push(part);
+        }
+        PathBuf::from(spelled)
+    }
+
     /// A traversal spelled against a verbatim base is still refused as unsafe.
     ///
-    /// Under `\\?\` Windows parses literally — `/` is not a separator and `..`
-    /// is an ordinary name — so `..\/source\/track.flac` arrives as one
-    /// "normal" component rather than as `ParentDir`, and the rejection has to
-    /// come from the component's spelling rather than its kind. This is the
-    /// exact shape the canonical fixture produces on Windows.
+    /// Under `\\?\` Windows parses literally: `/` is not a separator, so a
+    /// slash-spelled traversal arrives as one "normal" component and the
+    /// rejection has to come from the component's spelling rather than its
+    /// kind — a literal `..` between backslashes is still `ParentDir` and is
+    /// covered by the portable test above.
     #[cfg(windows)]
     #[test]
     fn a_traversal_spelled_against_a_verbatim_base_is_still_unsafe() {
@@ -2135,7 +2152,7 @@ mod tests {
         assert!(matches!(
             validate_local_move(
                 &source,
-                &[source.join("../source/track.flac")],
+                &[spelled_under(&source, &["../source/track.flac"])],
                 &destination,
                 LocalMoveLimits::default(),
             ),
