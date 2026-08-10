@@ -108,6 +108,43 @@ pub struct TextFileOpenPlan {
     pub lifecycle: TextFileOpenLifecycle,
 }
 
+/// Starts one detached opener and reaps it in the background.
+///
+/// Only [`TextFileOpenLifecycle::Detached`] plans belong here. The other
+/// lifecycle hands the console to a terminal editor, which only a front-end
+/// that owns a terminal can arrange — so it stays in the terminal front-end and
+/// is refused here rather than silently downgraded to a detached launch that
+/// would draw an editor over the running UI.
+///
+/// The child is reaped on a thread instead of being abandoned: a graphical
+/// opener exits almost immediately, and an unreaped one would sit as a zombie
+/// for as long as Youta runs.
+///
+/// # Errors
+///
+/// Returns a message when the plan is not detached, or when the process cannot
+/// be started.
+pub fn spawn_detached_text_file_open(plan: &TextFileOpenPlan) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    if plan.lifecycle != TextFileOpenLifecycle::Detached {
+        return Err("this text file needs a terminal editor".to_owned());
+    }
+    let mut child = Command::new(&plan.executable)
+        .args(&plan.arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot start {}: {error}", plan.executable.display()))?;
+    let _ = std::thread::Builder::new()
+        .name("youta-text-file-opener".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
+}
+
 /// Plans how to open `path` without invoking a shell.
 ///
 /// A physical-console override is honored only on Linux. In all other cases,

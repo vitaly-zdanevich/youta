@@ -36,6 +36,16 @@ const COMMONS_CATEGORY_PAGE_BASE: &str = "https://commons.wikimedia.org/wiki/Cat
 const COMMONS_FILE_PAGE_BASE: &str = "https://commons.wikimedia.org/wiki/File:";
 const COMMONS_FILE_PREVIEW_BASE: &str = "https://commons.wikimedia.org/wiki/Special:Redirect/file/";
 const COMMONS_PREVIEW_WIDTH: &str = "512";
+const COMMONS_API_ENDPOINT: &str = "https://commons.wikimedia.org/w/api.php";
+const MAX_COMMONS_IMAGE_RESPONSE_BYTES: usize = 64 * 1024;
+/// Property carrying a subject's logotype, preferred for a broadcaster.
+const LOGO_IMAGE_PROPERTY: &str = "P154";
+/// Property carrying a subject's representative image.
+const REPRESENTATIVE_IMAGE_PROPERTY: &str = "P18";
+/// Width requested for artwork resolved through Commons.
+const COMMONS_ARTWORK_WIDTH: &str = "512";
+/// Host every Commons raster must be served from.
+const COMMONS_UPLOAD_HOST: &str = "upload.wikimedia.org";
 
 /// External media identifier property used for an exact Wikidata lookup.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -265,6 +275,7 @@ pub struct WikidataProvider {
     max_response_bytes: usize,
     entity_api_endpoint: Url,
     formatter_query_endpoint: Url,
+    commons_api_endpoint: Url,
     max_entity_response_bytes: usize,
     max_label_response_bytes: usize,
     max_formatter_response_bytes: usize,
@@ -287,6 +298,8 @@ impl WikidataProvider {
                 .expect("the compile-time Wikidata entity API URL is valid"),
             formatter_query_endpoint: Url::parse(ENDPOINT)
                 .expect("the compile-time Wikidata query endpoint is valid"),
+            commons_api_endpoint: Url::parse(COMMONS_API_ENDPOINT)
+                .expect("the compile-time Wikimedia Commons API URL is valid"),
             max_entity_response_bytes: MAX_ENTITY_RESPONSE_BYTES,
             max_label_response_bytes: MAX_LABEL_RESPONSE_BYTES,
             max_formatter_response_bytes: MAX_FORMATTER_RESPONSE_BYTES,
@@ -397,6 +410,45 @@ impl WikidataProvider {
         Ok(render_entity_statements(pending, &labels, &formatter_urls))
     }
 
+    /// Resolves one item's logotype to artwork Youta can actually fetch.
+    ///
+    /// This is two bounded requests rather than one. Wikidata names a Commons
+    /// file, and Commons' stable file address is a redirect — which Youta's
+    /// artwork agent refuses on purpose, because a redirect can cross from a
+    /// public host to a private one after the first check passed. The second
+    /// request therefore asks Commons for the raster URL itself, bounded to a
+    /// display width, and the result is a direct `upload.wikimedia.org` target.
+    ///
+    /// P154 is preferred over P18: a broadcaster's logotype identifies the
+    /// station, while its representative image is as likely to be a photograph
+    /// of a transmitter mast or a studio building.
+    ///
+    /// `Ok(None)` means the item simply has no image, which is ordinary and not
+    /// worth reporting to the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid Q-ID, a failed or oversized response, or
+    /// malformed claims.
+    pub fn item_artwork(&self, item_id: &str) -> Result<Option<Url>, ProviderError> {
+        validate_item_id(item_id)?;
+        let entity_url =
+            build_entity_api_url(&self.entity_api_endpoint, &[item_id.to_owned()], "claims")?;
+        let response: EntityStatementsResponse =
+            get_bounded_json(&self.agent, &entity_url, self.max_entity_response_bytes)?;
+        let Some(entity) = response.entities.get(item_id) else {
+            return Ok(None);
+        };
+        let Some(filename) = commons_image_filename(entity) else {
+            return Ok(None);
+        };
+
+        let image_url = build_commons_image_url(&self.commons_api_endpoint, &filename);
+        let response: CommonsImageResponse =
+            get_bounded_json(&self.agent, &image_url, MAX_COMMONS_IMAGE_RESPONSE_BYTES)?;
+        Ok(response.raster_url())
+    }
+
     #[cfg(test)]
     fn with_statement_endpoints(
         entity_api_endpoint: Url,
@@ -406,11 +458,15 @@ impl WikidataProvider {
         let formatter_query_endpoint = entity_api_endpoint
             .join("/sparql")
             .expect("a test entity API URL can form a sibling SPARQL endpoint");
+        let commons_api_endpoint = entity_api_endpoint
+            .join("/commons/api.php")
+            .expect("a test entity API URL can form a sibling Commons endpoint");
         Self {
             agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
             max_response_bytes: MAX_RESPONSE_BYTES,
             entity_api_endpoint,
             formatter_query_endpoint,
+            commons_api_endpoint,
             max_entity_response_bytes,
             max_label_response_bytes,
             max_formatter_response_bytes: max_label_response_bytes
@@ -747,6 +803,105 @@ fn build_entity_api_url(
             .append_pair("languagefallback", "1");
     }
     Ok(url)
+}
+
+/// Picks the Commons file one entity's logotype or image claims name.
+///
+/// Only a present `commonsMedia` value counts: a claim can be marked "no value"
+/// or "unknown value", and either would otherwise read as a file name.
+fn commons_image_filename(entity: &RawStatementEntity) -> Option<String> {
+    for property in [LOGO_IMAGE_PROPERTY, REPRESENTATIVE_IMAGE_PROPERTY] {
+        let Some(claims) = entity.claims.get(property) else {
+            continue;
+        };
+        let filename = claims.iter().find_map(|claim| {
+            let snak = &claim.mainsnak;
+            (snak.snak_type == "value" && snak.data_type.as_deref() == Some("commonsMedia"))
+                .then(|| snak.data_value.as_ref()?.value.as_str())
+                .flatten()
+                .filter(|filename| !filename.is_empty() && filename.len() <= MAX_VALUE_BYTES)
+                .map(str::to_owned)
+        });
+        if filename.is_some() {
+            return filename;
+        }
+    }
+    None
+}
+
+/// Builds the bounded Commons request that resolves one file to a raster URL.
+fn build_commons_image_url(endpoint: &Url, filename: &str) -> Url {
+    let mut url = endpoint.clone();
+    url.query_pairs_mut()
+        .append_pair("action", "query")
+        .append_pair("format", "json")
+        .append_pair("formatversion", "2")
+        .append_pair("prop", "imageinfo")
+        .append_pair("iiprop", "url")
+        .append_pair("iiurlwidth", COMMONS_ARTWORK_WIDTH)
+        .append_pair("titles", &format!("File:{filename}"));
+    url
+}
+
+/// Bounded `imageinfo` reply naming one file's raster locations.
+#[derive(Debug, Deserialize)]
+struct CommonsImageResponse {
+    #[serde(default)]
+    query: Option<CommonsImageQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommonsImageQuery {
+    #[serde(default)]
+    pages: Vec<CommonsImagePage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommonsImagePage {
+    #[serde(default)]
+    imageinfo: Vec<CommonsImageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommonsImageInfo {
+    /// Rendered raster at the requested width, absent for a file Commons cannot
+    /// scale.
+    #[serde(default)]
+    thumburl: Option<String>,
+    /// The original file, which is already a raster small enough to serve when
+    /// no thumbnail was rendered.
+    #[serde(default)]
+    url: Option<String>,
+}
+
+impl CommonsImageResponse {
+    /// Returns the served raster, preferring the width-bounded rendering.
+    ///
+    /// A scaled rendering also normalizes format: Commons rasterizes an SVG
+    /// logotype to PNG, and an SVG is not something Youta's artwork pipeline
+    /// accepts. The original is used only when Commons declined to scale, which
+    /// it does for a file already smaller than the requested width.
+    fn raster_url(&self) -> Option<Url> {
+        let info = self.query.as_ref()?.pages.first()?.imageinfo.first()?;
+        info.thumburl
+            .as_deref()
+            .or(info.url.as_deref())
+            .and_then(commons_raster_url)
+    }
+}
+
+/// Accepts only an HTTPS raster served from Commons' own upload host.
+///
+/// The URL arrives inside a provider response and is handed to the artwork
+/// fetcher, so it is pinned to the host Commons actually serves files from
+/// rather than trusted for being in a Wikimedia reply.
+fn commons_raster_url(value: &str) -> Option<Url> {
+    let url = Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some(COMMONS_UPLOAD_HOST)
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(url)
 }
 
 fn validate_item_id(item_id: &str) -> Result<(), ProviderError> {
@@ -4588,6 +4743,143 @@ mod tests {
         }
     }
 
+    /// A logotype must resolve to a raster Youta can actually fetch.
+    ///
+    /// The second request is the point of the test: Commons' stable file address
+    /// is a redirect, and Youta's artwork agent refuses redirects, so a
+    /// logotype that stopped at the file name would silently never render.
+    #[test]
+    fn an_item_logotype_resolves_to_a_direct_commons_raster() {
+        let claims = serde_json::json!({
+            "entities": {
+                "Q19909": {
+                    "claims": {
+                        "P18": [{
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "property": "P18",
+                                "datatype": "commonsMedia",
+                                "datavalue": {"type": "string", "value": "A transmitter mast.jpg"}
+                            }
+                        }],
+                        "P154": [{
+                            "mainsnak": {
+                                "snaktype": "novalue",
+                                "property": "P154",
+                                "datatype": "commonsMedia"
+                            }
+                        }, {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "property": "P154",
+                                "datatype": "commonsMedia",
+                                "datavalue": {"type": "string", "value": "France Musique logo.png"}
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string();
+        let image = serde_json::json!({
+            "query": {
+                "pages": [{
+                    "imageinfo": [{
+                        "url": "https://upload.wikimedia.org/wikipedia/commons/c/c4/Logo.png",
+                        "thumburl": "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c4/Logo.png/512px-Logo.png"
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &claims),
+            json_response("200 OK", &image),
+        ]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        let artwork = provider
+            .item_artwork("Q19909")
+            .expect("the logotype should resolve");
+        let requests = server.finish();
+
+        assert_eq!(
+            artwork.as_ref().map(Url::as_str),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c4/Logo.png/512px-Logo.png"
+            ),
+            "the width-bounded rendering is what a renderer can decode"
+        );
+        assert_eq!(requests.len(), 2);
+        let claims_pairs = server_url(&requests[0])
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            claims_pairs.get("props").map(String::as_str),
+            Some("claims")
+        );
+        let image_pairs = server_url(&requests[1])
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            image_pairs.get("titles").map(String::as_str),
+            Some("File:France Musique logo.png"),
+            "the logotype must win over the representative image"
+        );
+        assert_eq!(
+            image_pairs.get("iiurlwidth").map(String::as_str),
+            Some("512")
+        );
+    }
+
+    /// An item without an image is an ordinary outcome and costs one request.
+    #[test]
+    fn an_item_without_an_image_never_reaches_commons() {
+        let claims = serde_json::json!({
+            "entities": {"Q1": {"claims": {"P31": []}}}
+        })
+        .to_string();
+        let server = MockServer::spawn(vec![json_response("200 OK", &claims)]);
+        let provider = WikidataProvider::with_statement_endpoints(
+            server.base_url.join("w/api.php").expect("entity API URL"),
+            MAX_ENTITY_RESPONSE_BYTES,
+            MAX_LABEL_RESPONSE_BYTES,
+        );
+
+        assert_eq!(
+            provider
+                .item_artwork("Q1")
+                .expect("no image is not an error"),
+            None
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    /// A raster URL arrives inside a provider response, so it is pinned to the
+    /// host Commons serves files from rather than trusted for being in a reply.
+    #[test]
+    fn only_an_https_commons_upload_target_is_accepted() {
+        for rejected in [
+            "http://upload.wikimedia.org/wikipedia/commons/c/c4/Logo.png",
+            "https://images.example/wikipedia/commons/c/c4/Logo.png",
+            "https://user:secret@upload.wikimedia.org/c/c4/Logo.png",
+            "file:///etc/passwd",
+            "not a URL",
+        ] {
+            assert_eq!(commons_raster_url(rejected), None, "{rejected}");
+        }
+        assert!(
+            commons_raster_url("https://upload.wikimedia.org/wikipedia/commons/c/c4/Logo.png")
+                .is_some()
+        );
+    }
+
     fn server_url(target: &str) -> Url {
         Url::parse("http://127.0.0.1/")
             .expect("base URL")
@@ -4617,7 +4909,16 @@ mod tests {
                 for response in responses {
                     let mut stream = loop {
                         match listener.accept() {
-                            Ok((stream, _)) => break stream,
+                            // BSD and macOS let an accepted socket inherit the
+                            // listener's non-blocking flag, while Linux does
+                            // not. Clearing it keeps the blocking reads below
+                            // identical on every platform.
+                            Ok((stream, _)) => {
+                                stream
+                                    .set_nonblocking(false)
+                                    .expect("mock stream should become blocking");
+                                break stream;
+                            }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                 if thread_stop.load(Ordering::Relaxed) {
                                     return;

@@ -356,6 +356,7 @@ fn build_search_command(
 
     let socket_timeout = config.timeout.as_secs().max(1);
     let mut command = Command::new(&config.executable);
+    crate::child_process::quiet(&mut command);
     command.arg("--ignore-config");
     if !config.allow_plugins {
         command.arg("--no-plugin-dirs");

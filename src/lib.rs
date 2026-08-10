@@ -4,14 +4,24 @@
 //! rendering behind separate interfaces so distribution builds can omit
 //! services they do not use.
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
+/// Canonical paths in the crate's one spelling; see the module's own account.
+pub(crate) mod fs_path;
+
 pub mod build_info;
+pub mod child_process;
 pub mod config;
 pub mod diagnostics;
 pub mod domain;
+pub mod durability;
+pub mod file_identity;
 pub mod links;
 pub mod local_browser;
 pub mod persistence;
 pub mod playback;
+pub mod private_files;
 pub mod providers;
 #[cfg(feature = "qr")]
 pub mod qr_code;
@@ -42,11 +52,23 @@ pub(crate) mod gpm;
 #[cfg(feature = "tracker-music")]
 pub mod tracker_media;
 
+#[cfg(any(feature = "remote-artwork", feature = "local-artwork"))]
+pub mod artwork;
+
+#[cfg(feature = "local-artwork")]
+pub(crate) mod local_artwork;
+
 #[cfg(feature = "images")]
 pub mod thumbnails;
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "controller")]
 pub mod app;
 
 #[cfg(feature = "tui")]
 pub mod tui;
+
+#[cfg(feature = "controller")]
+pub mod view;
+
+#[cfg(feature = "controller")]
+pub mod keymap;

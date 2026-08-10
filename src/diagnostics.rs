@@ -8,7 +8,9 @@
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{self, Write as _};
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::Read as _;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
@@ -609,6 +611,7 @@ fn run_helper_probe(
     timeout: Duration,
 ) -> ExternalHelperProbeStatus {
     let mut command = Command::new(executable);
+    crate::child_process::quiet(&mut command);
     command
         .args(kind.version_arguments())
         .stdin(Stdio::null())
@@ -891,6 +894,11 @@ fn operating_system_info() -> (OperatingSystemInfo, bool) {
     )
 }
 
+/// Reads a capped prefix of one file, reporting whether the cap was reached.
+///
+/// Only the Linux `os-release` probe reads a file this way, so the helper is
+/// compiled there alone rather than left as an unused definition elsewhere.
+#[cfg(target_os = "linux")]
 fn read_bounded(path: &Path, limit: usize) -> std::io::Result<(String, bool)> {
     let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
     File::open(path)?
@@ -901,6 +909,11 @@ fn read_bounded(path: &Path, limit: usize) -> std::io::Result<(String, bool)> {
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
+/// Parses `os-release` text into the reported operating-system name and version.
+///
+/// The parser itself touches no filesystem, so it stays available to the unit
+/// test on every platform while its only caller is Linux-only.
+#[cfg(any(target_os = "linux", test))]
 fn parse_os_release(input: &str) -> Option<OperatingSystemInfo> {
     let mut pretty_name = None;
     let mut name = None;
@@ -936,6 +949,7 @@ fn parse_os_release(input: &str) -> Option<OperatingSystemInfo> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_os_release_value(value: &str) -> String {
     let unquoted = if value.len() >= 2
         && ((value.starts_with('"') && value.ends_with('"'))

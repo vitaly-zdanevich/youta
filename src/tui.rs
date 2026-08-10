@@ -5,7 +5,6 @@
 
 use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -37,37 +36,29 @@ use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
-    BandcampAudioFormat, DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout,
-    ThumbnailMode, YouTubeThumbnailSize,
+    DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
 };
-use crate::domain::{Chapter, MediaId, MediaKind, SourceKind, decode_url_path_segment_once};
+use crate::domain::{Chapter, MediaId, SourceKind, decode_url_path_segment_once};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "qr")]
 use crate::qr_code::QrMatrix;
-use crate::report_actions::system_url_opener_name;
+use crate::report_actions::{SystemReportActions, system_url_opener_name};
 use crate::subscriptions::SubscriptionKind;
 use crate::terminal_environment::{TerminalAttachment, openrc_manages_system};
 #[cfg(feature = "local-browser")]
-use crate::text_file_open::{TextFileOpenLifecycle, TextFileOpenPlan};
+use crate::text_file_open::{
+    TextFileOpenLifecycle, TextFileOpenPlan, spawn_detached_text_file_open,
+};
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
-use crate::waveform::{Peak, PeakPyramid};
+use crate::waveform::Peak;
 
-/// Official Google instructions for creating and restricting a `YouTube` API key.
-pub const YOUTUBE_API_KEY_GUIDE_URL: &str =
-    "https://developers.google.com/youtube/registering_an_application";
+pub use crate::view::*;
 
-/// Official overview of Yandex OAuth access tokens.
-pub const YANDEX_OAUTH_GUIDE_URL: &str = "https://yandex.com/dev/id/doc/en/concepts/ya-oauth-intro";
-
-/// Google Cloud page where the user creates and restricts API credentials.
-pub const GOOGLE_CLOUD_CREDENTIALS_URL: &str = "https://console.cloud.google.com/apis/credentials";
-
-/// Fixed-width placeholder rendered before playable Wikidata media values.
-pub const WIKIDATA_MEDIA_PLAY_SYMBOL: &str = "▶";
+use crate::keymap::{Key, KeyPress, PopupGeometry, ScrollGeometry};
 
 /// Fixed-width marker rendered for the same actively playing Commons value.
 const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "⏸";
@@ -77,9 +68,6 @@ const PLAYBACK_PLAYING_SYMBOL: &str = "▶";
 
 /// Marker shown while the current media is paused.
 const PLAYBACK_PAUSED_SYMBOL: &str = "⏸";
-
-/// Official Invidious documentation listing public instances.
-pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
 
 /// Most chapter-label rows Youta may reserve above the seek track.
 const MAX_CHAPTER_LABEL_ROWS: u16 = 4;
@@ -93,176 +81,6 @@ const WAVEFORM_ROWS: u16 = 4;
 /// Player rows reserved for the waveform plus its one-line playback status.
 const WAVEFORM_PLAYER_ROWS: u16 = WAVEFORM_ROWS + 1;
 
-/// Top-level Youta screen.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Screen {
-    /// Provider search and selected-item details.
-    #[default]
-    Search,
-    /// Music-focused search through `music.youtube.com`.
-    YouTubeMusic,
-    /// Personalized recommendations and catalogue search through Yandex Music.
-    YandexMusic,
-    /// Artist, album, and track discovery through `Bandcamp`.
-    Bandcamp,
-    /// Podcast-show discovery through Apple's public catalogue.
-    ApplePodcasts,
-    /// Public-domain audiobook discovery through `LibriVox`.
-    LibriVox,
-    /// Curated public live-radio stations.
-    Radio,
-    /// Aggregated tracker-module search across dedicated archives.
-    TrackerMusic,
-    /// Locally subscribed channels and feeds.
-    Subscriptions,
-    /// Local folders and supported media files.
-    Local,
-    /// Media available without a network connection.
-    Downloaded,
-    /// Played and partially played media.
-    History,
-    /// Nested user playlists and folders.
-    Playlists,
-    /// Listening totals grouped by source.
-    Statistics,
-}
-
-impl Screen {
-    const ALL: [Self; 14] = [
-        Self::Search,
-        Self::YouTubeMusic,
-        Self::YandexMusic,
-        Self::Bandcamp,
-        Self::ApplePodcasts,
-        Self::LibriVox,
-        Self::Radio,
-        Self::TrackerMusic,
-        Self::Subscriptions,
-        Self::Local,
-        Self::Playlists,
-        Self::Downloaded,
-        Self::History,
-        Self::Statistics,
-    ];
-
-    /// Whether the active build exposes this provider-backed tab.
-    const fn enabled(self) -> bool {
-        match self {
-            Self::YouTubeMusic => cfg!(feature = "youtube-music"),
-            Self::YandexMusic => cfg!(feature = "yandex-music"),
-            Self::Bandcamp => cfg!(feature = "bandcamp"),
-            Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
-            Self::LibriVox => cfg!(feature = "librivox"),
-            Self::Radio => cfg!(feature = "radio"),
-            _ => true,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Search => "YT",
-            Self::YouTubeMusic => "YT Music",
-            Self::YandexMusic => "YandexMusic",
-            Self::Bandcamp => "Bandcamp",
-            Self::ApplePodcasts => "Apple Podcasts",
-            Self::LibriVox => "LibriVox",
-            Self::Radio => "Radio",
-            Self::TrackerMusic => "MOD/tracker",
-            Self::Local => "Local",
-            Self::Subscriptions => "Subscriptions",
-            Self::Playlists => "Playlists",
-            Self::Downloaded => "Downloaded",
-            Self::History => "History",
-            Self::Statistics => "Stats",
-        }
-    }
-
-    const fn compact_label(self) -> &'static str {
-        match self {
-            Self::Search => "YT",
-            Self::YouTubeMusic => "YT Music",
-            Self::YandexMusic => "Yandex",
-            Self::Bandcamp => "Bandcamp",
-            Self::ApplePodcasts => "Apple",
-            Self::LibriVox => "LibriVox",
-            Self::Radio => "Radio",
-            Self::TrackerMusic => "MOD",
-            Self::Local => "Local",
-            Self::Subscriptions => "Subs",
-            Self::Playlists => "Lists",
-            Self::Downloaded => "Offline",
-            Self::History => "History",
-            Self::Statistics => "Stats",
-        }
-    }
-
-    /// Returns the next enabled top-level tab, wrapping at the end.
-    fn next(self) -> Self {
-        let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
-            return Self::ALL[0];
-        };
-        (1..=Self::ALL.len())
-            .map(|offset| Self::ALL[(index + offset) % Self::ALL.len()])
-            .find(|candidate| candidate.enabled())
-            .unwrap_or(Self::Search)
-    }
-
-    /// Returns the previous enabled top-level tab, wrapping at the beginning.
-    fn previous(self) -> Self {
-        let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
-            return Self::ALL[Self::ALL.len() - 1];
-        };
-        (1..=Self::ALL.len())
-            .map(|offset| Self::ALL[(index + Self::ALL.len() - offset) % Self::ALL.len()])
-            .find(|candidate| candidate.enabled())
-            .unwrap_or(Self::Search)
-    }
-}
-
-/// Alternative content shown in the right-hand panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RightPanelMode {
-    /// Metadata and description.
-    #[default]
-    Details,
-    /// Channel or feed information for the playing item.
-    Channel,
-}
-
-/// Owner-aware state of the lazily generated local waveform.
-///
-/// Keeping the decoded peak pyramid in the immutable view lets terminal
-/// resizes select a suitable resolution without decoding the local file again.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum WaveformView {
-    /// No eligible local media currently owns the waveform track.
-    #[default]
-    Unavailable,
-    /// The background worker is inspecting the exact local media item.
-    Loading {
-        /// Local media identity captured when generation started.
-        media_id: MediaId,
-    },
-    /// A complete, reusable multiresolution peak envelope.
-    Ready {
-        /// Local media identity owning these peaks.
-        media_id: MediaId,
-        /// Controller generation identifying the exact file identity behind these peaks.
-        generation: u64,
-        /// Duration used for owner-aware mouse seeking.
-        duration: Duration,
-        /// Width-independent peak data shared without per-frame cloning.
-        pyramid: Arc<PeakPyramid>,
-    },
-    /// Generation failed for the exact local media item.
-    Failed {
-        /// Local media identity owning this failure.
-        media_id: MediaId,
-        /// Short actionable failure text.
-        message: String,
-    },
-}
-
 /// Seek-bar visual style.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SeekBarStyle {
@@ -271,220 +89,6 @@ pub enum SeekBarStyle {
     Line,
     /// A small animated cat label on the progress marker.
     NyanCat,
-}
-
-/// Object type queried by the default YouTube search screen.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SearchKind {
-    /// Search for YouTube videos.
-    #[default]
-    Videos,
-    /// Search for YouTube channels independently of videos.
-    Channels,
-}
-
-/// Ordering selected for YouTube video or channel searches.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum YouTubeSearchSort {
-    /// Let the configured provider rank results by relevance.
-    #[default]
-    Relevance,
-    /// Put the newest available uploads first.
-    Newest,
-}
-
-/// Exact catalogue category queried by the Yandex Music tab.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum YandexMusicSearchKind {
-    /// Music, podcasts, and audiobooks in one catalogue query.
-    #[default]
-    All,
-    /// Songs, artists, and music albums.
-    Music,
-    /// Podcast shows and episodes.
-    Podcasts,
-    /// Audiobooks identified by explicit provider metadata.
-    Audiobooks,
-}
-
-impl YandexMusicSearchKind {
-    /// Returns the next category in the Yandex Music search selector.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::All => Self::Music,
-            Self::Music => Self::Podcasts,
-            Self::Podcasts => Self::Audiobooks,
-            Self::Audiobooks => Self::All,
-        }
-    }
-
-    /// Returns the compact category label rendered in controls and status.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Music => "music",
-            Self::Podcasts => "podcasts",
-            Self::Audiobooks => "audiobooks",
-        }
-    }
-
-    /// Returns the title-cased category label used in the search panel heading.
-    #[must_use]
-    const fn title_label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Music => "Music",
-            Self::Podcasts => "Podcasts",
-            Self::Audiobooks => "Audiobooks",
-        }
-    }
-}
-
-/// Active content route inside the authenticated Yandex Music tab.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum YandexMusicRouteView {
-    /// The account's default My Wave recommendations.
-    #[default]
-    Recommendations,
-    /// One explicit catalogue search result.
-    Search,
-    /// Tracks belonging to one opened album, podcast, or audiobook.
-    Album,
-    /// Popular tracks and albums belonging to one exact artist.
-    Artist,
-}
-
-/// Reaction state shown for one selected Yandex Music track.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum YandexMusicReactionView {
-    /// Neither explicit reaction is selected.
-    #[default]
-    Neutral,
-    /// The track is liked, including an optimistic offline update.
-    Liked,
-    /// The track is disliked, including an optimistic offline update.
-    Disliked,
-}
-
-/// Selection-sensitive controls exposed by the Yandex Music detail panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YandexMusicActionsView {
-    /// Selected row is a playable track, episode, or audiobook chapter.
-    pub track_selected: bool,
-    /// Selected row has an exact primary artist that can open inside Youta.
-    pub artist_available: bool,
-    /// Selected row can open an album, show, or audiobook.
-    pub album_available: bool,
-    /// Current route is an opened album rather than recommendations/search.
-    pub album_open: bool,
-    /// At least ten recommendation tracks can be downloaded as one batch.
-    pub twenty_recommendations_available: bool,
-    /// Optimistic current reaction for the selected track.
-    pub reaction: YandexMusicReactionView,
-}
-
-/// Ordering applied to entries in the Local file browser.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LocalSizeSort {
-    /// Keep the normal directories-first, name ordering.
-    #[default]
-    Off,
-    /// Put known smaller files or folders first.
-    Ascending,
-    /// Put known larger files or folders first.
-    Descending,
-}
-
-impl LocalSizeSort {
-    /// Returns the next state in the Local size-sort control.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Off => Self::Ascending,
-            Self::Ascending => Self::Descending,
-            Self::Descending => Self::Off,
-        }
-    }
-
-    /// Returns the compact label rendered beside the `Z` hotkey.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Off => "Size sort: off",
-            Self::Ascending => "Size sort: ascending",
-            Self::Descending => "Size sort: descending",
-        }
-    }
-}
-
-/// Ordering applied to the built-in Radio station catalogue.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RadioSort {
-    /// Sort station names alphabetically.
-    #[default]
-    Name,
-    /// Put higher known bitrates first and unknown bitrates last.
-    BitrateDescending,
-    /// Put lower known bitrates first and unknown bitrates last.
-    BitrateAscending,
-}
-
-impl RadioSort {
-    /// Returns the next Radio ordering exposed by the `B` control.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Name => Self::BitrateDescending,
-            Self::BitrateDescending => Self::BitrateAscending,
-            Self::BitrateAscending => Self::Name,
-        }
-    }
-
-    /// Returns the compact label displayed in the Radio control row.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Name => "Sort: name A–Z",
-            Self::BitrateDescending => "Sort: bitrate high–low",
-            Self::BitrateAscending => "Sort: bitrate low–high",
-        }
-    }
-}
-
-/// Submitted provider search whose progress is animated in the result panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchActivity {
-    /// A video or channel search through the configured `YouTube` provider.
-    YouTube,
-    /// A music-focused search through `yt-dlp` and `music.youtube.com`.
-    YouTubeMusic,
-    /// A Yandex Music catalogue search.
-    YandexMusic,
-    /// A public track and album search through `Bandcamp`.
-    Bandcamp,
-    /// A show search through Apple's public podcast catalogue.
-    ApplePodcasts,
-    /// A public-domain audiobook search through `LibriVox`.
-    LibriVox,
-    /// An aggregate search through the enabled MOD/tracker archives.
-    TrackerArchives,
-}
-
-impl SearchActivity {
-    /// Returns the result screen that owns this submitted search.
-    const fn screen(self) -> Screen {
-        match self {
-            Self::YouTube => Screen::Search,
-            Self::YouTubeMusic => Screen::YouTubeMusic,
-            Self::YandexMusic => Screen::YandexMusic,
-            Self::Bandcamp => Screen::Bandcamp,
-            Self::ApplePodcasts => Screen::ApplePodcasts,
-            Self::LibriVox => Screen::LibriVox,
-            Self::TrackerArchives => Screen::TrackerMusic,
-        }
-    }
 }
 
 /// UI color and visibility preferences.
@@ -504,6 +108,8 @@ pub struct UiSettings {
     pub prefetch_search_thumbnails: bool,
     /// Persistent thumbnail byte cache selected by the loaded configuration.
     pub thumbnail_cache_dir: Option<PathBuf>,
+    /// `FFmpeg` used to extract the one frame a local video is previewed by.
+    pub ffmpeg_executable: PathBuf,
     /// Redraw period while playback is active.
     pub playing_tick: Duration,
     /// Redraw period while idle or paused.
@@ -527,1556 +133,11 @@ impl Default for UiSettings {
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
             thumbnail_cache_dir: None,
+            ffmpeg_executable: PathBuf::from("ffmpeg"),
             playing_tick: Duration::from_millis(250),
             idle_tick: Duration::from_secs(1),
         }
     }
-}
-
-/// One row shown in a list panel.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RowView {
-    /// Stable media identity used to mark the authoritative playing item.
-    pub media_id: Option<MediaId>,
-    /// Primary row label.
-    pub title: String,
-    /// Source-specific secondary label.
-    pub subtitle: String,
-    /// Source name used for color distinction.
-    pub source: String,
-    /// Local watched percentage.
-    pub watched_percent: u8,
-    /// Whether accepted playback has started, including before one percent.
-    ///
-    /// This is persisted independently from the rounded percentage so a
-    /// successful zero-position start can render as partial without claiming
-    /// that one percent has already been heard.
-    pub playback_started: bool,
-    /// Whether the source is locally subscribed.
-    pub subscribed: bool,
-    /// Preferred artwork URL available for selected rendering or prefetch.
-    pub thumbnail_url: Option<url::Url>,
-    /// Whether provider metadata identifies this as a vertical video.
-    pub vertical: bool,
-    /// Hide played-state markers while retaining identity for playing-row emphasis.
-    pub hide_watched_marker: bool,
-    /// Omit generic source and marker padding on a source-specific screen.
-    pub compact: bool,
-    /// Whether a Radio station is pinned by the persistent favorites action.
-    pub radio_favorite: bool,
-    /// Whether this Local row belongs to the current explicit move batch.
-    pub local_marked: bool,
-}
-
-/// One selected local video frame rendered through the thumbnail worker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalVideoThumbnailView {
-    /// Exact local video path; the worker revalidates its filesystem identity.
-    pub path: PathBuf,
-    /// Midpoint seek position in milliseconds.
-    pub midpoint_millis: u64,
-}
-
-/// Details for the selected media item.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailView {
-    /// Stable identity of the selected media used by description timecodes.
-    pub media_id: Option<MediaId>,
-    /// Display title.
-    pub title: String,
-    /// Source/provider label.
-    pub source: String,
-    /// Display name of the channel that published the selected media.
-    pub channel_name: String,
-    /// Stable provider channel identifier used by local subscriptions.
-    pub channel_id: String,
-    /// Exact public channel page opened by the channel browser action.
-    pub channel_webpage_url: Option<url::Url>,
-    /// Whether the channel is present in Youta's local OPML subscriptions.
-    pub channel_subscribed: bool,
-    /// Public channel subscriber count, when exposed by the provider.
-    pub channel_subscriber_count: Option<u64>,
-    /// Public channel video count, when exposed by the provider.
-    pub channel_video_count: Option<u64>,
-    /// Aggregate public channel view count, when exposed by the provider.
-    pub channel_total_view_count: Option<u64>,
-    /// Human-readable channel creation/joined date.
-    pub channel_created: String,
-    /// Provider-supplied channel country code or label.
-    pub channel_country: String,
-    /// Whether additional channel profile links exceeded a safety bound.
-    pub channel_links_truncated: bool,
-    /// Human-readable length.
-    pub length: String,
-    /// Description text.
-    pub description: String,
-    /// Full Last.fm artist biography discovered after local fingerprinting.
-    ///
-    /// This enrichment is kept separate from [`Self::description`] so a late
-    /// network completion cannot duplicate or overwrite rebuilt local metadata.
-    pub lastfm_artist_description: String,
-    /// Parsed timecode spans that can seek or start the selected media.
-    pub timecodes: Vec<DetailTimecodeView>,
-    /// Parsed `YouTube` video URLs that may replace Details internally.
-    pub video_links: Vec<DetailVideoLinkView>,
-    /// Public like count, formatted by the provider.
-    pub likes: String,
-    /// Public view count, formatted by the provider.
-    pub views: String,
-    /// Public top-level comment count, formatted by the provider.
-    pub comments: String,
-    /// Publication date.
-    pub published: String,
-    /// Provider-reported license.
-    pub license: String,
-    /// Whether the selected Radio station is stored in persistent favorites.
-    pub radio_favorite: bool,
-    /// Local playlists that currently contain this media item.
-    ///
-    /// The controller supplies display names in stable presentation order.
-    /// An empty list keeps the playlist metadata line out of Details.
-    pub playlist_names: Vec<String>,
-    /// Whether an exact private local note exists for this media or source.
-    ///
-    /// The note body deliberately remains outside `DetailView` so diagnostics
-    /// and debug snapshots cannot expose user-authored private text.
-    pub has_private_note: bool,
-    /// Lazy Wikidata lookup state or item link.
-    pub wikidata: String,
-    /// Selectable external links associated with this media item or channel.
-    pub links: Vec<DetailLinkView>,
-    /// Wikidata item whose property spoiler is currently expanded.
-    pub expanded_wikidata_item: Option<String>,
-    /// Wikidata item whose property request is in flight.
-    pub loading_wikidata_item: Option<String>,
-    /// Bounded, already-formatted Wikidata property spoilers.
-    pub wikidata_entities: Vec<DetailWikidataEntityView>,
-    /// Remote thumbnail URL consumed by the optional image renderer.
-    ///
-    /// The URL is never rendered as text. Unsupported terminals omit the
-    /// image without fetching it.
-    pub thumbnail_url: Option<url::Url>,
-    /// Largest provider-advertised image reserved for full-terminal expansion.
-    ///
-    /// The normal Details preview continues to use [`Self::thumbnail_url`],
-    /// which follows the configured YouTube size. Image-enabled renderers may
-    /// warm this separate target before the user clicks the visible preview.
-    pub expanded_thumbnail_url: Option<url::Url>,
-    /// Source pixel dimensions used to reserve an aspect-correct preview area.
-    pub thumbnail_dimensions: Option<(u32, u32)>,
-    /// Lazy midpoint-frame target for a selected local video.
-    pub local_video_thumbnail: Option<LocalVideoThumbnailView>,
-    /// Whether artwork occupies all remaining rows in the Details panel.
-    ///
-    /// This interaction-only state is never persisted. Selecting another item
-    /// constructs a fresh [`DetailView`] and restores the configured artwork
-    /// height.
-    pub thumbnail_expanded: bool,
-    /// Whether the selected local entry can be renamed in place.
-    pub local_renamable: bool,
-    /// Whether the selected local file or folder can enter the move workflow.
-    pub local_movable: bool,
-    /// Whether the selected local entry can be moved to recoverable Trash.
-    pub local_trashable: bool,
-    /// Whether the selected local audio file should offer fingerprinting.
-    ///
-    /// A successful identity-bound lookup, including one with no matches,
-    /// hides the action while its cached result remains projected in Details.
-    pub local_fingerprint_available: bool,
-    /// Whether the selected file owns an active fingerprint lookup.
-    pub local_fingerprint_pending: bool,
-}
-
-/// Current route inside the Subscriptions screen.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SubscriptionRoute {
-    /// Selectable OPML sources.
-    #[default]
-    Sources,
-    /// Videos belonging to the activated source.
-    Items,
-}
-
-/// Pane receiving list navigation in split Subscriptions mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SubscriptionPane {
-    /// The source list.
-    #[default]
-    Sources,
-    /// The selected source's media list.
-    Items,
-}
-
-/// Render-ready state owned by the Subscriptions screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubscriptionsView {
-    /// Configured navigation model.
-    pub layout: SubscriptionsLayout,
-    /// Active drill-down route.
-    pub route: SubscriptionRoute,
-    /// Selectable OPML sources in stable folder order.
-    pub sources: Vec<RowView>,
-    /// Selected source index.
-    pub selected_source: usize,
-    /// Videos loaded for the selected source.
-    pub items: Vec<RowView>,
-    /// Selected video index.
-    pub selected_item: usize,
-    /// List pane receiving `j`, `k`, and Enter in split mode.
-    pub focus: SubscriptionPane,
-    /// Whether split mode temporarily shows the selected item's Details.
-    pub description_expanded: bool,
-    /// Whether the selected source has a provider request in flight.
-    pub loading: bool,
-    /// Human-readable source name included in the item-list heading.
-    pub source_title: String,
-    /// Provider family controlling source-specific headings and actions.
-    pub source_kind: SubscriptionKind,
-    /// Public subscriber count for the selected source, when exposed.
-    pub source_subscriber_count: Option<u64>,
-    /// Human-readable channel creation date, when exposed.
-    pub source_created: String,
-}
-
-impl Default for SubscriptionsView {
-    fn default() -> Self {
-        Self {
-            layout: SubscriptionsLayout::default(),
-            route: SubscriptionRoute::Sources,
-            sources: Vec::new(),
-            selected_source: 0,
-            items: Vec::new(),
-            selected_item: 0,
-            focus: SubscriptionPane::Sources,
-            description_expanded: false,
-            loading: false,
-            source_title: String::new(),
-            source_kind: SubscriptionKind::YouTube,
-            source_subscriber_count: None,
-            source_created: String::new(),
-        }
-    }
-}
-
-/// Focused editor for adding one portable audio or video podcast feed.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct RssSubscriptionPopupView {
-    /// Draft absolute HTTP(S) RSS or Atom feed URL, potentially with a private
-    /// query token. Its custom [`std::fmt::Debug`] implementation redacts it.
-    pub url: String,
-    /// Validation or OPML-persistence failure retained inside the popup.
-    pub validation_error: Option<String>,
-    /// Exact private OPML file that receives the new subscription.
-    pub config_path: String,
-}
-
-impl std::fmt::Debug for RssSubscriptionPopupView {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RssSubscriptionPopupView")
-            .field("url", &"[REDACTED]")
-            .field(
-                "validation_error",
-                &self.validation_error.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("config_path", &self.config_path)
-            .finish()
-    }
-}
-
-/// Focused in-app editor for preferences that are implemented at runtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreferencesPopupView {
-    /// Draft Subscriptions layout saved only when the user confirms.
-    pub subscriptions_layout: SubscriptionsLayout,
-    /// Draft advertisement-chapter behavior saved only on confirmation.
-    pub skip_advertisement_chapters: bool,
-    /// Draft selected-video `YouTube` prewarming saved only on confirmation.
-    pub youtube_prewarm: bool,
-    /// Draft exact `YouTube` thumbnail size saved only on confirmation.
-    pub youtube_thumbnail_size: YouTubeThumbnailSize,
-    /// Draft lazy Local-folder size behavior saved only on confirmation.
-    pub show_local_folder_sizes: bool,
-    /// Draft physical-Linux-TTY artwork behavior saved only on confirmation.
-    pub show_images_in_tty: bool,
-    /// Draft preferred Bandcamp playback encoding.
-    pub bandcamp_audio_format: BandcampAudioFormat,
-    /// Exact private TOML file updated by the save action.
-    pub config_path: String,
-    /// Environment variable shadowing the TOML value, when present.
-    pub environment_override: Option<String>,
-    /// Save or validation failure kept inside the popup.
-    pub validation_error: Option<String>,
-}
-
-/// Playable selected item for which playlist actions are available.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlaylistItemView {
-    /// Stable identity used to verify that Details actions target displayed media.
-    pub media_id: MediaId,
-    /// Human-readable item title shown in the playlist chooser.
-    pub title: String,
-    /// Whether the reserved `todo` playlist currently contains the item.
-    pub in_todo: bool,
-}
-
-/// Focused multiline editor for one private local note.
-///
-/// The body has a custom redacted [`std::fmt::Debug`] representation because
-/// `ViewModel` is routinely included in test failures and may later be sampled
-/// while producing diagnostics.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct PrivateNotePopupView {
-    /// Human-readable media, channel, or podcast-show label.
-    pub target_label: String,
-    /// User-authored multiline plain text.
-    pub body: String,
-    /// UTF-8 byte offset at a grapheme boundary where edits are applied.
-    pub cursor_byte: usize,
-    /// First wrapped visual line requested for the editor viewport.
-    pub scroll_offset: usize,
-    /// Whether rendering should keep the insertion cursor inside the viewport.
-    pub follow_cursor: bool,
-    /// Whether a note existed when this editor opened.
-    pub existing: bool,
-    /// Whether Delete now awaits one explicit confirmation.
-    pub confirming_delete: bool,
-    /// Exact local state path used by the selected persistence backend.
-    pub storage_path: String,
-    /// Validation or persistence failure retained inside the editor.
-    pub validation_error: Option<String>,
-}
-
-impl std::fmt::Debug for PrivateNotePopupView {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PrivateNotePopupView")
-            .field("target_label", &self.target_label)
-            .field("body", &"[REDACTED]")
-            .field("cursor_byte", &self.cursor_byte)
-            .field("scroll_offset", &self.scroll_offset)
-            .field("follow_cursor", &self.follow_cursor)
-            .field("existing", &self.existing)
-            .field("confirming_delete", &self.confirming_delete)
-            .field("storage_path", &self.storage_path)
-            .field(
-                "validation_error",
-                &self.validation_error.as_ref().map(|_| "[REDACTED]"),
-            )
-            .finish()
-    }
-}
-
-/// Cursor movement inside the multiline private-note editor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrivateNoteCursorMotion {
-    /// Move to the preceding grapheme cluster.
-    Left,
-    /// Move to the following grapheme cluster.
-    Right,
-    /// Keep the visual column while moving to the preceding line.
-    Up,
-    /// Keep the visual column while moving to the following line.
-    Down,
-    /// Move to the start of the current line.
-    Home,
-    /// Move to the end of the current line.
-    End,
-}
-
-/// One local playlist shown in the membership chooser.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PlaylistChoiceView {
-    /// Stable controller-owned playlist identity.
-    pub playlist_id: String,
-    /// User-visible playlist name.
-    pub name: String,
-    /// Whether the selected playable item belongs to this playlist.
-    pub contains_item: bool,
-}
-
-/// Active route inside the playlist chooser/editor popup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PlaylistPopupMode {
-    /// Browse playlists and toggle the selected item's membership.
-    #[default]
-    Choose,
-    /// Create a playlist and add the selected item to it.
-    Create,
-    /// Rename or describe an existing playlist without changing its identity.
-    Edit,
-}
-
-/// Focused field inside the playlist create/edit form.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PlaylistEditorField {
-    /// Required playlist display name.
-    #[default]
-    Name,
-    /// Optional playlist description.
-    Description,
-}
-
-/// Controller-owned local-playlist chooser and create/edit form.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlaylistPopupView {
-    /// Selected playable item whose membership is being edited.
-    pub item_title: String,
-    /// Stable playlist rows with current membership exposed immediately.
-    pub playlists: Vec<PlaylistChoiceView>,
-    /// Selected playlist row in [`Self::playlists`].
-    pub selected: usize,
-    /// Chooser, creation, or editing route.
-    pub mode: PlaylistPopupMode,
-    /// Stable identity retained while editing an existing playlist.
-    ///
-    /// This remains `None` for the chooser and new-playlist form. In
-    /// particular, editing the reserved `todo` playlist changes only its
-    /// display fields, never the identity used by the quick action.
-    pub editing_playlist_id: Option<String>,
-    /// Editor field currently receiving printable characters.
-    pub editor_field: PlaylistEditorField,
-    /// Draft required display name.
-    pub editor_name: String,
-    /// Draft optional description; an empty value represents `None`.
-    pub editor_description: String,
-    /// Maximum UTF-8 bytes accepted in the name.
-    pub name_limit: usize,
-    /// Maximum user-visible characters accepted in the description.
-    pub description_limit: usize,
-    /// Validation or persistence failure retained inside the popup.
-    pub validation_error: Option<String>,
-}
-
-impl Default for PlaylistPopupView {
-    fn default() -> Self {
-        Self {
-            item_title: String::new(),
-            playlists: Vec::new(),
-            selected: 0,
-            mode: PlaylistPopupMode::Choose,
-            editing_playlist_id: None,
-            editor_field: PlaylistEditorField::Name,
-            editor_name: String::new(),
-            editor_description: String::new(),
-            name_limit: 256,
-            description_limit: 1_000,
-            validation_error: None,
-        }
-    }
-}
-
-/// Explicit local or downloaded-file mutation awaiting input or confirmation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalFilePopupView {
-    /// Same-directory rename with an editable basename.
-    Rename {
-        /// Draft basename.
-        value: String,
-        /// UTF-8 byte offset at a grapheme boundary where edits are applied.
-        cursor_byte: usize,
-        /// Validation or filesystem failure retained in the popup.
-        error: Option<String>,
-    },
-    /// Recoverable move-to-Trash confirmation.
-    Trash {
-        /// Exact display basename being removed from the current folder.
-        name: String,
-        /// Full source path passed to the system Trash backend after confirmation.
-        path: String,
-        /// Filesystem failure retained in the popup.
-        error: Option<String>,
-    },
-    /// Recoverable move-to-Trash confirmation for an offline download.
-    DownloadedTrash {
-        /// Exact display basename being removed from the downloads directory.
-        name: String,
-        /// Full source path passed to the system Trash backend after confirmation.
-        path: String,
-        /// Filesystem failure retained in the popup.
-        error: Option<String>,
-    },
-    /// Destination browser for one or more explicitly selected Local entries.
-    Move {
-        /// Lossy display names of the source entries, bounded by the controller.
-        source_names: Vec<String>,
-        /// Canonical directory that would receive the selected sources.
-        destination: String,
-        /// Parent and real child directories available for navigation.
-        directories: Vec<LocalMoveDestinationView>,
-        /// Selected destination-browser row.
-        selected: usize,
-        /// Whether a background directory listing is in flight.
-        pending: bool,
-        /// Validation or filesystem failure retained in the popup.
-        error: Option<String>,
-    },
-}
-
-/// One exact destination-browser row inside the Local Move popup.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalMoveDestinationView {
-    /// Human-readable basename, or `..` for the canonical parent.
-    pub name: String,
-    /// Canonical directory selected when this row is activated.
-    pub path: String,
-}
-
-/// One selectable timecode span inside the original Details description.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailTimecodeView {
-    /// Inclusive UTF-8 byte offset in [`DetailView::description`].
-    pub start_byte: usize,
-    /// Exclusive UTF-8 byte offset in [`DetailView::description`].
-    pub end_byte: usize,
-    /// Absolute playback destination in seconds.
-    pub seconds: u64,
-    /// Whether this timestamp starts a parsed line-leading chapter.
-    pub is_chapter: bool,
-}
-
-/// One `YouTube` video URL followed by an internal-navigation action.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailVideoLinkView {
-    /// Inclusive UTF-8 byte offset of the source URL.
-    pub start_byte: usize,
-    /// Exclusive UTF-8 byte offset of the source URL.
-    pub end_byte: usize,
-    /// Stable eleven-character `YouTube` video identifier.
-    pub video_id: String,
-    /// Optional initial position encoded in the URL.
-    pub start_seconds: Option<u64>,
-}
-
-/// One selectable external link displayed in a details or channel panel.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailLinkView {
-    /// Plain, non-clickable text rendered immediately before the link value.
-    pub prefix: String,
-    /// Human-readable link label, such as a Wikidata item name.
-    pub label: String,
-    /// Absolute URL passed to the controller when the link is activated.
-    pub url: String,
-    /// Exact Wikidata Q-ID when this link owns a lazy property spoiler.
-    pub wikidata_item_id: Option<String>,
-    /// Provider-selected text and spacing treatment for this link.
-    pub presentation: DetailLinkPresentation,
-    /// Optional exact destination opened inside Youta by the adjacent marker.
-    pub internal_target: Option<DetailLinkInternalTarget>,
-}
-
-/// Exact provider destination exposed by one Details-row internal-link marker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DetailLinkInternalTarget {
-    /// One stable Yandex Music artist identifier.
-    YandexMusicArtist(String),
-    /// One stable Yandex Music album, show, or audiobook identifier.
-    YandexMusicAlbum(String),
-    /// One stable numeric `LibriVox` author identifier.
-    LibriVoxAuthor(String),
-}
-
-impl DetailLinkInternalTarget {
-    /// Builds the semantic controller action dispatched by its one-cell marker.
-    fn action(&self) -> UiAction {
-        match self {
-            Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
-            Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
-            Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
-        }
-    }
-}
-
-/// Text and vertical-spacing treatment for one external Details link.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DetailLinkPresentation {
-    /// Render the human label followed by an em dash and the URL.
-    #[default]
-    LabelAndUrl,
-    /// Render the human label and URL, then reserve one non-clickable row.
-    LabelAndUrlSpaced,
-    /// Render only the human-readable label.
-    LabelOnly,
-    /// Render only the label and reserve one non-clickable row after it.
-    LabelOnlySpaced,
-    /// Render only the URL.
-    UrlOnly,
-    /// Render only the URL and reserve one non-clickable row after it.
-    UrlOnlySpaced,
-}
-
-/// Bounded human-facing Wikidata properties cached for one Details page.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailWikidataEntityView {
-    /// Exact Wikidata Q-ID represented by this spoiler.
-    pub item_id: String,
-    /// Preformatted, scrollable property/value text.
-    pub text: String,
-    /// Item-valued statement spans that open canonical Wikidata pages.
-    pub value_links: Vec<DetailWikidataValueLinkView>,
-    /// Play/pause controls for supported Commons audio and video values.
-    pub media_controls: Vec<DetailWikidataMediaView>,
-    /// First Commons P18 preview retained for the expanded property spoiler.
-    ///
-    /// Keeping one preview bounds rendering and memory work. It is used only as
-    /// a fallback when no primary provider artwork exists and never replaces
-    /// YouTube or other source artwork. Every P18 value remains readable and
-    /// clickable in [`Self::text`].
-    pub image_url: Option<url::Url>,
-}
-
-/// One playable Commons value embedded in expanded Wikidata text.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DetailWikidataMediaView {
-    /// Inclusive byte offset of the fixed-width play/pause marker.
-    pub marker_start_byte: usize,
-    /// Exclusive byte offset of the fixed-width play/pause marker.
-    pub marker_end_byte: usize,
-    /// Stable Commons identity used to match current playback.
-    pub media_id: MediaId,
-    /// Audio or video classification supplied by the Wikidata provider.
-    pub kind: MediaKind,
-    /// Human-facing Commons filename used as the player title.
-    pub title: String,
-    /// Canonical Commons file page retained for navigation and history.
-    pub webpage_url: url::Url,
-    /// Stable credential-free Commons file redirect passed to playback.
-    pub playback_url: url::Url,
-}
-
-/// One clickable item, identifier, Commons page, or Wikipedia article inside
-/// expanded Wikidata details.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DetailWikidataValueLinkView {
-    /// Inclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
-    pub start_byte: usize,
-    /// Exclusive UTF-8 byte offset in [`DetailWikidataEntityView::text`].
-    pub end_byte: usize,
-    /// Validated credential-free HTTP(S) target supplied by the provider.
-    pub url: String,
-}
-
-/// One terminal-cell position inside the visible, selectable Details text.
-///
-/// Rows are semantic selectable rows, not absolute terminal rows. This keeps
-/// the selection confined to rendered metadata, links, and description text
-/// while excluding the other pane, pane headings, controls, and thumbnail cells.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DetailsTextPosition {
-    /// Zero-based selectable row in the currently visible Details content.
-    pub row: usize,
-    /// Zero-based terminal-cell column inside that row.
-    pub column: usize,
-}
-
-/// Current Youta-owned drag selection in the Details panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DetailsTextSelection {
-    /// Position where the current drag started.
-    pub anchor: DetailsTextPosition,
-    /// Most recent clipped pointer position.
-    pub focus: DetailsTextPosition,
-    /// Whether a left-button drag is still in progress.
-    pub dragging: bool,
-}
-
-/// Diagnostic information shown above the normal interface after an error.
-///
-/// `report` contains the complete, copyable diagnostic report rather than a
-/// shortened user-facing message. The controller owns `scroll_offset` so the
-/// position survives terminal redraws and resize events.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ErrorPopupView {
-    /// Short error title displayed in the popup border.
-    pub title: String,
-    /// Complete report, including the stack trace and environment information.
-    pub report: String,
-    /// Zero-based wrapped-line offset at the top of the viewport.
-    pub scroll_offset: usize,
-    /// Whether the GitHub CLI is available for pre-filling a new issue.
-    pub gh_available: bool,
-    /// Result of the most recent copy or issue-review action.
-    pub action_status: Option<String>,
-}
-
-/// One public top-level comment rendered in the selected-video popup.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VideoCommentView {
-    /// Public author display name.
-    pub author_name: String,
-    /// Public like count attached to the comment.
-    pub like_count: u64,
-    /// Human-readable publication date, when exposed by the provider.
-    pub published: Option<String>,
-    /// Provider-supplied plain-text body.
-    pub text: String,
-}
-
-/// Explicit loading state for the bounded public-comments popup.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum VideoCommentsPopupState {
-    /// The provider worker is loading comments.
-    #[default]
-    Loading,
-    /// One or more comments are ready for display.
-    Ready,
-    /// The provider returned a successful empty result.
-    Empty,
-    /// The provider request failed without closing the popup.
-    Error(String),
-}
-
-/// Scrollable public comments for one exact selected YouTube video.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VideoCommentsPopupView {
-    /// Stable provider video identifier that owns this popup.
-    pub video_id: String,
-    /// Human-readable selected video title.
-    pub video_title: String,
-    /// Explicit request/result state.
-    pub state: VideoCommentsPopupState,
-    /// At most twenty bounded public top-level comments.
-    pub comments: Vec<VideoCommentView>,
-    /// Zero-based wrapped-line offset at the top of the viewport.
-    pub scroll_offset: usize,
-}
-
-/// Offline QR representation of one exact selected YouTube video.
-#[cfg(feature = "qr")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoQrPopupView {
-    /// Stable provider video identifier that owns this popup.
-    pub video_id: String,
-    /// Human-readable selected video title retained for controller ownership checks.
-    pub video_title: String,
-    /// Full canonical YouTube watch URL encoded into [`Self::matrix`].
-    pub url: String,
-    /// Provider-independent QR modules generated once when the popup opens.
-    pub matrix: QrMatrix,
-}
-
-/// One source-control commit rendered in the offline-first project-history popup.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProjectCommitView {
-    /// Complete hexadecimal object identifier.
-    pub hash: String,
-    /// ISO-8601 commit timestamp retained from the build or GitHub response.
-    pub committed_at: String,
-    /// Complete multiline commit message, including its body and trailers.
-    pub message: String,
-}
-
-/// State of the one-per-process GitHub history check.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum ProjectHistoryRemoteState {
-    /// Only deterministic build-time history is available.
-    #[default]
-    Embedded,
-    /// A background comparison against the repository's main branch is active.
-    Checking,
-    /// GitHub confirmed that no newer commits exist.
-    UpToDate,
-    /// Newer commits were merged into the process-local view.
-    Updated,
-    /// The online check failed; embedded history remains usable.
-    Unavailable(String),
-}
-
-/// Scrollable recent-project-history popup and runtime installation facts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProjectHistoryPopupView {
-    /// Newest-first embedded and optionally fetched commits, bounded to ten.
-    pub commits: Vec<ProjectCommitView>,
-    /// Full commit hash that produced this binary, when known.
-    pub current_hash: Option<String>,
-    /// Human-readable package/build origin.
-    pub installation: String,
-    /// Absolute executable path resolved by the running process.
-    pub executable_path: String,
-    /// Directory from which this process was launched.
-    pub started_in: String,
-    /// Optional source directory retained only for local builds.
-    pub build_source: Option<String>,
-    /// Status of the lazy online comparison.
-    pub remote_state: ProjectHistoryRemoteState,
-    /// Zero-based wrapped-line offset at the top of the viewport.
-    pub scroll_offset: usize,
-}
-
-/// Editable setup shown when a YouTube search needs provider credentials.
-///
-/// The API key remains in controller-owned memory while the popup is open.
-/// Rendering always masks it, including in test and alternate-screen buffers.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct YouTubeSetupPopupView {
-    /// Input currently receiving keyboard characters.
-    pub selected_field: YouTubeSetupField,
-    /// YouTube Data API key. The renderer never displays this value directly.
-    pub api_key: String,
-    /// Base URL of a user-selected Invidious instance.
-    pub invidious_url: String,
-    /// Exact private credentials path where an official API key is stored.
-    pub api_key_path: String,
-    /// Exact general configuration path where an Invidious URL is stored.
-    pub invidious_path: String,
-    /// Actionable validation or provider-construction failure, when present.
-    pub validation_error: Option<String>,
-}
-
-impl std::fmt::Debug for YouTubeSetupPopupView {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("YouTubeSetupPopupView")
-            .field("selected_field", &self.selected_field)
-            .field("api_key", &"[REDACTED]")
-            .field("invidious_url", &self.invidious_url)
-            .field("api_key_path", &self.api_key_path)
-            .field("invidious_path", &self.invidious_path)
-            .field("validation_error", &self.validation_error)
-            .finish()
-    }
-}
-
-/// Masked OAuth-token editor for the optional Yandex Music source.
-///
-/// The token remains controller-owned while the popup is open. Rendering and
-/// debug output expose only a fixed redaction marker.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct YandexMusicSetupPopupView {
-    /// Yandex OAuth access token. The renderer never displays this value.
-    pub token: String,
-    /// Exact private credentials path where the token will be stored.
-    pub token_path: String,
-    /// A candidate token is being validated before it can replace durable state.
-    pub validating: bool,
-    /// Actionable validation or provider-construction failure, when present.
-    pub validation_error: Option<String>,
-}
-
-impl std::fmt::Debug for YandexMusicSetupPopupView {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("YandexMusicSetupPopupView")
-            .field("token", &"[REDACTED]")
-            .field("token_path", &self.token_path)
-            .field("validating", &self.validating)
-            .field("validation_error", &self.validation_error)
-            .finish()
-    }
-}
-
-/// Selectable credential field in the YouTube provider setup popup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum YouTubeSetupField {
-    /// Official YouTube Data API key.
-    #[default]
-    ApiKey,
-    /// Invidious instance base URL.
-    InvidiousUrl,
-}
-
-/// Progress and completion information for one supervised media download.
-///
-/// Only one download can be active at a time. A completed view remains visible
-/// until another download starts so the destination path is easy to inspect.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DownloadView {
-    /// Human-readable title of the selected remote media.
-    pub title: String,
-    /// Bytes written so far.
-    pub downloaded_bytes: u64,
-    /// Exact or extractor-estimated total byte count.
-    pub total_bytes: Option<u64>,
-    /// Current transfer speed, rounded to bytes per second.
-    pub bytes_per_second: Option<u64>,
-    /// Estimated seconds remaining.
-    pub eta_seconds: Option<u64>,
-    /// Whether the supervised child process is still running.
-    pub active: bool,
-    /// Confined final media path reported after post-processing.
-    pub completed_path: Option<String>,
-}
-
-/// A live Radio stream capture that remains private until it is finalized.
-///
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RadioRecordingView {
-    /// Stable curated-station identifier owning this capture.
-    pub station_id: String,
-    /// Human-readable station name shown beside the recording marker.
-    pub station_name: String,
-}
-
-/// Complete immutable view rendered for one frame.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ViewModel {
-    /// Active screen.
-    pub screen: Screen,
-    /// Whether text typed by the user edits the search query.
-    pub search_editing: bool,
-    /// Current search query.
-    pub search_query: String,
-    /// UTF-8 byte position of the search editor's insertion cursor.
-    pub search_cursor_byte: usize,
-    /// Canonical folder displayed by the Local screen.
-    pub local_path: String,
-    /// Whether the default YouTube search targets videos or channels.
-    pub search_kind: SearchKind,
-    /// Ordering applied to every page of the current YouTube search.
-    pub youtube_search_sort: YouTubeSearchSort,
-    /// Whether `YouTube` video searches require a Creative Commons licence.
-    ///
-    /// Channel searches retain this preference but do not send a video-only
-    /// licence filter to the configured provider.
-    pub youtube_creative_commons_only: bool,
-    /// Exact category queried by the Yandex Music tab.
-    pub yandex_music_search_kind: YandexMusicSearchKind,
-    /// Active recommendations, search, or album route in the Yandex Music tab.
-    pub yandex_music_route: YandexMusicRouteView,
-    /// Submitted provider search that has not reached a terminal response.
-    pub search_activity: Option<SearchActivity>,
-    /// Whether a foreground Local directory listing is awaiting its response.
-    pub local_browse_pending: bool,
-    /// Whether selected Local artwork is awaiting background extraction.
-    pub local_artwork_pending: bool,
-    /// Monotonic frame counter for explicit local-audio fingerprinting.
-    pub local_fingerprint_animation_frame: usize,
-    /// Monotonic frame counter for the active ASCII search animation.
-    pub search_animation_frame: usize,
-    /// Whether accepted media is waiting for authoritative playback start.
-    pub playback_starting: bool,
-    /// Monotonic frame counter for the ASCII playback-start animation.
-    pub playback_start_animation_frame: usize,
-    /// Media whose backend emitted `PlaybackStarted`, including while paused.
-    pub playing_media_id: Option<MediaId>,
-    /// Rows on the active screen.
-    pub rows: Vec<RowView>,
-    /// Selected row index.
-    pub selected: usize,
-    /// Selected item details.
-    pub details: Option<DetailView>,
-    /// Dedicated Subscriptions navigation and list state.
-    pub subscriptions: SubscriptionsView,
-    /// Whether Youta confines mouse-drag selection to visible Details text.
-    pub text_selection_mode: bool,
-    /// Active or most recently copied Details text range.
-    pub details_text_selection: Option<DetailsTextSelection>,
-    /// Whether the right-hand Details or Channel panel has explicit focus.
-    pub details_focused: bool,
-    /// Requested vertical scroll offset inside the focused details text.
-    ///
-    /// The renderer clamps this value to the current wrapped content and
-    /// viewport, which can change after a resize.
-    pub details_scroll: usize,
-    /// Selected external-link index, or `None` before link navigation begins.
-    pub selected_detail_link: Option<usize>,
-    /// Selected Commons media control inside the expanded Wikidata spoiler.
-    pub selected_wikidata_media: Option<usize>,
-    /// Selected right-panel mode.
-    pub right_panel_mode: RightPanelMode,
-    /// Whether the local waveform replaces the normal player seek bar.
-    pub waveform_visible: bool,
-    /// Owner-aware local waveform generation and peak state.
-    pub waveform: WaveformView,
-    /// Whether the active backend loaded the exact file identity behind the waveform.
-    pub waveform_playback_matches: bool,
-    /// Current player state.
-    pub playback: PlaybackStatus,
-    /// Best-effort current programme or track for the playing radio station.
-    ///
-    /// Fresh provider metadata is preferred; the player may supply ICY
-    /// metadata as a fallback without replacing the stable station title.
-    pub radio_now_playing: Option<String>,
-    /// Active original-quality Radio capture, if one is being staged privately.
-    pub radio_recording: Option<RadioRecordingView>,
-    /// Chapters inferred for the authoritative playing media.
-    pub playback_chapters: Vec<Chapter>,
-    /// Whether chapter labels include their timestamps.
-    pub show_chapter_timestamps: bool,
-    /// Whether exact `Реклама` chapters are hidden from navigation and skipped.
-    pub skip_advertisement_chapters: bool,
-    /// Local file-browser ordering by known file and lazy folder sizes.
-    pub local_size_sort: LocalSizeSort,
-    /// Whether Local includes unsupported regular files alongside media.
-    pub show_all_local_files: bool,
-    /// Ordering applied to the built-in Radio station catalogue.
-    pub radio_sort: RadioSort,
-    /// Whether recursive Local-folder sizes and size ordering are available.
-    pub local_folder_sizes_enabled: bool,
-    /// Whether a physical Linux TTY may render half-block artwork.
-    pub show_images_in_tty: bool,
-    /// Selected playable item for which quick and general playlist actions apply.
-    pub playlist_item: Option<PlaylistItemView>,
-    /// Whether the selected Playlists-screen row can open the shared editor.
-    pub playlist_edit_available: bool,
-    /// Whether the Playlists screen is showing entries that can return to its index.
-    pub playlist_back_available: bool,
-    /// Whether EOF continues with the next playable same-source list entry.
-    pub autoplay: bool,
-    /// Repeat-current-item state.
-    pub repeating: bool,
-    /// Status or error message.
-    pub status_line: String,
-    /// One short-lived notice replacing the footer controls for one line.
-    ///
-    /// This is intentionally separate from [`Self::status_line`]: routine
-    /// status changes must not accidentally keep or replace a timed notice.
-    pub transient_footer_notice: Option<String>,
-    /// Whether the help overlay is open.
-    pub help_open: bool,
-    /// Offline-first recent commit history and runtime provenance.
-    pub project_history_popup: Option<ProjectHistoryPopupView>,
-    /// Whether this terminal attachment can launch a graphical external opener.
-    pub external_opener_available: bool,
-    /// Whether output is attached directly to a Linux virtual console.
-    ///
-    /// Linux consoles simulate italic and dim text by changing palette colors,
-    /// so renderers use this flag to avoid unstable text styling.
-    pub physical_linux_console: bool,
-    /// Scrollable diagnostic popup, when a recoverable error is being reported.
-    pub error_popup: Option<ErrorPopupView>,
-    /// Whether the selected YouTube video supports loading public comments.
-    pub video_comments_available: bool,
-    /// Scrollable bounded public-comments popup.
-    pub video_comments_popup: Option<VideoCommentsPopupView>,
-    /// Offline QR code for the exact selected YouTube video.
-    #[cfg(feature = "qr")]
-    pub video_qr_popup: Option<VideoQrPopupView>,
-    /// Editable provider setup shown after an unavailable YouTube operation.
-    pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
-    /// Editable OAuth-token setup for the optional Yandex Music source.
-    pub yandex_music_setup_popup: Option<YandexMusicSetupPopupView>,
-    /// Focused RSS/Atom podcast-subscription editor.
-    pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
-    /// Focused runtime preferences editor.
-    pub preferences_popup: Option<PreferencesPopupView>,
-    /// Focused local-playlist chooser or create/edit form.
-    pub playlist_popup: Option<PlaylistPopupView>,
-    /// Focused private-note editor.
-    pub private_note_popup: Option<PrivateNotePopupView>,
-    /// Whether the current selection resolves to a note-capable exact target.
-    pub private_note_available: bool,
-    /// Selection-sensitive actions for the Yandex Music tab.
-    pub yandex_music_actions: YandexMusicActionsView,
-    /// Explicit rename, move, or recoverable Trash confirmation for a local file.
-    pub local_file_popup: Option<LocalFilePopupView>,
-    /// Active or most recently completed supervised download.
-    pub download: Option<DownloadView>,
-    /// Whether the controller has requested application shutdown.
-    pub quitting: bool,
-}
-
-impl Default for ViewModel {
-    fn default() -> Self {
-        Self {
-            screen: Screen::Search,
-            search_editing: false,
-            search_query: String::new(),
-            search_cursor_byte: 0,
-            local_path: String::new(),
-            search_kind: SearchKind::Videos,
-            youtube_search_sort: YouTubeSearchSort::Relevance,
-            youtube_creative_commons_only: false,
-            yandex_music_search_kind: YandexMusicSearchKind::All,
-            yandex_music_route: YandexMusicRouteView::Recommendations,
-            search_activity: None,
-            local_browse_pending: false,
-            local_artwork_pending: false,
-            local_fingerprint_animation_frame: 0,
-            search_animation_frame: 0,
-            playback_starting: false,
-            playback_start_animation_frame: 0,
-            playing_media_id: None,
-            rows: Vec::new(),
-            selected: 0,
-            details: None,
-            subscriptions: SubscriptionsView::default(),
-            text_selection_mode: false,
-            details_text_selection: None,
-            details_focused: false,
-            details_scroll: 0,
-            selected_detail_link: None,
-            selected_wikidata_media: None,
-            right_panel_mode: RightPanelMode::Details,
-            waveform_visible: false,
-            waveform: WaveformView::Unavailable,
-            waveform_playback_matches: false,
-            playback: PlaybackStatus::default(),
-            radio_now_playing: None,
-            radio_recording: None,
-            playback_chapters: Vec::new(),
-            show_chapter_timestamps: false,
-            skip_advertisement_chapters: true,
-            local_size_sort: LocalSizeSort::Off,
-            show_all_local_files: false,
-            radio_sort: RadioSort::Name,
-            local_folder_sizes_enabled: true,
-            show_images_in_tty: true,
-            playlist_item: None,
-            playlist_edit_available: false,
-            playlist_back_available: false,
-            autoplay: false,
-            repeating: false,
-            status_line: "Press / to search or ? for help".to_owned(),
-            transient_footer_notice: None,
-            help_open: false,
-            project_history_popup: None,
-            external_opener_available: true,
-            physical_linux_console: false,
-            error_popup: None,
-            video_comments_available: false,
-            video_comments_popup: None,
-            #[cfg(feature = "qr")]
-            video_qr_popup: None,
-            youtube_setup_popup: None,
-            yandex_music_setup_popup: None,
-            rss_subscription_popup: None,
-            preferences_popup: None,
-            playlist_popup: None,
-            private_note_popup: None,
-            private_note_available: false,
-            yandex_music_actions: YandexMusicActionsView::default(),
-            local_file_popup: None,
-            download: None,
-            quitting: false,
-        }
-    }
-}
-
-/// Relative or absolute movement inside a diagnostic error report.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorPopupScroll {
-    /// Move by a signed number of wrapped text lines.
-    Lines(i32),
-    /// Move by a signed number of visible pages.
-    Pages(i32),
-    /// Jump to the beginning of the report.
-    Home,
-    /// Jump to the end of the report.
-    End,
-}
-
-/// Relative or absolute movement inside the Details panel text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetailsScroll {
-    /// Move by a signed number of wrapped text lines.
-    Lines(i32),
-    /// Move by a signed number of text pages.
-    Pages(i32),
-    /// Jump to the beginning of the text.
-    Home,
-    /// Jump to the end of the text.
-    End,
-}
-
-/// Semantic action emitted by keyboard or mouse input.
-#[derive(Clone, Debug, PartialEq)]
-pub enum UiAction {
-    /// Exit Youta after saving state.
-    Quit,
-    /// Record graphical-opener and physical-Linux-console capabilities.
-    SetExternalOpenerAvailable(bool),
-    /// Record the attached terminal window's current pixel dimensions.
-    SetTerminalWindowPixels {
-        /// Independently reported pixel width, when nonzero.
-        width: Option<u16>,
-        /// Independently reported pixel height, when nonzero.
-        height: Option<u16>,
-    },
-    /// Report that F8 retained its keyboard pointer without physical GPM input.
-    ReportGpmUnavailable {
-        /// Whether this binary was compiled with the GPM input adapter.
-        gpm_supported: bool,
-        /// Whether OpenRC manages the system.
-        openrc_managed: bool,
-    },
-    /// Open or close the help overlay.
-    ToggleHelp,
-    /// Open the offline-first recent project-history popup.
-    OpenProjectHistory,
-    /// Set the exact renderer-clamped project-history line offset.
-    SetProjectHistoryScroll(usize),
-    /// Close the project-history popup without changing the active screen.
-    DismissProjectHistory,
-    /// Switch to a top-level screen.
-    ShowScreen(Screen),
-    /// Enter search-query editing mode.
-    BeginSearch,
-    /// Cancel search-query editing.
-    CancelSearch,
-    /// Insert one character at the query cursor.
-    AppendSearch(char),
-    /// Move the query insertion cursor by one displayed grapheme.
-    MoveSearchCursor(i8),
-    /// Remove the query grapheme immediately before the insertion cursor.
-    DeleteSearchCharacter,
-    /// Delete the Vim-style word before the search cursor.
-    DeleteSearchWord,
-    /// Submit the current query.
-    SubmitSearch,
-    /// Switch the default YouTube search between videos and channels.
-    ToggleSearchKind,
-    /// Switch YouTube search between relevance and newest-first ordering.
-    ToggleYouTubeSearchSort,
-    /// Restrict `YouTube` video search to Creative Commons-licensed results.
-    ToggleYouTubeCreativeCommons,
-    /// Cycle Yandex Music search through music, podcasts, and audiobooks.
-    CycleYandexMusicSearchKind,
-    /// Toggle the selected Yandex Music track's liked state.
-    ToggleYandexMusicLike,
-    /// Toggle the selected Yandex Music track's disliked state.
-    ToggleYandexMusicDislike,
-    /// Open the selected row's primary artist inside Youta.
-    OpenYandexMusicArtist,
-    /// Open the selected track's album or selected album row.
-    OpenYandexMusicAlbum,
-    /// Open one exact Yandex Music artist selected from a Details link.
-    OpenYandexMusicArtistById(String),
-    /// Open one exact Yandex Music album selected from a Details link.
-    OpenYandexMusicAlbumById(String),
-    /// Open one exact `LibriVox` author selected from a Details link.
-    OpenLibriVoxAuthorById(String),
-    /// Download every track in the currently opened or selected album.
-    DownloadYandexMusicAlbum,
-    /// Download the first twenty current My Wave recommendations.
-    DownloadTwentyYandexMusicRecommendations,
-    /// Move list selection by a signed row count.
-    MoveSelection(i32),
-    /// Select an exact row.
-    SelectRow(usize),
-    /// Activate the selected row.
-    ActivateSelection,
-    /// Select the active queue item and show its description.
-    ShowNowPlaying,
-    /// Move the external-link selection by a signed row count.
-    MoveDetailLink(i32),
-    /// Select an exact external link without opening it.
-    SelectDetailLink(usize),
-    /// Ask the controller to open an exact external link.
-    ActivateDetailLink(usize),
-    /// Expand or collapse lazy Wikidata properties for an external-link row.
-    ToggleWikidataStatements(usize),
-    /// Open one validated Wikidata item, identifier, Commons page, or
-    /// Wikipedia article.
-    OpenWikidataValue(String),
-    /// Move the selected Commons media control inside expanded Wikidata.
-    MoveWikidataMedia(i32),
-    /// Start or pause one indexed Commons media value in expanded Wikidata.
-    ActivateWikidataMedia(usize),
-    /// Give or remove explicit keyboard focus from the Details panel.
-    SetDetailsFocus(bool),
-    /// Toggle artwork between its configured size and the remaining Details area.
-    ToggleThumbnailExpansion,
-    /// Scroll the focused or pointer-targeted Details panel.
-    ScrollDetails(DetailsScroll),
-    /// Set the Details panel to an exact renderer-clamped wrapped-line offset.
-    SetDetailsScroll(usize),
-    /// Toggle Youta-owned mouse selection for text in the Details panel.
-    ToggleTextSelectionMode,
-    /// Start a text selection at an exact visible Details position.
-    BeginDetailsTextSelection(DetailsTextPosition),
-    /// Extend the current selection to a clipped visible Details position.
-    UpdateDetailsTextSelection(DetailsTextPosition),
-    /// Finish the selection and copy exactly the supplied visible text.
-    FinishDetailsTextSelection {
-        /// Final clipped position.
-        focus: DetailsTextPosition,
-        /// Bounded text reconstructed from selectable Details rows.
-        text: String,
-    },
-    /// Subscribe to or unsubscribe from the displayed channel in local OPML.
-    ToggleSubscription,
-    /// Toggle pause in the invisible playback backend.
-    TogglePause,
-    /// Seek by a signed number of seconds.
-    SeekRelative(i64),
-    /// Seek to a percentage from `0.0` to `100.0`.
-    SeekPercent(f64),
-    /// Seek within, or start, the media owning a description timecode.
-    ActivateTimecode {
-        /// Media identity captured when the timecode was rendered.
-        media_id: MediaId,
-        /// Absolute playback destination in seconds.
-        seconds: u64,
-    },
-    /// Seek within, or start, the exact local file generation owning a waveform.
-    ActivateWaveformTimecode {
-        /// Media identity captured when the waveform was rendered.
-        media_id: MediaId,
-        /// Controller generation identifying the waveform's exact file identity.
-        generation: u64,
-        /// Absolute playback destination in seconds.
-        seconds: u64,
-    },
-    /// Replace Details with a `YouTube` video referenced by its description.
-    ActivateDescriptionVideo {
-        /// Stable eleven-character `YouTube` video identifier.
-        video_id: String,
-        /// Optional initial position encoded in the source URL.
-        start_seconds: Option<u64>,
-    },
-    /// Change volume by a signed percentage.
-    ChangeVolume(i8),
-    /// Change playback speed by a signed multiplier step.
-    ChangeSpeed(f64),
-    /// Select the previous or next chapter.
-    ChangeChapter(i32),
-    /// Toggle timestamps inside chapter labels without changing seek targets.
-    ToggleChapterTimestamps,
-    /// Open or close the selected playable local file's waveform.
-    ToggleWaveform,
-    /// Fingerprint the selected local audio file and query AcoustID.
-    FingerprintLocalAudio,
-    /// Toggle repeat-current-item.
-    ToggleRepeat,
-    /// Toggle automatic continuation within the active source list.
-    ToggleAutoplay,
-    /// Cycle Local entry ordering through off, ascending, and descending size.
-    ToggleLocalSizeSort,
-    /// Toggle unsupported regular files in the Local listing.
-    ToggleLocalAllFiles,
-    /// Cycle Radio stations through name and known-bitrate orderings.
-    CycleRadioSort,
-    /// Toggle the selected Radio station in persistent favorites.
-    ToggleRadioFavorite,
-    /// Start or stop original-quality capture of the currently playing Radio station.
-    ToggleRadioRecording,
-    /// Show information about the playing channel.
-    ShowChannel,
-    /// Open the parent of the currently displayed Local directory.
-    OpenLocalParent,
-    /// Return to the previous internal Details page or seek position.
-    GoBack,
-    /// Move forward to a Details page previously left with [`Self::GoBack`].
-    GoForward,
-    /// Queue the selected item immediately after the current item.
-    PlayNext,
-    /// Add the selected item to the current queue.
-    AddToQueue,
-    /// Toggle the selected playable item in the reserved `todo` playlist.
-    ToggleTodoPlaylist,
-    /// Open the general playlist-membership chooser for the selected item.
-    OpenPlaylistPopup,
-    /// Move the playlist chooser selection by a signed row count.
-    MovePlaylistPopupSelection(i32),
-    /// Select one exact playlist-membership row.
-    SelectPlaylistPopupRow(usize),
-    /// Toggle membership in the selected chooser row without closing it.
-    ToggleSelectedPlaylistMembership,
-    /// Replace the chooser with an empty new-playlist editor.
-    BeginNewPlaylist,
-    /// Open the shared editor for the selected Playlists-screen row.
-    EditSelectedPlaylist,
-    /// Give one create/edit field keyboard focus.
-    SelectPlaylistEditorField(PlaylistEditorField),
-    /// Append one printable character to the focused playlist editor field.
-    AppendPlaylistEditorCharacter(char),
-    /// Remove the final character from the focused playlist editor field.
-    DeletePlaylistEditorCharacter,
-    /// Delete the Vim-style word before the focused playlist editor cursor.
-    DeletePlaylistEditorWord,
-    /// Create a playlist and add the selected playable item to it.
-    CreatePlaylistAndAdd,
-    /// Save display-name and optional-description changes to one stable playlist.
-    UpdatePlaylist,
-    /// Return from the editor to its chooser, or close the playlist popup.
-    DismissPlaylistPopup,
-    /// Download the selected item.
-    Download,
-    /// Open the canonical item link in a browser.
-    OpenInBrowser,
-    /// Open the selected item's exact channel page in a browser.
-    OpenChannelInBrowser,
-    /// Copy the canonical item link.
-    CopyLink,
-    /// Edit a private local note.
-    EditPrivateNote,
-    /// Insert one printable character into the private-note editor.
-    AppendPrivateNoteCharacter(char),
-    /// Insert a line break into the private-note editor.
-    InsertPrivateNoteNewline,
-    /// Remove the grapheme immediately before the private-note cursor.
-    DeletePrivateNoteCharacter,
-    /// Delete the Vim-style word immediately before the private-note cursor.
-    DeletePrivateNoteWord,
-    /// Set the first wrapped visual line shown by the private-note editor.
-    SetPrivateNoteScroll(usize),
-    /// Move the private-note cursor without modifying its body.
-    MovePrivateNoteCursor(PrivateNoteCursorMotion),
-    /// Persist the private-note draft for its exact target.
-    SavePrivateNote,
-    /// Enter or complete private-note deletion confirmation.
-    RequestPrivateNoteDelete,
-    /// Close the private-note editor without saving.
-    DismissPrivateNotePopup,
-    /// Open equalizer controls.
-    OpenEqualizer,
-    /// Close the diagnostic error popup without changing the underlying screen.
-    DismissErrorPopup,
-    /// Open public top-level comments for the selected YouTube video.
-    OpenVideoComments,
-    /// Set the exact wrapped-line offset in the public-comments popup.
-    SetVideoCommentsScroll(usize),
-    /// Close the public-comments popup without changing Details.
-    DismissVideoComments,
-    /// Generate and show a QR code for the selected YouTube video.
-    #[cfg(feature = "qr")]
-    OpenVideoQr,
-    /// Close the selected-video QR popup without changing Details.
-    #[cfg(feature = "qr")]
-    DismissVideoQr,
-    /// Scroll the diagnostic report.
-    ScrollErrorPopup(ErrorPopupScroll),
-    /// Copy the complete diagnostic report.
-    CopyErrorReport,
-    /// Ask the GitHub CLI to open a pre-filled issue without submitting it.
-    FillGitHubIssue,
-    /// Copy the report and open the repository's new-issue page.
-    CopyAndOpenGitHubIssue,
-    /// Select the credential field edited by the YouTube setup popup.
-    SelectYouTubeSetupField(YouTubeSetupField),
-    /// Add one printable character to the selected YouTube setup field.
-    AppendYouTubeSetupCharacter(char),
-    /// Remove the last character from the selected YouTube setup field.
-    DeleteYouTubeSetupCharacter,
-    /// Delete the Vim-style word before the selected setup-field cursor.
-    DeleteYouTubeSetupWord,
-    /// Open Google's official `YouTube` API-key setup guide.
-    OpenYouTubeApiKeyGuide,
-    /// Open Google Cloud's API Credentials page.
-    OpenGoogleCloudCredentials,
-    /// Open the official Invidious public-instance list.
-    OpenInvidiousInstances,
-    /// Validate and save the selected YouTube provider configuration.
-    SubmitYouTubeSetup,
-    /// Close the YouTube setup popup without saving.
-    DismissYouTubeSetup,
-    /// Add one printable character to the masked Yandex Music OAuth token.
-    AppendYandexMusicTokenCharacter(char),
-    /// Remove the final token character.
-    DeleteYandexMusicTokenCharacter,
-    /// Delete the Vim-style word before the token cursor.
-    DeleteYandexMusicTokenWord,
-    /// Open Yandex's official OAuth overview.
-    OpenYandexOAuthGuide,
-    /// Validate and save the Yandex Music OAuth token.
-    SubmitYandexMusicSetup,
-    /// Close the Yandex Music setup popup without saving.
-    DismissYandexMusicSetup,
-    /// Open or focus the RSS/Atom podcast-feed editor.
-    OpenRssSubscriptionPopup,
-    /// Add one printable character to the draft RSS feed URL.
-    AppendRssSubscriptionCharacter(char),
-    /// Remove the last character from the draft RSS feed URL.
-    DeleteRssSubscriptionCharacter,
-    /// Delete the Vim-style word before the draft RSS feed cursor.
-    DeleteRssSubscriptionWord,
-    /// Validate and persist the draft RSS subscription.
-    SubmitRssSubscription,
-    /// Close the RSS subscription popup without saving.
-    DismissRssSubscriptionPopup,
-    /// Open the focused runtime preferences editor.
-    OpenPreferences,
-    /// Select one draft Subscriptions layout in the preferences editor.
-    SetSubscriptionsLayout(SubscriptionsLayout),
-    /// Toggle hiding and skipping exact `Реклама` chapters in the draft.
-    ToggleSkipAdvertisementChapters,
-    /// Toggle selected-video YouTube prewarming in the draft.
-    ToggleYouTubePrewarm,
-    /// Cycle the exact YouTube thumbnail size in the draft.
-    CycleYouTubeThumbnailSize,
-    /// Toggle lazy recursive Local-folder size measurement in the draft.
-    ToggleLocalFolderSizes,
-    /// Toggle half-block artwork on a physical Linux TTY in the draft.
-    ToggleTtyImages,
-    /// Cycle the preferred Bandcamp playback encoding in the draft.
-    CycleBandcampAudioFormat,
-    /// Persist the draft preference and close the editor.
-    SubmitPreferences,
-    /// Close the preferences editor without saving.
-    DismissPreferences,
-    /// Open a basename editor for the selected regular local file.
-    BeginLocalRename,
-    /// Add one printable character to the local rename basename.
-    AppendLocalRenameCharacter(char),
-    /// Move the local rename cursor by one signed grapheme.
-    MoveLocalRenameCursor(i8),
-    /// Remove the grapheme immediately before the local rename cursor.
-    DeleteLocalRenameCharacter,
-    /// Delete the Vim-style word immediately before the rename cursor.
-    DeleteLocalRenameWord,
-    /// Validate and execute the local rename.
-    SubmitLocalRename,
-    /// Ask for confirmation before moving the selected local entry to Trash.
-    RequestLocalTrash,
-    /// Move the selected local entry to recoverable system Trash.
-    ConfirmLocalTrash,
-    /// Ask for confirmation before moving the selected download to Trash.
-    RequestDownloadedTrash,
-    /// Move the selected download to recoverable system Trash.
-    ConfirmDownloadedTrash,
-    /// Open the destination chooser for marked entries or the current row.
-    BeginLocalMove,
-    /// Extend the Local move batch and selection by one signed row.
-    ExtendLocalMoveSelection(i32),
-    /// Select one exact row inside the Local Move destination browser.
-    SelectLocalMoveDestination(usize),
-    /// Move destination-browser selection by a signed row count.
-    MoveLocalMoveDestination(i32),
-    /// Open the selected parent or child directory in the Move popup.
-    ActivateLocalMoveDestination,
-    /// Move the validated source batch into the displayed destination.
-    ConfirmLocalMoveHere,
-    /// Close the local-entry popup without changing the filesystem.
-    DismissLocalFilePopup,
-    /// Select an exact subscription source row.
-    SelectSubscriptionSource(usize),
-    /// Select an exact subscription item row.
-    SelectSubscriptionItem(usize),
-    /// Toggle the selected subscription item's expanded description.
-    ToggleSubscriptionDescription,
-    /// Refresh page one for the active subscribed channel.
-    RefreshSubscriptionVideos,
-}
-
-impl UiAction {
-    /// Returns whether this action exists only to launch an external URL.
-    pub(crate) fn requires_external_opener(&self) -> bool {
-        matches!(
-            self,
-            Self::ActivateDetailLink(_)
-                | Self::OpenWikidataValue(_)
-                | Self::OpenInBrowser
-                | Self::OpenChannelInBrowser
-                | Self::CopyAndOpenGitHubIssue
-                | Self::OpenYouTubeApiKeyGuide
-                | Self::OpenGoogleCloudCredentials
-                | Self::OpenInvidiousInstances
-                | Self::OpenYandexOAuthGuide
-        )
-    }
-}
-
-/// Controller used by the generic terminal event loop.
-pub trait UiController {
-    /// Returns the view for the next frame.
-    fn view(&self) -> &ViewModel;
-
-    /// Applies one semantic user action.
-    fn dispatch(&mut self, action: UiAction);
-
-    /// Polls background workers and playback state.
-    fn tick(&mut self);
-
-    /// Takes one text-file command after an activation action planned it.
-    #[cfg(feature = "local-browser")]
-    fn take_text_file_open_plan(&mut self) -> Option<TextFileOpenPlan> {
-        None
-    }
-
-    /// Reports the result after the event loop safely handled terminal state.
-    #[cfg(feature = "local-browser")]
-    fn report_text_file_open_result(&mut self, _result: Result<TextFileOpenLifecycle, String>) {}
 }
 
 trait ThumbnailRenderer {
@@ -2135,6 +196,7 @@ struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
     mode: ThumbnailMode,
     cache_directory: Option<PathBuf>,
+    ffmpeg_executable: PathBuf,
     tty_images_enabled: bool,
     tty_image_policy_applies: bool,
     suspended_tty_manager: Option<ThumbnailManager>,
@@ -2158,6 +220,7 @@ impl TerminalThumbnailRenderer {
             manager,
             ThumbnailMode::Auto,
             None,
+            PathBuf::from("ffmpeg"),
             true,
             tty_image_policy_applies,
         )
@@ -2168,6 +231,7 @@ impl TerminalThumbnailRenderer {
         manager: ThumbnailManager,
         mode: ThumbnailMode,
         cache_directory: Option<PathBuf>,
+        ffmpeg_executable: PathBuf,
         tty_images_enabled: bool,
         tty_image_policy_applies: bool,
     ) -> Self {
@@ -2175,6 +239,7 @@ impl TerminalThumbnailRenderer {
             manager,
             mode,
             cache_directory,
+            ffmpeg_executable,
             tty_images_enabled,
             tty_image_policy_applies,
             suspended_tty_manager: None,
@@ -2196,16 +261,19 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.tty_images_enabled = enabled;
         if enabled {
             self.manager = self.suspended_tty_manager.take().unwrap_or_else(|| {
-                self.cache_directory.as_ref().map_or_else(
-                    || ThumbnailManager::from_current_terminal_with_tty_images(self.mode, true),
-                    |cache_directory| {
-                        ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
-                            self.mode,
-                            cache_directory.clone(),
-                            true,
-                        )
-                    },
-                )
+                self.cache_directory
+                    .as_ref()
+                    .map_or_else(
+                        || ThumbnailManager::from_current_terminal_with_tty_images(self.mode, true),
+                        |cache_directory| {
+                            ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
+                                self.mode,
+                                cache_directory.clone(),
+                                true,
+                            )
+                        },
+                    )
+                    .with_video_frame_program(self.ffmpeg_executable.clone())
             });
         } else {
             let disabled = ThumbnailManager::from_current_terminal(ThumbnailMode::Off);
@@ -2544,26 +612,31 @@ fn create_thumbnail_renderer(
     settings: &UiSettings,
     show_images_in_tty: bool,
 ) -> Option<Box<dyn ThumbnailRenderer>> {
-    let manager = settings.thumbnail_cache_dir.as_ref().map_or_else(
-        || {
-            ThumbnailManager::from_current_terminal_with_tty_images(
-                settings.thumbnails,
-                show_images_in_tty,
-            )
-        },
-        |cache_dir| {
-            ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
-                settings.thumbnails,
-                cache_dir.clone(),
-                show_images_in_tty,
-            )
-        },
-    );
+    let manager = settings
+        .thumbnail_cache_dir
+        .as_ref()
+        .map_or_else(
+            || {
+                ThumbnailManager::from_current_terminal_with_tty_images(
+                    settings.thumbnails,
+                    show_images_in_tty,
+                )
+            },
+            |cache_dir| {
+                ThumbnailManager::from_current_terminal_with_cache_and_tty_images(
+                    settings.thumbnails,
+                    cache_dir.clone(),
+                    show_images_in_tty,
+                )
+            },
+        )
+        .with_video_frame_program(settings.ffmpeg_executable.clone());
     Some(Box::new(
         TerminalThumbnailRenderer::new_with_runtime_policy(
             manager,
             settings.thumbnails,
             settings.thumbnail_cache_dir.clone(),
+            settings.ffmpeg_executable.clone(),
             show_images_in_tty,
             current_terminal_attachment().is_physical_linux_virtual_console(),
         ),
@@ -2811,6 +884,9 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
     let mut hit_map = HitMap::default();
     let mut virtual_cursor = VirtualCursor::default();
+    // Discovery reads filesystem metadata once and runs nothing, so the
+    // terminal owns its clipboard transport for the whole session.
+    let clipboard = SystemReportActions::new();
     loop {
         let mut renderer = thumbnail_renderer.take();
         if let Some(renderer) = renderer.as_mut() {
@@ -2898,6 +974,17 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 }
                 _ => {}
             }
+        }
+        // A terminal copies through a native helper, or through an OSC 52
+        // escape written to its own tty when there is no helper — which is why
+        // the copy happens here and not in the controller: neither transport
+        // exists in a window, and the escape one would be written into nothing.
+        if let Some(request) = controller.take_clipboard_request() {
+            controller.report_clipboard_result(
+                clipboard
+                    .copy_report(&request.text)
+                    .map_err(|error| error.to_string()),
+            );
         }
         #[cfg(feature = "local-browser")]
         if let Some(plan) = controller.take_text_file_open_plan() {
@@ -3408,26 +1495,15 @@ fn execute_text_file_open_plan(
     session: &mut TerminalSession,
     plan: TextFileOpenPlan,
 ) -> Result<TextFileOpenLifecycle, String> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     let lifecycle = plan.lifecycle;
     let mut command = Command::new(&plan.executable);
     command.args(&plan.arguments);
     match lifecycle {
-        TextFileOpenLifecycle::Detached => {
-            let mut child = command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|error| format!("cannot start {}: {error}", plan.executable.display()))?;
-            let _ = std::thread::Builder::new()
-                .name("youta-text-file-opener".to_owned())
-                .spawn(move || {
-                    let _ = child.wait();
-                });
-            Ok(lifecycle)
-        }
+        // Shared with the window, which reaches the same graphical opener and
+        // must not grow a second copy of the spawn-and-reap dance.
+        TextFileOpenLifecycle::Detached => spawn_detached_text_file_open(&plan).map(|()| lifecycle),
         TextFileOpenLifecycle::SuspendTuiAndWait => {
             session
                 .suspend()
@@ -3576,6 +1652,11 @@ struct HitMap {
     playlist_popup_first_index: usize,
     playlist_popup_fields: Vec<(PlaylistEditorField, Rect)>,
     playlist_popup_buttons: Vec<(UiAction, Rect)>,
+    /// Visible queue rows inside the queue popup.
+    queue_popup_rows: Rect,
+    /// First queue model row represented by [`Self::queue_popup_rows`].
+    queue_popup_first_index: usize,
+    queue_popup_buttons: Vec<(UiAction, Rect)>,
     private_note_buttons: Vec<(UiAction, Rect)>,
     /// Visible wrapped-text cells inside the private-note editor.
     private_note_text_area: Rect,
@@ -3893,30 +1974,6 @@ fn nearest_free_label_slot(
     best.map(|(_, _, row, start)| (row, start))
 }
 
-/// Reports whether expanded Details owns a renderable artwork source.
-fn expanded_thumbnail_available(view: &ViewModel) -> bool {
-    let Some(details) = view
-        .details
-        .as_ref()
-        .filter(|details| details.thumbnail_expanded)
-    else {
-        return false;
-    };
-    details.expanded_thumbnail_url.is_some()
-        || details.thumbnail_url.is_some()
-        || details.local_video_thumbnail.is_some()
-        || details
-            .expanded_wikidata_item
-            .as_deref()
-            .and_then(|item_id| {
-                details
-                    .wikidata_entities
-                    .iter()
-                    .find(|entity| entity.item_id == item_id)
-            })
-            .is_some_and(|entity| entity.image_url.is_some())
-}
-
 /// Renders expanded artwork as a modal once its terminal pixels are ready.
 ///
 /// While the enlarged target is loading, or while an image protocol advances
@@ -4037,7 +2094,7 @@ fn render_frame(
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
-        && expanded_thumbnail_available(view)
+        && view.expanded_thumbnail_available()
         && thumbnail_renderer
             .as_ref()
             .is_some_and(|renderer| renderer.is_enabled());
@@ -4160,6 +2217,12 @@ fn render_frame(
     hit_map.playlist_popup_buttons.clear();
     if let Some(popup) = view.playlist_popup.as_ref() {
         render_playlist_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+    }
+    hit_map.queue_popup_rows = Rect::default();
+    hit_map.queue_popup_first_index = 0;
+    hit_map.queue_popup_buttons.clear();
+    if let Some(popup) = view.queue_popup.as_ref() {
+        render_queue_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.private_note_buttons.clear();
     hit_map.private_note_text_area = Rect::default();
@@ -4393,22 +2456,15 @@ fn active_tab_window(
 /// therefore do not consume a second row for a duplicate title.
 fn search_panel_title(view: &ViewModel) -> String {
     if !view.search_editing {
-        match view.screen {
-            Screen::Radio if view.search_query.trim().is_empty() => return String::new(),
-            Screen::Radio => {}
-            Screen::Subscriptions
-            | Screen::Local
-            | Screen::Downloaded
-            | Screen::History
-            | Screen::Playlists
-            | Screen::Statistics => return String::new(),
-            Screen::Search
-            | Screen::YouTubeMusic
-            | Screen::YandexMusic
-            | Screen::Bandcamp
-            | Screen::ApplePodcasts
-            | Screen::LibriVox
-            | Screen::TrackerMusic => {}
+        // Which screens collect a query is not restated here: the window asks
+        // the same question to decide whether it draws a search field.
+        if view.screen.search_verb().is_none() {
+            return String::new();
+        }
+        // Radio filters as the user types, so an idle empty filter says nothing
+        // the tab has not already said.
+        if view.screen == Screen::Radio && view.search_query.trim().is_empty() {
+            return String::new();
         }
     }
     let search_title = if view.search_editing {
@@ -5324,15 +3380,7 @@ fn render_details_with_terminal_window(
         hit_map,
         "",
         empty_message,
-        match view.screen {
-            Screen::Local => InformationPanelKind::Local,
-            Screen::ApplePodcasts => InformationPanelKind::Podcast,
-            Screen::LibriVox => InformationPanelKind::Audiobook,
-            Screen::Radio => InformationPanelKind::Radio,
-            Screen::YandexMusic => InformationPanelKind::YandexMusic,
-            Screen::Bandcamp | Screen::Playlists | Screen::History => InformationPanelKind::Generic,
-            _ => InformationPanelKind::Video,
-        },
+        view.screen.details_kind(),
         true,
         ThumbnailSizing::adaptive_youtube(configured_thumbnail_height, terminal_window),
         thumbnail_renderer,
@@ -5364,27 +3412,6 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         | Screen::History
         | Screen::Statistics => false,
     }
-}
-
-/// Source-specific metadata layout used by the shared information renderer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InformationPanelKind {
-    /// Media details with duration, likes, and views.
-    Video,
-    /// Podcast show or episode details without video-only statistics.
-    Podcast,
-    /// Public-domain audiobook or section details without video-only statistics.
-    Audiobook,
-    /// Channel details with subscriber metadata.
-    Channel,
-    /// Public live-radio metadata without finite-media statistics.
-    Radio,
-    /// Authenticated Yandex Music catalogue details and source-specific actions.
-    YandexMusic,
-    /// Local folder, media, or image metadata without remote statistics.
-    Local,
-    /// Persisted or aggregate rows without source-specific remote statistics.
-    Generic,
 }
 
 /// Returns a real YouTube `@handle` carried by a safe channel URL.
@@ -7071,9 +5098,6 @@ fn active_description_chapter_line(
     Some(start..end)
 }
 
-/// Maximum clipboard payload reconstructed from one Details-panel drag.
-pub(crate) const MAX_DETAILS_SELECTION_BYTES: usize = 64 * 1024;
-
 /// Records only non-padding cells from one explicitly selectable text row.
 fn capture_selectable_details_row(frame: &mut Frame<'_>, hit_map: &mut HitMap, area: Rect) {
     if area.width == 0 || area.height == 0 {
@@ -8221,9 +6245,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         local_help.clear();
     }
     #[cfg(feature = "qr")]
-    let private_note_help = "  n private note     e equalizer     t Details-only text selection\n  Q selected YouTube video QR code";
+    let private_note_help =
+        "  n private note     t Details-only text selection\n  Q selected YouTube video QR code";
     #[cfg(not(feature = "qr"))]
-    let private_note_help = "  n private note     e equalizer     t Details-only text selection";
+    let private_note_help = "  n private note     t Details-only text selection";
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -8244,11 +6269,13 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
+        "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
         "",
         "Actions",
-        "  Ctrl+n play next     a add to queue     d download     o video page",
+        "  Ctrl+n play next     a add to queue     u show queue     d download",
+        "  o video page",
         "  l toggle todo     P choose playlist",
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
@@ -9753,6 +7780,161 @@ fn render_playlist_editor(
     );
 }
 
+/// Renders the playback queue.
+///
+/// The queue is the one piece of state Youta has always maintained and never
+/// shown: `a` and `Ctrl+n` have always been able to fill it, and nothing could
+/// display, reorder, or empty it afterwards.
+fn render_queue_popup(
+    frame: &mut Frame<'_>,
+    popup: &QueuePopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(82, 20, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Playback queue ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let position = match popup.current {
+        Some(current) => format!(
+            "Playing {} of {}",
+            current.saturating_add(1),
+            popup.items.len()
+        ),
+        None => format!(
+            "{} queued; the queue has been played through",
+            popup.items.len()
+        ),
+    };
+    let repeat = if popup.repeat_one {
+        " · repeating the current item"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{position}{repeat}\nEnter plays the selected entry from here."
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    hit_map.queue_popup_rows = sections[1];
+    let visible_rows = usize::from(sections[1].height).max(1);
+    let selected = popup.selected.min(popup.items.len().saturating_sub(1));
+    let first = selected.saturating_add(1).saturating_sub(visible_rows).min(
+        popup
+            .items
+            .len()
+            .saturating_sub(visible_rows.min(popup.items.len())),
+    );
+    hit_map.queue_popup_first_index = first;
+    let width = usize::from(sections[1].width);
+    let items = popup
+        .items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+        .map(|(index, item)| {
+            let is_selected = index == selected;
+            let is_current = popup.current == Some(index);
+            let marker = if is_current {
+                "▶"
+            } else if is_selected {
+                "›"
+            } else {
+                " "
+            };
+            let mut label = format!("{marker} {}", item.title);
+            if !item.subtitle.is_empty() {
+                label.push_str(" · ");
+                label.push_str(&item.subtitle);
+            }
+            if !item.length.is_empty() {
+                label.push_str(" · ");
+                label.push_str(&item.length);
+            }
+            ListItem::new(truncate_terminal_text(&label, width)).style(if is_selected {
+                theme.selected
+            } else if is_current {
+                theme.accent
+            } else {
+                theme.base
+            })
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), sections[1]);
+
+    let mut buttons = vec![(
+        button("Enter", "Play", show_hotkeys),
+        UiAction::ActivateQueuePopupRow(selected),
+    )];
+    // Removing the entry that is playing is refused by the controller, so the
+    // control that would ask for it is not offered.
+    if popup.current != Some(selected) {
+        buttons.push((
+            button("x", "Remove", show_hotkeys),
+            UiAction::RemoveQueuePopupRow(selected),
+        ));
+    }
+    buttons.push((button("C", "Clear", show_hotkeys), UiAction::ClearQueue));
+    buttons.push((
+        button("Esc", "Close", show_hotkeys),
+        UiAction::DismissQueuePopup,
+    ));
+    render_queue_popup_buttons(frame, sections[2], buttons, theme, hit_map);
+}
+
+/// Lays the queue controls out on one centered row and records their hit areas.
+fn render_queue_popup_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: Vec<(String, UiAction)>,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let mut x = centered_line_x(area, terminal_text_width(&controls));
+    for (label, action) in buttons {
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
+        if width > 0 {
+            hit_map
+                .queue_popup_buttons
+                .push((action, Rect::new(x, area.y, width, area.height.min(1))));
+        }
+        x = x
+            .saturating_add(terminal_text_width(&label))
+            .saturating_add(3);
+    }
+}
+
 fn render_playlist_popup_buttons<const N: usize>(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -10962,11 +9144,73 @@ fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
     Some(usize::from((hit_map.rows.height / row_height).max(1)))
 }
 
-/// Returns whether one key is the editor-local Vim word-delete chord.
-fn is_delete_previous_word_key(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('w' | 'W'))
+/// Translates one Crossterm key event into the shared vocabulary.
+///
+/// Returns [`None`] for keys the shared map has no name for, such as media and
+/// keypad keys, which the terminal front-end has never bound.
+fn key_press(key: KeyEvent) -> Option<KeyPress> {
+    let named = match key.code {
+        KeyCode::Char(character) => Key::Char(character),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::F(number) => Key::F(number),
+        _ => return None,
+    };
+    Some(KeyPress {
+        key: named,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    })
+}
+
+/// Reports the rendered popup scroll state the shared map needs for paging.
+fn popup_geometry(hit_map: &HitMap) -> PopupGeometry {
+    PopupGeometry {
+        project_history: ScrollGeometry {
+            offset: hit_map.project_history_scroll_offset,
+            maximum: hit_map.project_history_scroll_maximum,
+            page_lines: hit_map.project_history_page_lines,
+        },
+        video_comments: ScrollGeometry {
+            offset: hit_map.video_comments_scroll_offset,
+            maximum: hit_map.video_comments_scroll_maximum,
+            page_lines: hit_map.video_comments_page_lines,
+        },
+    }
+}
+
+/// Crossterm-flavoured shims so the renderer's popup tests stay unchanged.
+#[cfg(test)]
+fn project_history_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    crate::keymap::project_history_key_action(key_press(key)?, offset, maximum, page_lines)
+}
+
+#[cfg(test)]
+fn video_comments_key_action(
+    key: KeyEvent,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    crate::keymap::video_comments_key_action(key_press(key)?, offset, maximum, page_lines)
 }
 
 #[cfg(test)]
@@ -10975,852 +9219,21 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
 }
 
 /// Maps one key using the current rendered main-list page capacity.
+///
+/// The mapping itself lives in [`crate::keymap`] so the window applies the
+/// same modal precedence. Only the translation from Crossterm is local.
 fn key_action_with_page_rows(
     key: KeyEvent,
     view: &ViewModel,
     page_rows: Option<usize>,
     hit_map: Option<&HitMap>,
 ) -> Option<UiAction> {
-    if view.error_popup.is_none()
-        && view.project_history_popup.is_some()
-        && let Some(hit_map) = hit_map
-    {
-        return project_history_key_action(
-            key,
-            hit_map.project_history_scroll_offset,
-            hit_map.project_history_scroll_maximum,
-            hit_map.project_history_page_lines,
-        );
-    }
-    if view.error_popup.is_none()
-        && view.video_comments_popup.is_some()
-        && let Some(hit_map) = hit_map
-    {
-        return video_comments_key_action(
-            key,
-            hit_map.video_comments_scroll_offset,
-            hit_map.video_comments_scroll_maximum,
-            hit_map.video_comments_page_lines,
-        );
-    }
-    key_action_with_page_rows_unfiltered(key, view, page_rows)
-        .filter(|action| view.external_opener_available || !action.requires_external_opener())
-}
-
-/// Maps modal project-history navigation to one resize-aware wrapped-line offset.
-fn project_history_key_action(
-    key: KeyEvent,
-    offset: usize,
-    maximum: usize,
-    page_lines: usize,
-) -> Option<UiAction> {
-    let page_lines = page_lines.max(1);
-    match key.code {
-        KeyCode::Esc | KeyCode::F(9) => Some(UiAction::DismissProjectHistory),
-        KeyCode::Up | KeyCode::Char('k') => {
-            Some(UiAction::SetProjectHistoryScroll(offset.saturating_sub(1)))
-        }
-        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_add(1).min(maximum),
-        )),
-        KeyCode::PageUp => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_sub(page_lines),
-        )),
-        KeyCode::PageDown => Some(UiAction::SetProjectHistoryScroll(
-            offset.saturating_add(page_lines).min(maximum),
-        )),
-        KeyCode::Home => Some(UiAction::SetProjectHistoryScroll(0)),
-        KeyCode::End => Some(UiAction::SetProjectHistoryScroll(maximum)),
-        _ => None,
-    }
-}
-
-/// Maps modal comments navigation to one resize-aware wrapped-line offset.
-fn video_comments_key_action(
-    key: KeyEvent,
-    offset: usize,
-    maximum: usize,
-    page_lines: usize,
-) -> Option<UiAction> {
-    let page_lines = page_lines.max(1);
-    match key.code {
-        KeyCode::Esc | KeyCode::F(6) => Some(UiAction::DismissVideoComments),
-        KeyCode::Up | KeyCode::Char('k') => {
-            Some(UiAction::SetVideoCommentsScroll(offset.saturating_sub(1)))
-        }
-        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_add(1).min(maximum),
-        )),
-        KeyCode::PageUp => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_sub(page_lines),
-        )),
-        KeyCode::PageDown => Some(UiAction::SetVideoCommentsScroll(
-            offset.saturating_add(page_lines).min(maximum),
-        )),
-        KeyCode::Home => Some(UiAction::SetVideoCommentsScroll(0)),
-        KeyCode::End => Some(UiAction::SetVideoCommentsScroll(maximum)),
-        _ => None,
-    }
-}
-
-/// Maps one key before applying terminal-capability policy.
-fn key_action_with_page_rows_unfiltered(
-    key: KeyEvent,
-    view: &ViewModel,
-    page_rows: Option<usize>,
-) -> Option<UiAction> {
-    if view.error_popup.is_some() {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissErrorPopup),
-            KeyCode::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
-            KeyCode::Char('g' | 'G')
-                if view
-                    .error_popup
-                    .as_ref()
-                    .is_some_and(|error| error.gh_available) =>
-            {
-                Some(UiAction::FillGitHubIssue)
-            }
-            KeyCode::Char('i' | 'I') => Some(UiAction::CopyAndOpenGitHubIssue),
-            KeyCode::Up | KeyCode::Left => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1)))
-            }
-            KeyCode::Down | KeyCode::Right => {
-                Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(1)))
-            }
-            KeyCode::PageUp => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(-1))),
-            KeyCode::PageDown => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(1))),
-            KeyCode::Home => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Home)),
-            KeyCode::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
-            _ => None,
-        };
-    }
-    #[cfg(feature = "qr")]
-    {
-        if view.video_qr_popup.is_some() {
-            return match key.code {
-                KeyCode::Esc | KeyCode::Char('Q') => Some(UiAction::DismissVideoQr),
-                _ => None,
-            };
-        }
-    }
-    if let Some(popup) = view.project_history_popup.as_ref() {
-        return project_history_key_action(key, popup.scroll_offset, usize::MAX, 20);
-    }
-    if let Some(popup) = view.video_comments_popup.as_ref() {
-        return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
-    }
-    if let Some(popup) = view.private_note_popup.as_ref() {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissPrivateNotePopup),
-            KeyCode::Char('s' | 'S') if control => Some(UiAction::SavePrivateNote),
-            KeyCode::Delete => Some(UiAction::RequestPrivateNoteDelete),
-            KeyCode::Enter if popup.confirming_delete => Some(UiAction::RequestPrivateNoteDelete),
-            KeyCode::Enter => Some(UiAction::InsertPrivateNoteNewline),
-            KeyCode::Backspace => Some(UiAction::DeletePrivateNoteCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeletePrivateNoteWord)
-            }
-            KeyCode::Left => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Left,
-            )),
-            KeyCode::Right => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Right,
-            )),
-            KeyCode::Up => Some(UiAction::MovePrivateNoteCursor(PrivateNoteCursorMotion::Up)),
-            KeyCode::Down => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Down,
-            )),
-            KeyCode::Home => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::Home,
-            )),
-            KeyCode::End => Some(UiAction::MovePrivateNoteCursor(
-                PrivateNoteCursorMotion::End,
-            )),
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendPrivateNoteCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(popup) = view.playlist_popup.as_ref() {
-        return match popup.mode {
-            PlaylistPopupMode::Choose => match key.code {
-                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
-                KeyCode::Enter => Some(UiAction::ToggleSelectedPlaylistMembership),
-                KeyCode::Up | KeyCode::Char('k') => Some(UiAction::MovePlaylistPopupSelection(-1)),
-                KeyCode::Down | KeyCode::Char('j') => Some(UiAction::MovePlaylistPopupSelection(1)),
-                KeyCode::Char('n')
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    Some(UiAction::BeginNewPlaylist)
-                }
-                _ => None,
-            },
-            PlaylistPopupMode::Create | PlaylistPopupMode::Edit => match key.code {
-                KeyCode::Esc => Some(UiAction::DismissPlaylistPopup),
-                KeyCode::Enter if popup.mode == PlaylistPopupMode::Create => {
-                    Some(UiAction::CreatePlaylistAndAdd)
-                }
-                KeyCode::Enter => Some(UiAction::UpdatePlaylist),
-                KeyCode::Tab | KeyCode::BackTab => Some(UiAction::SelectPlaylistEditorField(
-                    match popup.editor_field {
-                        PlaylistEditorField::Name => PlaylistEditorField::Description,
-                        PlaylistEditorField::Description => PlaylistEditorField::Name,
-                    },
-                )),
-                KeyCode::Up => Some(UiAction::SelectPlaylistEditorField(
-                    PlaylistEditorField::Name,
-                )),
-                KeyCode::Down => Some(UiAction::SelectPlaylistEditorField(
-                    PlaylistEditorField::Description,
-                )),
-                KeyCode::Backspace => Some(UiAction::DeletePlaylistEditorCharacter),
-                KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                    Some(UiAction::DeletePlaylistEditorWord)
-                }
-                KeyCode::Char(character)
-                    if !character.is_control()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    Some(UiAction::AppendPlaylistEditorCharacter(character))
-                }
-                _ => None,
-            },
-        };
-    }
-    if let Some(popup) = view.local_file_popup.as_ref() {
-        return match (popup, key.code) {
-            (_, KeyCode::Esc) => Some(UiAction::DismissLocalFilePopup),
-            (LocalFilePopupView::Rename { .. }, KeyCode::Enter) => {
-                Some(UiAction::SubmitLocalRename)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Backspace) => {
-                Some(UiAction::DeleteLocalRenameCharacter)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Char('w' | 'W'))
-                if is_delete_previous_word_key(&key) =>
-            {
-                Some(UiAction::DeleteLocalRenameWord)
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Left) => {
-                Some(UiAction::MoveLocalRenameCursor(-1))
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Right) => {
-                Some(UiAction::MoveLocalRenameCursor(1))
-            }
-            (LocalFilePopupView::Rename { .. }, KeyCode::Char(character))
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendLocalRenameCharacter(character))
-            }
-            (LocalFilePopupView::Trash { .. }, KeyCode::Enter) => Some(UiAction::ConfirmLocalTrash),
-            (LocalFilePopupView::DownloadedTrash { .. }, KeyCode::Enter) => {
-                Some(UiAction::ConfirmDownloadedTrash)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Enter) => {
-                Some(UiAction::ActivateLocalMoveDestination)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Char('m' | 'M')) => {
-                Some(UiAction::ConfirmLocalMoveHere)
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Up | KeyCode::Char('k')) => {
-                Some(UiAction::MoveLocalMoveDestination(-1))
-            }
-            (LocalFilePopupView::Move { .. }, KeyCode::Down | KeyCode::Char('j')) => {
-                Some(UiAction::MoveLocalMoveDestination(1))
-            }
-            _ => None,
-        };
-    }
-    if view.rss_subscription_popup.is_some() {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissRssSubscriptionPopup),
-            KeyCode::Enter => Some(UiAction::SubmitRssSubscription),
-            KeyCode::Backspace => Some(UiAction::DeleteRssSubscriptionCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteRssSubscriptionWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendRssSubscriptionCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(preferences) = view.preferences_popup.as_ref() {
-        let alternative = preferences.subscriptions_layout.toggled();
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('p') => Some(UiAction::DismissPreferences),
-            KeyCode::Enter => Some(UiAction::SubmitPreferences),
-            KeyCode::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
-            KeyCode::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
-            KeyCode::Char('t') if cfg!(feature = "images") => {
-                Some(UiAction::CycleYouTubeThumbnailSize)
-            }
-            KeyCode::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
-            KeyCode::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
-            KeyCode::Char('b') if cfg!(feature = "bandcamp") => {
-                Some(UiAction::CycleBandcampAudioFormat)
-            }
-            KeyCode::Char('d') => Some(UiAction::SetSubscriptionsLayout(
-                SubscriptionsLayout::DrillDown,
-            )),
-            KeyCode::Char('s') => {
-                Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
-                Some(UiAction::SetSubscriptionsLayout(alternative))
-            }
-            _ => None,
-        };
-    }
-    if view.text_selection_mode
-        && !view
-            .details
-            .as_ref()
-            .is_some_and(|details| details.thumbnail_expanded)
-    {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
-            // Terminals normally consume Ctrl+Shift+C as their Copy command.
-            // If one forwards it, do not reinterpret that copy chord as Quit.
-            return (!shift).then_some(UiAction::Quit);
-        }
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('t') => Some(UiAction::ToggleTextSelectionMode),
-            KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
-            _ => None,
-        };
-    }
-    if let Some(setup) = view.yandex_music_setup_popup.as_ref() {
-        if setup.validating {
-            return match key.code {
-                KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
-                KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
-                _ => None,
-            };
-        }
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissYandexMusicSetup),
-            KeyCode::Enter => Some(UiAction::SubmitYandexMusicSetup),
-            KeyCode::F(1) => Some(UiAction::OpenYandexOAuthGuide),
-            KeyCode::Backspace => Some(UiAction::DeleteYandexMusicTokenCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteYandexMusicTokenWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendYandexMusicTokenCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if let Some(setup) = view.youtube_setup_popup.as_ref() {
-        let other_field = match setup.selected_field {
-            YouTubeSetupField::ApiKey => YouTubeSetupField::InvidiousUrl,
-            YouTubeSetupField::InvidiousUrl => YouTubeSetupField::ApiKey,
-        };
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::DismissYouTubeSetup),
-            KeyCode::Enter => Some(UiAction::SubmitYouTubeSetup),
-            KeyCode::F(1) => Some(UiAction::OpenYouTubeApiKeyGuide),
-            KeyCode::F(2) => Some(UiAction::OpenGoogleCloudCredentials),
-            KeyCode::F(3) => Some(UiAction::OpenInvidiousInstances),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                Some(UiAction::SelectYouTubeSetupField(other_field))
-            }
-            KeyCode::Backspace => Some(UiAction::DeleteYouTubeSetupCharacter),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteYouTubeSetupWord)
-            }
-            KeyCode::Char(character)
-                if !character.is_control()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendYouTubeSetupCharacter(character))
-            }
-            _ => None,
-        };
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Some(UiAction::Quit);
-    }
-    if view.help_open {
-        return match key.code {
-            KeyCode::Char('?') | KeyCode::Esc => Some(UiAction::ToggleHelp),
-            KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
-            KeyCode::Char('q') => Some(UiAction::Quit),
-            _ => None,
-        };
-    }
-    let thumbnail_expanded = view
-        .details
-        .as_ref()
-        .is_some_and(|details| details.thumbnail_expanded);
-    if thumbnail_expanded && key.code == KeyCode::Esc {
-        return Some(UiAction::ToggleThumbnailExpansion);
-    }
-    if expanded_thumbnail_available(view) {
-        return None;
-    }
-    if view.search_editing {
-        return match key.code {
-            KeyCode::Esc => Some(UiAction::CancelSearch),
-            KeyCode::Enter => Some(UiAction::SubmitSearch),
-            KeyCode::Backspace => Some(UiAction::DeleteSearchCharacter),
-            KeyCode::Left => Some(UiAction::MoveSearchCursor(-1)),
-            KeyCode::Right => Some(UiAction::MoveSearchCursor(1)),
-            KeyCode::Char('w' | 'W') if is_delete_previous_word_key(&key) => {
-                Some(UiAction::DeleteSearchWord)
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(UiAction::AppendSearch(character))
-            }
-            _ => None,
-        };
-    }
-    if is_delete_previous_word_key(&key) {
-        return None;
-    }
-
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let detail_link_count = view
-        .details
-        .as_ref()
-        .map_or(0, |details| details.links.len());
-    let wikidata_media_count = view
-        .details
-        .as_ref()
-        .and_then(|details| {
-            let item_id = details.expanded_wikidata_item.as_deref()?;
-            details
-                .wikidata_entities
-                .iter()
-                .find(|entity| entity.item_id == item_id)
-        })
-        .map_or(0, |entity| entity.media_controls.len());
-    let details_line_scroll_available = details_accept_line_scroll(view);
-    let wikidata_link_index = keyboard_wikidata_link_index(view);
-    match key.code {
-        KeyCode::Char('q') => Some(UiAction::Quit),
-        #[cfg(feature = "qr")]
-        KeyCode::Char('Q')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-                }) =>
-        {
-            Some(UiAction::OpenVideoQr)
-        }
-        KeyCode::Char('?') => Some(UiAction::ToggleHelp),
-        KeyCode::F(9) => Some(UiAction::OpenProjectHistory),
-        KeyCode::Char('/') => Some(UiAction::BeginSearch),
-        KeyCode::Char('p') | KeyCode::F(7) => Some(UiAction::OpenPreferences),
-        KeyCode::Tab if reverse_tab_modifiers(key.modifiers) => {
-            Some(UiAction::ShowScreen(view.screen.previous()))
-        }
-        KeyCode::Tab => Some(UiAction::ShowScreen(view.screen.next())),
-        KeyCode::BackTab => Some(UiAction::ShowScreen(view.screen.previous())),
-        KeyCode::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
-        KeyCode::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
-        KeyCode::F(3) => Some(UiAction::ShowScreen(Screen::History)),
-        KeyCode::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
-        KeyCode::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
-        KeyCode::Char('v') if view.screen == Screen::YandexMusic => {
-            Some(UiAction::CycleYandexMusicSearchKind)
-        }
-        KeyCode::Char('v') => Some(UiAction::ToggleSearchKind),
-        KeyCode::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(UiAction::PlayNext)
-        }
-        KeyCode::Char('C') if view.screen != Screen::YandexMusic => {
-            Some(UiAction::ToggleYouTubeCreativeCommons)
-        }
-        KeyCode::Char('A') => Some(UiAction::ToggleAutoplay),
-        KeyCode::Char('l')
-            if view.playlist_item.is_some()
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::ToggleTodoPlaylist)
-        }
-        KeyCode::Char('P')
-            if view.playlist_item.is_some()
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(UiAction::OpenPlaylistPopup)
-        }
-        KeyCode::Char('e') if view.screen == Screen::Playlists && view.playlist_edit_available => {
-            Some(UiAction::EditSelectedPlaylist)
-        }
-        KeyCode::Char('Z') if view.screen == Screen::Local && view.local_folder_sizes_enabled => {
-            Some(UiAction::ToggleLocalSizeSort)
-        }
-        KeyCode::Char('H') if view.screen == Screen::Local => Some(UiAction::ToggleLocalAllFiles),
-        KeyCode::Char('B') if view.screen == Screen::Radio => Some(UiAction::CycleRadioSort),
-        KeyCode::Char('f') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioFavorite),
-        KeyCode::Char('L')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
-        {
-            Some(UiAction::ToggleYandexMusicLike)
-        }
-        KeyCode::Char('X')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
-        {
-            Some(UiAction::ToggleYandexMusicDislike)
-        }
-        KeyCode::Char('g')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.artist_available =>
-        {
-            Some(UiAction::OpenYandexMusicArtist)
-        }
-        KeyCode::Char('b')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_available =>
-        {
-            Some(UiAction::OpenYandexMusicAlbum)
-        }
-        KeyCode::Char('D')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_open =>
-        {
-            Some(UiAction::DownloadYandexMusicAlbum)
-        }
-        KeyCode::Char('R')
-            if view.screen == Screen::YandexMusic
-                && view.yandex_music_actions.twenty_recommendations_available =>
-        {
-            Some(UiAction::DownloadTwentyYandexMusicRecommendations)
-        }
-        KeyCode::Char('f')
-            if view.screen == Screen::Local
-                && view
-                    .details
-                    .as_ref()
-                    .is_some_and(|details| details.local_fingerprint_available) =>
-        {
-            Some(UiAction::FingerprintLocalAudio)
-        }
-        KeyCode::Char('r') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioRecording),
-        KeyCode::Char('T') => Some(UiAction::ToggleChapterTimestamps),
-        #[cfg(feature = "local-rename")]
-        KeyCode::Char('r') if view.screen == Screen::Local => Some(UiAction::BeginLocalRename),
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('m')
-            if view.screen == Screen::Local
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::BeginLocalMove)
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('J')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('K')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(-1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('j')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(1))
-        }
-        #[cfg(feature = "local-move")]
-        KeyCode::Char('k')
-            if view.screen == Screen::Local && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ExtendLocalMoveSelection(-1))
-        }
-        #[cfg(feature = "local-trash")]
-        KeyCode::Delete if view.screen == Screen::Local => Some(UiAction::RequestLocalTrash),
-        #[cfg(feature = "local-trash")]
-        KeyCode::Char('x')
-            if view.screen == Screen::Downloaded
-                && !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-                ) =>
-        {
-            Some(UiAction::RequestDownloadedTrash)
-        }
-        KeyCode::Char('i')
-            if view.screen == Screen::Subscriptions
-                && view.subscriptions.layout == SubscriptionsLayout::Split
-                && !view.subscriptions.items.is_empty() =>
-        {
-            Some(UiAction::ToggleSubscriptionDescription)
-        }
-        KeyCode::Char('a')
-            if view.screen == Screen::Subscriptions
-                && view.subscriptions.route == SubscriptionRoute::Sources
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(UiAction::OpenRssSubscriptionPopup)
-        }
-        KeyCode::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
-        KeyCode::Char('R')
-            if view.screen == Screen::Subscriptions
-                && (view.subscriptions.route == SubscriptionRoute::Items
-                    || (view.subscriptions.layout == SubscriptionsLayout::Split
-                        && view.subscriptions.focus == SubscriptionPane::Items)) =>
-        {
-            Some(UiAction::RefreshSubscriptionVideos)
-        }
-        KeyCode::Char('t')
-            if view.details.is_some() && view.right_panel_mode == RightPanelMode::Details =>
-        {
-            Some(UiAction::ToggleTextSelectionMode)
-        }
-        KeyCode::Char('j') if alt && view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::MoveWikidataMedia(1))
-        }
-        KeyCode::Char('k') if alt && view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::MoveWikidataMedia(-1))
-        }
-        KeyCode::Char('j') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(1)),
-        KeyCode::Char('k') if alt && detail_link_count > 0 => Some(UiAction::MoveDetailLink(-1)),
-        KeyCode::Home if alt && detail_link_count > 0 => Some(UiAction::SelectDetailLink(0)),
-        KeyCode::End if alt && detail_link_count > 0 => {
-            Some(UiAction::SelectDetailLink(detail_link_count - 1))
-        }
-        KeyCode::Esc
-            if view.screen == Screen::Subscriptions
-                && (view.subscriptions.description_expanded
-                    || view.subscriptions.focus == SubscriptionPane::Items) =>
-        {
-            Some(UiAction::GoBack)
-        }
-        KeyCode::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
-        KeyCode::Esc
-            if view.screen == Screen::YandexMusic
-                && matches!(
-                    view.yandex_music_route,
-                    YandexMusicRouteView::Search
-                        | YandexMusicRouteView::Album
-                        | YandexMusicRouteView::Artist
-                ) =>
-        {
-            Some(UiAction::GoBack)
-        }
-        KeyCode::Esc if view.playlist_back_available => Some(UiAction::GoBack),
-        KeyCode::Esc if view.screen == Screen::LibriVox => Some(UiAction::GoBack),
-        KeyCode::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
-        KeyCode::Up if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
-        }
-        KeyCode::Down if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
-        }
-        KeyCode::Char('u') if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
-        }
-        KeyCode::Char('d') if alt && details_line_scroll_available => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
-        }
-        KeyCode::Up | KeyCode::Down if alt => None,
-        KeyCode::Char('u' | 'd') if alt => None,
-        KeyCode::PageUp if view.details_focused => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Pages(-1)))
-        }
-        KeyCode::PageDown if view.details_focused => {
-            Some(UiAction::ScrollDetails(DetailsScroll::Pages(1)))
-        }
-        KeyCode::PageUp
-            if matches!(
-                view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio
-            ) =>
-        {
-            page_rows
-                .filter(|rows| *rows > 0)
-                .map(|rows| UiAction::MoveSelection(-i32::try_from(rows).unwrap_or(i32::MAX)))
-        }
-        KeyCode::PageDown
-            if matches!(
-                view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio
-            ) =>
-        {
-            page_rows
-                .filter(|rows| *rows > 0)
-                .map(|rows| UiAction::MoveSelection(i32::try_from(rows).unwrap_or(i32::MAX)))
-        }
-        KeyCode::Home if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::Home)),
-        KeyCode::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
-        KeyCode::Char('j') => Some(UiAction::MoveSelection(1)),
-        KeyCode::Char('k') => Some(UiAction::MoveSelection(-1)),
-        KeyCode::F(6)
-            if view.video_comments_available
-                && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-                }) =>
-        {
-            Some(UiAction::OpenVideoComments)
-        }
-        KeyCode::Enter if alt && detail_link_count > 0 => {
-            let selected = view
-                .selected_detail_link
-                .unwrap_or_default()
-                .min(detail_link_count - 1);
-            Some(UiAction::ActivateDetailLink(selected))
-        }
-        KeyCode::Enter if view.details_focused && wikidata_media_count > 0 => {
-            Some(UiAction::ActivateWikidataMedia(
-                view.selected_wikidata_media
-                    .unwrap_or_default()
-                    .min(wikidata_media_count - 1),
-            ))
-        }
-        KeyCode::Enter => Some(UiAction::ActivateSelection),
-        KeyCode::Char(' ') => Some(UiAction::TogglePause),
-        KeyCode::Left if alt => Some(UiAction::GoBack),
-        KeyCode::Right if alt => Some(UiAction::GoForward),
-        KeyCode::Left if view.playback.seeking_available() => Some(UiAction::SeekRelative(-5)),
-        KeyCode::Right if view.playback.seeking_available() => Some(UiAction::SeekRelative(5)),
-        KeyCode::Up => Some(UiAction::ChangeVolume(5)),
-        KeyCode::Down => Some(UiAction::ChangeVolume(-5)),
-        KeyCode::Char('<') | KeyCode::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
-        KeyCode::Char('>') | KeyCode::Char('.') => Some(UiAction::ChangeSpeed(0.1)),
-        KeyCode::Char('[') if view.playback.seeking_available() && !view.playback.live => {
-            Some(UiAction::ChangeChapter(-1))
-        }
-        KeyCode::Char(']') if view.playback.seeking_available() && !view.playback.live => {
-            Some(UiAction::ChangeChapter(1))
-        }
-        KeyCode::Char('r') => Some(UiAction::ToggleRepeat),
-        KeyCode::Char('w')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::ToggleWaveform)
-        }
-        KeyCode::Char('c') => Some(UiAction::ShowChannel),
-        KeyCode::Char('s') => Some(UiAction::ToggleSubscription),
-        KeyCode::Backspace => Some(UiAction::GoBack),
-        KeyCode::Char('n')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-        {
-            Some(UiAction::EditPrivateNote)
-        }
-        KeyCode::Char('a') => Some(UiAction::AddToQueue),
-        KeyCode::Char('d') => Some(UiAction::Download),
-        KeyCode::Char('o') => Some(UiAction::OpenInBrowser),
-        KeyCode::Char('O') if view.screen == Screen::Radio => Some(UiAction::OpenInBrowser),
-        KeyCode::Char('O') => Some(UiAction::OpenChannelInBrowser),
-        KeyCode::Char('y') => Some(UiAction::CopyLink),
-        KeyCode::Char('e') => Some(UiAction::OpenEqualizer),
-        KeyCode::Char(digit @ '0'..='9') if view.playback.seeking_available() => {
-            let percentage = f64::from(digit.to_digit(10).unwrap_or_default()) * 10.0;
-            Some(UiAction::SeekPercent(percentage))
-        }
-        _ => None,
-    }
-}
-
-/// Reports whether line-scrolling shortcuts can target the visible Details pane.
-///
-/// The default Linux virtual-console keymap binds `Alt+Up` to its
-/// `KeyboardSignal` action and emits `Alt+Down` like plain `Down`, so neither
-/// chord reaches Crossterm as an Alt-modified arrow. [`key_action`] retains
-/// modifier-aware arrows for terminal emulators and also accepts `Alt+u/d` as
-/// virtual-console-safe aliases. Both paths use this predicate so a failed
-/// `Alt+d` scroll never falls through to the unrelated Download action.
-fn details_accept_line_scroll(view: &ViewModel) -> bool {
-    view.details.is_some() && view.right_panel_mode == RightPanelMode::Details
-}
-
-/// Resolves the Wikidata disclosure owned by the global `W` shortcut.
-///
-/// An expanded item takes precedence so `W` always collapses the visible
-/// spoiler. Otherwise the explicitly selected Wikidata row wins, followed by
-/// the first Wikidata row when asynchronous enrichment has not selected one.
-fn keyboard_wikidata_link_index(view: &ViewModel) -> Option<usize> {
-    let details = view.details.as_ref()?;
-    let index_for_item = |item_id: &str| {
-        details
-            .links
-            .iter()
-            .position(|link| link.wikidata_item_id.as_deref() == Some(item_id))
-    };
-    details
-        .expanded_wikidata_item
-        .as_deref()
-        .and_then(index_for_item)
-        .or_else(|| {
-            view.selected_detail_link.filter(|index| {
-                details
-                    .links
-                    .get(*index)
-                    .is_some_and(|link| link.wikidata_item_id.is_some())
-            })
-        })
-        .or_else(|| {
-            details
-                .links
-                .iter()
-                .position(|link| link.wikidata_item_id.is_some())
-        })
-}
-
-/// Recognizes reverse-tab modifier encodings produced by terminal keyboards.
-///
-/// Modern terminals normally report either [`KeyCode::BackTab`] or
-/// `Shift+Tab`. The default Linux virtual-console keymap emits Backtab as
-/// `Escape` followed by `Tab`, which Crossterm exposes as `Alt+Tab`. That
-/// encoding cannot be distinguished from a literal Alt+Tab, so both forms are
-/// intentionally accepted as the previous-screen shortcut.
-fn reverse_tab_modifiers(modifiers: KeyModifiers) -> bool {
-    modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+    crate::keymap::key_action(
+        key_press(key)?,
+        view,
+        page_rows,
+        hit_map.map(popup_geometry),
+    )
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
@@ -11947,6 +9360,27 @@ fn mouse_action_unfiltered(
                     hit_map.private_note_scroll_offset.saturating_sub(3),
                 ))
             }
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.queue_popup.as_ref() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(hit_map.queue_popup_rows, mouse.column, mouse.row) {
+                    let index = hit_map.queue_popup_first_index.saturating_add(usize::from(
+                        mouse.row.saturating_sub(hit_map.queue_popup_rows.y),
+                    ));
+                    (index < popup.items.len()).then_some(UiAction::SelectQueuePopupRow(index))
+                } else {
+                    hit_map
+                        .queue_popup_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            MouseEventKind::ScrollDown => Some(UiAction::MoveQueuePopupSelection(1)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveQueuePopupSelection(-1)),
             _ => None,
         };
     }
@@ -12555,7 +9989,9 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::domain::SourceKind;
+    use crate::config::{BandcampAudioFormat, YouTubeThumbnailSize};
+    use crate::domain::{MediaKind, SourceKind};
+    use crate::waveform::PeakPyramid;
 
     /// Cloneable byte sink used to inspect Crossterm's emitted SGR ordering.
     #[derive(Clone, Default)]
@@ -12708,6 +10144,7 @@ mod tests {
             manager,
             ThumbnailMode::Auto,
             Some(cache_directory.clone()),
+            PathBuf::from("ffmpeg"),
             true,
             true,
         );
@@ -17106,8 +14543,15 @@ mod tests {
         );
     }
 
+    /// `e` belongs to the Playlists screen alone.
+    ///
+    /// It used to be shared with an equalizer shortcut that only ever answered
+    /// "the equalizer is disabled in direct audiophile mode" — a permanent
+    /// refusal, because `docs/AUDIOPHILE.md` lists equalization among the DSP
+    /// Youta deliberately does not apply. The key is now unbound everywhere
+    /// else, and this test is what says so.
     #[test]
-    fn playlists_screen_edit_shortcut_overrides_equalizer_only_on_that_screen() {
+    fn the_edit_shortcut_exists_only_on_an_editable_playlists_row() {
         let playlists = ViewModel {
             screen: Screen::Playlists,
             playlist_edit_available: true,
@@ -17130,15 +14574,93 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 &playlist_entries
             ),
-            Some(UiAction::OpenEqualizer),
-            "playlist entries without an editable playlist row retain the equalizer shortcut"
+            None,
+            "playlist entries without an editable row leave the key unbound"
         );
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 &ViewModel::default()
             ),
-            Some(UiAction::OpenEqualizer)
+            None
+        );
+    }
+
+    /// The queue draws its entries, marks what is playing, and offers the
+    /// controls whose keys the shared map accepts.
+    ///
+    /// The Remove control is deliberately absent for the playing entry: the
+    /// controller refuses that removal, and offering a control that can only
+    /// answer "no" is what the equalizer key used to do.
+    #[test]
+    fn the_queue_popup_marks_the_playing_entry_and_offers_only_valid_controls() {
+        let queue = crate::view::QueuePopupView {
+            items: vec![
+                crate::view::QueueRowView {
+                    media_id: MediaId::new(SourceKind::Local, "/music/a.flac"),
+                    title: "First queued track".to_owned(),
+                    subtitle: "An Artist".to_owned(),
+                    length: "3:03".to_owned(),
+                },
+                crate::view::QueueRowView {
+                    media_id: MediaId::new(SourceKind::Local, "/music/b.flac"),
+                    title: "Second queued track".to_owned(),
+                    subtitle: String::new(),
+                    length: "4:10".to_owned(),
+                },
+            ],
+            current: Some(0),
+            selected: 0,
+            repeat_one: false,
+        };
+        let view = ViewModel {
+            queue_popup: Some(queue),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("queue terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw the queue");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("Playback queue"));
+        assert!(rendered.contains("Playing 1 of 2"));
+        assert!(rendered.contains("▶ First queued track · An Artist · 3:03"));
+        assert!(rendered.contains("Second queued track · 4:10"));
+        assert!(rendered.contains("[C] Clear"));
+        assert!(
+            !rendered.contains("[x] Remove"),
+            "the playing entry cannot be removed, so no control offers it"
+        );
+        assert!(
+            hit_map
+                .queue_popup_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::ClearQueue),
+            "the controls must be clickable, not only readable"
+        );
+        assert!(!hit_map.queue_popup_rows.is_empty());
+    }
+
+    /// `u` opens the queue, and must not shadow the Alt-chord that scrolls
+    /// Details — the two differ only by a modifier.
+    #[test]
+    fn the_queue_shortcut_is_unmodified_and_leaves_the_details_chord_alone() {
+        let view = ViewModel {
+            details: Some(crate::view::DetailView::default()),
+            details_focused: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenQueuePopup)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT), &view),
+            Some(UiAction::ScrollDetails(crate::view::DetailsScroll::Lines(
+                -1
+            )))
         );
     }
 

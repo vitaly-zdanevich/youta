@@ -350,7 +350,7 @@ pub fn validate_local_move(
         let supplied_parent = supplied_source
             .parent()
             .ok_or_else(|| LocalMoveValidationError::UnsafeSource(supplied_source.clone()))?;
-        let canonical_parent = fs::canonicalize(supplied_parent).map_err(|source| {
+        let canonical_parent = crate::fs_path::canonicalize(supplied_parent).map_err(|source| {
             LocalMoveValidationError::Inspect {
                 path: supplied_parent.to_owned(),
                 source,
@@ -456,7 +456,7 @@ pub fn list_local_move_destinations(
     let directory = canonical_real_directory(directory)?;
     let parent = directory
         .parent()
-        .map(fs::canonicalize)
+        .map(crate::fs_path::canonicalize)
         .transpose()
         .map_err(|source| LocalMoveValidationError::Inspect {
             path: directory.clone(),
@@ -517,15 +517,58 @@ pub fn list_local_move_destinations(
 /// return `None`.
 #[must_use]
 pub fn remap_local_path_prefix(path: &Path, mappings: &[LocalMoveMapping]) -> Option<PathBuf> {
+    // The match must not hinge on which of Windows' two spellings each side
+    // arrived in. A mapping holds what `fs::canonicalize` said — a `\\?\`
+    // verbatim path — while a stored locator decodes flat, and the file it
+    // names has just been moved away, so no amount of asking the filesystem
+    // can settle the two onto each other. Comparing both sides flat is the
+    // only meeting point that still exists.
+    let path = flat_spelling(path);
     mappings
         .iter()
         .filter_map(|mapping| {
-            path.strip_prefix(&mapping.source)
+            let source = flat_spelling(&mapping.source);
+            path.strip_prefix(source.as_ref())
                 .ok()
-                .map(|suffix| (mapping.source.components().count(), mapping, suffix))
+                .map(|suffix| (source.components().count(), mapping, suffix))
         })
         .max_by_key(|(components, _, _)| *components)
-        .map(|(_, mapping, suffix)| join_relative(&mapping.target, suffix))
+        .map(|(_, mapping, suffix)| join_relative(&flat_spelling(&mapping.target), suffix))
+}
+
+/// Returns `path` without a Windows verbatim prefix, when it carries one.
+///
+/// `\\?\C:\x` and `C:\x` name the same file, so a comparison between them is a
+/// comparison between one file and itself and must succeed. Only the exact
+/// spellings [`std::fs::canonicalize`] produces are translated — a verbatim
+/// disk or a verbatim UNC share — and only when the path is UTF-8, which every
+/// persistable mapping and decoded locator here already is; anything else
+/// passes through untouched and compares exactly as it did before.
+#[cfg(windows)]
+fn flat_spelling(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    let Some(text) = path.to_str() else {
+        return Cow::Borrowed(path);
+    };
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return Cow::Borrowed(path);
+    };
+    if let Some(share) = rest.strip_prefix(r"UNC\") {
+        Cow::Owned(PathBuf::from(format!(r"\\{share}")))
+    } else if rest.as_bytes().get(1) == Some(&b':') {
+        Cow::Borrowed(Path::new(rest))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+/// Returns `path` unchanged: only Windows spells one file two ways.
+///
+/// On Unix a leading `\\?\` is not a prefix but four ordinary bytes a file is
+/// entitled to be named by, so stripping it here would corrupt a real name.
+#[cfg(not(windows))]
+fn flat_spelling(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
 }
 
 /// Applies completed move mappings to a provider-qualified media identity.
@@ -604,13 +647,43 @@ pub enum LocalIdentityRemapError {
 
 /// Decodes a current file-URL or legacy absolute-path Local locator.
 fn local_locator_path(locator: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(locator)
+    let path = if let Ok(url) = url::Url::parse(locator)
         && url.scheme() == "file"
     {
-        return url.to_file_path().ok();
-    }
-    let path = PathBuf::from(locator);
-    path.is_absolute().then_some(path)
+        url.to_file_path().ok()?
+    } else {
+        let path = PathBuf::from(locator);
+        if !path.is_absolute() {
+            return None;
+        }
+        path
+    };
+    Some(settled_local_path(path))
+}
+
+/// Returns `path` in the one spelling the mappings below are stated in.
+///
+/// Windows spells one file two ways: [`std::fs::canonicalize`] answers with a
+/// `\\?\` verbatim prefix, and a file URL cannot carry that prefix, so a locator
+/// decodes into the other spelling while a mapping holds the canonical one and
+/// the prefix match never fires.
+///
+/// A path naming nothing is returned exactly as it decoded. That is the ordinary
+/// case here — remapping runs after the file has already moved away — so the
+/// source side of a mapping still has to be matched by the caller in whatever
+/// spelling it was stated.
+#[cfg(windows)]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    crate::fs_path::canonicalize(&path).unwrap_or(path)
+}
+
+/// Returns `path` unchanged, because this platform spells a file one way.
+///
+/// A file URL round trip is already lossless here, and canonicalising would
+/// additionally resolve symbolic links, which this module never follows.
+#[cfg(not(windows))]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 trait NoReplaceRenamer {
@@ -650,6 +723,16 @@ impl NoReplaceRenamer for SystemNoReplaceRenamer {
         )))]
         {
             let metadata = fs::symlink_metadata(source)?;
+            // A directory rename on Windows is no-replace by construction:
+            // `MoveFileEx` refuses to replace an existing target of either
+            // kind with a directory, so the plain rename already carries the
+            // whole guarantee. This is Windows-only — POSIX `rename` would
+            // quietly replace an *empty* target directory, so the other
+            // fallback platforms keep refusing instead of guessing.
+            #[cfg(windows)]
+            if metadata.file_type().is_dir() {
+                return fs::rename(source, target);
+            }
             if !metadata.file_type().is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1243,7 +1326,7 @@ fn canonical_real_directory(path: &Path) -> Result<PathBuf, LocalMoveValidationE
     if !metadata.file_type().is_dir() {
         return Err(LocalMoveValidationError::UnsupportedEntry(path.to_owned()));
     }
-    fs::canonicalize(path).map_err(|source| LocalMoveValidationError::Inspect {
+    crate::fs_path::canonicalize(path).map_err(|source| LocalMoveValidationError::Inspect {
         path: path.to_owned(),
         source,
     })
@@ -1281,11 +1364,19 @@ fn join_relative(root: &Path, relative: &Path) -> PathBuf {
 
 fn is_normalized_absolute(path: &Path) -> bool {
     path.is_absolute()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-            )
+        && path.components().all(|component| match component {
+            Component::Prefix(_) | Component::RootDir => true,
+            // Windows parses a verbatim (`\\?\`) path literally: `/` is not a
+            // separator there and `..` is an ordinary name, so a traversal
+            // written against a verbatim base arrives as one "normal"
+            // component instead of `ParentDir`. No real entry is spelled that
+            // way — no filesystem here permits `.`, `..`, or `/` in a name —
+            // so the spelling alone marks the path unsafe.
+            Component::Normal(name) => {
+                let bytes = name.as_encoded_bytes();
+                bytes != b".." && bytes != b"." && !bytes.contains(&b'/')
+            }
+            Component::CurDir | Component::ParentDir => false,
         })
 }
 
@@ -1418,10 +1509,19 @@ mod tests {
         }
     }
 
+    /// Builds a fixture whose paths are all rooted at the *canonical* temporary
+    /// directory.
+    ///
+    /// Moves report canonical sources and destinations, so expectations have to
+    /// be built from a canonical root too. On Windows the raw [`TempDir`] path
+    /// never compares equal to one: canonicalization rewrites 8.3 short
+    /// components (`RUNNER~1` into `runneradmin`) and adds the `\\?\` verbatim
+    /// prefix.
     fn directories() -> (TempDir, PathBuf, PathBuf) {
         let fixture = tempfile::tempdir().expect("temporary fixture");
-        let source = fixture.path().join("source");
-        let destination = fixture.path().join("destination");
+        let root = crate::fs_path::canonicalize(fixture.path()).expect("canonical fixture root");
+        let source = root.join("source");
+        let destination = root.join("destination");
         fs::create_dir(&source).expect("source folder");
         fs::create_dir(&destination).expect("destination folder");
         (fixture, source, destination)
@@ -1476,7 +1576,7 @@ mod tests {
         assert!(matches!(
             validate_local_move(
                 &source,
-                &[source.join("../source/track.flac")],
+                &[spelled_under(&source, &["..", "source", "track.flac"])],
                 &destination,
                 LocalMoveLimits::default(),
             ),
@@ -1713,11 +1813,11 @@ mod tests {
                 .expect("destination-only listing");
         assert_eq!(
             listing.path,
-            fs::canonicalize(&destination).expect("canonical")
+            crate::fs_path::canonicalize(&destination).expect("canonical")
         );
         assert_eq!(
             listing.parent,
-            Some(fs::canonicalize(fixture.path()).expect("canonical parent"))
+            Some(crate::fs_path::canonicalize(fixture.path()).expect("canonical parent"))
         );
         assert_eq!(
             listing
@@ -1958,41 +2058,129 @@ mod tests {
     fn remapping_uses_longest_prefix_and_only_changes_local_ids() {
         let mappings = vec![
             LocalMoveMapping {
-                source: PathBuf::from("/music"),
-                target: PathBuf::from("/archive"),
+                source: fixture_absolute("/music"),
+                target: fixture_absolute("/archive"),
             },
             LocalMoveMapping {
-                source: PathBuf::from("/music/album"),
-                target: PathBuf::from("/library/favourite"),
+                source: fixture_absolute("/music/album"),
+                target: fixture_absolute("/library/favourite"),
             },
         ];
         assert_eq!(
-            remap_local_path_prefix(Path::new("/music/album/disc/one.flac"), &mappings),
-            Some(PathBuf::from("/library/favourite/disc/one.flac"))
+            remap_local_path_prefix(&fixture_absolute("/music/album/disc/one.flac"), &mappings),
+            Some(fixture_absolute("/library/favourite/disc/one.flac"))
         );
         assert_eq!(
-            remap_local_path_prefix(Path::new("/music/album"), &mappings),
-            Some(PathBuf::from("/library/favourite"))
+            remap_local_path_prefix(&fixture_absolute("/music/album"), &mappings),
+            Some(fixture_absolute("/library/favourite"))
         );
         assert_eq!(
-            remap_local_path_prefix(Path::new("/musicology/one.flac"), &mappings),
+            remap_local_path_prefix(&fixture_absolute("/musicology/one.flac"), &mappings),
             None
         );
 
-        let mut local = MediaId::new(SourceKind::Local, "/music/album/one.flac");
+        let old_locator = fixture_absolute("/music/album/one.flac");
+        let old_locator = old_locator.to_str().expect("UTF-8 fixture locator");
+        let new_locator = fixture_absolute("/library/favourite/one.flac");
+        let new_locator = new_locator.to_str().expect("UTF-8 fixture locator");
+
+        let mut local = MediaId::new(SourceKind::Local, old_locator);
         assert!(remap_local_media_id(&mut local, &mappings).expect("UTF-8 remap"));
-        assert_eq!(local.external_id, "/library/favourite/one.flac");
+        assert_eq!(local.external_id, new_locator);
 
-        let mut current = MediaId::new(SourceKind::Local, "file:///music/album/one.flac");
+        let old_url = url::Url::from_file_path(fixture_absolute("/music/album/one.flac"))
+            .expect("absolute fixture URL");
+        let new_url = url::Url::from_file_path(fixture_absolute("/library/favourite/one.flac"))
+            .expect("absolute fixture URL");
+        let mut current = MediaId::new(SourceKind::Local, old_url.as_str());
         assert!(remap_local_media_id(&mut current, &mappings).expect("file-URL remap"));
-        assert_eq!(current.external_id, "file:///library/favourite/one.flac");
+        assert_eq!(current.external_id, new_url.as_str());
 
-        let mut youtube = MediaId::new(SourceKind::YouTube, "/music/album/one.flac");
+        let mut youtube = MediaId::new(SourceKind::YouTube, old_locator);
         assert!(!remap_local_media_id(&mut youtube, &mappings).expect("non-local unchanged"));
-        assert_eq!(youtube.external_id, "/music/album/one.flac");
+        assert_eq!(youtube.external_id, old_locator);
 
-        let mut locator = "/music/album/one.flac".to_owned();
+        let mut locator = old_locator.to_owned();
         assert!(remap_local_replay_locator(&mut locator, &mappings).expect("locator remap"));
-        assert_eq!(locator, "/library/favourite/one.flac");
+        assert_eq!(locator, new_locator);
+    }
+
+    /// Returns `path` as this platform spells an absolute path.
+    ///
+    /// `/music` is absolute only where the filesystem has one root; Windows
+    /// needs a drive letter or the decoders correctly answer that the fixture
+    /// names nothing.
+    fn fixture_absolute(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
+    /// Writes a traversal into the path's text, past `join`'s good manners.
+    ///
+    /// `PathBuf::push` onto a verbatim base *resolves* `.` and `..` and
+    /// re-separates what it is given — std keeps verbatim paths literal by
+    /// normalising at push time — so `join("../source/x")` quietly becomes the
+    /// clean path it points at and asserts nothing about validation. A hostile
+    /// locator does not arrive through `join`; it arrives as text. This builds
+    /// that text.
+    fn spelled_under(base: &Path, suffix_parts: &[&str]) -> PathBuf {
+        let mut spelled = base.as_os_str().to_owned();
+        for part in suffix_parts {
+            spelled.push(std::path::MAIN_SEPARATOR_STR);
+            spelled.push(part);
+        }
+        PathBuf::from(spelled)
+    }
+
+    /// A traversal spelled against a verbatim base is still refused as unsafe.
+    ///
+    /// Under `\\?\` Windows parses literally: `/` is not a separator, so a
+    /// slash-spelled traversal arrives as one "normal" component and the
+    /// rejection has to come from the component's spelling rather than its
+    /// kind — a literal `..` between backslashes is still `ParentDir` and is
+    /// covered by the portable test above.
+    #[cfg(windows)]
+    #[test]
+    fn a_traversal_spelled_against_a_verbatim_base_is_still_unsafe() {
+        let (_fixture, source, destination) = directories();
+        let track = source.join("track.flac");
+        fs::write(&track, b"audio").expect("track");
+
+        assert!(matches!(
+            validate_local_move(
+                &source,
+                &[spelled_under(&source, &["../source/track.flac"])],
+                &destination,
+                LocalMoveLimits::default(),
+            ),
+            Err(LocalMoveValidationError::UnsafeSource(_))
+        ));
+    }
+
+    /// A mapping written down verbatim still matches a locator that decoded
+    /// flat, because both spell the same file.
+    ///
+    /// This is the exact shape a completed move produces: the plan holds what
+    /// `fs::canonicalize` said — `\\?\C:\…` — while the stored identity made a
+    /// round trip through a file URL, which cannot carry that prefix, and the
+    /// file itself has already moved away, so nothing can be re-canonicalised.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_mapping_still_remaps_a_flat_locator() {
+        let mappings = vec![LocalMoveMapping {
+            source: PathBuf::from(r"\\?\C:\music"),
+            target: PathBuf::from(r"\\?\C:\archive"),
+        }];
+        assert_eq!(
+            remap_local_path_prefix(Path::new(r"C:\music\one.flac"), &mappings),
+            Some(PathBuf::from(r"C:\archive\one.flac"))
+        );
+
+        let mut current = MediaId::new(SourceKind::Local, "file:///C:/music/one.flac");
+        assert!(remap_local_media_id(&mut current, &mappings).expect("file-URL remap"));
+        assert_eq!(current.external_id, "file:///C:/archive/one.flac");
     }
 }

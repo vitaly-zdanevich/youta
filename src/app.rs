@@ -192,27 +192,28 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
-use crate::tui::DetailLinkInternalTarget;
+use crate::view::DetailLinkInternalTarget;
 #[cfg(any(feature = "librivox", feature = "yandex-music"))]
-use crate::tui::DetailLinkPresentation;
-use crate::tui::DetailLinkView;
+use crate::view::DetailLinkPresentation;
+use crate::view::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
-use crate::tui::DownloadView;
+use crate::view::DownloadView;
 #[cfg(feature = "local-move")]
-use crate::tui::LocalMoveDestinationView;
+use crate::view::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
-use crate::tui::RadioRecordingView;
+use crate::view::RadioRecordingView;
 #[cfg(feature = "radio")]
-use crate::tui::RadioSort;
+use crate::view::RadioSort;
 #[cfg(feature = "qr")]
-use crate::tui::VideoQrPopupView;
-use crate::tui::{
-    DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll,
-    DetailsTextSelection, ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL,
-    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
-    MAX_DETAILS_SELECTION_BYTES, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView,
-    PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion,
-    PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState,
+use crate::view::VideoQrPopupView;
+use crate::view::{
+    ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
+    DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
+    GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort,
+    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView,
+    PlaylistEditorField, PlaylistItemView, PlaylistPopupMode, PlaylistPopupView,
+    PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView,
+    ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView, QueueRowView,
     RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
     SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
     VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
@@ -220,11 +221,11 @@ use crate::tui::{
     YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
-use crate::tui::{
+use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
 };
 #[cfg(feature = "yandex-music")]
-use crate::tui::{
+use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
     YandexMusicSetupPopupView,
 };
@@ -564,10 +565,9 @@ fn moved_private_note_cursor_vertically(
 
 /// Factory used to start a playback engine only when the user presses Play.
 ///
-/// Delaying process creation keeps startup fast and avoids an idle decoder for
-/// users who only browse subscriptions or metadata.
-pub type PlaybackFactory =
-    Box<dyn FnMut() -> PlaybackResult<Box<dyn PlaybackBackend>> + Send + 'static>;
+/// This alias lives beside the backends in [`crate::playback`] and is re-exported
+/// here because a controller is what consumes it.
+pub use crate::playback::PlaybackFactory;
 
 trait YouTubeProviderBuilder: Send {
     fn official(&self, api_key: String) -> Result<Box<dyn Provider>, String>;
@@ -1000,7 +1000,7 @@ fn parse_local_path_input_from(
             current.join(path)
         }
     };
-    let path = std::fs::canonicalize(&raw_path).map_err(|source| LocalInputError::Io {
+    let path = crate::fs_path::canonicalize(&raw_path).map_err(|source| LocalInputError::Io {
         path: raw_path.clone(),
         source,
     })?;
@@ -1165,13 +1165,15 @@ trait LocalMediaProbe {
     fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata>;
 }
 
-/// Shell-free probe using the installed `ffprobe` executable.
-#[derive(Clone, Copy, Debug, Default)]
-struct SystemLocalMediaProbe;
+/// Shell-free probe using the configured `ffprobe` executable.
+#[derive(Clone, Debug)]
+struct SystemLocalMediaProbe {
+    executable: PathBuf,
+}
 
 impl LocalMediaProbe for SystemLocalMediaProbe {
     fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata> {
-        let mut child = Command::new("ffprobe")
+        let mut child = crate::child_process::quiet(&mut Command::new(&self.executable))
             .args([
                 "-v",
                 "error",
@@ -1224,12 +1226,14 @@ trait LocalMediaLoader: Send + Sync {
 }
 
 /// System metadata loader combining Lofty tags with a bounded `ffprobe` call.
-#[derive(Debug, Default)]
-struct SystemLocalMediaLoader;
+#[derive(Debug)]
+struct SystemLocalMediaLoader {
+    ffprobe_executable: PathBuf,
+}
 
 impl LocalMediaLoader for SystemLocalMediaLoader {
     fn load(&self, path: PathBuf) -> LocalMediaItem {
-        local_media_item(path)
+        local_media_item(path, &self.ffprobe_executable)
     }
 }
 
@@ -1239,28 +1243,12 @@ fn local_file_identity(path: &Path) -> Option<LocalFileIdentity> {
     if !metadata.is_file() {
         return None;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        Some(LocalFileIdentity {
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Some(LocalFileIdentity {
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        })
-    }
+    Some(LocalFileIdentity {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        filesystem: crate::file_identity::filesystem_identity(path, &metadata),
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1291,14 +1279,8 @@ struct LocalFileIdentity {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 /// One identity-bound selected-file metadata record.
@@ -1516,11 +1498,21 @@ struct LocalFolderSizeWorkerResult {
     reused: bool,
 }
 
+/// Whether this build can draw a midpoint frame for a local video.
+///
+/// Extraction and rendering are separate capabilities: a window links the
+/// extractor's crate but draws no frames, so a video there falls back to the
+/// artwork inside or beside the file rather than showing nothing at all.
+#[cfg(feature = "local-artwork")]
+const LOCAL_VIDEO_FRAMES_RENDERED: bool =
+    cfg!(all(feature = "local-video-thumbnails", feature = "images"));
+
 /// Lazy artwork lookup selected for one Local Details target.
-#[cfg(all(feature = "local-artwork", feature = "images"))]
+#[cfg(feature = "local-artwork")]
 #[derive(Clone, Copy)]
 enum LocalArtworkKind {
-    /// Extracts bounded embedded artwork from a playable media file.
+    /// Extracts bounded embedded artwork from a playable media file, or finds
+    /// the image a downloader left beside it.
     EmbeddedMedia,
     /// Discovers a conventional cover file without opening image contents.
     FolderCover,
@@ -1888,7 +1880,13 @@ fn publish_radio_recording(
 #[cfg(feature = "radio")]
 fn publish_file_without_replacement(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::hard_link(source, destination)?;
-    std::fs::File::open(destination)?.sync_all()
+    // The durability flush needs a handle with write access: Windows refuses
+    // `FlushFileBuffers` on a read-only handle with "Access is denied", while
+    // Unix has always allowed `fsync` on either kind.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(destination)?
+        .sync_all()
 }
 
 /// Copies across filesystems into a hidden Downloaded staging file before final publication.
@@ -2087,7 +2085,7 @@ enum ProviderRequest {
         generation: u64,
         root: PathBuf,
     },
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -2121,6 +2119,19 @@ enum ProviderRequest {
         generation: u64,
         station_id: String,
         endpoint: RadioNowPlayingEndpoint,
+    },
+    /// Resolve the selected station's logotype.
+    ///
+    /// Both sources travel with the request so the worker can fall through
+    /// without a second round trip through the reducer.
+    #[cfg(feature = "radio")]
+    RadioArtwork {
+        generation: u64,
+        station_id: String,
+        /// Verified Wikidata items for this station, empty for most of them.
+        item_ids: Vec<String>,
+        /// The station's own homepage, which advertises its logo.
+        homepage: Option<url::Url>,
     },
     #[cfg(feature = "bbc-radio")]
     ResolveBbcLive {
@@ -2524,7 +2535,7 @@ enum ProviderResponse {
         root: PathBuf,
         result: Result<Vec<LocalMediaItem>, String>,
     },
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     LocalArtwork {
         generation: u64,
         path: PathBuf,
@@ -2559,6 +2570,12 @@ enum ProviderResponse {
         generation: u64,
         station_id: String,
         result: Result<RadioNowPlaying, String>,
+    },
+    #[cfg(feature = "radio")]
+    RadioArtwork {
+        generation: u64,
+        station_id: String,
+        artwork: Option<url::Url>,
     },
     #[cfg(feature = "bbc-radio")]
     BbcLive {
@@ -2948,6 +2965,11 @@ enum AutoplayOrigin {
         channel_id: String,
         index: usize,
     },
+    Playlist {
+        /// Persisted entries captured when playback started from the playlist.
+        entries: Arc<[PlaylistEntry]>,
+        index: usize,
+    },
     LocalBrowser {
         directory: PathBuf,
         entries: Arc<[PathBuf]>,
@@ -2978,11 +3000,52 @@ enum AutoplayStep {
     Exhausted,
 }
 
+/// One scan direction through a same-source list.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ListStepDirection {
+    Forward,
+    Backward,
+}
+
+/// Scans one direction from an origin index for the first playable step.
+///
+/// The origin index itself is excluded in both directions, so a backward scan
+/// lands strictly before the position the origin describes.
+fn neighbour_list_step<T>(
+    items: &[T],
+    index: usize,
+    direction: ListStepDirection,
+    mut candidate: impl FnMut(usize, &T) -> Option<AutoplayStep>,
+) -> AutoplayStep {
+    match direction {
+        ListStepDirection::Forward => {
+            for (index, item) in items.iter().enumerate().skip(index.saturating_add(1)) {
+                if let Some(step) = candidate(index, item) {
+                    return step;
+                }
+            }
+        }
+        ListStepDirection::Backward => {
+            for index in (0..index.min(items.len())).rev() {
+                if let Some(step) = candidate(index, &items[index]) {
+                    return step;
+                }
+            }
+        }
+    }
+    AutoplayStep::Exhausted
+}
+
 #[cfg(feature = "tracker-music")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TrackerPreparationOwner {
     Manual,
     Autoplay(AutoplayOrigin),
+    /// A manual queue-edge step that crossed into the source list; plays the
+    /// prepared module regardless of the autoplay toggle.
+    ManualStep {
+        forward: bool,
+    },
     CanceledAutoplay,
 }
 
@@ -3166,8 +3229,14 @@ const MAX_LAZY_LOCAL_FOLDER_SIZES: usize = 256;
 /// Maximum completed directory sizes retained across Local navigation.
 const MAX_CACHED_LOCAL_FOLDER_SIZES: usize = 512;
 /// Maximum positive or negative embedded-artwork lookups retained in RAM.
-#[cfg(all(feature = "local-artwork", feature = "images"))]
+#[cfg(feature = "local-artwork")]
 const MAX_CACHED_LOCAL_ARTWORK: usize = 256;
+/// Maximum positive or negative station logotypes retained in RAM.
+///
+/// The curated catalogue is a few hundred stations, so this holds effectively
+/// all of them for a session and the bound exists only to stay finite.
+#[cfg(feature = "radio")]
+const MAX_CACHED_RADIO_ARTWORK: usize = 1_024;
 /// Maximum time a traversal can be reused when nested changes may be invisible.
 const LOCAL_FOLDER_SIZE_CACHE_TTL: Duration = Duration::from_mins(1);
 /// Retry delay for inaccessible or resource-limited directory trees.
@@ -3814,6 +3883,10 @@ pub struct AppController {
     /// One selected text-file command awaiting safe TUI lifecycle handling.
     #[cfg(feature = "local-browser")]
     pending_text_file_open: Option<TextFileOpenPlan>,
+    /// One copy awaiting the front-end that owns the platform clipboard.
+    pending_clipboard_request: Option<ClipboardRequest>,
+    /// Subject of the copy a front-end has taken but not yet reported on.
+    awaiting_clipboard_subject: Option<ClipboardSubject>,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -3962,17 +4035,30 @@ pub struct AppController {
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
     local_move_journal_pending: bool,
     /// Monotonic owner for the sole embedded-artwork extraction request.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_generation: u64,
     /// Media path currently being inspected by the provider worker.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     pending_local_artwork: Option<(u64, PathBuf)>,
     /// Process-local positive and negative artwork results by exact path.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_cache: HashMap<PathBuf, Option<url::Url>>,
     /// Insertion order bounding the process-local artwork result cache.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     local_artwork_cache_order: VecDeque<PathBuf>,
+    /// Monotonic owner for the sole station-logotype lookup.
+    #[cfg(feature = "radio")]
+    radio_artwork_generation: u64,
+    /// Station whose logotype the provider worker is resolving.
+    #[cfg(feature = "radio")]
+    pending_radio_artwork: Option<(u64, String)>,
+    /// Process-local positive and negative logotype results by station ID.
+    ///
+    /// A station that has no image is remembered as `None`, because the whole
+    /// catalogue is compiled in and re-asking Wikidata every time the selection
+    /// passes over the same station would be a request per keystroke.
+    #[cfg(feature = "radio")]
+    radio_artwork_cache: HashMap<String, Option<url::Url>>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
     /// Current OPML leaves in stable folder order.
@@ -4399,6 +4485,11 @@ impl AppController {
         let local_fingerprint_requests = local_fingerprint_thread
             .as_ref()
             .map(|_| local_fingerprint_request_sender);
+        // Both helper paths are read before `config` is moved into the
+        // controller, because the workers that use them outlive this scope.
+        let local_media_ffprobe = config.providers.ffprobe_executable.clone();
+        #[cfg(feature = "waveform")]
+        let waveform_ffmpeg = config.providers.ffmpeg_executable.clone();
         #[cfg(feature = "waveform")]
         let local_waveform_thread_result = thread::Builder::new()
             .name("youta-local-waveform".to_owned())
@@ -4406,7 +4497,7 @@ impl AppController {
                 local_waveform_worker(
                     local_waveform_request_receiver,
                     local_waveform_response_sender,
-                    Arc::new(FfmpegLocalWaveformExtractor::default()),
+                    Arc::new(FfmpegLocalWaveformExtractor::new(waveform_ffmpeg)),
                 );
             });
         #[cfg(feature = "waveform")]
@@ -4853,11 +4944,15 @@ impl AppController {
             local_listing: None,
             #[cfg(feature = "local-browser")]
             pending_text_file_open: None,
+            pending_clipboard_request: None,
+            awaiting_clipboard_subject: None,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
             pending_local_media_metadata: None,
-            local_media_loader: Arc::new(SystemLocalMediaLoader),
+            local_media_loader: Arc::new(SystemLocalMediaLoader {
+                ffprobe_executable: local_media_ffprobe,
+            }),
             local_media_metadata_sender,
             local_media_metadata_responses,
             #[cfg(feature = "acoustid")]
@@ -4945,14 +5040,20 @@ impl AppController {
             local_move_persistence_failure: None,
             #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_journal_pending,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_generation: 0,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             pending_local_artwork: None,
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_cache: HashMap::new(),
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             local_artwork_cache_order: VecDeque::new(),
+            #[cfg(feature = "radio")]
+            radio_artwork_generation: 0,
+            #[cfg(feature = "radio")]
+            pending_radio_artwork: None,
+            #[cfg(feature = "radio")]
+            radio_artwork_cache: HashMap::new(),
             tracker_results: Vec::new(),
             subscription_tree,
             subscription_entries: Vec::new(),
@@ -6028,7 +6129,10 @@ impl AppController {
             }];
             self.view.status_line = format!("Scanning {} in the background…", local.path.display());
         } else {
-            self.local_results.push(local_media_item(local.path));
+            self.local_results.push(local_media_item(
+                local.path,
+                &self.config.providers.ffprobe_executable,
+            ));
             self.refresh_local_rows();
             self.view.status_line = "Local media file recognized; press Enter to play".to_owned();
             self.refresh_selected_playlist_state();
@@ -6818,12 +6922,7 @@ impl AppController {
             YandexMusicRow::Album(album) => self.open_yandex_music_album(album.id),
             YandexMusicRow::Track(track) => {
                 let item = queue_item_from_yandex_music_track(&track);
-                let origin = self
-                    .config
-                    .playback
-                    .autoplay
-                    .then(|| self.autoplay_origin_for_media(&item.media.id))
-                    .flatten();
+                let origin = self.autoplay_origin_for_media(&item.media.id);
                 self.request_yandex_music_playback(*track, item, false, origin);
             }
         }
@@ -11067,6 +11166,10 @@ impl AppController {
                             self.view.status_line =
                                 "Canceled tracker preparation did not change playback".to_owned();
                         }
+                        TrackerPreparationOwner::ManualStep { .. } => {
+                            self.view.status_line =
+                                format!("Could not prepare the tracker item: {error}");
+                        }
                         TrackerPreparationOwner::Manual => {
                             self.show_error_message("Tracker module preparation failed", error);
                         }
@@ -11100,7 +11203,7 @@ impl AppController {
                     }
                 }
             }
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             ProviderResponse::LocalArtwork {
                 generation,
                 path,
@@ -11340,6 +11443,12 @@ impl AppController {
                 station_id,
                 result,
             } => self.handle_radio_now_playing(generation, station_id, result),
+            #[cfg(feature = "radio")]
+            ProviderResponse::RadioArtwork {
+                generation,
+                station_id,
+                artwork,
+            } => self.handle_radio_artwork(generation, station_id, artwork),
             #[cfg(feature = "bbc-radio")]
             ProviderResponse::BbcLive {
                 generation,
@@ -12444,7 +12553,7 @@ impl AppController {
     }
 
     /// Starts one lazy artwork lookup for selected Local media or a folder.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn request_selected_local_artwork(&mut self) {
         let selected = if self.view.screen == Screen::Local {
             self.local_entry_index()
@@ -12457,10 +12566,8 @@ impl AppController {
                     | crate::local_browser::LocalEntryKind::TrackerModule => {
                         Some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
                     }
-                    crate::local_browser::LocalEntryKind::Video => {
-                        (!cfg!(feature = "local-video-thumbnails"))
-                            .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia))
-                    }
+                    crate::local_browser::LocalEntryKind::Video => (!LOCAL_VIDEO_FRAMES_RENDERED)
+                        .then_some((entry.path.clone(), LocalArtworkKind::EmbeddedMedia)),
                     crate::local_browser::LocalEntryKind::Image
                     | crate::local_browser::LocalEntryKind::Text
                     | crate::local_browser::LocalEntryKind::Other => None,
@@ -12472,7 +12579,7 @@ impl AppController {
                 .and_then(|details| details.media_id.as_ref())
                 .and_then(local_path_from_media_id)
                 .and_then(|path| {
-                    (cfg!(not(feature = "local-video-thumbnails"))
+                    (!LOCAL_VIDEO_FRAMES_RENDERED
                         || crate::local_browser::classify_local_file(&path)
                             != Some(crate::local_browser::LocalEntryKind::Video))
                     .then_some((path, LocalArtworkKind::EmbeddedMedia))
@@ -12516,7 +12623,7 @@ impl AppController {
     }
 
     /// Stores one process-local artwork result with deterministic FIFO eviction.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn cache_local_artwork(&mut self, path: PathBuf, artwork: Option<url::Url>) {
         self.local_artwork_cache.insert(path.clone(), artwork);
         self.local_artwork_cache_order
@@ -12531,7 +12638,7 @@ impl AppController {
     }
 
     /// Applies a cached cover only when the same Local path still owns Details.
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     fn apply_cached_local_artwork(&mut self, path: &Path) {
         let Some(artwork) = self.local_artwork_cache.get(path) else {
             return;
@@ -13350,7 +13457,7 @@ impl AppController {
             let first_recording = self.apply_local_fingerprint_details();
             self.request_local_fingerprint_wikidata(first_recording.as_deref());
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         self.request_selected_local_artwork();
     }
 
@@ -13401,6 +13508,9 @@ impl AppController {
                     "Tracker module preparation failed",
                     "the prepared result no longer exists in the current tracker search",
                 );
+            } else if matches!(owner, TrackerPreparationOwner::ManualStep { .. }) {
+                self.view.status_line =
+                    "The prepared tracker item no longer exists in the current search".to_owned();
             }
             return;
         };
@@ -13431,6 +13541,9 @@ impl AppController {
                     "Tracker module preparation failed",
                     "the selected payload contained no supported tracker module",
                 );
+            } else if matches!(owner, TrackerPreparationOwner::ManualStep { .. }) {
+                self.view.status_line =
+                    "The prepared payload contained no supported tracker module".to_owned();
             } else {
                 self.view.status_line =
                     "Canceled tracker preparation contained no playable module".to_owned();
@@ -13475,6 +13588,26 @@ impl AppController {
                 }),
             ),
             TrackerPreparationOwner::Manual => self.play_queue_item(item, false),
+            TrackerPreparationOwner::ManualStep { forward } => {
+                // The step that requested this preparation consumed the parked
+                // resume position only now, when the module can actually play.
+                self.queued_autoplay_resume_origin = None;
+                let insert_at = if forward {
+                    self.playback_queue.items.len()
+                } else {
+                    self.playback_queue.current_index.unwrap_or(0)
+                };
+                self.playback_queue.items.insert(insert_at, item.clone());
+                self.playback_queue.current_index = Some(insert_at);
+                self.play_queue_item_with_origin(
+                    item,
+                    true,
+                    Some(AutoplayOrigin::Tracker {
+                        generation: self.search_generation,
+                        index,
+                    }),
+                );
+            }
             TrackerPreparationOwner::CanceledAutoplay => {
                 unreachable!("canceled preparation returned before queue activation")
             }
@@ -13561,7 +13694,7 @@ impl AppController {
                 ),
                 ..DetailView::default()
             });
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             self.request_selected_local_artwork();
         } else if self.view.screen == Screen::TrackerMusic
             && let Some(item) = self.tracker_results.get(self.view.selected)
@@ -13815,7 +13948,10 @@ impl AppController {
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen == Screen::Downloaded {
-            return queue_item_from_local(&local_media_item(self.selected_downloaded_path()?));
+            return queue_item_from_local(&local_media_item(
+                self.selected_downloaded_path()?,
+                &self.config.providers.ffprobe_executable,
+            ));
         }
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
@@ -13991,6 +14127,7 @@ impl AppController {
                 })?;
             return playlist_snapshot_from_queue_item(&queue_item_from_local(&local_media_item(
                 entry.path.clone(),
+                &self.config.providers.ffprobe_executable,
             ))?);
         }
 
@@ -15184,6 +15321,268 @@ impl AppController {
         }
     }
 
+    /// Opens the queue, positioned on the entry playback is currently on.
+    fn open_queue_popup(&mut self) {
+        if self.playback_queue.items.is_empty() {
+            self.view.status_line =
+                "The queue is empty; press a to add the selected item".to_owned();
+            return;
+        }
+        let selected = self.playback_queue.current_index.unwrap_or_default();
+        self.view.queue_popup = Some(self.queue_popup_view(selected));
+    }
+
+    /// Rebuilds an open queue without moving the highlight off its entry.
+    ///
+    /// This runs once per [`Self::tick`] rather than at each of the eleven
+    /// places the queue changes, because those places include ones the user did
+    /// not touch: reaching the end of a track advances the cursor, starting
+    /// playback inserts an entry beside it, and a Local move rewrites every
+    /// identity in the queue. A missed site would not merely show a stale
+    /// list — it would show one whose row indices no longer match the indices
+    /// the next click sends back, which is worse than showing nothing.
+    ///
+    /// It costs nothing while the queue is closed, which is almost always.
+    fn refresh_open_queue_popup(&mut self) {
+        if self.view.queue_popup.is_none() {
+            return;
+        }
+        if self.playback_queue.items.is_empty() {
+            self.view.queue_popup = None;
+            return;
+        }
+        let selected = self
+            .view
+            .queue_popup
+            .as_ref()
+            .map_or(0, |popup| popup.selected)
+            .min(self.playback_queue.items.len().saturating_sub(1));
+        self.view.queue_popup = Some(self.queue_popup_view(selected));
+    }
+
+    /// Republishes the title and creator of the entry playback is on.
+    ///
+    /// This shares [`Self::refresh_open_queue_popup`]'s choke point for the same
+    /// reason: the current entry moves on end-of-file and on a Local move, not
+    /// only when the user asks for something. Unlike the queue it is published
+    /// unconditionally, because a window's title bar, its tray tooltip, and the
+    /// notification for a track change all read it whether or not any popup is
+    /// open. It costs two string clones per tick and, being compared before
+    /// publication, produces no traffic while it is unchanged.
+    fn refresh_now_playing(&mut self) {
+        let current = self
+            .playback_queue
+            .current_index
+            .and_then(|index| self.playback_queue.items.get(index))
+            .map(|item| NowPlayingView {
+                media_id: item.media.id.clone(),
+                title: item.media.title.clone(),
+                subtitle: item.media.creator.clone().unwrap_or_default(),
+            });
+        if self.view.now_playing != current {
+            self.view.now_playing = current;
+        }
+    }
+
+    /// Projects the queue into the credential-free rows a front-end may hold.
+    fn queue_popup_view(&self, selected: usize) -> QueuePopupView {
+        QueuePopupView {
+            items: self
+                .playback_queue
+                .items
+                .iter()
+                .map(|item| QueueRowView {
+                    media_id: item.media.id.clone(),
+                    title: item.media.title.clone(),
+                    subtitle: item.media.creator.clone().unwrap_or_default(),
+                    length: item
+                        .media
+                        .duration_seconds
+                        .map(format_seconds)
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            current: self.playback_queue.current_index,
+            selected,
+            repeat_one: self.playback_queue.repeat_one,
+        }
+    }
+
+    /// Moves the queue cursor to one exact entry and starts it.
+    fn activate_queue_row(&mut self, row: usize) {
+        let Some(item) = self.playback_queue.items.get(row).cloned() else {
+            return;
+        };
+        // Park the same-source position this jump leaves, exactly as
+        // end-of-file does when explicit entries take over, so the original
+        // list survives a manual detour through queued items.
+        if self.queued_autoplay_resume_origin.is_none() && self.current_autoplay_origin.is_some() {
+            self.queued_autoplay_resume_origin = self.current_autoplay_origin.clone();
+        }
+        self.playback_queue.current_index = Some(row);
+        // The cursor is already where this item lives, so the playback path
+        // must not insert a second copy of it beside itself.
+        self.play_queue_item(item, true);
+    }
+
+    /// Starts the queue entry a signed number of steps from the current one.
+    ///
+    /// Repeat-one is deliberately not consulted. Repeat decides what happens
+    /// when an item *ends*; somebody who asked for the next track has already
+    /// said what they want, and replaying the same item in answer would look
+    /// like the key did nothing.
+    ///
+    /// At either end of the queue the step continues into the same-source
+    /// list playback started from, backward as well as forward, whether or
+    /// not autoplay is enabled: that toggle decides only what end-of-file
+    /// does on its own. A missing, replaced, or exhausted list is a stated
+    /// refusal rather than a wrap-around.
+    fn play_queue_neighbour(&mut self, step: i32) {
+        let Some(current) = self.playback_queue.current_index else {
+            self.view.status_line = "The queue holds nothing to move through".to_owned();
+            return;
+        };
+        let target = isize::try_from(step)
+            .ok()
+            .and_then(|step| current.checked_add_signed(step))
+            .filter(|target| *target < self.playback_queue.items.len());
+        if let Some(target) = target {
+            self.activate_queue_row(target);
+            return;
+        }
+        let backward = step < 0;
+        // A single-step overshoot is by definition at the queue edge and
+        // crosses into the source list; a larger jump keeps the refusal.
+        if step.unsigned_abs() == 1 {
+            self.step_into_source_list(backward);
+            return;
+        }
+        self.view.status_line = if backward {
+            "This is the first item in the queue".to_owned()
+        } else {
+            "This is the last item in the queue".to_owned()
+        };
+    }
+
+    /// Continues a manual queue-edge step into the owning same-source list.
+    ///
+    /// Deliberately not `continue_autoplay`: that path speaks in autoplay's
+    /// voice and maintains end-of-file follow state a keypress does not own.
+    /// The crossed-into entry is recorded as a queue row exactly as
+    /// end-of-file continuation records one, so the queue keeps describing
+    /// what is playing.
+    fn step_into_source_list(&mut self, backward: bool) {
+        let origin = self
+            .queued_autoplay_resume_origin
+            .clone()
+            .or_else(|| self.current_autoplay_origin.clone());
+        let Some(origin) = origin else {
+            self.view.status_line = if backward {
+                "This is the first item in the queue".to_owned()
+            } else {
+                "This is the last item in the queue".to_owned()
+            };
+            return;
+        };
+        let direction = if backward {
+            ListStepDirection::Backward
+        } else {
+            ListStepDirection::Forward
+        };
+        match self.neighbour_autoplay_step(&origin, direction) {
+            AutoplayStep::Play { item, origin } => {
+                self.queued_autoplay_resume_origin = None;
+                let insert_at = if backward {
+                    self.playback_queue.current_index.unwrap_or(0)
+                } else {
+                    self.playback_queue.items.len()
+                };
+                self.playback_queue.items.insert(insert_at, (*item).clone());
+                self.playback_queue.current_index = Some(insert_at);
+                self.play_queue_item_with_origin(*item, true, Some(origin));
+            }
+            #[cfg(feature = "tracker-music")]
+            AutoplayStep::PrepareTracker { index, origin: _ } => {
+                // The parked resume position survives until the preparation
+                // completes; a failed download must not lose the only handle
+                // on the list.
+                self.prepare_tracker_item(
+                    index,
+                    TrackerPreparationOwner::ManualStep { forward: !backward },
+                );
+            }
+            AutoplayStep::SourceChanged => {
+                self.view.status_line = "The source list changed since playback started".to_owned();
+            }
+            AutoplayStep::Exhausted => {
+                self.view.status_line = if backward {
+                    "Reached the start of the source list".to_owned()
+                } else {
+                    "Reached the end of the source list".to_owned()
+                };
+            }
+        }
+    }
+
+    /// Drops one entry, keeping the cursor on the item that is still playing.
+    fn remove_queue_row(&mut self, row: usize) {
+        if row >= self.playback_queue.items.len() {
+            return;
+        }
+        if self.playback_queue.current_index == Some(row) {
+            self.view.status_line =
+                "Stop the current item before removing it from the queue".to_owned();
+            return;
+        }
+        let removed = self.playback_queue.items.remove(row);
+        // Entries before the cursor shift, so the cursor shifts with them.
+        // Without this, removing an earlier entry would silently repoint the
+        // cursor at the wrong item and the next EOF would skip a track.
+        if let Some(current) = self.playback_queue.current_index
+            && current > row
+        {
+            self.playback_queue.current_index = Some(current.saturating_sub(1));
+        }
+        self.view.status_line = format!("Removed {} from the queue", removed.media.title);
+    }
+
+    /// Drops every entry except the one playback is on.
+    fn clear_queue(&mut self) {
+        let retained = self
+            .playback_queue
+            .current_index
+            .and_then(|index| self.playback_queue.items.get(index).cloned());
+        let removed = self
+            .playback_queue
+            .items
+            .len()
+            .saturating_sub(usize::from(retained.is_some()));
+        match retained {
+            Some(item) => {
+                self.playback_queue.items = vec![item];
+                self.playback_queue.current_index = Some(0);
+            }
+            None => {
+                self.playback_queue.items.clear();
+                self.playback_queue.current_index = None;
+            }
+        }
+        self.view.status_line = match removed {
+            0 => "The queue held nothing to clear".to_owned(),
+            1 => "Cleared one queued item".to_owned(),
+            count => format!("Cleared {count} queued items"),
+        };
+    }
+
+    /// Hands one copy to the front-end that owns the platform clipboard.
+    fn request_clipboard_copy(&mut self, text: String, subject: ClipboardSubject) {
+        self.pending_clipboard_request = Some(ClipboardRequest { text, subject });
+        self.view.status_line = match subject {
+            ClipboardSubject::Link => "Copying the link…".to_owned(),
+            ClipboardSubject::DetailsText(count) => format!("Copying {count} characters…"),
+        };
+    }
+
     #[cfg(feature = "yt-dlp")]
     fn start_selected_download(&mut self) {
         #[cfg(feature = "yandex-music")]
@@ -15900,14 +16299,10 @@ impl AppController {
                     self.view.status_line = "No LibriVox section is selected".to_owned();
                     return;
                 };
-                let origin = self
-                    .config
-                    .playback
-                    .autoplay
-                    .then(|| AutoplayOrigin::Librivox {
-                        items: Arc::from(queue),
-                        index: self.view.selected,
-                    });
+                let origin = Some(AutoplayOrigin::Librivox {
+                    items: Arc::from(queue),
+                    index: self.view.selected,
+                });
                 self.play_queue_item_with_origin(item, false, origin);
             }
         }
@@ -16113,7 +16508,7 @@ impl AppController {
                     "No default action is available for this file type".to_owned();
             }
             LocalEntryKind::Audio | LocalEntryKind::Video | LocalEntryKind::TrackerModule => {
-                let item = local_media_item(entry.path);
+                let item = local_media_item(entry.path, &self.config.providers.ffprobe_executable);
                 match queue_item_from_local(&item) {
                     Ok(item) => self.play_queue_item(item, false),
                     Err(error) => self.show_error_message("Local media could not be played", error),
@@ -16143,6 +16538,67 @@ impl AppController {
         self.browse_local_directory_with_reselection(parent, Some(child));
     }
 
+    /// Shows paths a window received from a system drag-and-drop.
+    ///
+    /// One drop names one place to look: the dropped directory itself, or the
+    /// folder the dropped file lives in with that file reselected. Dropping
+    /// several files out of one folder therefore lands on all of them at once,
+    /// which is the selection a file manager actually hands over.
+    ///
+    /// Nothing here is per-path, which is why the batch needs no bound: only
+    /// the first path is inspected and the rest are counted. Local reads it in
+    /// place, exactly as when the same path is typed into the input box.
+    #[cfg(feature = "local-browser")]
+    fn open_dropped_paths(&mut self, paths: Vec<PathBuf>) {
+        let dropped = paths.len();
+        let Some(first) = paths.into_iter().next() else {
+            self.view.status_line = "That drop carried no paths".to_owned();
+            return;
+        };
+        // Canonicalizing doubles as the existence check and matches what the
+        // input box already does with a typed path.
+        let path = match crate::fs_path::canonicalize(&first) {
+            Ok(path) => path,
+            Err(error) => {
+                self.view.status_line = format!("Cannot open {}: {error}", first.display());
+                return;
+            }
+        };
+        let directory = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) => {
+                self.view.status_line = format!("Cannot open {}: {error}", path.display());
+                return;
+            }
+        };
+        let (folder, reselect) = if directory {
+            (path, None)
+        } else if let Some(parent) = path.parent() {
+            (parent.to_path_buf(), Some(path))
+        } else {
+            self.view.status_line = format!("{} has no folder to open", path.display());
+            return;
+        };
+        if self.view.screen != Screen::Local {
+            self.show_screen(Screen::Local);
+        }
+        self.browse_local_directory_with_reselection(folder, reselect);
+        if dropped > 1 {
+            // The browse just wrote "Reading …", which the count replaces
+            // rather than joins: the interesting fact is that the other paths
+            // were not forgotten, and the folder name is already on screen.
+            self.view.status_line =
+                format!("{dropped} paths dropped; showing the folder the first one is in");
+        }
+    }
+
+    #[cfg(not(feature = "local-browser"))]
+    fn open_dropped_paths(&mut self, _paths: Vec<PathBuf>) {
+        self.view.status_line =
+            "This build omits the `local-browser` feature; dropped paths cannot be opened"
+                .to_owned();
+    }
+
     /// Starts bounded background preparation for a selected remote module.
     ///
     /// Returns `true` when activation was fully handled without immediately
@@ -16153,19 +16609,15 @@ impl AppController {
             self.view.status_line = "No tracker item is selected".to_owned();
             return true;
         }
-        self.prepare_tracker_item(self.view.selected, None)
+        self.prepare_tracker_item(self.view.selected, TrackerPreparationOwner::Manual)
     }
 
-    /// Starts one selected or autoplay-owned tracker preparation.
+    /// Starts one selected, stepped-to, or autoplay-owned tracker preparation.
     ///
     /// Returns `true` when the request was handled without entering the
     /// ordinary immediate-play path.
     #[cfg(feature = "tracker-music")]
-    fn prepare_tracker_item(
-        &mut self,
-        index: usize,
-        autoplay_origin: Option<AutoplayOrigin>,
-    ) -> bool {
+    fn prepare_tracker_item(&mut self, index: usize, owner: TrackerPreparationOwner) -> bool {
         if self.pending_tracker_preparation.is_some() {
             self.view.status_line =
                 "One tracker module is already being prepared in the background".to_owned();
@@ -16206,11 +16658,7 @@ impl AppController {
         ) {
             return true;
         }
-        let autoplay = autoplay_origin.is_some();
-        let owner = autoplay_origin.map_or(
-            TrackerPreparationOwner::Manual,
-            TrackerPreparationOwner::Autoplay,
-        );
+        let autoplay = matches!(owner, TrackerPreparationOwner::Autoplay(_));
         self.pending_tracker_preparation = Some(PendingTrackerPreparation {
             generation: self.search_generation,
             item_key,
@@ -17244,7 +17692,8 @@ impl AppController {
             .cached_local_media_item(&path, size_bytes)
             .filter(|item| item.technical_metadata_probed)
             .unwrap_or_else(|| {
-                let item = local_media_item(path.clone());
+                let item =
+                    local_media_item(path.clone(), &self.config.providers.ffprobe_executable);
                 if let Some(identity) = local_file_identity(&path) {
                     self.cache_local_media_item(identity, item.clone());
                 }
@@ -18576,6 +19025,47 @@ impl AppController {
                     });
                 }
             }
+            // Async playlist replays (Bandcamp, Apple, BBC, …) only complete
+            // while their entry is still selected on this screen, so matching
+            // the selection here captures the origin for every replay branch.
+            Screen::Playlists => {
+                if matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+                    && let Some(playlist) = self.active_playlist.as_ref()
+                    && playlist
+                        .entries
+                        .get(self.view.selected)
+                        .is_some_and(|entry| entry.media.id == *media_id)
+                {
+                    return Some(AutoplayOrigin::Playlist {
+                        entries: playlist.entries.clone().into(),
+                        index: self.view.selected,
+                    });
+                }
+            }
+            // The Downloaded screen is one flat directory listing, so its
+            // continuation is the existing local-browser snapshot over the
+            // downloads directory.
+            Screen::Downloaded => {
+                if media_id.source == SourceKind::Local {
+                    let entries = self
+                        .view
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.media_id.as_ref())
+                        .filter_map(local_path_from_media_id)
+                        .collect::<Vec<_>>();
+                    if let Some(index) = entries
+                        .iter()
+                        .position(|path| local_path_matches_media_id(path, media_id))
+                    {
+                        return Some(AutoplayOrigin::LocalBrowser {
+                            directory: self.config.downloads_dir(),
+                            entries: entries.into(),
+                            index,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -18655,18 +19145,64 @@ impl AppController {
         None
     }
 
+    /// Builds the queue item for a playlist entry that can start without a
+    /// provider round-trip.
+    ///
+    /// Sources whose replay needs an async resolver (Bandcamp, Apple
+    /// Podcasts, BBC, SoundStream, LitRes, Jamendo) return `None` and are
+    /// skipped by list continuation, exactly as autoplay skips scheduled
+    /// YouTube rows: continuation may only start what it can start directly.
+    fn playlist_step_queue_item(&self, entry: &PlaylistEntry) -> Option<QueueItem> {
+        if matches!(
+            entry.media.id.source,
+            SourceKind::Bandcamp
+                | SourceKind::ApplePodcasts
+                | SourceKind::BbcRadio
+                | SourceKind::SoundStream
+                | SourceKind::LitRes
+                | SourceKind::Jamendo
+        ) {
+            return None;
+        }
+        if entry.media.id.source == SourceKind::Local {
+            let path = local_path_from_locator(&entry.media.replay_locator)?;
+            if !path.is_absolute() || !path.is_file() {
+                return None;
+            }
+            return queue_item_from_local(&local_media_item(
+                path,
+                &self.config.providers.ffprobe_executable,
+            ))
+            .ok();
+        }
+        let mut item = queue_item_from_playlist_entry(entry).ok()?;
+        item.media.thumbnail_url = projected_persisted_thumbnail_url(
+            &item.media.id,
+            item.media.thumbnail_url.as_ref(),
+            self.effective_youtube_thumbnail_size(),
+        );
+        Some(item)
+    }
+
     /// Chooses the next playable entry without changing queue or player state.
     fn next_autoplay_step(&self, origin: &AutoplayOrigin) -> AutoplayStep {
+        self.neighbour_autoplay_step(origin, ListStepDirection::Forward)
+    }
+
+    /// Chooses the nearest playable entry in one direction without changing
+    /// queue or player state.
+    fn neighbour_autoplay_step(
+        &self,
+        origin: &AutoplayOrigin,
+        direction: ListStepDirection,
+    ) -> AutoplayStep {
         match origin {
             AutoplayOrigin::YouTube { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.youtube_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| match item {
+                neighbour_list_step(&self.youtube_results, *index, direction, |index, item| {
+                    match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
                                 item: Box::new(queue_item_from_video_with_thumbnail_size(
@@ -18681,18 +19217,18 @@ impl AppController {
                             })
                         }
                         _ => None,
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                    }
+                })
             }
             AutoplayOrigin::YouTubeMusic { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.youtube_music_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| match item {
+                neighbour_list_step(
+                    &self.youtube_music_results,
+                    *index,
+                    direction,
+                    |index, item| match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
                                 item: Box::new(queue_item_from_video_with_thumbnail_size(
@@ -18707,120 +19243,114 @@ impl AppController {
                             })
                         }
                         _ => None,
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                    },
+                )
             }
             #[cfg(feature = "yandex-music")]
-            AutoplayOrigin::YandexMusic { items, index } => items
-                .get(index.saturating_add(1))
-                .cloned()
-                .map(|item| AutoplayStep::Play {
-                    item: Box::new(item),
-                    origin: AutoplayOrigin::YandexMusic {
-                        items: Arc::clone(items),
-                        index: index.saturating_add(1),
-                    },
+            AutoplayOrigin::YandexMusic { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::YandexMusic {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
                 })
-                .unwrap_or(AutoplayStep::Exhausted),
+            }
             #[cfg(feature = "librivox")]
-            AutoplayOrigin::Librivox { items, index } => items
-                .get(index.saturating_add(1))
-                .cloned()
-                .map(|item| AutoplayStep::Play {
-                    item: Box::new(item),
-                    origin: AutoplayOrigin::Librivox {
-                        items: Arc::clone(items),
-                        index: index.saturating_add(1),
-                    },
+            AutoplayOrigin::Librivox { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::Librivox {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
                 })
-                .unwrap_or(AutoplayStep::Exhausted),
-            AutoplayOrigin::Subscription { channel_id, index } => self
-                .subscription_video_cache
-                .get(channel_id)
-                .and_then(|cached| {
-                    cached
-                        .items
-                        .iter()
-                        .enumerate()
-                        .skip(index.saturating_add(1))
-                        .find_map(|(index, item)| match item {
-                            SearchItem::Video(video) if video_is_autoplay_playable(video) => {
-                                Some(AutoplayStep::Play {
-                                    item: Box::new(queue_item_from_video_with_thumbnail_size(
-                                        video,
-                                        None,
-                                        self.effective_youtube_thumbnail_size(),
-                                    )),
-                                    origin: AutoplayOrigin::Subscription {
-                                        channel_id: channel_id.clone(),
-                                        index,
-                                    },
-                                })
-                            }
-                            _ => None,
-                        })
-                })
-                .unwrap_or(AutoplayStep::Exhausted),
-            AutoplayOrigin::LocalBrowser {
-                directory,
-                entries,
-                index,
-            } => entries
-                .iter()
-                .enumerate()
-                .skip(index.saturating_add(1))
-                .find_map(|(index, path)| {
-                    queue_item_from_local(&local_media_item(path.clone()))
-                        .ok()
+            }
+            AutoplayOrigin::Playlist { entries, index } => {
+                neighbour_list_step(entries, *index, direction, |index, entry| {
+                    self.playlist_step_queue_item(entry)
                         .map(|item| AutoplayStep::Play {
                             item: Box::new(item),
-                            origin: AutoplayOrigin::LocalBrowser {
-                                directory: directory.clone(),
+                            origin: AutoplayOrigin::Playlist {
                                 entries: Arc::clone(entries),
                                 index,
                             },
                         })
                 })
-                .unwrap_or(AutoplayStep::Exhausted),
+            }
+            AutoplayOrigin::Subscription { channel_id, index } => {
+                let Some(cached) = self.subscription_video_cache.get(channel_id) else {
+                    return AutoplayStep::Exhausted;
+                };
+                neighbour_list_step(&cached.items, *index, direction, |index, item| match item {
+                    SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                        Some(AutoplayStep::Play {
+                            item: Box::new(queue_item_from_video_with_thumbnail_size(
+                                video,
+                                None,
+                                self.effective_youtube_thumbnail_size(),
+                            )),
+                            origin: AutoplayOrigin::Subscription {
+                                channel_id: channel_id.clone(),
+                                index,
+                            },
+                        })
+                    }
+                    _ => None,
+                })
+            }
+            AutoplayOrigin::LocalBrowser {
+                directory,
+                entries,
+                index,
+            } => neighbour_list_step(entries, *index, direction, |index, path| {
+                queue_item_from_local(&local_media_item(
+                    path.clone(),
+                    &self.config.providers.ffprobe_executable,
+                ))
+                .ok()
+                .map(|item| AutoplayStep::Play {
+                    item: Box::new(item),
+                    origin: AutoplayOrigin::LocalBrowser {
+                        directory: directory.clone(),
+                        entries: Arc::clone(entries),
+                        index,
+                    },
+                })
+            }),
             AutoplayOrigin::LocalScan { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.local_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| {
-                        queue_item_from_local(item)
-                            .ok()
-                            .map(|item| AutoplayStep::Play {
-                                item: Box::new(item),
-                                origin: AutoplayOrigin::LocalScan {
-                                    generation: *generation,
-                                    index,
-                                },
-                            })
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                neighbour_list_step(&self.local_results, *index, direction, |index, item| {
+                    queue_item_from_local(item)
+                        .ok()
+                        .map(|item| AutoplayStep::Play {
+                            item: Box::new(item),
+                            origin: AutoplayOrigin::LocalScan {
+                                generation: *generation,
+                                index,
+                            },
+                        })
+                })
             }
             AutoplayOrigin::Tracker { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                for (index, item) in self
-                    .tracker_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                {
+                neighbour_list_step(&self.tracker_results, *index, direction, |index, item| {
                     if let Ok(item) = queue_item_from_tracker(item) {
-                        return AutoplayStep::Play {
+                        return Some(AutoplayStep::Play {
                             item: Box::new(item),
                             origin: AutoplayOrigin::Tracker {
                                 generation: *generation,
                                 index,
                             },
-                        };
+                        });
                     }
                     #[cfg(feature = "tracker-music")]
                     if item.download_url.is_some()
@@ -18829,16 +19359,16 @@ impl AppController {
                             TrackerAccess::DirectModule | TrackerAccess::ArchiveNeedsInspection
                         )
                     {
-                        return AutoplayStep::PrepareTracker {
+                        return Some(AutoplayStep::PrepareTracker {
                             index,
                             origin: AutoplayOrigin::Tracker {
                                 generation: *generation,
                                 index,
                             },
-                        };
+                        });
                     }
-                }
-                AutoplayStep::Exhausted
+                    None
+                })
             }
         }
     }
@@ -18851,7 +19381,7 @@ impl AppController {
             }
             #[cfg(feature = "tracker-music")]
             AutoplayStep::PrepareTracker { index, origin } => {
-                self.prepare_tracker_item(index, Some(origin));
+                self.prepare_tracker_item(index, TrackerPreparationOwner::Autoplay(origin));
             }
             AutoplayStep::SourceChanged => {
                 #[cfg(feature = "waveform")]
@@ -18872,12 +19402,10 @@ impl AppController {
     }
 
     fn play_queue_item(&mut self, item: QueueItem, queue_cursor_already_positioned: bool) {
-        let origin = self
-            .config
-            .playback
-            .autoplay
-            .then(|| self.autoplay_origin_for_media(&item.media.id))
-            .flatten();
+        // The same-source position is captured whether or not autoplay is on:
+        // the toggle gates only end-of-file continuation, while a manual
+        // queue-edge step may consume the position at any time.
+        let origin = self.autoplay_origin_for_media(&item.media.id);
         self.play_queue_item_with_origin(item, queue_cursor_already_positioned, origin);
     }
 
@@ -19479,9 +20007,10 @@ impl AppController {
                 }
                 match self.playback_queue.advance().cloned() {
                     Some(next) => {
-                        if self.config.playback.autoplay
-                            && self.queued_autoplay_resume_origin.is_none()
-                            && autoplay_origin.is_some()
+                        // Parked even with autoplay off: a manual queue-edge
+                        // step may consume this position after the explicit
+                        // entries finish.
+                        if self.queued_autoplay_resume_origin.is_none() && autoplay_origin.is_some()
                         {
                             self.queued_autoplay_resume_origin = autoplay_origin;
                         }
@@ -20764,6 +21293,10 @@ impl AppController {
             .collect();
         #[cfg(not(feature = "wikidata"))]
         let links = Vec::new();
+        // Artwork is not a Wikidata feature: the item is one of two sources for
+        // it, and the homepage that answers for the rest of the catalogue is
+        // compiled in beside the station itself.
+        let thumbnail_url = self.radio_artwork_cache.get(station.id).cloned().flatten();
         let mut details = DetailView {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
             title: station.name.to_owned(),
@@ -20772,10 +21305,86 @@ impl AppController {
             description,
             radio_favorite: self.radio_favorite_station_ids.contains(station.id),
             links,
+            thumbnail_url,
             ..DetailView::default()
         };
         preserve_same_media_wikidata_state(self.view.details.as_ref(), &mut details);
         self.view.details = Some(details);
+        self.request_selected_radio_artwork(station.id);
+    }
+
+    /// Starts one lazy logotype lookup for the selected Radio station.
+    ///
+    /// Each answer — including "this station has no image" — is remembered, so
+    /// moving through the catalogue costs at most one lookup per station rather
+    /// than one per selection. A single lookup is in flight at a time: the
+    /// catalogue filters as the user types, and a request per keystroke would be
+    /// a burst of traffic for artwork nobody has looked at yet.
+    #[cfg(feature = "radio")]
+    fn request_selected_radio_artwork(&mut self, station_id: &str) {
+        if self.radio_artwork_cache.contains_key(station_id) || self.pending_radio_artwork.is_some()
+        {
+            return;
+        }
+        #[cfg(feature = "wikidata")]
+        let item_ids = wikidata_item_ids_for_station(station_id)
+            .iter()
+            .map(|item| (*item).to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "wikidata"))]
+        let item_ids = Vec::new();
+        let homepage = station_by_id(station_id).and_then(|station| station.homepage_url().ok());
+        if item_ids.is_empty() && homepage.is_none() {
+            return;
+        }
+        let Some(sender) = self.provider_requests.as_ref() else {
+            return;
+        };
+        self.radio_artwork_generation = self.radio_artwork_generation.wrapping_add(1);
+        let generation = self.radio_artwork_generation;
+        let request = ProviderRequest::RadioArtwork {
+            generation,
+            station_id: station_id.to_owned(),
+            item_ids,
+            homepage,
+        };
+        if sender.send(request).is_ok() {
+            self.pending_radio_artwork = Some((generation, station_id.to_owned()));
+        }
+    }
+
+    /// Applies one station logotype, or remembers that the station has none.
+    #[cfg(feature = "radio")]
+    fn handle_radio_artwork(
+        &mut self,
+        generation: u64,
+        station_id: String,
+        artwork: Option<url::Url>,
+    ) {
+        if self.pending_radio_artwork.as_ref() != Some(&(generation, station_id.clone())) {
+            return;
+        }
+        self.pending_radio_artwork = None;
+        if self.radio_artwork_cache.len() >= MAX_CACHED_RADIO_ARTWORK {
+            self.radio_artwork_cache.clear();
+        }
+        self.radio_artwork_cache
+            .insert(station_id.clone(), artwork.clone());
+        // The selection may have moved on while the lookup was in flight, and a
+        // logotype belongs to exactly one station.
+        let selected = self.selected_radio_station().map(|station| station.id);
+        if selected == Some(station_id.as_str())
+            && let Some(details) = self.view.details.as_mut()
+        {
+            details.thumbnail_url = artwork;
+        }
+        // Only one lookup runs at a time, so every station passed over while
+        // this one was in flight was refused its own. The station actually on
+        // screen now asks again, which is what makes moving quickly through the
+        // catalogue converge instead of leaving a gap.
+        if let Some(selected) = selected {
+            self.request_selected_radio_artwork(selected);
+        }
     }
 
     /// Selects at most one station whose passive metadata may be refreshed.
@@ -21247,7 +21856,10 @@ impl AppController {
                 );
                 return;
             }
-            let item = match queue_item_from_local(&local_media_item(path)) {
+            let item = match queue_item_from_local(&local_media_item(
+                path,
+                &self.config.providers.ffprobe_executable,
+            )) {
                 Ok(item) => item,
                 Err(error) => {
                     self.show_error_message("Playlist item is unavailable", error);
@@ -22389,6 +23001,11 @@ impl AppController {
                 return;
             }
         };
+        // Downloads carry no embedded picture — `yt-dlp` writes the thumbnail
+        // beside the media — so the covers for this whole list come from one
+        // extra pass over the same directory rather than one lookup per row.
+        #[cfg(feature = "local-artwork")]
+        let sidecars = crate::local_artwork::sidecar_covers_in(&path);
         let mut read_failures = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -22419,11 +23036,16 @@ impl AppController {
                     continue;
                 }
             };
+            #[cfg(feature = "local-artwork")]
+            let thumbnail_url = crate::local_artwork::sidecar_cover_for(&sidecars, &entry_path);
+            #[cfg(not(feature = "local-artwork"))]
+            let thumbnail_url = None;
             self.view.rows.push(RowView {
                 media_id: Some(local_media_id(&entry_path)),
                 title: entry.file_name().to_string_lossy().into_owned(),
                 subtitle: human_bytes(size),
                 source: "Local download".to_owned(),
+                thumbnail_url,
                 ..RowView::default()
             });
         }
@@ -22497,7 +23119,7 @@ impl AppController {
         if metadata_pending {
             self.request_local_media_metadata(path);
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         self.request_selected_local_artwork();
     }
 
@@ -24370,7 +24992,7 @@ impl AppController {
         {
             self.local_folder_size_pending = None;
         }
-        #[cfg(all(feature = "local-artwork", feature = "images"))]
+        #[cfg(feature = "local-artwork")]
         {
             self.local_artwork_cache.retain(|path, _| !affected(path));
             self.local_artwork_cache_order
@@ -24498,7 +25120,9 @@ impl AppController {
             return;
         }
         if !autoplay {
-            self.queued_autoplay_resume_origin = None;
+            // The parked resume position is kept: a manual queue-edge step
+            // may still consume it, and re-enabling autoplay would otherwise
+            // forget where the list continuation stood.
             #[cfg(feature = "tracker-music")]
             self.cancel_pending_tracker_autoplay();
         } else if self.current_autoplay_origin.is_none()
@@ -24517,7 +25141,10 @@ impl AppController {
         let Some(pending) = self.pending_tracker_preparation.as_mut() else {
             return;
         };
-        if matches!(&pending.owner, TrackerPreparationOwner::Autoplay(_)) {
+        if matches!(
+            &pending.owner,
+            TrackerPreparationOwner::Autoplay(_) | TrackerPreparationOwner::ManualStep { .. }
+        ) {
             pending.owner = TrackerPreparationOwner::CanceledAutoplay;
             self.clear_playback_start_activity();
         }
@@ -25636,13 +26263,8 @@ impl UiController for AppController {
                 if text.is_empty() {
                     self.view.status_line = "No Details text selected".to_owned();
                 } else {
-                    let character_count = text.chars().count();
-                    self.view.status_line = match self.report_actions.copy_report(&text) {
-                        Ok(transport) => {
-                            format!("Copied {character_count} characters with {transport}")
-                        }
-                        Err(error) => format!("Could not copy Details text: {error}"),
-                    };
+                    let subject = ClipboardSubject::DetailsText(text.chars().count());
+                    self.request_clipboard_copy(text, subject);
                 }
             }
             UiAction::ToggleSubscription => {
@@ -25744,14 +26366,13 @@ impl UiController for AppController {
             UiAction::GoForward => self.go_forward(),
             UiAction::OpenInBrowser => self.open_current_in_browser(),
             UiAction::OpenChannelInBrowser => self.open_current_channel_in_browser(),
-            UiAction::CopyLink => {
-                self.view.status_line = self.current_url().map_or_else(
-                    || "No link is selected".to_owned(),
-                    |url| format!("Link: {url}"),
-                );
-            }
+            UiAction::CopyLink => match self.current_url() {
+                Some(url) => self.request_clipboard_copy(url, ClipboardSubject::Link),
+                None => self.view.status_line = "No link is selected".to_owned(),
+            },
             UiAction::PlayNext => self.queue_selected(true),
             UiAction::AddToQueue => self.queue_selected(false),
+            UiAction::PlayQueueNeighbour(step) => self.play_queue_neighbour(step),
             UiAction::ToggleTodoPlaylist => self.toggle_selected_todo(),
             UiAction::OpenPlaylistPopup => self.open_playlist_popup(),
             UiAction::MovePlaylistPopupSelection(delta) => {
@@ -25816,10 +26437,28 @@ impl UiController for AppController {
             UiAction::SavePrivateNote => self.save_private_note(),
             UiAction::RequestPrivateNoteDelete => self.request_private_note_delete(),
             UiAction::DismissPrivateNotePopup => self.dismiss_private_note_popup(),
-            UiAction::OpenEqualizer => {
-                self.view.status_line =
-                    "Equalizer is disabled in direct audiophile mode".to_owned();
+            UiAction::OpenQueuePopup => self.open_queue_popup(),
+            UiAction::MoveQueuePopupSelection(delta) => {
+                if let Some(popup) = self.view.queue_popup.as_mut()
+                    && let Some(selected) = moved_index(popup.selected, popup.items.len(), delta)
+                {
+                    popup.selected = selected;
+                }
             }
+            UiAction::SelectQueuePopupRow(row) => {
+                if let Some(popup) = self
+                    .view
+                    .queue_popup
+                    .as_mut()
+                    .filter(|popup| row < popup.items.len())
+                {
+                    popup.selected = row;
+                }
+            }
+            UiAction::ActivateQueuePopupRow(row) => self.activate_queue_row(row),
+            UiAction::RemoveQueuePopupRow(row) => self.remove_queue_row(row),
+            UiAction::ClearQueue => self.clear_queue(),
+            UiAction::DismissQueuePopup => self.view.queue_popup = None,
             UiAction::DismissErrorPopup => {
                 self.view.error_popup = None;
                 if self.quit_on_error_dismiss {
@@ -25985,6 +26624,7 @@ impl UiController for AppController {
             UiAction::RefreshSubscriptionVideos => {
                 self.refresh_selected_subscription_videos();
             }
+            UiAction::OpenDroppedPaths(paths) => self.open_dropped_paths(paths),
         }
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
@@ -25999,6 +26639,29 @@ impl UiController for AppController {
                 "Quit cancelled because state could not be saved; dismiss the popup and press Quit to retry"
                     .to_owned();
         }
+    }
+
+    fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        let request = self.pending_clipboard_request.take()?;
+        // The subject stays here rather than travelling out and back: the
+        // front-end reports only what its clipboard did, and a subject that
+        // made a round trip through another process could come back changed.
+        self.awaiting_clipboard_subject = Some(request.subject);
+        Some(request)
+    }
+
+    fn report_clipboard_result(&mut self, result: Result<String, String>) {
+        let subject = self.awaiting_clipboard_subject.take();
+        self.view.status_line = match (result, subject) {
+            (Ok(transport), Some(ClipboardSubject::DetailsText(count))) => {
+                format!("Copied {count} characters with {transport}")
+            }
+            (Ok(transport), _) => format!("Copied the link with {transport}"),
+            (Err(error), Some(ClipboardSubject::DetailsText(_))) => {
+                format!("Could not copy Details text: {error}")
+            }
+            (Err(error), _) => format!("Could not copy the link: {error}"),
+        };
     }
 
     #[cfg(feature = "local-browser")]
@@ -26024,6 +26687,8 @@ impl UiController for AppController {
         if self.diagnostic_only {
             return;
         }
+        self.refresh_open_queue_popup();
+        self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
         #[cfg(feature = "yandex-music")]
@@ -27556,6 +28221,8 @@ fn provider_worker(
     let lastfm = crate::providers::lastfm::LastFmProvider::new();
     #[cfg(feature = "radio")]
     let radio_now_playing = crate::providers::radio::RadioNowPlayingClient::new();
+    #[cfg(feature = "radio")]
+    let station_icon = crate::providers::station_icon::StationIconResolver::new();
     #[cfg(feature = "bbc-radio")]
     let bbc_live = BbcLiveResolver::new();
     #[cfg(feature = "network")]
@@ -28335,7 +29002,7 @@ fn provider_worker(
                     break;
                 }
             }
-            #[cfg(all(feature = "local-artwork", feature = "images"))]
+            #[cfg(feature = "local-artwork")]
             ProviderRequest::LocalArtwork {
                 generation,
                 path,
@@ -28344,7 +29011,7 @@ fn provider_worker(
             } => {
                 let result = match kind {
                     LocalArtworkKind::EmbeddedMedia => {
-                        crate::thumbnails::cached_local_artwork(&path, &cache_directory)
+                        crate::local_artwork::local_media_artwork(&path, &cache_directory)
                             .map_err(|error| error.to_string())
                     }
                     LocalArtworkKind::FolderCover => {
@@ -28498,6 +29165,44 @@ fn provider_worker(
                         generation,
                         station_id,
                         result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            #[cfg(feature = "radio")]
+            ProviderRequest::RadioArtwork {
+                generation,
+                station_id,
+                item_ids,
+                homepage,
+            } => {
+                // A station may legitimately map to more than one item, and a
+                // failed lookup is not worth reporting: artwork is decoration,
+                // so the station simply stays without a logotype.
+                #[cfg(feature = "wikidata")]
+                let wikidata_artwork = item_ids
+                    .iter()
+                    .find_map(|item_id| wikidata.item_artwork(item_id).ok().flatten());
+                #[cfg(not(feature = "wikidata"))]
+                let wikidata_artwork = {
+                    let _ = &item_ids;
+                    None
+                };
+                // Wikidata knows only the broadcasters notable enough to have
+                // an item; the rest of the catalogue advertises its logo on its
+                // own homepage.
+                let artwork = wikidata_artwork.or_else(|| {
+                    homepage
+                        .as_ref()
+                        .and_then(|homepage| station_icon.fetch(homepage).ok().flatten())
+                });
+                if responses
+                    .send(ProviderResponse::RadioArtwork {
+                        generation,
+                        station_id,
+                        artwork,
                     })
                     .is_err()
                 {
@@ -29530,9 +30235,14 @@ fn set_local_media_duration(item: &mut LocalMediaItem, duration: Duration) {
         .filter(|seconds| *seconds > 0);
 }
 
-/// Reads one local item and enriches it through the installed media probe.
-fn local_media_item(path: PathBuf) -> LocalMediaItem {
-    local_media_item_with_probe(path, &mut SystemLocalMediaProbe)
+/// Reads one local item and enriches it through the configured media probe.
+fn local_media_item(path: PathBuf, ffprobe_executable: &Path) -> LocalMediaItem {
+    local_media_item_with_probe(
+        path,
+        &mut SystemLocalMediaProbe {
+            executable: ffprobe_executable.to_path_buf(),
+        },
+    )
 }
 
 /// Reads one local item through an injectable technical-metadata probe.
@@ -31686,9 +32396,9 @@ fn prepare_download_destination(config: &Config) -> Result<PathBuf, String> {
         .ensure_directories()
         .map_err(|error| format!("cannot prepare Youta's private directories: {error}"))?;
     let destination = config.downloads_dir();
-    let root = std::fs::canonicalize(config.config_dir())
+    let root = crate::fs_path::canonicalize(config.config_dir())
         .map_err(|error| format!("cannot resolve the Youta config directory: {error}"))?;
-    let destination = std::fs::canonicalize(&destination)
+    let destination = crate::fs_path::canonicalize(&destination)
         .map_err(|error| format!("cannot resolve the downloads directory: {error}"))?;
     if destination == root || !destination.starts_with(&root) {
         return Err(format!(
@@ -31709,7 +32419,7 @@ fn validate_completed_download_path(
     } else {
         destination.join(reported_path)
     };
-    let candidate = std::fs::canonicalize(&candidate).map_err(|error| {
+    let candidate = crate::fs_path::canonicalize(&candidate).map_err(|error| {
         format!(
             "cannot resolve the completed media path `{}`: {error}",
             candidate.display()
@@ -33288,13 +33998,45 @@ fn local_media_id(path: &Path) -> MediaId {
 
 /// Recovers an exact Local path from a current file-URL or legacy path locator.
 fn local_path_from_locator(locator: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(locator)
+    let path = if let Ok(url) = url::Url::parse(locator)
         && url.scheme() == "file"
     {
-        return url.to_file_path().ok();
-    }
-    let path = PathBuf::from(locator);
-    path.is_absolute().then_some(path)
+        url.to_file_path().ok()?
+    } else {
+        let path = PathBuf::from(locator);
+        if !path.is_absolute() {
+            return None;
+        }
+        path
+    };
+    Some(settled_local_path(path))
+}
+
+/// Returns `path` in the one spelling the rest of the Local code compares to.
+///
+/// Windows spells one file two ways: [`std::fs::canonicalize`] answers with a
+/// `\\?\` verbatim prefix, and a file URL cannot carry that prefix, so a path
+/// that has been through a locator arrives in the other spelling and stops
+/// comparing equal to the canonical paths every other Local seam holds. Settling
+/// it here is what keeps one identity comparable to itself.
+///
+/// A path naming nothing cannot be settled and is returned exactly as it
+/// decoded — remapping a move that has already happened is that case, and it
+/// still needs the old path to look up.
+#[cfg(windows)]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    crate::fs_path::canonicalize(&path).unwrap_or(path)
+}
+
+/// Returns `path` unchanged, because this platform spells a file one way.
+///
+/// A file URL round trip is already lossless here, so canonicalising would buy
+/// nothing and would additionally resolve symbolic links — which Local browsing
+/// deliberately does not follow, and which would silently merge a link with its
+/// target into one identity.
+#[cfg(not(windows))]
+fn settled_local_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Recovers the exact path carried by a Local media identity.
@@ -34130,6 +34872,20 @@ mod tests {
 
     use super::*;
 
+    /// Returns `path` as this platform spells an absolute path.
+    ///
+    /// `/music` is absolute only where the filesystem has one root; on Windows
+    /// it is a relative path, and every place that validates a Local locator —
+    /// history replay, playlist membership, queue building — correctly refuses
+    /// it before the behaviour under test is ever reached.
+    fn fixture_absolute(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     /// Stable public author shared by LibriVox controller regression fixtures.
     #[cfg(feature = "librivox")]
     fn librivox_author_fixture() -> LibrivoxAuthor {
@@ -34253,7 +35009,7 @@ mod tests {
     }
 
     /// Stops the real provider worker and returns a deterministic request tap.
-    #[cfg(feature = "librivox")]
+    #[cfg(any(feature = "librivox", feature = "tracker-music"))]
     fn capture_controller_provider_requests(
         controller: &mut AppController,
     ) -> Receiver<ProviderRequest> {
@@ -34312,7 +35068,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_stale_search_response_cannot_replace_newer_results() {
-        let temporary = tempfile::tempdir().expect("LibriVox stale-response root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox stale-response root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34351,7 +35107,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_owned_search_response_populates_rows_and_details() {
-        let temporary = tempfile::tempdir().expect("LibriVox search-response root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox search-response root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34393,7 +35149,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn first_librivox_catalogue_response_restores_the_saved_row() {
-        let temporary = tempfile::tempdir().expect("LibriVox restore root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox restore root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -34452,7 +35208,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_child_route_persists_its_parent_catalogue_row() {
-        let temporary = tempfile::tempdir().expect("LibriVox child-session root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox child-session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -34531,7 +35287,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn keyboard_detail_activation_opens_exact_librivox_author_inside_youta() {
-        let temporary = tempfile::tempdir().expect("LibriVox author-navigation root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox author-navigation root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34560,7 +35316,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_author_books_load_in_bounded_continuation_pages() {
-        let temporary = tempfile::tempdir().expect("LibriVox pagination root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox pagination root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34638,7 +35394,7 @@ mod tests {
     #[cfg(feature = "librivox")]
     #[test]
     fn librivox_section_identity_autoplay_and_browser_url_remain_stable() {
-        let temporary = tempfile::tempdir().expect("LibriVox section-autoplay root");
+        let temporary = crate::test_support::canonical_tempdir("LibriVox section-autoplay root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34839,7 +35595,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_track_details_expose_distinct_artist_album_and_bare_source_links() {
-        let temporary = tempfile::tempdir().expect("Yandex details root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex details root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -34909,7 +35665,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_artist_navigation_uses_exact_ids_and_restores_nested_pages_from_memory() {
-        let temporary = tempfile::tempdir().expect("Yandex artist-navigation root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex artist-navigation root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35011,7 +35767,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_spoken_word_rows_are_not_mislabeled_as_music_tracks_or_albums() {
-        let temporary = tempfile::tempdir().expect("Yandex spoken-word rows root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex spoken-word rows root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35037,7 +35793,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_details_reserve_native_artwork_for_click_expansion() {
-        let temporary = tempfile::tempdir().expect("Yandex artwork root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex artwork root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35065,7 +35821,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_preview_scales_at_full_hd_and_4k_terminal_thresholds() {
-        let temporary = tempfile::tempdir().expect("Yandex adaptive-artwork root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex adaptive-artwork root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35133,7 +35889,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_rejects_direct_yandex_album_urls_without_provider_state() {
-        let temporary = tempfile::tempdir().expect("minimal Yandex search state root");
+        let temporary = crate::test_support::canonical_tempdir("minimal Yandex search state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35149,7 +35905,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_refuses_persisted_yandex_music_playback() {
-        let temporary = tempfile::tempdir().expect("minimal-build state root");
+        let temporary = crate::test_support::canonical_tempdir("minimal-build state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35191,7 +35947,7 @@ mod tests {
     #[cfg(not(feature = "yandex-music"))]
     #[test]
     fn feature_disabled_build_preserves_yandex_music_session_fields() {
-        let temporary = tempfile::tempdir().expect("minimal-build session root");
+        let temporary = crate::test_support::canonical_tempdir("minimal-build session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -35231,7 +35987,7 @@ mod tests {
                 '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
             )));
 
-        let temporary = tempfile::tempdir().expect("Yandex download directory");
+        let temporary = crate::test_support::canonical_tempdir("Yandex download directory");
         let existing = temporary.path().join("Fixture Track.flac");
         std::fs::write(&existing, b"existing").expect("existing download");
         let available =
@@ -35251,7 +36007,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_music_album_download_preserves_flattened_track_order_and_positions() {
-        let temporary = tempfile::tempdir().expect("Yandex album download root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex album download root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35312,7 +36068,8 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_music_recommendation_download_selects_exactly_the_first_twenty_in_order() {
-        let temporary = tempfile::tempdir().expect("Yandex recommendation download root");
+        let temporary =
+            crate::test_support::canonical_tempdir("Yandex recommendation download root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35394,7 +36151,7 @@ mod tests {
         assert!(!first.contains("track"));
         assert_ne!(first, changed);
 
-        let temporary = tempfile::tempdir().expect("Yandex playback cache");
+        let temporary = crate::test_support::canonical_tempdir("Yandex playback cache");
         let path = temporary.path().join(format!("{first}.flac"));
         std::fs::write(&path, b"bad").expect("partial cache fixture");
         assert!(!yandex_music_playback_cache_file_is_valid(&path, Some(4)));
@@ -35436,7 +36193,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_todo_note_and_history_restart_without_persisting_resolved_media() {
-        let temporary = tempfile::tempdir().expect("Yandex integration state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex integration state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let (factory, _playback, _statuses, events) = mock_playback_factory([], []);
@@ -35527,7 +36284,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn restored_yandex_music_screen_uses_its_own_search_query() {
-        let temporary = tempfile::tempdir().expect("Yandex session root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex session root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -35554,7 +36311,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_without_batch_ids_keeps_recommendations_usable() {
-        let temporary = tempfile::tempdir().expect("Yandex bootstrap root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex bootstrap root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35631,7 +36388,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_rate_limit_does_not_claim_that_the_token_expired() {
-        let temporary = tempfile::tempdir().expect("Yandex rate-limit root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex rate-limit root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35657,7 +36414,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_bootstrap_unauthorized_response_retains_token_replacement_guidance() {
-        let temporary = tempfile::tempdir().expect("Yandex unauthorized root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex unauthorized root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35682,7 +36439,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn first_yandex_search_without_a_token_opens_the_setup_editor() {
-        let temporary = tempfile::tempdir().expect("Yandex first-search root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex first-search root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35698,7 +36455,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn changing_yandex_search_scope_reruns_the_visible_query() {
-        let temporary = tempfile::tempdir().expect("Yandex scope-switch root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex scope-switch root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35745,7 +36502,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn direct_yandex_album_url_opens_the_exact_catalogue_item() {
-        let temporary = tempfile::tempdir().expect("Yandex direct-album root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex direct-album root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.providers.yandex_music_token = Some("fixture-token".to_owned());
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -35779,7 +36536,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn failed_yandex_search_clears_actions_for_the_discarded_selection() {
-        let temporary = tempfile::tempdir().expect("Yandex failed-search root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex failed-search root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35830,7 +36587,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_search_back_restores_cached_my_wave_without_network_work() {
-        let temporary = tempfile::tempdir().expect("Yandex route root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex route root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -35975,7 +36732,7 @@ mod tests {
     #[cfg(all(feature = "yandex-music", feature = "wikidata"))]
     #[test]
     fn yandex_wikidata_waits_for_stable_selection_and_serializes_exact_ids() {
-        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex Wikidata root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36060,7 +36817,7 @@ mod tests {
     fn yandex_wikidata_merges_fresh_cache_before_scheduling_only_misses() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("Yandex Wikidata root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex Wikidata root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         store
@@ -36424,7 +37181,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn my_wave_bootstrap_never_sits_behind_offline_reaction_retries() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         store
@@ -36489,7 +37246,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn constructor_retries_and_retains_a_durable_offline_reaction() {
-        let temporary = tempfile::tempdir().expect("Yandex startup state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex startup state root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -36546,7 +37303,7 @@ mod tests {
             }
         }
 
-        let temporary = tempfile::tempdir().expect("Yandex shutdown state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex shutdown state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -36604,7 +37361,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn failed_shutdown_reaction_retry_remains_in_the_durable_outbox() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -36627,7 +37384,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn successful_reaction_response_acknowledges_the_exact_durable_intent() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let pending = store
@@ -36648,7 +37405,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn stale_successful_reaction_response_cannot_acknowledge_a_newer_intent() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let stale = store
@@ -36673,7 +37430,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn unavailable_yandex_account_does_not_claim_a_reaction_was_saved() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36701,7 +37458,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn yandex_reaction_keeps_the_selected_track_and_synchronizes_saved_selection() {
-        let temporary = tempfile::tempdir().expect("Yandex reaction root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex reaction root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36790,7 +37547,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn newer_yandex_playback_supersedes_pending_resolution_and_ignores_late_result() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36853,7 +37610,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn starting_another_source_cancels_pending_yandex_playback() {
-        let temporary = tempfile::tempdir().expect("Yandex state root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex state root");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -36886,7 +37643,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn unvalidated_replacement_token_does_not_overwrite_the_working_credential() {
-        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex credential root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config
             .save_yandex_music_token("working-token".to_owned())
@@ -36960,7 +37717,7 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[test]
     fn validated_replacement_token_is_saved_and_adopted_atomically() {
-        let temporary = tempfile::tempdir().expect("Yandex credential root");
+        let temporary = crate::test_support::canonical_tempdir("Yandex credential root");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config
             .save_yandex_music_token("working-token".to_owned())
@@ -37325,7 +38082,7 @@ mod tests {
     /// Builds a selected YouTube video with a captured provider request lane.
     fn controller_with_youtube_video_comments()
     -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37341,7 +38098,7 @@ mod tests {
     #[cfg(feature = "network")]
     fn controller_with_project_history()
     -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -37402,6 +38159,44 @@ mod tests {
         controller.view.selected = index;
         controller.update_radio_detail();
         index
+    }
+
+    /// Receives the next provider request that is not a station logotype.
+    ///
+    /// Opening Radio or moving to another station starts one bounded, cached
+    /// Wikidata artwork lookup. That is deliberate, and it is not what these
+    /// tests are about.
+    #[cfg(all(feature = "radio", any(feature = "wikidata", feature = "bbc-radio")))]
+    fn next_request_ignoring_radio_artwork(
+        captured: &crossbeam_channel::Receiver<ProviderRequest>,
+    ) -> Option<ProviderRequest> {
+        loop {
+            match captured.try_recv() {
+                #[cfg(feature = "wikidata")]
+                Ok(ProviderRequest::RadioArtwork { .. }) => {}
+                Ok(request) => return Some(request),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Answers the logotype lookup that opening Radio starts for its first row.
+    ///
+    /// One lookup runs at a time, so a test that wants to observe the request
+    /// for a station it selects has to let the initial one finish first.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    fn settle_initial_radio_artwork(
+        controller: &mut AppController,
+        captured: &crossbeam_channel::Receiver<ProviderRequest>,
+    ) {
+        if let Ok(ProviderRequest::RadioArtwork {
+            generation,
+            station_id,
+            ..
+        }) = captured.try_recv()
+        {
+            controller.handle_radio_artwork(generation, station_id, None);
+        }
     }
 
     #[test]
@@ -37664,7 +38459,7 @@ mod tests {
 
     #[test]
     fn private_note_create_edit_delete_and_restart_preserve_one_exact_note() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
 
@@ -38085,7 +38880,7 @@ mod tests {
 
     #[test]
     fn cached_subscription_navigation_refreshes_playlist_state_without_provider_results() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -38160,7 +38955,7 @@ mod tests {
 
     #[test]
     fn downloaded_item_todo_membership_survives_restart_and_replays_locally() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let path = config.downloads_dir().join("fixture.opus");
@@ -38205,7 +39000,7 @@ mod tests {
     #[cfg(feature = "local-trash")]
     #[test]
     fn downloaded_trash_confirmation_revalidates_removes_and_refreshes_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let removed = config.downloads_dir().join("remove.opus");
         let retained = config.downloads_dir().join("retain.opus");
@@ -38256,7 +39051,7 @@ mod tests {
     #[cfg(feature = "local-trash")]
     #[test]
     fn downloaded_trash_failure_retains_context_and_full_diagnostic() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let downloaded = config.downloads_dir().join("offline.opus");
         let store = StateStore::open(&config).expect("disk state");
@@ -38507,7 +39302,7 @@ mod tests {
 
     #[test]
     fn playlist_index_and_exact_entry_route_survive_restart() {
-        let fixture = tempfile::tempdir().expect("temporary playlist state");
+        let fixture = crate::test_support::canonical_tempdir("temporary playlist state");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let snapshot = |video_id: &str, title: &str| {
@@ -38585,13 +39380,13 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn removed_local_playlist_entry_hides_actions_and_cannot_be_copied() {
-        let fixture = tempfile::tempdir().expect("temporary Local playlist");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local playlist");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let media_path = fixture.path().join("removed.flac");
         std::fs::write(&media_path, b"fixture audio").expect("Local media fixture");
         let snapshot = playlist_snapshot_from_queue_item(
-            &queue_item_from_local(&local_media_item(media_path.clone()))
+            &queue_item_from_local(&local_media_item(media_path.clone(), Path::new("ffprobe")))
                 .expect("Local queue item"),
         )
         .expect("stable Local snapshot");
@@ -38957,7 +39752,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn local_playlist_snapshot_uses_an_existing_absolute_file() {
-        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let temporary = crate::test_support::canonical_tempdir("temporary local folder");
         let path = temporary.path().join("fixture.opus");
         std::fs::write(&path, b"not decoded during playlist capture").expect("fixture file");
         let mut controller = controller_with_mock_statuses([]).0;
@@ -38995,7 +39790,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn local_mov_playlist_entry_waits_for_current_duration_before_thumbnail() {
-        let temporary = tempfile::tempdir().expect("temporary local playlist video");
+        let temporary = crate::test_support::canonical_tempdir("temporary local playlist video");
         let video = temporary.path().join("playlist.mov");
         std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
         let webpage_url = url::Url::from_file_path(&video).expect("absolute local file URL");
@@ -39070,7 +39865,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn asynchronous_local_listing_restores_playlist_actions_without_selection_movement() {
-        let temporary = tempfile::tempdir().expect("temporary local folder");
+        let temporary = crate::test_support::canonical_tempdir("temporary local folder");
         let path = temporary.path().join("fixture.opus");
         std::fs::write(&path, b"fixture media").expect("fixture file");
         let webpage_url = url::Url::from_file_path(&path).expect("absolute local file URL");
@@ -39171,7 +39966,7 @@ mod tests {
     fn system_url_opener_task_reports_nonzero_exit_instead_of_false_success() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = tempfile::tempdir().expect("temporary opener directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary opener directory");
         let opener = temporary.path().join(system_url_opener_name());
         std::fs::write(&opener, "#!/bin/sh\nexit 23\n").expect("opener fixture");
         std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))
@@ -39468,7 +40263,7 @@ mod tests {
 
     #[test]
     fn watched_percentage_is_restored_from_disk_for_search_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
         {
@@ -39489,7 +40284,7 @@ mod tests {
 
     #[test]
     fn zero_position_progress_and_explicit_overrides_restore_distinct_row_states() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
         {
@@ -39538,7 +40333,7 @@ mod tests {
 
     #[test]
     fn downloaded_rows_bulk_hydrate_partial_progress_after_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = config.downloads_dir().join("restart fixture.opus");
         let media_id = local_media_id(&track);
@@ -39566,7 +40361,7 @@ mod tests {
 
     #[test]
     fn periodic_checkpoint_stays_runtime_only_until_clean_persistence_boundary() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "periodic-runtime-only");
         let store = StateStore::open(&config).expect("disk state");
@@ -39619,7 +40414,7 @@ mod tests {
 
     #[test]
     fn failed_periodic_checkpoint_keeps_unacknowledged_listening_time() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "failed-periodic-checkpoint");
         let store = StateStore::open(&config).expect("disk state");
@@ -39649,7 +40444,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_is_idempotent_across_explicit_call_and_drop() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let session_path = config.runtime_dir().join("session.toml");
         let store = StateStore::open(&config).expect("disk state");
@@ -39678,7 +40473,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_publishes_pending_checkpoint_without_active_media() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "shutdown-pending-checkpoint");
         let store = StateStore::open(&config).expect("disk state");
@@ -39719,7 +40514,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_reports_checkpoint_publication_failure() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let media_id = MediaId::new(SourceKind::YouTube, "shutdown-checkpoint-failure");
         let store = StateStore::open(&config).expect("disk state");
@@ -39752,7 +40547,7 @@ mod tests {
 
     #[test]
     fn switching_media_flushes_the_previous_checkpoint_to_canonical_state() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let (factory, _state, _statuses, _events) = mock_playback_factory([], []);
@@ -39792,7 +40587,7 @@ mod tests {
 
     #[test]
     fn saved_youtube_search_restores_without_rerunning_and_keeps_details_lazy() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let mut request = SearchRequest::new("restored fixture", SearchTarget::Videos);
         request.page = 2;
@@ -39887,7 +40682,7 @@ mod tests {
     #[cfg(feature = "youtube-music")]
     #[test]
     fn saved_youtube_music_search_restores_screen_query_rows_selection_and_drops_streams() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let music_video = |video_id: &str, title: &str| {
             let mut video = subscription_video_summary();
@@ -40587,7 +41382,7 @@ mod tests {
 
     #[test]
     fn subscription_source_rows_shorten_opml_aliases_without_changing_feed_identity() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let handle =
             url::Url::parse("https://www.youtube.com/@myChanName").expect("fixture channel handle");
@@ -40694,7 +41489,7 @@ mod tests {
 
     #[test]
     fn subscription_source_row_restores_persisted_alias_before_provider_request() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let now = unix_time();
@@ -41051,7 +41846,7 @@ mod tests {
 
     #[test]
     fn description_video_navigation_restores_nested_details_and_clears_forward_history() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41200,7 +41995,7 @@ mod tests {
 
     #[test]
     fn description_video_navigation_history_is_bounded() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41228,7 +42023,7 @@ mod tests {
 
     #[test]
     fn forwarding_to_a_pending_link_reissues_details_and_rejects_the_stale_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -41288,7 +42083,7 @@ mod tests {
 
     #[test]
     fn local_channel_subscription_persists_and_updates_details_and_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -41414,7 +42209,7 @@ mod tests {
 
     #[test]
     fn rss_subscription_popup_validates_and_persists_portable_feed() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -41543,7 +42338,7 @@ mod tests {
     #[cfg(feature = "rss")]
     #[test]
     fn rss_subscription_opens_plays_refreshes_and_restores_a_stale_snapshot() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let feed_url =
             url::Url::parse("https://podcasts.example/feed.xml").expect("valid fixture feed URL");
@@ -41715,7 +42510,7 @@ mod tests {
 
     #[test]
     fn drill_down_subscriptions_load_only_after_enter_and_tab_returns_to_sources() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -41797,7 +42592,7 @@ mod tests {
 
     #[test]
     fn subscriptions_restore_disk_snapshot_before_refresh_and_reconcile_removed_videos() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let mut first_summary = subscription_video_summary();
@@ -41889,7 +42684,7 @@ mod tests {
 
     #[test]
     fn subscription_initial_empty_page_persists_first_later_playable_page() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open(&config).expect("initial disk state");
@@ -41959,7 +42754,7 @@ mod tests {
 
     #[test]
     fn subscription_disk_snapshot_survives_failure_and_clears_after_empty_success() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         {
@@ -42052,7 +42847,7 @@ mod tests {
 
     #[test]
     fn subscription_disk_cache_opens_without_provider_setup_interruption() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42106,7 +42901,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_bypasses_cache_and_preserves_video_identity() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42254,7 +43049,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_stages_filtered_empty_pages_without_blanking_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42340,7 +43135,7 @@ mod tests {
 
     #[test]
     fn subscription_refresh_keeps_a_selection_changed_while_loading() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -42905,7 +43700,7 @@ mod tests {
     #[cfg(feature = "wikidata")]
     #[test]
     fn reopening_subscription_channel_reapplies_persisted_wikidata_link() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
         save_fixture_subscriptions(&config, &[channel_id]);
@@ -42960,7 +43755,7 @@ mod tests {
     fn late_wikidata_response_cannot_replace_reopened_cached_channel() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let cached_channel_id = "UC6R1juCB5ArnJGMmUlEE_fg";
         save_fixture_subscriptions(&config, &["UCfirst", cached_channel_id]);
@@ -43037,7 +43832,7 @@ mod tests {
     fn subscription_channel_panel_debounces_exact_lazy_wikidata_lookup() {
         use crate::providers::wikidata::WikidataExternalKind;
 
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43077,7 +43872,7 @@ mod tests {
 
     #[test]
     fn empty_subscription_pages_continue_boundedly_and_enter_resumes_pagination() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43129,7 +43924,7 @@ mod tests {
 
     #[test]
     fn subscription_feed_hides_zero_duration_non_live_placeholders() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43181,7 +43976,7 @@ mod tests {
 
     #[test]
     fn empty_later_subscription_page_reaches_the_next_playable_page() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43234,7 +44029,7 @@ mod tests {
 
     #[test]
     fn subscription_pages_reject_skipped_continuations() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43269,7 +44064,7 @@ mod tests {
 
     #[test]
     fn subscription_response_is_cached_without_mutating_another_screen() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43508,7 +44303,7 @@ mod tests {
 
     #[test]
     fn subscription_channel_details_are_debounced_cached_and_applied_to_the_heading() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture"]);
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -43750,7 +44545,7 @@ mod tests {
 
     #[test]
     fn subscription_sources_restore_persisted_artwork_before_channel_switches() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
         let first_artwork =
@@ -44091,7 +44886,7 @@ mod tests {
 
     #[test]
     fn split_subscriptions_keep_independent_sources_videos_and_ram_cache() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.ui.subscriptions_layout = SubscriptionsLayout::Split;
         save_fixture_subscriptions(&config, &["UCfixture", "UCsecond"]);
@@ -44220,7 +45015,7 @@ mod tests {
 
     #[test]
     fn preferences_popup_saves_runtime_preferences_and_applies_them_live() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -44310,7 +45105,7 @@ mod tests {
     #[cfg(feature = "images")]
     #[test]
     fn preferences_cycle_the_complete_closed_youtube_thumbnail_size_set() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -44475,7 +45270,7 @@ mod tests {
     #[cfg(feature = "bandcamp")]
     #[test]
     fn preferences_cycle_the_complete_closed_bandcamp_format_set() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -44502,7 +45297,7 @@ mod tests {
 
     #[test]
     fn subscribe_reconciles_an_external_opml_add_without_unsubscribing_it() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -44544,7 +45339,7 @@ mod tests {
 
     #[test]
     fn channel_view_subscription_updates_the_video_back_snapshot() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -44648,7 +45443,7 @@ mod tests {
     #[cfg(feature = "local-rename")]
     #[test]
     fn local_rename_remaps_playlist_progress_and_history_across_restart() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("youta"));
         config.ensure_directories().expect("private Youta folders");
         let media_directory = fixture.path().join("media");
@@ -44659,7 +45454,8 @@ mod tests {
         let source_id = local_media_id(&source);
         let target_id = local_media_id(&target);
         let snapshot = playlist_snapshot_from_queue_item(
-            &queue_item_from_local(&local_media_item(source.clone())).expect("local queue item"),
+            &queue_item_from_local(&local_media_item(source.clone(), Path::new("ffprobe")))
+                .expect("local queue item"),
         )
         .expect("stable Local snapshot");
         let store = StateStore::open(&config).expect("disk state");
@@ -44792,7 +45588,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_extension_marks_real_rows_and_never_marks_parent_navigation() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let first = fixture.path().join("a.flac");
         let second = fixture.path().join("b.flac");
         std::fs::write(&first, b"a").expect("first fixture");
@@ -44838,7 +45634,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_chooser_keeps_rows_and_rejects_stale_destination_responses() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -44906,7 +45702,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_validation_error_keeps_sources_and_queues_no_mapping() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("song.flac");
         std::fs::write(&source, b"audio").expect("source fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -44978,7 +45774,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_progress_collision_is_rejected_before_journal_or_worker() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45051,7 +45847,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn durable_progress_collision_is_rejected_before_journal_or_worker() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45117,7 +45913,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_intent_is_durable_before_the_worker_can_mutate_files() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45180,7 +45976,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_success_remaps_memory_and_refreshes_without_blank_rows() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45283,7 +46079,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn completed_local_move_mappings_are_persisted_as_one_batch() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("moved/source.flac");
         let source_id = local_media_id(&source);
@@ -45347,7 +46143,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_retains_the_complete_batch() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -45405,7 +46201,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_blocks_local_playlist_mutations() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         std::fs::write(&target, b"moved audio").expect("moved Local fixture");
@@ -45470,7 +46266,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_local_move_persistence_is_not_retried_by_repeated_ticks() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -45534,7 +46330,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn failed_mapping_blocks_session_save_and_quit_until_explicit_retry_succeeds() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source = fixture.path().join("source.flac");
         let target = fixture.path().join("target.flac");
         let source_id = local_media_id(&source);
@@ -45606,7 +46402,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_move_partial_failure_shows_every_recovery_path_and_keeps_remainder() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45686,13 +46482,20 @@ mod tests {
         let error = error.as_deref().expect("recovery message");
         assert!(error.contains(&remaining_source.display().to_string()));
         assert!(error.contains(&staging.display().to_string()));
+        // The popup above shows the raw paths — it stays on screen. The report
+        // is the shareable artifact, and it passes the redaction boundary, so
+        // it retains each recovery path only in the form that boundary allows:
+        // verbatim for this fixture on Unix, `<redacted-home>` on Windows,
+        // where the runner's temporary directory lives under `C:\Users`.
+        let redacted_staging =
+            crate::diagnostics::redact_diagnostic_text(&staging.display().to_string());
         assert!(
             controller
                 .view
                 .error_popup
                 .as_ref()
-                .is_some_and(|popup| popup.report.contains(&staging.display().to_string())),
-            "the scrollable diagnostic must retain every recovery path"
+                .is_some_and(|popup| popup.report.contains(&redacted_staging)),
+            "the scrollable diagnostic must retain every recovery path the redaction allows"
         );
         assert!(
             controller
@@ -45705,7 +46508,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn local_filesystem_worker_executes_moves_off_the_controller_thread() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45750,7 +46553,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn shutdown_joins_and_drains_local_move_before_persisting_session() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
         std::fs::create_dir(&source_directory).expect("source directory");
@@ -45870,7 +46673,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn startup_reconciles_completed_and_untouched_parts_of_a_move_intent() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("config"));
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
@@ -45937,7 +46740,7 @@ mod tests {
     #[cfg(feature = "local-move")]
     #[test]
     fn durable_identity_collision_retains_journal_and_blocks_quit() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let config = Config::for_dir(fixture.path().join("config"));
         let source_directory = fixture.path().join("source");
         let destination_directory = fixture.path().join("destination");
@@ -45985,7 +46788,7 @@ mod tests {
 
     #[test]
     fn local_show_all_toggle_reloads_both_modes_and_preserves_supported_selection() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let track = fixture.path().join("song.flac");
         std::fs::write(&track, b"audio").expect("create Local audio fixture");
         std::fs::write(fixture.path().join("notes.txt"), b"notes")
@@ -46090,7 +46893,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn activating_a_local_text_entry_schedules_its_system_editor_plan() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let notes = fixture.path().join("notes.txt");
         std::fs::write(&notes, b"notes").expect("create Local text fixture");
         let listing = crate::local_browser::list_local_directory_with_options(
@@ -46133,7 +46936,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn activating_an_other_local_file_does_not_schedule_an_editor() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let binary = fixture.path().join("payload.bin");
         std::fs::write(&binary, b"binary").expect("create Local binary fixture");
         let listing = crate::local_browser::list_local_directory_with_options(
@@ -46167,7 +46970,7 @@ mod tests {
 
     #[test]
     fn local_browser_rows_and_folder_actions_are_source_specific() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let album = fixture.path().join("A long album folder");
         std::fs::create_dir(&album).expect("create album folder");
         std::fs::write(fixture.path().join("song.flac"), b"fixture")
@@ -46218,7 +47021,7 @@ mod tests {
     #[cfg(feature = "local-browser")]
     #[test]
     fn local_playback_updates_visible_progress_and_rehydrates_it() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let media_directory = fixture.path().join("Music");
         std::fs::create_dir(&media_directory).expect("create Local media folder");
         let track = media_directory.join("01 - Hello World.flac");
@@ -46380,11 +47183,11 @@ mod tests {
         assert!(rehydrated.playback_started);
     }
 
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     #[test]
     fn local_artwork_worker_response_updates_only_the_matching_details_path() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
-        let media_path = PathBuf::from("/tmp/youta-local-artwork.flac");
+        let media_path = fixture_absolute("/tmp/youta-local-artwork.flac");
         controller.view.details = Some(DetailView {
             media_id: Some(MediaId::new(
                 SourceKind::Local,
@@ -46393,8 +47196,8 @@ mod tests {
             ..DetailView::default()
         });
         controller.pending_local_artwork = Some((7, media_path.clone()));
-        let artwork =
-            url::Url::parse("file:///tmp/youta-local-artwork-cover.png").expect("artwork URL");
+        let artwork = url::Url::from_file_path(fixture_absolute("/tmp/youta-local-artwork.png"))
+            .expect("artwork URL");
 
         controller.handle_provider_response(ProviderResponse::LocalArtwork {
             generation: 7,
@@ -46437,7 +47240,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary local metadata fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary local metadata fixture");
         let media_path = fixture.path().join("mock.webm");
         std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
         let metadata = parse_local_ffprobe_output(
@@ -46523,7 +47326,7 @@ mod tests {
     fn local_mov_details_use_cached_metadata_without_requesting_audio_artwork() {
         use crossbeam_channel::TryRecvError;
 
-        let fixture = tempfile::tempdir().expect("temporary MOV fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary MOV fixture");
         let media_path = fixture.path().join("midpoint.MOV");
         std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -46572,7 +47375,7 @@ mod tests {
     ))]
     #[test]
     fn video_keeps_embedded_artwork_fallback_when_midpoint_extraction_is_omitted() {
-        let fixture = tempfile::tempdir().expect("temporary video-artwork fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary video-artwork fixture");
         let media_path = fixture.path().join("fallback.mov");
         std::fs::write(&media_path, b"mock MOV bytes").expect("write MOV fixture");
         let listing = crate::local_browser::list_local_directory(
@@ -46603,7 +47406,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn downloaded_mov_details_reuse_cached_duration_for_midpoint_thumbnail() {
-        let fixture = tempfile::tempdir().expect("temporary downloaded MOV fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary downloaded MOV fixture");
         let media_path = fixture.path().join("downloaded.mov");
         std::fs::write(&media_path, b"mock downloaded MOV").expect("write MOV fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -46638,6 +47441,120 @@ mod tests {
             })
         );
         assert!(controller.pending_local_media_metadata.is_none());
+    }
+
+    /// Every downloaded row carries its own cover, not just the selected one:
+    /// the list is where a user looks for it, and the thumbnails are sitting in
+    /// the same directory the rows were just read from.
+    #[cfg(feature = "local-artwork")]
+    #[test]
+    fn downloaded_rows_carry_the_thumbnails_written_beside_them() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).expect("disk state");
+        let downloads = config.downloads_dir();
+        let covered = downloads.join("Popular Monster [ydK1vjQBvp0].opus");
+        let cover = downloads.join("Popular Monster [ydK1vjQBvp0].webp");
+        let bare = downloads.join("Ronald [RAoirYYwPgU].opus");
+        std::fs::write(&covered, b"covered download").expect("covered download fixture");
+        std::fs::write(&cover, b"RIFF\0\0\0\0WEBPVP8 body").expect("sidecar fixture");
+        std::fs::write(&bare, b"bare download").expect("bare download fixture");
+        // A thumbnail that is not really an image must not reach a renderer.
+        std::fs::write(
+            downloads.join("Ronald [RAoirYYwPgU].png"),
+            b"<!doctype html>",
+        )
+        .expect("mislabelled sidecar fixture");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.show_screen(Screen::Downloaded);
+
+        let row = |title: &str| {
+            controller
+                .view
+                .rows
+                .iter()
+                .find(|row| row.title == title)
+                .expect("downloaded row")
+                .thumbnail_url
+                .clone()
+        };
+        assert_eq!(
+            row("Popular Monster [ydK1vjQBvp0].opus")
+                .as_ref()
+                .and_then(|url| url.to_file_path().ok())
+                .as_deref()
+                .map(crate::test_support::one_path_shape),
+            Some(cover)
+        );
+        assert_eq!(row("Ronald [RAoirYYwPgU].opus"), None);
+    }
+
+    /// A download carries no embedded picture: `yt-dlp` writes the thumbnail
+    /// beside it. Selecting one therefore has to ask for artwork, and the
+    /// answer has to reach Details, or the Downloaded screen shows covers for
+    /// nothing at all.
+    #[cfg(feature = "local-artwork")]
+    #[test]
+    fn a_downloaded_file_shows_the_thumbnail_written_beside_it() {
+        let fixture = crate::test_support::canonical_tempdir("temporary downloads fixture");
+        let media_path = fixture.path().join("Popular Monster [ydK1vjQBvp0].opus");
+        let sidecar = fixture.path().join("Popular Monster [ydK1vjQBvp0].webp");
+        std::fs::write(&media_path, b"mock downloaded audio").expect("write media fixture");
+        std::fs::write(&sidecar, b"RIFF\0\0\0\0WEBPVP8 body").expect("write sidecar fixture");
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        let (requests, captured) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.view.screen = Screen::Downloaded;
+        controller.view.rows = vec![RowView {
+            media_id: Some(MediaId::new(
+                SourceKind::Local,
+                media_path.display().to_string(),
+            )),
+            title: "Popular Monster".to_owned(),
+            ..RowView::default()
+        }];
+
+        controller.update_downloaded_detail();
+
+        let ProviderRequest::LocalArtwork {
+            generation,
+            path,
+            cache_directory,
+            kind,
+        } = captured.try_recv().expect("downloaded artwork request")
+        else {
+            panic!("expected a Local artwork request");
+        };
+        assert_eq!(path, media_path);
+        assert!(matches!(kind, LocalArtworkKind::EmbeddedMedia));
+
+        // The worker runs the same discovery the provider thread would.
+        let artwork = crate::local_artwork::local_media_artwork(&path, &cache_directory)
+            .expect("discover downloaded artwork");
+        assert_eq!(
+            artwork
+                .as_ref()
+                .and_then(|url| url.to_file_path().ok())
+                .as_deref()
+                .map(crate::test_support::one_path_shape),
+            Some(sidecar),
+            "the sidecar thumbnail is the cover a download actually has"
+        );
+        controller.handle_provider_response(ProviderResponse::LocalArtwork {
+            generation,
+            path,
+            result: Ok(artwork.clone()),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.clone()),
+            artwork
+        );
     }
 
     #[test]
@@ -46680,7 +47597,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary Local browser fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local browser fixture");
         let media_path = fixture.path().join("mock.webm");
         std::fs::write(&media_path, b"mock media").expect("write mock WebM file");
         let listing = crate::local_browser::list_local_directory(
@@ -46761,7 +47678,7 @@ mod tests {
     #[test]
     fn local_media_metadata_cache_has_a_fixed_lru_bound() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
-        let fixture = tempfile::tempdir().expect("temporary metadata cache fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary metadata cache fixture");
         for index in 0..=MAX_CACHED_LOCAL_MEDIA_ITEMS {
             let path = fixture.path().join(format!("{index}.flac"));
             std::fs::write(&path, [u8::try_from(index % 256).expect("bounded byte")])
@@ -46798,7 +47715,8 @@ mod tests {
     fn controller_with_local_fingerprint_config(
         client_key: Option<&str>,
     ) -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
-        let fixture = tempfile::tempdir().expect("temporary fingerprint controller fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary fingerprint controller fixture");
         let mut config = Config::for_dir(fixture.path().join("youta"));
         config.providers.acoustid_client_key = client_key.map(str::to_owned);
         let store = StateStore::open_in_memory().expect("in-memory fingerprint state");
@@ -46923,7 +47841,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprinting_is_eligible_only_for_the_exact_selected_audio_file() {
-        let media = tempfile::tempdir().expect("temporary fingerprint eligibility fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint eligibility fixture");
         let audio = media.path().join("track.flac");
         let video = media.path().join("clip.mp4");
         let image = media.path().join("cover.jpg");
@@ -46966,7 +47885,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_action_points_missing_keys_to_the_private_credentials_file() {
-        let media = tempfile::tempdir().expect("temporary missing-key fixture");
+        let media = crate::test_support::canonical_tempdir("temporary missing-key fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47001,7 +47920,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn missing_fpcalc_failure_reaches_local_error_popup_with_install_guidance() {
-        let media = tempfile::tempdir().expect("temporary missing-fpcalc fixture");
+        let media = crate::test_support::canonical_tempdir("temporary missing-fpcalc fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47040,7 +47959,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn disconnected_fingerprint_worker_cannot_accept_phantom_follow_up_work() {
-        let media = tempfile::tempdir().expect("temporary disconnected-worker fixture");
+        let media = crate::test_support::canonical_tempdir("temporary disconnected-worker fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47074,7 +47993,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_f_dispatch_animates_and_caches_an_empty_success() {
-        let media = tempfile::tempdir().expect("temporary empty fingerprint fixture");
+        let media = crate::test_support::canonical_tempdir("temporary empty fingerprint fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47138,7 +48057,8 @@ mod tests {
     fn local_fingerprint_completion_projects_ranked_musicbrainz_links() {
         const HIGH_RECORDING: &str = "11111111-1111-4111-8111-111111111111";
         const LOW_RECORDING: &str = "22222222-2222-4222-8222-222222222222";
-        let media = tempfile::tempdir().expect("temporary candidate projection fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary candidate projection fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47205,7 +48125,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn tick_reveals_fingerprint_action_after_selected_file_replacement() {
-        let media = tempfile::tempdir().expect("temporary fingerprint revalidation fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint revalidation fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"original audio fixture")
             .expect("write original fingerprint fixture");
@@ -47258,7 +48179,7 @@ mod tests {
     #[test]
     fn cached_fingerprint_reuses_one_pending_musicbrainz_wikidata_lookup() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
-        let media = tempfile::tempdir().expect("temporary Wikidata dedup fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Wikidata dedup fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, provider_requests) =
@@ -47328,7 +48249,7 @@ mod tests {
     fn fingerprint_wikidata_is_visible_before_lastfm_artist_description_arrives() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm enrichment fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm enrichment fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, provider_requests) =
@@ -47428,7 +48349,7 @@ mod tests {
     #[test]
     fn late_lastfm_artist_description_cannot_replace_another_local_track() {
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary stale Last.fm fixture");
+        let media = crate::test_support::canonical_tempdir("temporary stale Last.fm fixture");
         let first = media.path().join("first.flac");
         let second = media.path().join("second.flac");
         std::fs::write(&first, b"first audio fixture").expect("write first fixture");
@@ -47501,7 +48422,7 @@ mod tests {
     #[test]
     fn lastfm_failure_keeps_the_already_visible_wikidata_link() {
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm failure fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm failure fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47566,7 +48487,7 @@ mod tests {
     fn lastfm_success_keeps_visible_wikidata_during_same_recording_refresh() {
         const RECORDING_ID: &str = "11111111-1111-4111-8111-111111111111";
         const RECORDING_ITEM: &str = "Q123456";
-        let media = tempfile::tempdir().expect("temporary Last.fm refresh fixture");
+        let media = crate::test_support::canonical_tempdir("temporary Last.fm refresh fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47667,7 +48588,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn replacement_identity_rejects_an_obsolete_fingerprint_completion() {
-        let media = tempfile::tempdir().expect("temporary replacement fingerprint fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary replacement fingerprint fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"old audio").expect("write original audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47719,7 +48641,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn stale_fingerprint_generation_cannot_replace_the_active_request() {
-        let media = tempfile::tempdir().expect("temporary stale-generation fixture");
+        let media = crate::test_support::canonical_tempdir("temporary stale-generation fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47774,7 +48696,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn changing_local_selection_cancels_the_exact_fingerprint_request() {
-        let media = tempfile::tempdir().expect("temporary selection cancellation fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary selection cancellation fixture");
         let first = media.path().join("first.flac");
         let second = media.path().join("second.flac");
         std::fs::write(&first, b"first audio").expect("write first audio fixture");
@@ -47803,7 +48726,7 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_ram_cache_is_lru_bounded() {
-        let media = tempfile::tempdir().expect("temporary fingerprint cache fixture");
+        let media = crate::test_support::canonical_tempdir("temporary fingerprint cache fixture");
         let (_config, mut controller, _provider_requests) =
             controller_with_local_fingerprint_config(None);
         let mut keys = Vec::new();
@@ -47848,7 +48771,8 @@ mod tests {
     #[cfg(feature = "acoustid")]
     #[test]
     fn local_fingerprint_worker_shutdown_cancels_and_joins_active_work() {
-        let media = tempfile::tempdir().expect("temporary fingerprint shutdown fixture");
+        let media =
+            crate::test_support::canonical_tempdir("temporary fingerprint shutdown fixture");
         let audio = media.path().join("track.flac");
         std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
         let (_config, mut controller, _provider_requests) =
@@ -47958,7 +48882,7 @@ mod tests {
     #[cfg(not(feature = "waveform"))]
     #[test]
     fn omitted_waveform_feature_leaves_the_seek_bar_visible() {
-        let fixture = tempfile::tempdir().expect("temporary omitted-waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary omitted-waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"local audio").expect("write omitted-waveform fixture");
         let media_id = local_media_id(&media_path);
@@ -47996,7 +48920,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn restored_waveform_waits_for_delayed_initial_local_listing() {
-        let fixture = tempfile::tempdir().expect("temporary restored waveform folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary restored waveform folder");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"restored local audio")
             .expect("write restored waveform fixture");
@@ -48135,7 +49059,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_toggle_preserves_right_panel_and_cancels_request() {
-        let fixture = tempfile::tempdir().expect("temporary waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"mock local audio").expect("write local waveform fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -48188,7 +49112,7 @@ mod tests {
     #[test]
     fn local_waveform_request_keeps_fractional_and_subsecond_duration() {
         for duration in [Duration::from_millis(1_900), Duration::from_millis(900)] {
-            let fixture = tempfile::tempdir().expect("temporary duration fixture");
+            let fixture = crate::test_support::canonical_tempdir("temporary duration fixture");
             let media_path = fixture.path().join("short.flac");
             std::fs::write(&media_path, b"short local audio")
                 .expect("write short waveform fixture");
@@ -48227,7 +49151,8 @@ mod tests {
             (Duration::from_millis(1_900), 1),
             (Duration::from_millis(900), 0),
         ] {
-            let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+            let fixture =
+                crate::test_support::canonical_tempdir("temporary active waveform fixture");
             let media_path = fixture.path().join("short.flac");
             std::fs::write(&media_path, b"short local audio")
                 .expect("write active waveform fixture");
@@ -48259,7 +49184,8 @@ mod tests {
             (Duration::from_millis(900), 0),
         ] {
             for play_another_local_file in [false, true] {
-                let fixture = tempfile::tempdir().expect("temporary inactive waveform fixture");
+                let fixture =
+                    crate::test_support::canonical_tempdir("temporary inactive waveform fixture");
                 let selected_path = fixture.path().join("selected.flac");
                 let other_path = fixture.path().join("other.flac");
                 std::fs::write(&selected_path, b"selected local audio")
@@ -48315,7 +49241,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_identity_bound_local_waveform_click_seeks_without_restarting() {
-        let fixture = tempfile::tempdir().expect("temporary active waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary active waveform fixture");
         let media_path = fixture.path().join("active.flac");
         std::fs::write(&media_path, b"active local audio").expect("write active waveform fixture");
         let duration = Duration::from_secs(42);
@@ -48366,7 +49292,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_local_waveform_accepts_subsecond_backend_duration_rounding() {
-        let fixture = tempfile::tempdir().expect("temporary rounded-duration fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary rounded-duration fixture");
         let media_path = fixture.path().join("rounded.flac");
         std::fs::write(&media_path, b"rounded local audio")
             .expect("write rounded-duration fixture");
@@ -48410,7 +49336,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn active_local_waveform_rejects_a_different_backend_duration() {
-        let fixture = tempfile::tempdir().expect("temporary duration-mismatch fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary duration-mismatch fixture");
         let media_path = fixture.path().join("active.flac");
         std::fs::write(&media_path, b"active local audio")
             .expect("write duration-mismatch fixture");
@@ -48456,7 +49382,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn generic_local_queue_start_captures_identity_for_waveform_seek() {
-        let fixture = tempfile::tempdir().expect("temporary generic Local queue fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary generic Local queue fixture");
         let media_path = fixture.path().join("queued.flac");
         std::fs::write(&media_path, b"queued local audio")
             .expect("write generic Local queue fixture");
@@ -48496,7 +49423,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn replaced_selected_file_waveform_restarts_instead_of_seeking_old_stream() {
-        let fixture = tempfile::tempdir().expect("temporary replacement-click fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary replacement-click fixture");
         let media_path = fixture.path().join("replaceable.flac");
         std::fs::write(&media_path, b"old local audio")
             .expect("write original replacement-click fixture");
@@ -48553,7 +49480,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn waveform_click_revalidates_replacement_after_render() {
-        let fixture = tempfile::tempdir().expect("temporary stale-click fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary stale-click fixture");
         let media_path = fixture.path().join("stale.flac");
         std::fs::write(&media_path, b"old local audio").expect("write stale-click fixture");
         let duration = Duration::from_secs(42);
@@ -48608,7 +49535,8 @@ mod tests {
     fn selected_local_waveform_uses_original_non_utf8_path() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 waveform fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 waveform fixture");
         let filename = std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec());
         let media_path = fixture.path().join(filename);
         std::fs::write(&media_path, b"non-UTF-8 local audio")
@@ -48634,7 +49562,8 @@ mod tests {
     fn non_utf8_local_media_ids_and_waveform_targets_remain_distinct() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 collision fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 collision fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -48699,7 +49628,8 @@ mod tests {
     fn non_utf8_local_files_keep_separate_progress_and_history() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary non-UTF-8 playback fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary non-UTF-8 playback fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"track-\xFF.flac".to_vec()));
@@ -48761,7 +49691,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn hiding_waveform_cancels_local_waveform_request() {
-        let fixture = tempfile::tempdir().expect("temporary waveform visibility fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform visibility fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"local audio").expect("write waveform visibility fixture");
         let request = LocalWaveformRequest::from_path(media_path.clone())
@@ -48791,7 +49722,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn selecting_metadata_loading_file_cancels_previous_waveform() {
-        let fixture = tempfile::tempdir().expect("temporary waveform selection fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform selection fixture");
         let first_path = fixture.path().join("first.flac");
         let second_path = fixture.path().join("second.flac");
         std::fs::write(&first_path, b"first local audio").expect("write first waveform fixture");
@@ -48854,7 +49786,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn stale_local_waveform_response_cannot_replace_newer_owner() {
-        let fixture = tempfile::tempdir().expect("temporary waveform owner fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform owner fixture");
         let media_path = fixture.path().join("new-owner.flac");
         std::fs::write(&media_path, b"new owner").expect("write waveform owner fixture");
         let request =
@@ -48912,7 +49844,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn completed_waveform_is_revalidated_before_display_after_replacement() {
-        let fixture = tempfile::tempdir().expect("temporary completed replacement fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary completed replacement fixture");
         let media_path = fixture.path().join("completed.flac");
         std::fs::write(&media_path, b"old completed waveform")
             .expect("write completed replacement fixture");
@@ -48995,7 +49928,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn waveform_click_rejects_changed_duration_for_same_file_identity() {
-        let fixture = tempfile::tempdir().expect("temporary duration correction fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary duration correction fixture");
         let media_path = fixture.path().join("duration.flac");
         std::fs::write(&media_path, b"duration correction local audio")
             .expect("write duration correction fixture");
@@ -49056,7 +49990,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn replaced_local_file_retries_identity_scoped_waveform_failure() {
-        let fixture = tempfile::tempdir().expect("temporary failed waveform fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary failed waveform fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"old waveform").expect("write original waveform fixture");
         let media_id = local_media_id(&media_path);
@@ -49155,7 +50089,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn unavailable_local_waveform_retries_after_its_bounded_delay() {
-        let fixture = tempfile::tempdir().expect("temporary unkeyed retry fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary unkeyed retry fixture");
         let media_path = fixture.path().join("retry.flac");
         std::fs::write(&media_path, b"retry local audio").expect("write unkeyed retry fixture");
         let duration = Duration::from_secs(42);
@@ -49225,7 +50159,7 @@ mod tests {
     fn failed_non_utf8_path_does_not_delay_a_distinct_selection() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let fixture = tempfile::tempdir().expect("temporary retry collision fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary retry collision fixture");
         let first_path = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"retry-\xFF.flac".to_vec()));
@@ -49284,7 +50218,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn ready_local_waveform_revalidates_periodically_but_clicks_immediately() {
-        let fixture = tempfile::tempdir().expect("temporary revalidation fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary revalidation fixture");
         let media_path = fixture.path().join("revalidate.flac");
         std::fs::write(&media_path, b"revalidation local audio")
             .expect("write revalidation fixture");
@@ -49334,7 +50268,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_ram_cache_enforces_entry_and_byte_limits() {
-        let fixture = tempfile::tempdir().expect("temporary waveform cache fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform cache fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
         let one_peak = Arc::new(crate::waveform::PeakPyramid::from_peaks(
             vec![crate::waveform::Peak {
@@ -49424,7 +50358,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_ram_cache_counts_retained_peak_capacity() {
-        let fixture = tempfile::tempdir().expect("temporary waveform capacity fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary waveform capacity fixture");
         let media_path = fixture.path().join("capacity.flac");
         std::fs::write(&media_path, b"capacity").expect("write waveform capacity fixture");
         let request =
@@ -49458,7 +50392,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_is_scoped_to_exact_timeline_duration() {
-        let fixture = tempfile::tempdir().expect("temporary waveform duration-cache fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform duration-cache fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"duration-sensitive waveform")
             .expect("write waveform duration-cache fixture");
@@ -49505,7 +50440,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_cache_replaces_stale_file_identity_for_same_path() {
-        let fixture = tempfile::tempdir().expect("temporary waveform replacement fixture");
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary waveform replacement fixture");
         let media_path = fixture.path().join("track.flac");
         std::fs::write(&media_path, b"old").expect("write original waveform fixture");
         let original =
@@ -49570,7 +50506,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_media_metadata_cache_rejects_same_size_path_replacement() {
-        let fixture = tempfile::tempdir().expect("temporary replacement fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary replacement fixture");
         let media_path = fixture.path().join("track.flac");
         let replacement_path = fixture.path().join("replacement.flac");
         std::fs::write(&media_path, b"old!").expect("write original fixture");
@@ -49609,7 +50545,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().expect("temporary worker race fixture");
+        let fixture = crate::test_support::canonical_tempdir("temporary worker race fixture");
         let media_path = fixture.path().join("track.flac");
         let replacement_path = fixture.path().join("replacement.flac");
         std::fs::write(&media_path, b"old!").expect("write original fixture");
@@ -49866,7 +50802,7 @@ mod tests {
 
     #[test]
     fn navigating_to_parent_reselects_the_folder_just_left() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         let child_listing = crate::local_browser::list_local_directory(
@@ -49925,7 +50861,7 @@ mod tests {
 
     #[test]
     fn local_parent_action_ascends_from_any_selected_row_and_reselects_the_child() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         std::fs::write(child.join("track.flac"), b"fixture").expect("create Local media fixture");
@@ -50032,7 +50968,7 @@ mod tests {
 
     #[test]
     fn pending_local_navigation_keeps_rows_visible_but_noninteractive() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let child = fixture.path().join("album");
         std::fs::create_dir(&child).expect("create child folder");
         let listing = crate::local_browser::list_local_directory(
@@ -50101,7 +51037,7 @@ mod tests {
 
     #[test]
     fn trash_refresh_preserves_rows_and_reuses_unchanged_sibling_size() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let removed = fixture.path().join("remove-me");
         let sibling = fixture.path().join("sibling");
         std::fs::create_dir(&removed).expect("create removed folder");
@@ -50225,10 +51161,10 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "local-artwork", feature = "images"))]
+    #[cfg(feature = "local-artwork")]
     #[test]
     fn folder_details_omit_duplicate_size_and_load_cover_lazily() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let album = fixture.path().join("album");
         std::fs::create_dir(&album).expect("create album");
         let cover = album.join("CoVeR.JpG");
@@ -50386,7 +51322,7 @@ mod tests {
     fn local_size_sort_keeps_unknown_folders_last_and_preserves_selected_path() {
         use crate::local_browser::LocalEntryKind;
 
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let small = fixture.path().join("small");
         let large = fixture.path().join("large");
         let unknown = fixture.path().join("unknown");
@@ -50529,7 +51465,7 @@ mod tests {
 
     #[test]
     fn lazy_folder_size_response_reorders_without_moving_selection() {
-        let fixture = tempfile::tempdir().expect("temporary Local folder");
+        let fixture = crate::test_support::canonical_tempdir("temporary Local folder");
         let measured = fixture.path().join("measured");
         let selected = fixture.path().join("selected");
         std::fs::create_dir(&measured).expect("create measured folder");
@@ -50589,7 +51525,7 @@ mod tests {
 
     #[test]
     fn local_subscription_save_failure_rolls_back_cache_and_view() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let blocked_root = temporary.path().join("not-a-directory");
         std::fs::write(&blocked_root, b"fixture").expect("blocking file");
         let config = Config::for_dir(&blocked_root);
@@ -50636,7 +51572,7 @@ mod tests {
 
     #[test]
     fn malformed_existing_opml_is_never_replaced_by_subscribe() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         config
             .ensure_directories()
@@ -50695,7 +51631,7 @@ mod tests {
 
     #[test]
     fn selecting_a_channel_invalidates_a_late_video_detail_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -51649,7 +52585,7 @@ mod tests {
 
     #[test]
     fn chapter_timestamp_toggle_changes_only_labels_and_survives_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -51680,7 +52616,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_screen_and_selected_station_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -51702,7 +52638,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn bitrate_sorted_radio_selection_restores_by_stable_station_id() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -51752,7 +52688,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_filter_and_filtered_selection_survive_restart_by_station_id() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -52072,7 +53008,7 @@ mod tests {
 
     #[test]
     fn submitted_youtube_search_animates_until_its_terminal_response() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52160,7 +53096,7 @@ mod tests {
 
     #[test]
     fn accumulated_youtube_search_stops_at_the_restart_safe_result_limit() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52218,7 +53154,7 @@ mod tests {
 
     #[test]
     fn newest_toggle_restarts_page_one_and_keeps_order_on_later_pages() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52278,7 +53214,7 @@ mod tests {
 
     #[test]
     fn creative_commons_toggle_restarts_and_survives_pagination_and_sort_changes() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52352,7 +53288,7 @@ mod tests {
 
     #[test]
     fn creative_commons_toggle_does_not_apply_a_video_filter_to_channel_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52374,7 +53310,7 @@ mod tests {
 
     #[test]
     fn superseded_generation_cannot_leave_or_clear_the_wrong_animation() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52403,7 +53339,7 @@ mod tests {
 
     #[test]
     fn tracker_search_stops_only_on_matching_completion_even_after_navigation() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52444,7 +53380,7 @@ mod tests {
 
     #[test]
     fn failed_send_and_provider_disconnect_restore_idle_search_state() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52476,7 +53412,7 @@ mod tests {
 
     #[test]
     fn missing_youtube_provider_opens_setup_popup_with_exact_storage_paths() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let expected_api_key_path = config.credentials_file().display().to_string();
         let expected_invidious_path = config.config_file().display().to_string();
@@ -52506,7 +53442,7 @@ mod tests {
 
     #[test]
     fn setup_input_is_bounded_and_cancel_keeps_the_pending_query() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -52535,7 +53471,7 @@ mod tests {
     #[cfg(feature = "youtube-official")]
     #[test]
     fn invalid_official_key_stays_in_setup_and_is_not_persisted() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -52569,7 +53505,7 @@ mod tests {
     #[cfg(feature = "youtube-official")]
     #[test]
     fn saved_official_setup_replaces_provider_and_retries_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let credentials_file = config.credentials_file();
@@ -52638,7 +53574,7 @@ mod tests {
     #[cfg(feature = "invidious")]
     #[test]
     fn saved_invidious_setup_replaces_provider_and_retries_search() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let config_file = config.config_file();
         let store = StateStore::open_in_memory().expect("in-memory state");
@@ -53116,7 +54052,7 @@ mod tests {
 
     #[test]
     fn selecting_another_item_restores_the_configured_artwork_height() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -53247,8 +54183,15 @@ mod tests {
         assert!(controller.view.status_line.contains("No Details text"));
     }
 
+    /// A finished drag hands bounded text to the front-end's clipboard.
+    ///
+    /// The controller does not copy: it produces a request and composes the
+    /// status line from whatever transport the front-end reports back. What has
+    /// to stay true here is the bound — a runaway drag must not hand an
+    /// unbounded payload across that seam, and the payload must stay valid
+    /// UTF-8 when it is cut.
     #[test]
-    fn finished_details_selection_uses_injectable_bounded_clipboard_action() {
+    fn finished_details_selection_hands_bounded_text_to_the_front_end() {
         let (mut controller, _) =
             controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
         controller.view.details = Some(DetailView {
@@ -53256,13 +54199,8 @@ mod tests {
             ..DetailView::default()
         });
         controller.view.text_selection_mode = true;
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        controller.report_actions = Box::new(MockDiagnosticActions {
-            calls: Arc::clone(&calls),
-            gh_available: false,
-        });
-        let anchor = crate::tui::DetailsTextPosition { row: 0, column: 0 };
-        let focus = crate::tui::DetailsTextPosition { row: 1, column: 3 };
+        let anchor = crate::view::DetailsTextPosition { row: 0, column: 0 };
+        let focus = crate::view::DetailsTextPosition { row: 1, column: 3 };
 
         controller.dispatch(UiAction::BeginDetailsTextSelection(anchor));
         controller.dispatch(UiAction::UpdateDetailsTextSelection(focus));
@@ -53271,10 +54209,11 @@ mod tests {
             text: "Title\nmeta".to_owned(),
         });
 
-        assert_eq!(
-            calls.lock().expect("clipboard calls").as_slice(),
-            [DiagnosticCall::Copy("Title\nmeta".to_owned())]
-        );
+        let request = controller
+            .take_clipboard_request()
+            .expect("a finished selection asks the front-end to copy");
+        assert_eq!(request.text, "Title\nmeta");
+        assert_eq!(request.subject, ClipboardSubject::DetailsText(10));
         assert_eq!(
             controller.view.details_text_selection,
             Some(DetailsTextSelection {
@@ -53283,25 +54222,376 @@ mod tests {
                 dragging: false,
             })
         );
-        assert!(controller.view.status_line.contains("mock clipboard"));
+        controller.report_clipboard_result(Ok("mock clipboard".to_owned()));
+        assert_eq!(
+            controller.view.status_line,
+            "Copied 10 characters with mock clipboard"
+        );
 
         controller.dispatch(UiAction::BeginDetailsTextSelection(anchor));
         controller.dispatch(UiAction::FinishDetailsTextSelection {
             focus,
             text: "é".repeat(MAX_DETAILS_SELECTION_BYTES),
         });
-        let calls = calls.lock().expect("bounded clipboard calls");
-        let DiagnosticCall::Copy(bounded) = calls.last().expect("second clipboard call") else {
-            panic!("unexpected diagnostic action")
-        };
+        let bounded = controller
+            .take_clipboard_request()
+            .expect("the second selection also asks to copy")
+            .text;
         assert!(bounded.len() <= MAX_DETAILS_SELECTION_BYTES);
         assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    /// The queue must be visible, and it must never carry a playable location.
+    ///
+    /// `QueueItem::playback_location` is a signed, short-lived media URL for
+    /// several providers. The desktop window renders this projection in another
+    /// process, so a location that leaked into it would be a credential leaving
+    /// the controller — the same boundary `src/diagnostics.rs` guards.
+    #[test]
+    fn the_queue_is_shown_without_exposing_any_playable_location() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.dispatch(UiAction::OpenQueuePopup);
+        assert!(
+            controller.view.queue_popup.is_none(),
+            "an empty queue opens nothing"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "The queue is empty; press a to add the selected item"
+        );
+
+        let mut first = fixture_direct_item("signed-first");
+        first.media.creator = Some("A Creator".to_owned());
+        first.media.duration_seconds = Some(125);
+        // The identity and the playable location are deliberately different
+        // here, as they are for every provider that signs its media URLs. A
+        // direct remote file is the one case where they are the same string,
+        // and using that fixture would make this assertion unprovable.
+        first.media.id = MediaId::new(SourceKind::RemoteFiles, "opaque-identity-42");
+        first.playback_location =
+            "https://cdn.example/opaque-identity-42?sig=SIGNATURE_THAT_MUST_STAY_HERE".to_owned();
+        let location = first.playback_location.clone();
+        controller.playback_queue.push(first);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("signed-second"));
+
+        controller.dispatch(UiAction::OpenQueuePopup);
+        let popup = controller
+            .view
+            .queue_popup
+            .clone()
+            .expect("the queue opens");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.current, Some(0));
+        assert_eq!(popup.selected, 0, "the highlight starts on what is playing");
+        assert_eq!(popup.items[0].title, "signed-first");
+        assert_eq!(popup.items[0].subtitle, "A Creator");
+        assert_eq!(popup.items[0].length, "2:05");
+        assert_eq!(
+            popup.items[1].length, "",
+            "an unknown running time is empty rather than invented"
+        );
+
+        let published = serde_json::to_string(&controller.view).expect("encode the snapshot");
+        assert!(
+            !published.contains(&location),
+            "the playable location must not reach a front-end"
+        );
+    }
+
+    /// A media key means "the next entry", not "the next entry unless repeat".
+    ///
+    /// Repeat-one governs what happens when an item ends. Consulting it here
+    /// would answer a deliberate press by replaying the same track, which is
+    /// indistinguishable from a key that does nothing.
+    ///
+    /// The edges refuse here because no source list owns these direct items;
+    /// a queue that grew out of a list continues into it instead.
+    #[test]
+    fn stepping_through_the_queue_moves_by_one_entry_and_stops_at_the_ends() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        for name in ["first", "second", "third"] {
+            controller.playback_queue.push(fixture_direct_item(name));
+        }
+        controller.playback_queue.current_index = Some(0);
+        controller.playback_queue.repeat_one = true;
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(2));
+
+        // The end is a stated refusal, not a wrap-around: wrapping would restart
+        // a finished queue from a key meant to advance it.
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(controller.playback_queue.current_index, Some(2));
+        assert_eq!(
+            controller.view.status_line,
+            "This is the last item in the queue"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.view.status_line,
+            "This is the first item in the queue"
+        );
+    }
+
+    /// Nothing playing is answered, not ignored.
+    ///
+    /// A media key is pressed out of sight of the window, so a silent no-op is
+    /// the one outcome that leaves the person with no idea what happened.
+    #[test]
+    fn stepping_an_empty_queue_says_so_rather_than_doing_nothing() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(
+            controller.view.status_line,
+            "The queue holds nothing to move through"
+        );
+        assert!(controller.playback_queue.items.is_empty());
+    }
+
+    /// Removing an entry must move the cursor with it.
+    ///
+    /// Without that, dropping an earlier entry silently repoints the cursor at
+    /// its neighbour and the next end-of-file skips a track.
+    #[test]
+    fn removing_a_queue_entry_keeps_the_cursor_on_the_same_item() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        for name in ["first", "second", "third"] {
+            controller.playback_queue.push(fixture_direct_item(name));
+        }
+        controller.playback_queue.current_index = Some(2);
+        controller.dispatch(UiAction::OpenQueuePopup);
+
+        controller.dispatch(UiAction::RemoveQueuePopupRow(0));
+        controller.tick();
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        let popup = controller.view.queue_popup.clone().expect("still open");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.items[1].title, "third");
+        assert_eq!(popup.current, Some(1));
+
+        // The playing entry is refused rather than removed, because dropping it
+        // would leave the queue describing something other than what is playing.
+        controller.dispatch(UiAction::RemoveQueuePopupRow(1));
+        assert_eq!(
+            controller.view.status_line,
+            "Stop the current item before removing it from the queue"
+        );
+        assert_eq!(controller.playback_queue.items.len(), 2);
+
+        controller.dispatch(UiAction::ClearQueue);
+        controller.tick();
+        assert_eq!(controller.playback_queue.items.len(), 1);
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.view.status_line, "Cleared one queued item",
+            "clearing keeps what is playing and says how much it dropped"
+        );
+    }
+
+    /// An index sent back by a front-end must never address a row that moved.
+    ///
+    /// The window addresses queue rows by position, so a list rebuilt only when
+    /// the user acts would go stale the moment playback advanced on its own.
+    #[test]
+    fn an_open_queue_follows_changes_the_user_did_not_make() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller
+            .playback_queue
+            .push(fixture_direct_item("playing-now"));
+        controller.dispatch(UiAction::OpenQueuePopup);
+
+        // Something other than the user changes the queue: an item starts and
+        // is recorded beside the cursor.
+        controller
+            .playback_queue
+            .begin_now(fixture_direct_item("started-elsewhere"), false);
+        controller.tick();
+
+        let popup = controller.view.queue_popup.clone().expect("still open");
+        assert_eq!(popup.items.len(), 2);
+        assert_eq!(popup.items[0].title, "started-elsewhere");
+        assert_eq!(popup.current, Some(0));
+    }
+
+    /// A window title, a tray tooltip, and a track-change notification all read
+    /// one field, and it must follow the queue rather than the visible list.
+    ///
+    /// Deriving it from `rows` is the tempting shortcut and the wrong one: the
+    /// playing item leaves `rows` as soon as the user browses anywhere else,
+    /// and the announcement would then follow the cursor instead of the sound.
+    #[test]
+    fn what_is_playing_is_published_for_the_surfaces_outside_the_list() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.tick();
+        assert!(
+            controller.view.now_playing.is_none(),
+            "an empty queue announces nothing"
+        );
+
+        let mut first = fixture_direct_item("First Track");
+        first.media.creator = Some("A Creator".to_owned());
+        controller.playback_queue.push(first);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("Second Track"));
+        controller.tick();
+        let playing = controller
+            .view
+            .now_playing
+            .clone()
+            .expect("a queued entry is announced");
+        assert_eq!(playing.title, "First Track");
+        assert_eq!(playing.subtitle, "A Creator");
+
+        // Browsing elsewhere empties `rows` of the playing item; the
+        // announcement must not follow the user out of the list.
+        controller.dispatch(UiAction::ShowScreen(Screen::History));
+        controller.tick();
+        assert_eq!(
+            controller
+                .view
+                .now_playing
+                .as_ref()
+                .map(|it| it.title.clone()),
+            Some("First Track".to_owned())
+        );
+
+        controller.playback_queue.current_index = Some(1);
+        controller.tick();
+        let advanced = controller
+            .view
+            .now_playing
+            .clone()
+            .expect("the next entry is announced");
+        assert_eq!(advanced.title, "Second Track");
+        assert_eq!(
+            advanced.subtitle, "",
+            "an unknown creator stays empty rather than being invented"
+        );
+        assert_ne!(
+            advanced.media_id, playing.media_id,
+            "identity is what marks a change of track, so it must move too"
+        );
+    }
+
+    /// Dropping media on the window must land on it in Local.
+    ///
+    /// A terminal cannot receive a drop, so this action exists only for the
+    /// window — but the navigation it performs is the Local browser's own, so a
+    /// dropped path can reach nothing the arrow keys could not already reach.
+    #[cfg(feature = "local-browser")]
+    #[test]
+    fn a_dropped_path_opens_where_it_lives_and_selects_it() {
+        let temporary = crate::test_support::canonical_tempdir("temporary media directory");
+        // Canonical from the start: macOS resolves `/var` to `/private/var`,
+        // and the controller compares the canonical form.
+        let folder =
+            crate::fs_path::canonicalize(temporary.path()).expect("canonical media directory");
+        let track = folder.join("Track.opus");
+        std::fs::write(&track, b"audio").expect("media fixture");
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![track.clone()]));
+        assert_eq!(
+            controller.view.screen,
+            Screen::Local,
+            "a drop switches to the browser that shows it"
+        );
+        assert_eq!(controller.view.local_path, folder.display().to_string());
+        assert_eq!(
+            controller
+                .pending_local_reselection
+                .as_ref()
+                .map(|(_, child)| child.clone()),
+            Some(track.clone()),
+            "the dropped file is reselected when its folder arrives"
+        );
+
+        // A dropped folder is the place itself, with nothing to reselect.
+        let nested = folder.join("Album");
+        std::fs::create_dir(&nested).expect("nested folder fixture");
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![nested.clone()]));
+        assert_eq!(controller.view.local_path, nested.display().to_string());
+        assert!(controller.pending_local_reselection.is_none());
+
+        // Several paths still name one place, and the count is reported so the
+        // rest are not silently forgotten.
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![
+            track.clone(),
+            folder.join("Other.opus"),
+        ]));
+        assert_eq!(controller.view.local_path, folder.display().to_string());
+        assert_eq!(
+            controller.view.status_line,
+            "2 paths dropped; showing the folder the first one is in"
+        );
+
+        // A path that is gone by the time it arrives must say so and move
+        // nothing, rather than leaving Local pointing at a folder it never read.
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![folder.join("Gone.opus")]));
+        assert!(
+            controller.view.status_line.starts_with("Cannot open "),
+            "{}",
+            controller.view.status_line
+        );
+        assert_eq!(controller.view.local_path, folder.display().to_string());
+    }
+
+    /// `y` must reach a clipboard rather than print the URL and stop.
+    ///
+    /// It printed `Link: {url}` into the status line for the whole life of the
+    /// project, which looks like a copy and is not one.
+    #[test]
+    fn copying_a_link_asks_the_front_end_and_reports_its_transport() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        // Nothing selected: no request may be produced at all, or the front-end
+        // would put an empty string on the user's clipboard.
+        controller.dispatch(UiAction::CopyLink);
+        assert!(controller.take_clipboard_request().is_none());
+        assert_eq!(controller.view.status_line, "No link is selected");
+
+        controller.active_description_video = Some(ActiveDescriptionVideo {
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            start_seconds: None,
+        });
+
+        controller.dispatch(UiAction::CopyLink);
+        let request = controller
+            .take_clipboard_request()
+            .expect("a selected link is handed to the front-end");
+        assert!(request.text.contains("dQw4w9WgXcQ"), "{}", request.text);
+        assert_eq!(request.subject, ClipboardSubject::Link);
+
+        controller.report_clipboard_result(Err("no clipboard helper".to_owned()));
+        assert_eq!(
+            controller.view.status_line, "Could not copy the link: no clipboard helper",
+            "a failed copy must say so rather than look like a success"
+        );
     }
 
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn download_controller_supervises_progress_and_refreshes_completed_file() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let mut config = Config::for_dir(temporary.path().join("youta"));
         config.subscriptions.download_thumbnails = false;
         let download_dir = config.downloads_dir();
@@ -53350,7 +54640,7 @@ mod tests {
         assert!(!request.write_thumbnail);
         assert_eq!(
             request.destination,
-            std::fs::canonicalize(config.downloads_dir()).expect("canonical downloads")
+            crate::fs_path::canonicalize(config.downloads_dir()).expect("canonical downloads")
         );
 
         controller.dispatch(UiAction::ShowScreen(Screen::Downloaded));
@@ -53396,7 +54686,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn second_download_is_refused_and_shutdown_cancels_the_running_child() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let cancelled = Arc::new(AtomicBool::new(false));
         let process = MockRunningDownload {
@@ -53432,7 +54722,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn generic_ytdlp_selection_uses_its_canonical_remote_url() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(Vec::new())),
@@ -53463,7 +54753,7 @@ mod tests {
     #[cfg(all(feature = "yandex-music", feature = "yt-dlp"))]
     #[test]
     fn selected_yandex_download_uses_native_media_pipeline_instead_of_ytdlp() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(Vec::new())),
@@ -53495,7 +54785,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn failed_download_opens_the_complete_diagnostic_popup() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let process = MockRunningDownload {
             progress: Some(Cursor::new(
@@ -53548,7 +54838,7 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn download_paths_and_output_buffers_remain_confined_and_bounded() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let destination =
             prepare_download_destination(&config).expect("confined download destination");
@@ -53668,8 +54958,9 @@ mod tests {
             "https://cdn.example/episode.m4a"
         );
 
+        let local_path = fixture_absolute("/tmp/youta-fixture.flac");
         let local = LocalMediaItem {
-            path: PathBuf::from("/tmp/youta-fixture.flac"),
+            path: local_path.clone(),
             title: "Local".to_owned(),
             artist: Some("Artist One; Artist Two".to_owned()),
             album: Some("Album".to_owned()),
@@ -53706,7 +54997,9 @@ mod tests {
         }
         assert_eq!(
             queued_local.playback_location,
-            "file:///tmp/youta-fixture.flac"
+            url::Url::from_file_path(&local_path)
+                .expect("absolute fixture URL")
+                .to_string()
         );
 
         let tracker = TrackerItem {
@@ -53822,13 +55115,15 @@ mod tests {
         }];
         controller.view.screen = Screen::TrackerMusic;
         controller.refresh_tracker_rows();
+        let replay_path = fixture_absolute("/music/Дед инсайд.flac");
+        let replay_locator = replay_path.to_str().expect("UTF-8 fixture locator");
         controller
             .store
             .insert_history(&HistoryEntry {
                 id: 0,
-                media_id: MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"),
+                media_id: MediaId::new(SourceKind::Local, replay_locator),
                 title: "Дед инсайд".to_owned(),
-                replay_locator: Some("/music/Дед инсайд.flac".to_owned()),
+                replay_locator: Some(replay_locator.to_owned()),
                 started_at: 10,
                 last_played_at: 11,
                 position_seconds: 0,
@@ -53845,7 +55140,7 @@ mod tests {
         assert_eq!(details.description, "Removed");
         assert_eq!(
             details.media_id,
-            Some(MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"))
+            Some(MediaId::new(SourceKind::Local, replay_locator))
         );
         assert!(!details.description.contains(stale_url.as_str()));
     }
@@ -53853,7 +55148,7 @@ mod tests {
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn history_waits_for_current_local_mov_duration_before_thumbnail() {
-        let temporary = tempfile::tempdir().expect("temporary History video directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary History video directory");
         let video = temporary.path().join("history.MOV");
         std::fs::write(&video, b"mock MOV bytes").expect("local video fixture");
         let (mut controller, _state) = controller_with_mock_statuses([]);
@@ -53907,7 +55202,7 @@ mod tests {
 
     #[test]
     fn history_enter_replays_existing_local_media_from_saved_progress() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let track = temporary.path().join("history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
         let media_id = local_media_id(&track);
@@ -53952,7 +55247,7 @@ mod tests {
 
     #[test]
     fn local_history_playlist_actions_persist_membership_and_replay_after_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let track = temporary.path().join("playlist history fixture.opus");
         std::fs::write(&track, b"mock audio").expect("local media fixture");
@@ -54157,7 +55452,7 @@ mod tests {
 
     #[test]
     fn missing_local_history_is_marked_removed_and_opens_a_recoverable_error() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let removed = temporary.path().join("removed.opus");
         let (mut controller, state) = controller_with_mock_statuses([]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
@@ -54216,7 +55511,7 @@ mod tests {
 
     #[test]
     fn removed_and_unreplayable_history_rows_expose_no_playlist_actions() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let removed = temporary.path().join("removed playlist fixture.opus");
         let unsafe_remote = "https://media.example.test/private.opus?token=fixture";
         let (mut controller, _) = controller_with_mock_statuses([]);
@@ -54864,6 +56159,666 @@ mod tests {
         assert_eq!(controller.view.status_line, "Playback queue finished");
     }
 
+    /// `}` at the queue edge continues into the list playback started from,
+    /// with autoplay off: that toggle governs end-of-file, not a deliberate
+    /// keypress. Unplayable scheduled rows are skipped exactly as autoplay
+    /// skips them.
+    #[test]
+    fn manual_next_crosses_into_the_youtube_list_with_autoplay_off() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut scheduled = first.clone();
+        scheduled.video_id = "planned0000".to_owned();
+        scheduled.title = "Scheduled placeholder".to_owned();
+        scheduled.duration_seconds = Some(0);
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(scheduled),
+            SearchItem::Video(second),
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 2,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        assert_eq!(
+            controller.playback_queue.items[1].media.title, "Second playable video",
+            "the crossed-into item must be recorded as a queue entry"
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// `{` at the queue start steps backward through the same list, and the
+    /// earlier item is prepended so the queue keeps reading in play order.
+    #[test]
+    fn manual_previous_steps_back_into_the_youtube_list() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first), SearchItem::Video(second.clone())];
+        controller.view.selected = 1;
+        controller.play_queue_item(queue_item_from_video(&second, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Second playable video", "Fixture video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(controller.playback_queue.items.len(), 2);
+        assert_eq!(
+            controller.playback_queue.items[0].media.title,
+            "Fixture video"
+        );
+    }
+
+    /// A replaced search refuses the step, exactly as it stops autoplay.
+    #[test]
+    fn manual_step_refuses_a_replaced_source_list() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller.search_generation = controller.search_generation.wrapping_add(1);
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state.lock().expect("mock state").played.len(),
+            1,
+            "a stale origin must not start anything"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "The source list changed since playback started"
+        );
+        assert_eq!(controller.playback_queue.items.len(), 1);
+    }
+
+    /// List edges are stated refusals rather than wrap-arounds, both ways.
+    #[test]
+    fn manual_step_refuses_at_the_source_list_edges() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(
+            controller.view.status_line,
+            "Reached the start of the source list"
+        );
+        assert_eq!(state.lock().expect("mock state").played.len(), 1);
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(
+            controller.view.status_line,
+            "Reached the end of the source list"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"]
+        );
+    }
+
+    /// Explicit queue entries still run before the list continues, and the
+    /// manual jump parks the list position the way end-of-file does.
+    #[test]
+    fn explicit_queue_entries_still_outrank_the_source_list_on_manual_next() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra"],
+            "the queued entry must outrank the source list"
+        );
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "the list position must be parked across the explicit entry"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// Repeat-one still loses to a deliberate press, now also at the edge.
+    #[test]
+    fn manual_next_ignores_repeat_one_at_the_queue_edge() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller.playback_queue.repeat_one = true;
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"],
+            "repeat-one must not answer a next-track press with a replay"
+        );
+    }
+
+    /// End-of-file parks the list position across explicit entries even with
+    /// autoplay off, so a later `}` can still continue the list.
+    #[test]
+    fn parked_origin_survives_the_queue_and_autoplay_off_for_manual_next() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra"]
+        );
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "end-of-file must park the position with autoplay off"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// Turning autoplay off must not forget where the list continuation
+    /// stood: the manual step may still consume it.
+    #[test]
+    fn toggling_autoplay_off_keeps_the_manual_step_position() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (factory, state, _, events) = mock_playback_factory(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        controller.dispatch(UiAction::ToggleAutoplay);
+        assert!(!controller.config.playback.autoplay);
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "disabling autoplay must keep the parked position"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+    }
+
+    fn fixture_youtube_playlist_entry(video_id: &str, title: &str) -> PlaylistEntry {
+        let page = url::Url::parse(&format!("https://www.youtube.com/watch?v={video_id}"))
+            .expect("fixture playlist page");
+        PlaylistEntry {
+            media: PlaylistMediaSnapshot {
+                id: MediaId::new(SourceKind::YouTube, video_id),
+                kind: MediaKind::Video,
+                title: title.to_owned(),
+                creator: Some("Fixture channel".to_owned()),
+                webpage_url: page.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(120),
+                replay_locator: page.to_string(),
+            },
+            segment: None,
+            added_at: 1,
+        }
+    }
+
+    fn controller_with_active_playlist(
+        controller: &mut AppController,
+        entries: Vec<PlaylistEntry>,
+    ) {
+        controller.view.screen = Screen::Playlists;
+        controller.playlists_route = PlaylistsRoute::Entries {
+            playlist_id: "fixture-playlist".to_owned(),
+        };
+        controller.active_playlist = Some(Playlist {
+            id: "fixture-playlist".to_owned(),
+            name: "Fixture playlist".to_owned(),
+            description: None,
+            entries,
+        });
+        controller.view.selected = 0;
+    }
+
+    /// `}` at the queue edge continues through the playlist an entry was
+    /// started from, with autoplay off.
+    #[test]
+    fn manual_next_crosses_into_the_playlist_entries() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let entries = vec![
+            fixture_youtube_playlist_entry("dQw4w9WgXcQ", "First playlist video"),
+            fixture_youtube_playlist_entry("9bZkp7q19f0", "Second playlist video"),
+        ];
+        controller_with_active_playlist(&mut controller, entries.clone());
+        controller.activate_playlist_selection();
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First playlist video", "Second playlist video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::Playlist {
+                entries: entries.into(),
+                index: 1,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+    }
+
+    /// Continuation only starts what it can start directly: playlist entries
+    /// whose replay needs a provider round-trip are skipped, exactly as
+    /// autoplay skips scheduled YouTube rows.
+    #[test]
+    fn manual_step_skips_playlist_entries_that_need_a_resolver() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let bandcamp_page = url::Url::parse("https://fixture.bandcamp.com/track/fixture")
+            .expect("fixture Bandcamp page");
+        let bandcamp_entry = PlaylistEntry {
+            media: PlaylistMediaSnapshot {
+                id: MediaId::new(SourceKind::Bandcamp, "fixture-artist/fixture-track"),
+                kind: MediaKind::Audio,
+                title: "Bandcamp between".to_owned(),
+                creator: Some("Fixture artist".to_owned()),
+                webpage_url: bandcamp_page.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(240),
+                replay_locator: bandcamp_page.to_string(),
+            },
+            segment: None,
+            added_at: 1,
+        };
+        let entries = vec![
+            fixture_youtube_playlist_entry("dQw4w9WgXcQ", "First playlist video"),
+            bandcamp_entry,
+            fixture_youtube_playlist_entry("9bZkp7q19f0", "Third playlist video"),
+        ];
+        controller_with_active_playlist(&mut controller, entries.clone());
+        controller.activate_playlist_selection();
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First playlist video", "Third playlist video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::Playlist {
+                entries: entries.into(),
+                index: 2,
+            })
+        );
+    }
+
+    /// `}` on the Downloaded screen continues through the downloads listing,
+    /// which owns its rows the way a browsed local directory does.
+    #[test]
+    fn manual_next_crosses_into_the_downloaded_listing() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let downloads = config.downloads_dir();
+        std::fs::create_dir_all(&downloads).expect("downloads directory");
+        std::fs::write(downloads.join("first.mp3"), b"first").expect("first fixture");
+        std::fs::write(downloads.join("second.flac"), b"second").expect("second fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (factory, state, _, _) = mock_playback_factory(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        controller.view.screen = Screen::Downloaded;
+        controller.populate_downloads();
+        let row_paths = controller
+            .view
+            .rows
+            .iter()
+            .filter_map(|row| row.media_id.as_ref())
+            .filter_map(local_path_from_media_id)
+            .collect::<Vec<_>>();
+        assert_eq!(row_paths.len(), 2, "both fixture downloads must be listed");
+        controller.view.selected = 0;
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .map(|input| input.location.clone())
+                .collect::<Vec<_>>(),
+            [
+                url::Url::from_file_path(&row_paths[0])
+                    .expect("first downloaded URL")
+                    .to_string(),
+                url::Url::from_file_path(&row_paths[1])
+                    .expect("second downloaded URL")
+                    .to_string()
+            ]
+        );
+        assert!(matches!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::LocalBrowser { index: 1, .. })
+        ));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+    }
+
     #[test]
     fn seeking_after_playback_finishes_does_not_command_the_idle_backend() {
         let active = PlaybackStatus {
@@ -55088,7 +57043,7 @@ mod tests {
 
     #[test]
     fn autoplay_advances_local_browser_files_in_listing_order() {
-        let directory = tempfile::tempdir().expect("temporary local folder");
+        let directory = crate::test_support::canonical_tempdir("temporary local folder");
         let first_path = directory.path().join("first.mp3");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first").expect("first fixture");
@@ -55156,7 +57111,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_confirmed_autoplay_transition() {
-        let directory = tempfile::tempdir().expect("temporary Local waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary Local waveform folder");
         let first_path = directory.path().join("first.mp3");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first waveform fixture").expect("first waveform fixture");
@@ -55250,7 +57205,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_confirmed_explicit_queue_transition() {
-        let directory = tempfile::tempdir().expect("temporary queued waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary queued waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("queued.flac");
         std::fs::write(&first_path, b"first queued waveform fixture")
@@ -55319,7 +57274,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_a_cross_directory_queue_transition() {
-        let root = tempfile::tempdir().expect("temporary cross-directory waveform root");
+        let root =
+            crate::test_support::canonical_tempdir("temporary cross-directory waveform root");
         let first_directory = root.path().join("first-album");
         let second_directory = root.path().join("second-album");
         std::fs::create_dir(&first_directory).expect("first album folder");
@@ -55427,7 +57383,8 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_follows_after_an_intervening_non_local_queue_item() {
-        let directory = tempfile::tempdir().expect("temporary mixed-queue waveform folder");
+        let directory =
+            crate::test_support::canonical_tempdir("temporary mixed-queue waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("second.flac");
         std::fs::write(&first_path, b"first mixed-queue waveform fixture")
@@ -55529,7 +57486,7 @@ mod tests {
     #[cfg(feature = "waveform")]
     #[test]
     fn local_waveform_transition_preserves_a_manual_selection() {
-        let directory = tempfile::tempdir().expect("temporary manual waveform folder");
+        let directory = crate::test_support::canonical_tempdir("temporary manual waveform folder");
         let first_path = directory.path().join("first.flac");
         let second_path = directory.path().join("second.flac");
         let inspected_path = directory.path().join("third-inspected.flac");
@@ -55620,7 +57577,7 @@ mod tests {
 
     #[test]
     fn autoplay_advances_prepared_tracker_modules_and_skips_metadata_rows() {
-        let directory = tempfile::tempdir().expect("temporary tracker folder");
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
         let first_path = directory.path().join("first.mod");
         let second_path = directory.path().join("second.xm");
         std::fs::write(&first_path, b"first").expect("first fixture");
@@ -55773,6 +57730,201 @@ mod tests {
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str()),
             Some("youta-prepared-fixture.mod")
+        );
+    }
+
+    /// `}` onto an unprepared tracker module downloads it and then plays it,
+    /// with autoplay off: the preparation belongs to the keypress, not to
+    /// autoplay's ownership rules.
+    #[cfg(feature = "tracker-music")]
+    #[test]
+    fn manual_next_prepares_an_unprepared_tracker_module_with_autoplay_off() {
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
+        let first_path = directory.path().join("first.mod");
+        std::fs::write(&first_path, b"first").expect("first fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.view.screen = Screen::TrackerMusic;
+        let item_key = "https://mods.example/remote";
+        controller.tracker_results = vec![
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "First module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse("https://mods.example/first")
+                    .expect("tracker page URL"),
+                download_url: None,
+                expected_format: None,
+                access: TrackerAccess::DirectModule,
+                prepared_path: Some(first_path),
+                insecure_transport: false,
+            },
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Remote module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse(item_key).expect("tracker page URL"),
+                download_url: url::Url::parse("https://mods.example/remote.zip").ok(),
+                expected_format: None,
+                access: TrackerAccess::ArchiveNeedsInspection,
+                prepared_path: None,
+                insecure_transport: false,
+            },
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(
+            queue_item_from_tracker(&controller.tracker_results[0]).expect("first queue item"),
+            false,
+        );
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(ProviderRequest::PrepareTracker { .. })
+        ));
+        assert_eq!(
+            controller
+                .pending_tracker_preparation
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(&TrackerPreparationOwner::ManualStep { forward: true })
+        );
+
+        let prepared = directory.path().join("remote.mod");
+        std::fs::write(&prepared, b"remote").expect("prepared fixture");
+        controller.handle_provider_response(ProviderResponse::TrackerPrepared {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            result: Ok(vec![crate::tracker_media::PreparedTrackerModule {
+                path: prepared,
+                display_name: "Remote module".to_owned(),
+                format: "mod".to_owned(),
+                size_bytes: 6,
+            }]),
+        });
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First module", "Remote module"]
+        );
+        assert_eq!(controller.playback_queue.items.len(), 2);
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// `{` onto an unprepared tracker module prepends the prepared result so
+    /// the queue keeps reading in play order.
+    #[cfg(feature = "tracker-music")]
+    #[test]
+    fn manual_previous_prepares_an_unprepared_tracker_module_before_the_queue() {
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
+        let second_path = directory.path().join("second.xm");
+        std::fs::write(&second_path, b"second").expect("second fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.view.screen = Screen::TrackerMusic;
+        let item_key = "https://mods.example/remote";
+        controller.tracker_results = vec![
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Remote module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse(item_key).expect("tracker page URL"),
+                download_url: url::Url::parse("https://mods.example/remote.zip").ok(),
+                expected_format: None,
+                access: TrackerAccess::ArchiveNeedsInspection,
+                prepared_path: None,
+                insecure_transport: false,
+            },
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Second module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse("https://mods.example/second")
+                    .expect("tracker page URL"),
+                download_url: None,
+                expected_format: None,
+                access: TrackerAccess::DirectModule,
+                prepared_path: Some(second_path),
+                insecure_transport: false,
+            },
+        ];
+        controller.view.selected = 1;
+        controller.play_queue_item(
+            queue_item_from_tracker(&controller.tracker_results[1]).expect("second queue item"),
+            false,
+        );
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(ProviderRequest::PrepareTracker { .. })
+        ));
+        assert_eq!(
+            controller
+                .pending_tracker_preparation
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(&TrackerPreparationOwner::ManualStep { forward: false })
+        );
+
+        let prepared = directory.path().join("remote.mod");
+        std::fs::write(&prepared, b"remote").expect("prepared fixture");
+        controller.handle_provider_response(ProviderResponse::TrackerPrepared {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            result: Ok(vec![crate::tracker_media::PreparedTrackerModule {
+                path: prepared,
+                display_name: "Remote module".to_owned(),
+                format: "mod".to_owned(),
+                size_bytes: 6,
+            }]),
+        });
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Second module", "Remote module"]
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.playback_queue.items[0].media.title, "Remote module",
+            "the crossed-into item must be prepended before the queue"
         );
     }
 
@@ -56799,6 +58951,7 @@ mod tests {
         let (requests, captured_requests) = unbounded();
         controller.provider_requests = Some(requests);
         controller.show_screen(Screen::Radio);
+        settle_initial_radio_artwork(&mut controller, &captured_requests);
 
         select_radio_station(&mut controller, "kexp");
 
@@ -56812,11 +58965,17 @@ mod tests {
                 ..DetailLinkView::default()
             }]
         );
+        // The same verified QID also resolves the station's logotype, which is
+        // the one request selecting a station makes on its own.
+        assert!(matches!(
+            captured_requests.try_recv().expect("station logotype request"),
+            ProviderRequest::RadioArtwork { station_id, item_ids, .. }
+                if station_id == "kexp" && item_ids == ["Q761627"]
+        ));
         controller.dispatch(UiAction::ToggleWikidataStatements(0));
 
         assert!(matches!(
-            captured_requests
-                .recv_timeout(Duration::from_secs(1))
+            next_request_ignoring_radio_artwork(&captured_requests)
                 .expect("lazy Wikidata statement request"),
             ProviderRequest::WikidataStatements { item_id } if item_id == "Q761627"
         ));
@@ -56833,6 +58992,122 @@ mod tests {
         assert_eq!(details.loading_wikidata_item.as_deref(), Some("Q761627"));
     }
 
+    /// A resolved logotype has to reach Details, and only the station it
+    /// belongs to: one lookup is in flight at a time, so a reply routinely
+    /// outlives the selection that asked for it.
+    #[cfg(all(feature = "radio", feature = "wikidata"))]
+    #[test]
+    fn a_station_logotype_reaches_details_and_survives_a_passive_refresh() {
+        let config = Config::for_dir("/tmp/youta-radio-logotype-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        settle_initial_radio_artwork(&mut controller, &captured_requests);
+        select_radio_station(&mut controller, "kexp");
+        let ProviderRequest::RadioArtwork { generation, .. } = captured_requests
+            .try_recv()
+            .expect("station logotype request")
+        else {
+            panic!("expected a station logotype request");
+        };
+        let logotype =
+            url::Url::parse("https://upload.wikimedia.org/wikipedia/commons/f/fd/Kexp_logo.png")
+                .expect("logotype URL");
+
+        // A reply for a station that is no longer selected must not paint the
+        // one that is.
+        controller.handle_radio_artwork(
+            generation,
+            "france-musique".to_owned(),
+            Some(logotype.clone()),
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            None,
+            "a stale reply must not paint the selected station"
+        );
+
+        controller.handle_radio_artwork(generation, "kexp".to_owned(), Some(logotype.clone()));
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&logotype)
+        );
+
+        // Passive now-playing refreshes rebuild Details several times a minute,
+        // and the artwork has to survive every one of them without a second
+        // lookup.
+        controller.update_radio_detail();
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.thumbnail_url.as_ref()),
+            Some(&logotype)
+        );
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "a remembered logotype must not be looked up again"
+        );
+    }
+
+    /// Most of the catalogue has no Wikidata item and never will — a hobby FLAC
+    /// stream is not a notable broadcaster. Those stations have to ask their own
+    /// homepage, or artwork would exist for a tenth of the list.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn a_station_without_a_wikidata_item_asks_its_own_homepage() {
+        let config = Config::for_dir("/tmp/youta-radio-homepage-icon-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.show_screen(Screen::Radio);
+        // Opening the tab starts a lookup for its first row, and one runs at a
+        // time, so it is answered before this test asks for another.
+        while let Ok(ProviderRequest::RadioArtwork {
+            generation,
+            station_id,
+            ..
+        }) = captured_requests.try_recv()
+        {
+            controller.handle_radio_artwork(generation, station_id, None);
+        }
+
+        select_radio_station(&mut controller, "sector-radio-progressive-flac");
+
+        let ProviderRequest::RadioArtwork {
+            station_id,
+            item_ids,
+            homepage,
+            ..
+        } = captured_requests.try_recv().expect("station icon request")
+        else {
+            panic!("expected a station logotype request");
+        };
+        assert_eq!(station_id, "sector-radio-progressive-flac");
+        assert!(
+            item_ids.is_empty(),
+            "this station has no verified Wikidata item"
+        );
+        assert_eq!(
+            homepage,
+            station_by_id("sector-radio-progressive-flac")
+                .and_then(|station| station.homepage_url().ok()),
+            "the worker needs the homepage to find the station's own logo"
+        );
+    }
+
     #[cfg(all(feature = "radio", feature = "wikidata"))]
     #[test]
     fn passive_radio_refresh_preserves_only_same_station_wikidata_state() {
@@ -56845,8 +59120,7 @@ mod tests {
         select_radio_station(&mut controller, "france-musique");
         controller.dispatch(UiAction::ToggleWikidataStatements(0));
         assert!(matches!(
-            captured_requests
-                .recv_timeout(Duration::from_secs(1))
+            next_request_ignoring_radio_artwork(&captured_requests)
                 .expect("explicit Wikidata request"),
             ProviderRequest::WikidataStatements { item_id } if item_id == "Q19909"
         ));
@@ -57019,7 +59293,12 @@ mod tests {
         );
         assert!(controller.resolved_direct.is_none());
         assert!(controller.pending_bbc_playback.is_none());
-        assert!(captured_requests.try_recv().is_err());
+        // Selecting the station starts its logotype lookup, and nothing else:
+        // a pasted link must not resolve a manifest or begin playback.
+        assert!(
+            next_request_ignoring_radio_artwork(&captured_requests).is_none(),
+            "a pasted station link must not resolve a manifest"
+        );
         assert!(playback.lock().expect("mock playback").played.is_empty());
     }
 
@@ -57060,9 +59339,7 @@ mod tests {
         let ProviderRequest::ResolveBbcLive {
             generation: first_generation,
             station_id,
-        } = captured_requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("BBC manifest request")
+        } = next_request_ignoring_radio_artwork(&captured_requests).expect("BBC manifest request")
         else {
             panic!("expected a BBC live request");
         };
@@ -57401,7 +59678,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_favorite_action_persists_and_rehydrates_starred_rows() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("file state");
         let mut controller = AppController::new(config.clone(), store, None, None);
@@ -57961,7 +60238,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_station_note_survives_restart_and_keeps_one_source_target_across_routes() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let station = station_by_id("radio-swiss-classic").expect("Radio station");
         let source_id = MediaId::new(SourceKind::Radio, station.id);
@@ -59322,6 +61599,30 @@ mod tests {
         assert_eq!(search_route(Screen::Subscriptions), SearchRoute::None);
     }
 
+    /// A screen offers a query editor exactly where submitting one does
+    /// something.
+    ///
+    /// Both front-ends label their editor from `Screen::search_verb`, while the
+    /// submit path dispatches on `search_route`. Radio is the one deliberate
+    /// difference: it filters the compiled catalogue in place instead of asking
+    /// a provider, so it carries a verb without a route.
+    #[test]
+    fn every_screen_with_a_search_verb_submits_somewhere() {
+        for screen in Screen::ALL {
+            let verb = screen.search_verb();
+            let expected = match screen {
+                Screen::Radio => Some("Filter"),
+                _ if search_route(screen) == SearchRoute::None => None,
+                _ => Some("Search"),
+            };
+            assert_eq!(
+                verb, expected,
+                "{screen:?} labels its search editor inconsistently with its \
+                 submit route"
+            );
+        }
+    }
+
     #[cfg(feature = "bandcamp")]
     #[test]
     fn canonical_bandcamp_url_opens_first_class_tab_without_searching() {
@@ -59482,7 +61783,7 @@ mod tests {
     #[cfg(feature = "bandcamp")]
     #[test]
     fn bandcamp_query_rows_and_selection_are_independent_and_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let mut first_youtube = subscription_video_summary();
         first_youtube.title = "First YouTube fixture".to_owned();
@@ -60300,7 +62601,7 @@ mod tests {
     #[cfg(feature = "apple-podcasts")]
     #[test]
     fn apple_podcasts_query_selection_and_show_rows_survive_restart() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let store = StateStore::open(&config).expect("disk state");
         let mut controller = AppController::new(config, store, None, None);
@@ -60617,7 +62918,7 @@ mod tests {
 
     #[test]
     fn local_paths_expand_home_and_scan_supported_media_only() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let home = temporary.path().join("home");
         let album = home.join("Music").join("meanna");
         std::fs::create_dir_all(album.join("disc")).expect("album directories");
@@ -60631,7 +62932,7 @@ mod tests {
         assert!(input.directory);
         assert_eq!(
             input.path,
-            std::fs::canonicalize(&album).expect("canonical album")
+            crate::fs_path::canonicalize(&album).expect("canonical album")
         );
 
         let scanned = scan_local_media(&input.path).expect("local scan");
@@ -60649,7 +62950,7 @@ mod tests {
 
     #[test]
     fn direct_local_file_and_file_url_are_accepted() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let media = temporary.path().join("spoken episode.m4a");
         std::fs::write(&media, b"fixture").expect("media fixture");
 
@@ -60983,7 +63284,7 @@ mod tests {
         };
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("provider storage");
+        let storage = crate::test_support::canonical_tempdir("provider storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -61067,7 +63368,7 @@ mod tests {
         };
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("provider storage");
+        let storage = crate::test_support::canonical_tempdir("provider storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -61140,7 +63441,7 @@ mod tests {
     fn provider_worker_reports_missing_jamendo_configuration_without_network() {
         let (requests, request_receiver) = unbounded();
         let (response_sender, responses) = unbounded();
-        let storage = tempfile::tempdir().expect("tracker storage");
+        let storage = crate::test_support::canonical_tempdir("tracker storage");
         let storage_path = storage.path().to_owned();
         let worker = thread::spawn(move || {
             provider_worker(
@@ -61238,7 +63539,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_starts_only_for_the_playing_station_in_private_runtime() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
 
         controller.dispatch(UiAction::ToggleRadioRecording);
@@ -61287,7 +63588,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_stop_finalizes_and_downloaded_lists_only_the_final_file() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller
@@ -61325,7 +63626,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_collision_preserves_the_existing_download() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let config = Config::for_dir(temporary.path().join("youta"));
         config.ensure_directories().expect("Youta directories");
         let started_at = Local::now();
@@ -61367,7 +63668,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn cross_filesystem_recording_publish_removes_private_and_hidden_staging_files() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let source = temporary.path().join("private.aac");
         let downloads = temporary.path().join("downloads");
         std::fs::create_dir(&downloads).expect("download directory");
@@ -61446,7 +63747,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_rejects_wrong_screen_and_missing_live_station() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, _) = radio_recording_controller(&temporary);
         controller.view.playing_media_id = None;
         controller.toggle_radio_recording();
@@ -61472,7 +63773,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn radio_recording_stops_after_the_radio_selection_moves() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, station) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller
@@ -61511,7 +63812,7 @@ mod tests {
     #[cfg(feature = "radio")]
     #[test]
     fn shutdown_finalizes_an_active_radio_recording() {
-        let temporary = tempfile::tempdir().expect("temporary recording root");
+        let temporary = crate::test_support::canonical_tempdir("temporary recording root");
         let (mut controller, state, _) = radio_recording_controller(&temporary);
         controller.toggle_radio_recording();
         let staging = controller

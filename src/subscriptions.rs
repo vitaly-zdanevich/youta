@@ -753,17 +753,7 @@ fn sensible_feed_title(url: &Url) -> String {
         .to_owned()
 }
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
+use crate::private_files::set_private_file_permissions;
 
 #[cfg(test)]
 mod tests {

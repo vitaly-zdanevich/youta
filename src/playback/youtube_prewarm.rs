@@ -26,8 +26,6 @@ use rustix::io::Errno;
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Deserialize;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use thiserror::Error;
 use url::Url;
 
@@ -232,7 +230,7 @@ impl PrewarmedYouTubeAudio {
     }
 
     /// Constructs a resolved stream for controller state-machine tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, feature = "controller"))]
     pub(crate) fn for_test(media_url: Url, expires_at_unix: Option<u64>) -> Self {
         Self {
             media_url,
@@ -268,7 +266,7 @@ pub struct YouTubePrewarmResult {
 
 impl YouTubePrewarmResult {
     /// Constructs a completion for controller generation tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, feature = "controller"))]
     pub(crate) const fn for_test(
         generation: u64,
         outcome: Result<PrewarmedYouTubeAudio, YouTubePrewarmError>,
@@ -527,8 +525,7 @@ fn validate_source_url(url: &Url) -> Result<(), YouTubePrewarmError> {
 fn build_command(config: &YouTubePrewarmConfig, source_url: &Url) -> Command {
     let socket_timeout = config.timeout.as_secs().max(1);
     let mut command = Command::new(&config.executable);
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::child_process::supervised(&mut command);
     command.arg("--ignore-config");
     if !config.allow_plugins {
         command.arg("--no-plugin-dirs");
@@ -688,6 +685,9 @@ fn terminate_process_tree(child: &mut Child) -> Option<io::Error> {
     }
     #[cfg(not(unix))]
     {
+        // No process group to signal, so the descendants are ended by name
+        // before the direct child, while the chain to them still exists.
+        crate::child_process::kill_descendants(child.id());
         child
             .kill()
             .err()
@@ -1304,6 +1304,8 @@ exit 7"#,
             thread::sleep(Duration::from_millis(5));
         }
         assert!(marker.exists(), "mock child must start before cancellation");
+        // Only Linux can then confirm the reap through `/proc`.
+        #[cfg(target_os = "linux")]
         let pid = std::fs::read_to_string(&marker).expect("read mock child PID");
         cancellation.cancel();
         let completion = worker.join().expect("join cancellation worker");

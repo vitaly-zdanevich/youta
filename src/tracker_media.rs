@@ -429,10 +429,10 @@ impl<T: TrackerTransport> TrackerMediaPreparer<T> {
     ) -> Result<Self, TrackerPrepareError> {
         let limits = limits.validate()?;
         fs::create_dir_all(storage_root.as_ref())?;
-        let storage_root = fs::canonicalize(storage_root.as_ref())?;
+        let storage_root = crate::fs_path::canonicalize(storage_root.as_ref())?;
         let cache_candidate = storage_root.join(CACHE_DIRECTORY_NAME);
         fs::create_dir_all(&cache_candidate)?;
-        let cache_root = fs::canonicalize(&cache_candidate)?;
+        let cache_root = crate::fs_path::canonicalize(&cache_candidate)?;
         if cache_root == storage_root || !cache_root.starts_with(&storage_root) {
             return Err(TrackerPrepareError::CacheEscapedRoot);
         }
@@ -1503,33 +1503,12 @@ fn cached_display_name(file_name: &str, format: &str) -> String {
         .replace('-', " ")
 }
 
+use crate::private_files::{set_private_directory_permissions, set_private_file_permissions};
+
 fn create_private_file(path: &Path) -> Result<File, io::Error> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn set_private_directory_permissions(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::private_files::open_privately(&mut options).open(path)
 }
 
 fn is_regular_nonsymlink(path: &Path) -> Result<bool, io::Error> {
@@ -1545,7 +1524,7 @@ fn ensure_owned_directory(cache_root: &Path, path: &Path) -> Result<(), TrackerP
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(TrackerPrepareError::InvalidCacheEntry);
     }
-    let canonical = fs::canonicalize(path)?;
+    let canonical = crate::fs_path::canonicalize(path)?;
     if canonical == cache_root || !canonical.starts_with(cache_root) {
         return Err(TrackerPrepareError::CacheEscapedRoot);
     }
@@ -1714,7 +1693,11 @@ mod tests {
 
     #[test]
     fn raw_module_is_cached_privately_and_reused_without_transport() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        // The cache root below is compared against this path by prefix, and the
+        // preparer reports a canonical one, so the fixture has to be canonical
+        // too — macOS resolves `/var` to `/private/var` and Windows answers
+        // behind a `\\?\` prefix.
+        let temporary = crate::test_support::canonical_tempdir("temporary tracker cache root");
         let url = "https://modules.example/music?id=42";
         let transport = MockTransport::once(url, s3m_fixture());
         let mut preparer =

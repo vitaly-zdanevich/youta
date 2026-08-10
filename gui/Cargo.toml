@@ -1,0 +1,50 @@
+[package]
+name = "youta-gui"
+version = "0.27.2"
+edition = "2024"
+rust-version = "1.95"
+description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
+license = "MIT"
+repository = "https://github.com/vitaly-zdanevich/youta"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# The reducer, the view contract, persistence, providers, and playback come
+# from the shared crate. `controller` deliberately excludes the terminal
+# renderer, so Crossterm and Ratatui never enter this binary.
+youta = { path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr"] }
+
+percent-encoding = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+url = "2.5"
+serde_json = "1.0"
+# `tray-icon` is the only extra Tauri feature: the menu is always compiled in,
+# the tray is not.
+tauri = { version = "2", features = ["tray-icon"] }
+# The platform clipboard, used from Rust on the reducer thread rather than from
+# the web view: a copy is decided by the controller, so nothing is gained by
+# routing the text out to JavaScript and back, and the window's capability list
+# stays as small as it is.
+tauri-plugin-clipboard-manager = "2"
+# Track-change notifications, raised from Rust for the same reason. Capabilities
+# gate what the *web view* may invoke, so calling a plugin from the reducer
+# thread grants the page nothing.
+tauri-plugin-notification = "2"
+# The keyboard's media keys and the panel beside them: MPRIS, the System Media
+# Transport Controls, and Now Playing behind one interface. The default D-Bus
+# backend is the native one and needs `libdbus-1-dev` on Linux; the alternative
+# is pure Rust but starts an async runtime in a thread of its own, which this
+# project does not otherwise have.
+souvlaki = "0.8"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+# `test` supplies the mock runtime, so the reducer's lifecycle is exercised
+# without a real window — the window itself is what cannot be scripted.
+tauri = { version = "2", features = ["test"] }
+tempfile = "3.27.0"

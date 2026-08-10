@@ -24,9 +24,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
 /// Number of source audio frames summarized by one `FFmpeg` statistics record.
 pub const DEFAULT_FRAMES_PER_PEAK: usize = 4_096;
 /// Maximum number of peaks retained at the finest in-memory resolution.
@@ -50,14 +47,8 @@ pub struct LocalWaveformIdentity {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 impl LocalWaveformIdentity {
@@ -76,14 +67,7 @@ impl LocalWaveformIdentity {
             length: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            changed_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            changed_nanoseconds: metadata.ctime_nsec(),
+            filesystem: crate::file_identity::filesystem_identity(path, &metadata),
         })
     }
 
@@ -492,6 +476,7 @@ impl FfmpegLocalWaveformExtractor {
             frames_per_peak
         );
         let mut command = Command::new(&self.program);
+        crate::child_process::quiet(&mut command);
         command
             .arg("-nostdin")
             .arg("-hide_banner")
@@ -535,6 +520,7 @@ impl FfmpegLocalWaveformExtractor {
         });
         let filter = format!("[0:a:0]{timeline_filters}aformat=sample_fmts=s16[pcm]");
         let mut command = Command::new(&self.program);
+        crate::child_process::quiet(&mut command);
         command
             .arg("-nostdin")
             .arg("-hide_banner")

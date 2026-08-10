@@ -217,6 +217,124 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  desktop:
+    name: Desktop ${{ matrix.operating_system }} ${{ matrix.architecture }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - operating_system: Linux
+            artifact_os: linux
+            architecture: amd64
+            runner: ubuntu-24.04
+          - operating_system: Linux
+            artifact_os: linux
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+          - operating_system: macOS
+            artifact_os: macos
+            architecture: amd64
+            runner: macos-15-intel
+          - operating_system: macOS
+            artifact_os: macos
+            architecture: arm64
+            runner: macos-15
+          - operating_system: Windows
+            artifact_os: windows
+            architecture: amd64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    # Declared at the job so that a step can ask whether signing material
+    # exists: a secret referenced only inside a step is not visible to that
+    # step's own condition.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 10
+
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      # Node ships with every hosted runner image, and this workflow avoids
+      # setup actions on purpose, exactly as the Rust toolchain step does.
+      - name: Report the Node used to build the window page
+        run: |
+          node --version
+          npm --version
+
+      # WebKitGTK is the Linux web view, and D-Bus is what the media keys speak
+      # there. `librsvg2` and `patchelf` belong to the AppImage bundler rather
+      # than to Youta.
+      - name: Install the Linux desktop toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: desktop-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # Signing happens only when the maintainer has supplied the material for
+      # it. Without these secrets the bundles are produced unsigned, which is
+      # the current state of the project and is documented as such in
+      # README.md; the workflow does not pretend otherwise or fail.
+      - name: Unlock the macOS signing identity
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        run: |
+          set -Eeuo pipefail
+          keychain="${RUNNER_TEMP}/youta-signing.keychain-db"
+          password=$(openssl rand -base64 24)
+          security create-keychain -p "${password}" "${keychain}"
+          security set-keychain-settings -lut 900 "${keychain}"
+          security unlock-keychain -p "${password}" "${keychain}"
+          printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" \
+            -k "${keychain}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "${password}" "${keychain}"
+          security list-keychain -d user -s "${keychain}" login.keychain-db
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+
+      # The Apple variables are empty when the secrets do not exist, which is
+      # exactly how the Tauri bundler is told to skip signing and notarization.
+      - name: Build the desktop bundles
+        run: scripts/package-desktop.sh dist-desktop
+
+      - name: Upload desktop bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: youta-desktop-${{ matrix.artifact_os }}-${{ matrix.architecture }}
+          path: |
+            dist-desktop/*
+          if-no-files-found: error
+
   vendor:
     name: Vendored Cargo dependencies
     needs: validate
@@ -259,6 +377,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - binaries
+      - desktop
       - vendor
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -287,10 +406,37 @@ jobs:
               expected+=("${archive}" "${archive}.sha256")
             done
           done
+          # The desktop window ships installers rather than tarballs, and each
+          # platform has its own: what a user double-clicks on Windows is not
+          # what a user double-clicks on Fedora. The table is written out rather
+          # than derived so that a bundler silently producing one format fewer
+          # fails the release instead of shrinking it.
+          desktop_version=$(
+            awk -F '"' '
+              /^\[package\]$/ { in_package = 1; next }
+              in_package && /^\[/ { exit }
+              in_package && /^version = / { print $2; exit }
+            ' gui/Cargo.toml
+          )
+          desktop_bundles=(
+            'linux-amd64:deb rpm AppImage'
+            'linux-arm64:deb rpm AppImage'
+            'macos-amd64:dmg'
+            'macos-arm64:dmg'
+            'windows-amd64:exe'
+          )
+          for entry in "${desktop_bundles[@]}"; do
+            platform=${entry%%:*}
+            for extension in ${entry#*:}; do
+              bundle="youta-desktop-${desktop_version}-${platform}.${extension}"
+              expected+=("${bundle}" "${bundle}.sha256")
+            done
+          done
+
           vendor_archive="youta-${version}-vendor.tar.xz"
           expected+=("${vendor_archive}" "${vendor_archive}.sha256")
 
-          readonly expected_asset_count=42
+          readonly expected_asset_count=60
           ((${#expected[@]} == expected_asset_count)) || {
             echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
             exit 1

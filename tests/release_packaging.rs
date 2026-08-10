@@ -75,8 +75,11 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(!text_only.contains("qr"));
     assert!(!text_only.contains("dep:qrcode"));
     assert!(!tui.contains("dep:qrcode"));
-    assert_eq!(feature_entries(&manifest, "qr"), ["tui", "dep:qrcode"]);
-    assert!(qr.contains("tui"));
+    // QR encoding produces a module matrix and renders nothing, so it must not
+    // drag a front-end into a build that only wants the encoder.
+    assert_eq!(feature_entries(&manifest, "qr"), ["dep:qrcode"]);
+    assert!(!qr.contains("tui"));
+    assert!(!qr.contains("dep:ratatui"));
     assert!(qr.contains("dep:qrcode"));
     assert_eq!(
         manifest["dependencies"]["qrcode"]["optional"].as_bool(),
@@ -190,6 +193,41 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
     );
 }
 
+/// Front-end-free capabilities must stay reachable without a front-end.
+///
+/// Each of these produces data rather than pixels, so a build that wants only
+/// the data must not be forced to link a renderer. The assertions are here
+/// because the coupling is easy to reintroduce by adding one entry to a feature
+/// list, and nothing else would notice.
+#[test]
+fn renderer_free_capabilities_never_require_a_front_end() {
+    let manifest = manifest();
+
+    for capability in ["remote-artwork", "local-artwork", "qr"] {
+        let closure = feature_closure(&manifest, capability);
+        for renderer in ["tui", "dep:ratatui", "dep:crossterm", "dep:ratatui-image"] {
+            assert!(
+                !closure.contains(renderer),
+                "`{capability}` must not require `{renderer}`"
+            );
+        }
+    }
+
+    // Terminal artwork is that pipeline plus decoding and graphics protocols,
+    // so `images` keeps both halves.
+    let images = feature_closure(&manifest, "images");
+    assert!(images.contains("remote-artwork"));
+    assert!(images.contains("tui"));
+    assert!(images.contains("dep:ratatui-image"));
+
+    // Local covers are found by reading tags and directory entries, so that
+    // capability must not drag in the HTTP client either: a text-only local
+    // build stays offline.
+    let local_artwork = feature_closure(&manifest, "local-artwork");
+    assert!(!local_artwork.contains("network"));
+    assert!(!local_artwork.contains("dep:ureq"));
+}
+
 #[test]
 fn release_script_builds_four_portable_non_sqlite_variants() {
     let script = read_repository_file("scripts/package-release.sh");
@@ -243,7 +281,9 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     for contract in [
         "platforms=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64)",
         "suffixes=('' -text -no-qr -text-no-qr)",
-        "readonly expected_asset_count=42",
+        // Forty terminal archives and checksums, eighteen desktop installers
+        // and checksums, and the vendor archive with its own.
+        "readonly expected_asset_count=60",
         "archive=\"youta-${version}-${platform}${suffix}.tar.gz\"",
         "vendor_archive=\"youta-${version}-vendor.tar.xz\"",
         "--label expected-assets",
@@ -314,6 +354,124 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
             "workflow omits the LibriVox and Wikidata composition boundary"
         );
     }
+}
+
+/// The desktop window ships installers, and five files have to agree on which.
+///
+/// The terminal binary is one portable tarball per target triple; the window is
+/// a different artefact on every platform, produced by a bundler that only runs
+/// on that platform. Nothing about that is derivable, so it is written down in
+/// `gui/tauri.conf.json`, `scripts/package-desktop.sh`, both workflows, and
+/// `README.md` — and this is what keeps those five copies the same answer.
+#[test]
+fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it() {
+    let configuration: serde_json::Value =
+        serde_json::from_str(&read_repository_file("gui/tauri.conf.json"))
+            .expect("the desktop configuration is valid JSON");
+    let bundle = &configuration["bundle"];
+
+    assert_eq!(
+        bundle["active"].as_bool(),
+        Some(true),
+        "the bundler produces the release artefact and cannot be inactive"
+    );
+    let targets: BTreeSet<String> = bundle["targets"]
+        .as_array()
+        .expect("the bundle targets are listed rather than inferred")
+        .iter()
+        .filter_map(|target| target.as_str().map(str::to_owned))
+        .collect();
+    for target in ["deb", "rpm", "appimage", "app", "dmg", "nsis"] {
+        assert!(
+            targets.contains(target),
+            "the desktop bundle contract omits `{target}`"
+        );
+    }
+
+    // A window with no icon is a window the desktop cannot show in a launcher,
+    // and the bundler fails late and obscurely when one is missing.
+    for icon in bundle["icon"]
+        .as_array()
+        .expect("the bundle declares its icons")
+    {
+        let icon = icon.as_str().expect("an icon path is a string");
+        assert!(
+            repository_path(Path::new("gui").join(icon)).exists(),
+            "the desktop bundle names a missing icon: {icon}"
+        );
+    }
+
+    // The Linux web view is a runtime dependency of the package, not of the
+    // build, so it belongs in the package metadata as well as in the workflow.
+    let deb_depends: BTreeSet<String> = bundle["linux"]["deb"]["depends"]
+        .as_array()
+        .expect("the Debian package declares its dependencies")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(str::to_owned))
+        .collect();
+    assert!(deb_depends.contains("libwebkit2gtk-4.1-0"));
+
+    let script = read_repository_file("scripts/package-desktop.sh");
+    assert!(script.contains("gui/Cargo.toml"));
+    assert!(script.contains("npm --prefix gui/ui run build"));
+    assert!(script.contains("youta-desktop-${version}-${operating_system}-${architecture}"));
+    assert!(
+        script.contains("No installable bundle was produced"),
+        "a bundler that produced nothing must fail rather than report success"
+    );
+    assert!(
+        script.contains("refusing to choose between them"),
+        "two bundles claiming one asset name must fail rather than pick one"
+    );
+    // The read-write staging image the DMG is assembled inside sits beside the
+    // `.app`, is a `.dmg` by name, and is five times the size. Collecting from
+    // the format directories rather than the whole tree is what keeps it out.
+    assert!(
+        script.contains("for format in deb rpm appimage dmg nsis msi"),
+        "bundles must be collected from the bundler's format directories"
+    );
+
+    let release = read_repository_file(".github/workflows/release.yml");
+    for platform in [
+        "linux-amd64:deb rpm AppImage",
+        "linux-arm64:deb rpm AppImage",
+        "macos-amd64:dmg",
+        "macos-arm64:dmg",
+        "windows-amd64:exe",
+    ] {
+        assert!(
+            release.contains(platform),
+            "the release asset contract omits `{platform}`"
+        );
+    }
+    assert!(release.contains("readonly expected_asset_count=60"));
+    assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
+    assert!(release.contains("libwebkit2gtk-4.1-dev"));
+    assert!(release.contains("libdbus-1-dev"));
+    assert!(
+        release.contains("APPLE_SIGNING_IDENTITY"),
+        "signing must be wired even while the certificate does not exist"
+    );
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("cargo test --locked -p youta-gui --all-targets"),
+        "the desktop crate needs a lane that runs its tests"
+    );
+    assert!(ci.contains("libwebkit2gtk-4.1-dev"));
+    assert!(ci.contains("libdbus-1-dev"));
+    assert!(
+        ci.contains("The desktop window links ${renderer}."),
+        "the renderer-free claim must be checked by machine, not by hand"
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("WEBKIT_DISABLE_DMABUF_RENDERER=1"));
+    assert!(readme.contains("libwebkit2gtk-4.1-dev"));
+    assert!(
+        readme.contains("not signed"),
+        "an unsigned installer is something a user meets before Youta starts"
+    );
 }
 
 #[test]

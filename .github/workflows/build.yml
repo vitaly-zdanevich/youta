@@ -61,11 +61,15 @@ jobs:
       - name: Show the coverage runner version
         run: cargo llvm-cov --version
 
+      # `youta-gui` is excluded for the same reason as in ci.yml: it links
+      # Tauri, whose Linux backend needs the WebKitGTK and glib development
+      # packages that this runner does not install.
       - name: Generate LCOV coverage
         run: |
           cargo llvm-cov \
             --locked \
             --workspace \
+            --exclude youta-gui \
             --all-features \
             --lib \
             --bins \

@@ -47,6 +47,8 @@ pub mod rss;
 pub mod soundstream;
 #[cfg(feature = "sponsorblock")]
 pub mod sponsorblock;
+#[cfg(feature = "radio")]
+pub mod station_icon;
 #[cfg(feature = "tracker-music")]
 pub mod tracker;
 #[cfg(feature = "wikidata")]

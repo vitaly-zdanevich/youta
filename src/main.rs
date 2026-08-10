@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
 
 use youta::config::Config;
 use youta::diagnostics::{ExternalHelper, ExternalHelperKind};
-use youta::persistence::PersistenceError;
 #[cfg(feature = "tui")]
 use youta::persistence::StateStore;
+use youta::persistence::{ANOTHER_INSTANCE_MESSAGE, PersistenceError};
 #[cfg(feature = "yt-dlp")]
 use youta::playback::ytdlp::{YtDlp, YtDlpConfig};
 use youta::providers::{SearchItem, SearchRequest, SearchTarget, configured_youtube_provider};
@@ -53,9 +53,6 @@ enum CliCommand {
     /// List the site extractors reported by the installed yt-dlp.
     Extractors,
 }
-
-/// Plain terminal notice for a second process rejected by the state lock.
-const ANOTHER_INSTANCE_MESSAGE: &str = "Another instance of Youta is already running";
 
 fn main() -> ExitCode {
     match run() {
@@ -139,9 +136,6 @@ fn run_tui(config: Config) -> Result<()> {
     use std::sync::{Arc, Mutex};
 
     use youta::app::AppController;
-    #[cfg(feature = "backend-mpv")]
-    use youta::app::PlaybackFactory;
-    use youta::config::PlaybackBackend as ConfiguredBackend;
     use youta::diagnostics::{DiagnosticReport, format_panic};
     use youta::tui::{SeekBarStyle, UiSettings};
 
@@ -152,26 +146,7 @@ fn run_tui(config: Config) -> Result<()> {
         Ok(provider) => (provider, None),
         Err(error) => (None, Some(error)),
     };
-    let playback_factory = match config.playback.backend {
-        ConfiguredBackend::Mpv => {
-            #[cfg(feature = "backend-mpv")]
-            {
-                use youta::playback::mpv::MpvBackend;
-
-                let process_config = process_playback_config(&config);
-                let factory: PlaybackFactory = Box::new(move || {
-                    let player = MpvBackend::spawn(&process_config)?;
-                    Ok(Box::new(player))
-                });
-                Some(factory)
-            }
-            #[cfg(not(feature = "backend-mpv"))]
-            {
-                None
-            }
-        }
-        ConfiguredBackend::Native => None,
-    };
+    let playback_factory = youta::playback::configured_playback_factory(&config);
     let store = StateStore::open(&config).context("cannot open restart-safe state")?;
     let settings = UiSettings {
         show_hotkeys: config.ui.show_button_hotkeys,
@@ -185,6 +160,7 @@ fn run_tui(config: Config) -> Result<()> {
         thumbnail_height: config.ui.thumbnail_height,
         prefetch_search_thumbnails: config.ui.prefetch_search_thumbnails,
         thumbnail_cache_dir: Some(config.thumbnail_cache_dir()),
+        ffmpeg_executable: config.providers.ffmpeg_executable.clone(),
         ..UiSettings::default()
     };
     let shutdown_git_sync = config
@@ -314,39 +290,6 @@ fn run_tui(_config: Config) -> Result<()> {
     bail!("this build does not include the `tui` feature")
 }
 
-#[cfg(all(feature = "tui", feature = "backend-mpv"))]
-fn process_playback_config(config: &Config) -> youta::playback::ProcessPlaybackConfig {
-    use youta::config::AudioOutput as ConfiguredAudioOutput;
-    use youta::playback::{
-        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackProfile, ProcessPlaybackConfig,
-    };
-
-    let audio_output = match config.playback.output {
-        ConfiguredAudioOutput::Auto => AudioOutputDriver::Auto,
-        ConfiguredAudioOutput::Alsa => AudioOutputDriver::Alsa,
-        ConfiguredAudioOutput::Jack => AudioOutputDriver::Jack,
-        ConfiguredAudioOutput::PulseAudio => AudioOutputDriver::PulseAudio,
-        ConfiguredAudioOutput::PipeWire => AudioOutputDriver::PipeWire,
-    };
-    ProcessPlaybackConfig {
-        mpv_executable: config.providers.mpv_executable.clone(),
-        yt_dlp_executable: config.providers.yt_dlp_executable.clone(),
-        runtime_dir: config.config_dir().join("runtime"),
-        audio_output,
-        audio_device: config.playback.device.clone(),
-        profile: if config.playback.audiophile.enabled {
-            PlaybackProfile::Direct
-        } else {
-            PlaybackProfile::Balanced
-        },
-        audiophile: AudiophilePlaybackOptions {
-            exclusive_device: config.playback.audiophile.exclusive_device,
-            avoid_resampling: config.playback.audiophile.avoid_resampling,
-            output_sample_rate_hz: config.playback.audiophile.output_sample_rate_hz,
-        },
-    }
-}
-
 fn run_search(config: &Config, query: &str, channels: bool) -> Result<()> {
     let provider = configured_youtube_provider(&config.providers)?.context(
         "configure providers.youtube_api_key or providers.invidious_base_url before searching YouTube",
@@ -456,13 +399,13 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
     checks.extend([
         HelperCheck {
             name: "ffmpeg",
-            executable: Path::new("ffmpeg"),
+            executable: &config.providers.ffmpeg_executable,
             arguments: &["-version"],
             required: false,
         },
         HelperCheck {
             name: "ffprobe",
-            executable: Path::new("ffprobe"),
+            executable: &config.providers.ffprobe_executable,
             arguments: &["-version"],
             required: false,
         },
@@ -530,16 +473,17 @@ fn run_doctor(config: &Config) -> Result<()> {
 
     #[cfg(feature = "tracker-music")]
     {
-        let tracker_decoder = Command::new("ffmpeg")
-            .args(["-hide_banner", "-demuxers"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .is_some_and(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .to_ascii_lowercase()
-                    .contains("libopenmpt")
-            });
+        let tracker_decoder =
+            youta::child_process::quiet(&mut Command::new(&config.providers.ffmpeg_executable))
+                .args(["-hide_banner", "-demuxers"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .to_ascii_lowercase()
+                        .contains("libopenmpt")
+                });
         println!(
             "tracker replay through FFmpeg/libopenmpt: {}",
             if tracker_decoder {
@@ -567,7 +511,7 @@ fn run_doctor(config: &Config) -> Result<()> {
 }
 
 fn helper_version(executable: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new(executable)
+    let output = youta::child_process::quiet(&mut Command::new(executable))
         .args(arguments)
         .output()
         .with_context(|| format!("cannot start {}", executable.display()))?;
@@ -673,8 +617,6 @@ fn print_config(config: &Config) {
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-    #[cfg(all(feature = "tui", feature = "backend-mpv"))]
-    use youta::config::AudioOutput;
     use youta::config::{Config, PlaybackBackend};
 
     use super::doctor_helper_checks;
@@ -873,46 +815,5 @@ mod tests {
             .expect("state lock released before callback");
 
         drop(reopened);
-    }
-
-    #[cfg(all(feature = "tui", feature = "backend-mpv"))]
-    #[test]
-    fn process_config_maps_every_audio_output_driver() {
-        use youta::playback::AudioOutputDriver;
-
-        let temporary = tempdir().expect("temporary directory");
-        let mut config = Config::for_dir(temporary.path());
-        for (configured, expected) in [
-            (AudioOutput::Auto, AudioOutputDriver::Auto),
-            (AudioOutput::Alsa, AudioOutputDriver::Alsa),
-            (AudioOutput::Jack, AudioOutputDriver::Jack),
-            (AudioOutput::PulseAudio, AudioOutputDriver::PulseAudio),
-            (AudioOutput::PipeWire, AudioOutputDriver::PipeWire),
-        ] {
-            config.playback.output = configured;
-            assert_eq!(
-                super::process_playback_config(&config).audio_output,
-                expected
-            );
-        }
-    }
-
-    #[cfg(all(feature = "tui", feature = "backend-mpv"))]
-    #[test]
-    fn process_config_preserves_audiophile_tuning() {
-        use youta::playback::PlaybackProfile;
-
-        let temporary = tempdir().expect("temporary directory");
-        let mut config = Config::for_dir(temporary.path());
-        config.playback.audiophile.enabled = true;
-        config.playback.audiophile.exclusive_device = true;
-        config.playback.audiophile.avoid_resampling = true;
-        config.playback.audiophile.output_sample_rate_hz = Some(96_000);
-
-        let process = super::process_playback_config(&config);
-        assert_eq!(process.profile, PlaybackProfile::Direct);
-        assert!(process.audiophile.exclusive_device);
-        assert!(process.audiophile.avoid_resampling);
-        assert_eq!(process.audiophile.output_sample_rate_hz, Some(96_000));
     }
 }

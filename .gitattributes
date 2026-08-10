@@ -1,1 +1,15 @@
+# The packaging contract asserts on the exact bytes of checked-in scripts and
+# workflows, newlines included, so every working tree has to hold the same line
+# endings as the index. Git for Windows defaults to `core.autocrlf=true`, which
+# rewrites text files on checkout and would fail those assertions on the line
+# endings alone rather than on anything the contract is about. Nothing here is
+# built by a tool that requires CRLF: there is no `.bat`, `.cmd`, or `.ps1`.
+* text=auto eol=lf
+
+# Artwork is matched by content heuristics anyway; saying so is cheaper than
+# trusting them with a file whose first bytes could look like text.
+*.png binary
+*.ico binary
+*.icns binary
+
 .git_archival.txt export-subst

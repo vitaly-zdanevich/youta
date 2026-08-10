@@ -12,24 +12,19 @@
 //! filesystem fingerprint before reuse.
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek, Write};
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, Cursor, IsTerminal, Read, Seek};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "local-video-thumbnails")]
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 #[cfg(feature = "local-video-thumbnails")]
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
-
-#[cfg(feature = "local-artwork")]
-use std::fmt;
-#[cfg(feature = "local-artwork")]
-use std::fs::File;
-#[cfg(feature = "local-artwork")]
-use std::io::{BufReader, SeekFrom};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use image::{
@@ -42,27 +37,30 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, ResizeEncodeRender};
 use sha2::{Digest, Sha256};
-use ureq::ResponseExt;
-use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
 use crate::config::ThumbnailMode;
-use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 use crate::terminal_environment::{TerminalAttachment, is_linux_virtual_console};
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
+use crate::artwork::{
+    HttpThumbnailTransport, ThumbnailCache, ThumbnailTransport, is_safe_thumbnail_source,
+};
+// The renderer's tests still exercise the pipeline end to end, so they reach
+// into the neutral half for its fetch entry points and guarded resolver.
+#[cfg(test)]
+use crate::artwork::{
+    ActiveCacheTemporary, ThumbnailCachePolicy, fetch_thumbnail, fetch_thumbnail_with_policy,
+    is_cache_entry_name, mock_thumbnail_agent, thumbnail_agent,
+};
+
+// `ThumbnailFailure` moved to the neutral half; keep its published path.
+pub use crate::artwork::ThumbnailFailure;
+
 const MAX_IMAGE_DIMENSION: u32 = 4_096;
 const MAX_DECODE_ALLOC_BYTES: u64 = 32 * 1024 * 1024;
 const REQUEST_DEBOUNCE: Duration = Duration::from_millis(150);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const FALLBACK_FONT_SIZE: (u16, u16) = (10, 20);
-const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-// Retain a complete maximum search prefetch unless the independent 64 MiB
-// budget requires byte-based eviction.
-const CACHE_MAX_ENTRIES: usize = 512;
-const CACHE_FILE_EXTENSION: &str = "image";
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
 const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 16;
@@ -81,17 +79,6 @@ const LOCAL_VIDEO_EXTRACT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_VIDEO_EXTRACT_POLL: Duration = Duration::from_millis(10);
 #[cfg(feature = "local-video-thumbnails")]
 const MAX_LOCAL_VIDEO_STDERR_BYTES: usize = 64 * 1024;
-#[cfg(feature = "local-artwork")]
-const MAX_LOCAL_ARTWORK_READ_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(feature = "local-artwork")]
-const MAX_LOCAL_ARTWORK_TAG_ITEM_BYTES: usize = MAX_DOWNLOAD_BYTES + 64 * 1024;
-#[cfg(feature = "local-artwork")]
-const MAX_LOCAL_ARTWORK_PICTURES: usize = 64;
-#[cfg(feature = "local-artwork")]
-const LOCAL_ARTWORK_CACHE_KEY_VERSION: &[u8] = b"youta-local-art-v1\0";
-static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_CACHE_TEMPORARIES: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 #[cfg(test)]
 static LOCAL_SOURCE_DECODE_COUNTS: std::sync::Mutex<Vec<(PathBuf, usize)>> =
     std::sync::Mutex::new(Vec::new());
@@ -131,43 +118,6 @@ pub enum ThumbnailCapability {
     Supported(ThumbnailProtocol),
 }
 
-/// Safe, URL-free reason why selected artwork could not be displayed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThumbnailFailure {
-    /// The provider returned an unsupported or unsafe URL.
-    InvalidSource,
-    /// The image could not be downloaded before the bounded timeout.
-    DownloadFailed,
-    /// The response exceeded Youta's thumbnail byte limit.
-    ResponseTooLarge,
-    /// The response was not JPEG, PNG, or WebP.
-    UnsupportedFormat,
-    /// The image was malformed or exceeded decode limits.
-    InvalidImage,
-    /// FFmpeg could not extract a representative local-video frame.
-    LocalVideoFrameExtractionFailed,
-    /// The terminal protocol encoder rejected the image.
-    EncodingFailed,
-    /// The background thumbnail worker stopped unexpectedly.
-    WorkerStopped,
-}
-
-impl std::fmt::Display for ThumbnailFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::InvalidSource => "thumbnail source is not HTTP or HTTPS",
-            Self::DownloadFailed => "thumbnail download failed",
-            Self::ResponseTooLarge => "thumbnail exceeds the 4 MiB download limit",
-            Self::UnsupportedFormat => "thumbnail is not JPEG, PNG, or WebP",
-            Self::InvalidImage => "thumbnail is invalid or exceeds decode limits",
-            Self::LocalVideoFrameExtractionFailed => "video frame extraction failed",
-            Self::EncodingFailed => "terminal thumbnail encoding failed",
-            Self::WorkerStopped => "thumbnail worker stopped",
-        };
-        formatter.write_str(message)
-    }
-}
-
 /// Current state of the selected item's lazy thumbnail.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThumbnailState {
@@ -192,6 +142,14 @@ pub enum ThumbnailState {
     reason = "these independently observed terminal facts are not a state machine"
 )]
 pub struct TerminalInfo {
+    /// Whether this binary is running on Linux.
+    ///
+    /// An observed fact like every other field here rather than a `cfg!` read
+    /// at the point of use, because the virtual-console policy below is
+    /// ordinary logic that every platform's build should be able to exercise.
+    /// Deciding it from the compilation target instead left the Linux console
+    /// rules untested anywhere but Linux.
+    pub linux: bool,
     /// Whether standard input is attached to a terminal.
     pub stdin_is_terminal: bool,
     /// Whether standard output is attached to a terminal.
@@ -232,6 +190,7 @@ impl TerminalInfo {
             .into_iter()
             .any(|name| std::env::var_os(name).is_some());
         Self {
+            linux: cfg!(target_os = "linux"),
             stdin_is_terminal: io::stdin().is_terminal(),
             stdout_is_terminal: io::stdout().is_terminal(),
             term,
@@ -249,7 +208,7 @@ impl TerminalInfo {
     /// Returns whether output is a directly attached Linux virtual console.
     fn confirmed_linux_virtual_console(&self) -> bool {
         TerminalAttachment {
-            linux: cfg!(target_os = "linux"),
+            linux: self.linux,
             stdin_is_terminal: self.stdin_is_terminal,
             stdout_is_terminal: self.stdout_is_terminal,
             term: self.term.clone(),
@@ -440,10 +399,6 @@ struct LocalPreviewTarget {
     height: u32,
 }
 
-trait ThumbnailTransport: Send + 'static {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
-}
-
 /// Cancellation token shared by one visible thumbnail request and its worker.
 #[derive(Clone)]
 struct RequestCancellation {
@@ -468,7 +423,22 @@ trait LocalVideoFrameExtractor: Send + 'static {
 }
 
 /// Shell-free FFmpeg process used by the production local-video worker.
-struct FfmpegVideoFrameExtractor;
+struct FfmpegVideoFrameExtractor {
+    program: PathBuf,
+}
+
+impl Default for FfmpegVideoFrameExtractor {
+    fn default() -> Self {
+        Self::new(PathBuf::from("ffmpeg"))
+    }
+}
+
+impl FfmpegVideoFrameExtractor {
+    /// Extracts frames with a specific `FFmpeg` build.
+    const fn new(program: PathBuf) -> Self {
+        Self { program }
+    }
+}
 
 #[cfg(not(feature = "local-video-thumbnails"))]
 impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
@@ -493,7 +463,7 @@ impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
         if cancellation.is_cancelled() {
             return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
         }
-        let mut child = local_video_frame_command(path, midpoint)
+        let mut child = local_video_frame_command(&self.program, path, midpoint)
             .spawn()
             .map_err(|_| ThumbnailFailure::LocalVideoFrameExtractionFailed)?;
         let Some(stdout) = child.stdout.take() else {
@@ -555,8 +525,9 @@ impl LocalVideoFrameExtractor for FfmpegVideoFrameExtractor {
 
 /// Builds a shell-free, one-frame FFmpeg invocation with bounded output size.
 #[cfg(feature = "local-video-thumbnails")]
-fn local_video_frame_command(path: &Path, midpoint: LocalVideoMidpoint) -> Command {
-    let mut command = Command::new("ffmpeg");
+fn local_video_frame_command(program: &Path, path: &Path, midpoint: LocalVideoMidpoint) -> Command {
+    let mut command = Command::new(program);
+    crate::child_process::quiet(&mut command);
     command
         .arg("-nostdin")
         .arg("-hide_banner")
@@ -608,377 +579,6 @@ fn read_bounded_process_pipe(reader: impl Read, limit: usize) -> io::Result<Vec<
     Ok(bytes)
 }
 
-struct HttpThumbnailTransport {
-    agent: ureq::Agent,
-}
-
-/// DNS resolver that pins thumbnail connections to public addresses only.
-#[derive(Debug, Default)]
-struct PublicThumbnailResolver {
-    resolver: DefaultResolver,
-    #[cfg(test)]
-    allow_non_public: bool,
-}
-
-impl Resolver for PublicThumbnailResolver {
-    fn resolve(
-        &self,
-        uri: &ureq::http::Uri,
-        config: &ureq::config::Config,
-        timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let resolved = self.resolver.resolve(uri, config, timeout)?;
-        #[cfg(test)]
-        if self.allow_non_public {
-            return Ok(resolved);
-        }
-        let mut public = self.empty();
-        for address in &resolved {
-            if !ip_address_is_non_public(address.ip()) {
-                public.push(*address);
-            }
-        }
-        if public.is_empty() {
-            Err(ureq::Error::HostNotFound)
-        } else {
-            Ok(public)
-        }
-    }
-}
-
-impl ThumbnailTransport for HttpThumbnailTransport {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
-        fetch_thumbnail(&self.agent, source)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ThumbnailCachePolicy {
-    max_age: Duration,
-    max_bytes: u64,
-    max_entries: usize,
-}
-
-impl Default for ThumbnailCachePolicy {
-    fn default() -> Self {
-        Self {
-            max_age: CACHE_MAX_AGE,
-            max_bytes: CACHE_MAX_BYTES,
-            max_entries: CACHE_MAX_ENTRIES,
-        }
-    }
-}
-
-struct ThumbnailCache {
-    directory: PathBuf,
-    policy: ThumbnailCachePolicy,
-}
-
-impl ThumbnailCache {
-    fn new(directory: PathBuf) -> Self {
-        Self {
-            directory,
-            policy: ThumbnailCachePolicy::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_policy(directory: PathBuf, policy: ThumbnailCachePolicy) -> Self {
-        Self { directory, policy }
-    }
-
-    fn read(&self, source: &Url) -> io::Result<Option<Vec<u8>>> {
-        self.read_key(source.as_str().as_bytes())
-    }
-
-    fn read_key(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if !self.directory.exists() {
-            return Ok(None);
-        }
-        self.secure_directory()?;
-        let path = self.entry_path_for_key(key);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if !metadata.file_type().is_file()
-            || metadata.len() == 0
-            || metadata.len() > MAX_DOWNLOAD_BYTES as u64
-            || self.is_expired(&metadata)
-        {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-        if !self.is_confined_entry(&path)? {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-
-        let file = fs::File::open(&path)?;
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(metadata.len())
-                .unwrap_or(MAX_DOWNLOAD_BYTES)
-                .min(MAX_DOWNLOAD_BYTES),
-        );
-        file.take(u64::try_from(MAX_DOWNLOAD_BYTES + 1).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
-        if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
-            remove_cache_entry(&path);
-            return Ok(None);
-        }
-        Ok(Some(bytes))
-    }
-
-    fn prepare(&self) -> io::Result<()> {
-        self.secure_directory()?;
-        self.evict()
-    }
-
-    fn store(&self, source: &Url, bytes: &[u8]) -> io::Result<()> {
-        self.store_key(source.as_str().as_bytes(), bytes)
-    }
-
-    fn store_key(&self, key: &[u8], bytes: &[u8]) -> io::Result<()> {
-        if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
-            return Ok(());
-        }
-        self.secure_directory()?;
-        let path = self.entry_path_for_key(key);
-        self.write_atomic(&path, bytes)?;
-        self.evict()
-    }
-
-    fn remove(&self, source: &Url) {
-        self.remove_key(source.as_str().as_bytes());
-    }
-
-    fn remove_key(&self, key: &[u8]) {
-        remove_cache_entry(&self.entry_path_for_key(key));
-    }
-
-    #[cfg(test)]
-    fn entry_path(&self, source: &Url) -> PathBuf {
-        self.entry_path_for_key(source.as_str().as_bytes())
-    }
-
-    fn entry_path_for_key(&self, key: &[u8]) -> PathBuf {
-        let digest = Sha256::digest(key);
-        self.directory
-            .join(format!("{digest:x}.{CACHE_FILE_EXTENSION}"))
-    }
-
-    fn secure_directory(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.directory)?;
-        let metadata = fs::symlink_metadata(&self.directory)?;
-        if !metadata.file_type().is_dir() {
-            return Err(io::Error::other("thumbnail cache path is not a directory"));
-        }
-        set_private_directory_permissions(&self.directory)
-    }
-
-    fn is_confined_entry(&self, path: &Path) -> io::Result<bool> {
-        let directory = fs::canonicalize(&self.directory)?;
-        let entry = fs::canonicalize(path)?;
-        Ok(entry.parent() == Some(directory.as_path()))
-    }
-
-    fn is_expired(&self, metadata: &fs::Metadata) -> bool {
-        metadata
-            .modified()
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > self.policy.max_age)
-    }
-
-    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.directory.join(format!(
-            ".thumbnail.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let active_temporary = ActiveCacheTemporary::register(temporary.clone());
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            set_private_file_permissions(&temporary)?;
-            fs::rename(&temporary, path)?;
-            set_private_file_permissions(path)?;
-            let _ = fs::File::open(&self.directory).and_then(|directory| directory.sync_all());
-            Ok(())
-        })();
-        drop(active_temporary);
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    fn evict(&self) -> io::Result<()> {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if is_cache_temp_name(&entry.file_name()) {
-                let path = entry.path();
-                if cache_temporary_is_active(&path) {
-                    continue;
-                }
-                if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
-                {
-                    remove_cache_entry(&path);
-                }
-                continue;
-            }
-            if !is_cache_entry_name(&entry.file_name()) {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if !metadata.file_type().is_file()
-                || metadata.len() == 0
-                || metadata.len() > MAX_DOWNLOAD_BYTES as u64
-                || self.is_expired(&metadata)
-            {
-                remove_cache_entry(&path);
-                continue;
-            }
-            entries.push(CacheEntry {
-                path,
-                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                bytes: metadata.len(),
-            });
-        }
-
-        entries.sort_by(|left, right| {
-            left.modified
-                .cmp(&right.modified)
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        let mut total_bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
-        let mut total_entries = entries.len();
-        for entry in entries {
-            if total_entries <= self.policy.max_entries && total_bytes <= self.policy.max_bytes {
-                break;
-            }
-            if fs::remove_file(&entry.path).is_ok() {
-                total_entries = total_entries.saturating_sub(1);
-                total_bytes = total_bytes.saturating_sub(entry.bytes);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Registration preventing concurrent cache eviction from deleting a live
-/// atomic-write temporary.
-struct ActiveCacheTemporary {
-    path: PathBuf,
-}
-
-impl ActiveCacheTemporary {
-    fn register(path: PathBuf) -> Self {
-        ACTIVE_CACHE_TEMPORARIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.clone());
-        Self { path }
-    }
-}
-
-impl Drop for ActiveCacheTemporary {
-    fn drop(&mut self) {
-        ACTIVE_CACHE_TEMPORARIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.path);
-    }
-}
-
-fn cache_temporary_is_active(path: &Path) -> bool {
-    ACTIVE_CACHE_TEMPORARIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(path)
-}
-
-struct CacheEntry {
-    path: PathBuf,
-    modified: SystemTime,
-    bytes: u64,
-}
-
-fn is_cache_entry_name(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(digest) = name.strip_suffix(&format!(".{CACHE_FILE_EXTENSION}")) else {
-        return false;
-    };
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn is_cache_temp_name(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(sequence) = name
-        .strip_prefix(".thumbnail.")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let mut components = sequence.split('.');
-    matches!(
-        (components.next(), components.next(), components.next()),
-        (Some(process), Some(sequence), None)
-            if !process.is_empty()
-                && !sequence.is_empty()
-                && process.bytes().all(|byte| byte.is_ascii_digit())
-                && sequence.bytes().all(|byte| byte.is_ascii_digit())
-    )
-}
-
-fn remove_cache_entry(path: &Path) {
-    let _ = fs::remove_file(path);
-}
-
-fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 /// Stable identity for one regular local image at a point in time.
 ///
 /// The canonical path and change metadata keep derivatives private, invalidate
@@ -989,18 +589,8 @@ struct LocalThumbnailFingerprint {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
+    /// Number the filesystem assigned, which a replacement cannot reuse.
+    filesystem: Option<crate::file_identity::FilesystemIdentity>,
 }
 
 impl LocalThumbnailFingerprint {
@@ -1011,7 +601,7 @@ impl LocalThumbnailFingerprint {
             return Err(ThumbnailFailure::InvalidSource);
         }
         let canonical_path =
-            fs::canonicalize(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
+            crate::fs_path::canonicalize(path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
         let canonical_metadata =
             fs::symlink_metadata(&canonical_path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
         if !canonical_metadata.file_type().is_file() {
@@ -1026,26 +616,12 @@ impl LocalThumbnailFingerprint {
     }
 
     fn from_metadata(canonical_path: PathBuf, metadata: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
         Self {
+            filesystem: crate::file_identity::filesystem_identity(&canonical_path, metadata),
             canonical_path,
             length: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
-            #[cfg(unix)]
-            modified_seconds: metadata.mtime(),
-            #[cfg(unix)]
-            modified_nanoseconds: metadata.mtime_nsec(),
         }
     }
 
@@ -1094,14 +670,20 @@ impl LocalThumbnailFingerprint {
         digest.update(self.length.to_le_bytes());
         hash_local_thumbnail_system_time(digest, self.modified);
         hash_local_thumbnail_system_time(digest, self.created);
-        #[cfg(unix)]
-        {
-            digest.update(self.device.to_le_bytes());
-            digest.update(self.inode.to_le_bytes());
-            digest.update(self.change_seconds.to_le_bytes());
-            digest.update(self.change_nanoseconds.to_le_bytes());
-            digest.update(self.modified_seconds.to_le_bytes());
-            digest.update(self.modified_nanoseconds.to_le_bytes());
+        // A cache key is only as sharp as the identity behind it, so the
+        // filesystem's own numbers go in whenever the platform supplies them.
+        // The tag keeps "no identity" from colliding with an identity of zeros.
+        match self.filesystem {
+            Some(filesystem) => {
+                digest.update([1]);
+                digest.update(filesystem.volume.to_le_bytes());
+                digest.update(filesystem.file.to_le_bytes());
+                let (seconds, nanoseconds) = filesystem.changed.unwrap_or((0, 0));
+                digest.update([u8::from(filesystem.changed.is_some())]);
+                digest.update(seconds.to_le_bytes());
+                digest.update(nanoseconds.to_le_bytes());
+            }
+            None => digest.update([0]),
         }
     }
 }
@@ -1235,433 +817,6 @@ fn decode_local_preview_record(bytes: &[u8]) -> Option<DynamicImage> {
     }
 }
 
-/// Failure while extracting and persisting optional artwork from local media.
-///
-/// Messages intentionally omit the media path so callers can safely surface a
-/// concise failure without disclosing a private filesystem layout.
-#[cfg(feature = "local-artwork")]
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum LocalArtworkError {
-    /// The requested path was a symlink, directory, or another non-file object.
-    #[error("local artwork source is not a regular file")]
-    InvalidSource,
-    /// The file changed between validation, parsing, and cache publication.
-    #[error("local artwork source changed while it was being read")]
-    SourceChanged,
-    /// Lofty or the cumulative reader reached an artwork safety limit.
-    #[error("embedded artwork exceeds Youta's bounded extraction limits")]
-    LimitExceeded,
-    /// Reading or inspecting the source failed.
-    #[error("unable to read the local artwork source")]
-    SourceIo(#[source] io::Error),
-    /// The media container or its tags were malformed.
-    #[error("unable to parse embedded artwork")]
-    Tag(#[source] lofty::error::LoftyError),
-    /// The private thumbnail cache could not be read or updated.
-    #[error("unable to access the local artwork cache")]
-    CacheIo(#[source] io::Error),
-    /// The cache entry could not be represented as an absolute file URL.
-    #[error("unable to represent cached local artwork as a file URL")]
-    CacheUrl,
-}
-
-/// Extracts one bounded embedded cover and returns its persistent cache URL.
-///
-/// The source must be a regular file rather than a symlink. Youta opens it
-/// read-only, limits cumulative tag reads to 8 MiB, limits any single Lofty tag
-/// allocation to slightly over 4 MiB for container overhead, and accepts only
-/// JPEG, PNG, or WebP images within the normal thumbnail decode limits. At most
-/// 64 embedded pictures are considered, with front cover preferred over
-/// `Other`, then the remaining picture types.
-///
-/// Cache keys contain a versioned digest of the canonical path and stable file
-/// metadata. An unchanged source therefore reuses its private opaque cache
-/// entry across restarts, while a tag edit or file replacement gets a new
-/// entry. The media file is never written. Unsupported, malformed, or absent
-/// pictures are an ordinary `Ok(None)`.
-///
-/// This helper is synchronous by design and must run on Youta's bounded
-/// background provider worker, never on the TUI render thread.
-///
-/// # Errors
-///
-/// Returns [`LocalArtworkError`] when the source is unsafe, changes during
-/// extraction, exceeds a hard limit, cannot be parsed, or cannot be persisted
-/// in the private cache.
-#[cfg(feature = "local-artwork")]
-pub(crate) fn cached_local_artwork(
-    media_path: &Path,
-    cache_directory: &Path,
-) -> Result<Option<Url>, LocalArtworkError> {
-    cached_local_artwork_with_extractor(media_path, cache_directory, extract_local_artwork)
-}
-
-#[cfg(feature = "local-artwork")]
-fn cached_local_artwork_with_extractor<F>(
-    media_path: &Path,
-    cache_directory: &Path,
-    extractor: F,
-) -> Result<Option<Url>, LocalArtworkError>
-where
-    F: FnOnce(&LocalMediaFingerprint) -> Result<Option<ValidatedArtwork>, LocalArtworkError>,
-{
-    let fingerprint = LocalMediaFingerprint::capture(media_path)?;
-    let cache_key = fingerprint.cache_key();
-    let cache = ThumbnailCache::new(cache_directory.to_path_buf());
-
-    match cache
-        .read_key(&cache_key)
-        .map_err(LocalArtworkError::CacheIo)?
-    {
-        Some(bytes) if decode_thumbnail(&bytes).is_ok() => {
-            fingerprint.ensure_current()?;
-            return cached_local_artwork_url(&cache, &cache_key).map(Some);
-        }
-        Some(_) => cache.remove_key(&cache_key),
-        None => {}
-    }
-
-    let Some(artwork) = extractor(&fingerprint)? else {
-        fingerprint.ensure_current()?;
-        return Ok(None);
-    };
-    fingerprint.ensure_current()?;
-    cache
-        .store_key(&cache_key, &artwork.0)
-        .map_err(LocalArtworkError::CacheIo)?;
-    fingerprint.ensure_current().inspect_err(|_| {
-        cache.remove_key(&cache_key);
-    })?;
-    cached_local_artwork_url(&cache, &cache_key).map(Some)
-}
-
-#[cfg(feature = "local-artwork")]
-fn cached_local_artwork_url(
-    cache: &ThumbnailCache,
-    cache_key: &[u8],
-) -> Result<Url, LocalArtworkError> {
-    let path = fs::canonicalize(cache.entry_path_for_key(cache_key))
-        .map_err(LocalArtworkError::CacheIo)?;
-    Url::from_file_path(path).map_err(|()| LocalArtworkError::CacheUrl)
-}
-
-#[cfg(feature = "local-artwork")]
-fn extract_local_artwork(
-    fingerprint: &LocalMediaFingerprint,
-) -> Result<Option<ValidatedArtwork>, LocalArtworkError> {
-    use lofty::config::{GlobalOptions, ParseOptions, apply_global_options};
-    use lofty::file::{FileType, TaggedFileExt};
-    use lofty::probe::Probe;
-
-    let file = File::open(&fingerprint.canonical_path).map_err(LocalArtworkError::SourceIo)?;
-    let opened_metadata = file.metadata().map_err(LocalArtworkError::SourceIo)?;
-    let opened =
-        LocalMediaFingerprint::from_metadata(fingerprint.canonical_path.clone(), &opened_metadata);
-    if &opened != fingerprint {
-        return Err(LocalArtworkError::SourceChanged);
-    }
-
-    let _options_reset = LoftyGlobalOptionsReset;
-    apply_global_options(
-        GlobalOptions::new()
-            .allocation_limit(MAX_LOCAL_ARTWORK_TAG_ITEM_BYTES)
-            .use_custom_resolvers(false)
-            .preserve_format_specific_items(false),
-    );
-    let options = ParseOptions::new()
-        .read_properties(false)
-        .read_cover_art(true);
-    let reader = ReadBudget::new(BufReader::new(file), MAX_LOCAL_ARTWORK_READ_BYTES);
-    let probe = Probe::new(reader).options(options);
-    let mut probe = probe.guess_file_type().map_err(map_local_artwork_io)?;
-    if probe.file_type().is_none()
-        && let Some(file_type) = FileType::from_path(&fingerprint.canonical_path)
-    {
-        probe = probe.set_file_type(file_type);
-    }
-    let tagged_file = probe.read().map_err(map_local_artwork_tag_error)?;
-
-    let mut pictures = tagged_file
-        .tags()
-        .iter()
-        .flat_map(lofty::tag::Tag::pictures)
-        .take(MAX_LOCAL_ARTWORK_PICTURES)
-        .collect::<Vec<_>>();
-    pictures.sort_by_key(|picture| local_picture_priority(picture.pic_type()));
-    let artwork = pictures
-        .into_iter()
-        .find_map(|picture| ValidatedArtwork::from_slice(picture.data()));
-    drop(tagged_file);
-    fingerprint.ensure_current()?;
-    Ok(artwork)
-}
-
-#[cfg(feature = "local-artwork")]
-fn local_picture_priority(picture_type: lofty::picture::PictureType) -> u8 {
-    use lofty::picture::PictureType;
-
-    match picture_type {
-        PictureType::CoverFront => 0,
-        PictureType::Other => 1,
-        _ => 2,
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-struct ValidatedArtwork(Vec<u8>);
-
-#[cfg(feature = "local-artwork")]
-impl ValidatedArtwork {
-    fn from_slice(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
-            return None;
-        }
-        decode_thumbnail(bytes)
-            .is_ok()
-            .then(|| Self(bytes.to_vec()))
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LocalMediaFingerprint {
-    canonical_path: PathBuf,
-    length: u64,
-    modified: Option<SystemTime>,
-    created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
-}
-
-#[cfg(feature = "local-artwork")]
-impl LocalMediaFingerprint {
-    fn capture(path: &Path) -> Result<Self, LocalArtworkError> {
-        let supplied_metadata = fs::symlink_metadata(path).map_err(LocalArtworkError::SourceIo)?;
-        if !supplied_metadata.file_type().is_file() {
-            return Err(LocalArtworkError::InvalidSource);
-        }
-        let canonical_path = fs::canonicalize(path).map_err(LocalArtworkError::SourceIo)?;
-        let canonical_metadata =
-            fs::symlink_metadata(&canonical_path).map_err(LocalArtworkError::SourceIo)?;
-        if !canonical_metadata.file_type().is_file() {
-            return Err(LocalArtworkError::InvalidSource);
-        }
-        let supplied = Self::from_metadata(canonical_path.clone(), &supplied_metadata);
-        let canonical = Self::from_metadata(canonical_path, &canonical_metadata);
-        if supplied != canonical {
-            return Err(LocalArtworkError::SourceChanged);
-        }
-        Ok(canonical)
-    }
-
-    fn from_metadata(canonical_path: PathBuf, metadata: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        Self {
-            canonical_path,
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
-            #[cfg(unix)]
-            modified_seconds: metadata.mtime(),
-            #[cfg(unix)]
-            modified_nanoseconds: metadata.mtime_nsec(),
-        }
-    }
-
-    fn ensure_current(&self) -> Result<(), LocalArtworkError> {
-        if &Self::capture(&self.canonical_path)? == self {
-            Ok(())
-        } else {
-            Err(LocalArtworkError::SourceChanged)
-        }
-    }
-
-    fn cache_key(&self) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(LOCAL_ARTWORK_CACHE_KEY_VERSION);
-        hash_local_path(&mut digest, &self.canonical_path);
-        digest.update(self.length.to_le_bytes());
-        hash_system_time(&mut digest, self.modified);
-        hash_system_time(&mut digest, self.created);
-        #[cfg(unix)]
-        {
-            digest.update(self.device.to_le_bytes());
-            digest.update(self.inode.to_le_bytes());
-            digest.update(self.change_seconds.to_le_bytes());
-            digest.update(self.change_nanoseconds.to_le_bytes());
-            digest.update(self.modified_seconds.to_le_bytes());
-            digest.update(self.modified_nanoseconds.to_le_bytes());
-        }
-        digest.finalize().into()
-    }
-}
-
-#[cfg(all(feature = "local-artwork", unix))]
-fn hash_local_path(digest: &mut Sha256, path: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-
-    let bytes = path.as_os_str().as_bytes();
-    digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-    digest.update(bytes);
-}
-
-#[cfg(all(feature = "local-artwork", windows))]
-fn hash_local_path(digest: &mut Sha256, path: &Path) {
-    use std::os::windows::ffi::OsStrExt;
-
-    let length = path.as_os_str().encode_wide().count();
-    digest.update(u64::try_from(length).unwrap_or(u64::MAX).to_le_bytes());
-    for word in path.as_os_str().encode_wide() {
-        digest.update(word.to_le_bytes());
-    }
-}
-
-#[cfg(all(feature = "local-artwork", not(any(unix, windows))))]
-fn hash_local_path(digest: &mut Sha256, path: &Path) {
-    let path = path.as_os_str().to_string_lossy();
-    digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
-    digest.update(path.as_bytes());
-}
-
-#[cfg(feature = "local-artwork")]
-fn hash_system_time(digest: &mut Sha256, time: Option<SystemTime>) {
-    let Some(time) = time else {
-        digest.update([0]);
-        return;
-    };
-    match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => {
-            digest.update([1]);
-            digest.update(duration.as_secs().to_le_bytes());
-            digest.update(duration.subsec_nanos().to_le_bytes());
-        }
-        Err(error) => {
-            let duration = error.duration();
-            digest.update([2]);
-            digest.update(duration.as_secs().to_le_bytes());
-            digest.update(duration.subsec_nanos().to_le_bytes());
-        }
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-struct ReadBudget<R> {
-    inner: R,
-    remaining: usize,
-}
-
-#[cfg(feature = "local-artwork")]
-impl<R> ReadBudget<R> {
-    const fn new(inner: R, limit: usize) -> Self {
-        Self {
-            inner,
-            remaining: limit,
-        }
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-impl<R: Read> Read for ReadBudget<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            let mut overflow = [0_u8; 1];
-            return match self.inner.read(&mut overflow) {
-                Ok(0) => Ok(0),
-                Ok(_) => Err(io::Error::other(LocalArtworkReadLimit)),
-                Err(error) => Err(error),
-            };
-        }
-        let allowed = buffer.len().min(self.remaining);
-        let read = self.inner.read(&mut buffer[..allowed])?;
-        self.remaining = self.remaining.saturating_sub(read);
-        Ok(read)
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-impl<R: Seek> Seek for ReadBudget<R> {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(position)
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-#[derive(Debug)]
-struct LocalArtworkReadLimit;
-
-#[cfg(feature = "local-artwork")]
-impl fmt::Display for LocalArtworkReadLimit {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("embedded artwork read limit exceeded")
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-impl std::error::Error for LocalArtworkReadLimit {}
-
-#[cfg(feature = "local-artwork")]
-fn is_local_artwork_read_limit(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<LocalArtworkReadLimit>())
-        .is_some()
-}
-
-#[cfg(feature = "local-artwork")]
-fn map_local_artwork_io(error: io::Error) -> LocalArtworkError {
-    if is_local_artwork_read_limit(&error) {
-        LocalArtworkError::LimitExceeded
-    } else {
-        LocalArtworkError::SourceIo(error)
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-fn map_local_artwork_tag_error(error: lofty::error::LoftyError) -> LocalArtworkError {
-    use lofty::error::ErrorKind;
-
-    match error.kind() {
-        ErrorKind::TooMuchData => LocalArtworkError::LimitExceeded,
-        ErrorKind::Io(error) if is_local_artwork_read_limit(error) => {
-            LocalArtworkError::LimitExceeded
-        }
-        _ => LocalArtworkError::Tag(error),
-    }
-}
-
-#[cfg(feature = "local-artwork")]
-struct LoftyGlobalOptionsReset;
-
-#[cfg(feature = "local-artwork")]
-impl Drop for LoftyGlobalOptionsReset {
-    fn drop(&mut self) {
-        lofty::config::apply_global_options(lofty::config::GlobalOptions::default());
-    }
-}
-
 /// Owns the selected thumbnail's bounded background pipeline and ready image.
 pub struct ThumbnailManager {
     capability: ThumbnailCapability,
@@ -1677,6 +832,7 @@ pub struct ThumbnailManager {
     prepared_decoded_bytes: usize,
     picker: Option<Picker>,
     cache_directory: Option<PathBuf>,
+    video_frame_program: PathBuf,
     request_sender: Option<Sender<WorkerRequest>>,
     request_discarder: Option<Receiver<WorkerRequest>>,
     prefetch_sender: Option<Sender<Vec<Url>>>,
@@ -1686,6 +842,19 @@ pub struct ThumbnailManager {
 }
 
 impl ThumbnailManager {
+    /// Points local video-frame extraction at a specific `FFmpeg`.
+    ///
+    /// Applied after construction rather than through every constructor: the
+    /// worker that reads it is started lazily, on the first local video, so a
+    /// manager configured at any point before then is configured in time. The
+    /// default is the bare name, which is what a Unix installation puts on
+    /// `PATH`; Windows installations usually need the full path.
+    #[must_use]
+    pub fn with_video_frame_program(mut self, program: PathBuf) -> Self {
+        self.video_frame_program = program;
+        self
+    }
+
     /// Detects the current terminal and starts a worker only when useful.
     ///
     /// `Auto` relies only on environment variables and terminal ioctls. `On`
@@ -1797,6 +966,7 @@ impl ThumbnailManager {
             prepared_decoded_bytes: 0,
             picker: Some(picker),
             cache_directory,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: None,
             request_discarder: None,
             prefetch_sender: None,
@@ -1826,6 +996,7 @@ impl ThumbnailManager {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: None,
             request_discarder: None,
             prefetch_sender: None,
@@ -2006,6 +1177,7 @@ impl ThumbnailManager {
             request_receiver,
             result_sender,
             self.cache_directory.clone(),
+            self.video_frame_program.clone(),
             Arc::clone(&self.current_generation),
         );
         if !spawned {
@@ -2269,16 +1441,15 @@ fn spawn_visible_worker(
     requests: Receiver<WorkerRequest>,
     results: Sender<WorkerResult>,
     cache_directory: Option<PathBuf>,
+    video_frame_program: PathBuf,
     current_generation: Arc<AtomicU64>,
 ) -> bool {
     spawn_visible_worker_with_transport_and_extractor(
         picker,
         requests,
         results,
-        HttpThumbnailTransport {
-            agent: thumbnail_agent(),
-        },
-        FfmpegVideoFrameExtractor,
+        HttpThumbnailTransport::new(),
+        FfmpegVideoFrameExtractor::new(video_frame_program),
         cache_directory.map(ThumbnailCache::new),
         REQUEST_DEBOUNCE,
         current_generation,
@@ -2299,7 +1470,7 @@ fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
         requests,
         results,
         transport,
-        FfmpegVideoFrameExtractor,
+        FfmpegVideoFrameExtractor::default(),
         cache,
         debounce,
         Arc::new(AtomicU64::new(0)),
@@ -2353,9 +1524,7 @@ fn spawn_visible_worker_with_transport_and_extractor<
 fn spawn_prefetch_worker(prefetch_updates: Receiver<Vec<Url>>, cache_directory: PathBuf) -> bool {
     spawn_prefetch_worker_with_transport(
         prefetch_updates,
-        HttpThumbnailTransport {
-            agent: thumbnail_agent(),
-        },
+        HttpThumbnailTransport::new(),
         ThumbnailCache::new(cache_directory),
     )
 }
@@ -2411,7 +1580,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
             let mut prefetch_cache_ready =
                 cache.as_ref().is_some_and(|cache| cache.prepare().is_ok());
             let mut prefetch_backlog = VecDeque::new();
-            let mut extractor = FfmpegVideoFrameExtractor;
+            let mut extractor = FfmpegVideoFrameExtractor::default();
             let current_generation = Arc::new(AtomicU64::new(0));
             loop {
                 match latest_worker_request(&requests) {
@@ -2661,43 +1830,6 @@ fn prefetch_thumbnail(
         return Ok(());
     }
     cache.store(source, &bytes)
-}
-
-fn thumbnail_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .user_agent(concat!(
-            "youta/",
-            env!("CARGO_PKG_VERSION"),
-            " (+",
-            env!("CARGO_PKG_REPOSITORY"),
-            ")"
-        ))
-        .build();
-    ureq::Agent::with_parts(
-        config,
-        DefaultConnector::default(),
-        PublicThumbnailResolver::default(),
-    )
-}
-
-#[cfg(test)]
-fn mock_thumbnail_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build();
-    ureq::Agent::with_parts(
-        config,
-        DefaultConnector::default(),
-        PublicThumbnailResolver {
-            resolver: DefaultResolver::default(),
-            allow_non_public: true,
-        },
-    )
 }
 
 fn load_thumbnail(
@@ -3110,81 +2242,6 @@ fn encode_thumbnail(
     }
 }
 
-fn fetch_thumbnail(agent: &ureq::Agent, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
-    fetch_thumbnail_with_policy(agent, source, false)
-}
-
-/// Fetches one thumbnail, optionally allowing a loopback test fixture.
-fn fetch_thumbnail_with_policy(
-    agent: &ureq::Agent,
-    source: &Url,
-    allow_non_public_test_source: bool,
-) -> Result<Vec<u8>, ThumbnailFailure> {
-    if source.scheme() == "file" {
-        let path = source
-            .to_file_path()
-            .map_err(|()| ThumbnailFailure::InvalidSource)?;
-        let metadata = fs::symlink_metadata(&path).map_err(|_| ThumbnailFailure::DownloadFailed)?;
-        if !metadata.file_type().is_file() {
-            return Err(ThumbnailFailure::InvalidSource);
-        }
-        if metadata.len() > MAX_DOWNLOAD_BYTES as u64 {
-            return Err(ThumbnailFailure::ResponseTooLarge);
-        }
-        return fs::read(path).map_err(|_| ThumbnailFailure::DownloadFailed);
-    }
-    if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
-        return Err(ThumbnailFailure::InvalidSource);
-    }
-    let mut response = agent
-        .get(source.as_str())
-        .header("Accept", "image/jpeg, image/png, image/webp")
-        .call()
-        .map_err(|_| ThumbnailFailure::DownloadFailed)?;
-    if !(200..300).contains(&response.status().as_u16()) {
-        return Err(ThumbnailFailure::DownloadFailed);
-    }
-    let final_url =
-        Url::parse(&response.get_uri().to_string()).map_err(|_| ThumbnailFailure::InvalidSource)?;
-    if !is_safe_remote_thumbnail_source(&final_url, allow_non_public_test_source) {
-        return Err(ThumbnailFailure::InvalidSource);
-    }
-    if response
-        .body()
-        .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
-    {
-        return Err(ThumbnailFailure::ResponseTooLarge);
-    }
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(u64::try_from(MAX_DOWNLOAD_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
-        .read_to_vec()
-        .map_err(|error| match error {
-            ureq::Error::BodyExceedsLimit(_) => ThumbnailFailure::ResponseTooLarge,
-            _ => ThumbnailFailure::DownloadFailed,
-        })?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        Err(ThumbnailFailure::ResponseTooLarge)
-    } else {
-        Ok(bytes)
-    }
-}
-
-fn is_safe_thumbnail_source(source: &Url) -> bool {
-    is_safe_remote_thumbnail_source(source, false)
-        || (source.scheme() == "file" && source.to_file_path().is_ok())
-}
-
-fn is_safe_remote_thumbnail_source(source: &Url, allow_non_public_test_source: bool) -> bool {
-    matches!(source.scheme(), "http" | "https")
-        && source.username().is_empty()
-        && source.password().is_none()
-        && source.host_str().is_some()
-        && (allow_non_public_test_source || !remote_url_has_non_public_host(source))
-}
-
 /// Converts one terminal-cell rectangle into the exact corresponding pixel
 /// box, using the terminal's detected font dimensions.
 fn local_preview_target(picker: &Picker, area: Rect) -> LocalPreviewTarget {
@@ -3225,7 +2282,7 @@ fn decode_local_thumbnail_path(
 
 #[cfg(test)]
 fn record_local_source_decode(path: &Path) {
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = crate::fs_path::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut counts = LOCAL_SOURCE_DECODE_COUNTS
         .lock()
         .expect("local thumbnail decode counter");
@@ -3501,6 +2558,10 @@ pub(crate) mod tests {
 
     fn graphical_terminal() -> TerminalInfo {
         TerminalInfo {
+            // The console rules are what several of these tests are about, so
+            // the base fixture claims Linux and the build target is not
+            // allowed to decide the answer for them.
+            linux: true,
             stdin_is_terminal: true,
             stdout_is_terminal: true,
             term: Some("xterm-kitty".to_owned()),
@@ -3980,7 +3041,8 @@ pub(crate) mod tests {
         use std::ffi::{OsStr, OsString};
 
         let path = Path::new("/tmp/a movie;not-a-command.MOV");
-        let command = local_video_frame_command(path, LocalVideoMidpoint(60_500));
+        let command =
+            local_video_frame_command(Path::new("ffmpeg"), path, LocalVideoMidpoint(60_500));
         let expected = [
             "-nostdin",
             "-hide_banner",
@@ -4063,7 +3125,7 @@ pub(crate) mod tests {
             generation: 7,
             current_generation: generation,
         };
-        let bytes = FfmpegVideoFrameExtractor
+        let bytes = FfmpegVideoFrameExtractor::default()
             .extract(&movie, LocalVideoMidpoint(2_000), &cancellation)
             .expect("extract real MOV midpoint");
         let image = decode_thumbnail(&bytes)
@@ -4092,7 +3154,7 @@ pub(crate) mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe MOV extraction"),
             (
-                fs::canonicalize(&movie).expect("canonical MOV path"),
+                crate::fs_path::canonicalize(&movie).expect("canonical MOV path"),
                 60_500
             )
         );
@@ -4224,21 +3286,21 @@ pub(crate) mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe first extraction")
                 .0,
-            fs::canonicalize(&first).expect("canonical first MOV")
+            crate::fs_path::canonicalize(&first).expect("canonical first MOV")
         );
         assert!(manager.synchronize_local_video(&second, 2_000, area));
         assert_eq!(
             cancelled
                 .recv_timeout(Duration::from_secs(1))
                 .expect("first extraction cancellation"),
-            fs::canonicalize(&first).expect("canonical first MOV")
+            crate::fs_path::canonicalize(&first).expect("canonical first MOV")
         );
         assert_eq!(
             observed
                 .recv_timeout(Duration::from_secs(1))
                 .expect("observe replacement extraction"),
             (
-                fs::canonicalize(&second).expect("canonical second MOV"),
+                crate::fs_path::canonicalize(&second).expect("canonical second MOV"),
                 2_000
             )
         );
@@ -4534,6 +3596,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(request_sender),
             request_discarder: Some(request_discarder),
             prefetch_sender: None,
@@ -5255,6 +4318,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: Some(cache_directory),
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(visible_request_sender),
             request_discarder: Some(visible_request_discarder),
             prefetch_sender: Some(prefetch_sender),
@@ -5561,6 +4625,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             picker: None,
             cache_directory: None,
+            video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(request_sender),
             request_discarder: None,
             prefetch_sender: None,
@@ -5627,313 +4692,6 @@ pub(crate) mod tests {
         assert!(!rendered.contains("images.example"));
     }
 
-    #[cfg(feature = "local-artwork")]
-    mod local_artwork {
-        use std::cell::Cell;
-        use std::fs::OpenOptions;
-
-        use lofty::config::WriteOptions;
-        use lofty::picture::{MimeType, Picture, PictureType};
-        use lofty::tag::{Accessor, Tag, TagExt, TagType};
-
-        use super::*;
-
-        #[test]
-        fn embedded_artwork_prefers_front_cover_then_other_then_first_picture() {
-            let directory = tempfile::tempdir().expect("temporary local-media directory");
-            let cache_directory = directory.path().join("thumbnail-cache");
-            let media_path = directory.path().join("covers.mp3");
-            let first = fixture_color_png([255, 0, 0, 255]);
-            let other = fixture_color_png([0, 255, 0, 255]);
-            let front = fixture_color_png([0, 0, 255, 255]);
-            write_tagged_mp3(
-                &media_path,
-                [
-                    fixture_picture(first, PictureType::Band),
-                    fixture_picture(other, PictureType::Other),
-                    fixture_picture(front.clone(), PictureType::CoverFront),
-                ],
-            );
-
-            let url = cached_local_artwork(&media_path, &cache_directory)
-                .expect("extract front cover")
-                .expect("front cover must exist");
-            assert_eq!(read_file_url(&url), front);
-
-            let fallback_path = directory.path().join("fallback.mp3");
-            let fallback = fixture_color_png([255, 255, 0, 255]);
-            let preferred_other = fixture_color_png([0, 255, 255, 255]);
-            write_tagged_mp3(
-                &fallback_path,
-                [
-                    fixture_picture(fallback, PictureType::Composer),
-                    fixture_picture(preferred_other.clone(), PictureType::Other),
-                ],
-            );
-            let url = cached_local_artwork(&fallback_path, &cache_directory)
-                .expect("extract Other artwork")
-                .expect("Other artwork must exist");
-            assert_eq!(read_file_url(&url), preferred_other);
-
-            let first_only_path = directory.path().join("first-only.mp3");
-            let first_only = fixture_color_png([255, 0, 255, 255]);
-            write_tagged_mp3(
-                &first_only_path,
-                [fixture_picture(
-                    first_only.clone(),
-                    PictureType::Illustration,
-                )],
-            );
-            let url = cached_local_artwork(&first_only_path, &cache_directory)
-                .expect("extract first available artwork")
-                .expect("fallback artwork must exist");
-            assert_eq!(read_file_url(&url), first_only);
-        }
-
-        #[test]
-        fn absent_malformed_unsupported_and_oversized_artwork_are_cache_misses() {
-            let directory = tempfile::tempdir().expect("temporary local-media directory");
-            let cache_directory = directory.path().join("thumbnail-cache");
-
-            let no_art_path = directory.path().join("no-art.mp3");
-            write_tagged_mp3(&no_art_path, []);
-            assert!(
-                cached_local_artwork(&no_art_path, &cache_directory)
-                    .expect("read media without artwork")
-                    .is_none()
-            );
-
-            let malformed_path = directory.path().join("malformed.mp3");
-            write_tagged_mp3(
-                &malformed_path,
-                [fixture_picture(
-                    b"not a PNG despite its tag".to_vec(),
-                    PictureType::CoverFront,
-                )],
-            );
-            assert!(
-                cached_local_artwork(&malformed_path, &cache_directory)
-                    .expect("ignore malformed artwork")
-                    .is_none()
-            );
-
-            let unsupported_path = directory.path().join("unsupported.mp3");
-            let unsupported = Picture::unchecked(b"GIF89a unsupported".to_vec())
-                .pic_type(PictureType::CoverFront)
-                .mime_type(MimeType::Gif)
-                .build();
-            write_tagged_mp3(&unsupported_path, [unsupported]);
-            assert!(
-                cached_local_artwork(&unsupported_path, &cache_directory)
-                    .expect("ignore unsupported artwork")
-                    .is_none()
-            );
-
-            let oversized_path = directory.path().join("oversized.mp3");
-            write_tagged_mp3(
-                &oversized_path,
-                [fixture_picture(
-                    vec![0_u8; MAX_DOWNLOAD_BYTES + 1],
-                    PictureType::CoverFront,
-                )],
-            );
-            assert!(
-                matches!(
-                    cached_local_artwork(&oversized_path, &cache_directory),
-                    Ok(None) | Err(LocalArtworkError::LimitExceeded)
-                ),
-                "oversized tag data must never be cached"
-            );
-            assert!(
-                !cache_directory.exists() || cache_entry_count(&cache_directory) == 0,
-                "invalid optional artwork must not create cache entries"
-            );
-        }
-
-        #[test]
-        fn extraction_preserves_source_and_uses_opaque_private_cache_files() {
-            let directory = tempfile::tempdir().expect("temporary local-media directory");
-            let cache_directory = directory.path().join("thumbnail-cache");
-            let media_path = directory.path().join("private album name.mp3");
-            let artwork = fixture_color_png([12, 34, 56, 255]);
-            write_tagged_mp3(
-                &media_path,
-                [fixture_picture(artwork.clone(), PictureType::CoverFront)],
-            );
-            let source_before = fs::read(&media_path).expect("snapshot source bytes");
-            let metadata_before = fs::metadata(&media_path).expect("snapshot source metadata");
-
-            let url = cached_local_artwork(&media_path, &cache_directory)
-                .expect("extract embedded artwork")
-                .expect("embedded artwork");
-            let cache_path = url.to_file_path().expect("absolute cache file URL");
-
-            assert_eq!(read_file_url(&url), artwork);
-            assert_eq!(
-                fs::read(&media_path).expect("read source after extraction"),
-                source_before
-            );
-            let metadata_after =
-                fs::metadata(&media_path).expect("source metadata after extraction");
-            assert_eq!(metadata_after.len(), metadata_before.len());
-            assert_eq!(
-                metadata_after.modified().ok(),
-                metadata_before.modified().ok()
-            );
-            assert_eq!(metadata_after.permissions(), metadata_before.permissions());
-            assert_eq!(cache_path.parent(), Some(cache_directory.as_path()));
-            assert!(is_cache_entry_name(
-                cache_path.file_name().expect("opaque cache filename")
-            ));
-            assert!(
-                !cache_path
-                    .file_name()
-                    .expect("cache filename")
-                    .to_string_lossy()
-                    .contains("private album name")
-            );
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                assert_eq!(
-                    fs::metadata(&cache_directory)
-                        .expect("cache directory metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o700
-                );
-                assert_eq!(
-                    fs::metadata(&cache_path)
-                        .expect("cache entry metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
-            }
-        }
-
-        #[test]
-        fn unchanged_source_reuses_cache_and_modified_source_gets_a_new_key() {
-            let directory = tempfile::tempdir().expect("temporary local-media directory");
-            let cache_directory = directory.path().join("thumbnail-cache");
-            let media_path = directory.path().join("fingerprint.mp3");
-            fs::write(&media_path, b"stable media fixture").expect("write media fixture");
-            let first_artwork = fixture_color_png([1, 2, 3, 255]);
-            let second_artwork = fixture_color_png([4, 5, 6, 255]);
-            let calls = Cell::new(0_u8);
-
-            let first = cached_local_artwork_with_extractor(&media_path, &cache_directory, |_| {
-                calls.set(calls.get() + 1);
-                Ok(ValidatedArtwork::from_slice(&first_artwork))
-            })
-            .expect("populate local artwork cache")
-            .expect("first cache URL");
-            let restarted =
-                cached_local_artwork_with_extractor(&media_path, &cache_directory, |_| {
-                    calls.set(calls.get() + 1);
-                    Ok(ValidatedArtwork::from_slice(&second_artwork))
-                })
-                .expect("reuse local artwork cache")
-                .expect("restart cache URL");
-            assert_eq!(restarted, first);
-            assert_eq!(calls.get(), 1, "restart hit must bypass tag extraction");
-            assert_eq!(read_file_url(&restarted), first_artwork);
-
-            OpenOptions::new()
-                .append(true)
-                .open(&media_path)
-                .expect("open media fixture for modification")
-                .write_all(b"!")
-                .expect("modify source fingerprint");
-            let modified =
-                cached_local_artwork_with_extractor(&media_path, &cache_directory, |_| {
-                    calls.set(calls.get() + 1);
-                    Ok(ValidatedArtwork::from_slice(&second_artwork))
-                })
-                .expect("cache modified local artwork")
-                .expect("modified cache URL");
-            assert_ne!(modified, first);
-            assert_eq!(calls.get(), 2, "source edit must repeat tag extraction");
-            assert_eq!(read_file_url(&modified), second_artwork);
-        }
-
-        #[test]
-        fn cumulative_reader_reports_data_beyond_its_fixed_budget() {
-            let mut reader = ReadBudget::new(
-                Cursor::new(vec![0_u8; MAX_LOCAL_ARTWORK_READ_BYTES + 1]),
-                MAX_LOCAL_ARTWORK_READ_BYTES,
-            );
-            let mut sink = Vec::new();
-            let error = reader
-                .read_to_end(&mut sink)
-                .expect_err("read beyond fixed artwork budget");
-            assert!(is_local_artwork_read_limit(&error));
-            assert_eq!(sink.len(), MAX_LOCAL_ARTWORK_READ_BYTES);
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn symlink_source_is_rejected_without_touching_cache_or_target() {
-            use std::os::unix::fs::symlink;
-
-            let directory = tempfile::tempdir().expect("temporary local-media directory");
-            let cache_directory = directory.path().join("thumbnail-cache");
-            let media_path = directory.path().join("target.mp3");
-            let symlink_path = directory.path().join("linked.mp3");
-            let source = b"private source bytes";
-            fs::write(&media_path, source).expect("write symlink target");
-            symlink(&media_path, &symlink_path).expect("create media symlink");
-
-            assert!(matches!(
-                cached_local_artwork(&symlink_path, &cache_directory),
-                Err(LocalArtworkError::InvalidSource)
-            ));
-            assert_eq!(
-                fs::read(&media_path).expect("read untouched symlink target"),
-                source
-            );
-            assert!(!cache_directory.exists());
-        }
-
-        fn write_tagged_mp3(path: &Path, pictures: impl IntoIterator<Item = Picture>) {
-            let mut tag = Tag::new(TagType::Id3v2);
-            tag.set_title("Youta embedded-artwork fixture".to_owned());
-            for picture in pictures {
-                tag.push_picture(picture);
-            }
-            let mut bytes = Vec::new();
-            tag.dump_to(&mut bytes, WriteOptions::default())
-                .expect("encode ID3v2 fixture");
-            bytes.extend_from_slice(&[0_u8; 256]);
-            fs::write(path, bytes).expect("write tagged MP3 fixture");
-        }
-
-        fn fixture_picture(bytes: Vec<u8>, picture_type: PictureType) -> Picture {
-            Picture::unchecked(bytes)
-                .pic_type(picture_type)
-                .mime_type(MimeType::Png)
-                .build()
-        }
-
-        fn fixture_color_png(color: [u8; 4]) -> Vec<u8> {
-            let image = image::RgbaImage::from_pixel(3, 2, image::Rgba(color));
-            let mut png = Cursor::new(Vec::new());
-            DynamicImage::ImageRgba8(image)
-                .write_to(&mut png, ImageFormat::Png)
-                .expect("encode colored PNG fixture");
-            png.into_inner()
-        }
-
-        fn read_file_url(url: &Url) -> Vec<u8> {
-            fs::read(url.to_file_path().expect("absolute file URL"))
-                .expect("read cached local artwork")
-        }
-    }
-
     pub(crate) fn manager_with_mock_transport() -> MockManagerParts {
         manager_with_mock_transport_in_cache(None)
     }
@@ -5998,6 +4756,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 picker: None,
                 cache_directory,
+                video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
                 prefetch_sender: Some(prefetch_sender),
@@ -6056,6 +4815,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 picker: None,
                 cache_directory,
+                video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
                 prefetch_sender: None,
@@ -6197,7 +4957,7 @@ pub(crate) mod tests {
     }
 
     fn local_source_decode_count(path: &Path) -> usize {
-        let path = fs::canonicalize(path).expect("canonical local thumbnail fixture");
+        let path = crate::fs_path::canonicalize(path).expect("canonical local thumbnail fixture");
         LOCAL_SOURCE_DECODE_COUNTS
             .lock()
             .expect("local thumbnail decode counts")
