@@ -723,6 +723,16 @@ impl NoReplaceRenamer for SystemNoReplaceRenamer {
         )))]
         {
             let metadata = fs::symlink_metadata(source)?;
+            // A directory rename on Windows is no-replace by construction:
+            // `MoveFileEx` refuses to replace an existing target of either
+            // kind with a directory, so the plain rename already carries the
+            // whole guarantee. This is Windows-only — POSIX `rename` would
+            // quietly replace an *empty* target directory, so the other
+            // fallback platforms keep refusing instead of guessing.
+            #[cfg(windows)]
+            if metadata.file_type().is_dir() {
+                return fs::rename(source, target);
+            }
             if !metadata.file_type().is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1354,11 +1364,19 @@ fn join_relative(root: &Path, relative: &Path) -> PathBuf {
 
 fn is_normalized_absolute(path: &Path) -> bool {
     path.is_absolute()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-            )
+        && path.components().all(|component| match component {
+            Component::Prefix(_) | Component::RootDir => true,
+            // Windows parses a verbatim (`\\?\`) path literally: `/` is not a
+            // separator there and `..` is an ordinary name, so a traversal
+            // written against a verbatim base arrives as one "normal"
+            // component instead of `ParentDir`. No real entry is spelled that
+            // way — no filesystem here permits `.`, `..`, or `/` in a name —
+            // so the spelling alone marks the path unsafe.
+            Component::Normal(name) => {
+                let bytes = name.as_encoded_bytes();
+                bytes != b".." && bytes != b"." && !bytes.contains(&b'/')
+            }
+            Component::CurDir | Component::ParentDir => false,
         })
 }
 
@@ -2098,6 +2116,31 @@ mod tests {
         } else {
             PathBuf::from(path)
         }
+    }
+
+    /// A traversal spelled against a verbatim base is still refused as unsafe.
+    ///
+    /// Under `\\?\` Windows parses literally — `/` is not a separator and `..`
+    /// is an ordinary name — so `..\/source\/track.flac` arrives as one
+    /// "normal" component rather than as `ParentDir`, and the rejection has to
+    /// come from the component's spelling rather than its kind. This is the
+    /// exact shape the canonical fixture produces on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn a_traversal_spelled_against_a_verbatim_base_is_still_unsafe() {
+        let (_fixture, source, destination) = directories();
+        let track = source.join("track.flac");
+        fs::write(&track, b"audio").expect("track");
+
+        assert!(matches!(
+            validate_local_move(
+                &source,
+                &[source.join("../source/track.flac")],
+                &destination,
+                LocalMoveLimits::default(),
+            ),
+            Err(LocalMoveValidationError::UnsafeSource(_))
+        ));
     }
 
     /// A mapping written down verbatim still matches a locator that decoded
