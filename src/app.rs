@@ -46267,13 +46267,20 @@ mod tests {
         let error = error.as_deref().expect("recovery message");
         assert!(error.contains(&remaining_source.display().to_string()));
         assert!(error.contains(&staging.display().to_string()));
+        // The popup above shows the raw paths — it stays on screen. The report
+        // is the shareable artifact, and it passes the redaction boundary, so
+        // it retains each recovery path only in the form that boundary allows:
+        // verbatim for this fixture on Unix, `<redacted-home>` on Windows,
+        // where the runner's temporary directory lives under `C:\Users`.
+        let redacted_staging =
+            crate::diagnostics::redact_diagnostic_text(&staging.display().to_string());
         assert!(
             controller
                 .view
                 .error_popup
                 .as_ref()
-                .is_some_and(|popup| popup.report.contains(&staging.display().to_string())),
-            "the scrollable diagnostic must retain every recovery path"
+                .is_some_and(|popup| popup.report.contains(&redacted_staging)),
+            "the scrollable diagnostic must retain every recovery path the redaction allows"
         );
         assert!(
             controller
