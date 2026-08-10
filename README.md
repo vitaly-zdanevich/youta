@@ -105,10 +105,16 @@ Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
 
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
-YouTube Music, subscription-channel, Local, or MOD/tracker list. Items added
-with **Play next** or **Add to queue** always run first; Youta then resumes the
-original source list. Replacing a live search stops that list's continuation
-instead of accidentally playing an unrelated new result.
+YouTube Music, subscription-channel, Local, Downloaded, playlist, or
+MOD/tracker list. Items added with **Play next** or **Add to queue** always run
+first; Youta then resumes the original source list. Replacing a live search
+stops that list's continuation instead of accidentally playing an unrelated
+new result. Playlist entries whose replay needs a provider round-trip
+(Bandcamp, Apple Podcasts, BBC, SoundStream, LitRes, Jamendo) are skipped by
+continuation, the way scheduled YouTube rows are: continuation only starts
+what it can start directly. The same-source position is tracked even while
+autoplay is off, so a manual skip can use it; the toggle decides only whether
+end-of-file continues on its own.
 
 `u` opens that queue. It lists the entries in play order, marks the one
 playback is on, and starts the selected entry from where it sits, drops a
@@ -122,10 +128,12 @@ moves the cursor, and starting playback records an entry beside it.
 media key or a tray menu does. They are the shifted neighbours of `[` and `]`
 for the next size up: those move within one item, these move between them.
 Repeat-one is not consulted, because somebody who asked for the next track has
-already said what they want, and the step stays inside the queue rather than
-continuing into an autoplay list — autoplay's continuation belongs to
-end-of-file, where the origin that survives a finished queue is established.
-Either end is a stated refusal rather than a wrap-around.
+already said what they want. At either end of the queue the step continues
+into the same-source list playback started from, backward as well as forward,
+whether or not autoplay is enabled — that toggle governs only what end-of-file
+does on its own. The crossed-into item is recorded as a queue entry exactly as
+end-of-file continuation records one. A missing, replaced, or exhausted list
+is a stated refusal rather than a wrap-around.
 
 `y` copies the selected item's link to the system clipboard. The controller
 only decides *what* to copy; each front-end reaches its own clipboard, because
@@ -743,8 +751,9 @@ MPRIS on Linux, the System Media Transport Controls on Windows, Now Playing on
 macOS. Play and Pause name a destination rather than a change, so both are
 answered against the reducer's live state instead of the last snapshot — a Play
 arriving at something already playing does nothing rather than pausing it. Next
-and Previous step through the *queue*, which is also what those entries mean in
-the tray, where there is no cursor for "queue the selected item" to refer to.
+and Previous step through the *queue*, continuing into the playing source list
+at its edges, which is also what those entries mean in the tray, where there is
+no cursor for "queue the selected item" to refer to.
 Youta has no stop, so the Stop button holds the item where it is; a dragged
 position is refused rather than approximated while the running time is unknown;
 and a URI arriving from the session bus is ignored, because Youta plays what its

@@ -2965,6 +2965,11 @@ enum AutoplayOrigin {
         channel_id: String,
         index: usize,
     },
+    Playlist {
+        /// Persisted entries captured when playback started from the playlist.
+        entries: Arc<[PlaylistEntry]>,
+        index: usize,
+    },
     LocalBrowser {
         directory: PathBuf,
         entries: Arc<[PathBuf]>,
@@ -2995,11 +3000,52 @@ enum AutoplayStep {
     Exhausted,
 }
 
+/// One scan direction through a same-source list.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ListStepDirection {
+    Forward,
+    Backward,
+}
+
+/// Scans one direction from an origin index for the first playable step.
+///
+/// The origin index itself is excluded in both directions, so a backward scan
+/// lands strictly before the position the origin describes.
+fn neighbour_list_step<T>(
+    items: &[T],
+    index: usize,
+    direction: ListStepDirection,
+    mut candidate: impl FnMut(usize, &T) -> Option<AutoplayStep>,
+) -> AutoplayStep {
+    match direction {
+        ListStepDirection::Forward => {
+            for (index, item) in items.iter().enumerate().skip(index.saturating_add(1)) {
+                if let Some(step) = candidate(index, item) {
+                    return step;
+                }
+            }
+        }
+        ListStepDirection::Backward => {
+            for index in (0..index.min(items.len())).rev() {
+                if let Some(step) = candidate(index, &items[index]) {
+                    return step;
+                }
+            }
+        }
+    }
+    AutoplayStep::Exhausted
+}
+
 #[cfg(feature = "tracker-music")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TrackerPreparationOwner {
     Manual,
     Autoplay(AutoplayOrigin),
+    /// A manual queue-edge step that crossed into the source list; plays the
+    /// prepared module regardless of the autoplay toggle.
+    ManualStep {
+        forward: bool,
+    },
     CanceledAutoplay,
 }
 
@@ -6876,12 +6922,7 @@ impl AppController {
             YandexMusicRow::Album(album) => self.open_yandex_music_album(album.id),
             YandexMusicRow::Track(track) => {
                 let item = queue_item_from_yandex_music_track(&track);
-                let origin = self
-                    .config
-                    .playback
-                    .autoplay
-                    .then(|| self.autoplay_origin_for_media(&item.media.id))
-                    .flatten();
+                let origin = self.autoplay_origin_for_media(&item.media.id);
                 self.request_yandex_music_playback(*track, item, false, origin);
             }
         }
@@ -11125,6 +11166,10 @@ impl AppController {
                             self.view.status_line =
                                 "Canceled tracker preparation did not change playback".to_owned();
                         }
+                        TrackerPreparationOwner::ManualStep { .. } => {
+                            self.view.status_line =
+                                format!("Could not prepare the tracker item: {error}");
+                        }
                         TrackerPreparationOwner::Manual => {
                             self.show_error_message("Tracker module preparation failed", error);
                         }
@@ -13463,6 +13508,9 @@ impl AppController {
                     "Tracker module preparation failed",
                     "the prepared result no longer exists in the current tracker search",
                 );
+            } else if matches!(owner, TrackerPreparationOwner::ManualStep { .. }) {
+                self.view.status_line =
+                    "The prepared tracker item no longer exists in the current search".to_owned();
             }
             return;
         };
@@ -13493,6 +13541,9 @@ impl AppController {
                     "Tracker module preparation failed",
                     "the selected payload contained no supported tracker module",
                 );
+            } else if matches!(owner, TrackerPreparationOwner::ManualStep { .. }) {
+                self.view.status_line =
+                    "The prepared payload contained no supported tracker module".to_owned();
             } else {
                 self.view.status_line =
                     "Canceled tracker preparation contained no playable module".to_owned();
@@ -13537,6 +13588,26 @@ impl AppController {
                 }),
             ),
             TrackerPreparationOwner::Manual => self.play_queue_item(item, false),
+            TrackerPreparationOwner::ManualStep { forward } => {
+                // The step that requested this preparation consumed the parked
+                // resume position only now, when the module can actually play.
+                self.queued_autoplay_resume_origin = None;
+                let insert_at = if forward {
+                    self.playback_queue.items.len()
+                } else {
+                    self.playback_queue.current_index.unwrap_or(0)
+                };
+                self.playback_queue.items.insert(insert_at, item.clone());
+                self.playback_queue.current_index = Some(insert_at);
+                self.play_queue_item_with_origin(
+                    item,
+                    true,
+                    Some(AutoplayOrigin::Tracker {
+                        generation: self.search_generation,
+                        index,
+                    }),
+                );
+            }
             TrackerPreparationOwner::CanceledAutoplay => {
                 unreachable!("canceled preparation returned before queue activation")
             }
@@ -15342,6 +15413,12 @@ impl AppController {
         let Some(item) = self.playback_queue.items.get(row).cloned() else {
             return;
         };
+        // Park the same-source position this jump leaves, exactly as
+        // end-of-file does when explicit entries take over, so the original
+        // list survives a manual detour through queued items.
+        if self.queued_autoplay_resume_origin.is_none() && self.current_autoplay_origin.is_some() {
+            self.queued_autoplay_resume_origin = self.current_autoplay_origin.clone();
+        }
         self.playback_queue.current_index = Some(row);
         // The cursor is already where this item lives, so the playback path
         // must not insert a second copy of it beside itself.
@@ -15355,10 +15432,11 @@ impl AppController {
     /// said what they want, and replaying the same item in answer would look
     /// like the key did nothing.
     ///
-    /// The step stays inside the queue and does not continue into an autoplay
-    /// list. Autoplay's continuation belongs to end-of-file, where the resume
-    /// origin that survives a finished queue is established; a skip borrowing
-    /// that path would have to reproduce the same bookkeeping to be correct.
+    /// At either end of the queue the step continues into the same-source
+    /// list playback started from, backward as well as forward, whether or
+    /// not autoplay is enabled: that toggle decides only what end-of-file
+    /// does on its own. A missing, replaced, or exhausted list is a stated
+    /// refusal rather than a wrap-around.
     fn play_queue_neighbour(&mut self, step: i32) {
         let Some(current) = self.playback_queue.current_index else {
             self.view.status_line = "The queue holds nothing to move through".to_owned();
@@ -15368,15 +15446,82 @@ impl AppController {
             .ok()
             .and_then(|step| current.checked_add_signed(step))
             .filter(|target| *target < self.playback_queue.items.len());
-        let Some(target) = target else {
-            self.view.status_line = if step < 0 {
+        if let Some(target) = target {
+            self.activate_queue_row(target);
+            return;
+        }
+        let backward = step < 0;
+        // A single-step overshoot is by definition at the queue edge and
+        // crosses into the source list; a larger jump keeps the refusal.
+        if step.unsigned_abs() == 1 {
+            self.step_into_source_list(backward);
+            return;
+        }
+        self.view.status_line = if backward {
+            "This is the first item in the queue".to_owned()
+        } else {
+            "This is the last item in the queue".to_owned()
+        };
+    }
+
+    /// Continues a manual queue-edge step into the owning same-source list.
+    ///
+    /// Deliberately not `continue_autoplay`: that path speaks in autoplay's
+    /// voice and maintains end-of-file follow state a keypress does not own.
+    /// The crossed-into entry is recorded as a queue row exactly as
+    /// end-of-file continuation records one, so the queue keeps describing
+    /// what is playing.
+    fn step_into_source_list(&mut self, backward: bool) {
+        let origin = self
+            .queued_autoplay_resume_origin
+            .clone()
+            .or_else(|| self.current_autoplay_origin.clone());
+        let Some(origin) = origin else {
+            self.view.status_line = if backward {
                 "This is the first item in the queue".to_owned()
             } else {
                 "This is the last item in the queue".to_owned()
             };
             return;
         };
-        self.activate_queue_row(target);
+        let direction = if backward {
+            ListStepDirection::Backward
+        } else {
+            ListStepDirection::Forward
+        };
+        match self.neighbour_autoplay_step(&origin, direction) {
+            AutoplayStep::Play { item, origin } => {
+                self.queued_autoplay_resume_origin = None;
+                let insert_at = if backward {
+                    self.playback_queue.current_index.unwrap_or(0)
+                } else {
+                    self.playback_queue.items.len()
+                };
+                self.playback_queue.items.insert(insert_at, (*item).clone());
+                self.playback_queue.current_index = Some(insert_at);
+                self.play_queue_item_with_origin(*item, true, Some(origin));
+            }
+            #[cfg(feature = "tracker-music")]
+            AutoplayStep::PrepareTracker { index, origin: _ } => {
+                // The parked resume position survives until the preparation
+                // completes; a failed download must not lose the only handle
+                // on the list.
+                self.prepare_tracker_item(
+                    index,
+                    TrackerPreparationOwner::ManualStep { forward: !backward },
+                );
+            }
+            AutoplayStep::SourceChanged => {
+                self.view.status_line = "The source list changed since playback started".to_owned();
+            }
+            AutoplayStep::Exhausted => {
+                self.view.status_line = if backward {
+                    "Reached the start of the source list".to_owned()
+                } else {
+                    "Reached the end of the source list".to_owned()
+                };
+            }
+        }
     }
 
     /// Drops one entry, keeping the cursor on the item that is still playing.
@@ -16154,14 +16299,10 @@ impl AppController {
                     self.view.status_line = "No LibriVox section is selected".to_owned();
                     return;
                 };
-                let origin = self
-                    .config
-                    .playback
-                    .autoplay
-                    .then(|| AutoplayOrigin::Librivox {
-                        items: Arc::from(queue),
-                        index: self.view.selected,
-                    });
+                let origin = Some(AutoplayOrigin::Librivox {
+                    items: Arc::from(queue),
+                    index: self.view.selected,
+                });
                 self.play_queue_item_with_origin(item, false, origin);
             }
         }
@@ -16468,19 +16609,15 @@ impl AppController {
             self.view.status_line = "No tracker item is selected".to_owned();
             return true;
         }
-        self.prepare_tracker_item(self.view.selected, None)
+        self.prepare_tracker_item(self.view.selected, TrackerPreparationOwner::Manual)
     }
 
-    /// Starts one selected or autoplay-owned tracker preparation.
+    /// Starts one selected, stepped-to, or autoplay-owned tracker preparation.
     ///
     /// Returns `true` when the request was handled without entering the
     /// ordinary immediate-play path.
     #[cfg(feature = "tracker-music")]
-    fn prepare_tracker_item(
-        &mut self,
-        index: usize,
-        autoplay_origin: Option<AutoplayOrigin>,
-    ) -> bool {
+    fn prepare_tracker_item(&mut self, index: usize, owner: TrackerPreparationOwner) -> bool {
         if self.pending_tracker_preparation.is_some() {
             self.view.status_line =
                 "One tracker module is already being prepared in the background".to_owned();
@@ -16521,11 +16658,7 @@ impl AppController {
         ) {
             return true;
         }
-        let autoplay = autoplay_origin.is_some();
-        let owner = autoplay_origin.map_or(
-            TrackerPreparationOwner::Manual,
-            TrackerPreparationOwner::Autoplay,
-        );
+        let autoplay = matches!(owner, TrackerPreparationOwner::Autoplay(_));
         self.pending_tracker_preparation = Some(PendingTrackerPreparation {
             generation: self.search_generation,
             item_key,
@@ -18892,6 +19025,47 @@ impl AppController {
                     });
                 }
             }
+            // Async playlist replays (Bandcamp, Apple, BBC, …) only complete
+            // while their entry is still selected on this screen, so matching
+            // the selection here captures the origin for every replay branch.
+            Screen::Playlists => {
+                if matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+                    && let Some(playlist) = self.active_playlist.as_ref()
+                    && playlist
+                        .entries
+                        .get(self.view.selected)
+                        .is_some_and(|entry| entry.media.id == *media_id)
+                {
+                    return Some(AutoplayOrigin::Playlist {
+                        entries: playlist.entries.clone().into(),
+                        index: self.view.selected,
+                    });
+                }
+            }
+            // The Downloaded screen is one flat directory listing, so its
+            // continuation is the existing local-browser snapshot over the
+            // downloads directory.
+            Screen::Downloaded => {
+                if media_id.source == SourceKind::Local {
+                    let entries = self
+                        .view
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.media_id.as_ref())
+                        .filter_map(local_path_from_media_id)
+                        .collect::<Vec<_>>();
+                    if let Some(index) = entries
+                        .iter()
+                        .position(|path| local_path_matches_media_id(path, media_id))
+                    {
+                        return Some(AutoplayOrigin::LocalBrowser {
+                            directory: self.config.downloads_dir(),
+                            entries: entries.into(),
+                            index,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -18971,18 +19145,64 @@ impl AppController {
         None
     }
 
+    /// Builds the queue item for a playlist entry that can start without a
+    /// provider round-trip.
+    ///
+    /// Sources whose replay needs an async resolver (Bandcamp, Apple
+    /// Podcasts, BBC, SoundStream, LitRes, Jamendo) return `None` and are
+    /// skipped by list continuation, exactly as autoplay skips scheduled
+    /// YouTube rows: continuation may only start what it can start directly.
+    fn playlist_step_queue_item(&self, entry: &PlaylistEntry) -> Option<QueueItem> {
+        if matches!(
+            entry.media.id.source,
+            SourceKind::Bandcamp
+                | SourceKind::ApplePodcasts
+                | SourceKind::BbcRadio
+                | SourceKind::SoundStream
+                | SourceKind::LitRes
+                | SourceKind::Jamendo
+        ) {
+            return None;
+        }
+        if entry.media.id.source == SourceKind::Local {
+            let path = local_path_from_locator(&entry.media.replay_locator)?;
+            if !path.is_absolute() || !path.is_file() {
+                return None;
+            }
+            return queue_item_from_local(&local_media_item(
+                path,
+                &self.config.providers.ffprobe_executable,
+            ))
+            .ok();
+        }
+        let mut item = queue_item_from_playlist_entry(entry).ok()?;
+        item.media.thumbnail_url = projected_persisted_thumbnail_url(
+            &item.media.id,
+            item.media.thumbnail_url.as_ref(),
+            self.effective_youtube_thumbnail_size(),
+        );
+        Some(item)
+    }
+
     /// Chooses the next playable entry without changing queue or player state.
     fn next_autoplay_step(&self, origin: &AutoplayOrigin) -> AutoplayStep {
+        self.neighbour_autoplay_step(origin, ListStepDirection::Forward)
+    }
+
+    /// Chooses the nearest playable entry in one direction without changing
+    /// queue or player state.
+    fn neighbour_autoplay_step(
+        &self,
+        origin: &AutoplayOrigin,
+        direction: ListStepDirection,
+    ) -> AutoplayStep {
         match origin {
             AutoplayOrigin::YouTube { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.youtube_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| match item {
+                neighbour_list_step(&self.youtube_results, *index, direction, |index, item| {
+                    match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
                                 item: Box::new(queue_item_from_video_with_thumbnail_size(
@@ -18997,18 +19217,18 @@ impl AppController {
                             })
                         }
                         _ => None,
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                    }
+                })
             }
             AutoplayOrigin::YouTubeMusic { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.youtube_music_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| match item {
+                neighbour_list_step(
+                    &self.youtube_music_results,
+                    *index,
+                    direction,
+                    |index, item| match item {
                         SearchItem::Video(video) if video_is_autoplay_playable(video) => {
                             Some(AutoplayStep::Play {
                                 item: Box::new(queue_item_from_video_with_thumbnail_size(
@@ -19023,123 +19243,114 @@ impl AppController {
                             })
                         }
                         _ => None,
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                    },
+                )
             }
             #[cfg(feature = "yandex-music")]
-            AutoplayOrigin::YandexMusic { items, index } => items
-                .get(index.saturating_add(1))
-                .cloned()
-                .map(|item| AutoplayStep::Play {
-                    item: Box::new(item),
-                    origin: AutoplayOrigin::YandexMusic {
-                        items: Arc::clone(items),
-                        index: index.saturating_add(1),
-                    },
-                })
-                .unwrap_or(AutoplayStep::Exhausted),
-            #[cfg(feature = "librivox")]
-            AutoplayOrigin::Librivox { items, index } => items
-                .get(index.saturating_add(1))
-                .cloned()
-                .map(|item| AutoplayStep::Play {
-                    item: Box::new(item),
-                    origin: AutoplayOrigin::Librivox {
-                        items: Arc::clone(items),
-                        index: index.saturating_add(1),
-                    },
-                })
-                .unwrap_or(AutoplayStep::Exhausted),
-            AutoplayOrigin::Subscription { channel_id, index } => self
-                .subscription_video_cache
-                .get(channel_id)
-                .and_then(|cached| {
-                    cached
-                        .items
-                        .iter()
-                        .enumerate()
-                        .skip(index.saturating_add(1))
-                        .find_map(|(index, item)| match item {
-                            SearchItem::Video(video) if video_is_autoplay_playable(video) => {
-                                Some(AutoplayStep::Play {
-                                    item: Box::new(queue_item_from_video_with_thumbnail_size(
-                                        video,
-                                        None,
-                                        self.effective_youtube_thumbnail_size(),
-                                    )),
-                                    origin: AutoplayOrigin::Subscription {
-                                        channel_id: channel_id.clone(),
-                                        index,
-                                    },
-                                })
-                            }
-                            _ => None,
-                        })
-                })
-                .unwrap_or(AutoplayStep::Exhausted),
-            AutoplayOrigin::LocalBrowser {
-                directory,
-                entries,
-                index,
-            } => entries
-                .iter()
-                .enumerate()
-                .skip(index.saturating_add(1))
-                .find_map(|(index, path)| {
-                    queue_item_from_local(&local_media_item(
-                        path.clone(),
-                        &self.config.providers.ffprobe_executable,
-                    ))
-                    .ok()
-                    .map(|item| AutoplayStep::Play {
-                        item: Box::new(item),
-                        origin: AutoplayOrigin::LocalBrowser {
-                            directory: directory.clone(),
-                            entries: Arc::clone(entries),
+            AutoplayOrigin::YandexMusic { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::YandexMusic {
+                            items: Arc::clone(items),
                             index,
                         },
                     })
                 })
-                .unwrap_or(AutoplayStep::Exhausted),
+            }
+            #[cfg(feature = "librivox")]
+            AutoplayOrigin::Librivox { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::Librivox {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
+            AutoplayOrigin::Playlist { entries, index } => {
+                neighbour_list_step(entries, *index, direction, |index, entry| {
+                    self.playlist_step_queue_item(entry)
+                        .map(|item| AutoplayStep::Play {
+                            item: Box::new(item),
+                            origin: AutoplayOrigin::Playlist {
+                                entries: Arc::clone(entries),
+                                index,
+                            },
+                        })
+                })
+            }
+            AutoplayOrigin::Subscription { channel_id, index } => {
+                let Some(cached) = self.subscription_video_cache.get(channel_id) else {
+                    return AutoplayStep::Exhausted;
+                };
+                neighbour_list_step(&cached.items, *index, direction, |index, item| match item {
+                    SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                        Some(AutoplayStep::Play {
+                            item: Box::new(queue_item_from_video_with_thumbnail_size(
+                                video,
+                                None,
+                                self.effective_youtube_thumbnail_size(),
+                            )),
+                            origin: AutoplayOrigin::Subscription {
+                                channel_id: channel_id.clone(),
+                                index,
+                            },
+                        })
+                    }
+                    _ => None,
+                })
+            }
+            AutoplayOrigin::LocalBrowser {
+                directory,
+                entries,
+                index,
+            } => neighbour_list_step(entries, *index, direction, |index, path| {
+                queue_item_from_local(&local_media_item(
+                    path.clone(),
+                    &self.config.providers.ffprobe_executable,
+                ))
+                .ok()
+                .map(|item| AutoplayStep::Play {
+                    item: Box::new(item),
+                    origin: AutoplayOrigin::LocalBrowser {
+                        directory: directory.clone(),
+                        entries: Arc::clone(entries),
+                        index,
+                    },
+                })
+            }),
             AutoplayOrigin::LocalScan { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                self.local_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                    .find_map(|(index, item)| {
-                        queue_item_from_local(item)
-                            .ok()
-                            .map(|item| AutoplayStep::Play {
-                                item: Box::new(item),
-                                origin: AutoplayOrigin::LocalScan {
-                                    generation: *generation,
-                                    index,
-                                },
-                            })
-                    })
-                    .unwrap_or(AutoplayStep::Exhausted)
+                neighbour_list_step(&self.local_results, *index, direction, |index, item| {
+                    queue_item_from_local(item)
+                        .ok()
+                        .map(|item| AutoplayStep::Play {
+                            item: Box::new(item),
+                            origin: AutoplayOrigin::LocalScan {
+                                generation: *generation,
+                                index,
+                            },
+                        })
+                })
             }
             AutoplayOrigin::Tracker { generation, index } => {
                 if *generation != self.search_generation {
                     return AutoplayStep::SourceChanged;
                 }
-                for (index, item) in self
-                    .tracker_results
-                    .iter()
-                    .enumerate()
-                    .skip(index.saturating_add(1))
-                {
+                neighbour_list_step(&self.tracker_results, *index, direction, |index, item| {
                     if let Ok(item) = queue_item_from_tracker(item) {
-                        return AutoplayStep::Play {
+                        return Some(AutoplayStep::Play {
                             item: Box::new(item),
                             origin: AutoplayOrigin::Tracker {
                                 generation: *generation,
                                 index,
                             },
-                        };
+                        });
                     }
                     #[cfg(feature = "tracker-music")]
                     if item.download_url.is_some()
@@ -19148,16 +19359,16 @@ impl AppController {
                             TrackerAccess::DirectModule | TrackerAccess::ArchiveNeedsInspection
                         )
                     {
-                        return AutoplayStep::PrepareTracker {
+                        return Some(AutoplayStep::PrepareTracker {
                             index,
                             origin: AutoplayOrigin::Tracker {
                                 generation: *generation,
                                 index,
                             },
-                        };
+                        });
                     }
-                }
-                AutoplayStep::Exhausted
+                    None
+                })
             }
         }
     }
@@ -19170,7 +19381,7 @@ impl AppController {
             }
             #[cfg(feature = "tracker-music")]
             AutoplayStep::PrepareTracker { index, origin } => {
-                self.prepare_tracker_item(index, Some(origin));
+                self.prepare_tracker_item(index, TrackerPreparationOwner::Autoplay(origin));
             }
             AutoplayStep::SourceChanged => {
                 #[cfg(feature = "waveform")]
@@ -19191,12 +19402,10 @@ impl AppController {
     }
 
     fn play_queue_item(&mut self, item: QueueItem, queue_cursor_already_positioned: bool) {
-        let origin = self
-            .config
-            .playback
-            .autoplay
-            .then(|| self.autoplay_origin_for_media(&item.media.id))
-            .flatten();
+        // The same-source position is captured whether or not autoplay is on:
+        // the toggle gates only end-of-file continuation, while a manual
+        // queue-edge step may consume the position at any time.
+        let origin = self.autoplay_origin_for_media(&item.media.id);
         self.play_queue_item_with_origin(item, queue_cursor_already_positioned, origin);
     }
 
@@ -19798,9 +20007,10 @@ impl AppController {
                 }
                 match self.playback_queue.advance().cloned() {
                     Some(next) => {
-                        if self.config.playback.autoplay
-                            && self.queued_autoplay_resume_origin.is_none()
-                            && autoplay_origin.is_some()
+                        // Parked even with autoplay off: a manual queue-edge
+                        // step may consume this position after the explicit
+                        // entries finish.
+                        if self.queued_autoplay_resume_origin.is_none() && autoplay_origin.is_some()
                         {
                             self.queued_autoplay_resume_origin = autoplay_origin;
                         }
@@ -24910,7 +25120,9 @@ impl AppController {
             return;
         }
         if !autoplay {
-            self.queued_autoplay_resume_origin = None;
+            // The parked resume position is kept: a manual queue-edge step
+            // may still consume it, and re-enabling autoplay would otherwise
+            // forget where the list continuation stood.
             #[cfg(feature = "tracker-music")]
             self.cancel_pending_tracker_autoplay();
         } else if self.current_autoplay_origin.is_none()
@@ -24929,7 +25141,10 @@ impl AppController {
         let Some(pending) = self.pending_tracker_preparation.as_mut() else {
             return;
         };
-        if matches!(&pending.owner, TrackerPreparationOwner::Autoplay(_)) {
+        if matches!(
+            &pending.owner,
+            TrackerPreparationOwner::Autoplay(_) | TrackerPreparationOwner::ManualStep { .. }
+        ) {
             pending.owner = TrackerPreparationOwner::CanceledAutoplay;
             self.clear_playback_start_activity();
         }
@@ -34794,7 +35009,7 @@ mod tests {
     }
 
     /// Stops the real provider worker and returns a deterministic request tap.
-    #[cfg(feature = "librivox")]
+    #[cfg(any(feature = "librivox", feature = "tracker-music"))]
     fn capture_controller_provider_requests(
         controller: &mut AppController,
     ) -> Receiver<ProviderRequest> {
@@ -54092,6 +54307,9 @@ mod tests {
     /// Repeat-one governs what happens when an item ends. Consulting it here
     /// would answer a deliberate press by replaying the same track, which is
     /// indistinguishable from a key that does nothing.
+    ///
+    /// The edges refuse here because no source list owns these direct items;
+    /// a queue that grew out of a list continues into it instead.
     #[test]
     fn stepping_through_the_queue_moves_by_one_entry_and_stops_at_the_ends() {
         let (mut controller, _) =
@@ -55941,6 +56159,666 @@ mod tests {
         assert_eq!(controller.view.status_line, "Playback queue finished");
     }
 
+    /// `}` at the queue edge continues into the list playback started from,
+    /// with autoplay off: that toggle governs end-of-file, not a deliberate
+    /// keypress. Unplayable scheduled rows are skipped exactly as autoplay
+    /// skips them.
+    #[test]
+    fn manual_next_crosses_into_the_youtube_list_with_autoplay_off() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut scheduled = first.clone();
+        scheduled.video_id = "planned0000".to_owned();
+        scheduled.title = "Scheduled placeholder".to_owned();
+        scheduled.duration_seconds = Some(0);
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results = vec![
+            SearchItem::Video(first.clone()),
+            SearchItem::Video(scheduled),
+            SearchItem::Video(second),
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 2,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        assert_eq!(
+            controller.playback_queue.items[1].media.title, "Second playable video",
+            "the crossed-into item must be recorded as a queue entry"
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// `{` at the queue start steps backward through the same list, and the
+    /// earlier item is prepended so the queue keeps reading in play order.
+    #[test]
+    fn manual_previous_steps_back_into_the_youtube_list() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first), SearchItem::Video(second.clone())];
+        controller.view.selected = 1;
+        controller.play_queue_item(queue_item_from_video(&second, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Second playable video", "Fixture video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(controller.playback_queue.items.len(), 2);
+        assert_eq!(
+            controller.playback_queue.items[0].media.title,
+            "Fixture video"
+        );
+    }
+
+    /// A replaced search refuses the step, exactly as it stops autoplay.
+    #[test]
+    fn manual_step_refuses_a_replaced_source_list() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller.search_generation = controller.search_generation.wrapping_add(1);
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state.lock().expect("mock state").played.len(),
+            1,
+            "a stale origin must not start anything"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "The source list changed since playback started"
+        );
+        assert_eq!(controller.playback_queue.items.len(), 1);
+    }
+
+    /// List edges are stated refusals rather than wrap-arounds, both ways.
+    #[test]
+    fn manual_step_refuses_at_the_source_list_edges() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+        assert_eq!(
+            controller.view.status_line,
+            "Reached the start of the source list"
+        );
+        assert_eq!(state.lock().expect("mock state").played.len(), 1);
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+        assert_eq!(
+            controller.view.status_line,
+            "Reached the end of the source list"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"]
+        );
+    }
+
+    /// Explicit queue entries still run before the list continues, and the
+    /// manual jump parks the list position the way end-of-file does.
+    #[test]
+    fn explicit_queue_entries_still_outrank_the_source_list_on_manual_next() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra"],
+            "the queued entry must outrank the source list"
+        );
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "the list position must be parked across the explicit entry"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// Repeat-one still loses to a deliberate press, now also at the edge.
+    #[test]
+    fn manual_next_ignores_repeat_one_at_the_queue_edge() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.update_player();
+        controller.playback_queue.repeat_one = true;
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Second playable video"],
+            "repeat-one must not answer a next-track press with a replay"
+        );
+    }
+
+    /// End-of-file parks the list position across explicit entries even with
+    /// autoplay off, so a later `}` can still continue the list.
+    #[test]
+    fn parked_origin_survives_the_queue_and_autoplay_off_for_manual_next() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra"]
+        );
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "end-of-file must park the position with autoplay off"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// Turning autoplay off must not forget where the list continuation
+    /// stood: the manual step may still consume it.
+    #[test]
+    fn toggling_autoplay_off_keeps_the_manual_step_position() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (factory, state, _, events) = mock_playback_factory(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.view.selected = 0;
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller
+            .playback_queue
+            .push(fixture_direct_item("explicit extra"));
+        controller.update_player();
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        controller.update_player();
+
+        controller.dispatch(UiAction::ToggleAutoplay);
+        assert!(!controller.config.playback.autoplay);
+        assert_eq!(
+            controller.queued_autoplay_resume_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 0,
+            }),
+            "disabling autoplay must keep the parked position"
+        );
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "explicit extra", "Second playable video"]
+        );
+    }
+
+    fn fixture_youtube_playlist_entry(video_id: &str, title: &str) -> PlaylistEntry {
+        let page = url::Url::parse(&format!("https://www.youtube.com/watch?v={video_id}"))
+            .expect("fixture playlist page");
+        PlaylistEntry {
+            media: PlaylistMediaSnapshot {
+                id: MediaId::new(SourceKind::YouTube, video_id),
+                kind: MediaKind::Video,
+                title: title.to_owned(),
+                creator: Some("Fixture channel".to_owned()),
+                webpage_url: page.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(120),
+                replay_locator: page.to_string(),
+            },
+            segment: None,
+            added_at: 1,
+        }
+    }
+
+    fn controller_with_active_playlist(
+        controller: &mut AppController,
+        entries: Vec<PlaylistEntry>,
+    ) {
+        controller.view.screen = Screen::Playlists;
+        controller.playlists_route = PlaylistsRoute::Entries {
+            playlist_id: "fixture-playlist".to_owned(),
+        };
+        controller.active_playlist = Some(Playlist {
+            id: "fixture-playlist".to_owned(),
+            name: "Fixture playlist".to_owned(),
+            description: None,
+            entries,
+        });
+        controller.view.selected = 0;
+    }
+
+    /// `}` at the queue edge continues through the playlist an entry was
+    /// started from, with autoplay off.
+    #[test]
+    fn manual_next_crosses_into_the_playlist_entries() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let entries = vec![
+            fixture_youtube_playlist_entry("dQw4w9WgXcQ", "First playlist video"),
+            fixture_youtube_playlist_entry("9bZkp7q19f0", "Second playlist video"),
+        ];
+        controller_with_active_playlist(&mut controller, entries.clone());
+        controller.activate_playlist_selection();
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First playlist video", "Second playlist video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::Playlist {
+                entries: entries.into(),
+                index: 1,
+            })
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+    }
+
+    /// Continuation only starts what it can start directly: playlist entries
+    /// whose replay needs a provider round-trip are skipped, exactly as
+    /// autoplay skips scheduled YouTube rows.
+    #[test]
+    fn manual_step_skips_playlist_entries_that_need_a_resolver() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let bandcamp_page = url::Url::parse("https://fixture.bandcamp.com/track/fixture")
+            .expect("fixture Bandcamp page");
+        let bandcamp_entry = PlaylistEntry {
+            media: PlaylistMediaSnapshot {
+                id: MediaId::new(SourceKind::Bandcamp, "fixture-artist/fixture-track"),
+                kind: MediaKind::Audio,
+                title: "Bandcamp between".to_owned(),
+                creator: Some("Fixture artist".to_owned()),
+                webpage_url: bandcamp_page.clone(),
+                thumbnail_url: None,
+                duration_seconds: Some(240),
+                replay_locator: bandcamp_page.to_string(),
+            },
+            segment: None,
+            added_at: 1,
+        };
+        let entries = vec![
+            fixture_youtube_playlist_entry("dQw4w9WgXcQ", "First playlist video"),
+            bandcamp_entry,
+            fixture_youtube_playlist_entry("9bZkp7q19f0", "Third playlist video"),
+        ];
+        controller_with_active_playlist(&mut controller, entries.clone());
+        controller.activate_playlist_selection();
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First playlist video", "Third playlist video"]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::Playlist {
+                entries: entries.into(),
+                index: 2,
+            })
+        );
+    }
+
+    /// `}` on the Downloaded screen continues through the downloads listing,
+    /// which owns its rows the way a browsed local directory does.
+    #[test]
+    fn manual_next_crosses_into_the_downloaded_listing() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let downloads = config.downloads_dir();
+        std::fs::create_dir_all(&downloads).expect("downloads directory");
+        std::fs::write(downloads.join("first.mp3"), b"first").expect("first fixture");
+        std::fs::write(downloads.join("second.flac"), b"second").expect("second fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (factory, state, _, _) = mock_playback_factory(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, Some(factory));
+        controller.view.screen = Screen::Downloaded;
+        controller.populate_downloads();
+        let row_paths = controller
+            .view
+            .rows
+            .iter()
+            .filter_map(|row| row.media_id.as_ref())
+            .filter_map(local_path_from_media_id)
+            .collect::<Vec<_>>();
+        assert_eq!(row_paths.len(), 2, "both fixture downloads must be listed");
+        controller.view.selected = 0;
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .map(|input| input.location.clone())
+                .collect::<Vec<_>>(),
+            [
+                url::Url::from_file_path(&row_paths[0])
+                    .expect("first downloaded URL")
+                    .to_string(),
+                url::Url::from_file_path(&row_paths[1])
+                    .expect("second downloaded URL")
+                    .to_string()
+            ]
+        );
+        assert!(matches!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::LocalBrowser { index: 1, .. })
+        ));
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+    }
+
     #[test]
     fn seeking_after_playback_finishes_does_not_command_the_idle_backend() {
         let active = PlaybackStatus {
@@ -56852,6 +57730,201 @@ mod tests {
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str()),
             Some("youta-prepared-fixture.mod")
+        );
+    }
+
+    /// `}` onto an unprepared tracker module downloads it and then plays it,
+    /// with autoplay off: the preparation belongs to the keypress, not to
+    /// autoplay's ownership rules.
+    #[cfg(feature = "tracker-music")]
+    #[test]
+    fn manual_next_prepares_an_unprepared_tracker_module_with_autoplay_off() {
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
+        let first_path = directory.path().join("first.mod");
+        std::fs::write(&first_path, b"first").expect("first fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.view.screen = Screen::TrackerMusic;
+        let item_key = "https://mods.example/remote";
+        controller.tracker_results = vec![
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "First module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse("https://mods.example/first")
+                    .expect("tracker page URL"),
+                download_url: None,
+                expected_format: None,
+                access: TrackerAccess::DirectModule,
+                prepared_path: Some(first_path),
+                insecure_transport: false,
+            },
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Remote module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse(item_key).expect("tracker page URL"),
+                download_url: url::Url::parse("https://mods.example/remote.zip").ok(),
+                expected_format: None,
+                access: TrackerAccess::ArchiveNeedsInspection,
+                prepared_path: None,
+                insecure_transport: false,
+            },
+        ];
+        controller.view.selected = 0;
+        controller.play_queue_item(
+            queue_item_from_tracker(&controller.tracker_results[0]).expect("first queue item"),
+            false,
+        );
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(1));
+
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(ProviderRequest::PrepareTracker { .. })
+        ));
+        assert_eq!(
+            controller
+                .pending_tracker_preparation
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(&TrackerPreparationOwner::ManualStep { forward: true })
+        );
+
+        let prepared = directory.path().join("remote.mod");
+        std::fs::write(&prepared, b"remote").expect("prepared fixture");
+        controller.handle_provider_response(ProviderResponse::TrackerPrepared {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            result: Ok(vec![crate::tracker_media::PreparedTrackerModule {
+                path: prepared,
+                display_name: "Remote module".to_owned(),
+                format: "mod".to_owned(),
+                size_bytes: 6,
+            }]),
+        });
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["First module", "Remote module"]
+        );
+        assert_eq!(controller.playback_queue.items.len(), 2);
+        assert_eq!(controller.playback_queue.current_index, Some(1));
+        assert!(controller.queued_autoplay_resume_origin.is_none());
+    }
+
+    /// `{` onto an unprepared tracker module prepends the prepared result so
+    /// the queue keeps reading in play order.
+    #[cfg(feature = "tracker-music")]
+    #[test]
+    fn manual_previous_prepares_an_unprepared_tracker_module_before_the_queue() {
+        let directory = crate::test_support::canonical_tempdir("temporary tracker folder");
+        let second_path = directory.path().join("second.xm");
+        std::fs::write(&second_path, b"second").expect("second fixture");
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(1),
+            duration: Some(Duration::from_secs(1)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle(
+            [active],
+            [PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted],
+        );
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.view.screen = Screen::TrackerMusic;
+        let item_key = "https://mods.example/remote";
+        controller.tracker_results = vec![
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Remote module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse(item_key).expect("tracker page URL"),
+                download_url: url::Url::parse("https://mods.example/remote.zip").ok(),
+                expected_format: None,
+                access: TrackerAccess::ArchiveNeedsInspection,
+                prepared_path: None,
+                insecure_transport: false,
+            },
+            TrackerItem {
+                source: "Fixture archive".to_owned(),
+                title: "Second module".to_owned(),
+                subtitle: String::new(),
+                webpage_url: url::Url::parse("https://mods.example/second")
+                    .expect("tracker page URL"),
+                download_url: None,
+                expected_format: None,
+                access: TrackerAccess::DirectModule,
+                prepared_path: Some(second_path),
+                insecure_transport: false,
+            },
+        ];
+        controller.view.selected = 1;
+        controller.play_queue_item(
+            queue_item_from_tracker(&controller.tracker_results[1]).expect("second queue item"),
+            false,
+        );
+        controller.update_player();
+
+        controller.dispatch(UiAction::PlayQueueNeighbour(-1));
+
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(ProviderRequest::PrepareTracker { .. })
+        ));
+        assert_eq!(
+            controller
+                .pending_tracker_preparation
+                .as_ref()
+                .map(|pending| &pending.owner),
+            Some(&TrackerPreparationOwner::ManualStep { forward: false })
+        );
+
+        let prepared = directory.path().join("remote.mod");
+        std::fs::write(&prepared, b"remote").expect("prepared fixture");
+        controller.handle_provider_response(ProviderResponse::TrackerPrepared {
+            generation: controller.search_generation,
+            item_key: item_key.to_owned(),
+            result: Ok(vec![crate::tracker_media::PreparedTrackerModule {
+                path: prepared,
+                display_name: "Remote module".to_owned(),
+                format: "mod".to_owned(),
+                size_bytes: 6,
+            }]),
+        });
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Second module", "Remote module"]
+        );
+        assert_eq!(controller.playback_queue.current_index, Some(0));
+        assert_eq!(
+            controller.playback_queue.items[0].media.title, "Remote module",
+            "the crossed-into item must be prepended before the queue"
         );
     }
 

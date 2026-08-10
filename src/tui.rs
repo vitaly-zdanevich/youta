@@ -6269,7 +6269,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
-        "  {/} previous / next item in the queue",
+        "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
         "",

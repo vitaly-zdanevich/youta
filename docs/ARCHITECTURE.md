@@ -682,7 +682,13 @@ selection belongs in configuration and is compile-time removable.
 ### Queue and cuts
 
 The active queue is an ordered list independent from user playlists. `Play
-next` inserts after the active item; `Add to queue` appends. A cut is a
+next` inserts after the active item; `Add to queue` appends. Manual transport
+stepping (`{`/`}`, media keys, tray) moves through the queue and, at either
+edge, crosses into the owning same-source list in both directions regardless
+of `playback.autoplay`; the crossed-into item is appended or prepended as a
+queue row. User playlists and the Downloaded listing are owning lists too;
+playlist entries whose replay needs a provider round-trip are skipped by
+continuation. A cut is a
 non-destructive media reference plus `[start, end)` timestamps, title, comment,
 and playlist placement. Lossless export is possible only when container and
 codec boundaries permit a stream copy; otherwise Youta must label the operation
