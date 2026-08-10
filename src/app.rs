@@ -1880,7 +1880,13 @@ fn publish_radio_recording(
 #[cfg(feature = "radio")]
 fn publish_file_without_replacement(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::hard_link(source, destination)?;
-    std::fs::File::open(destination)?.sync_all()
+    // The durability flush needs a handle with write access: Windows refuses
+    // `FlushFileBuffers` on a read-only handle with "Access is denied", while
+    // Unix has always allowed `fsync` on either kind.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(destination)?
+        .sync_all()
 }
 
 /// Copies across filesystems into a hidden Downloaded staging file before final publication.
@@ -34651,6 +34657,20 @@ mod tests {
 
     use super::*;
 
+    /// Returns `path` as this platform spells an absolute path.
+    ///
+    /// `/music` is absolute only where the filesystem has one root; on Windows
+    /// it is a relative path, and every place that validates a Local locator —
+    /// history replay, playlist membership, queue building — correctly refuses
+    /// it before the behaviour under test is ever reached.
+    fn fixture_absolute(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     /// Stable public author shared by LibriVox controller regression fixtures.
     #[cfg(feature = "librivox")]
     fn librivox_author_fixture() -> LibrivoxAuthor {
@@ -46945,7 +46965,7 @@ mod tests {
     #[test]
     fn local_artwork_worker_response_updates_only_the_matching_details_path() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
-        let media_path = PathBuf::from("/tmp/youta-local-artwork.flac");
+        let media_path = fixture_absolute("/tmp/youta-local-artwork.flac");
         controller.view.details = Some(DetailView {
             media_id: Some(MediaId::new(
                 SourceKind::Local,
@@ -46954,8 +46974,8 @@ mod tests {
             ..DetailView::default()
         });
         controller.pending_local_artwork = Some((7, media_path.clone()));
-        let artwork =
-            url::Url::parse("file:///tmp/youta-local-artwork-cover.png").expect("artwork URL");
+        let artwork = url::Url::from_file_path(fixture_absolute("/tmp/youta-local-artwork.png"))
+            .expect("artwork URL");
 
         controller.handle_provider_response(ProviderResponse::LocalArtwork {
             generation: 7,
@@ -54713,8 +54733,9 @@ mod tests {
             "https://cdn.example/episode.m4a"
         );
 
+        let local_path = fixture_absolute("/tmp/youta-fixture.flac");
         let local = LocalMediaItem {
-            path: PathBuf::from("/tmp/youta-fixture.flac"),
+            path: local_path.clone(),
             title: "Local".to_owned(),
             artist: Some("Artist One; Artist Two".to_owned()),
             album: Some("Album".to_owned()),
@@ -54751,7 +54772,9 @@ mod tests {
         }
         assert_eq!(
             queued_local.playback_location,
-            "file:///tmp/youta-fixture.flac"
+            url::Url::from_file_path(&local_path)
+                .expect("absolute fixture URL")
+                .to_string()
         );
 
         let tracker = TrackerItem {
@@ -54867,13 +54890,15 @@ mod tests {
         }];
         controller.view.screen = Screen::TrackerMusic;
         controller.refresh_tracker_rows();
+        let replay_path = fixture_absolute("/music/Дед инсайд.flac");
+        let replay_locator = replay_path.to_str().expect("UTF-8 fixture locator");
         controller
             .store
             .insert_history(&HistoryEntry {
                 id: 0,
-                media_id: MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"),
+                media_id: MediaId::new(SourceKind::Local, replay_locator),
                 title: "Дед инсайд".to_owned(),
-                replay_locator: Some("/music/Дед инсайд.flac".to_owned()),
+                replay_locator: Some(replay_locator.to_owned()),
                 started_at: 10,
                 last_played_at: 11,
                 position_seconds: 0,
@@ -54890,7 +54915,7 @@ mod tests {
         assert_eq!(details.description, "Removed");
         assert_eq!(
             details.media_id,
-            Some(MediaId::new(SourceKind::Local, "/music/Дед инсайд.flac"))
+            Some(MediaId::new(SourceKind::Local, replay_locator))
         );
         assert!(!details.description.contains(stale_url.as_str()));
     }

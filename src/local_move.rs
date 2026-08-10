@@ -456,7 +456,7 @@ pub fn list_local_move_destinations(
     let directory = canonical_real_directory(directory)?;
     let parent = directory
         .parent()
-        .map(fs::canonicalize)
+        .map(crate::fs_path::canonicalize)
         .transpose()
         .map_err(|source| LocalMoveValidationError::Inspect {
             path: directory.clone(),
