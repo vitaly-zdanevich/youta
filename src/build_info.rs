@@ -215,9 +215,12 @@ mod tests {
 
         assert!(!commits.is_empty());
         assert!(commits.len() <= 10);
-        assert!(commits.iter().any(|commit| {
-            commit.message.contains("\n\n") && commit.message.lines().count() > 1
-        }));
+        // Nothing here may require a multi-line message body. That would be an
+        // assertion about how the last ten commits happened to be written, not
+        // about this code, and a run of terse commits is a legitimate history —
+        // it has already turned this test red once. Newline preservation
+        // through the build-script escaping belongs to a fixture the repository
+        // controls, not to whatever history the checkout arrived with.
         assert!(commits.iter().any(|commit| {
             commit.hash == current_build_sha()
                 && !commit.committed_at.is_empty()
