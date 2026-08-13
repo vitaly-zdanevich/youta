@@ -4,8 +4,10 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
+
+#[cfg(unix)]
+use std::process::Command;
 
 fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
@@ -632,9 +634,13 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     assert!(readme.contains("standalone GUI executable"));
 }
 
-/// Empty repository secrets are exported by Actions as present-but-empty
-/// variables. Unsigned macOS packaging must tell Tauri not to sign, while a
-/// configured certificate keeps Tauri's ordinary signing path.
+/// Empty repository secrets are exported by Actions as present-but-empty.
+///
+/// The executable probe is Unix-only because resolving `bash` on Windows can
+/// select the WSL launcher instead of the Git Bash used by the release job.
+/// Windows still checks the integration contract in the platform-independent
+/// test below.
+#[cfg(unix)]
 #[test]
 fn desktop_signing_mode_distinguishes_unsigned_and_configured_macos_builds() {
     let helper = repository_path("scripts/desktop-signing-mode.sh");
@@ -677,6 +683,15 @@ configure_desktop_tauri_signing_args linux
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Every host validates that desktop packaging selects signing mode before a
+/// pinned Tauri invocation, without requiring that host to launch Bash.
+#[test]
+fn desktop_signing_mode_precedes_the_pinned_tauri_invocation() {
+    let helper = read_repository_file("scripts/desktop-signing-mode.sh");
+    assert!(helper.contains("configure_desktop_tauri_signing_args"));
+    assert!(helper.contains("tauri_signing_args+=(--no-sign)"));
 
     let packaging = read_repository_file("scripts/package-desktop.sh");
     let source_helper = packaging
