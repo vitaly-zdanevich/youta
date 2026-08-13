@@ -895,6 +895,34 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Waits until a subprocess fixture publishes one complete, nonzero PID.
+    ///
+    /// Shell redirection creates the marker before `printf` writes its value.
+    /// Requiring the trailing newline prevents a loaded test runner from
+    /// observing an empty or partially written marker as a ready fixture.
+    #[cfg(unix)]
+    fn wait_for_process_marker(marker: &std::path::Path, deadline: Instant) -> u32 {
+        loop {
+            match std::fs::read_to_string(marker) {
+                Ok(contents) => {
+                    if let Some(serialized_pid) = contents.strip_suffix('\n')
+                        && let Ok(pid) = serialized_pid.parse::<u32>()
+                        && pid != 0
+                    {
+                        return pid;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read subprocess marker: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mock child must publish its PID before cancellation"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Waits for Linux to publish a killed fixture process as gone or zombie.
     ///
     /// A successful process-group signal can precede the target's final
@@ -1286,7 +1314,7 @@ exit 7"#,
         let marker_directory = tempfile::tempdir().expect("temporary cancellation marker");
         let marker = marker_directory.path().join("child.pid");
         let executable = MockExecutable::new(&format!(
-            "printf '%s' \"$$\" > '{}'\nexec sleep 10",
+            "printf '%s\\n' \"$$\" > '{}'\nexec sleep 10",
             marker.display()
         ));
         let resolver = resolver_for(&executable, Duration::from_secs(5), 1024, 1024);
@@ -1299,14 +1327,7 @@ exit 7"#,
             )
         });
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(marker.exists(), "mock child must start before cancellation");
-        // Only Linux can then confirm the reap through `/proc`.
-        #[cfg(target_os = "linux")]
-        let pid = std::fs::read_to_string(&marker).expect("read mock child PID");
+        let pid = wait_for_process_marker(&marker, Instant::now() + Duration::from_secs(3));
         cancellation.cancel();
         let completion = worker.join().expect("join cancellation worker");
 
@@ -1321,6 +1342,8 @@ exit 7"#,
             !PathBuf::from(format!("/proc/{pid}")).exists(),
             "the cancelled child must be reaped"
         );
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
     }
 
     #[cfg(unix)]
