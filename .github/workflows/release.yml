@@ -458,8 +458,8 @@ jobs:
           security list-keychain -d user -s "${keychain}" login.keychain-db
           rm -f "${RUNNER_TEMP}/certificate.p12"
 
-      # The Apple variables are empty when the secrets do not exist, which is
-      # exactly how the Tauri bundler is told to skip signing and notarization.
+      # The packaging boundary translates an absent or empty Apple certificate
+      # into Tauri's explicit `--no-sign` mode and preserves configured secrets.
       - name: Build the desktop bundles
         run: scripts/package-desktop.sh dist-desktop
 

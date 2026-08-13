@@ -16,6 +16,8 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(CDPATH= cd -- "${script_dir}/.." && pwd)
+# shellcheck source=scripts/desktop-signing-mode.sh
+source "${script_dir}/desktop-signing-mode.sh"
 cd "${repository_root}"
 
 version=$(
@@ -107,14 +109,15 @@ export YOUTA_BUILD_ORIGIN=github-release
 npm --prefix gui/ui ci
 npm --prefix gui/ui run build
 
-# `--no-bundle` is deliberately absent: the bundles are the artefact. Signing is
-# driven entirely by environment variables the workflow supplies from secrets,
-# so an unsigned local build and a signed release build run the same command.
+# `--no-bundle` is deliberately absent: the bundles are the artefact. A macOS
+# build without a certificate passes Tauri's supported `--no-sign` switch;
+# configured signing and notarization environment variables pass through.
 #
 # The bundler runs from `gui/`, where its configuration lives: every path inside
 # that file, including the page directory and the icons, is written relative to
 # it. The workspace target directory stays at the repository root regardless.
-(cd gui && npx --yes "@tauri-apps/cli@2" build)
+configure_desktop_tauri_signing_args "${operating_system}"
+(cd gui && npx --yes "@tauri-apps/cli@2.11.4" build "${tauri_signing_args[@]}")
 
 produced_executable="target/release/youta-gui${executable_extension}"
 [[ -f ${produced_executable} ]] || {

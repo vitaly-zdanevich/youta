@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
@@ -629,6 +630,72 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         "an unsigned installer is something a user meets before Youta starts"
     );
     assert!(readme.contains("standalone GUI executable"));
+}
+
+/// Empty repository secrets are exported by Actions as present-but-empty
+/// variables. Unsigned macOS packaging must tell Tauri not to sign, while a
+/// configured certificate keeps Tauri's ordinary signing path.
+#[test]
+fn desktop_signing_mode_distinguishes_unsigned_and_configured_macos_builds() {
+    let helper = repository_path("scripts/desktop-signing-mode.sh");
+    let probe = r#"
+set -Eeuo pipefail
+source "$1"
+
+unset APPLE_CERTIFICATE
+configure_desktop_tauri_signing_args macos
+[[ ${#tauri_signing_args[@]} -eq 1 && ${tauri_signing_args[0]} == --no-sign ]]
+
+export APPLE_CERTIFICATE=
+configure_desktop_tauri_signing_args macos
+[[ ${#tauri_signing_args[@]} -eq 1 && ${tauri_signing_args[0]} == --no-sign ]]
+declare -p APPLE_CERTIFICATE > /dev/null
+[[ -z ${APPLE_CERTIFICATE} ]]
+
+export APPLE_CERTIFICATE=configured-certificate
+configure_desktop_tauri_signing_args macos
+[[ ${#tauri_signing_args[@]} -eq 0 ]]
+[[ ${APPLE_CERTIFICATE} == configured-certificate ]]
+bash -c '[[ ${APPLE_CERTIFICATE} == configured-certificate ]]'
+
+APPLE_CERTIFICATE=
+configure_desktop_tauri_signing_args linux
+[[ ${#tauri_signing_args[@]} -eq 0 ]]
+"#;
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(probe)
+        .arg("desktop-signing-mode-test")
+        .arg(&helper)
+        .output()
+        .expect("bash must execute the signing-mode regression probe");
+
+    assert!(
+        output.status.success(),
+        "desktop signing mode selection failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let packaging = read_repository_file("scripts/package-desktop.sh");
+    let source_helper = packaging
+        .find("desktop-signing-mode.sh")
+        .expect("desktop packaging sources the signing-mode helper");
+    let configure = packaging
+        .find("configure_desktop_tauri_signing_args")
+        .expect("desktop packaging configures Tauri's signing arguments");
+    let tauri = packaging
+        .find("@tauri-apps/cli@2.11.4")
+        .expect("desktop packaging pins the Tauri CLI with --no-sign support");
+    assert!(
+        source_helper < configure && configure < tauri,
+        "unsigned macOS mode must be selected before Tauri starts"
+    );
+    assert!(
+        !packaging.contains("\"@tauri-apps/cli@2\""),
+        "desktop packaging must not float across Tauri 2.x releases"
+    );
 }
 
 #[test]
