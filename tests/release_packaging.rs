@@ -355,13 +355,13 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         "suffixes=('' -text -no-qr -text-no-qr)",
         "linux_platforms=(linux-amd64 linux-i686 linux-arm64)",
         "no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)",
-        // Sixty-four terminal executables and checksums, ten standalone GUI
+        // Sixty-four terminal executables and checksums, twelve standalone GUI
         // executables and checksums, eighteen desktop installers and checksums,
         // the source-only vendor archive, and the plain license notice, each
         // with its checksum.
-        "readonly expected_asset_count=96",
+        "readonly expected_asset_count=98",
         "executable=\"youta-${version}-${platform}${suffix}\"",
-        "desktop_executables=(linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
+        "desktop_executables=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
         "gui_executable=\"youta-gui-${version}-${platform}${extension}\"",
         "vendor_archive=\"youta-${version}-vendor.tar.xz\"",
         "license_notice=\"youta-${version}-LICENSE.txt\"",
@@ -603,8 +603,35 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
             "the release asset contract omits `{platform}`"
         );
     }
-    assert!(release.contains("readonly expected_asset_count=96"));
+    assert!(
+        release.contains("desktop_executables=(linux-amd64 linux-i686 linux-arm64"),
+        "the desktop executable contract must include Linux i686"
+    );
+    assert!(release.contains("readonly expected_asset_count=98"));
     assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
+    assert!(
+        release
+            .contains("scripts/package-desktop-executable.sh i686-unknown-linux-gnu dist-desktop")
+    );
+    let cross_packaging = read_repository_file("scripts/package-desktop-executable.sh");
+    assert!(cross_packaging.contains("@tauri-apps/cli@2.11.4"));
+    assert!(cross_packaging.contains("--target \"${target}\""));
+    assert!(cross_packaging.contains("--no-bundle"));
+    assert!(
+        !cross_packaging.contains("\ncargo build"),
+        "a direct Cargo build omits Tauri's production custom protocol"
+    );
+    for dependency in [
+        "libwebkit2gtk-4.1-dev:i386",
+        "libgtk-3-dev:i386",
+        "libdbus-1-dev:i386",
+    ] {
+        assert!(
+            release.contains(dependency),
+            "the i686 desktop build omits `{dependency}`"
+        );
+    }
+    assert!(release.contains("PKG_CONFIG_ALLOW_CROSS: '1'"));
     assert!(release.contains("libwebkit2gtk-4.1-dev"));
     assert!(release.contains("libdbus-1-dev"));
     assert!(
@@ -619,6 +646,11 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     );
     assert!(ci.contains("libwebkit2gtk-4.1-dev"));
     assert!(ci.contains("libdbus-1-dev"));
+    assert!(ci.contains("name: Desktop window (Linux i686)"));
+    assert!(
+        ci.contains("scripts/package-desktop-executable.sh i686-unknown-linux-gnu dist-desktop")
+    );
+    assert!(ci.contains("path: dist-desktop/youta-gui-*-linux-i686"));
     assert!(
         ci.contains("The desktop window links ${renderer}."),
         "the renderer-free claim must be checked by machine, not by hand"

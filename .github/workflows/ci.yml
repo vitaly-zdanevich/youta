@@ -324,6 +324,64 @@ jobs:
             fi
           done
 
+  desktop-linux-i686:
+    name: Desktop window (Linux i686)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PKG_CONFIG_ALLOW_CROSS: '1'
+      PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
+      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-m32
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add i686-unknown-linux-gnu
+
+      - name: Install the Linux i686 desktop toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes \
+            gcc-multilib \
+            libc6-dev:i386 \
+            libwebkit2gtk-4.1-dev:i386 \
+            libgtk-3-dev:i386 \
+            libdbus-1-dev:i386
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: desktop-linux-i686-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the unbundled Linux i686 GUI executable
+        run: scripts/package-desktop-executable.sh i686-unknown-linux-gnu dist-desktop
+
+      - name: Verify the executable architecture
+        run: file dist-desktop/youta-gui-*-linux-i686 | grep --fixed-strings 'ELF 32-bit LSB pie executable, Intel 80386'
+
+      - name: Upload the unbundled GUI executable
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-gui-*-linux-i686
+          if-no-files-found: error
+
+      - name: Upload the unbundled GUI executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-gui-*-linux-i686.sha256
+          if-no-files-found: error
+
   windows-compile:
     name: Windows compile (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}

@@ -563,6 +563,76 @@ jobs:
           path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.exe.sha256
           if-no-files-found: error
 
+  desktop-i686:
+    name: Desktop Linux i686 executable
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      # Keep pkg-config from falling back to amd64 libraries: a successful
+      # cross-build must prove that every GUI dependency is available on x86.
+      PKG_CONFIG_ALLOW_CROSS: '1'
+      PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
+      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-m32
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add i686-unknown-linux-gnu
+
+      # Ubuntu publishes the complete WebKitGTK stack as Multi-Arch packages.
+      # Install its i386 development files explicitly so the unbundled GUI is
+      # genuinely 32-bit; native Linux installers remain amd64/arm64-only.
+      - name: Install the Linux i686 desktop toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes \
+            gcc-multilib \
+            libc6-dev:i386 \
+            libwebkit2gtk-4.1-dev:i386 \
+            libgtk-3-dev:i386 \
+            libdbus-1-dev:i386
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: desktop-linux-i686-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the unbundled Linux i686 GUI executable
+        run: scripts/package-desktop-executable.sh i686-unknown-linux-gnu dist-desktop
+
+      - name: Verify the executable architecture
+        run: file dist-desktop/youta-gui-*-linux-i686 | grep --fixed-strings 'ELF 32-bit LSB pie executable, Intel 80386'
+
+      - name: Read the desktop version
+        run: |
+          version=$(sed -n '/^version = /s/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
+          test -n "${version}"
+          echo "DESKTOP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Upload the unbundled GUI executable
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-gui-${{ env.DESKTOP_VERSION }}-linux-i686
+          if-no-files-found: error
+
+      - name: Upload the unbundled GUI executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-gui-${{ env.DESKTOP_VERSION }}-linux-i686.sha256
+          if-no-files-found: error
+
   vendor:
     name: Vendored Cargo dependencies
     needs: validate
@@ -657,6 +727,7 @@ jobs:
     needs:
       - binaries
       - desktop
+      - desktop-i686
       - vendor
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -708,7 +779,7 @@ jobs:
             'macos-arm64:dmg'
             'windows-amd64:exe'
           )
-          desktop_executables=(linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64)
+          desktop_executables=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64 windows-amd64)
           for platform in "${desktop_executables[@]}"; do
             extension=
             [[ ${platform} == windows-* ]] && extension=.exe
@@ -728,7 +799,7 @@ jobs:
           license_notice="youta-${version}-LICENSE.txt"
           expected+=("${license_notice}" "${license_notice}.sha256")
 
-          readonly expected_asset_count=96
+          readonly expected_asset_count=98
           ((${#expected[@]} == expected_asset_count)) || {
             echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
             exit 1

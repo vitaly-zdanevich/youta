@@ -1048,9 +1048,10 @@ adds the same backend with vendored SQLite.
 
 Tagged releases are produced for Linux on amd64, i686, and arm64, and natively
 for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2 or newer
-processor. Every pair has four artifacts covering the independent `images` and
-`qr` capabilities: the unsuffixed archive enables both, `-text` omits images,
-`-no-qr` omits QR support, and `-text-no-qr` omits both. None opts into SQLite.
+processor. Every pair has four executables covering the independent `images`
+and `qr` capabilities: the unsuffixed executable enables both, `-text` omits
+images, `-no-qr` omits QR support, and `-text-no-qr` omits both. None opts into
+SQLite.
 Windows amd64/arm64 and the portable FreeBSD x86_64 boundary are
 compile-checked. The Windows runtime paths are implemented rather than
 stubbed — named-pipe IPC, platform-appropriate durability and file access,
@@ -1058,11 +1059,13 @@ tree-killing of helpers, real file identity — but the terminal binary is not
 advertised for Windows until the deterministic suite has been run there; a
 non-gating job reports it. The desktop window is a separate artifact with its
 own contract: installable bundles per platform (`.deb`, `.rpm`, AppImage,
-`.dmg`, NSIS) built by `scripts/package-desktop.sh`, unsigned until signing
-material exists, and with no automatic updater, because an update channel needs
-a key pair and an endpoint a repository cannot manufacture for itself. The release also contains a `cargo vendor` archive and matching
-Cargo source configuration so Gentoo and other external/offline builders use
-the exact locked dependency graph. The Gentoo ebuild exposes positive
+`.dmg`, NSIS) built by `scripts/package-desktop.sh`, plus the unbundled Linux
+i686 GUI built by `scripts/package-desktop-executable.sh`, unsigned until
+signing material exists, and with no automatic updater, because an update
+channel needs a key pair and an endpoint a repository cannot manufacture for
+itself. The release also contains a `cargo vendor` archive and matching Cargo
+source configuration so Gentoo and other external/offline builders use the
+exact locked dependency graph. The Gentoo ebuild exposes positive
 default-on `images` and `qr` USE flags, which can be disabled independently.
 It is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)

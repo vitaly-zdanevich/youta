@@ -636,12 +636,17 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 youta-desktop
 That is a WebKitGTK workaround rather than a Youta setting, and it is worth
 trying first whenever the window appears but shows nothing.
 
-Desktop artifacts are built by `scripts/package-desktop.sh`. It publishes a
-standalone GUI executable for every supported host and also produces whatever
-the host platform's bundler can make — `.deb`, `.rpm` and AppImage on Linux,
-`.dmg` on macOS, an NSIS installer on Windows — with a `.sha256` beside every
-file. It does not cross-compile, because none of those bundlers do; the release
-workflow runs it once per operating system instead.
+Native desktop artifacts are built by `scripts/package-desktop.sh`. It
+publishes a standalone GUI executable and whatever the host platform's bundler
+can make — `.deb`, `.rpm` and AppImage on Linux, `.dmg` on macOS, an NSIS
+installer on Windows — with a `.sha256` beside every file. Installers are not
+cross-compiled; the release workflow runs that script once per host. Linux
+i686 is the deliberate unbundled exception:
+`scripts/package-desktop-executable.sh` cross-builds its GUI against Ubuntu's
+i386 WebKitGTK/GTK/D-Bus packages with Tauri's production protocol enabled,
+but does not claim that a cross-built installer is native. The resulting raw
+executable remains dynamically linked; distribution packages must supply its
+32-bit GUI libraries, as the Gentoo x86 ebuild does.
 
 The installers are **not signed**, on any platform. macOS will refuse a
 downloaded `.dmg` until it is opened through the right-click "Open" menu, and
@@ -1639,16 +1644,16 @@ source package can compile both front ends without npm network access. It is
 source input and is the deliberate archive exception. No published executable
 enables SQLite; human-readable TOML remains the standard persistence backend.
 
-The desktop window is published as a standalone GUI executable and in the
-native forms its platforms expect: `.deb`, `.rpm` and AppImage for Linux amd64
-and arm64, a `.dmg` for macOS amd64 and arm64, and an NSIS installer for Windows
-amd64. The macOS executable can be launched from a terminal; Finder users
-should use the `.dmg`. `scripts/package-desktop.sh` builds whichever of those
-the host can make and writes a `.sha256` beside each, and the release workflow
-runs it once per operating system — a bundler cannot cross-compile an
-installer. The complete asset list is asserted before anything is published,
-so a bundler that quietly produced one format fewer fails the release instead
-of shrinking it.
+The desktop window is published as a standalone GUI executable for Linux
+amd64, i686 and arm64, macOS amd64 and arm64, and Windows amd64. Native bundle
+forms remain `.deb`, `.rpm` and AppImage for Linux amd64 and arm64, `.dmg` for
+macOS amd64 and arm64, and NSIS for Windows amd64. The macOS executable can be
+launched from a terminal; Finder users should use the `.dmg`.
+`scripts/package-desktop.sh` builds whichever native forms its host can make,
+while `scripts/package-desktop-executable.sh` produces the standalone Linux
+i686 program without pretending to cross-compile an installer. Every file has
+a `.sha256`; the complete asset list is asserted before publication, so a
+missing architecture or bundle fails the release instead of shrinking it.
 
 The window has its own CI lane on Linux, macOS, and Windows, which compiles it,
 runs its tests, lints it, type-checks its page, and proves by `cargo tree` that
