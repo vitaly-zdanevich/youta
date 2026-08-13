@@ -60,6 +60,7 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     let text_only = feature_closure(&manifest, "app");
     let tui = feature_closure(&manifest, "tui");
     let qr = feature_closure(&manifest, "qr");
+    let gpm = feature_closure(&manifest, "gpm");
     let yandex_free = feature_closure(&manifest, "app-core");
 
     assert!(default.contains("images"));
@@ -67,6 +68,8 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(default.contains("dep:qrcode"));
     assert!(default.contains("app"));
     assert!(default.contains("yandex-music"));
+    assert!(default.contains("gpm"));
+    assert!(default.contains("dep:mio"));
     assert!(!default.contains("sqlite-state"));
     assert!(!default.contains("bundled-sqlite"));
     assert!(!default.contains("dep:rusqlite"));
@@ -74,6 +77,13 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(text_only.contains("yandex-music"));
     assert!(!text_only.contains("qr"));
     assert!(!text_only.contains("dep:qrcode"));
+    assert!(!text_only.contains("gpm"));
+    assert!(!text_only.contains("dep:mio"));
+    assert!(!yandex_free.contains("gpm"));
+    assert!(!yandex_free.contains("dep:mio"));
+    assert_eq!(feature_entries(&manifest, "gpm"), ["tui", "dep:mio"]);
+    assert!(gpm.contains("tui"));
+    assert!(gpm.contains("dep:mio"));
     assert!(!tui.contains("dep:qrcode"));
     // QR encoding produces a module matrix and renders nothing, so it must not
     // drag a front-end into a build that only wants the encoder.
@@ -229,20 +239,53 @@ fn renderer_free_capabilities_never_require_a_front_end() {
 }
 
 #[test]
-fn release_script_builds_four_portable_non_sqlite_variants() {
+fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
     let script = read_repository_file("scripts/package-release.sh");
 
     assert!(!script.contains("--features bundled-sqlite"));
-    assert!(script.contains("--features app,qr"));
-    assert!(script.contains("--features app,images"));
-    assert!(script.contains("\t\t\t--features app\n"));
-    assert!(script.contains("archive_suffix=-text"));
-    assert!(script.contains("archive_suffix=-no-qr"));
-    assert!(script.contains("archive_suffix=-text-no-qr"));
-    assert!(script.contains("images)"));
-    assert!(script.contains("text)"));
-    assert!(script.contains("images-no-qr)"));
-    assert!(script.contains("text-no-qr)"));
+    for feature_set in [
+        "cargo_features=app,gpm,images,qr",
+        "cargo_features=app,gpm,qr",
+        "cargo_features=app,gpm,images",
+        "cargo_features=app,gpm",
+        "cargo_features=app,images,qr",
+        "cargo_features=app,qr",
+        "cargo_features=app,images",
+        "cargo_features=app",
+    ] {
+        assert!(
+            script.contains(feature_set),
+            "release script omits feature set `{feature_set}`"
+        );
+    }
+    assert!(script.contains("executable_suffix=-text"));
+    assert!(script.contains("executable_suffix=-no-qr"));
+    assert!(script.contains("executable_suffix=-text-no-qr"));
+    for variant in [
+        "images)",
+        "text)",
+        "images-no-qr)",
+        "text-no-qr)",
+        "images-no-gpm)",
+        "text-no-gpm)",
+        "images-no-qr-no-gpm)",
+        "text-no-qr-no-gpm)",
+    ] {
+        assert!(
+            script.contains(variant),
+            "release script omits variant `{variant}`"
+        );
+    }
+    for suffix in [
+        "executable_suffix=-no-gpm",
+        "executable_suffix=-text-no-gpm",
+        "executable_suffix=-no-qr-no-gpm",
+        "executable_suffix=-text-no-qr-no-gpm",
+    ] {
+        assert!(script.contains(suffix), "release script omits `{suffix}`");
+    }
+    assert!(script.contains("No-GPM release variants are supported only on Linux"));
+    assert!(script.contains("--features \"${cargo_features}\""));
     assert!(script.contains("Supported variants: images, text, images-no-qr, text-no-qr"));
     assert!(script.contains("YOUTA_BUILD_ORIGIN=github-release"));
     assert!(!script.contains("install -D"));
@@ -254,8 +297,16 @@ fn release_script_builds_four_portable_non_sqlite_variants() {
     assert!(script.contains("aarch64-unknown-linux-gnu"));
     assert!(script.contains("x86_64-apple-darwin"));
     assert!(script.contains("aarch64-apple-darwin"));
-    assert!(script.contains("gtar"));
+    assert!(script.contains("executable=\"${output_directory}/${package_name}\""));
+    assert!(script.contains("install -m 755"));
+    assert!(!script.contains(".tar.gz"));
+    assert!(!script.contains("gtar"));
+    assert!(!script.contains("gzip"));
     assert!(script.contains("shasum -a 256"));
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("same four combinations with a trailing `-no-gpm`\nsuffix"));
+    assert!(readme.contains("neither `app` nor `app-core` adds it transitively"));
 }
 
 #[test]
@@ -274,18 +325,43 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(release.contains("dist text"));
     assert!(release.contains("dist images-no-qr"));
     assert!(release.contains("dist text-no-qr"));
+    assert!(release.contains("dist images-no-gpm"));
+    assert!(release.contains("dist text-no-gpm"));
+    assert!(release.contains("dist images-no-qr-no-gpm"));
+    assert!(release.contains("dist text-no-qr-no-gpm"));
+    for suffix in [
+        "-no-gpm",
+        "-text-no-gpm",
+        "-no-qr-no-gpm",
+        "-text-no-qr-no-gpm",
+    ] {
+        let upload_path = format!(
+            "path: dist/youta-${{{{ env.PACKAGE_VERSION }}}}-${{{{ matrix.artifact_os }}}}-${{{{ matrix.architecture }}}}{suffix}"
+        );
+        assert!(
+            release.contains(&upload_path),
+            "release workflow omits no-GPM upload `{upload_path}`"
+        );
+    }
     assert!(release.contains("fetch-depth: 10"));
-    assert!(release.contains("brew install gnu-tar"));
+    assert!(!release.contains("brew install gnu-tar"));
     assert!(release.contains("architecture: i686"));
     assert!(release.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     for contract in [
         "platforms=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64)",
         "suffixes=('' -text -no-qr -text-no-qr)",
-        // Forty terminal archives and checksums, eighteen desktop installers
-        // and checksums, and the vendor archive with its own.
-        "readonly expected_asset_count=60",
-        "archive=\"youta-${version}-${platform}${suffix}.tar.gz\"",
+        "linux_platforms=(linux-amd64 linux-i686 linux-arm64)",
+        "no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)",
+        // Sixty-four terminal executables and checksums, ten standalone GUI
+        // executables and checksums, eighteen desktop installers and checksums,
+        // the source-only vendor archive, and the plain license notice, each
+        // with its checksum.
+        "readonly expected_asset_count=96",
+        "executable=\"youta-${version}-${platform}${suffix}\"",
+        "desktop_executables=(linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
+        "gui_executable=\"youta-gui-${version}-${platform}${extension}\"",
         "vendor_archive=\"youta-${version}-vendor.tar.xz\"",
+        "license_notice=\"youta-${version}-LICENSE.txt\"",
         "--label expected-assets",
         "--label downloaded-assets",
         "sha256sum --check --strict -- *.sha256",
@@ -295,6 +371,24 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
             "release workflow omits asset contract `{contract}`"
         );
     }
+    assert_eq!(
+        release.matches("uses: actions/upload-artifact@v7").count(),
+        release.matches("archive: false").count(),
+        "every workflow artifact must be the file itself, not an implicit ZIP"
+    );
+
+    let publish = release
+        .split_once("\n  publish:\n")
+        .map(|(_, publish)| publish)
+        .expect("release workflow must define its publish job");
+    assert!(
+        publish.contains("desktop_version=${version}"),
+        "the checkout-free publish job must derive the synchronized GUI version from the tag"
+    );
+    assert!(
+        !publish.contains("gui/Cargo.toml"),
+        "the checkout-free publish job cannot inspect a repository file"
+    );
     assert!(
         release
             .find("Validate the complete release asset set")
@@ -310,6 +404,23 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("i686-unknown-linux-gnu"));
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
+    for feature_set in [
+        "app,gpm,images,qr",
+        "app,gpm,qr",
+        "app,gpm,images",
+        "app,gpm",
+        "app,images,qr",
+        "app,qr",
+        "app,images",
+        "app",
+    ] {
+        assert!(
+            ci.contains(&format!(
+                "--target i686-unknown-linux-gnu --no-default-features --features {feature_set}\n"
+            )),
+            "i686 CI omits published feature set `{feature_set}`"
+        );
+    }
     assert!(ci.contains("ELF 32-bit"));
     assert!(ci.contains("/lib/ld-linux.so.2"));
     assert!(ci.contains("target/i686-unknown-linux-gnu/release/youta --version"));
@@ -356,13 +467,45 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     }
 }
 
-/// The desktop window ships installers, and five files have to agree on which.
+#[test]
+fn vendor_archive_carries_the_built_gui_frontend_for_offline_packages() {
+    let script = read_repository_file("scripts/package-vendor.sh");
+    for asset in ["index.html", "app.js", "app.css"] {
+        assert!(
+            script.contains(&format!("[[ -f gui/frontend/{asset} ]]")),
+            "vendor packaging must reject a missing production GUI asset: {asset}"
+        );
+    }
+    assert!(
+        script.contains("${package_root}/gui/frontend"),
+        "the source-only vendor archive must carry the production GUI frontend"
+    );
+    assert!(
+        script.contains("--workspace \\\n\t\t\t--all-features"),
+        "offline verification must compile the GUI workspace member too"
+    );
+
+    let release = read_repository_file(".github/workflows/release.yml");
+    let build_frontend = release
+        .find("npm --prefix gui/ui run build")
+        .expect("the vendor job builds the production GUI frontend");
+    let package_vendor = release
+        .find("scripts/package-vendor.sh dist")
+        .expect("the vendor job packages the offline source inputs");
+    assert!(
+        build_frontend < package_vendor,
+        "the GUI frontend must exist before the vendor archive is assembled"
+    );
+}
+
+/// The desktop window ships a standalone executable and native installers.
 ///
-/// The terminal binary is one portable tarball per target triple; the window is
-/// a different artefact on every platform, produced by a bundler that only runs
-/// on that platform. Nothing about that is derivable, so it is written down in
-/// `gui/tauri.conf.json`, `scripts/package-desktop.sh`, both workflows, and
-/// `README.md` — and this is what keeps those five copies the same answer.
+/// The terminal and window are both published as directly downloadable
+/// executables. The window additionally retains native installers produced by
+/// a bundler that only runs on that platform. Nothing about the installer set is
+/// derivable, so it is written down in `gui/tauri.conf.json`,
+/// `scripts/package-desktop.sh`, both workflows, and `README.md` — and this is
+/// what keeps those five copies the same answer.
 #[test]
 fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it() {
     let configuration: serde_json::Value =
@@ -414,7 +557,20 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     let script = read_repository_file("scripts/package-desktop.sh");
     assert!(script.contains("gui/Cargo.toml"));
     assert!(script.contains("npm --prefix gui/ui run build"));
+    assert!(script.contains(
+        "youta-gui-${version}-${operating_system}-${architecture}${executable_extension}"
+    ));
+    assert!(script.contains("target/release/youta-gui${executable_extension}"));
+    assert!(script.contains("install -m 755"));
     assert!(script.contains("youta-desktop-${version}-${operating_system}-${architecture}"));
+    assert!(
+        script.contains("-name '*-setup.exe'"),
+        "Tauri v2 names NSIS installers with a hyphen before `setup`"
+    );
+    assert!(
+        !script.contains("-name '*_setup.exe'"),
+        "the obsolete underscore pattern misses Tauri v2 NSIS installers"
+    );
     assert!(
         script.contains("No installable bundle was produced"),
         "a bundler that produced nothing must fail rather than report success"
@@ -444,7 +600,7 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
             "the release asset contract omits `{platform}`"
         );
     }
-    assert!(release.contains("readonly expected_asset_count=60"));
+    assert!(release.contains("readonly expected_asset_count=96"));
     assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
     assert!(release.contains("libwebkit2gtk-4.1-dev"));
     assert!(release.contains("libdbus-1-dev"));
@@ -471,6 +627,70 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     assert!(
         readme.contains("not signed"),
         "an unsigned installer is something a user meets before Youta starts"
+    );
+    assert!(readme.contains("standalone GUI executable"));
+}
+
+#[test]
+fn desktop_and_core_versions_remain_in_sync() {
+    let core_manifest = manifest();
+    let core_version = core_manifest["package"]["version"]
+        .as_str()
+        .expect("the core package has a version");
+    let gui_manifest: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("gui/Cargo.toml must remain valid TOML");
+    let gui_version = gui_manifest["package"]["version"]
+        .as_str()
+        .expect("the GUI package has a version");
+    let gui_core_features: BTreeSet<&str> = gui_manifest["dependencies"]["youta"]["features"]
+        .as_array()
+        .expect("the GUI declares its shared-core feature profile")
+        .iter()
+        .map(|feature| feature.as_str().expect("GUI core features are strings"))
+        .collect();
+    for required in [
+        "controller",
+        "sources",
+        "remote-artwork",
+        "qr",
+        "yandex-music",
+    ] {
+        assert!(
+            gui_core_features.contains(required),
+            "the GUI core profile omitted `{required}`"
+        );
+    }
+    let tauri: serde_json::Value =
+        serde_json::from_str(&read_repository_file("gui/tauri.conf.json"))
+            .expect("gui/tauri.conf.json must remain valid JSON");
+
+    assert_eq!(gui_version, core_version, "the GUI crate version drifted");
+    assert_eq!(
+        tauri["version"].as_str(),
+        Some(core_version),
+        "the Tauri bundle version drifted"
+    );
+
+    let ui_package: serde_json::Value =
+        serde_json::from_str(&read_repository_file("gui/ui/package.json"))
+            .expect("gui/ui/package.json must remain valid JSON");
+    let ui_lock: serde_json::Value =
+        serde_json::from_str(&read_repository_file("gui/ui/package-lock.json"))
+            .expect("gui/ui/package-lock.json must remain valid JSON");
+    assert_eq!(
+        ui_package["version"].as_str(),
+        Some(core_version),
+        "the GUI page version drifted"
+    );
+    assert_eq!(
+        ui_lock["version"].as_str(),
+        Some(core_version),
+        "the GUI package lock version drifted"
+    );
+    assert_eq!(
+        ui_lock["packages"][""]["version"].as_str(),
+        Some(core_version),
+        "the locked GUI root package version drifted"
     );
 }
 

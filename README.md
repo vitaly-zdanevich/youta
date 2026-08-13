@@ -498,17 +498,19 @@ Install `fpcalc` from your operating system's
 - Fedora: `dnf install chromaprint-tools`
 - macOS with Homebrew: `brew install chromaprint`
 
-Build the otherwise complete default application without image decoding or
-terminal-image dependencies with:
+Build the complete application without image decoding, terminal-image
+dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
 	--features app,qr
 ```
 
-The default `app` profile includes the experimental YandexMusic adapter. Build
-the same application without Yandex Music code, and retain the default image
-support, with:
+The `app` profile includes the experimental YandexMusic adapter but does not
+force GPM into distribution builds. Add `gpm` explicitly to either feature
+list when Linux virtual-console mouse input is wanted. Build the same
+application without Yandex Music code, and retain the default image support,
+with:
 
 ```sh
 cargo build --release --locked --no-default-features \
@@ -517,8 +519,10 @@ cargo build --release --locked --no-default-features \
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
 `qr` to remove QR encoding and its shortcut from any custom build. Cargo
-features are additive, so `app-core` is the explicit complete profile without
-`yandex-music`; there is no misleading negative feature.
+features are additive: `app-core` is the complete profile without
+`yandex-music`, and `gpm` is the positive opt-in for virtual-console mouse
+input. The ordinary default feature set still enables both Yandex Music and
+GPM.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -632,10 +636,11 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 youta-desktop
 That is a WebKitGTK workaround rather than a Youta setting, and it is worth
 trying first whenever the window appears but shows nothing.
 
-Installers are built by `scripts/package-desktop.sh`, which produces whatever
+Desktop artifacts are built by `scripts/package-desktop.sh`. It publishes a
+standalone GUI executable for every supported host and also produces whatever
 the host platform's bundler can make — `.deb`, `.rpm` and AppImage on Linux,
-`.dmg` on macOS, an NSIS installer on Windows — and writes a `.sha256` beside
-each. It does not cross-compile, because none of those bundlers do; the release
+`.dmg` on macOS, an NSIS installer on Windows — with a `.sha256` beside every
+file. It does not cross-compile, because none of those bundlers do; the release
 workflow runs it once per operating system instead.
 
 The installers are **not signed**, on any platform. macOS will refuse a
@@ -1292,9 +1297,9 @@ normal mouse-capture behavior. `F8` provides a keyboard pointer on every
 terminal: arrow keys move its reversed cell cursor, `Enter` clicks the current
 cell, and `Esc` or `F8` exits. On a virtual console with GPM running, the
 physical mouse moves this same square while it is visible. Keyboard movement
-remains available when GPM is not installed or not running. Minimal builds can
-omit the Linux-console client with
-`--no-default-features` or by leaving `gpm` out of their feature list. See the
+remains available when GPM is not installed or not running. Custom builds omit
+the Linux-console client with `--no-default-features` by leaving `gpm` out of
+their feature list; neither `app` nor `app-core` adds it transitively. See the
 [GPM protocol definitions](https://sources.debian.org/src/gpm/1.20.7-12/src/headers/gpm.h/)
 for the control-socket contract.
 
@@ -1620,22 +1625,30 @@ and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
 failure fails CI. Tagged releases build for Linux on amd64, i686, and arm64,
 and natively for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2
-or newer processor. Each operating-system/architecture pair publishes archives
-for all four combinations of the default-on `images` and `qr` capabilities. The
-`-text` suffix omits images, while the `-no-qr` suffix omits QR support. The
-release also publishes one Cargo vendor archive for offline/external build
-systems. No binary archive enables SQLite; human-readable TOML remains the
-standard release persistence backend.
+or newer processor. Each operating-system/architecture pair publishes directly
+downloadable executables for all four combinations of the default-on `images`
+and `qr` capabilities. These established executables retain GPM support. Linux
+additionally publishes the same four combinations with a trailing `-no-gpm`
+suffix for distributions where GPM is opt-in. The `-text` suffix omits images,
+while `-no-qr` omits QR support. These are raw GitHub artifacts rather than ZIP
+or tar wrappers. GitHub does not preserve their Unix executable bit, so a
+downloaded Linux or macOS file needs `chmod +x ./youta-*` before it is run. The
+release also publishes one Cargo vendor archive for offline/external build systems. It
+contains the locked Rust dependency graph and the already-built GUI page, so a
+source package can compile both front ends without npm network access. It is
+source input and is the deliberate archive exception. No published executable
+enables SQLite; human-readable TOML remains the standard persistence backend.
 
-The desktop window is published beside those archives as installers rather than
-tarballs, because that is what its platforms expect: `.deb`, `.rpm` and
-AppImage for Linux amd64 and arm64, a `.dmg` for macOS amd64 and arm64, and an
-NSIS installer for Windows amd64. `scripts/package-desktop.sh` builds whichever
-of those the host can make and writes a `.sha256` beside each, and the release
-workflow runs it once per operating system — a bundler cannot cross-compile an
-installer. The complete asset list is asserted before anything is published, so
-a bundler that quietly produced one format fewer fails the release instead of
-shrinking it.
+The desktop window is published as a standalone GUI executable and in the
+native forms its platforms expect: `.deb`, `.rpm` and AppImage for Linux amd64
+and arm64, a `.dmg` for macOS amd64 and arm64, and an NSIS installer for Windows
+amd64. The macOS executable can be launched from a terminal; Finder users
+should use the `.dmg`. `scripts/package-desktop.sh` builds whichever of those
+the host can make and writes a `.sha256` beside each, and the release workflow
+runs it once per operating system — a bundler cannot cross-compile an
+installer. The complete asset list is asserted before anything is published,
+so a bundler that quietly produced one format fewer fails the release instead
+of shrinking it.
 
 The window has its own CI lane on Linux, macOS, and Windows, which compiles it,
 runs its tests, lints it, type-checks its page, and proves by `cargo tree` that
@@ -1723,9 +1736,14 @@ The Gentoo ebuild is maintained as
 in the
 [`vitaly-zdanevich-overlay`](https://github.com/vitaly-zdanevich/gentoo-overlay).
 It maps provider choices to USE flags and consumes the release vendor archive.
-Its positive `images` and `qr` USE flags are enabled by default. Gentoo users
-can independently disable them with conventional `USE="-images"` and
-`USE="-qr"` overrides.
+Both the source and binary packages expose an opt-in `gui` USE flag; enabling
+it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
+arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
+enabled by default. Gentoo users can independently disable them with
+conventional `USE="-images"` and `USE="-qr"` overrides.
+GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
+binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
+is enabled; otherwise it uses the corresponding `-no-gpm` release executable.
 GitHub Actions use Node 24-based action majors and set the maximum requested job
 timeout to 360 minutes.
 
@@ -1736,10 +1754,20 @@ scripts/package-release.sh x86_64-unknown-linux-gnu dist images
 scripts/package-release.sh x86_64-unknown-linux-gnu dist text
 scripts/package-release.sh x86_64-unknown-linux-gnu dist images-no-qr
 scripts/package-release.sh x86_64-unknown-linux-gnu dist text-no-qr
+scripts/package-release.sh x86_64-unknown-linux-gnu dist images-no-gpm
+scripts/package-release.sh x86_64-unknown-linux-gnu dist text-no-gpm
+scripts/package-release.sh x86_64-unknown-linux-gnu dist images-no-qr-no-gpm
+scripts/package-release.sh x86_64-unknown-linux-gnu dist text-no-qr-no-gpm
 scripts/package-release.sh i686-unknown-linux-gnu dist images
 scripts/package-release.sh i686-unknown-linux-gnu dist text
 scripts/package-release.sh i686-unknown-linux-gnu dist images-no-qr
 scripts/package-release.sh i686-unknown-linux-gnu dist text-no-qr
+scripts/package-release.sh i686-unknown-linux-gnu dist images-no-gpm
+scripts/package-release.sh i686-unknown-linux-gnu dist text-no-gpm
+scripts/package-release.sh i686-unknown-linux-gnu dist images-no-qr-no-gpm
+scripts/package-release.sh i686-unknown-linux-gnu dist text-no-qr-no-gpm
+npm --prefix gui/ui ci
+npm --prefix gui/ui run build
 scripts/package-vendor.sh
 ```
 

@@ -1686,6 +1686,7 @@ VERSION="42 (Stable)"
 
         assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(features.contains(&"acoustid"), cfg!(feature = "acoustid"));
+        assert_eq!(features.contains(&"gpm"), cfg!(feature = "gpm"));
         assert_eq!(features.contains(&"qr"), cfg!(feature = "qr"));
     }
 }

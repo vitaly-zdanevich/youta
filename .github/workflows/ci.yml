@@ -220,7 +220,11 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,images,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,images
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,images,qr
           cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,qr
           cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,images
           cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app

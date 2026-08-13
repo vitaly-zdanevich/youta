@@ -13,6 +13,13 @@ cd "${repository_root}"
 	echo 'Cargo.lock is required to create a reproducible vendor archive.' >&2
 	exit 1
 }
+[[ -f gui/frontend/index.html ]] &&
+	[[ -f gui/frontend/app.js ]] &&
+	[[ -f gui/frontend/app.css ]] || {
+	echo 'Build the production GUI frontend before creating the vendor archive.' >&2
+	echo 'Run: npm --prefix gui/ui ci && npm --prefix gui/ui run build' >&2
+	exit 1
+}
 
 version=$(
 	awk -F '"' '
@@ -41,6 +48,12 @@ trap cleanup EXIT
 package_root="${staging_directory}/youta-${version}"
 mkdir -p "${package_root}/.cargo"
 
+# Gentoo and other offline source builders cannot resolve npm packages inside
+# their build sandbox. Carry only Vite's deterministic production output beside
+# the vendored Rust graph; the source archive supplies the editable UI sources.
+mkdir -p "${package_root}/gui/frontend"
+cp -a gui/frontend/. "${package_root}/gui/frontend/"
+
 (
 	cd "${package_root}"
 	cargo vendor \
@@ -67,6 +80,7 @@ mkdir -p "${verification_cargo_home}" "${verification_target}"
 			--manifest-path "${repository_root}/Cargo.toml" \
 			--locked \
 			--offline \
+			--workspace \
 			--all-features
 )
 

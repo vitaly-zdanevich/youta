@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 #
-# Build a versioned Linux or macOS binary archive for one explicit Rust target.
+# Build a versioned Linux or macOS executable for one explicit Rust target.
 # Usage:
-#   scripts/package-release.sh [target-triple] [output-directory] [images|text|images-no-qr|text-no-qr]
+#   scripts/package-release.sh [target-triple] [output-directory] [variant]
+#
+# Variants are images, text, images-no-qr, text-no-qr, and their Linux-only
+# images-no-gpm, text-no-gpm, images-no-qr-no-gpm, and
+# text-no-qr-no-gpm counterparts.
 
 set -Eeuo pipefail
 
@@ -59,116 +63,77 @@ esac
 
 case "${variant}" in
 	images)
-		archive_suffix=
+		executable_suffix=
+		cargo_features=app,gpm,images,qr
 		;;
 	text)
-		archive_suffix=-text
+		executable_suffix=-text
+		cargo_features=app,gpm,qr
 		;;
 	images-no-qr)
-		archive_suffix=-no-qr
+		executable_suffix=-no-qr
+		cargo_features=app,gpm,images
 		;;
 	text-no-qr)
-		archive_suffix=-text-no-qr
+		executable_suffix=-text-no-qr
+		cargo_features=app,gpm
+		;;
+	images-no-gpm)
+		executable_suffix=-no-gpm
+		cargo_features=app,images,qr
+		;;
+	text-no-gpm)
+		executable_suffix=-text-no-gpm
+		cargo_features=app,qr
+		;;
+	images-no-qr-no-gpm)
+		executable_suffix=-no-qr-no-gpm
+		cargo_features=app,images
+		;;
+	text-no-qr-no-gpm)
+		executable_suffix=-text-no-qr-no-gpm
+		cargo_features=app
 		;;
 	*)
 		echo "Unsupported release variant: ${variant}" >&2
-		echo 'Supported variants: images, text, images-no-qr, text-no-qr' >&2
+		echo 'Supported variants: images, text, images-no-qr, text-no-qr,' >&2
+		echo 'images-no-gpm, text-no-gpm, images-no-qr-no-gpm, text-no-qr-no-gpm' >&2
 		exit 1
 		;;
 esac
 
-mkdir -p "${output_argument}"
-output_directory=$(CDPATH= cd -- "${output_argument}" && pwd)
-staging_directory=$(mktemp -d)
-
-cleanup() {
-	rm -rf -- "${staging_directory}"
-}
-trap cleanup EXIT
-
-package_name="youta-${version}-${operating_system}-${architecture}${archive_suffix}"
-package_root="${staging_directory}/${package_name}"
-export YOUTA_BUILD_ORIGIN=github-release
-
-case "${variant}" in
-	images)
-		cargo build \
-			--locked \
-			--release \
-			--target "${target}"
-		;;
-	text)
-		cargo build \
-			--locked \
-			--release \
-			--target "${target}" \
-			--no-default-features \
-			--features app,qr
-		;;
-	images-no-qr)
-		cargo build \
-			--locked \
-			--release \
-			--target "${target}" \
-			--no-default-features \
-			--features app,images
-		;;
-	text-no-qr)
-		cargo build \
-			--locked \
-			--release \
-			--target "${target}" \
-			--no-default-features \
-			--features app
-		;;
-esac
-
-mkdir -p "${package_root}/bin" "${package_root}/docs"
-install -m 755 \
-	"target/${target}/release/youta" \
-	"${package_root}/bin/youta"
-install -m 644 README.md "${package_root}/README.md"
-install -m 644 LICENSE "${package_root}/LICENSE"
-install -m 644 config.example.toml "${package_root}/config.example.toml"
-install -m 644 docs/ARCHITECTURE.md "${package_root}/docs/ARCHITECTURE.md"
-install -m 644 docs/FEASIBILITY.md "${package_root}/docs/FEASIBILITY.md"
-install -m 644 docs/AUDIOPHILE.md "${package_root}/docs/AUDIOPHILE.md"
-
-archive="${output_directory}/${package_name}.tar.gz"
-source_date_epoch=${SOURCE_DATE_EPOCH:-0}
-
-if command -v gtar > /dev/null 2>&1; then
-	tar_command=gtar
-else
-	tar_command=tar
-fi
-tar_version=$("${tar_command}" --version 2> /dev/null || true)
-if [[ ${tar_version} != *'GNU tar'* ]]; then
-	echo 'Reproducible release packaging requires GNU tar (`tar` or `gtar`).' >&2
+if [[ ${variant} == *-no-gpm && ${operating_system} != linux ]]; then
+	echo 'No-GPM release variants are supported only on Linux.' >&2
 	exit 1
 fi
 
-"${tar_command}" \
-	--sort=name \
-	--mtime="@${source_date_epoch}" \
-	--owner=0 \
-	--group=0 \
-	--numeric-owner \
-	-C "${staging_directory}" \
-	-cf - \
-	"${package_name}" |
-	gzip -n > "${archive}"
+mkdir -p "${output_argument}"
+output_directory=$(CDPATH= cd -- "${output_argument}" && pwd)
+package_name="youta-${version}-${operating_system}-${architecture}${executable_suffix}"
+export YOUTA_BUILD_ORIGIN=github-release
+
+cargo build \
+	--locked \
+	--release \
+	--target "${target}" \
+	--no-default-features \
+	--features "${cargo_features}"
+
+executable="${output_directory}/${package_name}"
+install -m 755 \
+	"target/${target}/release/youta" \
+	"${executable}"
 
 (
 	cd "${output_directory}"
-	archive_name=$(basename -- "${archive}")
+	executable_name=$(basename -- "${executable}")
 	if command -v sha256sum > /dev/null 2>&1; then
-		sha256sum "${archive_name}" > "${archive_name}.sha256"
+		sha256sum "${executable_name}" > "${executable_name}.sha256"
 	elif command -v shasum > /dev/null 2>&1; then
-		shasum -a 256 "${archive_name}" > "${archive_name}.sha256"
+		shasum -a 256 "${executable_name}" > "${executable_name}.sha256"
 	else
 		echo 'Release packaging requires `sha256sum` or `shasum`.' >&2
 		exit 1
 	fi
 )
-echo "Created ${archive}"
+echo "Created ${executable}"

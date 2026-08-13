@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.27.2"
+version = "0.31.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
@@ -15,7 +15,7 @@ unsafe_code = "forbid"
 # The reducer, the view contract, persistence, providers, and playback come
 # from the shared crate. `controller` deliberately excludes the terminal
 # renderer, so Crossterm and Ratatui never enter this binary.
-youta = { path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr"] }
+youta = { path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
 
 percent-encoding = "2.3"
 serde = { version = "1.0", features = ["derive"] }

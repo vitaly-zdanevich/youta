@@ -175,10 +175,6 @@ jobs:
           rustup default "${RUST_VERSION}"
           rustup target add "${{ matrix.target }}"
 
-      - name: Install reproducible archive tooling on macOS
-        if: runner.os == 'macOS'
-        run: brew install gnu-tar
-
       - name: Install Linux i686 linker support
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
@@ -193,28 +189,163 @@ jobs:
             ~/.cargo/git
           key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Set reproducible archive timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+      - name: Read the executable version
+        run: |
+          version=$(sed -n '/^version = /s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "${version}"
+          echo "PACKAGE_VERSION=${version}" >> "${GITHUB_ENV}"
 
-      - name: Build the default archive with image support
+      - name: Build the default executable with image support
         run: scripts/package-release.sh "${{ matrix.target }}" dist images
 
-      - name: Build the text-only archive
+      - name: Build the text-only executable
         run: scripts/package-release.sh "${{ matrix.target }}" dist text
 
-      - name: Build the image archive without QR support
+      - name: Build the image executable without QR support
         run: scripts/package-release.sh "${{ matrix.target }}" dist images-no-qr
 
-      - name: Build the text-only archive without QR support
+      - name: Build the text-only executable without QR support
         run: scripts/package-release.sh "${{ matrix.target }}" dist text-no-qr
 
-      - name: Upload binary archives
+      # Gentoo's `gpm` USE flag is opt-in. Keep the established unsuffixed
+      # executables GPM-enabled, and additionally publish each Linux feature
+      # combination without the virtual-console client.
+      - name: Build the default Linux executable without GPM support
+        if: runner.os == 'Linux'
+        run: scripts/package-release.sh "${{ matrix.target }}" dist images-no-gpm
+
+      - name: Build the text-only Linux executable without GPM support
+        if: runner.os == 'Linux'
+        run: scripts/package-release.sh "${{ matrix.target }}" dist text-no-gpm
+
+      - name: Build the Linux executable without QR or GPM support
+        if: runner.os == 'Linux'
+        run: scripts/package-release.sh "${{ matrix.target }}" dist images-no-qr-no-gpm
+
+      - name: Build the text-only Linux executable without QR or GPM support
+        if: runner.os == 'Linux'
+        run: scripts/package-release.sh "${{ matrix.target }}" dist text-no-qr-no-gpm
+
+      # Direct artifacts are single files, so the Actions page and API expose
+      # the actual executable instead of a ZIP that contains it.
+      - name: Upload the default executable
         uses: actions/upload-artifact@v7
         with:
-          name: youta-${{ matrix.artifact_os }}-${{ matrix.architecture }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}
+          if-no-files-found: error
+
+      - name: Upload the default executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.sha256
+          if-no-files-found: error
+
+      - name: Upload the text-only executable
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text
+          if-no-files-found: error
+
+      - name: Upload the text-only executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text.sha256
+          if-no-files-found: error
+
+      - name: Upload the image executable without QR support
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-qr
+          if-no-files-found: error
+
+      - name: Upload the image executable checksum without QR support
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-qr.sha256
+          if-no-files-found: error
+
+      - name: Upload the text-only executable without QR support
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-qr
+          if-no-files-found: error
+
+      - name: Upload the text-only executable checksum without QR support
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-qr.sha256
+          if-no-files-found: error
+
+      - name: Upload the default Linux executable without GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-gpm
+          if-no-files-found: error
+
+      - name: Upload the default Linux executable checksum without GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-gpm.sha256
+          if-no-files-found: error
+
+      - name: Upload the text-only Linux executable without GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-gpm
+          if-no-files-found: error
+
+      - name: Upload the text-only Linux executable checksum without GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-gpm.sha256
+          if-no-files-found: error
+
+      - name: Upload the Linux executable without QR or GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-qr-no-gpm
+          if-no-files-found: error
+
+      - name: Upload the Linux executable checksum without QR or GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-no-qr-no-gpm.sha256
+          if-no-files-found: error
+
+      - name: Upload the text-only Linux executable without QR or GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-qr-no-gpm
+          if-no-files-found: error
+
+      - name: Upload the text-only Linux executable checksum without QR or GPM support
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-text-no-qr-no-gpm.sha256
           if-no-files-found: error
 
   desktop:
@@ -228,22 +359,27 @@ jobs:
             artifact_os: linux
             architecture: amd64
             runner: ubuntu-24.04
+            executable_extension: ''
           - operating_system: Linux
             artifact_os: linux
             architecture: arm64
             runner: ubuntu-24.04-arm
+            executable_extension: ''
           - operating_system: macOS
             artifact_os: macos
             architecture: amd64
             runner: macos-15-intel
+            executable_extension: ''
           - operating_system: macOS
             artifact_os: macos
             architecture: arm64
             runner: macos-15
+            executable_extension: ''
           - operating_system: Windows
             artifact_os: windows
             architecture: amd64
             runner: windows-2025
+            executable_extension: .exe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     defaults:
@@ -327,12 +463,104 @@ jobs:
       - name: Build the desktop bundles
         run: scripts/package-desktop.sh dist-desktop
 
-      - name: Upload desktop bundles
+      - name: Read the desktop version
+        run: |
+          version=$(sed -n '/^version = /s/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
+          test -n "${version}"
+          echo "DESKTOP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Upload the standalone GUI executable
         uses: actions/upload-artifact@v7
         with:
-          name: youta-desktop-${{ matrix.artifact_os }}-${{ matrix.architecture }}
-          path: |
-            dist-desktop/*
+          archive: false
+          path: dist-desktop/youta-gui-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}${{ matrix.executable_extension }}
+          if-no-files-found: error
+
+      - name: Upload the standalone GUI executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-gui-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}${{ matrix.executable_extension }}.sha256
+          if-no-files-found: error
+
+      - name: Upload the Debian installer
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.deb
+          if-no-files-found: error
+
+      - name: Upload the Debian installer checksum
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.deb.sha256
+          if-no-files-found: error
+
+      - name: Upload the RPM installer
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.rpm
+          if-no-files-found: error
+
+      - name: Upload the RPM installer checksum
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.rpm.sha256
+          if-no-files-found: error
+
+      - name: Upload the AppImage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.AppImage
+          if-no-files-found: error
+
+      - name: Upload the AppImage checksum
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.AppImage.sha256
+          if-no-files-found: error
+
+      - name: Upload the macOS disk image
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.dmg
+          if-no-files-found: error
+
+      - name: Upload the macOS disk image checksum
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.dmg.sha256
+          if-no-files-found: error
+
+      - name: Upload the Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.exe
+          if-no-files-found: error
+
+      - name: Upload the Windows installer checksum
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.exe.sha256
           if-no-files-found: error
 
   vendor:
@@ -349,6 +577,17 @@ jobs:
           rustup toolchain install "${RUST_VERSION}" --profile minimal
           rustup default "${RUST_VERSION}"
 
+      # The vendor archive proves that every workspace member builds offline,
+      # so this job needs the GUI's native link inputs as well as Rust.
+      - name: Install the source-package GUI toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev
+
       - name: Restore Cargo registry cache
         uses: actions/cache@v5
         with:
@@ -357,19 +596,59 @@ jobs:
             ~/.cargo/git
           key: vendor-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
+      # Source packages build the Rust GUI offline. Give the vendor archive the
+      # production page once here so downstream package managers never need npm.
+      - name: Build the GUI frontend for offline source packages
+        run: |
+          node --version
+          npm --version
+          npm --prefix gui/ui ci
+          npm --prefix gui/ui run build
+
       - name: Set reproducible archive timestamp
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
 
       - name: Create dependency archive
         run: scripts/package-vendor.sh dist
 
-      - name: Upload dependency archive
+      # Raw executables cannot carry the notice that used to sit inside every
+      # binary tarball, so publish one plain copy beside all executables.
+      - name: Prepare the license notice
+        run: |
+          version=$(sed -n '/^version = /s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "${version}"
+          notice="youta-${version}-LICENSE.txt"
+          install -m 644 LICENSE "dist/${notice}"
+          (cd dist && sha256sum "${notice}" > "${notice}.sha256")
+
+      # The source-only vendor bundle is the deliberate archive exception: it
+      # is input for offline compilation rather than a program to execute.
+      - name: Upload the dependency archive
         uses: actions/upload-artifact@v7
         with:
-          name: youta-vendor
-          path: |
-            dist/*-vendor.tar.xz
-            dist/*-vendor.tar.xz.sha256
+          archive: false
+          path: dist/youta-*-vendor.tar.xz
+          if-no-files-found: error
+
+      - name: Upload the dependency archive checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-*-vendor.tar.xz.sha256
+          if-no-files-found: error
+
+      - name: Upload the license notice
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-*-LICENSE.txt
+          if-no-files-found: error
+
+      - name: Upload the license notice checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-*-LICENSE.txt.sha256
           if-no-files-found: error
 
   publish:
@@ -402,8 +681,16 @@ jobs:
           expected=()
           for platform in "${platforms[@]}"; do
             for suffix in "${suffixes[@]}"; do
-              archive="youta-${version}-${platform}${suffix}.tar.gz"
-              expected+=("${archive}" "${archive}.sha256")
+              executable="youta-${version}-${platform}${suffix}"
+              expected+=("${executable}" "${executable}.sha256")
+            done
+          done
+          linux_platforms=(linux-amd64 linux-i686 linux-arm64)
+          no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)
+          for platform in "${linux_platforms[@]}"; do
+            for suffix in "${no_gpm_suffixes[@]}"; do
+              executable="youta-${version}-${platform}${suffix}"
+              expected+=("${executable}" "${executable}.sha256")
             done
           done
           # The desktop window ships installers rather than tarballs, and each
@@ -411,13 +698,9 @@ jobs:
           # what a user double-clicks on Fedora. The table is written out rather
           # than derived so that a bundler silently producing one format fewer
           # fails the release instead of shrinking it.
-          desktop_version=$(
-            awk -F '"' '
-              /^\[package\]$/ { in_package = 1; next }
-              in_package && /^\[/ { exit }
-              in_package && /^version = / { print $2; exit }
-            ' gui/Cargo.toml
-          )
+          # The GUI/core version-sync regression test lets this checkout-free
+          # job use the version already validated against the release tag.
+          desktop_version=${version}
           desktop_bundles=(
             'linux-amd64:deb rpm AppImage'
             'linux-arm64:deb rpm AppImage'
@@ -425,6 +708,13 @@ jobs:
             'macos-arm64:dmg'
             'windows-amd64:exe'
           )
+          desktop_executables=(linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64)
+          for platform in "${desktop_executables[@]}"; do
+            extension=
+            [[ ${platform} == windows-* ]] && extension=.exe
+            gui_executable="youta-gui-${version}-${platform}${extension}"
+            expected+=("${gui_executable}" "${gui_executable}.sha256")
+          done
           for entry in "${desktop_bundles[@]}"; do
             platform=${entry%%:*}
             for extension in ${entry#*:}; do
@@ -435,8 +725,10 @@ jobs:
 
           vendor_archive="youta-${version}-vendor.tar.xz"
           expected+=("${vendor_archive}" "${vendor_archive}.sha256")
+          license_notice="youta-${version}-LICENSE.txt"
+          expected+=("${license_notice}" "${license_notice}.sha256")
 
-          readonly expected_asset_count=60
+          readonly expected_asset_count=96
           ((${#expected[@]} == expected_asset_count)) || {
             echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
             exit 1

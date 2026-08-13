@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Build the Youta desktop window's installable bundles for the host platform
-# and collect them, with checksums, into one output directory.
+# Build the Youta desktop window's standalone executable and installable
+# bundles for the host platform, with checksums, into one output directory.
 #
 # Usage:
 #   scripts/package-desktop.sh [output-directory]
@@ -36,26 +36,32 @@ case "${host_target}" in
 	x86_64-unknown-linux-gnu)
 		operating_system=linux
 		architecture=amd64
+		executable_extension=
 		;;
 	aarch64-unknown-linux-gnu)
 		operating_system=linux
 		architecture=arm64
+		executable_extension=
 		;;
 	x86_64-apple-darwin)
 		operating_system=macos
 		architecture=amd64
+		executable_extension=
 		;;
 	aarch64-apple-darwin)
 		operating_system=macos
 		architecture=arm64
+		executable_extension=
 		;;
 	x86_64-pc-windows-msvc)
 		operating_system=windows
 		architecture=amd64
+		executable_extension=.exe
 		;;
 	aarch64-pc-windows-msvc)
 		operating_system=windows
 		architecture=arm64
+		executable_extension=.exe
 		;;
 	*)
 		echo "Unsupported desktop host: ${host_target}" >&2
@@ -69,6 +75,24 @@ esac
 output_argument=${1:-dist-desktop}
 mkdir -p "${output_argument}"
 output_directory=$(CDPATH= cd -- "${output_argument}" && pwd)
+
+# Write a checksum beside one release asset without assuming GNU coreutils on
+# macOS. The executable and installers consequently share one checksum format.
+write_checksum() {
+	local asset_path=$1
+	(
+		cd "${output_directory}"
+		asset=$(basename -- "${asset_path}")
+		if command -v sha256sum > /dev/null 2>&1; then
+			sha256sum "${asset}" > "${asset}.sha256"
+		elif command -v shasum > /dev/null 2>&1; then
+			shasum -a 256 "${asset}" > "${asset}.sha256"
+		else
+			echo 'Desktop packaging requires `sha256sum` or `shasum`.' >&2
+			exit 1
+		fi
+	)
+}
 
 command -v npm > /dev/null 2>&1 || {
 	echo 'The desktop window needs Node and npm to build its page.' >&2
@@ -91,6 +115,16 @@ npm --prefix gui/ui run build
 # that file, including the page directory and the icons, is written relative to
 # it. The workspace target directory stays at the repository root regardless.
 (cd gui && npx --yes "@tauri-apps/cli@2" build)
+
+produced_executable="target/release/youta-gui${executable_extension}"
+[[ -f ${produced_executable} ]] || {
+	echo "The desktop build produced no standalone executable at ${produced_executable}." >&2
+	exit 1
+}
+executable="${output_directory}/youta-gui-${version}-${operating_system}-${architecture}${executable_extension}"
+install -m 755 "${produced_executable}" "${executable}"
+write_checksum "${executable}"
+echo "Created ${executable}"
 
 bundle_root="target/release/bundle"
 [[ -d ${bundle_root} ]] || {
@@ -122,22 +156,11 @@ for format in deb rpm appimage dmg nsis msi; do
 		}
 		collected=$((collected + 1))
 		install -m 644 "${produced}" "${destination}"
-		(
-			cd "${output_directory}"
-			asset=$(basename -- "${destination}")
-			if command -v sha256sum > /dev/null 2>&1; then
-				sha256sum "${asset}" > "${asset}.sha256"
-			elif command -v shasum > /dev/null 2>&1; then
-				shasum -a 256 "${asset}" > "${asset}.sha256"
-			else
-				echo 'Desktop packaging requires `sha256sum` or `shasum`.' >&2
-				exit 1
-			fi
-		)
+		write_checksum "${destination}"
 		echo "Created ${destination}"
 	done < <(find "${format_directory}" -maxdepth 1 -type f \
 		\( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
-		-o -name '*.dmg' -o -name '*_setup.exe' -o -name '*.msi' \) | sort)
+		-o -name '*.dmg' -o -name '*-setup.exe' -o -name '*.msi' \) | sort)
 done
 
 [[ ${collected} -gt 0 ]] || {
