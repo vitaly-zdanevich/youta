@@ -13,6 +13,8 @@
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 
+![Youta logo](gui/icons/icon.png)
+
 Youta is a low-resource terminal YouTube audio player and subscription manager
 written in Rust. It saves and shows listening progress. Subscriptions are
 currently stored and managed locally; YouTube-account synchronization is not

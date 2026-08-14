@@ -547,6 +547,15 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         );
     }
 
+    let nsis = &bundle["windows"]["nsis"];
+    for field in ["installerIcon", "uninstallerIcon"] {
+        assert_eq!(
+            nsis[field].as_str(),
+            Some("icons/icon.ico"),
+            "the NSIS {field} must use the same Youta icon as the portable Windows executable"
+        );
+    }
+
     // The Linux web view is a runtime dependency of the package, not of the
     // build, so it belongs in the package metadata as well as in the workflow.
     let deb_depends: BTreeSet<String> = bundle["linux"]["deb"]["depends"]
@@ -664,6 +673,25 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         "an unsigned installer is something a user meets before Youta starts"
     );
     assert!(readme.contains("standalone GUI executable"));
+}
+
+#[test]
+fn readme_displays_the_canonical_desktop_icon_below_its_badges() {
+    let readme = read_repository_file("README.md");
+    let badges_end = readme
+        .find("[![Technical Debt]")
+        .expect("README must retain its final badge");
+    let logo = readme
+        .find("![Youta logo](gui/icons/icon.png)")
+        .expect("README must display the canonical desktop icon");
+    let introduction = readme
+        .find("Youta is a low-resource")
+        .expect("README must retain its introduction");
+
+    assert!(
+        badges_end < logo && logo < introduction,
+        "the logo must appear after all badges and before the README introduction"
+    );
 }
 
 /// Empty repository secrets are exported by Actions as present-but-empty.
