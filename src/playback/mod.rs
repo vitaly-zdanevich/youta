@@ -111,8 +111,10 @@ pub struct PlaybackInput {
     /// Ask an extractor-backed remote load to verify candidate media URLs.
     ///
     /// Controllers should enable this only for a retry after a media CDN
-    /// rejects the extractor's initial URL. Normal loads keep it disabled to
-    /// avoid an extra remote format check.
+    /// rejects the extractor's initial URL or yt-dlp finds no requested
+    /// audio-only format. The retry may use a muxed stream when no audio-only
+    /// stream exists. Normal loads keep it disabled to avoid an extra remote
+    /// format check.
     pub verify_remote_format: bool,
     /// Sensitive headers required by a freshly resolved direct media URL.
     pub http_headers: PlaybackHttpHeaders,

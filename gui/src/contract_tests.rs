@@ -28,7 +28,8 @@ use youta::view::{
     DownloadView, ErrorPopupView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
     PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
     QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
-    VideoCommentsPopupView, ViewModel, WaveformView,
+    VideoCommentsPopupView, ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView,
+    YtDlpVersionLookupView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -160,6 +161,14 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     );
     emitted.insert("ErrorPopupView", emitted_keys(&ErrorPopupView::default()));
     emitted.insert(
+        "YtDlpForbiddenView",
+        emitted_keys(&YtDlpForbiddenView::default()),
+    );
+    emitted.insert(
+        "YtDlpGentooVersionView",
+        emitted_keys(&YtDlpGentooVersionView::default()),
+    );
+    emitted.insert(
         "VideoCommentsPopupView",
         emitted_keys(&VideoCommentsPopupView::default()),
     );
@@ -267,6 +276,8 @@ fn every_checked_interface_is_actually_declared() {
         "DetailVideoLinkView",
         "DetailWikidataEntityView",
         "ErrorPopupView",
+        "YtDlpForbiddenView",
+        "YtDlpGentooVersionView",
         "VideoCommentsPopupView",
         "VideoCommentView",
         "ProjectHistoryPopupView",
@@ -288,6 +299,62 @@ fn every_checked_interface_is_actually_declared() {
             "contract.ts no longer declares {interface}"
         );
     }
+}
+
+#[test]
+fn yt_dlp_lookup_variants_keep_the_window_contract_shape() {
+    assert_eq!(
+        serde_json::to_value(YtDlpVersionLookupView::Loading).expect("encode loading lookup"),
+        serde_json::json!("Loading")
+    );
+    assert_eq!(
+        variant_keys(
+            &YtDlpVersionLookupView::Available {
+                version: "2026.08.19".to_owned(),
+                released_on: Some("2026-08-19".to_owned()),
+            },
+            "Available",
+        ),
+        BTreeSet::from(["released_on".to_owned(), "version".to_owned()])
+    );
+    assert_eq!(
+        variant_keys(
+            &YtDlpVersionLookupView::Unavailable {
+                reason: "timed out".to_owned(),
+            },
+            "Unavailable",
+        ),
+        BTreeSet::from(["reason".to_owned()])
+    );
+}
+
+#[test]
+fn the_window_error_component_keeps_the_specialized_message_and_actions() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "403 from yt-dlp — try later or update it.",
+        "A 403 can be temporary or authentication-related.",
+        "OpenYtDlpProject",
+        "OpenGentooYtDlpPackage",
+        "CopyErrorReport",
+        "DismissErrorPopup",
+    ] {
+        assert!(
+            source.contains(required),
+            "popup component no longer contains {required}"
+        );
+    }
+    assert!(
+        source.contains("popup.yt_dlp_forbidden"),
+        "the component must choose the structured body from the view"
+    );
 }
 
 /// Collects every action the window names inline at a `dispatch` call.

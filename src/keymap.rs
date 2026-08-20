@@ -310,19 +310,21 @@ fn unfiltered_key_action(
     view: &ViewModel,
     page_rows: Option<usize>,
 ) -> Option<UiAction> {
-    if view.error_popup.is_some() {
+    if let Some(error) = view.error_popup.as_ref() {
+        let yt_dlp_forbidden = error.yt_dlp_forbidden.as_ref();
         return match key.key {
             Key::Esc => Some(UiAction::DismissErrorPopup),
             Key::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
-            Key::Char('g' | 'G')
-                if view
-                    .error_popup
-                    .as_ref()
-                    .is_some_and(|error| error.gh_available) =>
-            {
+            Key::Char('u' | 'U') if yt_dlp_forbidden.is_some() => Some(UiAction::OpenYtDlpProject),
+            Key::Char('p' | 'P') if yt_dlp_forbidden.is_some_and(|view| view.gentoo.is_some()) => {
+                Some(UiAction::OpenGentooYtDlpPackage)
+            }
+            Key::Char('g' | 'G') if yt_dlp_forbidden.is_none() && error.gh_available => {
                 Some(UiAction::FillGitHubIssue)
             }
-            Key::Char('i' | 'I') => Some(UiAction::CopyAndOpenGitHubIssue),
+            Key::Char('i' | 'I') if yt_dlp_forbidden.is_none() => {
+                Some(UiAction::CopyAndOpenGitHubIssue)
+            }
             Key::Up | Key::Left => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1))),
             Key::Down | Key::Right => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(1))),
             Key::PageUp => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(-1))),

@@ -63,6 +63,8 @@ pub mod youtube_channel_page;
 pub mod youtube_music;
 #[cfg(feature = "youtube-official")]
 pub mod youtube_official;
+#[cfg(feature = "yt-dlp")]
+pub mod yt_dlp_updates;
 
 /// Default upper bound for a provider JSON response.
 pub const DEFAULT_MAX_JSON_BYTES: usize = 2 * 1024 * 1024;

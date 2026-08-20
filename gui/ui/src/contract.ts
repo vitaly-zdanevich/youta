@@ -218,6 +218,27 @@ export type InformationPanelKind =
   | "Local"
   | "Generic";
 
+/** Progressive result of one bounded yt-dlp version lookup. */
+export type YtDlpVersionLookupView =
+  | "Loading"
+  | { Available: { version: string; released_on: string | null } }
+  | { Unavailable: { reason: string } };
+
+/** Gentoo's architecture-specific stable yt-dlp package metadata. */
+export interface YtDlpGentooVersionView {
+  arch: string;
+  package_url: string;
+  latest_stable: YtDlpVersionLookupView;
+}
+
+/** Progressive version metadata for an HTTP 403 attributed to yt-dlp. */
+export interface YtDlpForbiddenView {
+  project_url: string;
+  installed: YtDlpVersionLookupView;
+  github_latest: YtDlpVersionLookupView;
+  gentoo: YtDlpGentooVersionView | null;
+}
+
 /** The diagnostic report shown after a recoverable failure. */
 export interface ErrorPopupView {
   title: string;
@@ -225,6 +246,7 @@ export interface ErrorPopupView {
   scroll_offset: number;
   gh_available: boolean;
   action_status: string | null;
+  yt_dlp_forbidden: YtDlpForbiddenView | null;
 }
 
 /** One public top-level comment. */

@@ -34,6 +34,13 @@ mod backend {
     const ICY_TITLE_OBSERVER_ID: u64 = 1;
     const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
 
+    /// Audio-only selector used by every ordinary extractor-backed load.
+    #[cfg(feature = "yt-dlp")]
+    const YTDL_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
+
+    /// Checked YouTube retry selector with a last-resort muxed stream.
+    const YTDL_CHECKED_YOUTUBE_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio/best";
+
     struct MpvIpc {
         link: IpcLink,
         request_id: u64,
@@ -533,6 +540,10 @@ mod backend {
                 "ytdl-raw-options".to_owned(),
                 Value::String("check-formats=".to_owned()),
             );
+            options.insert(
+                "ytdl-format".to_owned(),
+                Value::String(YTDL_CHECKED_YOUTUBE_FORMAT.to_owned()),
+            );
         }
         if input.bypass_ytdl {
             options.insert("ytdl".to_owned(), Value::String("no".to_owned()));
@@ -672,7 +683,7 @@ mod backend {
                 "--script-opts=ytdl_hook-ytdl_path={}",
                 config.yt_dlp_executable.display()
             ))
-            .arg("--ytdl-format=bestaudio[acodec^=opus]/bestaudio")
+            .arg(format!("--ytdl-format={YTDL_AUDIO_FORMAT}"))
             .arg(format!(
                 "--ytdl-raw-options=js-runtimes={}",
                 super::super::ytdlp::ADDITIONAL_JS_RUNTIME
@@ -1317,8 +1328,58 @@ mod backend {
                     json!({
                         "pause": "no",
                         "ytdl-raw-options": "check-formats=",
+                        "ytdl-format": YTDL_CHECKED_YOUTUBE_FORMAT,
                     }),
                 ]
+            );
+        }
+
+        #[cfg(feature = "yt-dlp")]
+        #[test]
+        fn checked_load_allows_the_reported_muxed_hls_formats_as_a_last_resort() {
+            let formats = json!([
+                {"format_id": "91", "protocol": "m3u8_native", "acodec": "mp4a.40.5", "vcodec": "avc1.4d400b"},
+                {"format_id": "92", "protocol": "m3u8_native", "acodec": "mp4a.40.5", "vcodec": "avc1.4d400c"},
+                {"format_id": "93", "protocol": "m3u8_native", "acodec": "mp4a.40.2", "vcodec": "avc1.4d401e"},
+                {"format_id": "94", "protocol": "m3u8_native", "acodec": "mp4a.40.2", "vcodec": "avc1.4d401f"},
+                {"format_id": "95", "protocol": "m3u8_native", "acodec": "mp4a.40.2", "vcodec": "avc1.4d401f"},
+                {"format_id": "96", "protocol": "m3u8_native", "acodec": "mp4a.40.2", "vcodec": "avc1.4d4028"},
+            ]);
+            let formats = formats.as_array().expect("format fixture array");
+
+            assert_eq!(
+                formats
+                    .iter()
+                    .filter_map(|format| format.get("format_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                ["91", "92", "93", "94", "95", "96"]
+            );
+            assert!(formats.iter().all(|format| {
+                format.get("protocol").and_then(Value::as_str) == Some("m3u8_native")
+                    && format.get("acodec").and_then(Value::as_str) != Some("none")
+                    && format.get("vcodec").and_then(Value::as_str) != Some("none")
+            }));
+            assert_eq!(
+                YTDL_CHECKED_YOUTUBE_FORMAT,
+                format!("{YTDL_AUDIO_FORMAT}/best"),
+                "the retry must preserve normal audio quality before allowing a muxed format"
+            );
+
+            let mut input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
+            input.verify_remote_format = true;
+            let command = loadfile_command(&input).expect("checked HLS-only loadfile command");
+            let options = command
+                .get(4)
+                .and_then(Value::as_object)
+                .expect("per-file options");
+
+            assert_eq!(
+                options.get("ytdl-format").and_then(Value::as_str),
+                Some(YTDL_CHECKED_YOUTUBE_FORMAT)
+            );
+            assert_eq!(
+                options.get("ytdl-raw-options").and_then(Value::as_str),
+                Some("check-formats=")
             );
         }
 
@@ -1359,6 +1420,7 @@ mod backend {
                         "pause": "no",
                         "start": "30.5",
                         "ytdl-raw-options": "check-formats=",
+                        "ytdl-format": YTDL_CHECKED_YOUTUBE_FORMAT,
                     }),
                 ]
             );

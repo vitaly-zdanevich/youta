@@ -19,6 +19,8 @@ import type {
   QueuePopupView,
   VideoCommentsPopupView,
   VideoQrPopupView,
+  YtDlpForbiddenView,
+  YtDlpVersionLookupView,
 } from "../contract";
 import { dispatch } from "../ipc";
 import { Popup, PopupButton, PopupError } from "./Popup";
@@ -178,7 +180,61 @@ export function ProjectHistoryPopup({ popup }: { popup: ProjectHistoryPopupView 
   );
 }
 
-/** The complete diagnostic report for a recoverable failure. */
+/** Formats one independently updating yt-dlp version lookup. */
+function ytDlpLookupText(lookup: YtDlpVersionLookupView) {
+  if (lookup === "Loading") {
+    return "Loading…";
+  }
+  if ("Unavailable" in lookup) {
+    const reason = lookup.Unavailable.reason.trim();
+    return reason === "" ? "Unavailable" : `Unavailable (${reason})`;
+  }
+  const releasedOn = lookup.Available.released_on?.trim();
+  return releasedOn
+    ? `${lookup.Available.version} (released ${releasedOn})`
+    : lookup.Available.version;
+}
+
+/** Short progressive guidance shown instead of the complete diagnostic report. */
+function YtDlpForbiddenBody({ view }: { view: YtDlpForbiddenView }) {
+  return (
+    <Body>
+      <p className="text-sm font-medium text-ink">
+        403 from yt-dlp — try later or update it.
+      </p>
+      <p className="mt-[8px] text-ink-dim">
+        A 403 can be temporary or authentication-related.
+      </p>
+      <dl className="mt-[14px] grid grid-cols-[max-content_minmax(0,1fr)] gap-x-[10px] gap-y-[6px]">
+        <dt className="text-ink-faint">Installed:</dt>
+        <dd className="font-mono text-ink-dim">{ytDlpLookupText(view.installed)}</dd>
+        <dt className="text-ink-faint">GitHub latest:</dt>
+        <dd className="font-mono text-ink-dim">{ytDlpLookupText(view.github_latest)}</dd>
+        {view.gentoo === null ? null : (
+          <>
+            <dt className="text-ink-faint">Gentoo latest stable ({view.gentoo.arch}):</dt>
+            <dd className="font-mono text-ink-dim">
+              {ytDlpLookupText(view.gentoo.latest_stable)}
+            </dd>
+          </>
+        )}
+      </dl>
+      <div className="mt-[16px] space-y-[6px] text-ink-faint">
+        <p>
+          Project: <span className="break-all font-mono text-ink-dim">{view.project_url}</span>
+        </p>
+        {view.gentoo === null ? null : (
+          <p>
+            Gentoo package:{" "}
+            <span className="break-all font-mono text-ink-dim">{view.gentoo.package_url}</span>
+          </p>
+        )}
+      </div>
+    </Body>
+  );
+}
+
+/** The complete copyable report, or specialized guidance for a yt-dlp 403. */
 export function ErrorPopup({
   popup,
   externalOpener,
@@ -186,6 +242,7 @@ export function ErrorPopup({
   popup: ErrorPopupView;
   externalOpener: boolean;
 }) {
+  const forbidden = popup.yt_dlp_forbidden;
   return (
     <Popup
       title={popup.title}
@@ -193,24 +250,43 @@ export function ErrorPopup({
       layer={LAYER.error}
       onDismiss={() => void dispatch("DismissErrorPopup")}
       footer={
-        <>
-          <PopupButton onClick={() => void dispatch("CopyErrorReport")}>Copy report</PopupButton>
-          {popup.gh_available ? (
-            <PopupButton onClick={() => void dispatch("FillGitHubIssue")}>
-              Prepare an issue
-            </PopupButton>
-          ) : null}
-          {popup.gh_available && externalOpener ? (
-            <PopupButton onClick={() => void dispatch("CopyAndOpenGitHubIssue")}>
-              Copy and open GitHub
-            </PopupButton>
-          ) : null}
-        </>
+        forbidden === null ? (
+          <>
+            <PopupButton onClick={() => void dispatch("CopyErrorReport")}>Copy report</PopupButton>
+            {popup.gh_available ? (
+              <PopupButton onClick={() => void dispatch("FillGitHubIssue")}>
+                Prepare an issue
+              </PopupButton>
+            ) : null}
+            {popup.gh_available && externalOpener ? (
+              <PopupButton onClick={() => void dispatch("CopyAndOpenGitHubIssue")}>
+                Copy and open GitHub
+              </PopupButton>
+            ) : null}
+          </>
+        ) : (
+          <>
+            {externalOpener ? (
+              <PopupButton onClick={() => void dispatch("OpenYtDlpProject")}>Project</PopupButton>
+            ) : null}
+            {externalOpener && forbidden.gentoo !== null ? (
+              <PopupButton onClick={() => void dispatch("OpenGentooYtDlpPackage")}>
+                Gentoo package
+              </PopupButton>
+            ) : null}
+            <PopupButton onClick={() => void dispatch("CopyErrorReport")}>Copy report</PopupButton>
+            <PopupButton onClick={() => void dispatch("DismissErrorPopup")}>Close</PopupButton>
+          </>
+        )
       }
     >
-      <div className="h-full overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
-        {popup.report}
-      </div>
+      {forbidden === null ? (
+        <div className="h-full overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
+          {popup.report}
+        </div>
+      ) : (
+        <YtDlpForbiddenBody view={forbidden} />
+      )}
     </Popup>
   );
 }

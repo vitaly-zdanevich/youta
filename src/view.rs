@@ -55,6 +55,12 @@ pub const WIKIDATA_MEDIA_PLAY_SYMBOL: &str = "▶";
 /// Official Invidious documentation listing public instances.
 pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
 
+/// Official yt-dlp source repository and release page.
+pub const YT_DLP_PROJECT_URL: &str = "https://github.com/yt-dlp/yt-dlp";
+
+/// Gentoo package metadata for yt-dlp.
+pub const GENTOO_YT_DLP_PACKAGE_URL: &str = "https://packages.gentoo.org/packages/net-misc/yt-dlp";
+
 /// Maximum clipboard payload reconstructed from one Details-panel drag.
 pub(crate) const MAX_DETAILS_SELECTION_BYTES: usize = 64 * 1024;
 
@@ -1242,6 +1248,83 @@ pub struct DetailsTextSelection {
     pub dragging: bool,
 }
 
+/// Progressive result of one bounded yt-dlp version lookup.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum YtDlpVersionLookupView {
+    /// The bounded local or remote lookup is still running.
+    #[default]
+    Loading,
+    /// One version was found, with its release date when the source exposes one.
+    Available {
+        /// Version text exactly as reported by the trusted helper or provider.
+        version: String,
+        /// Human-readable release date, when known.
+        released_on: Option<String>,
+    },
+    /// The bounded lookup finished without usable version metadata.
+    Unavailable {
+        /// Short, non-sensitive explanation suitable for display.
+        reason: String,
+    },
+}
+
+/// Gentoo's architecture-specific stable yt-dlp package metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct YtDlpGentooVersionView {
+    /// Gentoo keyword architecture whose stable version is being reported.
+    pub arch: String,
+    /// Fixed Gentoo package page displayed by both front-ends.
+    pub package_url: String,
+    /// Independently loading latest stable version for this architecture.
+    pub latest_stable: YtDlpVersionLookupView,
+}
+
+impl Default for YtDlpGentooVersionView {
+    fn default() -> Self {
+        Self {
+            arch: String::new(),
+            package_url: GENTOO_YT_DLP_PACKAGE_URL.to_owned(),
+            latest_stable: YtDlpVersionLookupView::Loading,
+        }
+    }
+}
+
+/// Progressive version metadata shown for an HTTP 403 attributed to yt-dlp.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct YtDlpForbiddenView {
+    /// Fixed official yt-dlp project URL displayed by both front-ends.
+    pub project_url: String,
+    /// Version of the configured yt-dlp executable Youta invoked.
+    pub installed: YtDlpVersionLookupView,
+    /// Latest release reported by the official GitHub repository.
+    pub github_latest: YtDlpVersionLookupView,
+    /// Gentoo package metadata, present only when Youta runs on Gentoo.
+    pub gentoo: Option<YtDlpGentooVersionView>,
+}
+
+impl YtDlpForbiddenView {
+    /// Creates the immediately visible state while bounded lookups run.
+    #[must_use]
+    pub fn loading(gentoo_arch: Option<String>) -> Self {
+        Self {
+            project_url: YT_DLP_PROJECT_URL.to_owned(),
+            installed: YtDlpVersionLookupView::Loading,
+            github_latest: YtDlpVersionLookupView::Loading,
+            gentoo: gentoo_arch.map(|arch| YtDlpGentooVersionView {
+                arch,
+                package_url: GENTOO_YT_DLP_PACKAGE_URL.to_owned(),
+                latest_stable: YtDlpVersionLookupView::Loading,
+            }),
+        }
+    }
+}
+
+impl Default for YtDlpForbiddenView {
+    fn default() -> Self {
+        Self::loading(None)
+    }
+}
+
 /// Diagnostic information shown above the normal interface after an error.
 ///
 /// `report` contains the complete, copyable diagnostic report rather than a
@@ -1259,6 +1342,11 @@ pub struct ErrorPopupView {
     pub gh_available: bool,
     /// Result of the most recent copy or issue-review action.
     pub action_status: Option<String>,
+    /// Short progressive body for a 403 attributed to yt-dlp.
+    ///
+    /// The complete diagnostic payload remains in `report` for copying even
+    /// while front-ends render this structured body instead.
+    pub yt_dlp_forbidden: Option<YtDlpForbiddenView>,
 }
 
 /// One public top-level comment rendered in the selected-video popup.
@@ -2057,6 +2145,10 @@ pub enum UiAction {
     DismissQueuePopup,
     /// Close the diagnostic error popup without changing the underlying screen.
     DismissErrorPopup,
+    /// Open the official yt-dlp project page from its specialized 403 popup.
+    OpenYtDlpProject,
+    /// Open Gentoo's yt-dlp package page from its specialized 403 popup.
+    OpenGentooYtDlpPackage,
     /// Open public top-level comments for the selected YouTube video.
     OpenVideoComments,
     /// Set the exact wrapped-line offset in the public-comments popup.
@@ -2203,6 +2295,8 @@ impl UiAction {
                 | Self::OpenInBrowser
                 | Self::OpenChannelInBrowser
                 | Self::CopyAndOpenGitHubIssue
+                | Self::OpenYtDlpProject
+                | Self::OpenGentooYtDlpPackage
                 | Self::OpenYouTubeApiKeyGuide
                 | Self::OpenGoogleCloudCredentials
                 | Self::OpenInvidiousInstances
@@ -2425,6 +2519,26 @@ mod tests {
 
         assert!(serialized.contains("nocturne op 9"));
         assert!(serialized.contains("Playing"));
+    }
+
+    #[test]
+    fn yt_dlp_forbidden_loading_state_uses_only_fixed_project_links() {
+        let popup = YtDlpForbiddenView::loading(Some("amd64".to_owned()));
+
+        assert_eq!(popup.project_url, YT_DLP_PROJECT_URL);
+        assert_eq!(popup.installed, YtDlpVersionLookupView::Loading);
+        assert_eq!(popup.github_latest, YtDlpVersionLookupView::Loading);
+        let gentoo = popup.gentoo.expect("Gentoo metadata row");
+        assert_eq!(gentoo.arch, "amd64");
+        assert_eq!(gentoo.package_url, GENTOO_YT_DLP_PACKAGE_URL);
+        assert_eq!(gentoo.latest_stable, YtDlpVersionLookupView::Loading);
+    }
+
+    #[test]
+    fn yt_dlp_popup_links_require_a_graphical_external_opener() {
+        assert!(UiAction::OpenYtDlpProject.requires_external_opener());
+        assert!(UiAction::OpenGentooYtDlpPackage.requires_external_opener());
+        assert!(!UiAction::CopyErrorReport.requires_external_opener());
     }
 
     #[test]

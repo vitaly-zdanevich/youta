@@ -12,6 +12,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
+#[cfg(all(feature = "yt-dlp", target_os = "linux"))]
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -59,6 +61,8 @@ use crate::config::{
     SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV,
     YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
 };
+#[cfg(feature = "yt-dlp")]
+use crate::diagnostics::ExternalHelperProbeStatus;
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 #[cfg(feature = "radio")]
 use crate::domain::RADIO_FAVORITES_PLAYLIST_ID;
@@ -175,6 +179,12 @@ use crate::providers::yandex_music_media::{YandexMusicDownloadProgress, YandexMu
 use crate::providers::youtube_music::{
     YouTubeMusicSearch, YouTubeMusicSearchConfig, YouTubeMusicTrack,
 };
+#[cfg(feature = "yt-dlp")]
+use crate::providers::yt_dlp_updates::{
+    GentooStableYtDlpVersion, GitHubYtDlpRelease, InstalledYtDlpVersion, parse_installed_version,
+};
+#[cfg(all(feature = "network", feature = "yt-dlp"))]
+use crate::providers::yt_dlp_updates::{GentooYtDlpPackageClient, GitHubYtDlpReleaseClient};
 use crate::providers::{
     ChannelDetails, ChannelExternalLinkKind, ChannelStatisticsMode, ChannelSubscriberCount,
     ChannelSummary, ChannelVideosRequest, MAX_VIDEO_COMMENTS, Provider, SearchFeature, SearchItem,
@@ -224,6 +234,10 @@ use crate::view::{
 use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
 };
+#[cfg(feature = "yt-dlp")]
+use crate::view::{
+    GENTOO_YT_DLP_PACKAGE_URL, YT_DLP_PROJECT_URL, YtDlpForbiddenView, YtDlpVersionLookupView,
+};
 #[cfg(feature = "yandex-music")]
 use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
@@ -267,6 +281,11 @@ const MAX_LIVE_SEEK_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Keeps absolute seeks inside [`BufferedRange`]'s half-open upper boundary.
 const LIVE_SEEK_END_GUARD: Duration = Duration::from_millis(1);
+
+/// Maximum Linux distribution metadata read while deciding whether Gentoo
+/// package information belongs in the specialized yt-dlp error popup.
+#[cfg(all(feature = "yt-dlp", target_os = "linux"))]
+const MAX_OS_RELEASE_ID_BYTES: u64 = 64 * 1024;
 
 const GPM_UNAVAILABLE_STATUS: &str = "GPM mouse unavailable. F8 keyboard pointer remains active.";
 const GPM_UNAVAILABLE_OPENRC_STATUS: &str =
@@ -2053,6 +2072,18 @@ enum ProviderRequest {
         generation: u64,
         base_sha: String,
     },
+    /// Starts only the missing process-local yt-dlp version lookups.
+    ///
+    /// The general provider worker merely launches the bounded independent
+    /// jobs; none of these checks may hold up unrelated catalogue requests.
+    #[cfg(feature = "yt-dlp")]
+    YtDlpUpdateLookups {
+        generation: u64,
+        executable: PathBuf,
+        installed: bool,
+        github: bool,
+        gentoo_arch: Option<String>,
+    },
     ChannelDetails {
         generation: u64,
         provider_generation: u64,
@@ -2423,6 +2454,25 @@ enum ProviderResponse {
     ProjectHistory {
         generation: u64,
         result: Result<Vec<GitHubCommit>, String>,
+    },
+    /// Configured executable version, resolved without network access.
+    #[cfg(feature = "yt-dlp")]
+    YtDlpInstalledVersion {
+        generation: u64,
+        result: Result<InstalledYtDlpVersion, String>,
+    },
+    /// Latest full release from the official GitHub API.
+    #[cfg(feature = "yt-dlp")]
+    YtDlpGitHubLatest {
+        generation: u64,
+        result: Result<GitHubYtDlpRelease, String>,
+    },
+    /// Latest stable Gentoo package version for one exact keyword arch.
+    #[cfg(feature = "yt-dlp")]
+    YtDlpGentooLatest {
+        generation: u64,
+        arch: String,
+        result: Result<Option<GentooStableYtDlpVersion>, String>,
     },
     #[cfg(feature = "bandcamp")]
     BandcampSearch {
@@ -3627,6 +3677,24 @@ struct ActiveRadioRecording {
     started_at: DateTime<Local>,
 }
 
+/// Components still owned by one process-local yt-dlp update lookup batch.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PendingYtDlpUpdateLookups {
+    generation: u64,
+    installed: bool,
+    github: bool,
+    gentoo_arch: Option<String>,
+}
+
+#[cfg(feature = "yt-dlp")]
+impl PendingYtDlpUpdateLookups {
+    /// Returns whether at least one bounded job still owns a response.
+    const fn is_active(&self) -> bool {
+        self.installed || self.github || self.gentoo_arch.is_some()
+    }
+}
+
 /// Default application state used by the interactive terminal.
 pub struct AppController {
     config: Config,
@@ -4226,6 +4294,21 @@ pub struct AppController {
     download_completion_notice_deadline: Option<Instant>,
     report_actions: Box<dyn DiagnosticActionHandler>,
     diagnostic_helpers_cache: Option<Vec<ExternalHelper>>,
+    /// Monotonic owner for independently completing yt-dlp update lookups.
+    #[cfg(feature = "yt-dlp")]
+    yt_dlp_update_generation: u64,
+    /// Components from the current lookup batch that have not replied yet.
+    #[cfg(feature = "yt-dlp")]
+    pending_yt_dlp_update_lookups: PendingYtDlpUpdateLookups,
+    /// Process-local installed-version result, including a bounded failure.
+    #[cfg(feature = "yt-dlp")]
+    yt_dlp_installed_version_cache: Option<YtDlpVersionLookupView>,
+    /// Process-local official GitHub latest-release result.
+    #[cfg(feature = "yt-dlp")]
+    yt_dlp_github_latest_cache: Option<YtDlpVersionLookupView>,
+    /// Process-local Gentoo stable result and the exact arch it describes.
+    #[cfg(feature = "yt-dlp")]
+    yt_dlp_gentoo_latest_cache: Option<(String, YtDlpVersionLookupView)>,
     /// URL-free completions from detached system-opener tasks.
     url_open_results: Receiver<UrlOpenCompletion>,
     /// Sender cloned into each detached system-opener task.
@@ -5168,6 +5251,16 @@ impl AppController {
             download_completion_notice_deadline: None,
             report_actions: Box::new(SystemReportActions::new()),
             diagnostic_helpers_cache: None,
+            #[cfg(feature = "yt-dlp")]
+            yt_dlp_update_generation: 0,
+            #[cfg(feature = "yt-dlp")]
+            pending_yt_dlp_update_lookups: PendingYtDlpUpdateLookups::default(),
+            #[cfg(feature = "yt-dlp")]
+            yt_dlp_installed_version_cache: None,
+            #[cfg(feature = "yt-dlp")]
+            yt_dlp_github_latest_cache: None,
+            #[cfg(feature = "yt-dlp")]
+            yt_dlp_gentoo_latest_cache: None,
             url_open_results,
             url_open_result_sender,
             url_open_pending: 0,
@@ -11034,6 +11127,20 @@ impl AppController {
             ProviderResponse::ProjectHistory { generation, result } => {
                 self.handle_project_history_response(generation, result);
             }
+            #[cfg(feature = "yt-dlp")]
+            ProviderResponse::YtDlpInstalledVersion { generation, result } => {
+                self.handle_yt_dlp_installed_version(generation, result);
+            }
+            #[cfg(feature = "yt-dlp")]
+            ProviderResponse::YtDlpGitHubLatest { generation, result } => {
+                self.handle_yt_dlp_github_latest(generation, result);
+            }
+            #[cfg(feature = "yt-dlp")]
+            ProviderResponse::YtDlpGentooLatest {
+                generation,
+                arch,
+                result,
+            } => self.handle_yt_dlp_gentoo_latest(generation, arch, result),
             ProviderResponse::Apple { generation, result } => {
                 if self.finish_playlist_replay(generation, &SourceKind::ApplePodcasts, &result) {
                     return;
@@ -19982,6 +20089,12 @@ impl AppController {
             .current_media
             .as_ref()
             .is_some_and(|media| media.source == SourceKind::ModArchive);
+        #[cfg(feature = "yt-dlp")]
+        let youtube_http_403 = self
+            .current_media
+            .as_ref()
+            .is_some_and(|media| media.source == SourceKind::YouTube)
+            && playback_end_reports_http_403(&end);
         self.prepare_to_clear_playback(elapsed);
         match end.reason.clone() {
             PlaybackEndReason::Eof if !playback_started => {
@@ -19990,6 +20103,16 @@ impl AppController {
                 #[cfg(feature = "tracker-music")]
                 self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
+                #[cfg(feature = "yt-dlp")]
+                if youtube_http_403 {
+                    let report = DiagnosticReport::capture_message(
+                        &message,
+                        self.unprobed_diagnostic_helpers(),
+                    )
+                    .render();
+                    self.show_yt_dlp_forbidden_report(report);
+                    return;
+                }
                 self.show_error_message("Playback did not start", message);
             }
             PlaybackEndReason::Eof => {
@@ -20060,6 +20183,16 @@ impl AppController {
                 #[cfg(feature = "tracker-music")]
                 self.cancel_pending_tracker_autoplay();
                 self.reset_playback_state();
+                #[cfg(feature = "yt-dlp")]
+                if youtube_http_403 {
+                    let report = DiagnosticReport::capture_message(
+                        &message,
+                        self.unprobed_diagnostic_helpers(),
+                    )
+                    .render();
+                    self.show_yt_dlp_forbidden_report(report);
+                    return;
+                }
                 self.show_error_message("Playback failed", message);
             }
             PlaybackEndReason::Other(reason) => {
@@ -23650,20 +23783,247 @@ impl AppController {
             .clone()
     }
 
+    /// Describes configured helpers without delaying an error popup to launch
+    /// their version commands.
+    #[cfg(feature = "yt-dlp")]
+    fn unprobed_diagnostic_helpers(&self) -> Vec<ExternalHelper> {
+        let helpers = vec![
+            ExternalHelper::new("mpv", Some(self.config.providers.mpv_executable.clone())),
+            ExternalHelper::new(
+                "yt-dlp",
+                Some(self.config.providers.yt_dlp_executable.clone()),
+            ),
+        ];
+        #[cfg(feature = "acoustid")]
+        let helpers = {
+            let mut helpers = helpers;
+            helpers.push(ExternalHelper::new(
+                "fpcalc",
+                Some(self.config.providers.fpcalc_executable.clone()),
+            ));
+            helpers
+        };
+        helpers
+    }
+
     fn show_error<E>(&mut self, title: &str, error: &E)
     where
         E: std::error::Error + 'static,
     {
+        #[cfg(feature = "yt-dlp")]
+        if message_reports_yt_dlp_http_403(&error.to_string()) {
+            let report =
+                DiagnosticReport::capture_error(error, self.unprobed_diagnostic_helpers()).render();
+            self.show_yt_dlp_forbidden_report(report);
+            return;
+        }
         let report = DiagnosticReport::capture_error(error, self.diagnostic_helpers()).render();
         self.show_diagnostic_report(title, report);
         self.view.status_line = format!("{title}: {error}");
     }
 
     fn show_error_message(&mut self, title: &str, message: impl std::fmt::Display) {
+        let message = message.to_string();
+        #[cfg(feature = "yt-dlp")]
+        if message_reports_yt_dlp_http_403(&message) {
+            let report =
+                DiagnosticReport::capture_message(&message, self.unprobed_diagnostic_helpers())
+                    .render();
+            self.show_yt_dlp_forbidden_report(report);
+            return;
+        }
         let report =
             DiagnosticReport::capture_message(&message, self.diagnostic_helpers()).render();
         self.show_diagnostic_report(title, report);
         self.view.status_line = format!("{title}: {message}");
+    }
+
+    /// Presents the actionable yt-dlp 403 body before starting any helper or
+    /// network request, then fills each version row independently.
+    #[cfg(feature = "yt-dlp")]
+    fn show_yt_dlp_forbidden_report(&mut self, report: String) {
+        let gentoo_arch = detected_gentoo_arch();
+        let mut forbidden = YtDlpForbiddenView::loading(gentoo_arch.clone());
+        if let Some(cached) = self.yt_dlp_installed_version_cache.as_ref() {
+            forbidden.installed = cached.clone();
+        }
+        if let Some(cached) = self.yt_dlp_github_latest_cache.as_ref() {
+            forbidden.github_latest = cached.clone();
+        }
+        if let (Some(gentoo), Some((cached_arch, cached))) = (
+            forbidden.gentoo.as_mut(),
+            self.yt_dlp_gentoo_latest_cache.as_ref(),
+        ) && gentoo.arch == *cached_arch
+        {
+            gentoo.latest_stable = cached.clone();
+        }
+        self.view.error_popup = Some(ErrorPopupView {
+            title: "yt-dlp HTTP 403".to_owned(),
+            report,
+            scroll_offset: 0,
+            gh_available: self.report_actions.gh_available(),
+            action_status: None,
+            yt_dlp_forbidden: Some(forbidden),
+        });
+        "403 from yt-dlp — try later or update it.".clone_into(&mut self.view.status_line);
+        self.start_missing_yt_dlp_update_lookups(gentoo_arch);
+    }
+
+    /// Starts no duplicate work when another specialized popup already owns
+    /// the same process-local lookup batch.
+    #[cfg(feature = "yt-dlp")]
+    fn start_missing_yt_dlp_update_lookups(&mut self, gentoo_arch: Option<String>) {
+        let installed = self.yt_dlp_installed_version_cache.is_none()
+            && !self.pending_yt_dlp_update_lookups.installed;
+        let github =
+            self.yt_dlp_github_latest_cache.is_none() && !self.pending_yt_dlp_update_lookups.github;
+        let gentoo_arch = gentoo_arch.filter(|arch| {
+            let cached = self
+                .yt_dlp_gentoo_latest_cache
+                .as_ref()
+                .is_some_and(|(cached_arch, _)| cached_arch == arch);
+            let pending = self.pending_yt_dlp_update_lookups.gentoo_arch.as_ref() == Some(arch);
+            !cached && !pending
+        });
+        if !installed && !github && gentoo_arch.is_none() {
+            return;
+        }
+        if !self.pending_yt_dlp_update_lookups.is_active() {
+            self.yt_dlp_update_generation = self.yt_dlp_update_generation.wrapping_add(1);
+            self.pending_yt_dlp_update_lookups.generation = self.yt_dlp_update_generation;
+        }
+        let generation = self.pending_yt_dlp_update_lookups.generation;
+        self.pending_yt_dlp_update_lookups.installed |= installed;
+        self.pending_yt_dlp_update_lookups.github |= github;
+        if gentoo_arch.is_some() {
+            self.pending_yt_dlp_update_lookups
+                .gentoo_arch
+                .clone_from(&gentoo_arch);
+        }
+        let request = ProviderRequest::YtDlpUpdateLookups {
+            generation,
+            executable: self.config.providers.yt_dlp_executable.clone(),
+            installed,
+            github,
+            gentoo_arch,
+        };
+        if self
+            .provider_requests
+            .as_ref()
+            .is_none_or(|sender| sender.send(request).is_err())
+        {
+            let reason = "background lookup worker is unavailable".to_owned();
+            if installed {
+                self.handle_yt_dlp_installed_version(generation, Err(reason.clone()));
+            }
+            if github {
+                self.handle_yt_dlp_github_latest(generation, Err(reason.clone()));
+            }
+            if let Some(arch) = self.pending_yt_dlp_update_lookups.gentoo_arch.clone() {
+                self.handle_yt_dlp_gentoo_latest(generation, arch, Err(reason));
+            }
+        }
+    }
+
+    /// Applies the local executable result without touching a replaced popup.
+    #[cfg(feature = "yt-dlp")]
+    fn handle_yt_dlp_installed_version(
+        &mut self,
+        generation: u64,
+        result: Result<InstalledYtDlpVersion, String>,
+    ) {
+        if generation != self.pending_yt_dlp_update_lookups.generation
+            || !self.pending_yt_dlp_update_lookups.installed
+        {
+            return;
+        }
+        self.pending_yt_dlp_update_lookups.installed = false;
+        let lookup = match result {
+            Ok(installed) => YtDlpVersionLookupView::Available {
+                version: installed.version,
+                released_on: Some(installed.release_date.to_string()),
+            },
+            Err(reason) => YtDlpVersionLookupView::Unavailable { reason },
+        };
+        self.yt_dlp_installed_version_cache = Some(lookup.clone());
+        if let Some(forbidden) = self
+            .view
+            .error_popup
+            .as_mut()
+            .and_then(|popup| popup.yt_dlp_forbidden.as_mut())
+        {
+            forbidden.installed = lookup;
+        }
+    }
+
+    /// Applies the official latest-release result without coupling it to the
+    /// local executable probe or Gentoo package lookup.
+    #[cfg(feature = "yt-dlp")]
+    fn handle_yt_dlp_github_latest(
+        &mut self,
+        generation: u64,
+        result: Result<GitHubYtDlpRelease, String>,
+    ) {
+        if generation != self.pending_yt_dlp_update_lookups.generation
+            || !self.pending_yt_dlp_update_lookups.github
+        {
+            return;
+        }
+        self.pending_yt_dlp_update_lookups.github = false;
+        let lookup = match result {
+            Ok(release) => YtDlpVersionLookupView::Available {
+                version: release.version,
+                released_on: release.published_at.get(..10).map(str::to_owned),
+            },
+            Err(reason) => YtDlpVersionLookupView::Unavailable { reason },
+        };
+        self.yt_dlp_github_latest_cache = Some(lookup.clone());
+        if let Some(forbidden) = self
+            .view
+            .error_popup
+            .as_mut()
+            .and_then(|popup| popup.yt_dlp_forbidden.as_mut())
+        {
+            forbidden.github_latest = lookup;
+        }
+    }
+
+    /// Applies one architecture-specific Gentoo result and caches even the
+    /// empty stable set so repeated errors do not refetch the package page.
+    #[cfg(feature = "yt-dlp")]
+    fn handle_yt_dlp_gentoo_latest(
+        &mut self,
+        generation: u64,
+        arch: String,
+        result: Result<Option<GentooStableYtDlpVersion>, String>,
+    ) {
+        if generation != self.pending_yt_dlp_update_lookups.generation
+            || self.pending_yt_dlp_update_lookups.gentoo_arch.as_deref() != Some(arch.as_str())
+        {
+            return;
+        }
+        self.pending_yt_dlp_update_lookups.gentoo_arch = None;
+        let lookup = match result {
+            Ok(Some(release)) => YtDlpVersionLookupView::Available {
+                version: release.version,
+                released_on: None,
+            },
+            Ok(None) => YtDlpVersionLookupView::Unavailable {
+                reason: format!("no stable version for {arch}"),
+            },
+            Err(reason) => YtDlpVersionLookupView::Unavailable { reason },
+        };
+        if let Some(gentoo) = self
+            .view
+            .error_popup
+            .as_mut()
+            .and_then(|popup| popup.yt_dlp_forbidden.as_mut())
+            .and_then(|forbidden| forbidden.gentoo.as_mut())
+            .filter(|gentoo| gentoo.arch == arch)
+        {
+            gentoo.latest_stable.clone_from(&lookup);
+        }
+        self.yt_dlp_gentoo_latest_cache = Some((arch, lookup));
     }
 
     /// Opens the diagnostic popup with a complete, already-redacted report.
@@ -23677,6 +24037,7 @@ impl AppController {
             scroll_offset: 0,
             gh_available: self.report_actions.gh_available(),
             action_status: None,
+            yt_dlp_forbidden: None,
         });
     }
 
@@ -26480,6 +26841,22 @@ impl UiController for AppController {
             UiAction::CopyErrorReport => self.copy_error_report(),
             UiAction::FillGitHubIssue => self.fill_github_issue(),
             UiAction::CopyAndOpenGitHubIssue => self.copy_and_open_github_issue(),
+            UiAction::OpenYtDlpProject => {
+                #[cfg(feature = "yt-dlp")]
+                self.open_external_url(YT_DLP_PROJECT_URL);
+                #[cfg(not(feature = "yt-dlp"))]
+                {
+                    self.view.status_line = "This build omits yt-dlp support".to_owned();
+                }
+            }
+            UiAction::OpenGentooYtDlpPackage => {
+                #[cfg(feature = "yt-dlp")]
+                self.open_external_url(GENTOO_YT_DLP_PACKAGE_URL);
+                #[cfg(not(feature = "yt-dlp"))]
+                {
+                    self.view.status_line = "This build omits yt-dlp support".to_owned();
+                }
+            }
             UiAction::SelectYouTubeSetupField(field) => {
                 if let Some(popup) = self.view.youtube_setup_popup.as_mut() {
                     popup.selected_field = field;
@@ -27923,6 +28300,136 @@ fn available_yandex_music_download_path(
     Err("could not choose an unused Yandex Music download filename".to_owned())
 }
 
+/// Launches the selected yt-dlp update checks independently so a slow remote
+/// service cannot delay either the local executable result or another source.
+#[cfg(feature = "yt-dlp")]
+fn spawn_yt_dlp_update_lookups(
+    generation: u64,
+    executable: PathBuf,
+    installed: bool,
+    github: bool,
+    gentoo_arch: Option<String>,
+    responses: Sender<ProviderResponse>,
+) {
+    let failure_responses = responses.clone();
+    let failure_gentoo_arch = gentoo_arch.clone();
+    let spawn = thread::Builder::new()
+        .name("youta-yt-dlp-updates".to_owned())
+        .spawn(move || {
+            thread::scope(|scope| {
+                if installed {
+                    let responses = responses.clone();
+                    scope.spawn(move || {
+                        let result =
+                            std::panic::catch_unwind(|| installed_yt_dlp_version(executable))
+                                .unwrap_or_else(|_| {
+                                    Err("installed-version lookup stopped unexpectedly".to_owned())
+                                });
+                        let _ = responses
+                            .send(ProviderResponse::YtDlpInstalledVersion { generation, result });
+                    });
+                }
+                if github {
+                    let responses = responses.clone();
+                    scope.spawn(move || {
+                        let result = std::panic::catch_unwind(github_latest_yt_dlp_version)
+                            .unwrap_or_else(|_| {
+                                Err("GitHub release lookup stopped unexpectedly".to_owned())
+                            });
+                        let _ = responses
+                            .send(ProviderResponse::YtDlpGitHubLatest { generation, result });
+                    });
+                }
+                if let Some(arch) = gentoo_arch {
+                    let responses = responses.clone();
+                    scope.spawn(move || {
+                        let result =
+                            std::panic::catch_unwind(|| gentoo_latest_stable_yt_dlp_version(&arch))
+                                .unwrap_or_else(|_| {
+                                    Err("Gentoo package lookup stopped unexpectedly".to_owned())
+                                });
+                        let _ = responses.send(ProviderResponse::YtDlpGentooLatest {
+                            generation,
+                            arch,
+                            result,
+                        });
+                    });
+                }
+            });
+        });
+    if let Err(error) = spawn {
+        let reason = format!("could not start update lookup: {error}");
+        if installed {
+            let _ = failure_responses.send(ProviderResponse::YtDlpInstalledVersion {
+                generation,
+                result: Err(reason.clone()),
+            });
+        }
+        if github {
+            let _ = failure_responses.send(ProviderResponse::YtDlpGitHubLatest {
+                generation,
+                result: Err(reason.clone()),
+            });
+        }
+        if let Some(arch) = failure_gentoo_arch {
+            let _ = failure_responses.send(ProviderResponse::YtDlpGentooLatest {
+                generation,
+                arch,
+                result: Err(reason),
+            });
+        }
+    }
+}
+
+/// Probes the exact configured executable with the existing bounded helper
+/// runner and validates its calendar version.
+#[cfg(feature = "yt-dlp")]
+fn installed_yt_dlp_version(executable: PathBuf) -> Result<InstalledYtDlpVersion, String> {
+    let helper = ExternalHelper::probe_configured(ExternalHelperKind::YtDlp, executable);
+    match helper.probe_status {
+        ExternalHelperProbeStatus::Available { version } => {
+            parse_installed_version(&version).map_err(|error| error.to_string())
+        }
+        ExternalHelperProbeStatus::Unavailable => {
+            Err("configured executable was not found".to_owned())
+        }
+        ExternalHelperProbeStatus::TimedOut => Err("version check timed out".to_owned()),
+        ExternalHelperProbeStatus::Failed { .. } => Err("version check failed".to_owned()),
+        ExternalHelperProbeStatus::NotProbed => Err("version check did not run".to_owned()),
+    }
+}
+
+/// Reads the official latest GitHub release when networking is compiled in.
+#[cfg(feature = "yt-dlp")]
+fn github_latest_yt_dlp_version() -> Result<GitHubYtDlpRelease, String> {
+    #[cfg(feature = "network")]
+    {
+        return GitHubYtDlpReleaseClient::new()
+            .latest_release()
+            .map_err(|error| error.to_string());
+    }
+    #[cfg(not(feature = "network"))]
+    Err("network support is disabled in this build".to_owned())
+}
+
+/// Reads the official Gentoo package JSON for one exact stable keyword arch.
+#[cfg(feature = "yt-dlp")]
+fn gentoo_latest_stable_yt_dlp_version(
+    arch: &str,
+) -> Result<Option<GentooStableYtDlpVersion>, String> {
+    #[cfg(feature = "network")]
+    {
+        return GentooYtDlpPackageClient::new()
+            .latest_stable(arch)
+            .map_err(|error| error.to_string());
+    }
+    #[cfg(not(feature = "network"))]
+    {
+        let _ = arch;
+        Err("network support is disabled in this build".to_owned())
+    }
+}
+
 /// Resolves, decrypts, and publishes one original-quality download batch.
 ///
 /// Provider and media work remains on this dedicated thread. Every track is
@@ -28684,6 +29191,21 @@ fn provider_worker(
                     break;
                 }
             }
+            #[cfg(feature = "yt-dlp")]
+            ProviderRequest::YtDlpUpdateLookups {
+                generation,
+                executable,
+                installed,
+                github,
+                gentoo_arch,
+            } => spawn_yt_dlp_update_lookups(
+                generation,
+                executable,
+                installed,
+                github,
+                gentoo_arch,
+                responses.clone(),
+            ),
             ProviderRequest::ChannelDetails {
                 generation,
                 provider_generation,
@@ -34790,6 +35312,94 @@ fn playback_end_reports_http_403(end: &PlaybackEnd) -> bool {
     })
 }
 
+/// Recognizes an HTTP 403 only when the retained message attributes it to the
+/// yt-dlp integration rather than to an unrelated provider API.
+#[cfg(feature = "yt-dlp")]
+fn message_reports_yt_dlp_http_403(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let identifies_yt_dlp = message.contains("yt-dlp")
+        || message.contains("youtube-dl")
+        || message.contains("ytdl_hook");
+    identifies_yt_dlp
+        && (message.contains("http error 403")
+            || message.contains("http 403")
+            || message.contains("403 forbidden")
+            || message.contains("403: forbidden"))
+}
+
+/// Parses only the distribution identifier from bounded `os-release` text.
+#[cfg(feature = "yt-dlp")]
+fn os_release_id(input: &str) -> Option<&str> {
+    input.lines().find_map(|line| {
+        let line = line.trim();
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "ID" {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        (!value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        .then_some(value)
+    })
+}
+
+/// Maps Rust target names to the corresponding Gentoo keyword architecture.
+#[cfg(feature = "yt-dlp")]
+const fn gentoo_arch_for_target(target_arch: &str) -> Option<&'static str> {
+    match target_arch.as_bytes() {
+        b"x86_64" => Some("amd64"),
+        b"x86" => Some("x86"),
+        b"aarch64" => Some("arm64"),
+        b"arm" => Some("arm"),
+        b"powerpc64" => Some("ppc64"),
+        b"powerpc" => Some("ppc"),
+        b"riscv64" => Some("riscv"),
+        b"s390x" => Some("s390"),
+        b"sparc64" => Some("sparc"),
+        _ => None,
+    }
+}
+
+/// Returns the architecture-specific Gentoo keyword only on a detected Gentoo
+/// Linux system. Failed or oversized metadata is treated as unknown.
+#[cfg(feature = "yt-dlp")]
+fn detected_gentoo_arch() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        for path in ["/etc/os-release", "/usr/lib/os-release"] {
+            let Ok(file) = std::fs::File::open(path) else {
+                continue;
+            };
+            let mut input = String::new();
+            let Ok(_) = file
+                .take(MAX_OS_RELEASE_ID_BYTES.saturating_add(1))
+                .read_to_string(&mut input)
+            else {
+                continue;
+            };
+            if input.len() as u64 > MAX_OS_RELEASE_ID_BYTES {
+                continue;
+            }
+            return (os_release_id(&input) == Some("gentoo"))
+                .then(|| gentoo_arch_for_target(std::env::consts::ARCH))
+                .flatten()
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
 fn playback_before_start_message(end: &PlaybackEnd) -> String {
     let summary = "mpv reached the end of the media before reporting that audio playback \
                    started. The source may be empty, unavailable, or unsupported.";
@@ -34820,6 +35430,7 @@ fn playback_end_reports_unsupported_format(end: &PlaybackEnd) -> bool {
     .any(|message| {
         message.contains("unrecognized file format")
             || message.contains("unsupported format")
+            || message.contains("requested format is not available")
             || message.contains("no audio or video streams selected")
             || message.contains("no video or audio streams selected")
     })
@@ -35009,7 +35620,7 @@ mod tests {
     }
 
     /// Stops the real provider worker and returns a deterministic request tap.
-    #[cfg(any(feature = "librivox", feature = "tracker-music"))]
+    #[cfg(any(feature = "librivox", feature = "tracker-music", feature = "yt-dlp"))]
     fn capture_controller_provider_requests(
         controller: &mut AppController,
     ) -> Receiver<ProviderRequest> {
@@ -58095,6 +58706,8 @@ mod tests {
         });
         let (mut controller, state, _, _) = controller_with_mock_lifecycle([], [failure]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
+        #[cfg(feature = "yt-dlp")]
+        let requests = capture_controller_provider_requests(&mut controller);
         controller.play_queue_item(fixture_direct_item("first"), false);
         controller
             .playback_queue
@@ -58115,6 +58728,20 @@ mod tests {
             .error_popup
             .as_ref()
             .expect("playback error popup");
+        #[cfg(feature = "yt-dlp")]
+        {
+            assert_eq!(popup.title, "yt-dlp HTTP 403");
+            assert!(popup.yt_dlp_forbidden.is_some());
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(ProviderRequest::YtDlpUpdateLookups {
+                    installed: true,
+                    github: true,
+                    ..
+                })
+            ));
+        }
+        #[cfg(not(feature = "yt-dlp"))]
         assert_eq!(popup.title, "Playback failed");
         assert!(popup.report.contains("loading failed"));
         assert!(popup.report.contains("HTTP 403"));
@@ -58167,6 +58794,8 @@ mod tests {
         let (mut controller, state, _, events) =
             controller_with_mock_lifecycle([], [PlaybackEvent::Ended(failure.clone())]);
         controller.diagnostic_helpers_cache = Some(Vec::new());
+        #[cfg(feature = "yt-dlp")]
+        let requests = capture_controller_provider_requests(&mut controller);
         controller.play_queue_item(fixture_youtube_item("fixture video"), false);
 
         controller.update_player();
@@ -58206,6 +58835,25 @@ mod tests {
             .error_popup
             .as_ref()
             .expect("the second rejection should remain visible for diagnosis");
+        #[cfg(feature = "yt-dlp")]
+        {
+            assert_eq!(popup.title, "yt-dlp HTTP 403");
+            let forbidden = popup
+                .yt_dlp_forbidden
+                .as_ref()
+                .expect("specialized progressive body");
+            assert_eq!(forbidden.installed, YtDlpVersionLookupView::Loading);
+            assert_eq!(forbidden.github_latest, YtDlpVersionLookupView::Loading);
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(ProviderRequest::YtDlpUpdateLookups {
+                    installed: true,
+                    github: true,
+                    ..
+                })
+            ));
+        }
+        #[cfg(not(feature = "yt-dlp"))]
         assert_eq!(popup.title, "Playback failed");
         assert!(popup.report.contains("HTTP error 403 Forbidden"));
         assert_eq!(
@@ -58215,11 +58863,165 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn yt_dlp_403_popup_opens_before_lookups_and_applies_partial_cached_results() {
+        let (mut controller, _, _, _) = controller_with_mock_lifecycle([], []);
+        let requests = capture_controller_provider_requests(&mut controller);
+
+        controller.show_error_message(
+            "Download failed",
+            "yt-dlp exited after HTTP Error 403: Forbidden",
+        );
+
+        assert!(
+            controller.diagnostic_helpers_cache.is_none(),
+            "the immediate popup must not run the generic synchronous helper probes"
+        );
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("specialized popup appears synchronously");
+        assert_eq!(popup.title, "yt-dlp HTTP 403");
+        let forbidden = popup
+            .yt_dlp_forbidden
+            .as_ref()
+            .expect("structured update body");
+        assert_eq!(forbidden.installed, YtDlpVersionLookupView::Loading);
+        assert_eq!(forbidden.github_latest, YtDlpVersionLookupView::Loading);
+        let (generation, gentoo_arch) = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lookup request is submitted after the popup is built")
+        {
+            ProviderRequest::YtDlpUpdateLookups {
+                generation,
+                installed: true,
+                github: true,
+                gentoo_arch,
+                ..
+            } => (generation, gentoo_arch),
+            _ => panic!("unexpected provider request"),
+        };
+
+        controller.handle_provider_response(ProviderResponse::YtDlpGitHubLatest {
+            generation,
+            result: Ok(GitHubYtDlpRelease {
+                version: "2026.08.19".to_owned(),
+                published_at: "2026-08-19T23:48:43Z".to_owned(),
+            }),
+        });
+        let progressively_updated = controller
+            .view
+            .error_popup
+            .as_ref()
+            .and_then(|popup| popup.yt_dlp_forbidden.as_ref())
+            .expect("the open popup accepts independent lookup results");
+        assert_eq!(
+            progressively_updated.installed,
+            YtDlpVersionLookupView::Loading
+        );
+        assert_eq!(
+            progressively_updated.github_latest,
+            YtDlpVersionLookupView::Available {
+                version: "2026.08.19".to_owned(),
+                released_on: Some("2026-08-19".to_owned()),
+            }
+        );
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        controller.handle_provider_response(ProviderResponse::YtDlpInstalledVersion {
+            generation: generation.wrapping_add(1),
+            result: Ok(parse_installed_version("1999.01.01").expect("fixture version")),
+        });
+        assert!(controller.yt_dlp_installed_version_cache.is_none());
+
+        controller.handle_provider_response(ProviderResponse::YtDlpInstalledVersion {
+            generation,
+            result: Ok(parse_installed_version("2026.07.04").expect("fixture version")),
+        });
+        if let Some(arch) = gentoo_arch {
+            controller.handle_provider_response(ProviderResponse::YtDlpGentooLatest {
+                generation,
+                arch: arch.clone(),
+                result: Ok(Some(GentooStableYtDlpVersion {
+                    version: "2026.08.19".to_owned(),
+                    arch,
+                })),
+            });
+        }
+        assert!(
+            controller.view.error_popup.is_none(),
+            "late partial results must not reopen a dismissed popup"
+        );
+
+        controller.show_error_message("Playback failed", "ytdl_hook: HTTP Error 403: Forbidden");
+
+        let forbidden = controller
+            .view
+            .error_popup
+            .as_ref()
+            .and_then(|popup| popup.yt_dlp_forbidden.as_ref())
+            .expect("cached popup");
+        assert_eq!(
+            forbidden.installed,
+            YtDlpVersionLookupView::Available {
+                version: "2026.07.04".to_owned(),
+                released_on: Some("2026-07-04".to_owned()),
+            }
+        );
+        assert_eq!(
+            forbidden.github_latest,
+            YtDlpVersionLookupView::Available {
+                version: "2026.08.19".to_owned(),
+                released_on: Some("2026-08-19".to_owned()),
+            }
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "completed process-local results must not be fetched again"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn yt_dlp_403_detection_does_not_capture_unrelated_provider_forbidden_errors() {
+        assert!(message_reports_yt_dlp_http_403(
+            "ytdl_hook: ERROR: HTTP Error 403: Forbidden"
+        ));
+        assert!(message_reports_yt_dlp_http_403(
+            "yt-dlp exited: 403 Forbidden"
+        ));
+        assert!(!message_reports_yt_dlp_http_403(
+            "Yandex Music provider returned HTTP status 403"
+        ));
+        assert!(!message_reports_yt_dlp_http_403(
+            "yt-dlp returned an unsupported format"
+        ));
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn gentoo_detection_parses_only_exact_ids_and_maps_supported_targets() {
+        assert_eq!(
+            os_release_id("NAME=Gentoo\nID=gentoo\nVERSION_ID=2.18\n"),
+            Some("gentoo")
+        );
+        assert_eq!(os_release_id("ID=\"gentoo\"\n"), Some("gentoo"));
+        assert_eq!(os_release_id("ID_LIKE=gentoo\nID=debian\n"), Some("debian"));
+        assert_eq!(os_release_id("ID=gentoo;command\n"), None);
+        assert_eq!(gentoo_arch_for_target("x86_64"), Some("amd64"));
+        assert_eq!(gentoo_arch_for_target("x86"), Some("x86"));
+        assert_eq!(gentoo_arch_for_target("aarch64"), Some("arm64"));
+        assert_eq!(gentoo_arch_for_target("unknown"), None);
+    }
+
     #[test]
     fn youtube_loaded_unusable_format_retries_checked_once_without_looping() {
         for media_error in [
             "unrecognized file format",
             "No video or audio streams selected.",
+            "ERROR: [youtube] fixture: Requested format is not available. Use --list-formats for a list of available formats",
         ] {
             let failure = PlaybackEnd {
                 reason: PlaybackEndReason::Error,

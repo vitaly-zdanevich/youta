@@ -6492,6 +6492,113 @@ fn short_project_commit_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
 
+/// Formats one independently updating version row without exposing diagnostics.
+fn yt_dlp_version_lookup_text(lookup: &YtDlpVersionLookupView) -> String {
+    match lookup {
+        YtDlpVersionLookupView::Loading => "Loading…".to_owned(),
+        YtDlpVersionLookupView::Available {
+            version,
+            released_on: Some(released_on),
+        } if !released_on.trim().is_empty() => {
+            format!("{version} (released {released_on})")
+        }
+        YtDlpVersionLookupView::Available { version, .. } => version.clone(),
+        YtDlpVersionLookupView::Unavailable { reason } if reason.trim().is_empty() => {
+            "Unavailable".to_owned()
+        }
+        YtDlpVersionLookupView::Unavailable { reason } => {
+            format!("Unavailable ({reason})")
+        }
+    }
+}
+
+/// Builds the short visible body while the complete report remains copyable.
+fn yt_dlp_forbidden_body(view: &YtDlpForbiddenView) -> String {
+    let mut lines = vec![
+        "403 from yt-dlp — try later or update it.".to_owned(),
+        String::new(),
+        "A 403 can be temporary or authentication-related.".to_owned(),
+        String::new(),
+        format!("Installed: {}", yt_dlp_version_lookup_text(&view.installed)),
+        format!(
+            "GitHub latest: {}",
+            yt_dlp_version_lookup_text(&view.github_latest)
+        ),
+    ];
+    if let Some(gentoo) = view.gentoo.as_ref() {
+        lines.push(format!(
+            "Gentoo latest stable ({}): {}",
+            gentoo.arch,
+            yt_dlp_version_lookup_text(&gentoo.latest_stable)
+        ));
+    }
+    lines.extend([String::new(), format!("Project: {}", view.project_url)]);
+    if let Some(gentoo) = view.gentoo.as_ref() {
+        lines.push(format!("Gentoo package: {}", gentoo.package_url));
+    }
+    lines.join("\n")
+}
+
+/// Renders the actions allowed by the active diagnostic body and records their
+/// exact mouse targets.
+fn render_error_popup_controls(
+    frame: &mut Frame<'_>,
+    error: &ErrorPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    area: Rect,
+) {
+    let mut buttons = if let Some(forbidden) = error.yt_dlp_forbidden.as_ref() {
+        let mut buttons = Vec::new();
+        if external_opener_available {
+            buttons.push(("[u] Project", UiAction::OpenYtDlpProject));
+            if forbidden.gentoo.is_some() {
+                buttons.push(("[p] Gentoo package", UiAction::OpenGentooYtDlpPackage));
+            }
+        }
+        buttons.push(("[c] Copy report", UiAction::CopyErrorReport));
+        buttons
+    } else {
+        let mut buttons = vec![("[c] Copy", UiAction::CopyErrorReport)];
+        if external_opener_available {
+            buttons.push(("[i] Copy + open issue", UiAction::CopyAndOpenGitHubIssue));
+        }
+        if error.gh_available {
+            buttons.push(("[g] Fill GitHub issue", UiAction::FillGitHubIssue));
+        }
+        buttons
+    };
+    buttons.push(("[Esc] Close", UiAction::DismissErrorPopup));
+    let labels_width = buttons
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .sum::<usize>()
+        .saturating_add(buttons.len().saturating_sub(1) * 3);
+    let labels_width = u16::try_from(labels_width).unwrap_or(u16::MAX);
+    let mut button_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(labels_width) / 2);
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    for (label, action) in buttons {
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        hit_map
+            .error_buttons
+            .push((action, Rect::new(button_x, area.y, width, 1)));
+        button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+}
+
 fn render_error_popup(
     frame: &mut Frame<'_>,
     error: &ErrorPopupView,
@@ -6536,8 +6643,10 @@ fn render_error_popup(
     } else {
         (report_area, Rect::default())
     };
+    let specialized_body = error.yt_dlp_forbidden.as_ref().map(yt_dlp_forbidden_body);
+    let visible_body = specialized_body.as_deref().unwrap_or(&error.report);
     let report_lines =
-        wrap_diagnostic_report(&error.report, usize::from(report_text_area.width.max(1)));
+        wrap_diagnostic_report(visible_body, usize::from(report_text_area.width.max(1)));
     let visible_lines = usize::from(report_text_area.height);
     let maximum_offset = report_lines.len().saturating_sub(visible_lines);
     let offset = error.scroll_offset.min(maximum_offset);
@@ -6574,11 +6683,13 @@ fn render_error_popup(
         offset.saturating_add(1)
     };
     let last_line = offset.saturating_add(visible_lines).min(report_lines.len());
-    let position = format!("Lines {first_line}–{last_line} of {}", report_lines.len());
-    let position = if let Some(status) = &error.action_status {
-        format!("{status} | {position}")
+    let report_position = format!("Lines {first_line}–{last_line} of {}", report_lines.len());
+    let position = if error.yt_dlp_forbidden.is_some() {
+        error.action_status.clone().unwrap_or_default()
+    } else if let Some(status) = &error.action_status {
+        format!("{status} | {report_position}")
     } else {
-        position
+        report_position
     };
     frame.render_widget(
         Paragraph::new(position)
@@ -6587,41 +6698,14 @@ fn render_error_popup(
         position_area,
     );
 
-    let mut buttons = vec![("[c] Copy", UiAction::CopyErrorReport)];
-    if external_opener_available {
-        buttons.push(("[i] Copy + open issue", UiAction::CopyAndOpenGitHubIssue));
-    }
-    if error.gh_available {
-        buttons.push(("[g] Fill GitHub issue", UiAction::FillGitHubIssue));
-    }
-    buttons.push(("[Esc] Close", UiAction::DismissErrorPopup));
-    let labels_width = buttons
-        .iter()
-        .map(|(label, _)| label.chars().count())
-        .sum::<usize>()
-        .saturating_add(buttons.len().saturating_sub(1) * 3);
-    let labels_width = u16::try_from(labels_width).unwrap_or(u16::MAX);
-    let mut button_x = buttons_area
-        .x
-        .saturating_add(buttons_area.width.saturating_sub(labels_width) / 2);
-    let controls = buttons
-        .iter()
-        .map(|(label, _)| *label)
-        .collect::<Vec<_>>()
-        .join("   ");
-    frame.render_widget(
-        Paragraph::new(controls.as_str())
-            .alignment(Alignment::Center)
-            .style(theme.accent),
+    render_error_popup_controls(
+        frame,
+        error,
+        external_opener_available,
+        theme,
+        hit_map,
         buttons_area,
     );
-    for (label, action) in buttons {
-        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-        hit_map
-            .error_buttons
-            .push((action, Rect::new(button_x, buttons_area.y, width, 1)));
-        button_x = button_x.saturating_add(width).saturating_add(3);
-    }
 }
 
 /// Renders one bounded, resize-aware public-comments popup.
@@ -10510,6 +10594,30 @@ mod tests {
             .collect()
     }
 
+    /// Builds the structured yt-dlp failure used by keyboard and renderer tests.
+    fn yt_dlp_forbidden_error(gentoo: bool) -> ErrorPopupView {
+        ErrorPopupView {
+            title: "Playback failed".to_owned(),
+            report: "COPY_ONLY_DIAGNOSTIC_REPORT".to_owned(),
+            yt_dlp_forbidden: Some(YtDlpForbiddenView {
+                project_url: YT_DLP_PROJECT_URL.to_owned(),
+                installed: YtDlpVersionLookupView::Available {
+                    version: "2026.07.04".to_owned(),
+                    released_on: Some("2026-07-04".to_owned()),
+                },
+                github_latest: YtDlpVersionLookupView::Loading,
+                gentoo: gentoo.then(|| YtDlpGentooVersionView {
+                    arch: "amd64".to_owned(),
+                    package_url: GENTOO_YT_DLP_PACKAGE_URL.to_owned(),
+                    latest_stable: YtDlpVersionLookupView::Unavailable {
+                        reason: "package metadata unavailable".to_owned(),
+                    },
+                }),
+            }),
+            ..ErrorPopupView::default()
+        }
+    }
+
     /// Verifies the intentionally small, source-independent footer action set.
     fn assert_minimal_footer_actions(hit_map: &HitMap) {
         let expected = [
@@ -12831,6 +12939,64 @@ mod tests {
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            None
+        );
+    }
+
+    #[test]
+    fn yt_dlp_forbidden_popup_reserves_its_link_shortcuts() {
+        let view = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(yt_dlp_forbidden_error(true)),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenYtDlpProject)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenGentooYtDlpPackage)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            None,
+            "generic issue actions must stay out of the specialized popup"
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            None
+        );
+
+        let without_gentoo = ViewModel {
+            error_popup: Some(yt_dlp_forbidden_error(false)),
+            ..view.clone()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+                &without_gentoo,
+            ),
+            None
+        );
+
+        let generic = ViewModel {
+            error_popup: Some(ErrorPopupView::default()),
+            ..view
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+                &generic
+            ),
+            None
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+                &generic
+            ),
             None
         );
     }
@@ -17352,6 +17518,31 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
             Some(UiAction::FillGitHubIssue)
+        );
+
+        view.error_popup = Some(yt_dlp_forbidden_error(true));
+        hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw physical-console yt-dlp popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains(YT_DLP_PROJECT_URL));
+        assert!(rendered.contains(GENTOO_YT_DLP_PACKAGE_URL));
+        assert!(!rendered.contains("[u] Project"));
+        assert!(!rendered.contains("[p] Gentoo package"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &view),
+            None
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &view),
+            None
+        );
+        assert!(
+            hit_map
+                .error_buttons
+                .iter()
+                .all(|(action, _)| !action.requires_external_opener())
         );
     }
 
@@ -22443,6 +22634,7 @@ prose 07:25 remains clickable but is not a chapter";
                 scroll_offset: 10,
                 gh_available: true,
                 action_status: None,
+                yt_dlp_forbidden: None,
             }),
             ..ViewModel::default()
         };
@@ -22481,6 +22673,101 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("[g] Fill GitHub issue"));
         assert!(rendered.contains("[Esc] Close"));
         assert_eq!(hit_map.error_buttons.len(), 4);
+    }
+
+    #[test]
+    fn yt_dlp_forbidden_popup_renders_progressive_versions_links_and_compact_actions() {
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(yt_dlp_forbidden_error(true)),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw structured yt-dlp error");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("403 from yt-dlp — try later or update it."));
+        assert!(rendered.contains("A 403 can be temporary or authentication-related."));
+        assert!(rendered.contains("Installed: 2026.07.04 (released 2026-07-04)"));
+        assert!(rendered.contains("GitHub latest: Loading…"));
+        assert!(
+            rendered.contains(
+                "Gentoo latest stable (amd64): Unavailable (package metadata unavailable)"
+            )
+        );
+        assert!(rendered.contains(YT_DLP_PROJECT_URL));
+        assert!(rendered.contains(GENTOO_YT_DLP_PACKAGE_URL));
+        assert!(!rendered.contains("COPY_ONLY_DIAGNOSTIC_REPORT"));
+        assert!(rendered.contains("[u] Project"));
+        assert!(rendered.contains("[p] Gentoo package"));
+        assert!(rendered.contains("[c] Copy report"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(!rendered.contains("GitHub issue"));
+
+        let actions = hit_map
+            .error_buttons
+            .iter()
+            .map(|(action, _)| action)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                &UiAction::OpenYtDlpProject,
+                &UiAction::OpenGentooYtDlpPackage,
+                &UiAction::CopyErrorReport,
+                &UiAction::DismissErrorPopup,
+            ]
+        );
+
+        let (_, project_area) = hit_map
+            .error_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::OpenYtDlpProject)
+            .expect("project button");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: project_area.x,
+                    row: project_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenYtDlpProject)
+        );
+
+        let non_gentoo = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(yt_dlp_forbidden_error(false)),
+            ..ViewModel::default()
+        };
+        let mut non_gentoo_hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &non_gentoo,
+                    &UiSettings::default(),
+                    &mut non_gentoo_hit_map,
+                );
+            })
+            .expect("draw non-Gentoo yt-dlp error");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("Gentoo latest stable"));
+        assert!(!rendered.contains(GENTOO_YT_DLP_PACKAGE_URL));
+        assert!(
+            non_gentoo_hit_map
+                .error_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::OpenGentooYtDlpPackage)
+        );
     }
 
     #[test]
