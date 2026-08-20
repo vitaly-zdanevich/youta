@@ -35618,7 +35618,7 @@ fn message_reports_yt_dlp_http_403(message: &str) -> bool {
 }
 
 /// Parses only the distribution identifier from bounded `os-release` text.
-#[cfg(feature = "yt-dlp")]
+#[cfg(all(feature = "yt-dlp", any(target_os = "linux", test)))]
 fn os_release_id(input: &str) -> Option<&str> {
     input.lines().find_map(|line| {
         let line = line.trim();
@@ -35645,7 +35645,7 @@ fn os_release_id(input: &str) -> Option<&str> {
 }
 
 /// Maps Rust target names to the corresponding Gentoo keyword architecture.
-#[cfg(feature = "yt-dlp")]
+#[cfg(all(feature = "yt-dlp", any(target_os = "linux", test)))]
 const fn gentoo_arch_for_target(target_arch: &str) -> Option<&'static str> {
     match target_arch.as_bytes() {
         b"x86_64" => Some("amd64"),
