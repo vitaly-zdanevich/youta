@@ -222,11 +222,7 @@ fn action_of(id: &MenuId) -> Option<UiAction> {
 /// take Cmd+C away silently.
 pub fn menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let preferences = item(app, &UiAction::OpenPreferences, "Preferences…")?;
-    let about = AboutMetadata {
-        name: Some("Youta".to_owned()),
-        version: Some(app.package_info().version.to_string()),
-        ..AboutMetadata::default()
-    };
+    let about = about_metadata(app.package_info().version.to_string());
 
     let file = Submenu::with_items(
         app,
@@ -376,6 +372,21 @@ pub fn menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     )
 }
 
+/// Builds the metadata shown by the operating system's About dialog.
+///
+/// Linux and Windows display `license` directly. macOS ignores that field, but
+/// retaining it here still gives every supported desktop implementation the
+/// complete notice where its native API permits it; `youta-gui --license`
+/// remains the platform-independent path.
+fn about_metadata(version: String) -> AboutMetadata<'static> {
+    AboutMetadata {
+        name: Some("Youta".to_owned()),
+        version: Some(version),
+        license: Some(youta::LICENSE_TEXT.to_owned()),
+        ..AboutMetadata::default()
+    }
+}
+
 /// Adds the tray icon, or explains why the desktop refused it.
 ///
 /// The tray does not keep Youta alive: closing the window still ends the
@@ -455,7 +466,7 @@ pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Announced, MAX_ANNOUNCED_CHARS, action_of, announce};
+    use super::{Announced, MAX_ANNOUNCED_CHARS, about_metadata, action_of, announce};
 
     use tauri::menu::MenuId;
     use youta::domain::{MediaId, SourceKind};
@@ -471,6 +482,14 @@ mod tests {
             }),
             ..ViewModel::default()
         }
+    }
+
+    /// A portable GUI executable has no adjacent archive in which to carry the
+    /// notice, so its ordinary About surface must retain the complete text.
+    #[test]
+    fn about_metadata_carries_the_embedded_license_notice() {
+        let about = about_metadata("1.2.3".to_owned());
+        assert_eq!(about.license.as_deref(), Some(youta::LICENSE_TEXT));
     }
 
     /// A menu id must round-trip to the action the entry was declared with.

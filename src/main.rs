@@ -24,6 +24,10 @@ use youta::providers::{SearchItem, SearchRequest, SearchTarget, configured_youtu
     long_about = None
 )]
 struct Cli {
+    /// Print the complete MIT license notice and exit.
+    #[arg(long, global = true)]
+    license: bool,
+
     /// Use this directory instead of the platform Youta configuration folder.
     #[arg(long, global = true, value_name = "PATH")]
     config_dir: Option<PathBuf>,
@@ -111,6 +115,10 @@ fn probe_diagnostic_helpers(
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if cli.license {
+        print!("{}", youta::LICENSE_TEXT);
+        return Ok(());
+    }
     let config = if let Some(directory) = cli.config_dir {
         Config::load_from_dir(directory)
     } else {

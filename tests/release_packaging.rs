@@ -357,14 +357,13 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         "no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)",
         // Sixty-four terminal executables and checksums, twelve standalone GUI
         // executables and checksums, eighteen desktop installers and checksums,
-        // the source-only vendor archive, and the plain license notice, each
-        // with its checksum.
-        "readonly expected_asset_count=98",
+        // and the source-only vendor archive with its checksum. The raw
+        // executables carry their own license notice.
+        "readonly expected_asset_count=96",
         "executable=\"youta-${version}-${platform}${suffix}\"",
         "desktop_executables=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
         "gui_executable=\"youta-gui-${version}-${platform}${extension}\"",
         "vendor_archive=\"youta-${version}-vendor.tar.xz\"",
-        "license_notice=\"youta-${version}-LICENSE.txt\"",
         "--label expected-assets",
         "--label downloaded-assets",
         "sha256sum --check --strict -- *.sha256",
@@ -374,6 +373,36 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
             "release workflow omits asset contract `{contract}`"
         );
     }
+    for obsolete_notice in [
+        "Prepare the license notice",
+        "Upload the license notice",
+        "youta-*-LICENSE.txt",
+        "license_notice=",
+    ] {
+        assert!(
+            !release.contains(obsolete_notice),
+            "release workflow still publishes the standalone notice `{obsolete_notice}`"
+        );
+    }
+    let gui_main = read_repository_file("gui/src/main.rs");
+    let gui_entrypoint = gui_main
+        .find("fn main()")
+        .expect("the desktop executable has an entry point");
+    let license_preflight = gui_main[gui_entrypoint..]
+        .find("requested_license(std::env::args_os())")
+        .expect("the desktop executable checks its embedded license option");
+    let configuration_startup = gui_main[gui_entrypoint..]
+        .find("Config::load()")
+        .expect("the desktop executable loads its configuration");
+    assert!(
+        license_preflight < configuration_startup,
+        "the portable GUI must print its embedded notice before configuration or Tauri startup"
+    );
+    assert!(
+        read_repository_file("gui/src/desktop.rs")
+            .contains("license: Some(youta::LICENSE_TEXT.to_owned())"),
+        "the native GUI About dialog must expose the embedded notice where supported"
+    );
     assert_eq!(
         release.matches("uses: actions/upload-artifact@v7").count(),
         release.matches("archive: false").count(),
@@ -521,6 +550,22 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         Some(true),
         "the bundler produces the release artefact and cannot be inactive"
     );
+    assert_eq!(
+        bundle["licenseFile"].as_str(),
+        Some("../LICENSE"),
+        "native desktop packages must retain the full MIT notice"
+    );
+    assert!(
+        repository_path(
+            Path::new("gui").join(
+                bundle["licenseFile"]
+                    .as_str()
+                    .expect("the desktop bundle declares its license file")
+            )
+        )
+        .is_file(),
+        "the desktop package license file must resolve to a repository file"
+    );
     let targets: BTreeSet<String> = bundle["targets"]
         .as_array()
         .expect("the bundle targets are listed rather than inferred")
@@ -616,7 +661,7 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         release.contains("desktop_executables=(linux-amd64 linux-i686 linux-arm64"),
         "the desktop executable contract must include Linux i686"
     );
-    assert!(release.contains("readonly expected_asset_count=98"));
+    assert!(release.contains("readonly expected_asset_count=96"));
     assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
     assert!(
         release

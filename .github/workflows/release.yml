@@ -681,16 +681,6 @@ jobs:
       - name: Create dependency archive
         run: scripts/package-vendor.sh dist
 
-      # Raw executables cannot carry the notice that used to sit inside every
-      # binary tarball, so publish one plain copy beside all executables.
-      - name: Prepare the license notice
-        run: |
-          version=$(sed -n '/^version = /s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          test -n "${version}"
-          notice="youta-${version}-LICENSE.txt"
-          install -m 644 LICENSE "dist/${notice}"
-          (cd dist && sha256sum "${notice}" > "${notice}.sha256")
-
       # The source-only vendor bundle is the deliberate archive exception: it
       # is input for offline compilation rather than a program to execute.
       - name: Upload the dependency archive
@@ -705,20 +695,6 @@ jobs:
         with:
           archive: false
           path: dist/youta-*-vendor.tar.xz.sha256
-          if-no-files-found: error
-
-      - name: Upload the license notice
-        uses: actions/upload-artifact@v7
-        with:
-          archive: false
-          path: dist/youta-*-LICENSE.txt
-          if-no-files-found: error
-
-      - name: Upload the license notice checksum
-        uses: actions/upload-artifact@v7
-        with:
-          archive: false
-          path: dist/youta-*-LICENSE.txt.sha256
           if-no-files-found: error
 
   publish:
@@ -796,10 +772,8 @@ jobs:
 
           vendor_archive="youta-${version}-vendor.tar.xz"
           expected+=("${vendor_archive}" "${vendor_archive}.sha256")
-          license_notice="youta-${version}-LICENSE.txt"
-          expected+=("${license_notice}" "${license_notice}.sha256")
 
-          readonly expected_asset_count=98
+          readonly expected_asset_count=96
           ((${#expected[@]} == expected_asset_count)) || {
             echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
             exit 1

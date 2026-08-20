@@ -4,6 +4,14 @@
 //! rendering behind separate interfaces so distribution builds can omit
 //! services they do not use.
 
+/// Complete license notice embedded in every directly distributed executable.
+///
+/// Native desktop packages also carry the same repository file through
+/// Tauri's `licenseFile` setting. Raw executables have no surrounding package,
+/// so their command-line entry points expose this exact text through
+/// `--license` instead.
+pub const LICENSE_TEXT: &str = include_str!("../LICENSE");
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

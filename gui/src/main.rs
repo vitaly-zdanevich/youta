@@ -19,6 +19,7 @@ mod desktop;
 mod media_keys;
 mod reducer;
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
@@ -258,7 +259,29 @@ fn serve_artwork(
     }
 }
 
+/// Returns the embedded notice when the process arguments request it.
+///
+/// This preflight is intentionally independent of configuration and Tauri:
+/// portable executables must be able to disclose their notice even on a host
+/// where the state directory or desktop runtime is unavailable.
+fn requested_license<I, S>(arguments: I) -> Option<&'static str>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    arguments
+        .into_iter()
+        .skip(1)
+        .any(|argument| argument.as_ref() == OsStr::new("--license"))
+        .then_some(youta::LICENSE_TEXT)
+}
+
 fn main() {
+    if let Some(license) = requested_license(std::env::args_os()) {
+        print!("{license}");
+        return;
+    }
+
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) => {
@@ -346,12 +369,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::serve_artwork;
+    use super::{requested_license, serve_artwork};
 
     use std::path::Path;
 
     use tauri::http::{Request, Response};
     use url::Url;
+
+    /// The license path is handled before configuration or desktop startup.
+    #[test]
+    fn only_the_exact_license_option_requests_the_embedded_notice() {
+        assert_eq!(
+            requested_license(["youta-gui", "--license"]),
+            Some(youta::LICENSE_TEXT)
+        );
+        assert_eq!(requested_license(["youta-gui"]), None);
+        assert_eq!(requested_license(["youta-gui", "--license-file"]), None);
+    }
 
     /// Builds a protocol request the way a web view would.
     fn request(uri: &str) -> Request<Vec<u8>> {

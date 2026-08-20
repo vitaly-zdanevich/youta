@@ -216,6 +216,25 @@ fn version_comes_from_the_package_manifest() {
 }
 
 #[test]
+fn license_notice_is_embedded_in_the_executable() {
+    let temporary = tempdir().expect("temporary directory");
+    fs::write(
+        temporary.path().join("config.toml"),
+        "[providers]\nallow_insecure_http = 'not-a-boolean'\n",
+    )
+    .expect("invalid configuration fixture");
+
+    youta_command()
+        .args(["--config-dir"])
+        .arg(temporary.path())
+        .arg("--license")
+        .assert()
+        .success()
+        .stdout(predicate::eq(include_str!("../LICENSE")))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
 fn config_command_reports_paths_and_redacts_credentials() {
     let temporary = tempdir().expect("temporary directory");
     fs::write(
