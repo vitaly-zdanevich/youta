@@ -355,11 +355,12 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         "suffixes=('' -text -no-qr -text-no-qr)",
         "linux_platforms=(linux-amd64 linux-i686 linux-arm64)",
         "no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)",
-        // Sixty-four terminal executables and checksums, twelve standalone GUI
-        // executables and checksums, eighteen desktop installers and checksums,
-        // and the source-only vendor archive with its checksum. The raw
-        // executables carry their own license notice.
-        "readonly expected_asset_count=96",
+        // Build jobs still transfer one internal checksum beside each of the 48
+        // deliverables so publication can verify every byte. GitHub Releases
+        // publish only those 48 deliverables because GitHub exposes their
+        // computed hashes in the Digest column.
+        "readonly expected_download_count=96",
+        "readonly expected_release_asset_count=48",
         "executable=\"youta-${version}-${platform}${suffix}\"",
         "desktop_executables=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
         "gui_executable=\"youta-gui-${version}-${platform}${extension}\"",
@@ -414,6 +415,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         .map(|(_, publish)| publish)
         .expect("release workflow must define its publish job");
     assert!(
+        publish.contains("find dist -maxdepth 1 -type f ! -name '*.sha256' -print0"),
+        "standalone checksum files must remain internal instead of becoming GitHub Release assets"
+    );
+    assert!(
+        publish.contains("gh release delete-asset \"${RELEASE_TAG}\" \"${checksum_asset}\" --yes"),
+        "rerunning publication must remove checksum assets left by an older workflow"
+    );
+    assert!(
         publish.contains("desktop_version=${version}"),
         "the checkout-free publish job must derive the synchronized GUI version from the tag"
     );
@@ -429,6 +438,10 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
                 .find("Create or update the tagged release")
                 .expect("release workflow publishes assets"),
         "release assets must be validated before publication"
+    );
+    assert!(
+        read_repository_file("README.md").contains("GitHub's Digest column"),
+        "release documentation must direct users to GitHub's built-in checksums"
     );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
@@ -661,7 +674,8 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         release.contains("desktop_executables=(linux-amd64 linux-i686 linux-arm64"),
         "the desktop executable contract must include Linux i686"
     );
-    assert!(release.contains("readonly expected_asset_count=96"));
+    assert!(release.contains("readonly expected_download_count=96"));
+    assert!(release.contains("readonly expected_release_asset_count=48"));
     assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
     assert!(
         release

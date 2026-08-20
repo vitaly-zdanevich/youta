@@ -639,10 +639,12 @@ That is a WebKitGTK workaround rather than a Youta setting, and it is worth
 trying first whenever the window appears but shows nothing.
 
 Native desktop artifacts are built by `scripts/package-desktop.sh`. It
-publishes a standalone GUI executable and whatever the host platform's bundler
+produces a standalone GUI executable and whatever the host platform's bundler
 can make — `.deb`, `.rpm` and AppImage on Linux, `.dmg` on macOS, an NSIS
-installer on Windows — with a `.sha256` beside every file. Installers are not
-cross-compiled; the release workflow runs that script once per host. Linux
+installer on Windows — with an internal `.sha256` beside every file for release
+verification. Only the program and installer files are attached to GitHub
+Releases; GitHub's Digest column displays their SHA-256 values. Installers are
+not cross-compiled; the release workflow runs that script once per host. Linux
 i686 is the deliberate unbundled exception:
 `scripts/package-desktop-executable.sh` cross-builds its GUI against Ubuntu's
 i386 WebKitGTK/GTK/D-Bus packages with Tauri's production protocol enabled,
@@ -1657,9 +1659,11 @@ macOS amd64 and arm64, and NSIS for Windows amd64. The macOS executable can be
 launched from a terminal; Finder users should use the `.dmg`.
 `scripts/package-desktop.sh` builds whichever native forms its host can make,
 while `scripts/package-desktop-executable.sh` produces the standalone Linux
-i686 program without pretending to cross-compile an installer. Every file has
-a `.sha256`; the complete asset list is asserted before publication, so a
-missing architecture or bundle fails the release instead of shrinking it.
+i686 program without pretending to cross-compile an installer. The workflow
+verifies an internal checksum for every file and asserts the complete asset
+list before publication, so a missing architecture or bundle fails the release
+instead of shrinking it. Checksum sidecars are not attached because GitHub's
+Digest column already displays each published file's SHA-256 value.
 
 The window has its own CI lane on Linux, macOS, and Windows, which compiles it,
 runs its tests, lints it, type-checks its page, and proves by `cargo tree` that

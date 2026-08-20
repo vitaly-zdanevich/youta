@@ -773,9 +773,11 @@ jobs:
           vendor_archive="youta-${version}-vendor.tar.xz"
           expected+=("${vendor_archive}" "${vendor_archive}.sha256")
 
-          readonly expected_asset_count=96
-          ((${#expected[@]} == expected_asset_count)) || {
-            echo "Internal release contract generated ${#expected[@]} assets; expected ${expected_asset_count}." >&2
+          # Checksums stay inside the workflow: GitHub calculates and displays
+          # a Digest for every asset attached to the Release page.
+          readonly expected_download_count=96
+          ((${#expected[@]} == expected_download_count)) || {
+            echo "Internal release contract generated ${#expected[@]} downloads; expected ${expected_download_count}." >&2
             exit 1
           }
 
@@ -787,8 +789,8 @@ jobs:
             printf '%s\n' "${expected[@]}" |
               LC_ALL=C sort
           )
-          ((${#actual[@]} == expected_asset_count)) || {
-            echo "Downloaded ${#actual[@]} release assets; expected ${expected_asset_count}." >&2
+          ((${#actual[@]} == expected_download_count)) || {
+            echo "Downloaded ${#actual[@]} build artifacts; expected ${expected_download_count}." >&2
             printf 'Downloaded asset: %s\n' "${actual[@]}" >&2
             exit 1
           }
@@ -811,13 +813,27 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mapfile -d '' assets < <(find dist -maxdepth 1 -type f -print0 | sort -z)
-          ((${#assets[@]} > 0)) || {
-            echo 'No release assets were downloaded.' >&2
+          readonly expected_release_asset_count=48
+          mapfile -d '' assets < <(
+            find dist -maxdepth 1 -type f ! -name '*.sha256' -print0 |
+              sort -z
+          )
+          ((${#assets[@]} == expected_release_asset_count)) || {
+            echo "Selected ${#assets[@]} GitHub Release assets; expected ${expected_release_asset_count}." >&2
             exit 1
           }
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            # A rerun may update a Release first created by an older workflow.
+            # Remove its redundant checksum sidecars before replacing payloads.
+            mapfile -t checksum_assets < <(
+              gh release view "${RELEASE_TAG}" \
+                --json assets \
+                --jq '.assets[].name | select(endswith(".sha256"))'
+            )
+            for checksum_asset in "${checksum_assets[@]}"; do
+              gh release delete-asset "${RELEASE_TAG}" "${checksum_asset}" --yes
+            done
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
           else
             gh release create "${RELEASE_TAG}" \
