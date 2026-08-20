@@ -312,6 +312,57 @@ fn unfiltered_key_action(
 ) -> Option<UiAction> {
     if let Some(error) = view.error_popup.as_ref() {
         let yt_dlp_forbidden = error.yt_dlp_forbidden.as_ref();
+        if yt_dlp_forbidden.is_none() {
+            match &error.github_issue_submission {
+                GitHubIssueSubmissionView::Confirming => {
+                    return match key.key {
+                        Key::Enter => Some(UiAction::ConfirmGitHubIssueSubmission),
+                        Key::Esc => Some(UiAction::CancelGitHubIssueSubmission),
+                        Key::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
+                        Key::Up | Key::Left => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1)))
+                        }
+                        Key::Down | Key::Right => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(1)))
+                        }
+                        Key::PageUp => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(-1)))
+                        }
+                        Key::PageDown => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(1)))
+                        }
+                        Key::Home => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Home)),
+                        Key::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
+                        _ => None,
+                    };
+                }
+                GitHubIssueSubmissionView::Submitting => return None,
+                GitHubIssueSubmissionView::Submitted { .. }
+                | GitHubIssueSubmissionView::OutcomeUnknown { .. } => {
+                    return match key.key {
+                        Key::Esc => Some(UiAction::DismissErrorPopup),
+                        Key::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
+                        Key::Char('o' | 'O') => Some(UiAction::OpenGitHubIssueSubmissionTarget),
+                        Key::Up | Key::Left => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1)))
+                        }
+                        Key::Down | Key::Right => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(1)))
+                        }
+                        Key::PageUp => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(-1)))
+                        }
+                        Key::PageDown => {
+                            Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Pages(1)))
+                        }
+                        Key::Home => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Home)),
+                        Key::End => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::End)),
+                        _ => None,
+                    };
+                }
+                GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. } => {}
+            }
+        }
         return match key.key {
             Key::Esc => Some(UiAction::DismissErrorPopup),
             Key::Char('c' | 'C') => Some(UiAction::CopyErrorReport),
@@ -320,7 +371,7 @@ fn unfiltered_key_action(
                 Some(UiAction::OpenGentooYtDlpPackage)
             }
             Key::Char('g' | 'G') if yt_dlp_forbidden.is_none() && error.gh_available => {
-                Some(UiAction::FillGitHubIssue)
+                Some(UiAction::RequestGitHubIssueSubmission)
             }
             Key::Char('i' | 'I') if yt_dlp_forbidden.is_none() => {
                 Some(UiAction::CopyAndOpenGitHubIssue)

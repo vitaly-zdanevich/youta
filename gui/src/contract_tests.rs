@@ -25,11 +25,11 @@ use serde::Serialize;
 use youta::domain::{MediaId, SourceKind};
 use youta::view::{
     DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadView, ErrorPopupView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
-    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
-    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
-    VideoCommentsPopupView, ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView,
-    YtDlpVersionLookupView,
+    DownloadView, ErrorPopupView, GitHubIssueSubmissionView, LocalMoveDestinationView,
+    NowPlayingView, PlaylistChoiceView, PlaylistPopupView, PreferencesPopupView, ProjectCommitView,
+    ProjectHistoryPopupView, QueuePopupView, QueueRowView, RowView, SubscriptionsView,
+    VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
+    YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -329,6 +329,51 @@ fn yt_dlp_lookup_variants_keep_the_window_contract_shape() {
 }
 
 #[test]
+fn github_issue_submission_variants_keep_the_window_contract_shape() {
+    assert_eq!(
+        serde_json::to_value(GitHubIssueSubmissionView::Idle).expect("encode idle submission"),
+        serde_json::json!("Idle")
+    );
+    assert_eq!(
+        serde_json::to_value(GitHubIssueSubmissionView::Confirming)
+            .expect("encode confirming submission"),
+        serde_json::json!("Confirming")
+    );
+    assert_eq!(
+        serde_json::to_value(GitHubIssueSubmissionView::Submitting)
+            .expect("encode pending submission"),
+        serde_json::json!("Submitting")
+    );
+    assert_eq!(
+        variant_keys(
+            &GitHubIssueSubmissionView::Submitted {
+                url: "https://github.com/vitaly-zdanevich/youta/issues/123".to_owned(),
+            },
+            "Submitted",
+        ),
+        BTreeSet::from(["url".to_owned()])
+    );
+    assert_eq!(
+        variant_keys(
+            &GitHubIssueSubmissionView::OutcomeUnknown {
+                issues_url: "https://github.com/vitaly-zdanevich/youta/issues".to_owned(),
+            },
+            "OutcomeUnknown",
+        ),
+        BTreeSet::from(["issues_url".to_owned()])
+    );
+    assert_eq!(
+        variant_keys(
+            &GitHubIssueSubmissionView::Failed {
+                message: "gh rejected the request".to_owned(),
+            },
+            "Failed",
+        ),
+        BTreeSet::from(["message".to_owned()])
+    );
+}
+
+#[test]
 fn the_window_error_component_keeps_the_specialized_message_and_actions() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ui")
@@ -355,6 +400,35 @@ fn the_window_error_component_keeps_the_specialized_message_and_actions() {
         source.contains("popup.yt_dlp_forbidden"),
         "the component must choose the structured body from the view"
     );
+}
+
+#[test]
+fn the_window_error_component_keeps_the_confirmed_submission_flow() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "popup.github_issue_submission",
+        "RequestGitHubIssueSubmission",
+        "ConfirmGitHubIssueSubmission",
+        "CancelGitHubIssueSubmission",
+        "OpenGitHubIssueSubmissionTarget",
+        "Submit GitHub issue",
+        "Retry submission",
+        "GitHub issue submission failed:",
+        "complete diagnostic report as a public GitHub issue",
+        "dismissDisabled={submitting}",
+    ] {
+        assert!(
+            source.contains(required),
+            "popup component no longer contains {required}"
+        );
+    }
 }
 
 /// Collects every action the window names inline at a `dispatch` call.

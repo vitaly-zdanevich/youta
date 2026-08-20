@@ -12,6 +12,7 @@
 
 import type {
   ErrorPopupView,
+  GitHubIssueSubmissionView,
   LocalFilePopupView,
   PlaylistPopupView,
   PreferencesPopupView,
@@ -234,6 +235,70 @@ function YtDlpForbiddenBody({ view }: { view: YtDlpForbiddenView }) {
   );
 }
 
+/** One direct-submission state shown above the complete report. */
+function GitHubIssueSubmissionNotice({
+  state,
+  externalOpener,
+}: {
+  state: GitHubIssueSubmissionView;
+  externalOpener: boolean;
+}) {
+  if (state === "Idle") {
+    return null;
+  }
+  if (state === "Confirming") {
+    return (
+      <p className="border-b border-line bg-accent/10 px-[18px] py-[10px] text-[11px] leading-[17px] text-ink">
+        This submits the complete diagnostic report as a public GitHub issue in
+        vitaly-zdanevich/youta. Review the report below before confirming.
+      </p>
+    );
+  }
+  if (state === "Submitting") {
+    return (
+      <p className="border-b border-line px-[18px] py-[10px] text-[11px] leading-[17px] text-ink-dim">
+        Submitting the public GitHub issue… This dialog cannot be closed until the request
+        finishes.
+      </p>
+    );
+  }
+  if ("Failed" in state) {
+    return (
+      <div className="border-b border-line bg-accent/10 px-[18px] py-[10px] text-[11px] leading-[17px] text-ink">
+        <p>GitHub issue submission failed:</p>
+        <p className="mt-[4px] whitespace-pre-wrap text-ink-dim">{state.Failed.message}</p>
+      </div>
+    );
+  }
+
+  const submitted = "Submitted" in state;
+  const url = submitted ? state.Submitted.url : state.OutcomeUnknown.issues_url;
+  return (
+    <div
+      className={`border-b border-line px-[18px] py-[10px] text-[11px] leading-[17px] ${
+        submitted ? "text-ink-dim" : "bg-accent/10 text-ink"
+      }`}
+    >
+      <p>
+        {submitted
+          ? "GitHub issue created:"
+          : "GitHub may have created the issue, but did not return a canonical URL. Check the public issue list before retrying:"}
+      </p>
+      {externalOpener ? (
+        <button
+          type="button"
+          onClick={() => void dispatch("OpenGitHubIssueSubmissionTarget")}
+          className="mt-[4px] break-all font-mono text-left text-accent underline decoration-accent/50 underline-offset-2 hover:decoration-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          {url}
+        </button>
+      ) : (
+        <p className="mt-[4px] break-all font-mono text-ink-dim">{url}</p>
+      )}
+    </div>
+  );
+}
+
 /** The complete copyable report, or specialized guidance for a yt-dlp 403. */
 export function ErrorPopup({
   popup,
@@ -243,22 +308,48 @@ export function ErrorPopup({
   externalOpener: boolean;
 }) {
   const forbidden = popup.yt_dlp_forbidden;
+  const submission = popup.github_issue_submission;
+  const confirming = submission === "Confirming";
+  const submitting = submission === "Submitting";
+  const failed = typeof submission === "object" && "Failed" in submission;
   return (
     <Popup
       title={popup.title}
       subtitle={popup.action_status ?? undefined}
       layer={LAYER.error}
-      onDismiss={() => void dispatch("DismissErrorPopup")}
+      dismissDisabled={submitting}
+      onDismiss={() =>
+        void dispatch(confirming ? "CancelGitHubIssueSubmission" : "DismissErrorPopup")
+      }
       footer={
         forbidden === null ? (
           <>
             <PopupButton onClick={() => void dispatch("CopyErrorReport")}>Copy report</PopupButton>
-            {popup.gh_available ? (
-              <PopupButton onClick={() => void dispatch("FillGitHubIssue")}>
-                Prepare an issue
+            {(submission === "Idle" || failed) && popup.gh_available ? (
+              <PopupButton
+                emphasis
+                onClick={() => void dispatch("RequestGitHubIssueSubmission")}
+              >
+                {failed ? "Retry submission" : "Submit GitHub issue"}
+              </PopupButton>
+            ) : confirming ? (
+              <>
+                <PopupButton
+                  emphasis
+                  onClick={() => void dispatch("ConfirmGitHubIssueSubmission")}
+                >
+                  Submit GitHub issue
+                </PopupButton>
+                <PopupButton onClick={() => void dispatch("CancelGitHubIssueSubmission")}>
+                  Cancel
+                </PopupButton>
+              </>
+            ) : submitting ? (
+              <PopupButton disabled onClick={() => undefined}>
+                Submitting…
               </PopupButton>
             ) : null}
-            {popup.gh_available && externalOpener ? (
+            {(submission === "Idle" || failed) && externalOpener ? (
               <PopupButton onClick={() => void dispatch("CopyAndOpenGitHubIssue")}>
                 Copy and open GitHub
               </PopupButton>
@@ -281,8 +372,11 @@ export function ErrorPopup({
       }
     >
       {forbidden === null ? (
-        <div className="h-full overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
-          {popup.report}
+        <div className="flex h-full min-h-0 flex-col">
+          <GitHubIssueSubmissionNotice state={submission} externalOpener={externalOpener} />
+          <div className="min-h-0 flex-1 overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
+            {popup.report}
+          </div>
         </div>
       ) : (
         <YtDlpForbiddenBody view={forbidden} />

@@ -1325,6 +1325,33 @@ impl Default for YtDlpForbiddenView {
     }
 }
 
+/// Lifecycle of one explicit diagnostic-report submission to GitHub.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum GitHubIssueSubmissionView {
+    /// No submission has been requested for this diagnostic report.
+    #[default]
+    Idle,
+    /// The user must confirm that the complete report will become public.
+    Confirming,
+    /// A background `gh issue create` process is still running.
+    Submitting,
+    /// GitHub accepted the report and returned its canonical issue URL.
+    Submitted {
+        /// Credential-free URL validated against Youta's issue tracker.
+        url: String,
+    },
+    /// `gh` may have submitted the issue but did not return a definite result.
+    OutcomeUnknown {
+        /// Repository issue list where the user can check before retrying.
+        issues_url: String,
+    },
+    /// GitHub definitely rejected the request, so an explicit retry is safe.
+    Failed {
+        /// Bounded, redacted failure returned by the GitHub CLI.
+        message: String,
+    },
+}
+
 /// Diagnostic information shown above the normal interface after an error.
 ///
 /// `report` contains the complete, copyable diagnostic report rather than a
@@ -1338,15 +1365,17 @@ pub struct ErrorPopupView {
     pub report: String,
     /// Zero-based wrapped-line offset at the top of the viewport.
     pub scroll_offset: usize,
-    /// Whether the GitHub CLI is available for pre-filling a new issue.
+    /// Whether the GitHub CLI is available for submitting a new issue.
     pub gh_available: bool,
-    /// Result of the most recent copy or issue-review action.
+    /// Result of the most recent copy or issue-submission action.
     pub action_status: Option<String>,
     /// Short progressive body for a 403 attributed to yt-dlp.
     ///
     /// The complete diagnostic payload remains in `report` for copying even
     /// while front-ends render this structured body instead.
     pub yt_dlp_forbidden: Option<YtDlpForbiddenView>,
+    /// Confirmation, progress, or result of direct GitHub issue submission.
+    pub github_issue_submission: GitHubIssueSubmissionView,
 }
 
 /// One public top-level comment rendered in the selected-video popup.
@@ -2165,8 +2194,14 @@ pub enum UiAction {
     ScrollErrorPopup(ErrorPopupScroll),
     /// Copy the complete diagnostic report.
     CopyErrorReport,
-    /// Ask the GitHub CLI to open a pre-filled issue without submitting it.
-    FillGitHubIssue,
+    /// Ask for confirmation before publishing the complete diagnostic report.
+    RequestGitHubIssueSubmission,
+    /// Submit the confirmed diagnostic report through the GitHub CLI.
+    ConfirmGitHubIssueSubmission,
+    /// Return to the diagnostic report without submitting it.
+    CancelGitHubIssueSubmission,
+    /// Open the created issue or the issue list for an uncertain submission.
+    OpenGitHubIssueSubmissionTarget,
     /// Copy the report and open the repository's new-issue page.
     CopyAndOpenGitHubIssue,
     /// Select the credential field edited by the YouTube setup popup.
@@ -2295,6 +2330,7 @@ impl UiAction {
                 | Self::OpenInBrowser
                 | Self::OpenChannelInBrowser
                 | Self::CopyAndOpenGitHubIssue
+                | Self::OpenGitHubIssueSubmissionTarget
                 | Self::OpenYtDlpProject
                 | Self::OpenGentooYtDlpPackage
                 | Self::OpenYouTubeApiKeyGuide

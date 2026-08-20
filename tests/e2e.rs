@@ -608,7 +608,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
 
 #[cfg(all(target_os = "linux", feature = "tui", feature = "backend-mpv"))]
 #[test]
-fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
+fn tui_error_popup_runs_copy_browser_review_and_confirmed_submission_actions() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
@@ -634,7 +634,8 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     write_executable(
         &helpers.join("gh"),
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$YOUTA_TEST_GH_ARGS_LOG\"\n\
-         /bin/cat > \"$YOUTA_TEST_GH_BODY_LOG\"\n",
+         /bin/cat > \"$YOUTA_TEST_GH_BODY_LOG\"\n\
+         printf '%s\\n' 'https://github.com/vitaly-zdanevich/youta/issues/123'\n",
     );
     let launcher = temporary.path().join("launch-youta");
     write_executable(
@@ -712,12 +713,29 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
             &open_log,
             "github.com/vitaly-zdanevich/youta/issues/new",
         ),
-        (b'g', &gh_body_log, "- No bounded input reached its limit."),
     ] {
         input.write_all(&[action]).expect("send popup action");
         input.flush().expect("flush popup action");
         wait_for_helper_output(output_path, expected);
     }
+    input
+        .write_all(b"g")
+        .expect("request GitHub issue submission");
+    input.flush().expect("flush submission request");
+    wait_for_transcript_text(&transcript, "This creates a public issue");
+    assert!(
+        !gh_body_log.exists(),
+        "requesting submission must not invoke gh before confirmation"
+    );
+    input
+        .write_all(b"\r")
+        .expect("confirm GitHub issue submission");
+    input.flush().expect("flush submission confirmation");
+    wait_for_helper_output(&gh_body_log, "- No bounded input reached its limit.");
+    wait_for_transcript_text(
+        &transcript,
+        "https://github.com/vitaly-zdanevich/youta/issues/123",
+    );
     input.write_all(b"\x1b").expect("close diagnostic popup");
     input.flush().expect("flush popup close");
     // Keep a short standalone-Escape gap so the terminal decoder cannot
@@ -763,7 +781,6 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     for expected in [
         "issue",
         "create",
-        "--web",
         "--repo",
         "vitaly-zdanevich/youta",
         "--body-file",
@@ -771,6 +788,7 @@ fn tui_error_popup_runs_copy_and_both_issue_review_actions() {
     ] {
         assert!(gh_arguments.lines().any(|argument| argument == expected));
     }
+    assert!(!gh_arguments.lines().any(|argument| argument == "--web"));
     let gh_body = fs::read_to_string(&gh_body_log).expect("GitHub CLI report body");
     assert_eq!(gh_body, copied);
 

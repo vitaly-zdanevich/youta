@@ -6549,27 +6549,100 @@ fn render_error_popup_controls(
     hit_map: &mut HitMap,
     area: Rect,
 ) {
-    let mut buttons = if let Some(forbidden) = error.yt_dlp_forbidden.as_ref() {
-        let mut buttons = Vec::new();
-        if external_opener_available {
-            buttons.push(("[u] Project", UiAction::OpenYtDlpProject));
-            if forbidden.gentoo.is_some() {
-                buttons.push(("[p] Gentoo package", UiAction::OpenGentooYtDlpPackage));
+    let mut buttons: Vec<(String, UiAction)> =
+        if let Some(forbidden) = error.yt_dlp_forbidden.as_ref() {
+            let mut buttons = Vec::new();
+            if external_opener_available {
+                buttons.push(("[u] Project".to_owned(), UiAction::OpenYtDlpProject));
+                if forbidden.gentoo.is_some() {
+                    buttons.push((
+                        "[p] Gentoo package".to_owned(),
+                        UiAction::OpenGentooYtDlpPackage,
+                    ));
+                }
             }
-        }
-        buttons.push(("[c] Copy report", UiAction::CopyErrorReport));
-        buttons
-    } else {
-        let mut buttons = vec![("[c] Copy", UiAction::CopyErrorReport)];
-        if external_opener_available {
-            buttons.push(("[i] Copy + open issue", UiAction::CopyAndOpenGitHubIssue));
-        }
-        if error.gh_available {
-            buttons.push(("[g] Fill GitHub issue", UiAction::FillGitHubIssue));
-        }
-        buttons
-    };
-    buttons.push(("[Esc] Close", UiAction::DismissErrorPopup));
+            buttons.push(("[c] Copy report".to_owned(), UiAction::CopyErrorReport));
+            buttons
+        } else {
+            match &error.github_issue_submission {
+                GitHubIssueSubmissionView::Idle => {
+                    let mut buttons = vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)];
+                    if external_opener_available {
+                        buttons.push((
+                            "[i] Copy + open issue".to_owned(),
+                            UiAction::CopyAndOpenGitHubIssue,
+                        ));
+                    }
+                    if error.gh_available {
+                        buttons.push((
+                            "[g] Submit GitHub issue".to_owned(),
+                            UiAction::RequestGitHubIssueSubmission,
+                        ));
+                    }
+                    buttons
+                }
+                GitHubIssueSubmissionView::Confirming => vec![
+                    ("[c] Copy".to_owned(), UiAction::CopyErrorReport),
+                    (
+                        "[Enter] Submit".to_owned(),
+                        UiAction::ConfirmGitHubIssueSubmission,
+                    ),
+                ],
+                GitHubIssueSubmissionView::Submitting => Vec::new(),
+                GitHubIssueSubmissionView::Submitted { .. } => {
+                    let mut buttons = vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)];
+                    if external_opener_available {
+                        buttons.push((
+                            "[o] Open issue".to_owned(),
+                            UiAction::OpenGitHubIssueSubmissionTarget,
+                        ));
+                    }
+                    buttons
+                }
+                GitHubIssueSubmissionView::OutcomeUnknown { .. } => {
+                    let mut buttons = vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)];
+                    if external_opener_available {
+                        buttons.push((
+                            "[o] Check existing issues".to_owned(),
+                            UiAction::OpenGitHubIssueSubmissionTarget,
+                        ));
+                    }
+                    buttons
+                }
+                GitHubIssueSubmissionView::Failed { .. } => {
+                    let mut buttons = vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)];
+                    if external_opener_available {
+                        buttons.push((
+                            "[i] Copy + open issue".to_owned(),
+                            UiAction::CopyAndOpenGitHubIssue,
+                        ));
+                    }
+                    if error.gh_available {
+                        buttons.push((
+                            "[g] Retry submission".to_owned(),
+                            UiAction::RequestGitHubIssueSubmission,
+                        ));
+                    }
+                    buttons
+                }
+            }
+        };
+    if matches!(
+        error.github_issue_submission,
+        GitHubIssueSubmissionView::Confirming
+    ) && error.yt_dlp_forbidden.is_none()
+    {
+        buttons.push((
+            "[Esc] Cancel".to_owned(),
+            UiAction::CancelGitHubIssueSubmission,
+        ));
+    } else if !matches!(
+        error.github_issue_submission,
+        GitHubIssueSubmissionView::Submitting
+    ) || error.yt_dlp_forbidden.is_some()
+    {
+        buttons.push(("[Esc] Close".to_owned(), UiAction::DismissErrorPopup));
+    }
     let labels_width = buttons
         .iter()
         .map(|(label, _)| label.chars().count())
@@ -6581,7 +6654,7 @@ fn render_error_popup_controls(
         .saturating_add(area.width.saturating_sub(labels_width) / 2);
     let controls = buttons
         .iter()
-        .map(|(label, _)| *label)
+        .map(|(label, _)| label.as_str())
         .collect::<Vec<_>>()
         .join("   ");
     frame.render_widget(
@@ -6592,10 +6665,37 @@ fn render_error_popup_controls(
     );
     for (label, action) in buttons {
         let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-        hit_map
-            .error_buttons
-            .push((action, Rect::new(button_x, area.y, width, 1)));
+        let clipped_width = area.right().saturating_sub(button_x).min(width);
+        if clipped_width > 0 {
+            hit_map
+                .error_buttons
+                .push((action, Rect::new(button_x, area.y, clipped_width, 1)));
+        }
         button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+}
+
+/// Returns the persistent submission notice that must remain visible beside
+/// transient copy or opener feedback.
+fn github_issue_submission_notice(state: &GitHubIssueSubmissionView) -> Option<String> {
+    match state {
+        GitHubIssueSubmissionView::Idle => None,
+        GitHubIssueSubmissionView::Confirming => Some(
+            "This creates a public issue in vitaly-zdanevich/youta with the complete diagnostic report."
+                .to_owned(),
+        ),
+        GitHubIssueSubmissionView::Submitting => {
+            Some("Submitting the public GitHub issue…".to_owned())
+        }
+        GitHubIssueSubmissionView::Submitted { url } => {
+            Some(format!("GitHub issue created:\n{url}"))
+        }
+        GitHubIssueSubmissionView::OutcomeUnknown { issues_url } => Some(format!(
+            "GitHub may have created the issue. Check existing issues before retrying:\n{issues_url}"
+        )),
+        GitHubIssueSubmissionView::Failed { message } => {
+            Some(format!("GitHub issue submission failed:\n{message}"))
+        }
     }
 }
 
@@ -6622,17 +6722,46 @@ fn render_error_popup(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    let submission_notice = error
+        .yt_dlp_forbidden
+        .is_none()
+        .then(|| github_issue_submission_notice(&error.github_issue_submission))
+        .flatten();
+    let submission_notice_lines = submission_notice
+        .as_deref()
+        .map(|notice| wrap_diagnostic_report(notice, usize::from(inner.width.max(1))))
+        .unwrap_or_default();
+    let submission_notice_height = u16::try_from(submission_notice_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(inner.height.saturating_sub(3));
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(submission_notice_height),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(inner);
-    let report_area = sections[0];
-    let position_area = sections[1];
-    let buttons_area = sections[2];
+    let submission_notice_area = sections[0];
+    let report_area = sections[1];
+    let position_area = sections[2];
+    let buttons_area = sections[3];
+
+    if submission_notice_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                submission_notice_lines
+                    .iter()
+                    .take(usize::from(submission_notice_height))
+                    .cloned()
+                    .map(Line::raw)
+                    .collect::<Vec<_>>(),
+            )
+            .style(theme.accent),
+            submission_notice_area,
+        );
+    }
 
     let (report_text_area, scrollbar_area) = if report_area.width > 1 {
         let report_columns = Layout::default()
@@ -9233,6 +9362,11 @@ fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
 /// Returns [`None`] for keys the shared map has no name for, such as media and
 /// keypad keys, which the terminal front-end has never bound.
 fn key_press(key: KeyEvent) -> Option<KeyPress> {
+    // Some terminals report both the press and release for one physical key.
+    // Ignoring releases prevents a confirmation key from acting twice.
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
     let named = match key.code {
         KeyCode::Char(character) => Key::Char(character),
         KeyCode::Enter => Key::Enter,
@@ -12892,7 +13026,19 @@ mod tests {
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
-            Some(UiAction::FillGitHubIssue)
+            Some(UiAction::RequestGitHubIssueSubmission)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('g'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ),
+                &view,
+            ),
+            None,
+            "a key release must not request publication"
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
@@ -12918,6 +13064,105 @@ mod tests {
             key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &view),
             None,
             "the popup must not leak the normal quit action"
+        );
+    }
+
+    #[test]
+    fn github_issue_submission_confirmation_owns_enter_and_escape() {
+        let confirming = ViewModel {
+            error_popup: Some(ErrorPopupView {
+                title: "Playback failed".to_owned(),
+                report: "complete report".to_owned(),
+                gh_available: true,
+                github_issue_submission: GitHubIssueSubmissionView::Confirming,
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &confirming
+            ),
+            Some(UiAction::ConfirmGitHubIssueSubmission)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &confirming
+            ),
+            None,
+            "the request hotkey must not also confirm publication"
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release,),
+                &confirming,
+            ),
+            None,
+            "an Enter release must not confirm publication"
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &confirming),
+            Some(UiAction::CancelGitHubIssueSubmission)
+        );
+
+        let submitted = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(ErrorPopupView {
+                github_issue_submission: GitHubIssueSubmissionView::Submitted {
+                    url: "https://github.com/vitaly-zdanevich/youta/issues/123".to_owned(),
+                },
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                &submitted
+            ),
+            Some(UiAction::OpenGitHubIssueSubmissionTarget)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &submitted
+            ),
+            None,
+            "a submitted diagnostic must not create a duplicate issue"
+        );
+
+        let failed = ViewModel {
+            error_popup: Some(ErrorPopupView {
+                gh_available: true,
+                github_issue_submission: GitHubIssueSubmissionView::Failed {
+                    message: "gh rejected the request".to_owned(),
+                },
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &failed
+            ),
+            Some(UiAction::RequestGitHubIssueSubmission)
+        );
+
+        let submitting = ViewModel {
+            error_popup: Some(ErrorPopupView {
+                github_issue_submission: GitHubIssueSubmissionView::Submitting,
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &submitting),
+            None,
+            "closing must not imply that an in-flight remote submission was cancelled"
         );
     }
 
@@ -17517,7 +17762,7 @@ mod tests {
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
-            Some(UiAction::FillGitHubIssue)
+            Some(UiAction::RequestGitHubIssueSubmission)
         );
 
         view.error_popup = Some(yt_dlp_forbidden_error(true));
@@ -22635,6 +22880,7 @@ prose 07:25 remains clickable but is not a chapter";
                 gh_available: true,
                 action_status: None,
                 yt_dlp_forbidden: None,
+                github_issue_submission: GitHubIssueSubmissionView::Idle,
             }),
             ..ViewModel::default()
         };
@@ -22670,9 +22916,94 @@ prose 07:25 remains clickable but is not a chapter";
         );
         assert!(rendered.contains("[c] Copy"));
         assert!(rendered.contains("[i] Copy + open issue"));
-        assert!(rendered.contains("[g] Fill GitHub issue"));
+        assert!(rendered.contains("[g] Submit GitHub issue"));
         assert!(rendered.contains("[Esc] Close"));
         assert_eq!(hit_map.error_buttons.len(), 4);
+    }
+
+    #[test]
+    fn diagnostic_popup_keeps_confirmation_visible_and_contains_submitted_controls() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut view = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(ErrorPopupView {
+                title: "Playback failed".to_owned(),
+                report: "complete report".to_owned(),
+                gh_available: true,
+                action_status: Some("Copied with wl-copy".to_owned()),
+                github_issue_submission: GitHubIssueSubmissionView::Confirming,
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw confirmation");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("This creates a public issue"));
+        assert!(rendered.contains("Copied with wl-copy"));
+        assert!(rendered.contains("[Enter] Submit"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        assert!(!rendered.contains("Copy + open issue"));
+
+        let url = "https://github.com/vitaly-zdanevich/youta/issues/123";
+        view.error_popup = Some(ErrorPopupView {
+            title: "Playback failed".to_owned(),
+            report: "complete report".to_owned(),
+            gh_available: true,
+            action_status: Some("Copied with wl-copy".to_owned()),
+            github_issue_submission: GitHubIssueSubmissionView::Submitted {
+                url: url.to_owned(),
+            },
+            ..ErrorPopupView::default()
+        });
+        hit_map.error_buttons.clear();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw submitted issue");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains(url));
+        assert!(rendered.contains("[o] Open issue"));
+        assert!(!rendered.contains(&format!("[o] {url}")));
+        assert!(!rendered.contains("Submit GitHub issue"));
+        assert!(
+            hit_map
+                .error_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenGitHubIssueSubmissionTarget)
+        );
+        let popup = centered_rect(92, 88, Rect::new(0, 0, 80, 24));
+        let inner = popup.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        assert!(hit_map.error_buttons.iter().all(|(_, target)| {
+            target.x >= inner.x
+                && target.right() <= inner.right()
+                && target.y >= inner.y
+                && target.bottom() <= inner.bottom()
+        }));
+
+        view.error_popup = Some(ErrorPopupView {
+            title: "Playback failed".to_owned(),
+            report: "complete report".to_owned(),
+            gh_available: true,
+            action_status: Some("Copied with wl-copy".to_owned()),
+            github_issue_submission: GitHubIssueSubmissionView::Failed {
+                message: "gh rejected the request".to_owned(),
+            },
+            ..ErrorPopupView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw failed submission");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("gh rejected the request"));
+        assert!(rendered.contains("Copied with wl-copy"));
+        assert!(rendered.contains("[g] Retry submission"));
     }
 
     #[test]
@@ -25566,7 +25897,10 @@ prose 07:25 remains clickable but is not a chapter";
             tabs: vec![(Screen::History, Rect::new(0, 0, 20, 2))],
             error_buttons: vec![
                 (UiAction::CopyErrorReport, Rect::new(20, 20, 8, 1)),
-                (UiAction::FillGitHubIssue, Rect::new(31, 20, 21, 1)),
+                (
+                    UiAction::RequestGitHubIssueSubmission,
+                    Rect::new(31, 20, 21, 1),
+                ),
             ],
             ..HitMap::default()
         };

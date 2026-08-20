@@ -1590,11 +1590,15 @@ and TUI reports also probe `ffmpeg` and `ffprobe`. Every probe uses fixed
 version arguments and an independent 1.5-second deadline.
 
 The popup always offers separate `Copy` and `Copy + open issue` actions. When
-`gh` is installed, it additionally offers `Fill GitHub issue`. Both issue
-actions open an editor for review and never submit automatically. The complete
-report travels through a helper's standard input or the terminal's OSC 52
-clipboard protocol; the fallback browser URL contains only a short bounded
-title and paste instruction.
+`gh` is installed, it additionally offers `Submit GitHub issue`. Direct
+submission first asks for explicit confirmation that the complete diagnostic
+report will become public, disables dismissal while `gh issue create` is
+running, and then shows the canonical issue URL. If the command's outcome is
+uncertain, Youta shows the repository issue list and asks the user to check it
+before retrying, avoiding accidental duplicates. `Copy + open issue` remains
+the manual browser-review path. The complete report travels through a helper's
+standard input or the terminal's OSC 52 clipboard protocol; the fallback
+browser URL contains only a short bounded title and paste instruction.
 
 The normal `release` profile keeps panic unwinding and line-table symbols so a
 panic can restore terminal state and produce useful frames. The optional

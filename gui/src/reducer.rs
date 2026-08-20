@@ -13,6 +13,7 @@
 //! serialized snapshot.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -259,6 +260,30 @@ enum Message {
     Stop,
 }
 
+/// Permission for the app exit initiated by the reducer itself.
+///
+/// Native quit events arrive on Tauri's event loop, while confirmation and
+/// other stateful actions are serialized on the reducer thread. An unapproved
+/// native exit therefore has to become an ordinary reducer `Quit`; consulting a
+/// published snapshot would race an action that is already queued but not yet
+/// visible. Once that `Quit` is accepted, this token lets the resulting
+/// [`AppHandle::exit`] request pass through the same native callback. The token
+/// remains set because the reducer returns immediately after authorization; if
+/// a platform emits more than one exit event, none should revive a controller
+/// that has already committed to shutdown.
+#[derive(Clone, Debug, Default)]
+struct ExitAuthorization(Arc<AtomicBool>);
+
+impl ExitAuthorization {
+    fn authorize(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn authorized(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Handle used by IPC commands to reach the reducer thread.
 pub struct ReducerHandle {
     actions: Sender<Message>,
@@ -267,6 +292,8 @@ pub struct ReducerHandle {
     /// A `Receiver` is `Send` but not `Sync`, and Tauri shares managed state
     /// across threads, so the exit path takes this lock to wait on it.
     finished: Mutex<Receiver<()>>,
+    /// Permission set only for the native exit requested by the reducer.
+    exit_authorization: ExitAuthorization,
 }
 
 impl ReducerHandle {
@@ -279,6 +306,21 @@ impl ReducerHandle {
         self.actions
             .send(Message::Action(action))
             .map_err(|_| "the Youta reducer stopped".to_owned())
+    }
+
+    /// Routes a native exit through the reducer unless the reducer authorized it.
+    ///
+    /// The return value says whether the caller must prevent the current native
+    /// exit. A `true` result means `Quit` was queued behind every action already
+    /// sent by the window. If the reducer has stopped and cannot receive that
+    /// action, the native exit is allowed so a broken background thread cannot
+    /// leave an uncloseable process.
+    #[must_use]
+    pub fn route_exit_request(&self) -> bool {
+        if self.exit_authorization.authorized() {
+            return false;
+        }
+        self.dispatch(UiAction::Quit).is_ok()
     }
 
     /// Queues one key press for the reducer to resolve and apply.
@@ -346,9 +388,8 @@ impl ReducerHandle {
 
     /// Stops playback and durable state before the process ends.
     ///
-    /// Closing the window is not a quit action inside the reducer, so nothing
-    /// else would reach the shutdown path: the player process would outlive the
-    /// window and the state lock would be released only by process death.
+    /// External exits can bypass the window's reducer-owned close request, so
+    /// the event-loop fallback still needs a synchronous shutdown path.
     pub fn shutdown(&self) {
         let _ = self.actions.send(Message::Stop);
         // `RecvTimeoutError` of either kind means the reducer is gone: it either
@@ -381,6 +422,8 @@ pub fn start<R: Runtime>(
     let published = Arc::clone(&latest);
     let artwork = Arc::new(PublishedArtwork::default());
     let published_artwork = Arc::clone(&artwork);
+    let exit_authorization = ExitAuthorization::default();
+    let reducer_exit_authorization = exit_authorization.clone();
 
     thread::Builder::new()
         .name("youta-reducer".to_owned())
@@ -422,6 +465,7 @@ pub fn start<R: Runtime>(
                 &published,
                 &published_artwork,
                 &focus,
+                &reducer_exit_authorization,
             );
             // Every exit from `run` lands here, so the player process is killed
             // and durable state is flushed whether the user quit, closed the
@@ -440,6 +484,7 @@ pub fn start<R: Runtime>(
         latest,
         artwork,
         finished: Mutex::new(finished),
+        exit_authorization,
     })
 }
 
@@ -584,6 +629,7 @@ fn run<R: Runtime>(
     published: &Arc<Mutex<ViewModel>>,
     artwork: &Arc<PublishedArtwork>,
     focus: &WindowFocus,
+    exit_authorization: &ExitAuthorization,
 ) {
     let mut last = controller.view().clone();
     let mut traffic = TrafficMeter::new();
@@ -675,6 +721,7 @@ fn run<R: Runtime>(
             // Quitting is a reducer decision, so the window is told to close
             // rather than the other way round. The exit handler then waits for
             // the shutdown this function is about to return into.
+            exit_authorization.authorize();
             app.exit(0);
             return;
         }
@@ -683,9 +730,15 @@ fn run<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ANOTHER_INSTANCE_MESSAGE, ReducerHandle, StateStore, WindowFocus, start};
+    use super::{
+        ANOTHER_INSTANCE_MESSAGE, ExitAuthorization, Message, PublishedArtwork, ReducerHandle,
+        StateStore, WindowFocus, start,
+    };
 
     use super::{PlaybackTick, ViewModel};
+
+    use std::sync::mpsc::channel;
+    use std::sync::{Arc, Mutex};
 
     use tauri::App;
     use tauri::test::{MockRuntime, mock_app};
@@ -752,6 +805,52 @@ mod tests {
 
         assert_eq!(second.err().as_deref(), Some(ANOTHER_INSTANCE_MESSAGE));
         first.shutdown();
+    }
+
+    /// A native quit can arrive before the reducer publishes the confirmation
+    /// action immediately preceding it. Both must therefore travel through the
+    /// same FIFO rather than deciding from the older published snapshot.
+    #[test]
+    fn an_external_exit_queues_quit_behind_an_unpublished_confirmation() {
+        let (actions, inbox) = channel();
+        let (_finished_sender, finished) = channel();
+        let handle = ReducerHandle {
+            actions,
+            latest: Arc::new(Mutex::new(ViewModel::default())),
+            artwork: Arc::new(PublishedArtwork::default()),
+            finished: Mutex::new(finished),
+            exit_authorization: ExitAuthorization::default(),
+        };
+
+        handle
+            .dispatch(UiAction::ConfirmGitHubIssueSubmission)
+            .expect("queue confirmation");
+        assert!(
+            handle.route_exit_request(),
+            "an external request must be prevented while reducer Quit is queued"
+        );
+        assert!(matches!(
+            inbox.recv().expect("confirmation message"),
+            Message::Action(UiAction::ConfirmGitHubIssueSubmission)
+        ));
+        assert!(matches!(
+            inbox.recv().expect("quit message"),
+            Message::Action(UiAction::Quit)
+        ));
+
+        handle.exit_authorization.authorize();
+        assert!(
+            !handle.route_exit_request(),
+            "the reducer's own exit must be allowed"
+        );
+        assert!(
+            !handle.route_exit_request(),
+            "repeated native events must not revive a committed shutdown"
+        );
+        assert!(
+            inbox.try_recv().is_err(),
+            "an authorized exit must not queue another Quit"
+        );
     }
 
     /// A position tick must travel as a playback update, not as a whole

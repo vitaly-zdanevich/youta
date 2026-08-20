@@ -302,6 +302,15 @@ fn main() {
         .menu(desktop::menu)
         .on_menu_event(|app, event| desktop::on_menu_event(app, &event))
         .on_window_event(move |window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                if let Some(reducer) = window.try_state::<ReducerHandle>() {
+                    // The reducer owns both persistence and operations that
+                    // cannot be interrupted safely. It decides whether this
+                    // close request may become a process exit.
+                    api.prevent_close();
+                    let _ = reducer.dispatch(UiAction::Quit);
+                }
+            }
             // Whether a track change is worth a notification depends on this
             // and on nothing else in the snapshot.
             WindowEvent::Focused(focused) => window_focus.set(*focused),
@@ -357,13 +366,22 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("the Youta window must start")
-        .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                // Closing the window is not a quit action inside the reducer, so
-                // without this the player process would outlive the window and
-                // the durable state lock would be released only by process death.
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                // Native Quit/Cmd+Q can arrive before the reducer publishes the
+                // action immediately preceding it. Queueing Quit on that same FIFO
+                // lets the controller decide from current state; only the exit the
+                // reducer authorizes after accepting Quit may pass through.
+                if app.state::<ReducerHandle>().route_exit_request() {
+                    api.prevent_exit();
+                }
+            }
+            tauri::RunEvent::Exit => {
+                // External exits that do not originate in the window still
+                // need to stop playback and flush durable state.
                 app.state::<ReducerHandle>().shutdown();
             }
+            _ => {}
         });
 }
 

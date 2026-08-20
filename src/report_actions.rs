@@ -21,6 +21,9 @@ use crate::diagnostics::redact_diagnostic_text;
 /// GitHub repository that receives Youta diagnostic reports.
 pub const GITHUB_REPOSITORY: &str = "vitaly-zdanevich/youta";
 
+/// Browser URL for Youta's GitHub issue list.
+pub const GITHUB_ISSUES_URL: &str = "https://github.com/vitaly-zdanevich/youta/issues";
+
 /// Maximum number of Unicode scalar values in a pre-filled issue title.
 pub const MAX_ISSUE_TITLE_CHARS: usize = 160;
 
@@ -33,6 +36,25 @@ const SHORT_ISSUE_BODY: &str =
 /// are not reported as successful because no zero exit status was observed.
 const PROCESS_OBSERVATION_TIME: Duration = Duration::from_millis(100);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Maximum grace period for pipe workers after the direct child terminates.
+///
+/// A descendant can inherit a pipe and keep it open indefinitely. Completion
+/// therefore uses messages received during this bounded grace period and
+/// detaches any worker still waiting for EOF when the deadline expires.
+const PROCESS_IO_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// Maximum time allowed for `gh` to submit a diagnostic issue.
+///
+/// Unlike browser and clipboard helpers, a timed-out submission is terminated
+/// and reaped instead of being detached. Its remote outcome remains unknown
+/// because GitHub may have accepted the request before the response was lost.
+const GITHUB_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum stdout and stderr retained from a completion-required helper.
+///
+/// Reader threads continue draining data after this limit so a noisy child
+/// cannot deadlock on a full pipe or grow Youta's memory without bound.
+pub const MAX_CAPTURED_HELPER_OUTPUT_BYTES: usize = 16 * 1024;
+/// Maximum terminal-safe helper detail included in a user-facing error.
+const MAX_DISPLAYED_HELPER_DETAIL_BYTES: usize = 512;
 
 /// Returns the native URL-opening command for the compiled operating system.
 ///
@@ -77,6 +99,129 @@ pub enum ProcessOutcome {
     ExitedUnsuccessfully(Option<i32>),
 }
 
+/// One bounded output stream captured from a completed helper process.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapturedOutput {
+    /// UTF-8 text retained from the beginning of the stream.
+    pub text: String,
+    /// Whether the complete stream was not retained because it exceeded the
+    /// byte limit or a descendant prevented the reader from observing EOF.
+    pub truncated: bool,
+}
+
+impl CapturedOutput {
+    fn display_text(&self) -> Option<String> {
+        let text = self.text.trim();
+        if text.is_empty() {
+            return self
+                .truncated
+                .then(|| "helper output exceeded the capture limit".to_owned());
+        }
+        let safe = escape_terminal_controls(&redact_diagnostic_text(text));
+        Some(bounded_helper_detail(&safe, self.truncated))
+    }
+}
+
+/// Escapes terminal instructions while retaining readable multiline text.
+///
+/// Newlines remain structural, CRLF is normalized, tabs become spaces, and
+/// every other Unicode control character is rendered through its Rust escape.
+/// In particular, an ANSI `ESC` byte becomes the inert text `\\u{1b}`.
+fn escape_terminal_controls(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                output.push('\n');
+            }
+            '\n' => output.push('\n'),
+            '\t' => output.push(' '),
+            character if character.is_control() => output.extend(character.escape_default()),
+            character => output.push(character),
+        }
+    }
+    output
+}
+
+/// Bounds escaped helper text while reserving room for truthful suffixes.
+fn bounded_helper_detail(input: &str, capture_truncated: bool) -> String {
+    const CAPTURE_SUFFIX: &str = "\n… helper output truncated";
+    const DISPLAY_SUFFIX: &str = "\n… helper detail truncated";
+
+    let capture_suffix = if capture_truncated {
+        CAPTURE_SUFFIX
+    } else {
+        ""
+    };
+    let display_truncated =
+        input.len().saturating_add(capture_suffix.len()) > MAX_DISPLAYED_HELPER_DETAIL_BYTES;
+    let display_suffix = if display_truncated {
+        DISPLAY_SUFFIX
+    } else {
+        ""
+    };
+    let content_limit = MAX_DISPLAYED_HELPER_DETAIL_BYTES
+        .saturating_sub(capture_suffix.len())
+        .saturating_sub(display_suffix.len());
+    let mut end = input.len().min(content_limit);
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut output = String::with_capacity(
+        end.saturating_add(capture_suffix.len())
+            .saturating_add(display_suffix.len()),
+    );
+    output.push_str(&input[..end]);
+    output.push_str(display_suffix);
+    output.push_str(capture_suffix);
+    output
+}
+
+/// Terminal state of a helper that must finish before its result is known.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletedProcessStatus {
+    /// The helper exited with a successful status.
+    ExitedSuccessfully,
+    /// The helper exited unsuccessfully, optionally exposing its status code.
+    ExitedUnsuccessfully(Option<i32>),
+    /// The helper exceeded its plan's observation time and was terminated.
+    ///
+    /// Terminating the local process cannot prove that a remote side effect
+    /// did not complete before the response was lost.
+    TimedOut,
+    /// The helper started, but its final state could not be established.
+    ///
+    /// A caller initiating a remote side effect must treat this as an
+    /// indeterminate outcome rather than offering an ordinary retry.
+    OutcomeUnknown {
+        /// Bounded local explanation of why completion could not be proven.
+        reason: String,
+    },
+}
+
+/// Bounded output and terminal state from a completion-required helper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedProcess {
+    /// How the helper completed.
+    pub status: CompletedProcessStatus,
+    /// Bounded standard output.
+    pub stdout: CapturedOutput,
+    /// Bounded standard error.
+    pub stderr: CapturedOutput,
+}
+
+impl CompletedProcess {
+    fn useful_detail(&self) -> Option<String> {
+        self.stderr
+            .display_text()
+            .or_else(|| self.stdout.display_text())
+    }
+}
+
 /// Injectable executor used by diagnostic report actions.
 ///
 /// Production code uses [`SystemRunner`]. Tests can implement this trait to
@@ -90,6 +235,21 @@ pub trait ReportActionRunner {
     /// Returns an I/O error when the process cannot be started, its input
     /// cannot be written, or its status cannot be observed.
     fn execute(&self, plan: &CommandPlan) -> io::Result<ProcessOutcome>;
+
+    /// Executes a plan to a definite result while capturing bounded output.
+    ///
+    /// A process that outlives [`CommandPlan::observation_time`] is terminated
+    /// and reaped. Implementations must keep draining stdout and stderr after
+    /// [`MAX_CAPTURED_HELPER_OUTPUT_BYTES`] so a noisy child cannot block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only when the process could not be started. Once a
+    /// helper starts, implementations must return
+    /// [`CompletedProcessStatus::OutcomeUnknown`] for local observation or I/O
+    /// failures so callers cannot mistake a possibly completed remote action
+    /// for a safe-to-retry pre-launch failure.
+    fn execute_to_completion(&self, plan: &CommandPlan) -> io::Result<CompletedProcess>;
 
     /// Writes a complete OSC 52 clipboard escape to the controlling terminal.
     ///
@@ -115,6 +275,7 @@ impl ReportActionRunner for SystemRunner {
             })
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        crate::child_process::quiet(&mut command);
 
         let mut child = command.spawn()?;
         if let Some(input) = &plan.standard_input {
@@ -133,12 +294,418 @@ impl ReportActionRunner for SystemRunner {
         observe_process(child, plan.observation_time)
     }
 
+    fn execute_to_completion(&self, plan: &CommandPlan) -> io::Result<CompletedProcess> {
+        execute_process_to_completion(plan)
+    }
+
     fn write_terminal_escape(&self, escape: &[u8]) -> io::Result<()> {
         let stdout = io::stdout();
         let mut terminal = stdout.lock();
         terminal.write_all(escape)?;
         terminal.flush()
     }
+}
+
+fn execute_process_to_completion(plan: &CommandPlan) -> io::Result<CompletedProcess> {
+    let mut command = Command::new(&plan.executable);
+    command
+        .args(&plan.arguments)
+        .stdin(if plan.standard_input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::child_process::quiet(&mut command);
+
+    let mut child = command.spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        return Ok(completion_setup_failed(
+            &mut child,
+            "child standard output was not piped",
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Ok(completion_setup_failed(
+            &mut child,
+            "child standard error was not piped",
+        ));
+    };
+    let stdin = if plan.standard_input.is_some() {
+        let Some(stdin) = child.stdin.take() else {
+            return Ok(completion_setup_failed(
+                &mut child,
+                "child standard input was not piped",
+            ));
+        };
+        Some(stdin)
+    } else {
+        None
+    };
+    let (events, completion_events) = mpsc::channel();
+    if let Err(error) = spawn_output_worker(
+        stdout,
+        CompletionWorker::Stdout,
+        "standard-output reader",
+        events.clone(),
+    ) {
+        return Ok(completion_setup_failed(
+            &mut child,
+            &format!("cannot start helper standard-output reader: {error}"),
+        ));
+    }
+    if let Err(error) = spawn_output_worker(
+        stderr,
+        CompletionWorker::Stderr,
+        "standard-error reader",
+        events.clone(),
+    ) {
+        return Ok(completion_setup_failed(
+            &mut child,
+            &format!("cannot start helper standard-error reader: {error}"),
+        ));
+    }
+    let stdin_expected = stdin.is_some();
+    if let Some(stdin) = stdin
+        && let Err(error) = spawn_input_worker(
+            stdin,
+            plan.standard_input.clone().unwrap_or_default(),
+            events.clone(),
+        )
+    {
+        return Ok(completion_setup_failed(
+            &mut child,
+            &format!("cannot start helper standard-input writer: {error}"),
+        ));
+    }
+    drop(events);
+
+    let deadline = Instant::now() + plan.observation_time;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                break if status.success() {
+                    CompletedProcessStatus::ExitedSuccessfully
+                } else {
+                    CompletedProcessStatus::ExitedUnsuccessfully(status.code())
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(PROCESS_POLL_INTERVAL.min(plan.observation_time));
+            }
+            Ok(None) => {
+                terminate_and_reap(&mut child);
+                break CompletedProcessStatus::TimedOut;
+            }
+            Err(error) => {
+                terminate_and_reap(&mut child);
+                break CompletedProcessStatus::OutcomeUnknown {
+                    reason: safe_local_failure(&format!(
+                        "cannot observe gh after it started: {error}"
+                    )),
+                };
+            }
+        }
+    };
+
+    let io_deadline = Instant::now() + PROCESS_IO_DRAIN_GRACE;
+    let captured = collect_completion_events(completion_events, stdin_expected, io_deadline);
+    let status = if matches!(&status, CompletedProcessStatus::ExitedSuccessfully) {
+        captured.stdin_failure_reason().map_or(status, |reason| {
+            CompletedProcessStatus::OutcomeUnknown { reason }
+        })
+    } else {
+        status
+    };
+    Ok(CompletedProcess {
+        status,
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionWorker {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+impl CompletionWorker {
+    const fn index(self) -> usize {
+        match self {
+            Self::Stdin => 0,
+            Self::Stdout => 1,
+            Self::Stderr => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stdin => "standard-input writer",
+            Self::Stdout => "standard-output reader",
+            Self::Stderr => "standard-error reader",
+        }
+    }
+}
+
+enum CompletionEvent {
+    Output {
+        worker: CompletionWorker,
+        bytes: Vec<u8>,
+    },
+    OutputTruncated(CompletionWorker),
+    Finished {
+        worker: CompletionWorker,
+        result: io::Result<()>,
+    },
+}
+
+#[derive(Debug, Default)]
+struct CapturedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl CapturedBytes {
+    fn push(&mut self, bytes: &[u8]) {
+        let remaining = MAX_CAPTURED_HELPER_OUTPUT_BYTES.saturating_sub(self.bytes.len());
+        let retained = remaining.min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retained]);
+        self.truncated |= retained < bytes.len();
+    }
+
+    fn finish(self) -> CapturedOutput {
+        CapturedOutput {
+            text: String::from_utf8_lossy(&self.bytes).into_owned(),
+            truncated: self.truncated,
+        }
+    }
+}
+
+struct CompletionCapture {
+    stdout: CapturedOutput,
+    stderr: CapturedOutput,
+    finished: [bool; 3],
+    failures: Vec<(CompletionWorker, String)>,
+    stdin_expected: bool,
+}
+
+impl CompletionCapture {
+    fn stdin_failure_reason(&self) -> Option<String> {
+        if !self.stdin_expected {
+            return None;
+        }
+        let mut failures = self
+            .failures
+            .iter()
+            .filter(|(worker, _)| *worker == CompletionWorker::Stdin)
+            .map(|(_, failure)| failure.clone())
+            .collect::<Vec<_>>();
+        if !self.finished[CompletionWorker::Stdin.index()] {
+            failures.push(format!(
+                "{} did not finish within {} ms after gh exited",
+                CompletionWorker::Stdin.label(),
+                PROCESS_IO_DRAIN_GRACE.as_millis()
+            ));
+        }
+        (!failures.is_empty()).then(|| safe_local_failure(&failures.join("; ")))
+    }
+}
+
+fn spawn_output_worker(
+    mut reader: impl io::Read + Send + 'static,
+    worker: CompletionWorker,
+    thread_name: &'static str,
+    events: mpsc::Sender<CompletionEvent>,
+) -> io::Result<()> {
+    let handle = thread::Builder::new()
+        .name(format!("youta-report-{thread_name}"))
+        .spawn(move || {
+            let result = stream_bounded_output(&mut reader, worker, &events);
+            let _ = events.send(CompletionEvent::Finished { worker, result });
+        })?;
+    drop(handle);
+    Ok(())
+}
+
+fn stream_bounded_output(
+    reader: &mut impl io::Read,
+    worker: CompletionWorker,
+    events: &mpsc::Sender<CompletionEvent>,
+) -> io::Result<()> {
+    let mut retained = 0_usize;
+    let mut truncation_sent = false;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let retained_count = MAX_CAPTURED_HELPER_OUTPUT_BYTES
+            .saturating_sub(retained)
+            .min(count);
+        if retained_count > 0 {
+            if events
+                .send(CompletionEvent::Output {
+                    worker,
+                    bytes: buffer[..retained_count].to_vec(),
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+            retained = retained.saturating_add(retained_count);
+        }
+        if retained_count < count && !truncation_sent {
+            if events
+                .send(CompletionEvent::OutputTruncated(worker))
+                .is_err()
+            {
+                return Ok(());
+            }
+            truncation_sent = true;
+        }
+    }
+}
+
+fn spawn_input_worker(
+    mut stdin: impl io::Write + Send + 'static,
+    input: Vec<u8>,
+    events: mpsc::Sender<CompletionEvent>,
+) -> io::Result<()> {
+    let handle = thread::Builder::new()
+        .name("youta-report-standard-input-writer".to_owned())
+        .spawn(move || {
+            let result = stdin.write_all(&input);
+            let _ = events.send(CompletionEvent::Finished {
+                worker: CompletionWorker::Stdin,
+                result,
+            });
+        })?;
+    drop(handle);
+    Ok(())
+}
+
+fn collect_completion_events(
+    events: mpsc::Receiver<CompletionEvent>,
+    stdin_expected: bool,
+    deadline: Instant,
+) -> CompletionCapture {
+    let mut stdout = CapturedBytes::default();
+    let mut stderr = CapturedBytes::default();
+    let mut finished = [!stdin_expected, false, false];
+    let mut failures = Vec::new();
+    while !finished.iter().all(|finished| *finished) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match events.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(event) => apply_completion_event(
+                event,
+                &mut stdout,
+                &mut stderr,
+                &mut finished,
+                &mut failures,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for event in events.try_iter() {
+        apply_completion_event(
+            event,
+            &mut stdout,
+            &mut stderr,
+            &mut finished,
+            &mut failures,
+        );
+    }
+    if !finished[CompletionWorker::Stdout.index()] {
+        stdout.truncated = true;
+    }
+    if !finished[CompletionWorker::Stderr.index()] {
+        stderr.truncated = true;
+    }
+    CompletionCapture {
+        stdout: stdout.finish(),
+        stderr: stderr.finish(),
+        finished,
+        failures,
+        stdin_expected,
+    }
+}
+
+fn apply_completion_event(
+    event: CompletionEvent,
+    stdout: &mut CapturedBytes,
+    stderr: &mut CapturedBytes,
+    finished: &mut [bool; 3],
+    failures: &mut Vec<(CompletionWorker, String)>,
+) {
+    match event {
+        CompletionEvent::Output { worker, bytes } => match worker {
+            CompletionWorker::Stdout => stdout.push(&bytes),
+            CompletionWorker::Stderr => stderr.push(&bytes),
+            CompletionWorker::Stdin => {}
+        },
+        CompletionEvent::OutputTruncated(worker) => match worker {
+            CompletionWorker::Stdout => stdout.truncated = true,
+            CompletionWorker::Stderr => stderr.truncated = true,
+            CompletionWorker::Stdin => {}
+        },
+        CompletionEvent::Finished { worker, result } => {
+            finished[worker.index()] = true;
+            if let Err(error) = result {
+                match worker {
+                    CompletionWorker::Stdout => stdout.truncated = true,
+                    CompletionWorker::Stderr => stderr.truncated = true,
+                    CompletionWorker::Stdin => {}
+                }
+                failures.push((worker, format!("{} failed: {error}", worker.label())));
+            }
+        }
+    }
+}
+
+fn completion_setup_failed(child: &mut Child, reason: &str) -> CompletedProcess {
+    terminate_and_reap(child);
+    CompletedProcess {
+        status: CompletedProcessStatus::OutcomeUnknown {
+            reason: safe_local_failure(reason),
+        },
+        stdout: CapturedOutput::default(),
+        stderr: CapturedOutput::default(),
+    }
+}
+
+fn safe_local_failure(reason: &str) -> String {
+    bounded_helper_detail(
+        &escape_terminal_controls(&redact_diagnostic_text(reason)),
+        false,
+    )
+}
+
+#[cfg(test)]
+fn read_bounded_output(mut reader: impl io::Read) -> io::Result<CapturedOutput> {
+    let mut retained = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURED_HELPER_OUTPUT_BYTES.saturating_sub(retained.len());
+        let retained_count = remaining.min(count);
+        retained.extend_from_slice(&buffer[..retained_count]);
+        truncated |= retained_count < count;
+    }
+    Ok(CapturedOutput {
+        text: String::from_utf8_lossy(&retained).into_owned(),
+        truncated,
+    })
 }
 
 fn observe_process(mut child: Child, observation_time: Duration) -> io::Result<ProcessOutcome> {
@@ -371,6 +938,20 @@ pub enum ReportActionError {
         helper: &'static str,
         /// Platform exit code, when one was available.
         exit_code: Option<i32>,
+        /// Bounded stderr, or stdout when stderr was empty.
+        detail: Option<String>,
+    },
+    /// A started GitHub submission has an indeterminate remote outcome.
+    GitHubSubmissionOutcomeUnknown {
+        /// Bounded explanation of the local process result.
+        reason: String,
+        /// Bounded stderr, or stdout when stderr was empty.
+        detail: Option<String>,
+    },
+    /// `gh` succeeded but did not print the created issue URL.
+    GitHubIssueUrlMissing {
+        /// Bounded command output retained for diagnosis.
+        detail: Option<String>,
     },
     /// A helper remained alive after the short foreground observation window.
     ProcessStillRunning {
@@ -405,10 +986,37 @@ impl fmt::Display for ReportActionError {
             Self::ProcessIo { helper, source } => {
                 write!(formatter, "cannot run {helper}: {source}")
             }
-            Self::ProcessFailed { helper, exit_code } => match exit_code {
-                Some(code) => write!(formatter, "{helper} exited with status {code}"),
-                None => write!(formatter, "{helper} terminated unsuccessfully"),
-            },
+            Self::ProcessFailed {
+                helper,
+                exit_code,
+                detail,
+            } => {
+                match exit_code {
+                    Some(code) => write!(formatter, "{helper} exited with status {code}"),
+                    None => write!(formatter, "{helper} terminated unsuccessfully"),
+                }?;
+                if let Some(detail) = detail {
+                    write!(formatter, ": {detail}")?;
+                }
+                Ok(())
+            }
+            Self::GitHubSubmissionOutcomeUnknown { reason, detail } => {
+                write!(
+                    formatter,
+                    "{reason}; the GitHub issue submission outcome is unknown, so check existing issues before retrying"
+                )?;
+                if let Some(detail) = detail {
+                    write!(formatter, ": {detail}")?;
+                }
+                Ok(())
+            }
+            Self::GitHubIssueUrlMissing { detail } => {
+                formatter.write_str("gh created an issue but did not return its URL")?;
+                if let Some(detail) = detail {
+                    write!(formatter, ": {detail}")?;
+                }
+                Ok(())
+            }
             Self::ProcessStillRunning { helper } => write!(
                 formatter,
                 "{helper} did not report a successful exit promptly; \
@@ -447,9 +1055,25 @@ impl std::error::Error for ReportActionError {
             Self::GitHubCliUnavailable
             | Self::UrlOpenerUnavailable
             | Self::ProcessFailed { .. }
+            | Self::GitHubSubmissionOutcomeUnknown { .. }
+            | Self::GitHubIssueUrlMissing { .. }
             | Self::ProcessStillRunning { .. }
             | Self::OpenAfterCopy { .. } => None,
         }
+    }
+}
+
+impl ReportActionError {
+    /// Returns whether a GitHub submission may have completed remotely.
+    ///
+    /// Callers should discourage an immediate retry and direct the user to
+    /// inspect [`GITHUB_ISSUES_URL`] for a possibly created duplicate.
+    #[must_use]
+    pub const fn submission_outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::GitHubSubmissionOutcomeUnknown { .. } | Self::GitHubIssueUrlMissing { .. }
+        )
     }
 }
 
@@ -462,6 +1086,13 @@ pub struct ReportActions<R> {
 
 /// Diagnostic report actions that launch direct operating-system processes.
 pub type SystemReportActions = ReportActions<SystemRunner>;
+
+/// A GitHub issue created from a complete diagnostic report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmittedGitHubIssue {
+    /// Canonical URL printed by `gh issue create`.
+    pub url: String,
+}
 
 impl ReportActions<SystemRunner> {
     /// Discovers available helpers and creates the production action handler.
@@ -528,23 +1159,63 @@ impl<R: ReportActionRunner> ReportActions<R> {
         Ok("OSC 52".to_owned())
     }
 
-    /// Opens a GitHub issue editor through `gh`, pre-filled but not submitted.
+    /// Submits a GitHub issue through `gh` and returns its canonical URL.
     ///
     /// The complete report is piped through standard input using
-    /// `--body-file -`. `--web` delegates final review and submission to the
-    /// user's browser.
+    /// `--body-file -`. The command intentionally does not use `--web`, which
+    /// would encode the full report into a length-limited browser URL.
     ///
     /// # Errors
     ///
     /// Returns an error when `gh` is unavailable, cannot launch, cannot accept
-    /// its input, exits unsuccessfully, or does not confirm a successful exit
-    /// within the short foreground observation window.
-    pub fn fill_github_issue(&self, title: &str, report: &str) -> Result<(), ReportActionError> {
+    /// its input, exits unsuccessfully, times out, or does not print the
+    /// created issue URL. Subprocess output included in errors is bounded and
+    /// redacted.
+    pub fn submit_github_issue(
+        &self,
+        title: &str,
+        report: &str,
+    ) -> Result<SubmittedGitHubIssue, ReportActionError> {
         let Some(github_cli) = &self.tools.github_cli else {
             return Err(ReportActionError::GitHubCliUnavailable);
         };
         let plan = github_cli_plan(github_cli, title, report);
-        self.execute_successfully(&plan, "gh")
+        let completed = self.runner.execute_to_completion(&plan).map_err(|source| {
+            ReportActionError::ProcessIo {
+                helper: "gh",
+                source,
+            }
+        })?;
+        let detail = completed.useful_detail();
+        match completed.status {
+            CompletedProcessStatus::ExitedSuccessfully => {
+                let url = github_issue_url(&completed.stdout.text)
+                    .ok_or(ReportActionError::GitHubIssueUrlMissing { detail })?;
+                Ok(SubmittedGitHubIssue { url })
+            }
+            CompletedProcessStatus::ExitedUnsuccessfully(exit_code) => {
+                let status = exit_code.map_or_else(
+                    || "gh terminated unsuccessfully".to_owned(),
+                    |code| format!("gh exited with status {code}"),
+                );
+                Err(ReportActionError::GitHubSubmissionOutcomeUnknown {
+                    reason: status,
+                    detail,
+                })
+            }
+            CompletedProcessStatus::TimedOut => {
+                Err(ReportActionError::GitHubSubmissionOutcomeUnknown {
+                    reason: format!(
+                        "gh did not finish within {} seconds and was stopped",
+                        plan.observation_time.as_secs()
+                    ),
+                    detail,
+                })
+            }
+            CompletedProcessStatus::OutcomeUnknown { reason } => {
+                Err(ReportActionError::GitHubSubmissionOutcomeUnknown { reason, detail })
+            }
+        }
     }
 
     /// Copies the report and opens a short pre-filled GitHub issue page.
@@ -595,7 +1266,11 @@ impl<R: ReportActionRunner> ReportActions<R> {
         {
             ProcessOutcome::ExitedSuccessfully => Ok(()),
             ProcessOutcome::ExitedUnsuccessfully(exit_code) => {
-                Err(ReportActionError::ProcessFailed { helper, exit_code })
+                Err(ReportActionError::ProcessFailed {
+                    helper,
+                    exit_code,
+                    detail: None,
+                })
             }
             ProcessOutcome::StillRunning => Err(ReportActionError::ProcessStillRunning { helper }),
         }
@@ -608,7 +1283,6 @@ fn github_cli_plan(executable: &Path, title: &str, report: &str) -> CommandPlan 
         arguments: vec![
             "issue".into(),
             "create".into(),
-            "--web".into(),
             "--repo".into(),
             GITHUB_REPOSITORY.into(),
             "--title".into(),
@@ -617,8 +1291,20 @@ fn github_cli_plan(executable: &Path, title: &str, report: &str) -> CommandPlan 
             "-".into(),
         ],
         standard_input: Some(report.as_bytes().to_vec()),
-        observation_time: PROCESS_OBSERVATION_TIME,
+        observation_time: GITHUB_SUBMISSION_TIMEOUT,
     }
+}
+
+fn github_issue_url(stdout: &str) -> Option<String> {
+    let prefix = format!("https://github.com/{GITHUB_REPOSITORY}/issues/");
+    stdout.split_whitespace().find_map(|token| {
+        let candidate = token.trim_matches(|character: char| {
+            matches!(character, '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';')
+        });
+        let issue_number = candidate.strip_prefix(&prefix)?;
+        (!issue_number.is_empty() && issue_number.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| candidate.to_owned())
+    })
 }
 
 fn issue_page_plan(executable: &Path, title: &str) -> CommandPlan {
@@ -742,6 +1428,7 @@ mod tests {
     struct MockRunner {
         plans: RefCell<Vec<CommandPlan>>,
         outcomes: RefCell<VecDeque<io::Result<ProcessOutcome>>>,
+        completed: RefCell<VecDeque<io::Result<CompletedProcess>>>,
         terminal_escapes: RefCell<Vec<Vec<u8>>>,
         terminal_error: RefCell<Option<io::Error>>,
     }
@@ -750,6 +1437,13 @@ mod tests {
         fn with_outcomes(outcomes: impl IntoIterator<Item = ProcessOutcome>) -> Self {
             Self {
                 outcomes: RefCell::new(outcomes.into_iter().map(Ok).collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_completed(completed: impl IntoIterator<Item = CompletedProcess>) -> Self {
+            Self {
+                completed: RefCell::new(completed.into_iter().map(Ok).collect()),
                 ..Self::default()
             }
         }
@@ -762,6 +1456,20 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(Ok(ProcessOutcome::ExitedSuccessfully))
+        }
+
+        fn execute_to_completion(&self, plan: &CommandPlan) -> io::Result<CompletedProcess> {
+            self.plans.borrow_mut().push(plan.clone());
+            self.completed.borrow_mut().pop_front().unwrap_or_else(|| {
+                Ok(CompletedProcess {
+                    status: CompletedProcessStatus::ExitedSuccessfully,
+                    stdout: CapturedOutput {
+                        text: format!("https://github.com/{GITHUB_REPOSITORY}/issues/123\n"),
+                        truncated: false,
+                    },
+                    stderr: CapturedOutput::default(),
+                })
+            })
         }
 
         fn write_terminal_escape(&self, escape: &[u8]) -> io::Result<()> {
@@ -787,9 +1495,14 @@ mod tests {
         let actions = ReportActions::with_runner(runner, tools());
         let report = "line one\nline two\nfull backtrace";
 
-        actions
-            .fill_github_issue("Playback failed", report)
+        let submission = actions
+            .submit_github_issue("Playback failed", report)
             .expect("plan should be accepted");
+
+        assert_eq!(
+            submission.url,
+            format!("https://github.com/{GITHUB_REPOSITORY}/issues/123")
+        );
 
         let plans = actions.runner.plans.borrow();
         assert_eq!(plans.len(), 1);
@@ -799,7 +1512,6 @@ mod tests {
             [
                 "issue",
                 "create",
-                "--web",
                 "--repo",
                 GITHUB_REPOSITORY,
                 "--title",
@@ -810,6 +1522,227 @@ mod tests {
             .map(OsString::from)
         );
         assert_eq!(plans[0].standard_input.as_deref(), Some(report.as_bytes()));
+        assert_eq!(plans[0].observation_time, GITHUB_SUBMISSION_TIMEOUT);
+    }
+
+    #[test]
+    fn github_submission_extracts_the_created_issue_url_from_bounded_stdout() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::ExitedSuccessfully,
+            stdout: CapturedOutput {
+                text: format!(
+                    "warning: using default template\nhttps://github.com/{GITHUB_REPOSITORY}/issues/456\n"
+                ),
+                truncated: false,
+            },
+            stderr: CapturedOutput::default(),
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let submission = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect("gh success should return the issue URL");
+
+        assert_eq!(
+            submission,
+            SubmittedGitHubIssue {
+                url: format!("https://github.com/{GITHUB_REPOSITORY}/issues/456")
+            }
+        );
+    }
+
+    #[test]
+    fn github_submission_accepts_exit_zero_url_when_only_output_eof_is_incomplete() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::ExitedSuccessfully,
+            stdout: CapturedOutput {
+                text: format!("https://github.com/{GITHUB_REPOSITORY}/issues/457\n"),
+                truncated: true,
+            },
+            stderr: CapturedOutput {
+                text: String::new(),
+                truncated: true,
+            },
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let submission = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect("exit zero and a canonical URL prove successful submission");
+
+        assert_eq!(
+            submission.url,
+            format!("https://github.com/{GITHUB_REPOSITORY}/issues/457")
+        );
+    }
+
+    #[test]
+    fn github_submission_never_accepts_a_url_from_an_unconfirmed_process_result() {
+        let statuses = [
+            CompletedProcessStatus::ExitedUnsuccessfully(Some(7)),
+            CompletedProcessStatus::TimedOut,
+            CompletedProcessStatus::OutcomeUnknown {
+                reason: "lost child status after gh started".to_owned(),
+            },
+        ];
+
+        for status in statuses {
+            let runner = MockRunner::with_completed([CompletedProcess {
+                status,
+                stdout: CapturedOutput {
+                    text: format!("https://github.com/{GITHUB_REPOSITORY}/issues/999\n"),
+                    truncated: false,
+                },
+                stderr: CapturedOutput::default(),
+            }]);
+            let actions = ReportActions::with_runner(runner, tools());
+
+            let error = actions
+                .submit_github_issue("Playback failed", "report")
+                .expect_err("canonical-looking stdout must not override an unconfirmed status");
+
+            assert!(error.submission_outcome_unknown());
+        }
+    }
+
+    #[test]
+    fn github_submission_nonzero_exit_is_indeterminate_and_includes_safe_stderr() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::ExitedUnsuccessfully(Some(1)),
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput {
+                text: "HTTP 403: token=secret was rejected".to_owned(),
+                truncated: true,
+            },
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect_err("gh failure should be reported");
+        let message = error.to_string();
+
+        assert!(message.contains("gh exited with status 1"));
+        assert!(message.contains("HTTP 403"));
+        assert!(message.contains("token= <redacted>"));
+        assert!(message.contains("helper output truncated"));
+        assert!(!message.contains("secret"));
+        assert!(error.submission_outcome_unknown());
+        assert!(message.contains("check existing issues before retrying"));
+    }
+
+    #[test]
+    fn github_submission_pre_start_io_failure_is_safe_to_retry() {
+        let runner = MockRunner::default();
+        runner.completed.borrow_mut().push_back(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "gh disappeared before it could start",
+        )));
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect_err("a process that never started should fail");
+
+        assert!(matches!(error, ReportActionError::ProcessIo { .. }));
+        assert!(!error.submission_outcome_unknown());
+    }
+
+    #[test]
+    fn github_submission_post_start_observation_failure_is_indeterminate() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::OutcomeUnknown {
+                reason: "cannot observe gh after it started: lost child status".to_owned(),
+            },
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect_err("a post-start observation failure has an unknown remote outcome");
+
+        assert!(error.submission_outcome_unknown());
+        let message = error.to_string();
+        assert!(message.contains("lost child status"));
+        assert!(message.contains("check existing issues before retrying"));
+    }
+
+    #[test]
+    fn helper_failure_detail_escapes_terminal_controls_and_has_a_display_limit() {
+        let raw = format!(
+            "\x1b]52;c;attacker-controlled\x07\x1b[31mred\x1b[0m\rrewritten\x08{}",
+            "x".repeat(MAX_DISPLAYED_HELPER_DETAIL_BYTES * 2)
+        );
+        let detail = CapturedOutput {
+            text: raw,
+            truncated: false,
+        }
+        .display_text()
+        .expect("nonempty helper detail");
+
+        assert!(detail.len() <= MAX_DISPLAYED_HELPER_DETAIL_BYTES);
+        assert!(
+            detail
+                .chars()
+                .all(|character| character == '\n' || !character.is_control()),
+            "terminal controls remained in {detail:?}"
+        );
+        assert!(detail.contains("\\u{1b}]52;c;attacker-controlled\\u{7}"));
+        assert!(detail.contains("helper detail truncated"));
+    }
+
+    #[test]
+    fn github_submission_timeout_reports_indeterminate_outcome_and_diagnostics() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::TimedOut,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput {
+                text: "network stalled".to_owned(),
+                truncated: false,
+            },
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect_err("timed-out submission should be reported");
+        assert!(matches!(
+            &error,
+            ReportActionError::GitHubSubmissionOutcomeUnknown { .. }
+        ));
+        assert!(error.submission_outcome_unknown());
+        let message = error.to_string();
+
+        assert!(message.contains("gh did not finish within 30 seconds and was stopped"));
+        assert!(message.contains("outcome is unknown"));
+        assert!(message.contains("check existing issues before retrying"));
+        assert!(message.contains("network stalled"));
+    }
+
+    #[test]
+    fn github_submission_rejects_success_without_an_issue_url() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::ExitedSuccessfully,
+            stdout: CapturedOutput {
+                text: "success without a URL".to_owned(),
+                truncated: false,
+            },
+            stderr: CapturedOutput::default(),
+        }]);
+        let actions = ReportActions::with_runner(runner, tools());
+
+        let error = actions
+            .submit_github_issue("Playback failed", "report")
+            .expect_err("a structured success requires the created issue URL");
+
+        assert!(matches!(
+            &error,
+            ReportActionError::GitHubIssueUrlMissing { .. }
+        ));
+        assert!(error.to_string().contains("success without a URL"));
+        assert!(error.submission_outcome_unknown());
     }
 
     #[test]
@@ -850,12 +1783,12 @@ mod tests {
         let report = "$(touch /tmp/not-run); `id`";
 
         actions
-            .fill_github_issue("Failure; rm -rf something", report)
+            .submit_github_issue("Failure; rm -rf something", report)
             .expect("mock command should succeed");
 
         let plans = actions.runner.plans.borrow();
         assert_eq!(plans[0].executable, Path::new("/usr/bin/gh"));
-        assert_eq!(plans[0].arguments[6], "Failure; rm -rf something");
+        assert_eq!(plans[0].arguments[5], "Failure; rm -rf something");
         assert_eq!(plans[0].standard_input.as_deref(), Some(report.as_bytes()));
         assert!(!plans[0].arguments.iter().any(|argument| argument == "-c"));
     }
@@ -1041,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_issue_requires_discovered_github_cli() {
+    fn submit_issue_requires_discovered_github_cli() {
         let runner = MockRunner::default();
         let actions = ReportActions::with_runner(
             runner,
@@ -1052,25 +1985,26 @@ mod tests {
         );
 
         let error = actions
-            .fill_github_issue("Failure", "report")
+            .submit_github_issue("Failure", "report")
             .expect_err("gh should be required");
         assert!(matches!(error, ReportActionError::GitHubCliUnavailable));
         assert!(actions.runner.plans.borrow().is_empty());
     }
 
     #[test]
-    fn running_helper_is_not_reported_as_a_successful_launch() {
-        let runner = MockRunner::with_outcomes([ProcessOutcome::StillRunning]);
+    fn timed_out_submission_is_not_reported_as_successful() {
+        let runner = MockRunner::with_completed([CompletedProcess {
+            status: CompletedProcessStatus::TimedOut,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+        }]);
         let actions = ReportActions::with_runner(runner, tools());
 
         let error = actions
-            .fill_github_issue("Failure", "report")
-            .expect_err("a running process has not confirmed success");
+            .submit_github_issue("Failure", "report")
+            .expect_err("a timed-out submission has an unknown outcome");
 
-        assert!(matches!(
-            error,
-            ReportActionError::ProcessStillRunning { helper: "gh" }
-        ));
+        assert!(error.submission_outcome_unknown());
     }
 
     #[cfg(unix)]
@@ -1112,6 +2046,188 @@ mod tests {
         assert_eq!(
             runner.execute(&input_plan).expect("pipe report to cat"),
             ProcessOutcome::ExitedSuccessfully
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_submits_a_430_line_report_and_captures_the_issue_url() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("fake-gh-success");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ncount=0\nwhile IFS= read -r line; do count=$((count + 1)); done\nif [ \"$count\" -ne 430 ]; then printf 'read %s lines\\n' \"$count\" >&2; exit 9; fi\nprintf '%s\\n' 'https://github.com/{GITHUB_REPOSITORY}/issues/430'\n"
+            ),
+        )
+        .expect("fake gh success fixture");
+        let report = (1..=430)
+            .map(|line| format!("diagnostic line {line}\n"))
+            .collect::<String>();
+        let plan = CommandPlan {
+            executable: shell,
+            arguments: vec![helper.into_os_string()],
+            standard_input: Some(report.into_bytes()),
+            observation_time: Duration::from_secs(2),
+        };
+
+        let completed = SystemRunner
+            .execute_to_completion(&plan)
+            .expect("complete fake gh submission");
+
+        assert_eq!(completed.status, CompletedProcessStatus::ExitedSuccessfully);
+        assert_eq!(
+            github_issue_url(&completed.stdout.text),
+            Some(format!("https://github.com/{GITHUB_REPOSITORY}/issues/430"))
+        );
+        assert!(completed.stderr.text.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_preserves_stderr_when_child_rejects_large_stdin_early() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("fake-gh-failure");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' 'API rejected the issue body' >&2\nexit 7\n",
+        )
+        .expect("fake gh failure fixture");
+        let plan = CommandPlan {
+            executable: shell,
+            arguments: vec![helper.into_os_string()],
+            standard_input: Some(vec![b'x'; 4 * 1024 * 1024]),
+            observation_time: Duration::from_secs(2),
+        };
+
+        let completed = SystemRunner
+            .execute_to_completion(&plan)
+            .expect("nonzero exit must not be masked by a broken stdin pipe");
+
+        assert_eq!(
+            completed.status,
+            CompletedProcessStatus::ExitedUnsuccessfully(Some(7))
+        );
+        assert_eq!(completed.stderr.text.trim(), "API rejected the issue body");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_does_not_wait_for_a_descendant_holding_stdout_open() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("fake-gh-descendant");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
+        let sleep = find_test_executable(&["/usr/bin/sleep", "/bin/sleep"]);
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do :; done\n\"$1\" 2 &\nprintf '%s\\n' 'https://github.com/{GITHUB_REPOSITORY}/issues/731'\n"
+            ),
+        )
+        .expect("fake gh inherited-pipe fixture");
+        let plan = CommandPlan {
+            executable: shell,
+            arguments: vec![helper.into_os_string(), sleep.into_os_string()],
+            standard_input: Some(b"complete diagnostic report\n".to_vec()),
+            observation_time: Duration::from_secs(1),
+        };
+
+        let started_at = Instant::now();
+        let completed = SystemRunner
+            .execute_to_completion(&plan)
+            .expect("direct child should complete without waiting for its descendant");
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "inherited stdout kept completion blocked for {elapsed:?}"
+        );
+        assert_eq!(completed.status, CompletedProcessStatus::ExitedSuccessfully);
+        assert_eq!(
+            github_issue_url(&completed.stdout.text),
+            Some(format!("https://github.com/{GITHUB_REPOSITORY}/issues/731"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_preserves_nonzero_exit_while_descendant_holds_stdin_open() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("fake-gh-stdin-descendant");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
+        let sleep = find_test_executable(&["/usr/bin/sleep", "/bin/sleep"]);
+        fs::write(
+            &helper,
+            "#!/bin/sh\n\"$1\" 2 3<&0 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' 'API rejected the issue body' >&2\nexit 7\n",
+        )
+        .expect("fake gh inherited-stdin fixture");
+        let plan = CommandPlan {
+            executable: shell,
+            arguments: vec![helper.into_os_string(), sleep.into_os_string()],
+            standard_input: Some(vec![b'x'; 4 * 1024 * 1024]),
+            observation_time: Duration::from_secs(1),
+        };
+
+        let started_at = Instant::now();
+        let completed = SystemRunner
+            .execute_to_completion(&plan)
+            .expect("nonzero child result must not wait for an inherited stdin reader");
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "inherited stdin kept completion blocked for {elapsed:?}"
+        );
+        assert_eq!(
+            completed.status,
+            CompletedProcessStatus::ExitedUnsuccessfully(Some(7))
+        );
+        assert_eq!(completed.stderr.text.trim(), "API rejected the issue body");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_runner_times_out_reaps_and_bounds_noisy_helper_output() {
+        let temporary = tempfile::tempdir().expect("temporary command directory");
+        let helper = temporary.path().join("fake-gh-timeout");
+        let pid_file = temporary.path().join("pid");
+        let shell = find_test_executable(&["/bin/sh", "/usr/bin/sh"]);
+        let sleep = find_test_executable(&["/usr/bin/sleep", "/bin/sleep"]);
+        let noise = "x".repeat(MAX_CAPTURED_HELPER_OUTPUT_BYTES + 4096);
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nprintf '%s' '{noise}'\nexec \"$2\" 5\n"
+            ),
+        )
+        .expect("fake gh timeout fixture");
+        let plan = CommandPlan {
+            executable: shell,
+            arguments: vec![
+                helper.into_os_string(),
+                pid_file.as_os_str().to_owned(),
+                sleep.into_os_string(),
+            ],
+            standard_input: None,
+            observation_time: Duration::from_millis(250),
+        };
+
+        let completed = SystemRunner
+            .execute_to_completion(&plan)
+            .expect("time out fake gh submission");
+
+        assert_eq!(completed.status, CompletedProcessStatus::TimedOut);
+        assert_eq!(
+            completed.stdout.text.len(),
+            MAX_CAPTURED_HELPER_OUTPUT_BYTES
+        );
+        assert!(completed.stdout.truncated);
+        let pid = wait_for_test_pid(&pid_file, Duration::from_secs(1));
+        assert!(
+            !PathBuf::from(format!("/proc/{pid}")).exists(),
+            "timed-out helper PID {pid} was not reaped"
         );
     }
 
@@ -1250,6 +2366,18 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode("🎵".as_bytes()), "8J+OtQ==");
+    }
+
+    #[test]
+    fn helper_output_capture_is_bounded_while_draining_the_complete_stream() {
+        let input = vec![b'x'; MAX_CAPTURED_HELPER_OUTPUT_BYTES + 4096];
+
+        let captured = read_bounded_output(io::Cursor::new(input))
+            .expect("in-memory output capture should succeed");
+
+        assert_eq!(captured.text.len(), MAX_CAPTURED_HELPER_OUTPUT_BYTES);
+        assert!(captured.text.bytes().all(|byte| byte == b'x'));
+        assert!(captured.truncated);
     }
 
     #[cfg(unix)]

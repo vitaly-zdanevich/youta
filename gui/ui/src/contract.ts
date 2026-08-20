@@ -224,6 +224,15 @@ export type YtDlpVersionLookupView =
   | { Available: { version: string; released_on: string | null } }
   | { Unavailable: { reason: string } };
 
+/** Lifecycle of one explicitly confirmed diagnostic-report submission. */
+export type GitHubIssueSubmissionView =
+  | "Idle"
+  | "Confirming"
+  | "Submitting"
+  | { Submitted: { url: string } }
+  | { OutcomeUnknown: { issues_url: string } }
+  | { Failed: { message: string } };
+
 /** Gentoo's architecture-specific stable yt-dlp package metadata. */
 export interface YtDlpGentooVersionView {
   arch: string;
@@ -247,6 +256,7 @@ export interface ErrorPopupView {
   gh_available: boolean;
   action_status: string | null;
   yt_dlp_forbidden: YtDlpForbiddenView | null;
+  github_issue_submission: GitHubIssueSubmissionView;
 }
 
 /** One public top-level comment. */

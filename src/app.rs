@@ -194,7 +194,7 @@ use crate::providers::{
 };
 #[cfg(feature = "qr")]
 use crate::qr_code::QrMatrix;
-use crate::report_actions::{SystemReportActions, system_url_opener_name};
+use crate::report_actions::{GITHUB_ISSUES_URL, SystemReportActions, system_url_opener_name};
 #[cfg(test)]
 use crate::subscriptions::SubscriptionNode;
 use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, SubscriptionTree};
@@ -219,13 +219,13 @@ use crate::view::VideoQrPopupView;
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
-    GOOGLE_CLOUD_CREDENTIALS_URL, INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort,
-    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView,
-    PlaylistEditorField, PlaylistItemView, PlaylistPopupMode, PlaylistPopupView,
-    PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView,
-    ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView, QueueRowView,
-    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
-    SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
+    GOOGLE_CLOUD_CREDENTIALS_URL, GitHubIssueSubmissionView, INVIDIOUS_INSTANCES_URL,
+    LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES,
+    NowPlayingView, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView, PlaylistPopupMode,
+    PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView,
+    ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView,
+    QueueRowView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity,
+    SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
     VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
     YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
     YouTubeSetupPopupView,
@@ -608,7 +608,13 @@ impl YouTubeProviderBuilder for SystemYouTubeProviderBuilder {
 trait DiagnosticActionHandler {
     fn gh_available(&self) -> bool;
     fn copy_report(&self, report: &str) -> Result<String, String>;
-    fn fill_github_issue(&self, title: &str, report: &str) -> Result<(), String>;
+    fn start_github_issue_submission(
+        &self,
+        title: String,
+        report: String,
+        generation: u64,
+        results: Sender<GitHubIssueSubmissionCompletion>,
+    ) -> Result<(), String>;
     fn copy_and_open_github_issue(&self, title: &str, report: &str) -> Result<String, String>;
 }
 
@@ -621,9 +627,28 @@ impl DiagnosticActionHandler for SystemReportActions {
         SystemReportActions::copy_report(self, report).map_err(|error| error.to_string())
     }
 
-    fn fill_github_issue(&self, title: &str, report: &str) -> Result<(), String> {
-        SystemReportActions::fill_github_issue(self, title, report)
-            .map_err(|error| error.to_string())
+    fn start_github_issue_submission(
+        &self,
+        title: String,
+        report: String,
+        generation: u64,
+        results: Sender<GitHubIssueSubmissionCompletion>,
+    ) -> Result<(), String> {
+        let actions = self.clone();
+        thread::Builder::new()
+            .name("youta-github-issue-submission".to_owned())
+            .spawn(move || {
+                let result = actions
+                    .submit_github_issue(&title, &report)
+                    .map(|issue| issue.url)
+                    .map_err(|error| GitHubIssueSubmissionFailure {
+                        outcome_unknown: error.submission_outcome_unknown(),
+                        message: error.to_string(),
+                    });
+                let _ = results.send(GitHubIssueSubmissionCompletion { generation, result });
+            })
+            .map(|_| ())
+            .map_err(|error| format!("cannot start GitHub issue submission worker: {error}"))
     }
 
     fn copy_and_open_github_issue(&self, title: &str, report: &str) -> Result<String, String> {
@@ -3521,6 +3546,8 @@ const DEFAULT_APPLE_PODCASTS_STOREFRONT: &str = "us";
 const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video…";
 /// Stable marker rendered below the pending linked-video title.
 const LINKED_VIDEO_LOADING_DESCRIPTION: &str = "Loading video details…";
+/// Maximum diagnostics retained while one remote issue result awaits review.
+const MAX_DEFERRED_DIAGNOSTIC_REPORTS: usize = 8;
 
 /// `YouTube` video currently displayed independently of the left-hand list.
 #[derive(Debug, Eq, PartialEq)]
@@ -3539,6 +3566,35 @@ enum UrlOpenCompletion {
     Succeeded,
     /// Starting, waiting for, or running the opener failed.
     Failed(String),
+}
+
+/// Result of one explicitly confirmed diagnostic-report submission.
+#[derive(Debug, Eq, PartialEq)]
+struct GitHubIssueSubmissionCompletion {
+    /// Diagnostic generation that owned the submitted report.
+    generation: u64,
+    /// Canonical created URL or a bounded, redacted helper failure.
+    result: Result<String, GitHubIssueSubmissionFailure>,
+}
+
+/// Failure metadata needed to prevent unsafe retries after an uncertain POST.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubIssueSubmissionFailure {
+    /// User-facing bounded and redacted failure text.
+    message: String,
+    /// Whether GitHub may have created the issue before the response was lost.
+    outcome_unknown: bool,
+}
+
+/// One diagnostic held while a GitHub submission result needs an explicit
+/// acknowledgement.
+#[derive(Debug, Eq, PartialEq)]
+enum DeferredDiagnosticReport {
+    /// Ordinary diagnostic popup content.
+    Standard { title: String, report: String },
+    /// Structured yt-dlp HTTP 403 content whose lookups start when displayed.
+    #[cfg(feature = "yt-dlp")]
+    YtDlpForbidden { report: String },
 }
 
 /// One bounded, move-only browser-style Details location.
@@ -4293,6 +4349,20 @@ pub struct AppController {
     #[cfg(feature = "yt-dlp")]
     download_completion_notice_deadline: Option<Instant>,
     report_actions: Box<dyn DiagnosticActionHandler>,
+    /// Completions from the sole explicitly confirmed GitHub submission.
+    github_issue_submission_results: Receiver<GitHubIssueSubmissionCompletion>,
+    /// Sender cloned into the detached submission task.
+    github_issue_submission_result_sender: Sender<GitHubIssueSubmissionCompletion>,
+    /// Identity of the diagnostic report currently displayed.
+    diagnostic_report_generation: u64,
+    /// Report generation whose submission worker has not returned a result.
+    pending_github_issue_submission: Option<u64>,
+    /// Submission generation whose result stays visible until dismissed.
+    pinned_github_issue_submission_generation: Option<u64>,
+    /// Failed result restored when the user cancels a retry confirmation.
+    github_issue_submission_confirmation_previous: Option<GitHubIssueSubmissionView>,
+    /// FIFO diagnostics waiting behind the pinned submission result.
+    deferred_diagnostic_reports: VecDeque<DeferredDiagnosticReport>,
     diagnostic_helpers_cache: Option<Vec<ExternalHelper>>,
     /// Monotonic owner for independently completing yt-dlp update lookups.
     #[cfg(feature = "yt-dlp")]
@@ -4420,6 +4490,7 @@ impl AppController {
         #[cfg(feature = "waveform")]
         let (local_waveform_response_sender, local_waveform_responses) = unbounded();
         let (url_open_result_sender, url_open_results) = unbounded();
+        let (github_issue_submission_result_sender, github_issue_submission_results) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
@@ -5250,6 +5321,13 @@ impl AppController {
             #[cfg(feature = "yt-dlp")]
             download_completion_notice_deadline: None,
             report_actions: Box::new(SystemReportActions::new()),
+            github_issue_submission_results,
+            github_issue_submission_result_sender,
+            diagnostic_report_generation: 0,
+            pending_github_issue_submission: None,
+            pinned_github_issue_submission_generation: None,
+            github_issue_submission_confirmation_previous: None,
+            deferred_diagnostic_reports: VecDeque::new(),
             diagnostic_helpers_cache: None,
             #[cfg(feature = "yt-dlp")]
             yt_dlp_update_generation: 0,
@@ -23842,6 +23920,19 @@ impl AppController {
     /// network request, then fills each version row independently.
     #[cfg(feature = "yt-dlp")]
     fn show_yt_dlp_forbidden_report(&mut self, report: String) {
+        if self.diagnostic_popup_reserved_for_github_submission() {
+            self.defer_diagnostic_report(DeferredDiagnosticReport::YtDlpForbidden { report });
+            return;
+        }
+        self.show_yt_dlp_forbidden_report_now(report);
+    }
+
+    /// Displays a structured yt-dlp diagnostic after any submission result
+    /// that previously reserved the modal has been acknowledged.
+    #[cfg(feature = "yt-dlp")]
+    fn show_yt_dlp_forbidden_report_now(&mut self, report: String) {
+        self.github_issue_submission_confirmation_previous = None;
+        self.diagnostic_report_generation = self.diagnostic_report_generation.wrapping_add(1);
         let gentoo_arch = detected_gentoo_arch();
         let mut forbidden = YtDlpForbiddenView::loading(gentoo_arch.clone());
         if let Some(cached) = self.yt_dlp_installed_version_cache.as_ref() {
@@ -23864,6 +23955,7 @@ impl AppController {
             gh_available: self.report_actions.gh_available(),
             action_status: None,
             yt_dlp_forbidden: Some(forbidden),
+            github_issue_submission: GitHubIssueSubmissionView::Idle,
         });
         "403 from yt-dlp — try later or update it.".clone_into(&mut self.view.status_line);
         self.start_missing_yt_dlp_update_lookups(gentoo_arch);
@@ -24031,14 +24123,61 @@ impl AppController {
     /// This is also used by the process-level panic boundary after the normal
     /// terminal session has restored raw mode and the alternate screen.
     pub fn show_diagnostic_report(&mut self, title: impl Into<String>, report: impl Into<String>) {
+        let title = title.into();
+        let report = report.into();
+        if self.diagnostic_popup_reserved_for_github_submission() {
+            self.defer_diagnostic_report(DeferredDiagnosticReport::Standard { title, report });
+            return;
+        }
+        self.show_diagnostic_report_now(title, report);
+    }
+
+    /// Returns whether replacing the active diagnostic could hide a pending or
+    /// completed GitHub submission result.
+    fn diagnostic_popup_reserved_for_github_submission(&self) -> bool {
+        self.pinned_github_issue_submission_generation.is_some()
+    }
+
+    /// Retains a bounded FIFO of diagnostics without allowing an error burst
+    /// to consume unbounded memory while a network result awaits review.
+    fn defer_diagnostic_report(&mut self, report: DeferredDiagnosticReport) {
+        if self.deferred_diagnostic_reports.len() >= MAX_DEFERRED_DIAGNOSTIC_REPORTS {
+            self.deferred_diagnostic_reports.pop_front();
+        }
+        self.deferred_diagnostic_reports.push_back(report);
+    }
+
+    /// Displays one ordinary diagnostic without applying modal deferral again.
+    fn show_diagnostic_report_now(&mut self, title: String, report: String) {
+        self.github_issue_submission_confirmation_previous = None;
+        self.diagnostic_report_generation = self.diagnostic_report_generation.wrapping_add(1);
         self.view.error_popup = Some(ErrorPopupView {
-            title: title.into(),
-            report: report.into(),
+            title,
+            report,
             scroll_offset: 0,
             gh_available: self.report_actions.gh_available(),
             action_status: None,
             yt_dlp_forbidden: None,
+            github_issue_submission: GitHubIssueSubmissionView::Idle,
         });
+    }
+
+    /// Presents the oldest retained diagnostic after a GitHub submission
+    /// result has been acknowledged.
+    fn show_deferred_diagnostic_report(&mut self) -> bool {
+        let Some(deferred) = self.deferred_diagnostic_reports.pop_front() else {
+            return false;
+        };
+        match deferred {
+            DeferredDiagnosticReport::Standard { title, report } => {
+                self.show_diagnostic_report_now(title, report);
+            }
+            #[cfg(feature = "yt-dlp")]
+            DeferredDiagnosticReport::YtDlpForbidden { report } => {
+                self.show_yt_dlp_forbidden_report_now(report);
+            }
+        }
+        true
     }
 
     /// Stops background activity and prepares a safe error-only TUI after a
@@ -24143,24 +24282,155 @@ impl AppController {
         }
     }
 
-    fn fill_github_issue(&mut self) {
+    /// Enters an explicit confirmation state before publishing diagnostics.
+    fn request_github_issue_submission(&mut self) {
+        let Some(error) = self.view.error_popup.as_mut() else {
+            return;
+        };
+        if error.yt_dlp_forbidden.is_some()
+            || !error.gh_available
+            || !matches!(
+                error.github_issue_submission,
+                GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. }
+            )
+        {
+            return;
+        }
+        if self.pending_github_issue_submission.is_some() {
+            error.action_status =
+                Some("Wait for the earlier GitHub issue submission to finish".to_owned());
+            return;
+        }
+        self.github_issue_submission_confirmation_previous = matches!(
+            error.github_issue_submission,
+            GitHubIssueSubmissionView::Failed { .. }
+        )
+        .then(|| error.github_issue_submission.clone());
+        error.github_issue_submission = GitHubIssueSubmissionView::Confirming;
+        error.action_status = None;
+    }
+
+    /// Cancels confirmation without closing or changing the diagnostic report.
+    fn cancel_github_issue_submission(&mut self) {
+        if let Some(error) = self.view.error_popup.as_mut()
+            && error.github_issue_submission == GitHubIssueSubmissionView::Confirming
+        {
+            error.github_issue_submission = self
+                .github_issue_submission_confirmation_previous
+                .take()
+                .unwrap_or(GitHubIssueSubmissionView::Idle);
+            error.action_status = None;
+        }
+    }
+
+    /// Starts one background `gh` submission after explicit confirmation.
+    fn confirm_github_issue_submission(&mut self) {
+        if !self.view.error_popup.as_ref().is_some_and(|error| {
+            error.github_issue_submission == GitHubIssueSubmissionView::Confirming
+        }) || self.pending_github_issue_submission.is_some()
+        {
+            return;
+        }
         let Some((title, report)) = self.error_report_snapshot() else {
             return;
         };
-        match self
-            .report_actions
-            .fill_github_issue(&format!("Youta error: {title}"), &report)
-        {
-            Ok(()) => {
-                self.set_error_action_status("Opened a pre-filled issue for review");
-            }
-            Err(error) => {
-                self.set_error_action_status(format!("Could not open `gh`: {error}"));
+        self.github_issue_submission_confirmation_previous = None;
+        let generation = self.diagnostic_report_generation;
+        if let Some(error) = self.view.error_popup.as_mut() {
+            error.github_issue_submission = GitHubIssueSubmissionView::Submitting;
+            error.action_status = Some("Submitting GitHub issue…".to_owned());
+        }
+        self.pending_github_issue_submission = Some(generation);
+        self.pinned_github_issue_submission_generation = Some(generation);
+        if let Err(error) = self.report_actions.start_github_issue_submission(
+            format!("Youta error: {title}"),
+            report,
+            generation,
+            self.github_issue_submission_result_sender.clone(),
+        ) {
+            self.pending_github_issue_submission = None;
+            if let Some(popup) = self.view.error_popup.as_mut() {
+                popup.github_issue_submission = GitHubIssueSubmissionView::Failed {
+                    message: format!("Could not start GitHub issue submission: {error}"),
+                };
+                popup.action_status = None;
             }
         }
     }
 
+    /// Applies submission results only to the diagnostic generation that sent them.
+    fn drain_github_issue_submission_results(&mut self) {
+        loop {
+            let completion = match self.github_issue_submission_results.try_recv() {
+                Ok(completion) => completion,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            if self.pending_github_issue_submission == Some(completion.generation) {
+                self.pending_github_issue_submission = None;
+            }
+            if completion.generation != self.diagnostic_report_generation {
+                self.view.status_line = match completion.result {
+                    Ok(url) => format!("Created GitHub issue: {url}"),
+                    Err(error) => format!("GitHub issue submission failed: {}", error.message),
+                };
+                continue;
+            }
+            let Some(popup) = self.view.error_popup.as_mut() else {
+                continue;
+            };
+            match completion.result {
+                Ok(url) => {
+                    popup.action_status = Some(format!("Created GitHub issue: {url}"));
+                    popup.github_issue_submission = GitHubIssueSubmissionView::Submitted { url };
+                }
+                Err(error) if error.outcome_unknown => {
+                    popup.action_status = Some(error.message);
+                    popup.github_issue_submission = GitHubIssueSubmissionView::OutcomeUnknown {
+                        issues_url: GITHUB_ISSUES_URL.to_owned(),
+                    };
+                }
+                Err(error) => {
+                    popup.action_status = None;
+                    popup.github_issue_submission = GitHubIssueSubmissionView::Failed {
+                        message: error.message,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Opens only the validated URL retained by a completed submission state.
+    fn open_github_issue_submission_target(&mut self) {
+        let url =
+            self.view
+                .error_popup
+                .as_ref()
+                .and_then(|popup| match &popup.github_issue_submission {
+                    GitHubIssueSubmissionView::Submitted { url } => Some(url.clone()),
+                    GitHubIssueSubmissionView::OutcomeUnknown { issues_url } => {
+                        Some(issues_url.clone())
+                    }
+                    GitHubIssueSubmissionView::Idle
+                    | GitHubIssueSubmissionView::Confirming
+                    | GitHubIssueSubmissionView::Submitting
+                    | GitHubIssueSubmissionView::Failed { .. } => None,
+                });
+        if let Some(url) = url {
+            self.open_external_url(&url);
+        }
+    }
+
     fn copy_and_open_github_issue(&mut self) {
+        if self.pending_github_issue_submission.is_some()
+            || !self.view.error_popup.as_ref().is_some_and(|popup| {
+                matches!(
+                    popup.github_issue_submission,
+                    GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. }
+                )
+            })
+        {
+            return;
+        }
         let Some((title, report)) = self.error_report_snapshot() else {
             return;
         };
@@ -26305,7 +26575,10 @@ impl UiController for AppController {
         }
         match action {
             UiAction::Quit => {
-                if self.local_move_is_executing() {
+                if self.pending_github_issue_submission.is_some() {
+                    self.view.status_line =
+                        "Wait for the GitHub issue submission result before quitting".to_owned();
+                } else if self.local_move_is_executing() {
                     self.view.status_line =
                         "Wait for the Local move to finish before quitting".to_owned();
                 } else {
@@ -26821,9 +27094,20 @@ impl UiController for AppController {
             UiAction::ClearQueue => self.clear_queue(),
             UiAction::DismissQueuePopup => self.view.queue_popup = None,
             UiAction::DismissErrorPopup => {
-                self.view.error_popup = None;
-                if self.quit_on_error_dismiss {
-                    self.view.quitting = true;
+                if self.view.error_popup.as_ref().is_some_and(|popup| {
+                    popup.github_issue_submission == GitHubIssueSubmissionView::Submitting
+                }) {
+                    self.set_error_action_status(
+                        "Wait for the GitHub issue submission result before closing",
+                    );
+                } else {
+                    self.pinned_github_issue_submission_generation = None;
+                    self.github_issue_submission_confirmation_previous = None;
+                    self.view.error_popup = None;
+                    let displayed_deferred = self.show_deferred_diagnostic_report();
+                    if self.quit_on_error_dismiss && !displayed_deferred {
+                        self.view.quitting = true;
+                    }
                 }
             }
             UiAction::OpenVideoComments => self.open_youtube_video_comments(),
@@ -26839,7 +27123,12 @@ impl UiController for AppController {
             UiAction::DismissVideoQr => self.view.video_qr_popup = None,
             UiAction::ScrollErrorPopup(movement) => self.scroll_error_popup(movement),
             UiAction::CopyErrorReport => self.copy_error_report(),
-            UiAction::FillGitHubIssue => self.fill_github_issue(),
+            UiAction::RequestGitHubIssueSubmission => self.request_github_issue_submission(),
+            UiAction::ConfirmGitHubIssueSubmission => self.confirm_github_issue_submission(),
+            UiAction::CancelGitHubIssueSubmission => self.cancel_github_issue_submission(),
+            UiAction::OpenGitHubIssueSubmissionTarget => {
+                self.open_github_issue_submission_target();
+            }
             UiAction::CopyAndOpenGitHubIssue => self.copy_and_open_github_issue(),
             UiAction::OpenYtDlpProject => {
                 #[cfg(feature = "yt-dlp")]
@@ -27061,6 +27350,7 @@ impl UiController for AppController {
             &mut self.transient_footer_notice_deadline,
             Instant::now(),
         );
+        self.drain_github_issue_submission_results();
         if self.diagnostic_only {
             return;
         }
@@ -52725,13 +53015,14 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum DiagnosticCall {
         Copy(String),
-        Fill { title: String, report: String },
+        Submit { title: String, report: String },
         CopyAndOpen { title: String, report: String },
     }
 
     struct MockDiagnosticActions {
         calls: Arc<Mutex<Vec<DiagnosticCall>>>,
         gh_available: bool,
+        submission_result: Mutex<Option<Result<String, GitHubIssueSubmissionFailure>>>,
     }
 
     #[cfg(any(feature = "youtube-official", feature = "invidious"))]
@@ -53062,15 +53353,28 @@ mod tests {
             Ok("mock clipboard".to_owned())
         }
 
-        fn fill_github_issue(&self, title: &str, report: &str) -> Result<(), String> {
+        fn start_github_issue_submission(
+            &self,
+            title: String,
+            report: String,
+            generation: u64,
+            results: Sender<GitHubIssueSubmissionCompletion>,
+        ) -> Result<(), String> {
             self.calls
                 .lock()
                 .expect("diagnostic calls")
-                .push(DiagnosticCall::Fill {
-                    title: title.to_owned(),
-                    report: report.to_owned(),
+                .push(DiagnosticCall::Submit { title, report });
+            let result = self
+                .submission_result
+                .lock()
+                .expect("diagnostic submission result")
+                .take()
+                .unwrap_or_else(|| {
+                    Ok("https://github.com/vitaly-zdanevich/youta/issues/123".to_owned())
                 });
-            Ok(())
+            results
+                .send(GitHubIssueSubmissionCompletion { generation, result })
+                .map_err(|_| "mock submission receiver stopped".to_owned())
         }
 
         fn copy_and_open_github_issue(&self, title: &str, report: &str) -> Result<String, String> {
@@ -53614,6 +53918,7 @@ mod tests {
         controller.report_actions = Box::new(MockDiagnosticActions {
             calls: Arc::new(Mutex::new(Vec::new())),
             gh_available: false,
+            submission_result: Mutex::new(None),
         });
     }
 
@@ -54392,13 +54697,14 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_buttons_remain_distinct_controller_actions() {
+    fn diagnostic_submission_requires_confirmation_and_runs_once() {
         let (mut controller, _) =
             controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         controller.report_actions = Box::new(MockDiagnosticActions {
             calls: Arc::clone(&calls),
             gh_available: true,
+            submission_result: Mutex::new(None),
         });
         controller.show_diagnostic_report("Playback failed", "complete report");
         assert!(
@@ -54411,7 +54717,7 @@ mod tests {
 
         controller.dispatch(UiAction::CopyErrorReport);
         controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
-        controller.dispatch(UiAction::FillGitHubIssue);
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
 
         assert_eq!(
             *calls.lock().expect("diagnostic calls"),
@@ -54421,20 +54727,122 @@ mod tests {
                     title: "Youta error: Playback failed".to_owned(),
                     report: "complete report".to_owned(),
                 },
-                DiagnosticCall::Fill {
-                    title: "Youta error: Playback failed".to_owned(),
-                    report: "complete report".to_owned(),
-                },
             ]
         );
-        assert!(
+        assert_eq!(
             controller
                 .view
                 .error_popup
                 .as_ref()
-                .and_then(|popup| popup.action_status.as_deref())
-                .is_some_and(|status| status.contains("pre-filled issue"))
+                .map(|popup| &popup.github_issue_submission),
+            Some(&GitHubIssueSubmissionView::Confirming)
         );
+
+        controller.dispatch(UiAction::CancelGitHubIssueSubmission);
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| &popup.github_issue_submission),
+            Some(&GitHubIssueSubmissionView::Idle)
+        );
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+
+        assert_eq!(
+            calls.lock().expect("diagnostic calls").last(),
+            Some(&DiagnosticCall::Submit {
+                title: "Youta error: Playback failed".to_owned(),
+                report: "complete report".to_owned(),
+            })
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("diagnostic calls")
+                .iter()
+                .filter(|call| matches!(call, DiagnosticCall::Submit { .. }))
+                .count(),
+            1,
+            "a second confirmation must not submit a duplicate issue"
+        );
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| &popup.github_issue_submission),
+            Some(&GitHubIssueSubmissionView::Submitting)
+        );
+
+        controller.drain_github_issue_submission_results();
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| &popup.github_issue_submission),
+            Some(&GitHubIssueSubmissionView::Submitted {
+                url: "https://github.com/vitaly-zdanevich/youta/issues/123".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn stale_manual_issue_action_cannot_race_direct_submission() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::clone(&calls),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("Playback failed", "complete report");
+
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
+
+        assert_eq!(
+            *calls.lock().expect("diagnostic calls"),
+            [DiagnosticCall::Submit {
+                title: "Youta error: Playback failed".to_owned(),
+                report: "complete report".to_owned(),
+            }],
+            "a stale GUI action must not open a second issue path"
+        );
+    }
+
+    #[test]
+    fn quit_waits_for_the_github_submission_result() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("Playback failed", "complete report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+
+        controller.dispatch(UiAction::Quit);
+
+        assert!(!controller.view.quitting);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("GitHub issue submission")
+        );
+
+        controller.drain_github_issue_submission_results();
+        controller.dispatch(UiAction::Quit);
+        assert!(controller.view.quitting);
     }
 
     #[test]
@@ -54445,6 +54853,7 @@ mod tests {
         controller.report_actions = Box::new(MockDiagnosticActions {
             calls: Arc::clone(&calls),
             gh_available: true,
+            submission_result: Mutex::new(None),
         });
         controller.show_diagnostic_report("Playback failed", "complete report");
         controller.dispatch(UiAction::SetExternalOpenerAvailable(false));
@@ -54457,15 +54866,285 @@ mod tests {
                 .status_line
                 .contains("Linux virtual console")
         );
-        controller.dispatch(UiAction::FillGitHubIssue);
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
 
         assert_eq!(
             *calls.lock().expect("diagnostic calls"),
-            [DiagnosticCall::Fill {
+            [DiagnosticCall::Submit {
                 title: "Youta error: Playback failed".to_owned(),
                 report: "complete report".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn uncertain_submission_hides_retry_and_points_to_existing_issues() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(Some(Err(GitHubIssueSubmissionFailure {
+                message: "submission outcome is unknown; check existing issues before retrying"
+                    .to_owned(),
+                outcome_unknown: true,
+            }))),
+        });
+        controller.show_diagnostic_report("Playback failed", "complete report");
+
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.drain_github_issue_submission_results();
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("diagnostic popup");
+        assert_eq!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::OutcomeUnknown {
+                issues_url: GITHUB_ISSUES_URL.to_owned(),
+            }
+        );
+        assert!(
+            popup
+                .action_status
+                .as_deref()
+                .is_some_and(|status| status.contains("check existing issues before retrying"))
+        );
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        assert!(matches!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| &popup.github_issue_submission),
+            Some(GitHubIssueSubmissionView::OutcomeUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn definite_submission_failure_survives_copy_and_defers_new_diagnostics() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::clone(&calls),
+            gh_available: true,
+            submission_result: Mutex::new(Some(Err(GitHubIssueSubmissionFailure {
+                message: "gh rejected the request".to_owned(),
+                outcome_unknown: false,
+            }))),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.drain_github_issue_submission_results();
+
+        controller.dispatch(UiAction::CopyErrorReport);
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::CancelGitHubIssueSubmission);
+        controller.show_diagnostic_report("Second failure", "second report");
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("failed submission popup");
+        assert_eq!(popup.title, "First failure");
+        assert_eq!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Failed {
+                message: "gh rejected the request".to_owned(),
+            }
+        );
+        assert_eq!(
+            calls.lock().expect("diagnostic calls").last(),
+            Some(&DiagnosticCall::Copy("first report".to_owned()))
+        );
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str()),
+            Some("Second failure")
+        );
+    }
+
+    #[test]
+    fn diagnostics_wait_until_a_submission_result_is_acknowledged() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.show_diagnostic_report("Second failure", "second report");
+        controller.show_diagnostic_report("Third failure", "third report");
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("submitting diagnostic popup");
+        assert_eq!(popup.title, "First failure");
+        assert_eq!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Submitting
+        );
+
+        controller.drain_github_issue_submission_results();
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("submitted diagnostic popup");
+        assert_eq!(popup.title, "First failure");
+        assert!(matches!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Submitted { .. }
+        ));
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("deferred diagnostic popup");
+        assert_eq!(popup.title, "Second failure");
+        assert_eq!(popup.report, "second report");
+        assert_eq!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Idle
+        );
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("second deferred diagnostic popup");
+        assert_eq!(popup.title, "Third failure");
+        assert_eq!(popup.report, "third report");
+    }
+
+    #[test]
+    fn completed_submission_stays_visible_when_a_new_diagnostic_arrives() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.drain_github_issue_submission_results();
+        controller.show_diagnostic_report("Second failure", "second report");
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("submitted diagnostic popup");
+        assert_eq!(popup.title, "First failure");
+        assert!(matches!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Submitted { .. }
+        ));
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str()),
+            Some("Second failure")
+        );
+    }
+
+    #[test]
+    fn fatal_diagnostic_is_displayed_before_diagnostic_only_mode_quits() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+        controller.enter_fatal_diagnostic_mode("Fatal failure", "fatal report");
+        controller.drain_github_issue_submission_results();
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        assert!(!controller.view.quitting);
+        assert_eq!(
+            controller
+                .view
+                .error_popup
+                .as_ref()
+                .map(|popup| popup.title.as_str()),
+            Some("Fatal failure")
+        );
+
+        controller.dispatch(UiAction::DismissErrorPopup);
+        assert!(controller.view.quitting);
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn deferred_yt_dlp_diagnostic_starts_lookups_only_after_submission_acknowledgement() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let requests = capture_controller_provider_requests(&mut controller);
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+
+        controller.show_yt_dlp_forbidden_report("yt-dlp report".to_owned());
+        assert!(
+            requests.try_recv().is_err(),
+            "a hidden yt-dlp diagnostic must not start version lookups"
+        );
+        controller.drain_github_issue_submission_results();
+        controller.dispatch(UiAction::DismissErrorPopup);
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("deferred yt-dlp popup");
+        assert_eq!(popup.title, "yt-dlp HTTP 403");
+        assert_eq!(popup.report, "yt-dlp report");
+        assert!(popup.yt_dlp_forbidden.is_some());
+        assert!(matches!(
+            requests.recv_timeout(Duration::from_secs(1)),
+            Ok(ProviderRequest::YtDlpUpdateLookups {
+                installed: true,
+                github: true,
+                ..
+            })
+        ));
     }
 
     #[test]
