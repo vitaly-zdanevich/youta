@@ -3739,6 +3739,7 @@ pub(crate) mod tests {
         replies
             .send(Ok(fixture_png()))
             .expect("release visible request");
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         assert_eq!(
             observed
                 .recv_timeout(Duration::from_secs(1))
@@ -3758,7 +3759,6 @@ pub(crate) mod tests {
             .send(Ok(fixture_png()))
             .expect("release second prefetch");
 
-        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         wait_for_cached_source(&cache_directory, &second);
         assert!(
             !manager.poll(),
