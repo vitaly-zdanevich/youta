@@ -181,6 +181,14 @@ export function ProjectHistoryPopup({ popup }: { popup: ProjectHistoryPopupView 
   );
 }
 
+/** Reports whether a dated yt-dlp version already communicates its release date. */
+function ytDlpVersionEncodesReleaseDate(version: string, releasedOn: string) {
+  const match = version.trim().match(/^(\d{4})\.(\d{2})\.(\d{2})(?:\.|$)/);
+  return match === null
+    ? false
+    : `${match[1]}-${match[2]}-${match[3]}` === releasedOn.trim();
+}
+
 /** Formats one independently updating yt-dlp version lookup. */
 function ytDlpLookupText(lookup: YtDlpVersionLookupView) {
   if (lookup === "Loading") {
@@ -191,7 +199,7 @@ function ytDlpLookupText(lookup: YtDlpVersionLookupView) {
     return reason === "" ? "Unavailable" : `Unavailable (${reason})`;
   }
   const releasedOn = lookup.Available.released_on?.trim();
-  return releasedOn
+  return releasedOn && !ytDlpVersionEncodesReleaseDate(lookup.Available.version, releasedOn)
     ? `${lookup.Available.version} (released ${releasedOn})`
     : lookup.Available.version;
 }

@@ -6364,6 +6364,21 @@ fn short_project_commit_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
 
+/// Reports whether a dated yt-dlp version already communicates its release date.
+fn yt_dlp_version_encodes_release_date(version: &str, released_on: &str) -> bool {
+    let version = version.trim();
+    let Some(prefix) = version.get(..10) else {
+        return false;
+    };
+    let suffix = &version[10..];
+    let bytes = prefix.as_bytes();
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        4 | 7 => *byte == b'.',
+        _ => byte.is_ascii_digit(),
+    }) && (suffix.is_empty() || suffix.starts_with('.'))
+        && prefix.replace('.', "-") == released_on.trim()
+}
+
 /// Formats one independently updating version row without exposing diagnostics.
 fn yt_dlp_version_lookup_text(lookup: &YtDlpVersionLookupView) -> String {
     match lookup {
@@ -6371,7 +6386,9 @@ fn yt_dlp_version_lookup_text(lookup: &YtDlpVersionLookupView) -> String {
         YtDlpVersionLookupView::Available {
             version,
             released_on: Some(released_on),
-        } if !released_on.trim().is_empty() => {
+        } if !released_on.trim().is_empty()
+            && !yt_dlp_version_encodes_release_date(version, released_on) =>
+        {
             format!("{version} (released {released_on})")
         }
         YtDlpVersionLookupView::Available { version, .. } => version.clone(),
@@ -22458,7 +22475,8 @@ prose 07:25 remains clickable but is not a chapter";
 
         assert!(rendered.contains("403 from yt-dlp — try later or update it."));
         assert!(rendered.contains("A 403 can be temporary or authentication-related."));
-        assert!(rendered.contains("Installed: 2026.07.04 (released 2026-07-04)"));
+        assert!(rendered.contains("Installed: 2026.07.04"));
+        assert!(!rendered.contains("released 2026-07-04"));
         assert!(rendered.contains("GitHub latest: Loading…"));
         assert!(
             rendered.contains(
@@ -22533,6 +22551,35 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .all(|(action, _)| action != &UiAction::OpenGentooYtDlpPackage)
         );
+    }
+
+    #[test]
+    fn yt_dlp_version_text_omits_a_release_date_already_encoded_by_the_version() {
+        for version in ["2026.08.19", "2026.08.19.232900"] {
+            assert_eq!(
+                yt_dlp_version_lookup_text(&YtDlpVersionLookupView::Available {
+                    version: version.to_owned(),
+                    released_on: Some("2026-08-19".to_owned()),
+                }),
+                version
+            );
+        }
+        assert_eq!(
+            yt_dlp_version_lookup_text(&YtDlpVersionLookupView::Available {
+                version: "2026.08.19".to_owned(),
+                released_on: Some("2026-08-20".to_owned()),
+            }),
+            "2026.08.19 (released 2026-08-20)"
+        );
+
+        let mut popup = YtDlpForbiddenView::loading(None);
+        popup.github_latest = YtDlpVersionLookupView::Available {
+            version: "2026.08.19".to_owned(),
+            released_on: Some("2026-08-19".to_owned()),
+        };
+        let body = yt_dlp_forbidden_body(&popup);
+        assert!(body.lines().any(|line| line == "GitHub latest: 2026.08.19"));
+        assert!(!body.contains("GitHub latest: 2026.08.19 (released"));
     }
 
     #[test]
