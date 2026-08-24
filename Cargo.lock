@@ -6829,7 +6829,7 @@ dependencies = [
 
 [[package]]
 name = "youta"
-version = "0.32.5"
+version = "0.32.6"
 dependencies = [
  "aes",
  "anyhow",
@@ -6877,7 +6877,7 @@ dependencies = [
 
 [[package]]
 name = "youta-gui"
-version = "0.32.5"
+version = "0.32.6"
 dependencies = [
  "percent-encoding",
  "serde",
