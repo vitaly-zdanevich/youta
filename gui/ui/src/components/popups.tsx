@@ -307,7 +307,7 @@ function GitHubIssueSubmissionNotice({
   );
 }
 
-/** The complete copyable report, or specialized guidance for a yt-dlp 403. */
+/** Copyable diagnostic/setup guidance, or specialized guidance for a yt-dlp 403. */
 export function ErrorPopup({
   popup,
   externalOpener,
@@ -317,9 +317,11 @@ export function ErrorPopup({
 }) {
   const forbidden = popup.yt_dlp_forbidden;
   const submission = popup.github_issue_submission;
-  const confirming = submission === "Confirming";
-  const submitting = submission === "Submitting";
+  const reportable = popup.reportable;
+  const confirming = reportable && submission === "Confirming";
+  const submitting = reportable && submission === "Submitting";
   const failed = typeof submission === "object" && "Failed" in submission;
+  const requestable = reportable && (submission === "Idle" || failed);
   return (
     <Popup
       title={popup.title}
@@ -332,8 +334,10 @@ export function ErrorPopup({
       footer={
         forbidden === null ? (
           <>
-            <PopupButton onClick={() => void dispatch("CopyErrorReport")}>Copy report</PopupButton>
-            {(submission === "Idle" || failed) && popup.gh_available ? (
+            <PopupButton onClick={() => void dispatch("CopyErrorReport")}>
+              {reportable ? "Copy report" : "Copy"}
+            </PopupButton>
+            {requestable && popup.gh_available ? (
               <PopupButton
                 emphasis
                 onClick={() => void dispatch("RequestGitHubIssueSubmission")}
@@ -357,7 +361,7 @@ export function ErrorPopup({
                 Submitting…
               </PopupButton>
             ) : null}
-            {(submission === "Idle" || failed) && externalOpener ? (
+            {requestable && externalOpener ? (
               <PopupButton onClick={() => void dispatch("CopyAndOpenGitHubIssue")}>
                 Copy and open GitHub
               </PopupButton>
@@ -381,7 +385,9 @@ export function ErrorPopup({
     >
       {forbidden === null ? (
         <div className="flex h-full min-h-0 flex-col">
-          <GitHubIssueSubmissionNotice state={submission} externalOpener={externalOpener} />
+          {reportable ? (
+            <GitHubIssueSubmissionNotice state={submission} externalOpener={externalOpener} />
+          ) : null}
           <div className="min-h-0 flex-1 overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
             {popup.report}
           </div>

@@ -41,6 +41,8 @@ pub const ACOUSTID_LOOKUP_ENDPOINT: &str = "https://api.acoustid.org/v2/lookup";
 /// Package-manager commands that install the official `fpcalc` helper.
 pub const FPCALC_INSTALL_GUIDANCE: &str = "\
 Install the Chromaprint tools package:
+  Gentoo: the `tools` USE flag is disabled by default; installing
+          media-libs/chromaprint without `tools` does not install `fpcalc`
   Gentoo: USE=tools emerge media-libs/chromaprint
   Debian/Ubuntu: apt install libchromaprint-tools
   Fedora: dnf install chromaprint-tools
@@ -528,6 +530,7 @@ pub struct FpcalcProcessError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FpcalcProcessErrorKind {
     Failure,
+    ExecutableNotFound,
     Cancelled,
 }
 
@@ -543,6 +546,15 @@ impl FpcalcProcessError {
         }
     }
 
+    /// Creates the expected setup failure produced when `fpcalc` is absent.
+    #[must_use]
+    pub(crate) fn missing_executable() -> Self {
+        Self {
+            kind: FpcalcProcessErrorKind::ExecutableNotFound,
+            message: format!("fpcalc executable was not found.\n{FPCALC_INSTALL_GUIDANCE}"),
+        }
+    }
+
     /// Creates a cooperative-cancellation result for an injected executor.
     #[must_use]
     pub fn cancelled() -> Self {
@@ -550,6 +562,11 @@ impl FpcalcProcessError {
             kind: FpcalcProcessErrorKind::Cancelled,
             message: "fpcalc process was cancelled".to_owned(),
         }
+    }
+
+    /// Returns whether setup guidance can resolve this missing-helper failure.
+    pub(crate) fn is_missing_executable(&self) -> bool {
+        self.kind == FpcalcProcessErrorKind::ExecutableNotFound
     }
 
     fn is_cancelled(&self) -> bool {
@@ -1238,10 +1255,10 @@ fn terminate_direct_child(child: &mut Child) -> Result<(), FpcalcProcessError> {
 }
 
 fn map_process_start_error(error: &io::Error) -> FpcalcProcessError {
+    if error.kind() == io::ErrorKind::NotFound {
+        return FpcalcProcessError::missing_executable();
+    }
     let message = match error.kind() {
-        io::ErrorKind::NotFound => {
-            format!("fpcalc executable was not found.\n{FPCALC_INSTALL_GUIDANCE}")
-        }
         io::ErrorKind::PermissionDenied => "fpcalc executable is not permitted".to_owned(),
         _ => "failed to start fpcalc".to_owned(),
     };
@@ -1754,8 +1771,10 @@ mod tests {
             "private executable path must not be shown",
         );
 
-        let rendered = map_process_start_error(&source).to_string();
+        let error = map_process_start_error(&source);
+        let rendered = error.to_string();
 
+        assert!(error.is_missing_executable());
         assert!(rendered.starts_with("fpcalc executable was not found."));
         for command in [
             "USE=tools emerge media-libs/chromaprint",
@@ -1768,6 +1787,8 @@ mod tests {
                 "missing installation command: {command}"
             );
         }
+        assert!(rendered.contains("`tools` USE flag is disabled by default"));
+        assert!(rendered.contains("without `tools` does not install `fpcalc`"));
         assert!(!rendered.contains("private executable path"));
     }
 

@@ -431,6 +431,30 @@ fn the_window_error_component_keeps_the_confirmed_submission_flow() {
     }
 }
 
+#[test]
+fn the_window_error_component_hides_issue_actions_for_setup_guidance() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "const reportable = popup.reportable;",
+        "reportable && submission === \"Confirming\"",
+        "reportable && (submission === \"Idle\" || failed)",
+        "requestable && popup.gh_available",
+        "requestable && externalOpener",
+    ] {
+        assert!(
+            source.contains(required),
+            "setup guidance no longer gates issue actions with {required}"
+        );
+    }
+}
+
 /// Collects every action the window names inline at a `dispatch` call.
 ///
 /// The grammar accepted is the one the window is written in: `dispatch("Name")`

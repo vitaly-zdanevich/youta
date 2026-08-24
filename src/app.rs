@@ -3591,7 +3591,11 @@ struct GitHubIssueSubmissionFailure {
 #[derive(Debug, Eq, PartialEq)]
 enum DeferredDiagnosticReport {
     /// Ordinary diagnostic popup content.
-    Standard { title: String, report: String },
+    Standard {
+        title: String,
+        report: String,
+        reportable: bool,
+    },
     /// Structured yt-dlp HTTP 403 content whose lookups start when displayed.
     #[cfg(feature = "yt-dlp")]
     YtDlpForbidden { report: String },
@@ -18174,15 +18178,24 @@ impl AppController {
             return;
         }
         if self.config.providers.acoustid_client_key.is_none() {
-            self.view.status_line = format!(
-                "Add providers.acoustid_client_key to {}",
-                self.config.credentials_file().display()
+            let message = format!(
+                "Create an AcoustID application key:\n\
+                 https://acoustid.org/api-key\n\n\
+                 Add it to:\n{}\n\n\
+                 [providers]\n\
+                 acoustid_client_key = '...'\n\n\
+                 Then restart Youta.",
+                self.config.credentials_file().display(),
             );
+            self.show_actionable_message("AcoustID API key required", message);
             return;
         }
         self.cancel_local_fingerprint();
         let Some(sender) = self.local_fingerprint_requests.as_ref() else {
-            self.view.status_line = "The local fingerprint worker is unavailable".to_owned();
+            self.show_actionable_message(
+                "Local fingerprinting unavailable",
+                "The background fingerprint worker is unavailable. Restart Youta and try again.",
+            );
             return;
         };
         self.local_fingerprint_generation = self.local_fingerprint_generation.wrapping_add(1);
@@ -18208,7 +18221,10 @@ impl AppController {
             }
         };
         if !sent {
-            self.view.status_line = "The local fingerprint worker stopped".to_owned();
+            self.show_actionable_message(
+                "Local fingerprinting unavailable",
+                "The background fingerprint worker stopped. Restart Youta and try again.",
+            );
             return;
         }
         self.pending_local_fingerprint = Some(PendingLocalFingerprint {
@@ -18889,6 +18905,24 @@ impl AppController {
                             }
                         }
                         Err(AudioIdentificationError::Cancelled) => {}
+                        Err(AudioIdentificationError::FpcalcProcess(error))
+                            if error.is_missing_executable() =>
+                        {
+                            if self.selected_local_fingerprint_target().is_some_and(
+                                |(selected_media_id, selected_key)| {
+                                    selected_media_id == pending.media_id
+                                        && selected_key == pending.key
+                                },
+                            ) {
+                                if let Some(details) = self.view.details.as_mut() {
+                                    details.local_fingerprint_pending = false;
+                                }
+                                self.show_actionable_message(
+                                    "Chromaprint tools required",
+                                    error.to_string(),
+                                );
+                            }
+                        }
                         Err(error) => {
                             if self.selected_local_fingerprint_target().is_some_and(
                                 |(selected_media_id, selected_key)| {
@@ -23952,7 +23986,8 @@ impl AppController {
             title: "yt-dlp HTTP 403".to_owned(),
             report,
             scroll_offset: 0,
-            gh_available: self.report_actions.gh_available(),
+            gh_available: false,
+            reportable: false,
             action_status: None,
             yt_dlp_forbidden: Some(forbidden),
             github_issue_submission: GitHubIssueSubmissionView::Idle,
@@ -24123,13 +24158,25 @@ impl AppController {
     /// This is also used by the process-level panic boundary after the normal
     /// terminal session has restored raw mode and the alternate screen.
     pub fn show_diagnostic_report(&mut self, title: impl Into<String>, report: impl Into<String>) {
-        let title = title.into();
-        let report = report.into();
+        self.show_report_popup(title.into(), report.into(), true);
+    }
+
+    /// Opens a concise local setup message without offering issue submission.
+    fn show_actionable_message(&mut self, title: impl Into<String>, report: impl Into<String>) {
+        self.show_report_popup(title.into(), report.into(), false);
+    }
+
+    /// Opens or defers one report-like modal with an explicit action policy.
+    fn show_report_popup(&mut self, title: String, report: String, reportable: bool) {
         if self.diagnostic_popup_reserved_for_github_submission() {
-            self.defer_diagnostic_report(DeferredDiagnosticReport::Standard { title, report });
+            self.defer_diagnostic_report(DeferredDiagnosticReport::Standard {
+                title,
+                report,
+                reportable,
+            });
             return;
         }
-        self.show_diagnostic_report_now(title, report);
+        self.show_diagnostic_report_now(title, report, reportable);
     }
 
     /// Returns whether replacing the active diagnostic could hide a pending or
@@ -24148,14 +24195,15 @@ impl AppController {
     }
 
     /// Displays one ordinary diagnostic without applying modal deferral again.
-    fn show_diagnostic_report_now(&mut self, title: String, report: String) {
+    fn show_diagnostic_report_now(&mut self, title: String, report: String, reportable: bool) {
         self.github_issue_submission_confirmation_previous = None;
         self.diagnostic_report_generation = self.diagnostic_report_generation.wrapping_add(1);
         self.view.error_popup = Some(ErrorPopupView {
             title,
             report,
             scroll_offset: 0,
-            gh_available: self.report_actions.gh_available(),
+            gh_available: reportable && self.report_actions.gh_available(),
+            reportable,
             action_status: None,
             yt_dlp_forbidden: None,
             github_issue_submission: GitHubIssueSubmissionView::Idle,
@@ -24169,8 +24217,12 @@ impl AppController {
             return false;
         };
         match deferred {
-            DeferredDiagnosticReport::Standard { title, report } => {
-                self.show_diagnostic_report_now(title, report);
+            DeferredDiagnosticReport::Standard {
+                title,
+                report,
+                reportable,
+            } => {
+                self.show_diagnostic_report_now(title, report, reportable);
             }
             #[cfg(feature = "yt-dlp")]
             DeferredDiagnosticReport::YtDlpForbidden { report } => {
@@ -24288,6 +24340,7 @@ impl AppController {
             return;
         };
         if error.yt_dlp_forbidden.is_some()
+            || !error.reportable
             || !error.gh_available
             || !matches!(
                 error.github_issue_submission,
@@ -24326,7 +24379,9 @@ impl AppController {
     /// Starts one background `gh` submission after explicit confirmation.
     fn confirm_github_issue_submission(&mut self) {
         if !self.view.error_popup.as_ref().is_some_and(|error| {
-            error.github_issue_submission == GitHubIssueSubmissionView::Confirming
+            error.reportable
+                && error.yt_dlp_forbidden.is_none()
+                && error.github_issue_submission == GitHubIssueSubmissionView::Confirming
         }) || self.pending_github_issue_submission.is_some()
         {
             return;
@@ -24423,10 +24478,12 @@ impl AppController {
     fn copy_and_open_github_issue(&mut self) {
         if self.pending_github_issue_submission.is_some()
             || !self.view.error_popup.as_ref().is_some_and(|popup| {
-                matches!(
-                    popup.github_issue_submission,
-                    GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. }
-                )
+                popup.reportable
+                    && popup.yt_dlp_forbidden.is_none()
+                    && matches!(
+                        popup.github_issue_submission,
+                        GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. }
+                    )
             })
         {
             return;
@@ -26958,8 +27015,10 @@ impl UiController for AppController {
                 self.fingerprint_selected_local_audio();
                 #[cfg(not(feature = "acoustid"))]
                 {
-                    self.view.status_line =
-                        "This build omits AcoustID fingerprinting support".to_owned();
+                    self.show_actionable_message(
+                        "Local fingerprinting unavailable",
+                        "This build omits AcoustID fingerprinting support.",
+                    );
                 }
             }
             UiAction::ToggleRepeat => {
@@ -38725,10 +38784,7 @@ mod tests {
             _cancellation: &AudioIdentificationCancellation,
         ) -> Result<Vec<MusicBrainzCandidate>, AudioIdentificationError> {
             Err(AudioIdentificationError::FpcalcProcess(
-                crate::audio_identification::FpcalcProcessError::new(format!(
-                    "fpcalc executable was not found.\n{}",
-                    crate::audio_identification::FPCALC_INSTALL_GUIDANCE
-                )),
+                crate::audio_identification::FpcalcProcessError::missing_executable(),
             ))
         }
     }
@@ -48796,13 +48852,26 @@ mod tests {
 
         controller.dispatch(UiAction::FingerprintLocalAudio);
 
-        assert_eq!(
-            controller.view.status_line,
-            format!(
-                "Add providers.acoustid_client_key to {}",
-                credentials_file.display()
-            )
-        );
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("missing-key setup popup");
+        assert_eq!(popup.title, "AcoustID API key required");
+        assert!(!popup.gh_available);
+        assert!(!popup.reportable);
+        for expected in [
+            "https://acoustid.org/api-key",
+            "[providers]",
+            "acoustid_client_key = '...'",
+            &credentials_file.display().to_string(),
+            "restart Youta",
+        ] {
+            assert!(
+                popup.report.contains(expected),
+                "missing setup guidance: {expected}"
+            );
+        }
         assert!(controller.pending_local_fingerprint.is_none());
         assert!(controller.local_fingerprint_cache.is_empty());
     }
@@ -48840,7 +48909,11 @@ mod tests {
             .error_popup
             .as_ref()
             .expect("missing-fpcalc error popup");
-        assert_eq!(popup.title, "Local audio fingerprinting failed");
+        assert_eq!(popup.title, "Chromaprint tools required");
+        assert!(!popup.gh_available);
+        assert!(!popup.reportable);
+        assert!(!popup.report.contains("Youta diagnostic report"));
+        assert!(!popup.report.contains("Forced backtrace"));
         for command in [
             "USE=tools emerge media-libs/chromaprint",
             "apt install libchromaprint-tools",
@@ -48852,6 +48925,16 @@ mod tests {
                 "missing installation command: {command}"
             );
         }
+        assert!(
+            popup
+                .report
+                .contains("`tools` USE flag is disabled by default")
+        );
+        assert!(
+            popup
+                .report
+                .contains("without `tools` does not install `fpcalc`")
+        );
         assert!(controller.view.details.as_ref().is_some_and(|details| {
             details.local_fingerprint_available && !details.local_fingerprint_pending
         }));
@@ -48882,10 +48965,15 @@ mod tests {
         controller.dispatch(UiAction::FingerprintLocalAudio);
 
         assert!(controller.pending_local_fingerprint.is_none());
-        assert_eq!(
-            controller.view.status_line,
-            "The local fingerprint worker is unavailable"
-        );
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("unavailable-worker popup");
+        assert_eq!(popup.title, "Local fingerprinting unavailable");
+        assert!(!popup.gh_available);
+        assert!(!popup.reportable);
+        assert!(popup.report.contains("background fingerprint worker"));
         assert!(controller.view.details.as_ref().is_some_and(|details| {
             details.local_fingerprint_available && !details.local_fingerprint_pending
         }));
@@ -54712,7 +54800,7 @@ mod tests {
                 .view
                 .error_popup
                 .as_ref()
-                .is_some_and(|popup| popup.gh_available)
+                .is_some_and(|popup| popup.gh_available && popup.reportable)
         );
 
         controller.dispatch(UiAction::CopyErrorReport);
@@ -54787,6 +54875,32 @@ mod tests {
             Some(&GitHubIssueSubmissionView::Submitted {
                 url: "https://github.com/vitaly-zdanevich/youta/issues/123".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn actionable_setup_messages_reject_stale_issue_actions() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::clone(&calls),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+
+        controller.show_actionable_message("Setup required", "local setup guidance");
+        controller.dispatch(UiAction::CopyAndOpenGitHubIssue);
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+
+        assert!(calls.lock().expect("diagnostic calls").is_empty());
+        let popup = controller.view.error_popup.as_ref().expect("setup popup");
+        assert!(!popup.reportable);
+        assert!(!popup.gh_available);
+        assert_eq!(
+            popup.github_issue_submission,
+            GitHubIssueSubmissionView::Idle
         );
     }
 
@@ -55036,6 +55150,34 @@ mod tests {
             .expect("second deferred diagnostic popup");
         assert_eq!(popup.title, "Third failure");
         assert_eq!(popup.report, "third report");
+    }
+
+    #[test]
+    fn deferred_actionable_message_remains_non_reportable() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        controller.show_diagnostic_report("First failure", "first report");
+        controller.dispatch(UiAction::RequestGitHubIssueSubmission);
+        controller.dispatch(UiAction::ConfirmGitHubIssueSubmission);
+
+        controller.show_actionable_message("Setup required", "local setup guidance");
+        controller.drain_github_issue_submission_results();
+        controller.dispatch(UiAction::DismissErrorPopup);
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("deferred setup popup");
+        assert_eq!(popup.title, "Setup required");
+        assert_eq!(popup.report, "local setup guidance");
+        assert!(!popup.reportable);
+        assert!(!popup.gh_available);
     }
 
     #[test]

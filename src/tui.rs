@@ -6452,6 +6452,8 @@ fn render_error_popup_controls(
             }
             buttons.push(("[c] Copy report".to_owned(), UiAction::CopyErrorReport));
             buttons
+        } else if !error.reportable {
+            vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)]
         } else {
             match &error.github_issue_submission {
                 GitHubIssueSubmissionView::Idle => {
@@ -6516,19 +6518,23 @@ fn render_error_popup_controls(
                 }
             }
         };
-    if matches!(
-        error.github_issue_submission,
-        GitHubIssueSubmissionView::Confirming
-    ) && error.yt_dlp_forbidden.is_none()
+    if error.reportable
+        && matches!(
+            error.github_issue_submission,
+            GitHubIssueSubmissionView::Confirming
+        )
+        && error.yt_dlp_forbidden.is_none()
     {
         buttons.push((
             "[Esc] Cancel".to_owned(),
             UiAction::CancelGitHubIssueSubmission,
         ));
-    } else if !matches!(
-        error.github_issue_submission,
-        GitHubIssueSubmissionView::Submitting
-    ) || error.yt_dlp_forbidden.is_some()
+    } else if !error.reportable
+        || !matches!(
+            error.github_issue_submission,
+            GitHubIssueSubmissionView::Submitting
+        )
+        || error.yt_dlp_forbidden.is_some()
     {
         buttons.push(("[Esc] Close".to_owned(), UiAction::DismissErrorPopup));
     }
@@ -12872,6 +12878,7 @@ mod tests {
                 title: "Playback failed".to_owned(),
                 report: "complete report".to_owned(),
                 gh_available: true,
+                reportable: true,
                 ..ErrorPopupView::default()
             }),
             ..ViewModel::default()
@@ -12938,6 +12945,7 @@ mod tests {
                 title: "Playback failed".to_owned(),
                 report: "complete report".to_owned(),
                 gh_available: true,
+                reportable: true,
                 github_issue_submission: GitHubIssueSubmissionView::Confirming,
                 ..ErrorPopupView::default()
             }),
@@ -12975,6 +12983,7 @@ mod tests {
         let submitted = ViewModel {
             external_opener_available: true,
             error_popup: Some(ErrorPopupView {
+                reportable: true,
                 github_issue_submission: GitHubIssueSubmissionView::Submitted {
                     url: "https://github.com/vitaly-zdanevich/youta/issues/123".to_owned(),
                 },
@@ -13001,6 +13010,7 @@ mod tests {
         let failed = ViewModel {
             error_popup: Some(ErrorPopupView {
                 gh_available: true,
+                reportable: true,
                 github_issue_submission: GitHubIssueSubmissionView::Failed {
                     message: "gh rejected the request".to_owned(),
                 },
@@ -13018,6 +13028,7 @@ mod tests {
 
         let submitting = ViewModel {
             error_popup: Some(ErrorPopupView {
+                reportable: true,
                 github_issue_submission: GitHubIssueSubmissionView::Submitting,
                 ..ErrorPopupView::default()
             }),
@@ -13037,6 +13048,7 @@ mod tests {
                 title: "Error".to_owned(),
                 report: "report".to_owned(),
                 gh_available: false,
+                reportable: true,
                 ..ErrorPopupView::default()
             }),
             ..ViewModel::default()
@@ -13049,6 +13061,34 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
             None
+        );
+
+        let guidance = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(ErrorPopupView {
+                title: "Setup required".to_owned(),
+                report: "actionable guidance".to_owned(),
+                gh_available: false,
+                reportable: false,
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                &guidance
+            ),
+            None,
+            "setup guidance must not open a public issue form"
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &guidance
+            ),
+            None,
+            "setup guidance must not submit a public issue"
         );
     }
 
@@ -17656,6 +17696,7 @@ mod tests {
         view.youtube_setup_popup = None;
         view.error_popup = Some(ErrorPopupView {
             gh_available: true,
+            reportable: true,
             ..ErrorPopupView::default()
         });
         hit_map = HitMap::default();
@@ -22329,6 +22370,7 @@ prose 07:25 remains clickable but is not a chapter";
                 report: report_lines.join("\n"),
                 scroll_offset: 10,
                 gh_available: true,
+                reportable: true,
                 action_status: None,
                 yt_dlp_forbidden: None,
                 github_issue_submission: GitHubIssueSubmissionView::Idle,
@@ -22373,6 +22415,41 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn setup_popup_hides_every_public_issue_action() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            external_opener_available: true,
+            error_popup: Some(ErrorPopupView {
+                title: "Setup required".to_owned(),
+                report: "Install a local helper".to_owned(),
+                reportable: false,
+                ..ErrorPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw setup popup");
+        let rendered = rendered_text(&terminal);
+
+        assert!(rendered.contains("[c] Copy"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(!rendered.contains("Copy + open issue"));
+        assert!(!rendered.contains("Submit GitHub issue"));
+        assert_eq!(
+            hit_map
+                .error_buttons
+                .iter()
+                .map(|(action, _)| action)
+                .collect::<Vec<_>>(),
+            [&UiAction::CopyErrorReport, &UiAction::DismissErrorPopup,]
+        );
+    }
+
+    #[test]
     fn diagnostic_popup_keeps_confirmation_visible_and_contains_submitted_controls() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -22383,6 +22460,7 @@ prose 07:25 remains clickable but is not a chapter";
                 title: "Playback failed".to_owned(),
                 report: "complete report".to_owned(),
                 gh_available: true,
+                reportable: true,
                 action_status: Some("Copied with wl-copy".to_owned()),
                 github_issue_submission: GitHubIssueSubmissionView::Confirming,
                 ..ErrorPopupView::default()
@@ -22405,6 +22483,7 @@ prose 07:25 remains clickable but is not a chapter";
             title: "Playback failed".to_owned(),
             report: "complete report".to_owned(),
             gh_available: true,
+            reportable: true,
             action_status: Some("Copied with wl-copy".to_owned()),
             github_issue_submission: GitHubIssueSubmissionView::Submitted {
                 url: url.to_owned(),
@@ -22442,6 +22521,7 @@ prose 07:25 remains clickable but is not a chapter";
             title: "Playback failed".to_owned(),
             report: "complete report".to_owned(),
             gh_available: true,
+            reportable: true,
             action_status: Some("Copied with wl-copy".to_owned()),
             github_issue_submission: GitHubIssueSubmissionView::Failed {
                 message: "gh rejected the request".to_owned(),
@@ -22650,6 +22730,7 @@ prose 07:25 remains clickable but is not a chapter";
             error_popup: Some(ErrorPopupView {
                 title: "Network error".to_owned(),
                 report: "full report".to_owned(),
+                reportable: true,
                 ..ErrorPopupView::default()
             }),
             ..ViewModel::default()
@@ -25370,6 +25451,7 @@ prose 07:25 remains clickable but is not a chapter";
                 title: "Error".to_owned(),
                 report: "report".to_owned(),
                 gh_available: true,
+                reportable: true,
                 ..ErrorPopupView::default()
             }),
             ..ViewModel::default()

@@ -248,12 +248,14 @@ export interface YtDlpForbiddenView {
   gentoo: YtDlpGentooVersionView | null;
 }
 
-/** The diagnostic report shown after a recoverable failure. */
+/** A diagnostic report or actionable setup message shown in the error layer. */
 export interface ErrorPopupView {
   title: string;
   report: string;
   scroll_offset: number;
   gh_available: boolean;
+  /** Whether this popup may offer either GitHub issue-creation path. */
+  reportable: boolean;
   action_status: string | null;
   yt_dlp_forbidden: YtDlpForbiddenView | null;
   github_issue_submission: GitHubIssueSubmissionView;

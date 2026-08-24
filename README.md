@@ -488,9 +488,14 @@ cargo run --locked -- --help
 
 The default build expects `mpv` and `yt-dlp` at runtime for online playback.
 It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
-audio identification. On Gentoo emerge [media-libs/chromaprint](https://packages.gentoo.org/packages/media-libs/chromaprint) with USE flag `tools`. These remain separate executables so they can be updated without rebuilding Youta. Human-readable persistence is part of the core
-build. The default feature set enables `images` and offline `qr` rendering.
-Runtime capability checks decide whether the TUI may fetch and render artwork.
+audio identification. On Gentoo, the `tools` USE flag is disabled by default;
+enable it when emerging
+[media-libs/chromaprint](https://packages.gentoo.org/packages/media-libs/chromaprint)
+because installing only the library does not provide `fpcalc`. These remain
+separate executables so they can be updated without rebuilding Youta.
+Human-readable persistence is part of the core build. The default feature set
+enables `images` and offline `qr` rendering. Runtime capability checks decide
+whether the TUI may fetch and render artwork.
 
 Install `fpcalc` from your operating system's
 [Chromaprint](https://github.com/acoustid/chromaprint) tools package:

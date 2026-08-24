@@ -312,7 +312,7 @@ fn unfiltered_key_action(
 ) -> Option<UiAction> {
     if let Some(error) = view.error_popup.as_ref() {
         let yt_dlp_forbidden = error.yt_dlp_forbidden.as_ref();
-        if yt_dlp_forbidden.is_none() {
+        if yt_dlp_forbidden.is_none() && error.reportable {
             match &error.github_issue_submission {
                 GitHubIssueSubmissionView::Confirming => {
                     return match key.key {
@@ -370,10 +370,12 @@ fn unfiltered_key_action(
             Key::Char('p' | 'P') if yt_dlp_forbidden.is_some_and(|view| view.gentoo.is_some()) => {
                 Some(UiAction::OpenGentooYtDlpPackage)
             }
-            Key::Char('g' | 'G') if yt_dlp_forbidden.is_none() && error.gh_available => {
+            Key::Char('g' | 'G')
+                if yt_dlp_forbidden.is_none() && error.reportable && error.gh_available =>
+            {
                 Some(UiAction::RequestGitHubIssueSubmission)
             }
-            Key::Char('i' | 'I') if yt_dlp_forbidden.is_none() => {
+            Key::Char('i' | 'I') if yt_dlp_forbidden.is_none() && error.reportable => {
                 Some(UiAction::CopyAndOpenGitHubIssue)
             }
             Key::Up | Key::Left => Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-1))),

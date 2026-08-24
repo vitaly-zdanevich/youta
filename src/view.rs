@@ -1352,21 +1352,24 @@ pub enum GitHubIssueSubmissionView {
     },
 }
 
-/// Diagnostic information shown above the normal interface after an error.
+/// Diagnostic or actionable setup information shown above the normal interface.
 ///
-/// `report` contains the complete, copyable diagnostic report rather than a
-/// shortened user-facing message. The controller owns `scroll_offset` so the
-/// position survives terminal redraws and resize events.
+/// For reportable failures, `report` contains the complete, copyable diagnostic
+/// report rather than a shortened user-facing message. Setup guidance instead
+/// stores its concise instructions there. The controller owns `scroll_offset`
+/// so the position survives terminal redraws and resize events.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ErrorPopupView {
     /// Short error title displayed in the popup border.
     pub title: String,
-    /// Complete report, including the stack trace and environment information.
+    /// Complete diagnostic report or concise local setup guidance.
     pub report: String,
     /// Zero-based wrapped-line offset at the top of the viewport.
     pub scroll_offset: usize,
-    /// Whether the GitHub CLI is available for submitting a new issue.
+    /// Whether direct GitHub CLI submission is available for this popup.
     pub gh_available: bool,
+    /// Whether this popup describes a reportable failure rather than setup guidance.
+    pub reportable: bool,
     /// Result of the most recent copy or issue-submission action.
     pub action_status: Option<String>,
     /// Short progressive body for a 403 attributed to yt-dlp.
