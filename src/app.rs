@@ -357,10 +357,10 @@ fn gpm_unavailable_status(gpm_supported: bool, openrc_managed: bool) -> &'static
     }
 }
 
-/// Expires a footer notice at its monotonic deadline.
+/// Expires a transient bottom-row notice at its monotonic deadline.
 ///
-/// Keeping expiry in the controller makes the renderer a pure projection and
-/// ensures the ordinary one-line hotkey footer returns without user input.
+/// Keeping expiry in the controller makes the renderer a pure projection.
+/// Removing the expired notice returns its temporary row to normal content.
 fn expire_transient_footer_notice(
     view: &mut ViewModel,
     deadline: &mut Option<Instant>,
@@ -4416,7 +4416,7 @@ pub struct AppController {
     last_position_save: Instant,
     last_session_save: Instant,
     last_tick: Instant,
-    /// Deadline after which the normal one-line footer controls return.
+    /// Deadline after which the temporary bottom-row notice disappears.
     transient_footer_notice_deadline: Option<Instant>,
     session_dirty: bool,
     unflushed_listen_time: Duration,

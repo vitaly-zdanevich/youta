@@ -2069,6 +2069,11 @@ fn render_frame(
     } else {
         2_u16.saturating_add(chapter_label_rows)
     };
+    let footer_notice = view
+        .transient_footer_notice
+        .as_deref()
+        .filter(|notice| !notice.is_empty());
+    let footer_rows = u16::from(footer_notice.is_some());
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2076,9 +2081,13 @@ fn render_frame(
             Constraint::Min(8),
             Constraint::Length(if view.download.is_some() { 2 } else { 0 }),
             Constraint::Length(player_rows),
-            Constraint::Length(1),
+            Constraint::Length(footer_rows),
         ])
         .split(frame.area());
+    // The permanent shortcut footer was removed to return its row to content.
+    // Clear its legacy hit map on every frame so an earlier render cannot leave
+    // invisible mouse targets behind.
+    hit_map.buttons.clear();
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
         || view.project_history_popup.is_some()
@@ -2139,27 +2148,9 @@ fn render_frame(
         render_download_bar(frame, sections[2], download, &theme);
     }
     render_seek_bar(frame, sections[3], view, settings, &theme, hit_map);
-    let status_line = view.transient_footer_notice.as_deref().unwrap_or("");
-    render_buttons(
-        frame,
-        sections[4],
-        settings,
-        &theme,
-        view.screen,
-        view.youtube_search_sort,
-        view.radio_sort,
-        view.youtube_creative_commons_only,
-        view.show_chapter_timestamps,
-        view.autoplay,
-        view.playlist_item.as_ref(),
-        view.playlist_edit_available,
-        view.playlist_back_available,
-        view.local_folder_sizes_enabled
-            .then_some(view.local_size_sort),
-        &status_line,
-        !view.playback.idle,
-        hit_map,
-    );
+    if let Some(notice) = footer_notice {
+        render_footer_notice(frame, sections[4], notice, &theme);
+    }
     if thumbnail_is_fullscreen && let Some(renderer) = thumbnail_renderer.as_deref_mut() {
         render_fullscreen_thumbnail_overlay(frame, view, &theme, hit_map, renderer);
     }
@@ -3022,6 +3013,7 @@ fn render_subscriptions_body(
                 subscriptions.loading,
                 view.search_animation_frame,
                 subscriptions.source_kind,
+                view.autoplay,
                 show_hotkeys,
                 theme,
                 hit_map,
@@ -3122,6 +3114,7 @@ fn render_subscriptions_body(
                     subscriptions.loading,
                     view.search_animation_frame,
                     subscriptions.source_kind,
+                    view.autoplay,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3170,6 +3163,7 @@ fn render_subscriptions_body(
                     subscriptions.loading,
                     view.search_animation_frame,
                     subscriptions.source_kind,
+                    view.autoplay,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3259,6 +3253,7 @@ fn render_subscription_item_buttons(
     loading: bool,
     animation_frame: usize,
     source_kind: SubscriptionKind,
+    autoplay: bool,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
@@ -3275,6 +3270,18 @@ fn render_subscription_item_buttons(
     let refresh = (
         button("R", &refresh_label, show_hotkeys),
         UiAction::RefreshSubscriptionVideos,
+    );
+    let autoplay = (
+        button(
+            "A",
+            if autoplay {
+                "Autoplay: on"
+            } else {
+                "Autoplay: off"
+            },
+            show_hotkeys,
+        ),
+        UiAction::ToggleAutoplay,
     );
     let description = description_available.then(|| {
         (
@@ -3293,11 +3300,12 @@ fn render_subscription_item_buttons(
             UiAction::ToggleSubscriptionDescription,
         )
     });
-    let mut buttons = Vec::with_capacity(2);
+    let mut buttons = Vec::with_capacity(3);
     if description_expanded && let Some(description) = description.clone() {
         buttons.push(description);
     }
     buttons.push(refresh);
+    buttons.push(autoplay);
     if !description_expanded && let Some(description) = description {
         buttons.push(description);
     }
@@ -6068,148 +6076,12 @@ fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     frame.buffer_mut().set_span(x, y, &label, width);
 }
 
-fn render_buttons(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    settings: &UiSettings,
-    theme: &Theme,
-    _screen: Screen,
-    _youtube_search_sort: YouTubeSearchSort,
-    _radio_sort: RadioSort,
-    _youtube_creative_commons_only: bool,
-    _show_chapter_timestamps: bool,
-    autoplay: bool,
-    _playlist_item: Option<&PlaylistItemView>,
-    _playlist_edit_available: bool,
-    _playlist_back_available: bool,
-    _local_size_sort: Option<LocalSizeSort>,
-    status: &str,
-    _playback_active: bool,
-    hit_map: &mut HitMap,
-) {
-    hit_map.buttons.clear();
-    if !status.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::raw(status))
-                .alignment(Alignment::Left)
-                .style(theme.accent.add_modifier(Modifier::BOLD)),
-            area,
-        );
-        return;
-    }
-
-    let full_buttons = vec![
-        (
-            button("/", "Search", settings.show_hotkeys),
-            UiAction::BeginSearch,
-        ),
-        (
-            button(
-                "A",
-                if autoplay {
-                    "Autoplay: on"
-                } else {
-                    "Autoplay: off"
-                },
-                settings.show_hotkeys,
-            ),
-            UiAction::ToggleAutoplay,
-        ),
-        (
-            button("k", "Move up", settings.show_hotkeys),
-            UiAction::MoveSelection(-1),
-        ),
-        (
-            button("j", "Move down", settings.show_hotkeys),
-            UiAction::MoveSelection(1),
-        ),
-        (
-            button("↑", "Volume up", settings.show_hotkeys),
-            UiAction::ChangeVolume(5),
-        ),
-        (
-            button("↓", "Volume down", settings.show_hotkeys),
-            UiAction::ChangeVolume(-5),
-        ),
-        (
-            button("p", "Preferences", settings.show_hotkeys),
-            UiAction::OpenPreferences,
-        ),
-        (
-            button("?", "Help", settings.show_hotkeys),
-            UiAction::ToggleHelp,
-        ),
-    ];
-    let full_width = full_buttons
-        .iter()
-        .map(|(label, _)| usize::from(terminal_text_width(label)))
-        .sum::<usize>()
-        .saturating_add((full_buttons.len() - 1) * 2);
-    let buttons = if full_width <= usize::from(area.width) {
-        full_buttons
-    } else {
-        let compact_buttons = vec![
-            (
-                button("/", "Search", settings.show_hotkeys),
-                UiAction::BeginSearch,
-            ),
-            (
-                button(
-                    "A",
-                    if autoplay { "on" } else { "off" },
-                    settings.show_hotkeys,
-                ),
-                UiAction::ToggleAutoplay,
-            ),
-            (
-                button("k", "Up", settings.show_hotkeys),
-                UiAction::MoveSelection(-1),
-            ),
-            (
-                button("j", "Down", settings.show_hotkeys),
-                UiAction::MoveSelection(1),
-            ),
-            (
-                button("↑", "+", settings.show_hotkeys),
-                UiAction::ChangeVolume(5),
-            ),
-            (
-                button("↓", "-", settings.show_hotkeys),
-                UiAction::ChangeVolume(-5),
-            ),
-            (
-                button("p", "Prefs", settings.show_hotkeys),
-                UiAction::OpenPreferences,
-            ),
-            (
-                button("?", "Help", settings.show_hotkeys),
-                UiAction::ToggleHelp,
-            ),
-        ];
-        compact_buttons
-    };
-    let controls = buttons
-        .iter()
-        .map(|(label, _)| label.as_str())
-        .collect::<Vec<_>>()
-        .join("  ");
-    let line_width = terminal_text_width(&controls);
-    let mut button_x = centered_line_x(area, line_width);
-    for (label, action) in &buttons {
-        let width = terminal_text_width(label);
-        let visible_width = area.right().saturating_sub(button_x).min(width);
-        if visible_width > 0 {
-            hit_map.buttons.push((
-                action.clone(),
-                Rect::new(button_x, area.y, visible_width, 1),
-            ));
-        }
-        button_x = button_x.saturating_add(width).saturating_add(2);
-    }
+/// Renders a transient one-line notice without restoring the removed shortcut footer.
+fn render_footer_notice(frame: &mut Frame<'_>, area: Rect, notice: &str, theme: &Theme) {
     frame.render_widget(
-        Paragraph::new(Line::raw(controls))
-            .alignment(Alignment::Center)
-            .style(theme.base),
+        Paragraph::new(Line::raw(notice))
+            .alignment(Alignment::Left)
+            .style(theme.accent.add_modifier(Modifier::BOLD)),
         area,
     );
 }
@@ -10752,31 +10624,6 @@ mod tests {
         }
     }
 
-    /// Verifies the intentionally small, source-independent footer action set.
-    fn assert_minimal_footer_actions(hit_map: &HitMap) {
-        let expected = [
-            UiAction::BeginSearch,
-            UiAction::ToggleAutoplay,
-            UiAction::MoveSelection(-1),
-            UiAction::MoveSelection(1),
-            UiAction::ChangeVolume(5),
-            UiAction::ChangeVolume(-5),
-            UiAction::OpenPreferences,
-            UiAction::ToggleHelp,
-        ];
-
-        assert_eq!(hit_map.buttons.len(), expected.len());
-        for action in expected {
-            assert!(
-                hit_map
-                    .buttons
-                    .iter()
-                    .any(|(candidate, target)| candidate == &action && target.width > 0),
-                "missing minimal footer action {action:?}"
-            );
-        }
-    }
-
     #[test]
     fn terminal_startup_sets_youta_title_before_entering_the_ui() {
         let mut output = Vec::new();
@@ -15150,7 +14997,7 @@ mod tests {
     }
 
     #[test]
-    fn render_contains_player_and_hotkey_controls() {
+    fn render_contains_player_without_the_global_hotkey_footer() {
         let backend = TestBackend::new(240, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
@@ -15195,17 +15042,27 @@ mod tests {
         assert!(!rendered.contains("[T]"));
         assert!(!rendered.contains("[d]"));
         assert!(!rendered.contains("[w]"));
-        assert!(rendered.contains("[/] Search"));
-        assert!(rendered.contains("[A] Autoplay: off"));
-        assert!(rendered.contains("[k] Move up"));
-        assert!(rendered.contains("[j] Move down"));
-        assert!(rendered.contains("[↑] Volume up"));
-        assert!(rendered.contains("[↓] Volume down"));
-        assert!(rendered.contains("[p] Preferences"));
-        assert!(rendered.contains("[?] Help"));
+        for removed in [
+            "[/] Search",
+            "[A] Autoplay",
+            "[k] Move up",
+            "[j] Move down",
+            "[↑] Volume up",
+            "[↓] Volume down",
+            "[p] Preferences",
+            "[?] Help",
+        ] {
+            assert!(
+                !rendered.contains(removed),
+                "the removed global footer must not render {removed}"
+            );
+        }
         assert!(!rendered.contains("[Enter] Start"));
         assert!(rendered.contains("0:30 / 2:00"));
-        assert_minimal_footer_actions(&hit_map);
+        assert!(
+            hit_map.buttons.is_empty(),
+            "removed footer controls must not leave invisible mouse targets"
+        );
         assert!(hit_map.buttons.iter().all(|(action, _)| {
             !matches!(action, UiAction::TogglePause | UiAction::ActivateSelection)
         }));
@@ -15465,8 +15322,34 @@ mod tests {
             "playing subscription videos keep only the active-playback marker"
         );
         assert!(rendered.contains("Expanded fixture description"));
-        assert!(rendered.contains("[R] Refresh videos"));
-        assert_minimal_footer_actions(&hit_map);
+        assert!(rendered.contains("[R] Refresh videos  [A] Autoplay: off"));
+        let refresh_target = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| {
+                (action == &UiAction::RefreshSubscriptionVideos).then_some(*target)
+            })
+            .expect("Refresh videos target");
+        let autoplay_target = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| (action == &UiAction::ToggleAutoplay).then_some(*target))
+            .expect("Autoplay target");
+        assert_eq!(autoplay_target.x, refresh_target.right() + 2);
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: autoplay_target.x,
+                    row: autoplay_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleAutoplay)
+        );
+        assert!(hit_map.buttons.is_empty());
         assert!(
             hit_map
                 .buttons
@@ -15484,6 +15367,13 @@ mod tests {
             "drill-down Details does not need a description toggle"
         );
         assert!(hit_map.subscription_item_rows.width > 0);
+
+        view.autoplay = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw enabled Autoplay beside subscription refresh");
+        assert!(rendered_text(&terminal).contains("[R] Refresh videos  [A] Autoplay: on"));
+        view.autoplay = false;
 
         view.subscriptions.loading = true;
         view.search_animation_frame = 2;
@@ -20920,180 +20810,6 @@ mod tests {
     }
 
     #[test]
-    fn bottom_controls_hide_hotkey_values_without_hiding_action_labels() {
-        let backend = TestBackend::new(240, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let settings = UiSettings {
-            show_hotkeys: false,
-            ..UiSettings::default()
-        };
-        let mut hit_map = HitMap::default();
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &settings,
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(LocalSizeSort::Off),
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-
-        assert!(rendered.contains("Move up"));
-        assert!(rendered.contains("Move down"));
-        assert!(rendered.contains("Volume up"));
-        assert!(rendered.contains("Volume down"));
-        assert!(!rendered.contains("Pause"));
-        assert!(!rendered.contains("Start"));
-        assert!(rendered.contains("Search"));
-        assert!(rendered.contains("Preferences"));
-        assert!(rendered.contains("Autoplay: off"));
-        assert!(rendered.contains("Help"));
-        assert!(!rendered.contains("Sort: relevance"));
-        for hidden in [
-            "[/]", "[A]", "[N]", "[C]", "[p]", "[k]", "[j]", "[↑]", "[↓]", "[Enter]", "[T]",
-            "[Tab]", "[M]",
-        ] {
-            assert!(!rendered.contains(hidden));
-        }
-        assert_minimal_footer_actions(&hit_map);
-        assert!(hit_map.buttons.iter().all(|(action, _)| {
-            !matches!(action, UiAction::TogglePause | UiAction::ActivateSelection)
-        }));
-    }
-
-    #[test]
-    fn bottom_controls_do_not_duplicate_subscription_refresh() {
-        let backend = TestBackend::new(240, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Subscriptions,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    None,
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw subscription footer");
-
-        assert!(!rendered_text(&terminal).contains("[R] Refresh"));
-        assert!(
-            hit_map
-                .buttons
-                .iter()
-                .all(|(action, _)| action != &UiAction::RefreshSubscriptionVideos),
-            "the footer must not duplicate the refresh action shown beside the subscription list"
-        );
-    }
-
-    #[test]
-    fn transient_openrc_notice_replaces_then_restores_the_one_line_footer() {
-        let backend = TestBackend::new(40, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
-        let notice = "Run rc-service gpm start. GPM mouse unavailable; F8 pointer remains active.";
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(LocalSizeSort::Off),
-                    notice,
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw GPM notice");
-
-        assert!(
-            rendered_text(&terminal).contains("Run rc-service gpm start"),
-            "the actionable command must survive narrow footer clipping"
-        );
-        assert!(
-            hit_map.buttons.is_empty(),
-            "replaced controls must not leave invisible click targets"
-        );
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(LocalSizeSort::Off),
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("restore footer controls");
-
-        let restored = rendered_text(&terminal);
-        assert!(!restored.contains("rc-service"));
-        assert!(restored.contains("[/] Search"));
-        assert!(!hit_map.buttons.is_empty());
-    }
-
-    #[test]
     fn transient_footer_notice_never_inherits_playback_start_animation() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -21121,101 +20837,50 @@ mod tests {
     }
 
     #[test]
-    fn one_line_bottom_controls_keep_navigation_click_targets_aligned() {
-        let backend = TestBackend::new(80, 1);
+    fn removed_shortcut_footer_returns_its_row_until_a_notice_is_present() {
+        let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
+        let view = ViewModel {
+            rows: (0..20)
+                .map(|index| RowView {
+                    title: format!("Row {index}"),
+                    ..RowView::default()
+                })
+                .collect(),
+            ..ViewModel::default()
+        };
+        let mut without_notice = HitMap::default();
 
         terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut without_notice))
+            .expect("draw without a footer notice");
+
+        let mut with_notice_view = view;
+        with_notice_view.transient_footer_notice = Some("Temporary notice".to_owned());
+        let mut with_notice = HitMap::default();
+        terminal
             .draw(|frame| {
-                render_buttons(
+                render(
                     frame,
-                    frame.area(),
+                    &with_notice_view,
                     &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(LocalSizeSort::Off),
-                    "",
-                    false,
-                    &mut hit_map,
+                    &mut with_notice,
                 );
             })
-            .expect("draw");
+            .expect("draw with a footer notice");
 
-        assert_minimal_footer_actions(&hit_map);
-        let rendered = rendered_text(&terminal);
-        for label in [
-            "[/] Search",
-            "[A] off",
-            "[k] Up",
-            "[j] Down",
-            "[↑] +",
-            "[↓] -",
-            "[p] Prefs",
-            "[?] Help",
-        ] {
-            assert!(rendered.contains(label), "missing compact label {label}");
-        }
-        assert!(!rendered.contains("[Tab]"));
-        assert!(
-            hit_map
-                .buttons
-                .iter()
-                .all(|(_, target)| target.y == terminal.backend().buffer().area.y)
-        );
-        assert!(hit_map.buttons.iter().all(|(_, target)| {
-            target.x >= terminal.backend().buffer().area.x
-                && target.right() <= terminal.backend().buffer().area.right()
-        }));
-        assert!(hit_map.buttons.iter().all(|(action, _)| {
-            !matches!(action, UiAction::TogglePause | UiAction::ActivateSelection)
-        }));
+        assert_eq!(without_notice.rows.height, with_notice.rows.height + 1);
+        assert!(without_notice.buttons.is_empty());
+        assert!(with_notice.buttons.is_empty());
     }
 
     #[test]
     fn playlist_back_remains_keyboard_accessible_without_footer_duplication() {
-        let backend = TestBackend::new(320, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
         let view = ViewModel {
             screen: Screen::Playlists,
             playlist_back_available: true,
             ..ViewModel::default()
         };
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Playlists,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    true,
-                    None,
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw playlist-entry controls");
-
-        assert!(!rendered_text(&terminal).contains("Back to playlists"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &view),
             Some(UiAction::GoBack)
@@ -21224,13 +20889,6 @@ mod tests {
             key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
             Some(UiAction::GoBack)
         );
-        assert!(
-            hit_map
-                .buttons
-                .iter()
-                .all(|(action, _)| action != &UiAction::GoBack)
-        );
-        assert_minimal_footer_actions(&hit_map);
     }
 
     #[test]
@@ -21278,9 +20936,6 @@ mod tests {
 
     #[test]
     fn playlist_actions_remain_keyboard_accessible_without_footer_duplication() {
-        let backend = TestBackend::new(80, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
         let playlist_item = PlaylistItemView {
             media_id: MediaId::new(SourceKind::YouTube, "playable"),
             title: "Playable".to_owned(),
@@ -21290,34 +20945,6 @@ mod tests {
             playlist_item: Some(playlist_item.clone()),
             ..ViewModel::default()
         };
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    Some(&playlist_item),
-                    false,
-                    false,
-                    None,
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw playable controls");
-
-        let rendered = rendered_text(&terminal);
-        assert!(!rendered.contains("[l] Add to todo"));
-        assert!(!rendered.contains("[P] Playlist…"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleTodoPlaylist)
@@ -21328,160 +20955,6 @@ mod tests {
                 &view
             ),
             Some(UiAction::OpenPlaylistPopup)
-        );
-        assert!(hit_map.buttons.iter().all(|(action, _)| !matches!(
-            action,
-            UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
-        )));
-        assert_minimal_footer_actions(&hit_map);
-    }
-
-    #[test]
-    fn hidden_hotkeys_keep_only_minimal_footer_action_labels() {
-        let backend = TestBackend::new(240, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
-        let playlist_item = PlaylistItemView {
-            media_id: MediaId::new(SourceKind::YouTube, "playable"),
-            title: "Playable".to_owned(),
-            in_todo: true,
-        };
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings {
-                        show_hotkeys: false,
-                        ..UiSettings::default()
-                    },
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    Some(&playlist_item),
-                    false,
-                    false,
-                    None,
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw controls without hotkey values");
-
-        let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Search"));
-        assert!(rendered.contains("Autoplay: off"));
-        assert!(rendered.contains("Preferences"));
-        assert!(rendered.contains("Help"));
-        assert!(!rendered.contains("Remove from todo"));
-        assert!(!rendered.contains("Playlist…"));
-        assert!(!rendered.contains("[l]"));
-        assert!(!rendered.contains("[P]"));
-        assert!(hit_map.buttons.iter().all(|(action, _)| !matches!(
-            action,
-            UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
-        )));
-        assert_minimal_footer_actions(&hit_map);
-    }
-
-    #[test]
-    fn eighty_column_search_footer_keeps_autoplay_visible_and_clickable() {
-        let backend = TestBackend::new(80, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
-        let view = ViewModel::default();
-
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::Search,
-                    YouTubeSearchSort::Relevance,
-                    RadioSort::Name,
-                    false,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    None,
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw compact Search controls");
-
-        let rendered = rendered_text(&terminal);
-        for label in [
-            "[/] Search",
-            "[A] off",
-            "[k] Up",
-            "[j] Down",
-            "[↑] +",
-            "[↓] -",
-            "[p] Prefs",
-            "[?] Help",
-        ] {
-            assert!(
-                rendered.contains(label),
-                "missing compact Search label {label}"
-            );
-        }
-        for expected in [
-            UiAction::BeginSearch,
-            UiAction::ToggleAutoplay,
-            UiAction::MoveSelection(-1),
-            UiAction::MoveSelection(1),
-            UiAction::ChangeVolume(5),
-            UiAction::ChangeVolume(-5),
-            UiAction::OpenPreferences,
-            UiAction::ToggleHelp,
-        ] {
-            assert!(
-                hit_map
-                    .buttons
-                    .iter()
-                    .any(|(action, target)| action == &expected && target.width > 0),
-                "missing visible compact Search action {expected:?}"
-            );
-        }
-        assert_minimal_footer_actions(&hit_map);
-        assert!(!rendered.contains("[Tab]"));
-        assert!(!rendered.contains("[C]"));
-        assert!(!rendered.contains("[S]"));
-        assert!(!rendered.contains("[Space] Pause"));
-        assert!(!rendered.contains("[Enter] Start"));
-        assert!(hit_map.buttons.iter().all(|(action, _)| {
-            !matches!(action, UiAction::TogglePause | UiAction::ActivateSelection)
-        }));
-        let (_, target) = hit_map
-            .buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleAutoplay)
-            .expect("visible Autoplay click target");
-        assert!(target.width > 0);
-        assert!(target.right() <= terminal.backend().buffer().area.right());
-        assert_eq!(
-            mouse_action(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: target.x,
-                    row: target.y,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &hit_map,
-                &view,
-            ),
-            Some(UiAction::ToggleAutoplay)
         );
     }
 
@@ -21565,45 +21038,6 @@ mod tests {
                 .iter()
                 .all(|(action, _)| action != &UiAction::ToggleLocalSizeSort)
         );
-    }
-
-    #[cfg(feature = "youtube-music")]
-    #[test]
-    fn youtube_music_bottom_controls_omit_youtube_video_filters() {
-        let backend = TestBackend::new(240, 2);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut hit_map = HitMap::default();
-        terminal
-            .draw(|frame| {
-                render_buttons(
-                    frame,
-                    frame.area(),
-                    &UiSettings::default(),
-                    &Theme::new(false),
-                    Screen::YouTubeMusic,
-                    YouTubeSearchSort::Newest,
-                    RadioSort::Name,
-                    true,
-                    true,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(LocalSizeSort::Off),
-                    "",
-                    false,
-                    &mut hit_map,
-                );
-            })
-            .expect("draw Music controls");
-        let rendered = rendered_text(&terminal);
-
-        assert!(!rendered.contains("CC only"));
-        assert!(!rendered.contains("Sort:"));
-        assert!(!rendered.contains("Videos/channels"));
-        assert!(rendered.contains("[/] Search"));
-        assert!(!rendered.contains("[d] Download"));
-        assert_minimal_footer_actions(&hit_map);
     }
 
     #[test]
@@ -24618,7 +24052,7 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .all(|(action, _)| action != &UiAction::OpenVideoQr)
         );
-        assert_minimal_footer_actions(&hit_map);
+        assert!(hit_map.buttons.is_empty());
     }
 
     #[cfg(feature = "qr")]

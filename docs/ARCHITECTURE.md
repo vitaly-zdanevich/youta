@@ -824,8 +824,8 @@ emulator reporting. The client does not link `libgpm`, but physical input
 requires an installed and running GPM daemon. PTYs never open GPM. Socket
 absence or disconnect retains the keyboard-driven `F8` pointer. Each new F8
 press forces an immediate socket retry, while the event loop performs no
-background reconnect probes. A failed pointer activation produces a one-time
-transient footer notice. A non-empty `/run/openrc/softlevel` enables the
+background reconnect probes. A failed pointer activation temporarily reserves
+one bottom row for a notice. A non-empty `/run/openrc/softlevel` enables the
 actionable `rc-service gpm start` wording; other init systems and builds
 without GPM remain truthful without that command. When GPM is available,
 physical motion moves the same visible square.

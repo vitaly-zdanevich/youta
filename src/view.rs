@@ -1701,7 +1701,7 @@ pub struct ViewModel {
     pub repeating: bool,
     /// Status or error message.
     pub status_line: String,
-    /// One short-lived notice replacing the footer controls for one line.
+    /// One short-lived notice that temporarily reserves the bottom row.
     ///
     /// This is intentionally separate from [`Self::status_line`]: routine
     /// status changes must not accidentally keep or replace a timed notice.

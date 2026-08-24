@@ -1296,10 +1296,10 @@ running. On Gentoo/OpenRC, start it with `rc-service gpm start` and enable it
 across restarts with `rc-update add gpm default`. A missing or inaccessible
 socket retains keyboard input. Each F8 press retries the socket immediately;
 Youta performs no background reconnect probes. If an activation attempt fails,
-Youta briefly replaces the one-line hotkey footer with a notice. When a
-non-empty OpenRC runtime softlevel identifies the active init system, that
-notice begins with `rc-service gpm start`. Builds without the `gpm` feature
-instead say that GPM support is absent and never suggest starting a daemon.
+Youta briefly reserves one bottom row for a notice. When a non-empty OpenRC
+runtime softlevel identifies the active init system, that notice begins with
+`rc-service gpm start`. Builds without the `gpm` feature instead say that GPM
+support is absent and never suggest starting a daemon.
 
 Youta does not open GPM from `/dev/pts/*`, so terminal emulators retain their
 normal mouse-capture behavior. `F8` provides a keyboard pointer on every
@@ -1413,6 +1413,7 @@ subscription-source root. Youta provides two layouts:
   videos or episodes in the usual list-and-Details view; `Backspace` or `Esc`
   returns to the source list. `[R] Refresh videos` requests a YouTube channel's
   first page again, while `[R] Refresh episodes` reloads an RSS or Atom feed.
+  The `[A] Autoplay: on/off` control follows the refresh action.
 - `split` keeps sources on the left and the selected source's videos or
   episodes on the right. Moving across sources uses only cached rows and makes
   no provider request; press `Enter` to activate the source, loading it
