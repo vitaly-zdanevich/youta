@@ -2252,6 +2252,7 @@ mod tests {
     fn command_is_shell_free_private_and_resource_bounded() {
         let analyzer = FfmpegAudioQualityAnalyzer::new("custom ffmpeg");
         let path = Path::new("/music/name with `shell` syntax.flac");
+        let expected_path = std::path::absolute(path).expect("absolute FFmpeg input path");
         let command = analyzer.command(path).expect("FFmpeg command");
         let arguments: Vec<&OsStr> = command.get_args().collect();
 
@@ -2259,7 +2260,7 @@ mod tests {
         assert!(
             arguments
                 .windows(2)
-                .any(|pair| { pair[0] == OsStr::new("-i") && pair[1] == path.as_os_str() })
+                .any(|pair| pair[0] == OsStr::new("-i") && pair[1] == expected_path.as_os_str())
         );
         assert!(
             arguments
