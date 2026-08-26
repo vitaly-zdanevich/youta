@@ -729,7 +729,12 @@ fn the_window_marks_local_batch_rows_and_hides_unsupported_quality_help() {
         .join("popups.tsx");
     let popup_source = std::fs::read_to_string(&popup_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", popup_path.display()));
-    assert!(popup_source.contains("audioQualitySupported ?"));
+    let guarded_quality_help = popup_source
+        .split_once("...(audioQualitySupported")
+        .and_then(|(_, conditional)| conditional.split_once(": [])"))
+        .map(|(supported, _)| supported)
+        .expect("audio-quality Help row must remain inside a supported-only conditional");
+    assert!(guarded_quality_help.contains("[\"V\", \"analyze selected/marked files or folder\"]"));
     assert!(
         popup_source.contains("[\"Shift+J · Shift+K\", \"mark Local row and move down · up\"]")
     );
