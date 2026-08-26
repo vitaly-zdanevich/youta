@@ -33,6 +33,7 @@ required-features = ["cli"]
 [features]
 default = [
     "app",
+    "audio-quality",
     "gpm",
     "images",
     "qr",
@@ -43,10 +44,10 @@ default = [
 # Yandex Music is included here so normal builds expose the complete top-level
 # source set. `app-core` remains the equivalent profile for distributors and
 # users who intentionally omit the private, experimental Yandex Music API.
-# GPM input, image rendering, QR encoding, and SQLite remain independent
-# features. Keeping `gpm` outside this profile lets system packages map their
-# positive GPM option directly to the Cargo feature without subtracting a
-# transitive default.
+# Audio-quality analysis, GPM input, image rendering, QR encoding, and SQLite
+# remain independent features. Keeping them outside this profile lets system
+# packages map positive options directly to Cargo features without subtracting
+# a transitive default.
 app = [
     "app-core",
     "yandex-music",
@@ -140,6 +141,10 @@ pulseaudio = []
 pipewire = []
 # Lazy local-file peak extraction through the user's existing FFmpeg helper.
 waveform = ["local-browser"]
+# On-demand local-file spectral analysis through the configured FFmpeg helper.
+# Rust performs the bounded FFT analysis; disabling this feature removes both
+# the action and its DSP dependency.
+audio-quality = ["local-browser", "dep:rustfft", "dep:rustix"]
 # Remote artwork fetching and its private on-disk cache, with no renderer.
 #
 # `src/artwork.rs` turns a provider URL into bytes under Youta's network and
@@ -281,6 +286,7 @@ percent-encoding = { version = "2.3.2", optional = true }
 qrcode = { version = "0.14.1", default-features = false, optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["cache"], optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+rustfft = { version = "6.4.1", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"

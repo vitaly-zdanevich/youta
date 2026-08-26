@@ -142,6 +142,55 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
 }
 
 #[test]
+fn audio_quality_is_default_but_remains_a_removable_local_capability() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let audio_quality = feature_closure(&manifest, "audio-quality");
+
+    assert!(default.contains("audio-quality"));
+    assert!(default.contains("dep:rustfft"));
+    assert!(default.contains("dep:rustix"));
+    assert!(audio_quality.contains("local-browser"));
+    assert!(audio_quality.contains("dep:rustfft"));
+    assert!(audio_quality.contains("dep:rustix"));
+    assert!(
+        !application.contains("audio-quality"),
+        "`app` must not make the default-on analyzer impossible to disable"
+    );
+    assert_eq!(
+        manifest["dependencies"]["rustfft"]["optional"].as_bool(),
+        Some(true),
+        "custom builds must be able to omit the FFT implementation"
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("[V] Analyze quality"));
+    assert!(readme.contains("measured cutoff"));
+    assert!(readme.contains("cannot recover an exact original bitrate"));
+    assert!(readme.contains("https://docs.rs/rustfft/"));
+    let architecture = read_repository_file("docs/ARCHITECTURE.md");
+    assert!(architecture.contains("Local audio-quality analysis"));
+    assert!(architecture.contains("replacement-sensitive file identity"));
+
+    let gui_manifest: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("gui/Cargo.toml must remain valid TOML");
+    assert!(
+        gui_manifest["features"]["default"]
+            .as_array()
+            .expect("the GUI declares its default feature profile")
+            .iter()
+            .any(|feature| feature.as_str() == Some("audio-quality")),
+        "ordinary GUI builds must retain the default-on analyzer"
+    );
+    assert_eq!(
+        gui_manifest["features"]["audio-quality"][0].as_str(),
+        Some("youta/audio-quality"),
+        "the GUI feature must forward to the removable shared-core analyzer"
+    );
+}
+
+#[test]
 fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     let manifest = manifest();
     let yandex_music = feature_closure(&manifest, "yandex-music");
@@ -174,8 +223,8 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app,qr"));
-    assert!(readme.contains("--features app-core,images,qr"));
+    assert!(readme.contains("--features app,audio-quality,qr"));
+    assert!(readme.contains("--features app-core,audio-quality,images,qr"));
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -247,17 +296,20 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,gpm,images,qr",
-        "cargo_features=app,gpm,qr",
-        "cargo_features=app,gpm,images",
-        "cargo_features=app,gpm",
-        "cargo_features=app,images,qr",
-        "cargo_features=app,qr",
-        "cargo_features=app,images",
-        "cargo_features=app",
+        "cargo_features=app,audio-quality,gpm,images,qr",
+        "cargo_features=app,audio-quality,gpm,qr",
+        "cargo_features=app,audio-quality,gpm,images",
+        "cargo_features=app,audio-quality,gpm",
+        "cargo_features=app,audio-quality,images,qr",
+        "cargo_features=app,audio-quality,qr",
+        "cargo_features=app,audio-quality,images",
+        "cargo_features=app,audio-quality",
     ] {
         assert!(
-            script.contains(feature_set),
+            script
+                .lines()
+                .map(str::trim)
+                .any(|line| line == feature_set),
             "release script omits feature set `{feature_set}`"
         );
     }
@@ -450,14 +502,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,gpm,images,qr",
-        "app,gpm,qr",
-        "app,gpm,images",
-        "app,gpm",
-        "app,images,qr",
-        "app,qr",
-        "app,images",
-        "app",
+        "app,audio-quality,gpm,images,qr",
+        "app,audio-quality,gpm,qr",
+        "app,audio-quality,gpm,images",
+        "app,audio-quality,gpm",
+        "app,audio-quality,images,qr",
+        "app,audio-quality,qr",
+        "app,audio-quality,images",
+        "app,audio-quality",
     ] {
         assert!(
             ci.contains(&format!(
@@ -712,6 +764,10 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         ci.contains("cargo test --locked -p youta-gui --all-targets"),
         "the desktop crate needs a lane that runs its tests"
     );
+    assert!(
+        ci.contains("cargo test --locked -p youta-gui --all-targets --no-default-features"),
+        "the desktop crate must prove that its default audio analyzer is removable"
+    );
     assert!(ci.contains("libwebkit2gtk-4.1-dev"));
     assert!(ci.contains("libdbus-1-dev"));
     assert!(ci.contains("name: Desktop window (Linux i686)"));
@@ -861,6 +917,16 @@ fn desktop_and_core_versions_remain_in_sync() {
             "the GUI core profile omitted `{required}`"
         );
     }
+    assert_eq!(
+        gui_manifest["features"]["default"][0].as_str(),
+        Some("audio-quality"),
+        "ordinary desktop builds must enable audio quality analysis"
+    );
+    assert_eq!(
+        gui_manifest["features"]["audio-quality"][0].as_str(),
+        Some("youta/audio-quality"),
+        "desktop distributors need one feature that disables the analyzer in both crates"
+    );
     let tauri: serde_json::Value =
         serde_json::from_str(&read_repository_file("gui/tauri.conf.json"))
             .expect("gui/tauri.conf.json must remain valid JSON");

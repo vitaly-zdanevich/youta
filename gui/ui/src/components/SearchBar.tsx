@@ -36,7 +36,7 @@ export function splitAtByte(text: string, byte: number): [string, string] {
  * The query editor for a screen that collects one.
  *
  * This is deliberately not an `<input>`. The reducer owns the query — it holds
- * the text, the insertion point, and the seventeen-level modal precedence that
+ * the text, the insertion point, and the ordered modal precedence that
  * decides what a key means — and `App` forwards keys to it only while no text
  * field has focus. A real input would capture those keys, leaving this window
  * to reimplement editing that already exists in `src/app.rs`, and the two

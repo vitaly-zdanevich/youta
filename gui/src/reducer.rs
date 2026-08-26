@@ -491,7 +491,7 @@ pub fn start<R: Runtime>(
 /// Applies one message, returning whether the reducer should keep running.
 ///
 /// A key is resolved here rather than in the window, against the view the
-/// controller holds right now, which is what makes the seventeen-level modal
+/// controller holds right now, which is what makes the ordered modal
 /// precedence in [`youta::keymap`] mean the same thing in both front-ends. A
 /// media key is resolved here for the narrower version of the same reason: it
 /// arrives from outside the process entirely, and Play means "resume" rather

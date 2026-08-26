@@ -691,6 +691,19 @@ pub struct DetailView {
     pub local_fingerprint_available: bool,
     /// Whether the selected file owns an active fingerprint lookup.
     pub local_fingerprint_pending: bool,
+    /// Whether the current Local selection or marked set can start quality analysis.
+    ///
+    /// Audio files are analyzed directly; directories are discovered
+    /// recursively by the worker.
+    pub local_audio_quality_available: bool,
+    /// Whether an audio-quality batch is active for this Local view.
+    pub local_audio_quality_pending: bool,
+    /// Bounded, presentation-ready result of local audio-quality analysis.
+    ///
+    /// The controller keeps this separate from the provider description so
+    /// front-ends can present the estimate as qualified analysis rather than
+    /// as source metadata.
+    pub local_audio_quality_description: String,
 }
 
 /// Current route inside the Subscriptions screen.
@@ -1384,6 +1397,31 @@ pub struct ErrorPopupView {
     pub github_issue_submission: GitHubIssueSubmissionView,
 }
 
+/// Copyable progress and results for one local audio-quality batch.
+///
+/// A batch may contain one selected file, the explicitly marked Local rows, or
+/// the recursively discovered audio files below one selected folder. The
+/// controller bounds `report`; front-ends only wrap and scroll the text.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct AudioQualityPopupView {
+    /// Short popup-border title.
+    pub title: String,
+    /// Current file or terminal batch summary.
+    pub summary: String,
+    /// Files that reached a terminal result.
+    pub completed: usize,
+    /// Files accepted into the bounded batch.
+    pub total: usize,
+    /// Plain-text, one-record-per-file report copied exactly by the controller.
+    pub report: String,
+    /// Result of the most recent report-copy request.
+    pub action_status: Option<String>,
+    /// Whether the worker may still add results.
+    pub pending: bool,
+    /// Zero-based wrapped-line offset at the top of the report viewport.
+    pub scroll_offset: usize,
+}
+
 /// One public top-level comment rendered in the selected-video popup.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct VideoCommentView {
@@ -1725,6 +1763,10 @@ pub struct ViewModel {
     pub physical_linux_console: bool,
     /// Scrollable diagnostic popup, when a recoverable error is being reported.
     pub error_popup: Option<ErrorPopupView>,
+    /// Whether this build can analyze effective local audio quality.
+    pub audio_quality_supported: bool,
+    /// Immediate progress and copyable results for local quality analysis.
+    pub audio_quality_popup: Option<AudioQualityPopupView>,
     /// Whether the selected YouTube video supports loading public comments.
     pub video_comments_available: bool,
     /// Scrollable bounded public-comments popup.
@@ -1871,6 +1913,8 @@ impl Default for ViewModel {
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
+            audio_quality_supported: cfg!(feature = "audio-quality"),
+            audio_quality_popup: None,
             video_comments_available: false,
             video_comments_popup: None,
             #[cfg(feature = "qr")]
@@ -2075,6 +2119,16 @@ pub enum UiAction {
     ToggleWaveform,
     /// Fingerprint the selected local audio file and query AcoustID.
     FingerprintLocalAudio,
+    /// Analyze the selected local audio file, marked entries, or selected folder.
+    AnalyzeLocalAudioQuality,
+    /// Cancel the active local audio-quality batch without discarding completed rows.
+    CancelAudioQualityAnalysis,
+    /// Copy the complete local audio-quality report through the front-end clipboard seam.
+    CopyAudioQualityReport,
+    /// Close a terminal local audio-quality result popup.
+    DismissAudioQualityPopup,
+    /// Set the renderer-clamped wrapped-line offset of the audio-quality report.
+    SetAudioQualityPopupScroll(usize),
     /// Toggle repeat-current-item.
     ToggleRepeat,
     /// Toggle automatic continuation within the active source list.
@@ -2294,7 +2348,7 @@ pub enum UiAction {
     ConfirmDownloadedTrash,
     /// Open the destination chooser for marked entries or the current row.
     BeginLocalMove,
-    /// Extend the Local move batch and selection by one signed row.
+    /// Toggle one Local batch mark and move the selection by one signed row.
     ExtendLocalMoveSelection(i32),
     /// Select one exact row inside the Local Move destination browser.
     SelectLocalMoveDestination(usize),
@@ -2359,6 +2413,8 @@ pub enum ClipboardSubject {
     Link,
     /// A range of Details text, measured in Unicode scalar values.
     DetailsText(usize),
+    /// A local audio-quality report, measured in Unicode scalar values.
+    AudioQualityReport(usize),
 }
 
 /// Text the controller decided to copy but deliberately does not copy itself.
@@ -2598,10 +2654,48 @@ mod tests {
             UiAction::MoveSelection(1),
             UiAction::SubmitSearch,
             UiAction::SeekPercent(42.5),
+            UiAction::AnalyzeLocalAudioQuality,
+            UiAction::CancelAudioQualityAnalysis,
+            UiAction::CopyAudioQualityReport,
+            UiAction::DismissAudioQualityPopup,
+            UiAction::SetAudioQualityPopupScroll(3),
         ];
         for action in actions {
             let encoded = serde_json::to_string(&action).expect("actions must serialize");
             assert!(!encoded.is_empty(), "{action:?} produced no payload");
         }
+    }
+
+    #[test]
+    fn audio_quality_popup_serializes_copyable_batch_progress() {
+        let view = ViewModel {
+            audio_quality_supported: true,
+            audio_quality_popup: Some(AudioQualityPopupView {
+                title: "Audio quality analysis".to_owned(),
+                summary: "Analyzing 2 audio files".to_owned(),
+                completed: 1,
+                total: 2,
+                report: "one.flac\tVerdict: band-limited audio".to_owned(),
+                action_status: Some("Copied with OSC 52".to_owned()),
+                pending: true,
+                scroll_offset: 4,
+            }),
+            ..ViewModel::default()
+        };
+
+        let json = serde_json::to_value(view).expect("serialize audio-quality popup");
+        assert_eq!(json["audio_quality_supported"], true);
+        assert_eq!(json["audio_quality_popup"]["completed"], 1);
+        assert_eq!(json["audio_quality_popup"]["total"], 2);
+        assert_eq!(json["audio_quality_popup"]["pending"], true);
+        assert_eq!(json["audio_quality_popup"]["scroll_offset"], 4);
+        assert_eq!(
+            json["audio_quality_popup"]["action_status"],
+            "Copied with OSC 52"
+        );
+        assert_eq!(
+            json["audio_quality_popup"]["report"],
+            "one.flac\tVerdict: band-limited audio"
+        );
     }
 }

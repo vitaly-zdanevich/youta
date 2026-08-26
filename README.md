@@ -52,6 +52,28 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   inevitable intermediate compactions for long files, and retains only a
   bounded min/max envelope in RAM; clicking any waveform row starts or seeks
   the exact selected file at that position.
+  `[V] Analyze quality` explicitly checks a selected local audio file, every
+  marked file or folder, or the selected folder for a stable high-frequency
+  cutoff. Folder traversal is deterministic, never follows symbolic links,
+  and analyzes at most 256 discovered audio files sequentially. A progress
+  popup retains a bounded report that can be copied while work continues or
+  after it finishes. The default-on `audio-quality` feature streams bounded PCM
+  from the existing `ffmpeg` helper and uses
+  [RustFFT](https://docs.rs/rustfft/) locally; no filename, audio, or result is
+  uploaded. Details keeps the factual current codec, sample rate, channel
+  count, and encoded bitrate separate from the qualitative assessment. It
+  reports the measured cutoff, evidence strength, and agreement across active
+  FFT windows from up to the leading 30 seconds. It does not convert bandwidth
+  into a codec-neutral source bitrate: Opus, AAC, MP3, and other encoders use
+  different low-pass behaviour. If the current sample rate or channel count is
+  unavailable, or a stream has more than two channels and `ffmpeg` must
+  normalize it to stereo, the cutoff remains visible but source-history
+  inference is suppressed.
+  Analysis cannot recover an exact original bitrate: a naturally
+  band-limited master can resemble a lossy encode, while an encoder that keeps
+  full bandwidth can leave no detectable cutoff. Youta therefore reports
+  evidence and uncertainty, never “genuine lossless,” a recovered source
+  bitrate, or a proven codec history.
   For an audio file, `[f] Fingerprint` explicitly runs Chromaprint's official
   `fpcalc` helper off the UI thread and submits only its encoded fingerprint
   and duration to [AcoustID](https://acoustid.org/). Ranked
@@ -486,7 +508,8 @@ cargo test --locked --all-targets
 cargo run --locked -- --help
 ```
 
-The default build expects `mpv` and `yt-dlp` at runtime for online playback.
+The default build expects `mpv` and `yt-dlp` at runtime for online playback,
+and `ffmpeg` for explicit local audio-quality analysis and waveform generation.
 It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
 audio identification. On Gentoo, the `tools` USE flag is disabled by default;
 enable it when emerging
@@ -510,7 +533,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,qr
+	--features app,audio-quality,qr
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -521,14 +544,15 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,images,qr
+	--features app-core,audio-quality,images,qr
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
 `qr` to remove QR encoding and its shortcut from any custom build. Cargo
 features are additive: `app-core` is the complete profile without
-`yandex-music`, and `gpm` is the positive opt-in for virtual-console mouse
-input. The ordinary default feature set still enables both Yandex Music and
+`yandex-music`, `audio-quality` is the independently removable local analyzer,
+and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
+default feature set still enables audio-quality analysis, Yandex Music, and
 GPM.
 
 Both configurations use human-readable TOML persistence. SQLite is included
@@ -592,8 +616,9 @@ backend. Both the TUI and `youta search` use this selection. The AcoustID key
 enables the Local Details `[f] Fingerprint` action; `fpcalc_executable` in
 `config.toml` can select a non-default Chromaprint helper path. `FFmpeg` and
 `FFprobe` are named the same way, by `ffmpeg_executable` and
-`ffprobe_executable`: the first draws local waveforms, extracts the midpoint
-frame a local video is previewed by, and decodes tracker modules; the second
+`ffprobe_executable`: the first draws local waveforms, analyzes local audio
+quality, extracts the midpoint frame a local video is previewed by, and decodes
+tracker modules; the second
 reads codec, bitrate, and exact duration for local media. Both default to the
 bare name, which a Unix installation puts on `PATH`; a Windows build of FFmpeg
 is usually unpacked rather than installed, so a full path is the normal setting
@@ -606,11 +631,11 @@ For a small local-only build:
 
 ```sh
 cargo build --release --no-default-features \
-	--features tui,local,waveform,backend-mpv
+	--features tui,local,audio-quality,waveform,backend-mpv
 ```
 
-This intentionally omits terminal thumbnails while retaining local waveform
-generation. A custom
+This intentionally omits terminal thumbnails while retaining local quality
+analysis and waveform generation. A custom
 `--no-default-features` build must list `images` explicitly when artwork is
 wanted.
 
@@ -1282,7 +1307,7 @@ known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
 dependencies while retaining the other defaults, build with
-`--no-default-features --features app,qr`. For a smaller custom build, omit
+`--no-default-features --features app,audio-quality,qr`. For a smaller custom build, omit
 `images`; include it explicitly to restore rendering. The rendering integration
 uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
@@ -1767,6 +1792,12 @@ it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
 arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
+The source package also maps default-enabled `audio-quality` directly to the
+Cargo feature, so `USE="-audio-quality"` removes its analyzer and RustFFT
+dependency. Prebuilt executables contain the fixed upstream feature set and
+keep audio-quality analysis enabled; offering a binary USE switch would require
+another copy of every Linux release variant rather than changing installed
+code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.

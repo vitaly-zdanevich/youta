@@ -11,6 +11,13 @@ publish = false
 [lints.rust]
 unsafe_code = "forbid"
 
+[features]
+default = ["audio-quality"]
+# Forward the source package's independently removable analyzer. Release and
+# ordinary GUI builds retain it through this crate's defaults; distributors
+# can disable both layers with `--no-default-features`.
+audio-quality = ["youta/audio-quality"]
+
 [dependencies]
 # The reducer, the view contract, persistence, providers, and playback come
 # from the shared crate. `controller` deliberately excludes the terminal

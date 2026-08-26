@@ -12,7 +12,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
-#[cfg(all(feature = "yt-dlp", target_os = "linux"))]
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,6 +35,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 #[cfg(any(
     feature = "acoustid",
+    feature = "audio-quality",
     feature = "apple-podcasts",
     feature = "librivox",
     feature = "rss",
@@ -53,6 +53,13 @@ use crate::audio_identification::{
     AudioIdentificationCancellation, AudioIdentificationError, AudioIdentifier, FpcalcConfig,
     FpcalcFingerprintRunner, LocalAudioIdentifier, MusicBrainzCandidate, SystemFpcalcProcess,
     UreqAcoustIdTransport,
+};
+#[cfg(feature = "audio-quality")]
+use crate::audio_quality::{
+    AudioQualityAnalyzer, AudioQualityCancellation, AudioQualityError, AudioQualityIdentity,
+    AudioQualityReport, AudioQualityRequest, AudioQualityTargetCollectionError,
+    AudioQualityTargetLimits, DeclaredEncoding, FfmpegAudioQualityAnalyzer,
+    collect_audio_quality_targets,
 };
 use crate::build_info::{self, RuntimeProvenance};
 use crate::config::{
@@ -202,6 +209,8 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
+#[cfg(feature = "audio-quality")]
+use crate::view::AudioQualityPopupView;
 use crate::view::DetailLinkInternalTarget;
 #[cfg(any(feature = "librivox", feature = "yandex-music"))]
 use crate::view::DetailLinkPresentation;
@@ -1154,6 +1163,16 @@ const MAX_LOCAL_FFPROBE_JSON_BYTES: usize = 64 * 1024;
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CACHED_LOCAL_MEDIA_ITEMS: usize = 128;
+#[cfg(feature = "audio-quality")]
+const MAX_CACHED_LOCAL_AUDIO_QUALITY_REPORTS: usize = 64;
+#[cfg(feature = "audio-quality")]
+const LOCAL_AUDIO_QUALITY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "audio-quality")]
+const MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES: usize = 2 * 1024;
+#[cfg(feature = "audio-quality")]
+const MAX_LOCAL_AUDIO_QUALITY_BATCH_PATH_BYTES: usize = 2 * 1024;
+#[cfg(feature = "audio-quality")]
+const MAX_LOCAL_AUDIO_QUALITY_BATCH_REPORT_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(feature = "acoustid")]
 const MAX_CACHED_LOCAL_FINGERPRINTS: usize = 64;
 #[cfg(feature = "acoustid")]
@@ -1215,9 +1234,50 @@ struct SystemLocalMediaProbe {
     executable: PathBuf,
 }
 
+/// Reads one FFprobe JSON document without allowing inherited pipes to block
+/// the controller after the direct helper exits.
+fn capture_local_ffprobe_stdout(mut stdout: std::process::ChildStdout) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut within_limit = true;
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if output.len().saturating_add(read) <= MAX_LOCAL_FFPROBE_JSON_BYTES {
+                    output.extend_from_slice(&buffer[..read]);
+                } else {
+                    // Keep draining so the helper cannot block on a full pipe,
+                    // but never retain an unbounded response in memory.
+                    within_limit = false;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    within_limit.then_some(output)
+}
+
+/// Ends one FFprobe invocation and reaps its direct process.
+fn terminate_local_ffprobe(child: &mut std::process::Child) {
+    #[cfg(feature = "audio-quality")]
+    crate::child_process::terminate_tree(child);
+    #[cfg(not(feature = "audio-quality"))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl LocalMediaProbe for SystemLocalMediaProbe {
     fn probe(&mut self, path: &Path) -> Option<LocalTechnicalMetadata> {
-        let mut child = crate::child_process::quiet(&mut Command::new(&self.executable))
+        let deadline = Instant::now().checked_add(LOCAL_FFPROBE_TIMEOUT)?;
+        // FFmpeg recognizes protocol prefixes before filesystem semantics.
+        // An absolute path makes names such as `concat:recording.flac`
+        // unambiguously local without changing the path retained in Details.
+        let input = std::path::absolute(path).ok()?;
+        let mut command = Command::new(&self.executable);
+        command
             .args([
                 "-v",
                 "error",
@@ -1229,37 +1289,67 @@ impl LocalMediaProbe for SystemLocalMediaProbe {
                 "-of",
                 "json",
             ])
-            .arg(path)
+            .arg(input)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let deadline = Instant::now().checked_add(LOCAL_FFPROBE_TIMEOUT)?;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                Ok(None) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    thread::sleep(remaining.min(LOCAL_FFPROBE_POLL_INTERVAL));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        }
-        let output = child.wait_with_output().ok()?;
-        if !output.status.success() || output.stdout.len() > MAX_LOCAL_FFPROBE_JSON_BYTES {
+            .stderr(Stdio::null());
+        #[cfg(feature = "audio-quality")]
+        crate::child_process::supervised(&mut command);
+        #[cfg(not(feature = "audio-quality"))]
+        crate::child_process::quiet(&mut command);
+        let mut child = command.spawn().ok()?;
+        let stdout = child.stdout.take()?;
+        let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
+        if thread::Builder::new()
+            .name("youta-local-ffprobe-output".to_owned())
+            .spawn(move || {
+                let _ = stdout_sender.send(capture_local_ffprobe_stdout(stdout));
+            })
+            .is_err()
+        {
+            terminate_local_ffprobe(&mut child);
             return None;
         }
-        parse_local_ffprobe_output(path, &output.stdout)
+        let mut exited_successfully = false;
+        let mut captured_stdout = None;
+        loop {
+            match stdout_receiver.try_recv() {
+                Ok(Some(output)) => captured_stdout = Some(output),
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    terminate_local_ffprobe(&mut child);
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if !exited_successfully {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            terminate_local_ffprobe(&mut child);
+                            return None;
+                        }
+                        // The direct helper is done. End any descendant still
+                        // holding stdout so EOF cannot extend this operation.
+                        terminate_local_ffprobe(&mut child);
+                        exited_successfully = true;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        terminate_local_ffprobe(&mut child);
+                        return None;
+                    }
+                }
+            }
+            if exited_successfully && let Some(output) = captured_stdout.as_deref() {
+                return parse_local_ffprobe_output(path, output);
+            }
+            if Instant::now() >= deadline {
+                terminate_local_ffprobe(&mut child);
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(LOCAL_FFPROBE_POLL_INTERVAL));
+        }
     }
 }
 
@@ -1338,6 +1428,90 @@ struct CachedLocalMediaItem {
 struct LocalMediaMetadataResponse {
     path: PathBuf,
     result: Option<(LocalFileIdentity, LocalMediaItem)>,
+}
+
+/// Replacement-sensitive RAM key for one explicit local-audio quality analysis.
+#[cfg(feature = "audio-quality")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LocalAudioQualityCacheKey {
+    path: PathBuf,
+    identity: AudioQualityIdentity,
+}
+
+/// Sole generation-owned audio-quality request visible to the controller.
+#[cfg(feature = "audio-quality")]
+struct PendingLocalAudioQuality {
+    generation: u64,
+    media_id: MediaId,
+    key: LocalAudioQualityCacheKey,
+    /// Present after probed metadata has allowed the FFmpeg job to start.
+    cancellation: Option<AudioQualityCancellation>,
+    /// The user requested cancellation while a worker completion may be queued.
+    cancel_requested: bool,
+}
+
+/// One recursively collected or marked analysis batch owned by its generation.
+#[cfg(feature = "audio-quality")]
+struct PendingLocalAudioQualityBatch {
+    generation: u64,
+    cancellation: AudioQualityCancellation,
+    completed: usize,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    report_truncated: bool,
+    /// The user requested cancellation while completed rows may still be queued.
+    cancel_requested: bool,
+}
+
+/// Commands accepted by the dedicated local-audio quality worker.
+#[cfg(feature = "audio-quality")]
+enum LocalAudioQualityWorkerRequest {
+    Analyze {
+        generation: u64,
+        request: AudioQualityRequest,
+        cancellation: AudioQualityCancellation,
+    },
+    AnalyzeBatch {
+        generation: u64,
+        roots: Vec<PathBuf>,
+        limits: AudioQualityTargetLimits,
+        cancellation: AudioQualityCancellation,
+    },
+    Shutdown,
+}
+
+/// Identity-owned completion returned by the local-audio quality worker.
+#[cfg(feature = "audio-quality")]
+struct LocalAudioQualityWorkerResponse {
+    generation: u64,
+    path: PathBuf,
+    result: Result<AudioQualityReport, AudioQualityError>,
+}
+
+/// Collection, progress, and terminal events from one sequential batch.
+#[cfg(feature = "audio-quality")]
+enum LocalAudioQualityBatchWorkerResponse {
+    TargetsCollected {
+        generation: u64,
+        total: usize,
+    },
+    ItemAnalyzed {
+        generation: u64,
+        index: usize,
+        total: usize,
+        path: PathBuf,
+        result: Result<AudioQualityReport, AudioQualityError>,
+    },
+    CollectionFailed {
+        generation: u64,
+        error: AudioQualityTargetCollectionError,
+    },
+    Finished {
+        generation: u64,
+        total: usize,
+        stopped_for_missing_ffmpeg: bool,
+    },
 }
 
 /// Replacement-sensitive RAM key for one explicit local-audio lookup.
@@ -4015,6 +4189,12 @@ pub struct AppController {
     pending_clipboard_request: Option<ClipboardRequest>,
     /// Subject of the copy a front-end has taken but not yet reported on.
     awaiting_clipboard_subject: Option<ClipboardSubject>,
+    /// Report revision attached to a quality copy not yet taken by a front-end.
+    #[cfg(feature = "audio-quality")]
+    pending_audio_quality_clipboard_revision: Option<u64>,
+    /// Report revision attached to the quality copy awaiting its result.
+    #[cfg(feature = "audio-quality")]
+    awaiting_audio_quality_clipboard_revision: Option<u64>,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -4029,6 +4209,54 @@ pub struct AppController {
     local_media_metadata_sender: Sender<LocalMediaMetadataResponse>,
     /// Completed selected-file metadata drained by the TUI event loop.
     local_media_metadata_responses: Receiver<LocalMediaMetadataResponse>,
+    /// Latest-only requests for the dedicated local-audio quality worker.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_requests: Option<Sender<LocalAudioQualityWorkerRequest>>,
+    /// Controller-side receiver used to replace one queued stale request.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_request_drain: Receiver<LocalAudioQualityWorkerRequest>,
+    /// Identity-bound quality completions drained by the UI event loop.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_responses: Receiver<LocalAudioQualityWorkerResponse>,
+    /// Recursive collection and sequential batch progress from the same worker.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_batch_responses: Receiver<LocalAudioQualityBatchWorkerResponse>,
+    /// Join handle for the sole FFmpeg audio-quality worker.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner rejecting stale quality completions.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_generation: u64,
+    /// Analysis generation allowed to mutate the currently visible popup.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_popup_owner_generation: Option<u64>,
+    /// Monotonic report revision rejecting stale clipboard completions.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_popup_revision: u64,
+    /// Exact selected local audio file currently being analyzed.
+    #[cfg(feature = "audio-quality")]
+    pending_local_audio_quality: Option<PendingLocalAudioQuality>,
+    /// Exact recursively collected or marked batch currently being analyzed.
+    #[cfg(feature = "audio-quality")]
+    pending_local_audio_quality_batch: Option<PendingLocalAudioQualityBatch>,
+    /// Injectable recursive collection bounds used by the worker.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_target_limits: AudioQualityTargetLimits,
+    /// RAM-only identity-bound successful analysis cache.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_cache: HashMap<LocalAudioQualityCacheKey, Arc<AudioQualityReport>>,
+    /// Least-recently-used order for bounded analysis eviction.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_cache_order: VecDeque<LocalAudioQualityCacheKey>,
+    /// Exact file identity represented by the visible quality result.
+    #[cfg(feature = "audio-quality")]
+    displayed_local_audio_quality: Option<LocalAudioQualityCacheKey>,
+    /// Earliest time a displayed result should revalidate its file.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_revalidate_at: Option<Instant>,
+    /// Whether a disconnected analysis worker has already been reported.
+    #[cfg(feature = "audio-quality")]
+    local_audio_quality_disconnect_reported: bool,
     /// Latest-only requests for the dedicated local-audio identifier.
     #[cfg(feature = "acoustid")]
     local_fingerprint_requests: Option<Sender<LocalFingerprintWorkerRequest>>,
@@ -4141,8 +4369,8 @@ pub struct AppController {
     /// Saved Local row waiting for the initial listing that restores the waveform.
     #[cfg(feature = "waveform")]
     pending_restored_local_waveform_selection: Option<(u64, usize)>,
-    /// Exact current-directory entries toggled into the next move batch.
-    #[cfg(feature = "local-move")]
+    /// Exact current-directory entries toggled into the next local batch action.
+    #[cfg(any(feature = "local-move", feature = "audio-quality"))]
     local_move_marks: HashSet<PathBuf>,
     /// Generation rejecting destination or move results for an older popup.
     #[cfg(feature = "local-move")]
@@ -4481,6 +4709,15 @@ impl AppController {
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
+        #[cfg(feature = "audio-quality")]
+        let (local_audio_quality_request_sender, local_audio_quality_request_receiver) = bounded(1);
+        #[cfg(feature = "audio-quality")]
+        let local_audio_quality_request_drain = local_audio_quality_request_receiver.clone();
+        #[cfg(feature = "audio-quality")]
+        let (local_audio_quality_response_sender, local_audio_quality_responses) = unbounded();
+        #[cfg(feature = "audio-quality")]
+        let (local_audio_quality_batch_response_sender, local_audio_quality_batch_responses) =
+            unbounded();
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
         #[cfg(feature = "acoustid")]
@@ -4643,9 +4880,38 @@ impl AppController {
         let local_fingerprint_requests = local_fingerprint_thread
             .as_ref()
             .map(|_| local_fingerprint_request_sender);
-        // Both helper paths are read before `config` is moved into the
-        // controller, because the workers that use them outlive this scope.
+        // Helper paths are read before `config` is moved into the controller,
+        // because the workers that use them outlive this scope.
         let local_media_ffprobe = config.providers.ffprobe_executable.clone();
+        let local_media_loader: Arc<dyn LocalMediaLoader> = Arc::new(SystemLocalMediaLoader {
+            ffprobe_executable: local_media_ffprobe,
+        });
+        #[cfg(feature = "audio-quality")]
+        let audio_quality_ffmpeg = config.providers.ffmpeg_executable.clone();
+        #[cfg(feature = "audio-quality")]
+        let local_audio_quality_media_loader = Arc::clone(&local_media_loader);
+        #[cfg(feature = "audio-quality")]
+        let local_audio_quality_thread_result = thread::Builder::new()
+            .name("youta-local-audio-quality".to_owned())
+            .spawn(move || {
+                local_audio_quality_worker(
+                    local_audio_quality_request_receiver,
+                    local_audio_quality_response_sender,
+                    local_audio_quality_batch_response_sender,
+                    Box::new(FfmpegAudioQualityAnalyzer::new(audio_quality_ffmpeg)),
+                    local_audio_quality_media_loader,
+                );
+            });
+        #[cfg(feature = "audio-quality")]
+        let (local_audio_quality_thread, local_audio_quality_thread_error) =
+            match local_audio_quality_thread_result {
+                Ok(handle) => (Some(handle), None),
+                Err(error) => (None, Some(error)),
+            };
+        #[cfg(feature = "audio-quality")]
+        let local_audio_quality_requests = local_audio_quality_thread
+            .as_ref()
+            .map(|_| local_audio_quality_request_sender);
         #[cfg(feature = "waveform")]
         let waveform_ffmpeg = config.providers.ffmpeg_executable.clone();
         #[cfg(feature = "waveform")]
@@ -5105,15 +5371,49 @@ impl AppController {
             pending_text_file_open: None,
             pending_clipboard_request: None,
             awaiting_clipboard_subject: None,
+            #[cfg(feature = "audio-quality")]
+            pending_audio_quality_clipboard_revision: None,
+            #[cfg(feature = "audio-quality")]
+            awaiting_audio_quality_clipboard_revision: None,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
             pending_local_media_metadata: None,
-            local_media_loader: Arc::new(SystemLocalMediaLoader {
-                ffprobe_executable: local_media_ffprobe,
-            }),
+            local_media_loader,
             local_media_metadata_sender,
             local_media_metadata_responses,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_requests,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_request_drain,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_responses,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_batch_responses,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_thread,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_generation: 0,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_popup_owner_generation: None,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_popup_revision: 0,
+            #[cfg(feature = "audio-quality")]
+            pending_local_audio_quality: None,
+            #[cfg(feature = "audio-quality")]
+            pending_local_audio_quality_batch: None,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_target_limits: AudioQualityTargetLimits::default(),
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_cache: HashMap::new(),
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_cache_order: VecDeque::new(),
+            #[cfg(feature = "audio-quality")]
+            displayed_local_audio_quality: None,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_revalidate_at: None,
+            #[cfg(feature = "audio-quality")]
+            local_audio_quality_disconnect_reported: false,
             #[cfg(feature = "acoustid")]
             local_fingerprint_requests,
             #[cfg(feature = "acoustid")]
@@ -5185,7 +5485,7 @@ impl AppController {
             pending_local_reselection: None,
             #[cfg(feature = "waveform")]
             pending_restored_local_waveform_selection: None,
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "audio-quality"))]
             local_move_marks: HashSet::new(),
             #[cfg(feature = "local-move")]
             local_move_generation: 0,
@@ -5478,6 +5778,13 @@ impl AppController {
         }
         if let Some(error) = local_browse_thread_error {
             controller.show_error("Could not start the Local browser worker", &error);
+        }
+        #[cfg(feature = "audio-quality")]
+        if let Some(error) = local_audio_quality_thread_error {
+            controller.show_actionable_message(
+                "Audio quality analysis unavailable",
+                format!("Could not start the local audio-quality worker: {error}"),
+            );
         }
         #[cfg(feature = "acoustid")]
         if let Some(error) = local_fingerprint_thread_error {
@@ -12686,6 +12993,24 @@ impl AppController {
             let Some((identity, item)) = result
                 .filter(|(identity, _)| local_file_identity(&path).as_ref() == Some(identity))
             else {
+                #[cfg(feature = "audio-quality")]
+                if self
+                    .pending_local_audio_quality
+                    .as_ref()
+                    .is_some_and(|pending| pending.key.path == path)
+                {
+                    self.cancel_local_audio_quality();
+                    self.local_audio_quality_popup_owner_generation = None;
+                    if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                        popup.pending = false;
+                        popup.summary =
+                            "The selected file changed or its metadata could not be read"
+                                .to_owned();
+                    }
+                    self.apply_local_audio_quality_details();
+                    self.view.status_line =
+                        "The local audio file changed; select it and try again".to_owned();
+                }
                 if self
                     .selected_local_metadata_path()
                     .as_deref()
@@ -12744,6 +13069,8 @@ impl AppController {
                 | Screen::Statistics => {}
             }
         }
+        #[cfg(feature = "audio-quality")]
+        self.start_pending_local_audio_quality();
     }
 
     /// Loads one lazily selected recursive-scan result and refreshes its row.
@@ -12934,7 +13261,7 @@ impl AppController {
                 self.sort_local_listing();
                 self.view.selected = selected;
                 self.select_local_path(reselected_path.as_deref());
-                #[cfg(feature = "local-move")]
+                #[cfg(any(feature = "local-move", feature = "audio-quality"))]
                 {
                     let visible_paths = self
                         .local_listing
@@ -12976,7 +13303,7 @@ impl AppController {
         directory: PathBuf,
         reselect_child: Option<PathBuf>,
     ) {
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         {
             let leaves_current_directory = self
                 .local_listing
@@ -13518,9 +13845,9 @@ impl AppController {
                 .and_then(|id| self.local_progress_cache.get(id))
                 .copied()
                 .unwrap_or_default();
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "audio-quality"))]
             let local_marked = self.local_move_marks.contains(&entry.path);
-            #[cfg(not(feature = "local-move"))]
+            #[cfg(not(any(feature = "local-move", feature = "audio-quality")))]
             let local_marked = false;
             let subtitle = match entry.kind {
                 LocalEntryKind::Directory => self
@@ -13574,8 +13901,12 @@ impl AppController {
 
         #[cfg(feature = "acoustid")]
         self.cancel_stale_local_fingerprint();
+        #[cfg(feature = "audio-quality")]
+        self.cancel_stale_local_audio_quality();
         let Some(listing) = self.local_listing.as_ref() else {
             self.view.details = None;
+            #[cfg(feature = "audio-quality")]
+            self.apply_local_audio_quality_details();
             return;
         };
         if self.view.selected == 0
@@ -13587,12 +13918,16 @@ impl AppController {
                 description: format!("Full path: {}", parent.display()),
                 ..DetailView::default()
             });
+            #[cfg(feature = "audio-quality")]
+            self.apply_local_audio_quality_details();
             #[cfg(all(feature = "acoustid", feature = "wikidata"))]
             self.invalidate_wikidata_lookup();
             return;
         }
         let Some(index) = self.local_entry_index() else {
             self.view.details = None;
+            #[cfg(feature = "audio-quality")]
+            self.apply_local_audio_quality_details();
             return;
         };
         let entry = listing.entries[index].clone();
@@ -13622,6 +13957,8 @@ impl AppController {
                 local_renamable: cfg!(feature = "local-rename"),
                 local_movable: cfg!(feature = "local-move"),
                 local_trashable: cfg!(feature = "local-trash"),
+                local_audio_quality_available: cfg!(feature = "audio-quality")
+                    && entry.kind == LocalEntryKind::Audio,
                 ..DetailView::default()
             });
             if metadata_pending {
@@ -13666,6 +14003,8 @@ impl AppController {
                 ..DetailView::default()
             });
         }
+        #[cfg(feature = "audio-quality")]
+        self.apply_local_audio_quality_details();
         #[cfg(feature = "acoustid")]
         {
             let first_recording = self.apply_local_fingerprint_details();
@@ -15790,10 +16129,19 @@ impl AppController {
 
     /// Hands one copy to the front-end that owns the platform clipboard.
     fn request_clipboard_copy(&mut self, text: String, subject: ClipboardSubject) {
+        #[cfg(feature = "audio-quality")]
+        {
+            self.pending_audio_quality_clipboard_revision =
+                matches!(subject, ClipboardSubject::AudioQualityReport(_))
+                    .then_some(self.local_audio_quality_popup_revision);
+        }
         self.pending_clipboard_request = Some(ClipboardRequest { text, subject });
         self.view.status_line = match subject {
             ClipboardSubject::Link => "Copying the link…".to_owned(),
             ClipboardSubject::DetailsText(count) => format!("Copying {count} characters…"),
+            ClipboardSubject::AudioQualityReport(count) => {
+                format!("Copying an audio quality report ({count} characters)…")
+            }
         };
     }
 
@@ -17964,6 +18312,644 @@ impl AppController {
     }
 
     /// Returns the exact selected local audio file and its replacement identity.
+    #[cfg(feature = "audio-quality")]
+    fn selected_local_audio_quality_target(&self) -> Option<(MediaId, LocalAudioQualityCacheKey)> {
+        if self.view.screen != Screen::Local {
+            return None;
+        }
+        let media_id = self
+            .view
+            .details
+            .as_ref()?
+            .media_id
+            .as_ref()
+            .filter(|media_id| media_id.source == SourceKind::Local)?
+            .clone();
+        let entry = self
+            .local_entry_index()
+            .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
+            .filter(|entry| entry.kind == crate::local_browser::LocalEntryKind::Audio)?;
+        if local_media_id(&entry.path) != media_id {
+            return None;
+        }
+        let identity = AudioQualityIdentity::from_path(&entry.path).ok()?;
+        Some((
+            media_id,
+            LocalAudioQualityCacheKey {
+                path: entry.path.clone(),
+                identity,
+            },
+        ))
+    }
+
+    /// Resolves the explicit Local roots owned by the current batch action.
+    ///
+    /// Marks take precedence over the cursor so Shift+J/K describes one exact
+    /// batch. Without marks, the current real file or directory is the root;
+    /// the synthetic parent row remains navigation-only.
+    #[cfg(feature = "audio-quality")]
+    fn selected_local_audio_quality_roots(&self) -> Vec<PathBuf> {
+        if self.view.screen != Screen::Local {
+            return Vec::new();
+        }
+        let Some(listing) = self.local_listing.as_ref() else {
+            return Vec::new();
+        };
+        let mut roots = listing
+            .entries
+            .iter()
+            .filter(|entry| self.local_move_marks.contains(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        if roots.is_empty()
+            && let Some(index) = self.local_entry_index()
+            && let Some(entry) = listing.entries.get(index)
+        {
+            roots.push(entry.path.clone());
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Reports whether the current marks or cursor contain an analyzable root.
+    #[cfg(feature = "audio-quality")]
+    fn selected_local_audio_quality_available(&self) -> bool {
+        if self.view.screen != Screen::Local {
+            return false;
+        }
+        let Some(listing) = self.local_listing.as_ref() else {
+            return false;
+        };
+        let is_supported = |entry: &crate::local_browser::LocalEntry| {
+            matches!(
+                entry.kind,
+                crate::local_browser::LocalEntryKind::Audio
+                    | crate::local_browser::LocalEntryKind::Directory
+            )
+        };
+        let marked = listing
+            .entries
+            .iter()
+            .filter(|entry| self.local_move_marks.contains(&entry.path))
+            .collect::<Vec<_>>();
+        if !marked.is_empty() {
+            return marked.into_iter().any(is_supported);
+        }
+        self.local_entry_index()
+            .and_then(|index| listing.entries.get(index))
+            .is_some_and(is_supported)
+    }
+
+    /// Returns the best declared encoding known for the exact selected file.
+    #[cfg(feature = "audio-quality")]
+    fn selected_local_audio_declared_encoding(
+        &mut self,
+        path: &Path,
+    ) -> Option<(DeclaredEncoding, Option<u32>, Option<u8>)> {
+        let cached = std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| self.cached_local_media_item(path, metadata.len()));
+        let cached = cached.filter(|item| item.technical_metadata_probed)?;
+        Some(local_audio_declared_encoding(&cached))
+    }
+
+    /// Cancels active and queued quality work without discarding safe cache entries.
+    #[cfg(feature = "audio-quality")]
+    fn cancel_local_audio_quality(&mut self) {
+        if let Some(pending) = self.pending_local_audio_quality.take() {
+            if let Some(cancellation) = pending.cancellation {
+                cancellation.cancel();
+            }
+        }
+        if let Some(pending) = self.pending_local_audio_quality_batch.take() {
+            pending.cancellation.cancel();
+        }
+        while let Ok(command) = self.local_audio_quality_request_drain.try_recv() {
+            match command {
+                LocalAudioQualityWorkerRequest::Analyze { cancellation, .. }
+                | LocalAudioQualityWorkerRequest::AnalyzeBatch { cancellation, .. } => {
+                    cancellation.cancel();
+                }
+                LocalAudioQualityWorkerRequest::Shutdown => {}
+            }
+        }
+        if let Some(details) = self.view.details.as_mut() {
+            details.local_audio_quality_pending = false;
+        }
+    }
+
+    /// Replaces the copyable popup and assigns its sole worker-generation owner.
+    #[cfg(feature = "audio-quality")]
+    fn replace_local_audio_quality_popup(
+        &mut self,
+        owner_generation: Option<u64>,
+        summary: impl Into<String>,
+        total: usize,
+        report: String,
+        pending: bool,
+    ) {
+        self.local_audio_quality_popup_owner_generation = owner_generation;
+        self.local_audio_quality_popup_revision =
+            self.local_audio_quality_popup_revision.wrapping_add(1);
+        self.view.audio_quality_popup = Some(AudioQualityPopupView {
+            title: "Audio quality analysis".to_owned(),
+            summary: summary.into(),
+            completed: usize::from(!pending && total == 1 && !report.is_empty()),
+            total,
+            report,
+            action_status: None,
+            pending,
+            scroll_offset: 0,
+        });
+    }
+
+    /// Appends one complete bounded file record and invalidates copied status.
+    #[cfg(feature = "audio-quality")]
+    fn append_local_audio_quality_popup_record(&mut self, generation: u64, record: &str) -> bool {
+        if self.local_audio_quality_popup_owner_generation != Some(generation) {
+            return false;
+        }
+        let Some(popup) = self.view.audio_quality_popup.as_mut() else {
+            return false;
+        };
+        let separator = if popup.report.is_empty() { "" } else { "\n\n" };
+        if popup
+            .report
+            .len()
+            .saturating_add(separator.len())
+            .saturating_add(record.len())
+            <= MAX_LOCAL_AUDIO_QUALITY_BATCH_REPORT_BYTES
+        {
+            popup.report.push_str(separator);
+            popup.report.push_str(record);
+            popup.action_status = None;
+            self.local_audio_quality_popup_revision =
+                self.local_audio_quality_popup_revision.wrapping_add(1);
+            return true;
+        }
+
+        const TRUNCATED_NOTICE: &str =
+            "[Report text limit reached; later file records are omitted.]";
+        let notice_separator = if popup.report.is_empty() { "" } else { "\n\n" };
+        if !popup.report.ends_with(TRUNCATED_NOTICE)
+            && popup
+                .report
+                .len()
+                .saturating_add(notice_separator.len())
+                .saturating_add(TRUNCATED_NOTICE.len())
+                <= MAX_LOCAL_AUDIO_QUALITY_BATCH_REPORT_BYTES
+        {
+            popup.report.push_str(notice_separator);
+            popup.report.push_str(TRUNCATED_NOTICE);
+            popup.action_status = None;
+            self.local_audio_quality_popup_revision =
+                self.local_audio_quality_popup_revision.wrapping_add(1);
+        }
+        false
+    }
+
+    /// Makes a user cancellation terminal without discarding completed records.
+    #[cfg(feature = "audio-quality")]
+    fn cancel_visible_local_audio_quality(&mut self) {
+        let mut waiting_for_worker = false;
+        let mut deferred_single = false;
+        if let Some(pending) = self.pending_local_audio_quality.as_mut() {
+            if let Some(cancellation) = pending.cancellation.as_ref() {
+                cancellation.cancel();
+                pending.cancel_requested = true;
+                waiting_for_worker = true;
+            } else {
+                deferred_single = true;
+            }
+        }
+        if deferred_single {
+            self.pending_local_audio_quality.take();
+        }
+        if let Some(pending) = self.pending_local_audio_quality_batch.as_mut() {
+            pending.cancellation.cancel();
+            pending.cancel_requested = true;
+            waiting_for_worker = true;
+        }
+
+        let (completed, total) = self
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .map(|popup| (popup.completed, popup.total))
+            .unwrap_or_default();
+        if waiting_for_worker {
+            if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                popup.pending = true;
+                popup.summary = if self.pending_local_audio_quality_batch.is_some() {
+                    if total == 0 {
+                        "Cancelling while collecting audio files…".to_owned()
+                    } else {
+                        format!("Cancelling after {completed} of {total}…")
+                    }
+                } else {
+                    "Cancelling audio quality analysis…".to_owned()
+                };
+            }
+            self.apply_local_audio_quality_details();
+            self.view.status_line = "Cancelling audio quality analysis…".to_owned();
+            return;
+        }
+
+        self.local_audio_quality_popup_owner_generation = None;
+        if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+            popup.pending = false;
+            popup.summary = if total == 0 {
+                "Audio quality analysis cancelled".to_owned()
+            } else {
+                format!(
+                    "Analysis cancelled after {completed} of {total}; remaining files were not analyzed"
+                )
+            };
+        }
+        self.apply_local_audio_quality_details();
+        self.view.status_line = "Audio quality analysis cancelled".to_owned();
+    }
+
+    /// Stops analysis when Local selection no longer owns its exact file.
+    #[cfg(feature = "audio-quality")]
+    fn cancel_stale_local_audio_quality(&mut self) {
+        let Some(pending_key) = self
+            .pending_local_audio_quality
+            .as_ref()
+            .filter(|pending| !pending.cancel_requested)
+            .map(|pending| pending.key.clone())
+        else {
+            return;
+        };
+        let selected = self
+            .selected_local_audio_quality_target()
+            .map(|(_, key)| key);
+        if selected.as_ref() != Some(&pending_key) {
+            self.cancel_visible_local_audio_quality();
+        }
+    }
+
+    /// Promotes one successful report to most-recent use.
+    #[cfg(feature = "audio-quality")]
+    fn promote_local_audio_quality_cache_key(&mut self, key: &LocalAudioQualityCacheKey) {
+        self.local_audio_quality_cache_order
+            .retain(|candidate| candidate != key);
+        self.local_audio_quality_cache_order.push_back(key.clone());
+    }
+
+    /// Stores one successful analysis in the bounded process-local cache.
+    #[cfg(feature = "audio-quality")]
+    fn cache_local_audio_quality(
+        &mut self,
+        key: LocalAudioQualityCacheKey,
+        report: AudioQualityReport,
+    ) {
+        self.local_audio_quality_cache.remove(&key);
+        self.local_audio_quality_cache_order
+            .retain(|candidate| candidate != &key);
+        while self.local_audio_quality_cache.len() >= MAX_CACHED_LOCAL_AUDIO_QUALITY_REPORTS {
+            let Some(oldest) = self.local_audio_quality_cache_order.pop_front() else {
+                break;
+            };
+            self.local_audio_quality_cache.remove(&oldest);
+        }
+        self.local_audio_quality_cache
+            .insert(key.clone(), Arc::new(report));
+        self.local_audio_quality_cache_order.push_back(key);
+    }
+
+    /// Projects cached analysis and exact pending ownership into Local Details.
+    #[cfg(feature = "audio-quality")]
+    fn apply_local_audio_quality_details(&mut self) {
+        let batch_pending = self.pending_local_audio_quality_batch.is_some();
+        let batch_available = self.selected_local_audio_quality_available();
+        let Some((_, key)) = self.selected_local_audio_quality_target() else {
+            self.displayed_local_audio_quality = None;
+            self.local_audio_quality_revalidate_at = None;
+            if let Some(details) = self.view.details.as_mut() {
+                details.local_audio_quality_available = batch_available;
+                details.local_audio_quality_pending = batch_pending;
+                details.local_audio_quality_description.clear();
+            }
+            return;
+        };
+        let pending = self
+            .pending_local_audio_quality
+            .as_ref()
+            .is_some_and(|pending| pending.key == key);
+        let cached = self.local_audio_quality_cache.get(&key).map(Arc::clone);
+        if cached.is_some() {
+            self.promote_local_audio_quality_cache_key(&key);
+            self.displayed_local_audio_quality = Some(key);
+            self.local_audio_quality_revalidate_at =
+                Some(Instant::now() + LOCAL_AUDIO_QUALITY_REVALIDATION_INTERVAL);
+        } else {
+            self.displayed_local_audio_quality = None;
+            self.local_audio_quality_revalidate_at = None;
+        }
+        let Some(details) = self.view.details.as_mut() else {
+            return;
+        };
+        details.local_audio_quality_available = true;
+        details.local_audio_quality_pending = pending || batch_pending;
+        details.local_audio_quality_description = cached
+            .as_deref()
+            .map_or_else(String::new, format_local_audio_quality_report);
+    }
+
+    /// Periodically drops a displayed report after local-file replacement.
+    #[cfg(feature = "audio-quality")]
+    fn revalidate_displayed_local_audio_quality(&mut self, now: Instant) {
+        let Some(displayed) = self.displayed_local_audio_quality.as_ref() else {
+            return;
+        };
+        if self
+            .local_audio_quality_revalidate_at
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        if self
+            .selected_local_audio_quality_target()
+            .is_some_and(|(_, current)| &current == displayed)
+        {
+            self.local_audio_quality_revalidate_at =
+                Some(now + LOCAL_AUDIO_QUALITY_REVALIDATION_INTERVAL);
+            return;
+        }
+
+        self.displayed_local_audio_quality = None;
+        self.local_audio_quality_revalidate_at = None;
+        let current_target = self.selected_local_audio_quality_target();
+        self.apply_local_audio_quality_details();
+        self.view.status_line =
+            if current_target.is_some() && self.displayed_local_audio_quality.is_none() {
+                "The local audio file changed; press V to analyze it again".to_owned()
+            } else if current_target.is_none() {
+                "The analyzed local audio file is no longer available".to_owned()
+            } else {
+                "Updated audio quality details for the current local file".to_owned()
+            };
+    }
+
+    /// Queues the latest explicit request, replacing the sole stale queued job.
+    #[cfg(feature = "audio-quality")]
+    fn enqueue_local_audio_quality_request(
+        &mut self,
+        mut command: LocalAudioQualityWorkerRequest,
+    ) -> bool {
+        let Some(sender) = self.local_audio_quality_requests.as_ref().cloned() else {
+            return false;
+        };
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(returned)) => {
+                    if let Ok(stale) = self.local_audio_quality_request_drain.try_recv() {
+                        match stale {
+                            LocalAudioQualityWorkerRequest::Analyze { cancellation, .. }
+                            | LocalAudioQualityWorkerRequest::AnalyzeBatch {
+                                cancellation, ..
+                            } => cancellation.cancel(),
+                            LocalAudioQualityWorkerRequest::Shutdown => {}
+                        }
+                    }
+                    command = returned;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
+    /// Explains how to repair a missing FFmpeg helper on Gentoo or elsewhere.
+    #[cfg(feature = "audio-quality")]
+    fn show_local_audio_quality_ffmpeg_required(&mut self) {
+        let message = format!(
+            "Install media-video/ffmpeg and retry. Youta does not need a restart after installing it.\n\n\
+             Gentoo:\n\
+             emerge --ask media-video/ffmpeg\n\n\
+             Or configure a different executable in:\n{}\n\n\
+             [providers]\n\
+             ffmpeg_executable = '/path/to/ffmpeg'\n\n\
+             Restart Youta only after changing this executable setting.",
+            self.config.config_file().display(),
+        );
+        self.show_actionable_message("FFmpeg required for audio quality analysis", message);
+    }
+
+    /// Starts a deferred request once exact technical metadata is available.
+    #[cfg(feature = "audio-quality")]
+    fn start_pending_local_audio_quality(&mut self) {
+        let Some((generation, media_id, key)) = self
+            .pending_local_audio_quality
+            .as_ref()
+            .filter(|pending| pending.cancellation.is_none())
+            .map(|pending| {
+                (
+                    pending.generation,
+                    pending.media_id.clone(),
+                    pending.key.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if !self.selected_local_audio_quality_target().is_some_and(
+            |(selected_media_id, selected_key)| {
+                selected_media_id == media_id && selected_key == key
+            },
+        ) {
+            self.cancel_visible_local_audio_quality();
+            return;
+        }
+        let Some((declared_encoding, source_sample_rate_hz, source_channels)) =
+            self.selected_local_audio_declared_encoding(&key.path)
+        else {
+            self.request_local_media_metadata(key.path);
+            self.view.status_line = "Reading local audio metadata before analysis…".to_owned();
+            return;
+        };
+        if self.local_audio_quality_requests.is_none() {
+            self.cancel_local_audio_quality();
+            self.local_audio_quality_popup_owner_generation = None;
+            if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                popup.pending = false;
+                popup.summary = "The background analysis worker is unavailable".to_owned();
+            }
+            self.show_actionable_message(
+                "Audio quality analysis unavailable",
+                "The background audio-quality worker is unavailable. Restart Youta and try again.",
+            );
+            return;
+        }
+        let mut request = AudioQualityRequest::new(key.path.clone(), key.identity.clone())
+            .with_declared_encoding(declared_encoding);
+        if let Some(sample_rate_hz) = source_sample_rate_hz {
+            request = request.with_source_sample_rate_hz(sample_rate_hz);
+        }
+        if let Some(channels) = source_channels {
+            request = request.with_source_channels(channels);
+        }
+        let cancellation = AudioQualityCancellation::new();
+        let command = LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            cancellation: cancellation.clone(),
+        };
+        if !self.enqueue_local_audio_quality_request(command) {
+            self.cancel_local_audio_quality();
+            self.local_audio_quality_popup_owner_generation = None;
+            if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                popup.pending = false;
+                popup.summary = "The background analysis worker stopped".to_owned();
+            }
+            self.show_actionable_message(
+                "Audio quality analysis unavailable",
+                "The background audio-quality worker stopped. Restart Youta and try again.",
+            );
+            return;
+        }
+        if let Some(pending) = self
+            .pending_local_audio_quality
+            .as_mut()
+            .filter(|pending| pending.generation == generation && pending.key.path == key.path)
+        {
+            pending.cancellation = Some(cancellation);
+        }
+        if self.local_audio_quality_popup_owner_generation == Some(generation)
+            && let Some(popup) = self.view.audio_quality_popup.as_mut()
+        {
+            popup.summary = "Analyzing 1 audio file…".to_owned();
+        }
+        self.view.status_line = "Analyzing local audio quality…".to_owned();
+    }
+
+    /// Starts or cancels one explicit identity-bound local quality analysis.
+    #[cfg(feature = "audio-quality")]
+    fn analyze_selected_local_audio_quality(&mut self) {
+        if self.pending_local_audio_quality.is_some()
+            || self.pending_local_audio_quality_batch.is_some()
+        {
+            self.cancel_visible_local_audio_quality();
+            return;
+        }
+        if !self.selected_local_audio_quality_available() {
+            self.view.status_line =
+                "Select or mark a local audio file or folder before analysis".to_owned();
+            return;
+        }
+
+        let selected_single = self
+            .local_move_marks
+            .is_empty()
+            .then(|| self.selected_local_audio_quality_target())
+            .flatten();
+        let Some((media_id, key)) = selected_single else {
+            self.start_local_audio_quality_batch(self.selected_local_audio_quality_roots());
+            return;
+        };
+        if let Some(cached) = self.local_audio_quality_cache.get(&key).map(Arc::clone) {
+            self.apply_local_audio_quality_details();
+            let report =
+                format_local_audio_quality_batch_record(1, 1, &key.path, Ok(cached.as_ref()));
+            self.replace_local_audio_quality_popup(
+                None,
+                "Using the cached result for this unchanged file",
+                1,
+                report,
+                false,
+            );
+            self.view.status_line =
+                "Using the cached quality analysis for this unchanged file".to_owned();
+            return;
+        }
+
+        self.cancel_local_audio_quality();
+        if self.local_audio_quality_requests.is_none() {
+            self.show_actionable_message(
+                "Audio quality analysis unavailable",
+                "The background audio-quality worker is unavailable. Restart Youta and try again.",
+            );
+            return;
+        }
+        self.local_audio_quality_generation = self.local_audio_quality_generation.wrapping_add(1);
+        let generation = self.local_audio_quality_generation;
+        self.replace_local_audio_quality_popup(
+            Some(generation),
+            "Reading local audio metadata…",
+            1,
+            String::new(),
+            true,
+        );
+        self.pending_local_audio_quality = Some(PendingLocalAudioQuality {
+            generation,
+            media_id,
+            key,
+            cancellation: None,
+            cancel_requested: false,
+        });
+        if let Some(details) = self.view.details.as_mut() {
+            details.local_audio_quality_available = true;
+            details.local_audio_quality_pending = true;
+        }
+        self.view.status_line = "Reading local audio metadata before analysis…".to_owned();
+        self.start_pending_local_audio_quality();
+    }
+
+    /// Opens the popup immediately and collects explicit roots on the worker.
+    #[cfg(feature = "audio-quality")]
+    fn start_local_audio_quality_batch(&mut self, roots: Vec<PathBuf>) {
+        if roots.is_empty() {
+            self.view.status_line =
+                "Select or mark a local audio file or folder before analysis".to_owned();
+            return;
+        }
+        self.cancel_local_audio_quality();
+        self.local_audio_quality_generation = self.local_audio_quality_generation.wrapping_add(1);
+        let generation = self.local_audio_quality_generation;
+        self.replace_local_audio_quality_popup(
+            Some(generation),
+            "Collecting audio files…",
+            0,
+            String::new(),
+            true,
+        );
+        let cancellation = AudioQualityCancellation::new();
+        self.pending_local_audio_quality_batch = Some(PendingLocalAudioQualityBatch {
+            generation,
+            cancellation: cancellation.clone(),
+            completed: 0,
+            total: 0,
+            succeeded: 0,
+            failed: 0,
+            report_truncated: false,
+            cancel_requested: false,
+        });
+        let request = LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation,
+            roots,
+            limits: self.local_audio_quality_target_limits,
+            cancellation,
+        };
+        if !self.enqueue_local_audio_quality_request(request) {
+            self.cancel_local_audio_quality();
+            self.local_audio_quality_popup_owner_generation = None;
+            if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                popup.pending = false;
+                popup.summary = "The background analysis worker is unavailable".to_owned();
+            }
+            self.show_actionable_message(
+                "Audio quality analysis unavailable",
+                "The background audio-quality worker is unavailable. Restart Youta and try again.",
+            );
+            return;
+        }
+        self.apply_local_audio_quality_details();
+        self.view.status_line = "Collecting local audio files for analysis…".to_owned();
+    }
+
+    /// Returns the exact selected local audio file and its replacement identity.
     #[cfg(feature = "acoustid")]
     fn selected_local_fingerprint_target(&self) -> Option<(MediaId, LocalFingerprintCacheKey)> {
         if self.view.screen != Screen::Local {
@@ -18881,6 +19867,420 @@ impl AppController {
             },
         );
         self.local_waveform_cache_order.push_back(key);
+    }
+
+    /// Applies every currently available local audio-quality completion.
+    #[cfg(feature = "audio-quality")]
+    fn drain_local_audio_quality_responses(&mut self) {
+        loop {
+            match self.local_audio_quality_responses.try_recv() {
+                Ok(response) => {
+                    let Some(pending) = self.pending_local_audio_quality.as_ref() else {
+                        continue;
+                    };
+                    if pending.generation != response.generation
+                        || pending.key.path != response.path
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_local_audio_quality
+                        .take()
+                        .expect("the matching pending audio quality request exists");
+                    let selected_still_owns_request = self
+                        .selected_local_audio_quality_target()
+                        .is_some_and(|(selected_media_id, selected_key)| {
+                            selected_media_id == pending.media_id && selected_key == pending.key
+                        });
+                    let selected_path_still_visible = self
+                        .selected_local_audio_quality_target()
+                        .is_some_and(|(selected_media_id, selected_key)| {
+                            selected_media_id == pending.media_id
+                                && selected_key.path == pending.key.path
+                        });
+                    let generation = pending.generation;
+                    let cancel_requested = pending.cancel_requested;
+                    match response.result {
+                        Ok(report)
+                            if report.identity() == &pending.key.identity
+                                && AudioQualityIdentity::from_path(&pending.key.path)
+                                    .ok()
+                                    .as_ref()
+                                    == Some(&pending.key.identity) =>
+                        {
+                            let assessment = report.assessment();
+                            let record = format_local_audio_quality_batch_record(
+                                1,
+                                1,
+                                &pending.key.path,
+                                Ok(&report),
+                            );
+                            self.append_local_audio_quality_popup_record(generation, &record);
+                            self.cache_local_audio_quality(pending.key, report);
+                            if self.local_audio_quality_popup_owner_generation == Some(generation) {
+                                self.local_audio_quality_popup_owner_generation = None;
+                                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                                    popup.completed = 1;
+                                    popup.total = 1;
+                                    popup.pending = false;
+                                    popup.summary = if cancel_requested {
+                                        format!(
+                                            "Analysis completed before cancellation took effect: {assessment}"
+                                        )
+                                    } else {
+                                        format!("Analysis complete: {assessment}")
+                                    };
+                                }
+                            }
+                            if selected_still_owns_request {
+                                self.apply_local_audio_quality_details();
+                                self.view.status_line = if cancel_requested {
+                                    format!(
+                                        "Audio quality analysis completed before cancellation took effect: {assessment}"
+                                    )
+                                } else {
+                                    format!("Audio quality analysis complete: {assessment}")
+                                };
+                            }
+                        }
+                        Ok(_) | Err(AudioQualityError::FileChanged) => {
+                            let error = AudioQualityError::FileChanged;
+                            let record = format_local_audio_quality_batch_record(
+                                1,
+                                1,
+                                &pending.key.path,
+                                Err(&error),
+                            );
+                            self.append_local_audio_quality_popup_record(generation, &record);
+                            if self.local_audio_quality_popup_owner_generation == Some(generation) {
+                                self.local_audio_quality_popup_owner_generation = None;
+                                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                                    popup.completed = 1;
+                                    popup.total = 1;
+                                    popup.pending = false;
+                                    popup.summary =
+                                        "The file changed; no quality result was cached".to_owned();
+                                }
+                            }
+                            if selected_path_still_visible {
+                                self.apply_local_audio_quality_details();
+                                self.view.status_line =
+                                    "The local audio file changed; press V to analyze it again"
+                                        .to_owned();
+                            }
+                        }
+                        Err(AudioQualityError::Cancelled) => {
+                            if self.local_audio_quality_popup_owner_generation == Some(generation) {
+                                self.local_audio_quality_popup_owner_generation = None;
+                                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                                    popup.pending = false;
+                                    popup.summary = "Audio quality analysis cancelled".to_owned();
+                                }
+                            }
+                            if selected_path_still_visible {
+                                self.apply_local_audio_quality_details();
+                            }
+                            self.view.status_line = "Audio quality analysis cancelled".to_owned();
+                        }
+                        Err(error) if error.is_missing_executable() => {
+                            let record = format_local_audio_quality_batch_record(
+                                1,
+                                1,
+                                &pending.key.path,
+                                Err(&error),
+                            );
+                            self.append_local_audio_quality_popup_record(generation, &record);
+                            if self.local_audio_quality_popup_owner_generation == Some(generation) {
+                                self.local_audio_quality_popup_owner_generation = None;
+                                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                                    popup.completed = 1;
+                                    popup.total = 1;
+                                    popup.pending = false;
+                                    popup.summary =
+                                        "Analysis stopped because FFmpeg is unavailable".to_owned();
+                                }
+                            }
+                            if selected_still_owns_request {
+                                self.apply_local_audio_quality_details();
+                                self.show_local_audio_quality_ffmpeg_required();
+                            }
+                        }
+                        Err(error) => {
+                            let record = format_local_audio_quality_batch_record(
+                                1,
+                                1,
+                                &pending.key.path,
+                                Err(&error),
+                            );
+                            self.append_local_audio_quality_popup_record(generation, &record);
+                            if self.local_audio_quality_popup_owner_generation == Some(generation) {
+                                self.local_audio_quality_popup_owner_generation = None;
+                                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                                    popup.completed = 1;
+                                    popup.total = 1;
+                                    popup.pending = false;
+                                    popup.summary = "Audio quality analysis failed".to_owned();
+                                }
+                            }
+                            if selected_still_owns_request {
+                                self.apply_local_audio_quality_details();
+                                self.show_error_message(
+                                    "Local audio quality analysis failed",
+                                    error.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.local_audio_quality_disconnect_reported {
+                        self.local_audio_quality_disconnect_reported = true;
+                        let worker_was_started = self.local_audio_quality_requests.take().is_some();
+                        self.cancel_local_audio_quality();
+                        self.local_audio_quality_popup_owner_generation = None;
+                        if let Some(popup) = self.view.audio_quality_popup.as_mut()
+                            && popup.pending
+                        {
+                            popup.pending = false;
+                            popup.summary = "The background analysis worker stopped".to_owned();
+                        }
+                        let (placeholder_sender, placeholder_receiver) = bounded(1);
+                        drop(placeholder_sender);
+                        self.local_audio_quality_request_drain = placeholder_receiver;
+                        if let Some(handle) = self.local_audio_quality_thread.take() {
+                            let _ = handle.join();
+                        }
+                        if worker_was_started {
+                            self.show_actionable_message(
+                                "Local audio-quality worker stopped",
+                                "The background FFmpeg analysis worker stopped. Restart Youta and try again.",
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Applies collection, progress, and terminal events for one batch owner.
+    #[cfg(feature = "audio-quality")]
+    fn drain_local_audio_quality_batch_responses(&mut self) {
+        while let Ok(response) = self.local_audio_quality_batch_responses.try_recv() {
+            match response {
+                LocalAudioQualityBatchWorkerResponse::TargetsCollected { generation, total } => {
+                    let Some(pending) = self
+                        .pending_local_audio_quality_batch
+                        .as_mut()
+                        .filter(|pending| pending.generation == generation)
+                    else {
+                        continue;
+                    };
+                    pending.total = total;
+                    let cancel_requested = pending.cancel_requested;
+                    let completed = pending.completed;
+                    if self.local_audio_quality_popup_owner_generation == Some(generation)
+                        && let Some(popup) = self.view.audio_quality_popup.as_mut()
+                    {
+                        popup.total = total;
+                        popup.summary = if cancel_requested {
+                            if total == 0 {
+                                "Cancelling while collecting audio files…".to_owned()
+                            } else {
+                                format!("Cancelling after {completed} of {total}…")
+                            }
+                        } else if total == 0 {
+                            "No supported audio files were found".to_owned()
+                        } else {
+                            format!("Analyzing 0 of {total} audio files…")
+                        };
+                    }
+                }
+                LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                    generation,
+                    index,
+                    total,
+                    path,
+                    result,
+                } => {
+                    if !self
+                        .pending_local_audio_quality_batch
+                        .as_ref()
+                        .is_some_and(|pending| pending.generation == generation)
+                    {
+                        continue;
+                    }
+                    let result = match result {
+                        Ok(report)
+                            if AudioQualityIdentity::from_path(&path).ok().as_ref()
+                                == Some(report.identity()) =>
+                        {
+                            Ok(report)
+                        }
+                        Ok(_) => Err(AudioQualityError::FileChanged),
+                        Err(error) => Err(error),
+                    };
+                    let record = format_local_audio_quality_batch_record(
+                        index,
+                        total,
+                        &path,
+                        result.as_ref().map_err(|error| error),
+                    );
+                    let record_retained =
+                        self.append_local_audio_quality_popup_record(generation, &record);
+                    let missing_ffmpeg = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(AudioQualityError::is_missing_executable);
+                    let succeeded = result.is_ok();
+                    if let Ok(report) = result {
+                        let key = LocalAudioQualityCacheKey {
+                            path: path.clone(),
+                            identity: report.identity().clone(),
+                        };
+                        self.cache_local_audio_quality(key, report);
+                    }
+                    let Some(pending) = self
+                        .pending_local_audio_quality_batch
+                        .as_mut()
+                        .filter(|pending| pending.generation == generation)
+                    else {
+                        continue;
+                    };
+                    pending.total = total;
+                    pending.completed = pending.completed.max(index).min(total);
+                    pending.succeeded = pending.succeeded.saturating_add(usize::from(succeeded));
+                    pending.failed = pending.failed.saturating_add(usize::from(!succeeded));
+                    pending.report_truncated |= !record_retained;
+                    let completed = pending.completed;
+                    let succeeded_count = pending.succeeded;
+                    let failed_count = pending.failed;
+                    let report_truncated = pending.report_truncated;
+                    let cancel_requested = pending.cancel_requested;
+                    if self.local_audio_quality_popup_owner_generation == Some(generation)
+                        && let Some(popup) = self.view.audio_quality_popup.as_mut()
+                    {
+                        popup.completed = completed;
+                        popup.total = total;
+                        popup.summary = if cancel_requested {
+                            format!("Cancelling after {completed} of {total}…")
+                        } else {
+                            format!(
+                                "Analyzed {completed} of {total}: {succeeded_count} succeeded, {failed_count} failed{}",
+                                if report_truncated {
+                                    "; report text truncated"
+                                } else {
+                                    ""
+                                }
+                            )
+                        };
+                    }
+                    self.apply_local_audio_quality_details();
+                    if missing_ffmpeg {
+                        self.pending_local_audio_quality_batch.take();
+                        self.local_audio_quality_popup_owner_generation = None;
+                        if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                            popup.pending = false;
+                            popup.summary = format!(
+                                "Stopped after {completed} of {total} because FFmpeg is unavailable; {} not analyzed",
+                                total.saturating_sub(completed),
+                            );
+                        }
+                        self.apply_local_audio_quality_details();
+                        self.show_local_audio_quality_ffmpeg_required();
+                    }
+                }
+                LocalAudioQualityBatchWorkerResponse::CollectionFailed { generation, error } => {
+                    if !self
+                        .pending_local_audio_quality_batch
+                        .as_ref()
+                        .is_some_and(|pending| pending.generation == generation)
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_local_audio_quality_batch
+                        .take()
+                        .expect("the matching batch generation exists");
+                    self.local_audio_quality_popup_owner_generation = None;
+                    let message = if pending.cancel_requested
+                        && matches!(error, AudioQualityTargetCollectionError::Cancelled)
+                    {
+                        "Audio quality analysis cancelled while collecting audio files".to_owned()
+                    } else {
+                        format_local_audio_quality_collection_error(&error)
+                    };
+                    if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                        popup.pending = false;
+                        popup.completed = 0;
+                        popup.total = 0;
+                        popup.summary = message.clone();
+                    }
+                    self.apply_local_audio_quality_details();
+                    self.view.status_line = message;
+                }
+                LocalAudioQualityBatchWorkerResponse::Finished {
+                    generation,
+                    total,
+                    stopped_for_missing_ffmpeg,
+                } => {
+                    if !self
+                        .pending_local_audio_quality_batch
+                        .as_ref()
+                        .is_some_and(|pending| pending.generation == generation)
+                    {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_local_audio_quality_batch
+                        .take()
+                        .expect("the matching batch generation exists");
+                    self.local_audio_quality_popup_owner_generation = None;
+                    let completed = pending.completed;
+                    let summary = if pending.cancel_requested && completed < total {
+                        format!(
+                            "Analysis cancelled after {completed} of {total}; {} files were not analyzed",
+                            total.saturating_sub(completed),
+                        )
+                    } else if total == 0 {
+                        "No supported local audio files were found; nothing was analyzed".to_owned()
+                    } else if stopped_for_missing_ffmpeg {
+                        format!(
+                            "Stopped after {completed} of {total} because FFmpeg is unavailable; {} not analyzed",
+                            total.saturating_sub(completed),
+                        )
+                    } else if completed < total {
+                        format!(
+                            "Stopped after {completed} of {total}; {} files were not analyzed",
+                            total.saturating_sub(completed),
+                        )
+                    } else {
+                        format!(
+                            "Analysis complete: {} succeeded, {} failed{}",
+                            pending.succeeded,
+                            pending.failed,
+                            if pending.report_truncated {
+                                "; report text truncated"
+                            } else {
+                                ""
+                            }
+                        )
+                    };
+                    if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                        popup.pending = false;
+                        popup.completed = completed;
+                        popup.total = total;
+                        popup.summary = summary.clone();
+                    }
+                    self.apply_local_audio_quality_details();
+                    self.view.status_line = summary;
+                    if stopped_for_missing_ffmpeg {
+                        self.show_local_audio_quality_ffmpeg_required();
+                    }
+                }
+            }
+        }
     }
 
     /// Applies every currently available local-audio identification completion.
@@ -20658,6 +22058,10 @@ impl AppController {
         if self.view.screen == Screen::Local && screen != Screen::Local {
             #[cfg(feature = "acoustid")]
             self.cancel_local_fingerprint();
+            #[cfg(feature = "audio-quality")]
+            if self.pending_local_audio_quality.is_some() {
+                self.cancel_visible_local_audio_quality();
+            }
             self.invalidate_local_folder_sizes();
         }
         self.view.search_editing = false;
@@ -24339,6 +25743,8 @@ impl AppController {
         title: impl Into<String>,
         report: impl Into<String>,
     ) {
+        #[cfg(feature = "audio-quality")]
+        self.shutdown_local_audio_quality_worker();
         #[cfg(feature = "yt-dlp")]
         self.shutdown_youtube_prewarm();
         if let Some(mut player) = self.player.take() {
@@ -25054,9 +26460,10 @@ impl AppController {
 
     /// Toggles the selected real Local entry and advances one signed row.
     ///
-    /// The synthetic `..` row is navigation only and can never enter a move
-    /// batch. Marks are exact paths, so sorting does not change their meaning.
-    #[cfg(feature = "local-move")]
+    /// The synthetic `..` row is navigation only and can never enter a move or
+    /// audio-quality batch. Marks are exact paths, so sorting does not change
+    /// their meaning.
+    #[cfg(any(feature = "local-move", feature = "audio-quality"))]
     fn extend_local_move_selection(&mut self, direction: i32) {
         if self.view.screen != Screen::Local {
             return;
@@ -25847,7 +27254,7 @@ impl AppController {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
-    #[cfg(not(feature = "local-move"))]
+    #[cfg(not(any(feature = "local-move", feature = "audio-quality")))]
     fn extend_local_move_selection(&mut self, _direction: i32) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
@@ -26448,6 +27855,20 @@ impl AppController {
         }
     }
 
+    /// Cancels, stops, and joins the dedicated local audio-quality analyzer.
+    #[cfg(feature = "audio-quality")]
+    fn shutdown_local_audio_quality_worker(&mut self) {
+        self.cancel_local_audio_quality();
+        if let Some(sender) = self.local_audio_quality_requests.take() {
+            let _ = sender.send(LocalAudioQualityWorkerRequest::Shutdown);
+        }
+        if let Some(handle) = self.local_audio_quality_thread.take() {
+            let _ = handle.join();
+        }
+        while self.local_audio_quality_responses.try_recv().is_ok() {}
+        while self.local_audio_quality_batch_responses.try_recv().is_ok() {}
+    }
+
     /// Cancels, stops, and joins the dedicated local-audio identifier.
     #[cfg(feature = "acoustid")]
     fn shutdown_local_fingerprint_worker(&mut self) {
@@ -26709,6 +28130,8 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        #[cfg(feature = "audio-quality")]
+        self.shutdown_local_audio_quality_worker();
         #[cfg(feature = "acoustid")]
         self.shutdown_local_fingerprint_worker();
         #[cfg(feature = "waveform")]
@@ -27175,6 +28598,70 @@ impl UiController for AppController {
                     );
                 }
             }
+            UiAction::AnalyzeLocalAudioQuality => {
+                #[cfg(feature = "audio-quality")]
+                self.analyze_selected_local_audio_quality();
+                #[cfg(not(feature = "audio-quality"))]
+                {
+                    self.show_actionable_message(
+                        "Audio quality analysis unavailable",
+                        "This build omits local audio-quality analysis support.",
+                    );
+                }
+            }
+            UiAction::CancelAudioQualityAnalysis => {
+                #[cfg(feature = "audio-quality")]
+                self.cancel_visible_local_audio_quality();
+                #[cfg(not(feature = "audio-quality"))]
+                {
+                    self.show_actionable_message(
+                        "Audio quality analysis unavailable",
+                        "This build omits local audio-quality analysis support.",
+                    );
+                }
+            }
+            UiAction::CopyAudioQualityReport => {
+                let report = self
+                    .view
+                    .audio_quality_popup
+                    .as_ref()
+                    .map(|popup| popup.report.clone())
+                    .unwrap_or_default();
+                if report.is_empty() {
+                    self.view.status_line =
+                        "No audio quality report is available to copy".to_owned();
+                } else {
+                    if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                        popup.action_status = None;
+                    }
+                    let subject = ClipboardSubject::AudioQualityReport(report.chars().count());
+                    self.request_clipboard_copy(report, subject);
+                }
+            }
+            UiAction::DismissAudioQualityPopup => {
+                if self
+                    .view
+                    .audio_quality_popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.pending)
+                {
+                    self.view.status_line =
+                        "Cancel audio quality analysis before closing this popup".to_owned();
+                } else {
+                    self.view.audio_quality_popup = None;
+                    #[cfg(feature = "audio-quality")]
+                    {
+                        self.local_audio_quality_popup_owner_generation = None;
+                        self.local_audio_quality_popup_revision =
+                            self.local_audio_quality_popup_revision.wrapping_add(1);
+                    }
+                }
+            }
+            UiAction::SetAudioQualityPopupScroll(offset) => {
+                if let Some(popup) = self.view.audio_quality_popup.as_mut() {
+                    popup.scroll_offset = offset;
+                }
+            }
             UiAction::ToggleRepeat => {
                 if self
                     .current_media
@@ -27508,6 +28995,12 @@ impl UiController for AppController {
             }
             UiAction::OpenDroppedPaths(paths) => self.open_dropped_paths(paths),
         }
+        // Desktop menus and file-drop events can navigate without going
+        // through `show_screen` or the keyboard's Local-selection path. Keep
+        // the exact single-file worker bound to the post-action selection;
+        // folder/marked batches deliberately remain independent of navigation.
+        #[cfg(feature = "audio-quality")]
+        self.cancel_stale_local_audio_quality();
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
             && !self.diagnostic_only
@@ -27529,18 +29022,48 @@ impl UiController for AppController {
         // front-end reports only what its clipboard did, and a subject that
         // made a round trip through another process could come back changed.
         self.awaiting_clipboard_subject = Some(request.subject);
+        #[cfg(feature = "audio-quality")]
+        {
+            self.awaiting_audio_quality_clipboard_revision =
+                self.pending_audio_quality_clipboard_revision.take();
+        }
         Some(request)
     }
 
     fn report_clipboard_result(&mut self, result: Result<String, String>) {
         let subject = self.awaiting_clipboard_subject.take();
+        #[cfg(feature = "audio-quality")]
+        let quality_revision = self.awaiting_audio_quality_clipboard_revision.take();
+        #[cfg(feature = "audio-quality")]
+        let quality_status = match (&result, subject) {
+            (Ok(transport), Some(ClipboardSubject::AudioQualityReport(_))) => {
+                Some(format!("Copied with {transport}"))
+            }
+            (Err(error), Some(ClipboardSubject::AudioQualityReport(_))) => {
+                Some(format!("Copy failed: {error}"))
+            }
+            _ => None,
+        };
+        #[cfg(feature = "audio-quality")]
+        if quality_revision == Some(self.local_audio_quality_popup_revision)
+            && let Some(status) = quality_status
+            && let Some(popup) = self.view.audio_quality_popup.as_mut()
+        {
+            popup.action_status = Some(status);
+        }
         self.view.status_line = match (result, subject) {
             (Ok(transport), Some(ClipboardSubject::DetailsText(count))) => {
                 format!("Copied {count} characters with {transport}")
             }
+            (Ok(transport), Some(ClipboardSubject::AudioQualityReport(count))) => {
+                format!("Copied an audio quality report ({count} characters) with {transport}")
+            }
             (Ok(transport), _) => format!("Copied the link with {transport}"),
             (Err(error), Some(ClipboardSubject::DetailsText(_))) => {
                 format!("Could not copy Details text: {error}")
+            }
+            (Err(error), Some(ClipboardSubject::AudioQualityReport(_))) => {
+                format!("Could not copy the audio quality report: {error}")
             }
             (Err(error), _) => format!("Could not copy the link: {error}"),
         };
@@ -27574,6 +29097,10 @@ impl UiController for AppController {
         self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "audio-quality")]
+        self.drain_local_audio_quality_responses();
+        #[cfg(feature = "audio-quality")]
+        self.drain_local_audio_quality_batch_responses();
         #[cfg(feature = "yandex-music")]
         self.drain_yandex_music_media_job_responses();
         #[cfg(feature = "acoustid")]
@@ -27607,6 +29134,8 @@ impl UiController for AppController {
         #[cfg(feature = "acoustid")]
         self.advance_local_fingerprint_animation();
         let now = Instant::now();
+        #[cfg(feature = "audio-quality")]
+        self.revalidate_displayed_local_audio_quality(now);
         #[cfg(feature = "acoustid")]
         self.revalidate_displayed_local_fingerprint(now);
         self.request_due_channel_details(now);
@@ -27810,6 +29339,366 @@ fn local_browse_worker(
             break;
         }
     }
+}
+
+/// Classifies current encoding metadata separately from spectral inference.
+#[cfg(feature = "audio-quality")]
+fn local_audio_declared_encoding(
+    item: &LocalMediaItem,
+) -> (DeclaredEncoding, Option<u32>, Option<u8>) {
+    let codec = item.codec.to_ascii_lowercase();
+    let lossless = matches!(codec.as_str(), "flac" | "alac") || codec.starts_with("pcm");
+    let encoding = if lossless {
+        DeclaredEncoding::Lossless
+    } else if matches!(
+        codec.as_str(),
+        "aac" | "ac-3" | "e-ac-3" | "mp1" | "mp2" | "mp3" | "opus" | "speex" | "vorbis"
+    ) {
+        DeclaredEncoding::Lossy {
+            bitrate_kbps: item.bitrate_kbps,
+        }
+    } else {
+        DeclaredEncoding::Unknown
+    };
+    (encoding, item.sample_rate_hz, item.channels)
+}
+
+/// Returns whether one Unicode marker can reorder text or create a visual row.
+#[cfg(feature = "audio-quality")]
+fn is_local_audio_quality_unsafe_unicode(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Escapes text that may originate in a filesystem name or operating-system error.
+///
+/// Bidirectional format controls and Unicode paragraph separators are escaped
+/// alongside terminal controls so a copied result cannot reorder a path or
+/// inject a visual record.
+#[cfg(feature = "audio-quality")]
+fn escape_local_audio_quality_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\\'
+            || character.is_control()
+            || is_local_audio_quality_unsafe_unicode(character)
+        {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// Truncates one escaped field at a UTF-8 boundary and marks the omission.
+#[cfg(feature = "audio-quality")]
+fn truncate_local_audio_quality_field(value: &mut String, maximum_bytes: usize) {
+    if value.len() <= maximum_bytes {
+        return;
+    }
+    const ELLIPSIS: &str = "…";
+    let retained = maximum_bytes.saturating_sub(ELLIPSIS.len());
+    truncate_utf8_bytes(value, retained);
+    if maximum_bytes >= ELLIPSIS.len() {
+        value.push_str(ELLIPSIS);
+    }
+}
+
+/// Produces one control-free, bounded path suitable for rendering and copying.
+#[cfg(feature = "audio-quality")]
+fn escaped_local_audio_quality_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let mut escaped = {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        let mut escaped = String::with_capacity(bytes.len());
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match std::str::from_utf8(&bytes[offset..]) {
+                Ok(valid) => {
+                    escaped.push_str(&escape_local_audio_quality_text(valid));
+                    break;
+                }
+                Err(error) => {
+                    let valid_end = offset.saturating_add(error.valid_up_to());
+                    if valid_end > offset {
+                        let valid = std::str::from_utf8(&bytes[offset..valid_end])
+                            .expect("UTF-8 validator reported an exact valid prefix");
+                        escaped.push_str(&escape_local_audio_quality_text(valid));
+                    }
+                    let invalid_length = error
+                        .error_len()
+                        .unwrap_or_else(|| bytes.len().saturating_sub(valid_end));
+                    for byte in &bytes[valid_end..valid_end.saturating_add(invalid_length)] {
+                        escaped.push_str(&format!("\\x{byte:02X}"));
+                    }
+                    offset = valid_end.saturating_add(invalid_length);
+                }
+            }
+        }
+        escaped
+    };
+    #[cfg(not(unix))]
+    let mut escaped = escape_local_audio_quality_text(&path.to_string_lossy());
+
+    truncate_local_audio_quality_field(&mut escaped, MAX_LOCAL_AUDIO_QUALITY_BATCH_PATH_BYTES);
+    escaped
+}
+
+/// Converts collection failures without allowing raw path controls into a popup.
+#[cfg(feature = "audio-quality")]
+fn format_local_audio_quality_collection_error(
+    error: &AudioQualityTargetCollectionError,
+) -> String {
+    let mut message = match error {
+        AudioQualityTargetCollectionError::InvalidLimits => {
+            "Audio-file collection limits are invalid".to_owned()
+        }
+        AudioQualityTargetCollectionError::Cancelled => {
+            "Audio-file collection was cancelled".to_owned()
+        }
+        AudioQualityTargetCollectionError::Inspect { path, source } => format!(
+            "Could not inspect `{}`: {}",
+            escaped_local_audio_quality_path(path),
+            escape_local_audio_quality_text(&source.to_string()),
+        ),
+        AudioQualityTargetCollectionError::InspectedEntryLimitReached { maximum } => format!(
+            "Collection stopped at the configured {maximum}-entry safety limit; no files were analyzed"
+        ),
+        AudioQualityTargetCollectionError::DepthLimitReached { path, maximum } => format!(
+            "Directory `{}` exceeds the configured depth of {maximum}; no files were analyzed",
+            escaped_local_audio_quality_path(path),
+        ),
+        AudioQualityTargetCollectionError::AudioFileLimitReached { maximum } => format!(
+            "Collection exceeds the configured {maximum}-audio-file safety limit; no files were analyzed"
+        ),
+        AudioQualityTargetCollectionError::TargetChanged(path) => format!(
+            "Target `{}` changed during collection; no files were analyzed",
+            escaped_local_audio_quality_path(path),
+        ),
+    };
+    truncate_local_audio_quality_field(&mut message, MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES);
+    message
+}
+
+/// Formats one complete file record with a control-free bounded path.
+#[cfg(feature = "audio-quality")]
+fn format_local_audio_quality_batch_record(
+    index: usize,
+    total: usize,
+    path: &Path,
+    result: Result<&AudioQualityReport, &AudioQualityError>,
+) -> String {
+    let body = match result {
+        Ok(report) => format_local_audio_quality_report(report),
+        Err(AudioQualityError::Cancelled) => "Analysis cancelled".to_owned(),
+        Err(error) if error.is_missing_executable() => {
+            "Analysis failed: FFmpeg is unavailable".to_owned()
+        }
+        Err(error) => {
+            let mut error = escape_local_audio_quality_text(&error.to_string());
+            truncate_local_audio_quality_field(
+                &mut error,
+                MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES,
+            );
+            format!("Analysis failed: {error}")
+        }
+    };
+    let indented = body
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut record = format!(
+        "[{index}/{total}] {}\n{indented}",
+        escaped_local_audio_quality_path(path),
+    );
+    truncate_local_audio_quality_field(
+        &mut record,
+        MAX_LOCAL_AUDIO_QUALITY_BATCH_PATH_BYTES
+            .saturating_add(MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES)
+            .saturating_add(128),
+    );
+    record
+}
+
+/// Analyzes explicit local-audio requests without blocking navigation or the
+/// general remote-provider worker.
+#[cfg(feature = "audio-quality")]
+fn local_audio_quality_worker(
+    requests: Receiver<LocalAudioQualityWorkerRequest>,
+    responses: Sender<LocalAudioQualityWorkerResponse>,
+    batch_responses: Sender<LocalAudioQualityBatchWorkerResponse>,
+    analyzer: Box<dyn AudioQualityAnalyzer>,
+    metadata_loader: Arc<dyn LocalMediaLoader>,
+) {
+    'worker: while let Ok(command) = requests.recv() {
+        match command {
+            LocalAudioQualityWorkerRequest::Analyze {
+                generation,
+                request,
+                cancellation,
+            } => {
+                let path = request.path().to_owned();
+                let result = analyzer.analyze(&request, &cancellation);
+                if responses
+                    .send(LocalAudioQualityWorkerResponse {
+                        generation,
+                        path,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            LocalAudioQualityWorkerRequest::AnalyzeBatch {
+                generation,
+                roots,
+                limits,
+                cancellation,
+            } => {
+                let targets = match collect_audio_quality_targets(&roots, limits, &cancellation) {
+                    Ok(targets) => targets,
+                    Err(error) => {
+                        if batch_responses
+                            .send(LocalAudioQualityBatchWorkerResponse::CollectionFailed {
+                                generation,
+                                error,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let total = targets.len();
+                if batch_responses
+                    .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                        generation,
+                        total,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let mut stopped_for_missing_ffmpeg = false;
+                for (offset, path) in targets.into_iter().enumerate() {
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
+                    let before = AudioQualityIdentity::from_path(&path);
+                    let result = match before {
+                        Ok(identity) => {
+                            let item = metadata_loader.load(path.clone());
+                            if cancellation.is_cancelled() {
+                                Err(AudioQualityError::Cancelled)
+                            } else if AudioQualityIdentity::from_path(&path).ok().as_ref()
+                                != Some(&identity)
+                            {
+                                Err(AudioQualityError::FileChanged)
+                            } else {
+                                let (declared_encoding, source_sample_rate_hz, source_channels) =
+                                    local_audio_declared_encoding(&item);
+                                let mut request = AudioQualityRequest::new(path.clone(), identity)
+                                    .with_declared_encoding(declared_encoding);
+                                if let Some(sample_rate_hz) = source_sample_rate_hz {
+                                    request = request.with_source_sample_rate_hz(sample_rate_hz);
+                                }
+                                if let Some(channels) = source_channels {
+                                    request = request.with_source_channels(channels);
+                                }
+                                analyzer.analyze(&request, &cancellation)
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    stopped_for_missing_ffmpeg = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(AudioQualityError::is_missing_executable);
+                    if batch_responses
+                        .send(LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                            generation,
+                            index: offset.saturating_add(1),
+                            total,
+                            path,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break 'worker;
+                    }
+                    if stopped_for_missing_ffmpeg || cancellation.is_cancelled() {
+                        break;
+                    }
+                }
+                if batch_responses
+                    .send(LocalAudioQualityBatchWorkerResponse::Finished {
+                        generation,
+                        total,
+                        stopped_for_missing_ffmpeg,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            LocalAudioQualityWorkerRequest::Shutdown => break,
+        }
+    }
+}
+
+/// Formats bounded evidence without claiming an unknowable original bitrate.
+#[cfg(feature = "audio-quality")]
+fn format_local_audio_quality_report(report: &AudioQualityReport) -> String {
+    let mut lines = vec![
+        format!("Verdict: {}", report.assessment()),
+        format!("Current encoding: {}", report.declared_encoding()),
+    ];
+    if let Some(sample_rate_hz) = report.source_sample_rate_hz() {
+        lines.push(format!(
+            "Current sample rate: {:.1} kHz",
+            f64::from(sample_rate_hz) / 1_000.0
+        ));
+    }
+    if let Some(channels) = report.source_channels() {
+        lines.push(format!("Current channels: {channels}"));
+    }
+    lines.push(format!("Evidence strength: {}", report.confidence()));
+    if let Some(bandwidth_hz) = report.effective_bandwidth_hz() {
+        lines.push(format!(
+            "Measured bandwidth: {:.1} kHz",
+            f64::from(bandwidth_hz) / 1_000.0
+        ));
+    }
+    if let Some(cliff_db) = report.cliff_db() {
+        lines.push(format!("Spectral cutoff drop: {cliff_db:.1} dB"));
+    }
+    if report.active_windows() > 0 {
+        lines.push(format!(
+            "Evidence: {}% agreement across {} active windows",
+            report.window_agreement_percent(),
+            report.active_windows()
+        ));
+    }
+    lines.push(format!("Interpretation: {}", report.interpretation()));
+    lines.push(
+        "This spectral estimate cannot prove the original encoder or bitrate; mastering can produce similar cutoffs."
+            .to_owned(),
+    );
+    let mut description = lines.join("\n");
+    truncate_utf8_bytes(&mut description, MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES);
+    description
 }
 
 /// Resolves explicit local-audio fingerprints without blocking navigation or
@@ -35991,7 +37880,12 @@ mod tests {
     use std::collections::VecDeque;
     #[cfg(feature = "yt-dlp")]
     use std::io::Cursor;
-    #[cfg(any(feature = "acoustid", feature = "yandex-music", feature = "yt-dlp"))]
+    #[cfg(any(
+        feature = "acoustid",
+        feature = "audio-quality",
+        feature = "yandex-music",
+        feature = "yt-dlp"
+    ))]
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -48742,6 +50636,79 @@ mod tests {
         assert_eq!(parse_local_probe_duration("N/A"), None);
     }
 
+    #[cfg(all(feature = "audio-quality", unix))]
+    #[test]
+    fn local_ffprobe_does_not_wait_for_a_descendant_holding_stdout_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = crate::test_support::canonical_tempdir(
+            "temporary inherited local ffprobe stdout fixture",
+        );
+        let helper = fixture.path().join("ffprobe-wrapper");
+        let media = fixture.path().join("track.flac");
+        std::fs::write(&media, b"media fixture").expect("write media fixture");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"streams\":[],\"format\":{\"format_name\":\"flac\",\"duration\":\"1\"}}'\n",
+                "sleep 2 &\n",
+                "exit 0\n",
+            ),
+        )
+        .expect("write ffprobe wrapper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("make ffprobe wrapper executable");
+        let started = Instant::now();
+
+        let metadata = SystemLocalMediaProbe { executable: helper }.probe(&media);
+
+        assert!(metadata.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the direct helper's descendant must not extend the probe deadline"
+        );
+    }
+
+    #[cfg(all(feature = "audio-quality", unix))]
+    #[test]
+    fn local_ffprobe_normalizes_a_protocol_like_relative_input_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = crate::test_support::canonical_tempdir(
+            "temporary protocol-like local ffprobe input fixture",
+        );
+        let helper = fixture.path().join("ffprobe-wrapper");
+        let mut captured_argument = helper.as_os_str().to_owned();
+        captured_argument.push(".input");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "last=\n",
+                "for argument in \"$@\"; do last=$argument; done\n",
+                "printf '%s' \"$last\" > \"$0.input\"\n",
+                "printf '%s' '{\"streams\":[],\"format\":{\"format_name\":\"flac\",\"duration\":\"1\"}}'\n",
+            ),
+        )
+        .expect("write ffprobe argument wrapper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("make ffprobe argument wrapper executable");
+
+        let metadata = SystemLocalMediaProbe { executable: helper }
+            .probe(Path::new("concat:youta-quality-input.flac"));
+
+        assert!(metadata.is_some());
+        let captured = PathBuf::from(
+            std::fs::read_to_string(captured_argument).expect("captured FFprobe input argument"),
+        );
+        assert!(captured.is_absolute());
+        assert_eq!(
+            captured.file_name(),
+            Some(std::ffi::OsStr::new("concat:youta-quality-input.flac"))
+        );
+    }
+
     #[cfg(all(feature = "images", feature = "local-video-thumbnails"))]
     #[test]
     fn local_video_thumbnail_uses_case_insensitive_mov_midpoint_only_for_finite_video() {
@@ -49151,6 +51118,1514 @@ mod tests {
                     .join(format!("{MAX_CACHED_LOCAL_MEDIA_ITEMS}.flac"))
             )
         );
+    }
+
+    /// Builds an isolated controller for local audio-quality integration tests.
+    #[cfg(feature = "audio-quality")]
+    fn controller_with_local_audio_quality() -> (tempfile::TempDir, AppController) {
+        let fixture =
+            crate::test_support::canonical_tempdir("temporary audio quality controller fixture");
+        let config = Config::for_dir(fixture.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory audio quality state");
+        (fixture, AppController::new(config, store, None, None))
+    }
+
+    /// Installs captured quality channels for deterministic ownership tests.
+    #[cfg(feature = "audio-quality")]
+    fn install_captured_local_audio_quality_channels(
+        controller: &mut AppController,
+    ) -> (
+        Receiver<LocalAudioQualityWorkerRequest>,
+        Sender<LocalAudioQualityWorkerResponse>,
+        Sender<LocalAudioQualityBatchWorkerResponse>,
+    ) {
+        controller.shutdown_local_audio_quality_worker();
+        let (request_sender, requests) = bounded(1);
+        let request_drain = requests.clone();
+        let (response_sender, responses) = unbounded();
+        let (batch_response_sender, batch_responses) = unbounded();
+        controller.local_audio_quality_requests = Some(request_sender);
+        controller.local_audio_quality_request_drain = request_drain;
+        controller.local_audio_quality_responses = responses;
+        controller.local_audio_quality_batch_responses = batch_responses;
+        controller.local_audio_quality_thread = None;
+        controller.local_audio_quality_disconnect_reported = false;
+        (requests, response_sender, batch_response_sender)
+    }
+
+    /// Selects one exact entry through the real Local listing.
+    #[cfg(feature = "audio-quality")]
+    fn select_local_audio_quality_fixture(
+        controller: &mut AppController,
+        directory: &Path,
+        selected_path: &Path,
+    ) -> MediaId {
+        let listing = crate::local_browser::list_local_directory(
+            directory,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("Local audio quality listing");
+        let entry_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == selected_path)
+            .expect("audio quality fixture in Local listing");
+        controller.view.screen = Screen::Local;
+        controller.view.selected =
+            entry_index.saturating_add(usize::from(listing.parent.is_some()));
+        controller.local_listing = Some(listing);
+        controller.rebuild_local_browser_rows();
+        controller.update_local_browser_detail();
+        local_media_id(selected_path)
+    }
+
+    /// Caches deterministic completed technical metadata for one test file.
+    #[cfg(feature = "audio-quality")]
+    fn cache_local_audio_quality_metadata(
+        controller: &mut AppController,
+        path: &Path,
+        codec: &str,
+        bitrate_kbps: Option<u32>,
+    ) {
+        let mut item = local_media_item_stub(path.to_owned(), None);
+        item.codec = codec.to_owned();
+        item.bitrate_kbps = bitrate_kbps;
+        item.sample_rate_hz = Some(44_100);
+        item.channels = Some(2);
+        item.technical_metadata_probed = true;
+        controller.cache_local_media_item(
+            local_file_identity(path).expect("audio quality metadata identity"),
+            item,
+        );
+    }
+
+    /// Deterministic analyzer used to exercise the controller worker boundary.
+    #[cfg(feature = "audio-quality")]
+    struct ScriptedAudioQualityAnalyzer {
+        outcomes: Mutex<VecDeque<Result<AudioQualityReport, AudioQualityError>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// Analyzer that blocks until shutdown cancels its exact request.
+    #[cfg(feature = "audio-quality")]
+    struct CancellationBlockingAudioQualityAnalyzer {
+        started: Arc<AtomicBool>,
+        observed_cancellation: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "audio-quality")]
+    impl AudioQualityAnalyzer for CancellationBlockingAudioQualityAnalyzer {
+        fn analyze(
+            &self,
+            _request: &AudioQualityRequest,
+            cancellation: &AudioQualityCancellation,
+        ) -> Result<AudioQualityReport, AudioQualityError> {
+            self.started.store(true, AtomicOrdering::Release);
+            let fallback_deadline = Instant::now() + Duration::from_secs(2);
+            while !cancellation.is_cancelled() && Instant::now() < fallback_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if cancellation.is_cancelled() {
+                self.observed_cancellation
+                    .store(true, AtomicOrdering::Release);
+                Err(AudioQualityError::Cancelled)
+            } else {
+                Err(AudioQualityError::TimedOut)
+            }
+        }
+    }
+
+    #[cfg(feature = "audio-quality")]
+    impl AudioQualityAnalyzer for ScriptedAudioQualityAnalyzer {
+        fn analyze(
+            &self,
+            _request: &AudioQualityRequest,
+            cancellation: &AudioQualityCancellation,
+        ) -> Result<AudioQualityReport, AudioQualityError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if cancellation.is_cancelled() {
+                return Err(AudioQualityError::Cancelled);
+            }
+            self.outcomes
+                .lock()
+                .expect("scripted audio quality outcomes")
+                .pop_front()
+                .expect("a scripted audio quality outcome")
+        }
+    }
+
+    /// Replaces the production analyzer with one deterministic worker.
+    #[cfg(feature = "audio-quality")]
+    fn install_local_audio_quality_analyzer(
+        controller: &mut AppController,
+        analyzer: Box<dyn AudioQualityAnalyzer>,
+    ) {
+        controller.shutdown_local_audio_quality_worker();
+        let (request_sender, requests) = bounded(1);
+        let request_drain = requests.clone();
+        let (response_sender, responses) = unbounded();
+        let (batch_response_sender, batch_responses) = unbounded();
+        let metadata_loader = Arc::clone(&controller.local_media_loader);
+        let worker = thread::Builder::new()
+            .name("youta-test-local-audio-quality".to_owned())
+            .spawn(move || {
+                local_audio_quality_worker(
+                    requests,
+                    response_sender,
+                    batch_response_sender,
+                    analyzer,
+                    metadata_loader,
+                );
+            })
+            .expect("test audio quality worker");
+        controller.local_audio_quality_requests = Some(request_sender);
+        controller.local_audio_quality_request_drain = request_drain;
+        controller.local_audio_quality_responses = responses;
+        controller.local_audio_quality_batch_responses = batch_responses;
+        controller.local_audio_quality_thread = Some(worker);
+        controller.local_audio_quality_disconnect_reported = false;
+    }
+
+    /// Drains one deterministic analyzer completion before the test deadline.
+    #[cfg(feature = "audio-quality")]
+    fn await_local_audio_quality(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.pending_local_audio_quality.is_some() && Instant::now() < deadline {
+            controller.drain_local_audio_quality_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            controller.pending_local_audio_quality.is_none(),
+            "local audio quality worker did not complete before the test deadline"
+        );
+    }
+
+    /// Drains one deterministic batch before the test deadline.
+    #[cfg(feature = "audio-quality")]
+    fn await_local_audio_quality_batch(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.pending_local_audio_quality_batch.is_some() && Instant::now() < deadline {
+            controller.drain_local_audio_quality_responses();
+            controller.drain_local_audio_quality_batch_responses();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            controller.pending_local_audio_quality_batch.is_none(),
+            "local audio quality batch did not complete before the test deadline"
+        );
+    }
+
+    /// Builds one cautious report with a stable high-frequency bandwidth limit.
+    #[cfg(feature = "audio-quality")]
+    fn band_limited_audio_quality_report(path: &Path) -> AudioQualityReport {
+        AudioQualityReport::new(
+            AudioQualityIdentity::from_path(path).expect("audio quality report identity"),
+            DeclaredEncoding::Lossy {
+                bitrate_kbps: Some(320),
+            },
+            crate::audio_quality::AudioQualityAssessment::BandLimited,
+            crate::audio_quality::AudioQualityConfidence::High,
+        )
+        .with_spectral_evidence(Some(15_800), Some(27.5), 91, 12, 480_000)
+        .with_source_sample_rate_hz(44_100)
+        .with_source_channels(2)
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn audio_quality_does_not_treat_container_extensions_as_lossy_codecs() {
+        for extension in ["m4a", "ogg", "oga", "wav"] {
+            let path = PathBuf::from(format!("track.{extension}"));
+            let item = local_media_item_stub(path.clone(), Some(0));
+
+            assert_eq!(item.codec, "unknown");
+            assert_eq!(
+                local_audio_declared_encoding(&item).0,
+                DeclaredEncoding::Unknown,
+                "container-only extension `{extension}` must not imply a lossy codec"
+            );
+        }
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_details_support_exact_audio_files_and_folders() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary audio quality eligibility fixture");
+        let audio = media.path().join("track.flac");
+        let video = media.path().join("clip.mp4");
+        let image = media.path().join("cover.jpg");
+        let folder = media.path().join("album");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        std::fs::write(&video, b"video fixture").expect("write video fixture");
+        std::fs::write(&image, b"image fixture").expect("write image fixture");
+        std::fs::create_dir(&folder).expect("create folder fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+
+        for (path, exact_audio, action_available) in [
+            (&audio, true, true),
+            (&video, false, false),
+            (&image, false, false),
+            (&folder, false, true),
+        ] {
+            let media_id =
+                select_local_audio_quality_fixture(&mut controller, media.path(), path.as_path());
+            let target = controller.selected_local_audio_quality_target();
+
+            assert_eq!(
+                target.as_ref().map(|(selected, _)| selected),
+                exact_audio.then_some(&media_id),
+                "unexpected analysis eligibility for {}",
+                path.display()
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.local_audio_quality_available),
+                action_available,
+                "Details action eligibility must include audio files and folders"
+            );
+        }
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_action_toggles_exact_request_cancellation() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary audio quality cancellation fixture");
+        let audio = media.path().join("track.mp3");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "MP3", Some(320));
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            cancellation,
+        } = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured audio quality request")
+        else {
+            panic!("unexpected audio quality worker command");
+        };
+        assert!(controller.pending_local_audio_quality.is_some());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_audio_quality_pending)
+        );
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            controller
+                .pending_local_audio_quality
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested)
+        );
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: request.path().to_owned(),
+                result: Err(AudioQualityError::Cancelled),
+            })
+            .expect("cancelled audio quality completion");
+        controller.drain_local_audio_quality_responses();
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_audio_quality_available && !details.local_audio_quality_pending
+        }));
+        assert_eq!(
+            controller.view.status_line,
+            "Audio quality analysis cancelled"
+        );
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_waits_for_nominal_bitrate_metadata_before_starting() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary deferred audio quality metadata fixture",
+        );
+        let audio = media.path().join("upencoded.mp3");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, _responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            controller
+                .pending_local_audio_quality
+                .as_ref()
+                .is_some_and(|pending| pending.cancellation.is_none()),
+            "the intent must remain cancelable while metadata is loading"
+        );
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_audio_quality_pending)
+        );
+
+        let identity = local_file_identity(&audio).expect("metadata response identity");
+        let mut item = local_media_item_stub(audio.clone(), None);
+        item.codec = "MP3".to_owned();
+        item.bitrate_kbps = Some(320);
+        item.sample_rate_hz = Some(44_100);
+        item.channels = Some(6);
+        item.technical_metadata_probed = true;
+        controller
+            .local_media_metadata_sender
+            .send(LocalMediaMetadataResponse {
+                path: audio.clone(),
+                result: Some((identity, item)),
+            })
+            .expect("deferred metadata completion");
+
+        controller.drain_local_media_metadata_responses();
+
+        let LocalAudioQualityWorkerRequest::Analyze {
+            request,
+            cancellation,
+            ..
+        } = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("analysis after metadata")
+        else {
+            panic!("unexpected audio quality command");
+        };
+        assert_eq!(
+            request.declared_encoding(),
+            DeclaredEncoding::Lossy {
+                bitrate_kbps: Some(320)
+            }
+        );
+        assert_eq!(request.source_sample_rate_hz(), Some(44_100));
+        assert_eq!(request.source_channels(), Some(6));
+        controller.cancel_local_audio_quality();
+        assert!(cancellation.is_cancelled());
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_completion_projects_and_reuses_bounded_evidence() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary audio quality success fixture");
+        let audio = media.path().join("upencoded.mp3");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_local_audio_quality_analyzer(
+            &mut controller,
+            Box::new(ScriptedAudioQualityAnalyzer {
+                outcomes: Mutex::new(VecDeque::from([Ok(band_limited_audio_quality_report(
+                    &audio,
+                ))])),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "MP3", Some(320));
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        await_local_audio_quality(&mut controller);
+
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("Local audio quality details");
+        assert!(details.local_audio_quality_available);
+        assert!(!details.local_audio_quality_pending);
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("Verdict: band-limited audio")
+        );
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("Current encoding: lossy encoding at 320 kbps")
+        );
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("Current sample rate: 44.1 kHz")
+        );
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("Current channels: 2")
+        );
+        assert!(
+            !details
+                .local_audio_quality_description
+                .contains("Estimated effective source")
+        );
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("Evidence strength: high")
+        );
+        assert!(
+            details
+                .local_audio_quality_description
+                .contains("cannot prove the original encoder or bitrate")
+        );
+        assert!(
+            details.local_audio_quality_description.len()
+                <= MAX_LOCAL_AUDIO_QUALITY_DESCRIPTION_BYTES
+        );
+        assert_eq!(controller.local_audio_quality_cache.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.view.status_line,
+            "Using the cached quality analysis for this unchanged file"
+        );
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn missing_ffmpeg_quality_failure_opens_non_reportable_setup_guidance() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary missing quality ffmpeg fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        install_local_audio_quality_analyzer(
+            &mut controller,
+            Box::new(ScriptedAudioQualityAnalyzer {
+                outcomes: Mutex::new(VecDeque::from([Err(AudioQualityError::FfmpegUnavailable(
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "mock missing FFmpeg"),
+                ))])),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "FLAC", None);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        await_local_audio_quality(&mut controller);
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("missing FFmpeg setup popup");
+        assert_eq!(popup.title, "FFmpeg required for audio quality analysis");
+        assert!(!popup.reportable);
+        assert!(popup.report.contains("emerge --ask media-video/ffmpeg"));
+        assert!(popup.report.contains("ffmpeg_executable"));
+        assert!(!popup.gh_available);
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn stale_and_replaced_audio_quality_completions_cannot_enter_the_cache() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary stale audio quality completion fixture",
+        );
+        let audio = media.path().join("track.mp3");
+        std::fs::write(&audio, b"first audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "MP3", Some(320));
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            ..
+        } = requests.recv().expect("captured active quality request")
+        else {
+            panic!("unexpected audio quality command");
+        };
+        let report = band_limited_audio_quality_report(&audio);
+
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation: generation.wrapping_sub(1),
+                path: request.path().to_owned(),
+                result: Ok(report.clone()),
+            })
+            .expect("send stale completion");
+        controller.drain_local_audio_quality_responses();
+        assert!(controller.pending_local_audio_quality.is_some());
+        assert!(controller.local_audio_quality_cache.is_empty());
+
+        std::fs::write(&audio, b"replacement audio fixture with new identity")
+            .expect("replace audio fixture");
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: request.path().to_owned(),
+                result: Ok(report),
+            })
+            .expect("send obsolete completion");
+        controller.drain_local_audio_quality_responses();
+
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(controller.local_audio_quality_cache.is_empty());
+        let details = controller.view.details.as_ref().expect("Local details");
+        assert!(details.local_audio_quality_available);
+        assert!(!details.local_audio_quality_pending);
+        assert!(details.local_audio_quality_description.is_empty());
+        assert_eq!(
+            controller.view.status_line,
+            "The local audio file changed; press V to analyze it again"
+        );
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn changing_local_selection_cancels_the_exact_quality_request() {
+        let media = crate::test_support::canonical_tempdir("temporary quality selection fixture");
+        let first = media.path().join("first.mp3");
+        let second = media.path().join("second.flac");
+        std::fs::write(&first, b"first audio fixture").expect("write first audio fixture");
+        std::fs::write(&second, b"second audio fixture").expect("write second audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &first);
+        cache_local_audio_quality_metadata(&mut controller, &first, "MP3", Some(320));
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            cancellation,
+        } = requests.recv().expect("captured quality request")
+        else {
+            panic!("unexpected audio quality command");
+        };
+
+        select_local_audio_quality_fixture(&mut controller, media.path(), &second);
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            controller
+                .pending_local_audio_quality
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested)
+        );
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: request.path().to_owned(),
+                result: Err(AudioQualityError::Cancelled),
+            })
+            .expect("cancelled selection completion");
+        controller.drain_local_audio_quality_responses();
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(controller.view.details.as_ref().is_some_and(|details| {
+            details.local_audio_quality_available && !details.local_audio_quality_pending
+        }));
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_folder_and_mixed_marks_start_exact_bounded_batches() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary folder and marked quality batch fixture",
+        );
+        let album = media.path().join("album");
+        let loose_audio = media.path().join("loose.mp3");
+        let image = media.path().join("cover.jpg");
+        std::fs::create_dir(&album).expect("create album fixture");
+        std::fs::write(album.join("track.flac"), b"nested audio fixture")
+            .expect("write nested audio fixture");
+        std::fs::write(&loose_audio, b"loose audio fixture").expect("write loose audio fixture");
+        std::fs::write(&image, b"image fixture").expect("write image fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, _responses, batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &album);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| popup.pending && popup.summary.contains("Collecting"))
+        );
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation,
+            roots,
+            limits,
+            cancellation,
+        } = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("selected folder batch request")
+        else {
+            panic!("selected folder must use recursive batch analysis");
+        };
+        assert_eq!(roots, vec![album.clone()]);
+        assert_eq!(limits, AudioQualityTargetLimits::default());
+
+        controller.dispatch(UiAction::CancelAudioQualityAnalysis);
+        assert!(cancellation.is_cancelled());
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::CollectionFailed {
+                generation,
+                error: AudioQualityTargetCollectionError::Cancelled,
+            })
+            .expect("cancelled folder collection");
+        controller.drain_local_audio_quality_batch_responses();
+
+        select_local_audio_quality_fixture(&mut controller, media.path(), &image);
+        controller.local_move_marks =
+            HashSet::from([image.clone(), album.clone(), loose_audio.clone()]);
+        controller.rebuild_local_browser_rows();
+        controller.update_local_browser_detail();
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_audio_quality_available)
+        );
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            roots,
+            cancellation,
+            ..
+        } = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("marked mixed batch request")
+        else {
+            panic!("marks must take precedence over the selected unsupported sibling");
+        };
+        let mut expected = vec![album, image, loose_audio];
+        expected.sort();
+        assert_eq!(roots, expected);
+        controller.dispatch(UiAction::CancelAudioQualityAnalysis);
+        assert!(cancellation.is_cancelled());
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_batch_forwards_probed_bitrate_sample_rate_and_channels() {
+        struct FixedQualityMetadataLoader;
+
+        impl LocalMediaLoader for FixedQualityMetadataLoader {
+            fn load(&self, path: PathBuf) -> LocalMediaItem {
+                let mut item = local_media_item_stub(path, None);
+                item.codec = "MP3".to_owned();
+                item.bitrate_kbps = Some(320);
+                item.sample_rate_hz = Some(48_000);
+                item.channels = Some(6);
+                item.technical_metadata_probed = true;
+                item
+            }
+        }
+
+        struct CapturingQualityAnalyzer {
+            requests: Sender<AudioQualityRequest>,
+        }
+
+        impl AudioQualityAnalyzer for CapturingQualityAnalyzer {
+            fn analyze(
+                &self,
+                request: &AudioQualityRequest,
+                _cancellation: &AudioQualityCancellation,
+            ) -> Result<AudioQualityReport, AudioQualityError> {
+                self.requests
+                    .send(request.clone())
+                    .expect("capture batch analyzer request");
+                Ok(AudioQualityReport::new(
+                    request.identity().clone(),
+                    request.declared_encoding(),
+                    crate::audio_quality::AudioQualityAssessment::Inconclusive,
+                    crate::audio_quality::AudioQualityConfidence::Low,
+                ))
+            }
+        }
+
+        let media =
+            crate::test_support::canonical_tempdir("temporary batch metadata forwarding fixture");
+        let album = media.path().join("album");
+        let audio = album.join("surround.mp3");
+        std::fs::create_dir(&album).expect("create album fixture");
+        std::fs::write(&audio, b"surround audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        controller.local_media_loader = Arc::new(FixedQualityMetadataLoader);
+        let (captured_sender, captured_requests) = unbounded();
+        install_local_audio_quality_analyzer(
+            &mut controller,
+            Box::new(CapturingQualityAnalyzer {
+                requests: captured_sender,
+            }),
+        );
+        select_local_audio_quality_fixture(&mut controller, media.path(), &album);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        await_local_audio_quality_batch(&mut controller);
+
+        let request = captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured recursive batch analyzer request");
+        assert_eq!(request.path(), audio);
+        assert_eq!(
+            request.declared_encoding(),
+            DeclaredEncoding::Lossy {
+                bitrate_kbps: Some(320),
+            }
+        );
+        assert_eq!(request.source_sample_rate_hz(), Some(48_000));
+        assert_eq!(request.source_channels(), Some(6));
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending && popup.completed == 1)
+        );
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_batch_progress_cache_and_copy_reject_stale_owners() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary quality batch progress fixture");
+        let album = media.path().join("album");
+        let first = album.join("first.mp3");
+        let second = album.join("second.mp3");
+        std::fs::create_dir(&album).expect("create album fixture");
+        std::fs::write(&first, b"first quality fixture").expect("write first fixture");
+        std::fs::write(&second, b"second quality fixture").expect("write second fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, _responses, batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &album);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch { generation, .. } = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured batch request")
+        else {
+            panic!("folder analysis must use a batch request");
+        };
+
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation: generation.wrapping_sub(1),
+                total: 99,
+            })
+            .expect("send stale target count");
+        controller.drain_local_audio_quality_batch_responses();
+        assert_eq!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .map(|popup| popup.total),
+            Some(0),
+            "an older generation must not replace current progress"
+        );
+
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation,
+                total: 2,
+            })
+            .expect("send target count");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                generation,
+                index: 1,
+                total: 2,
+                path: first.clone(),
+                result: Ok(band_limited_audio_quality_report(&first)),
+            })
+            .expect("send first result");
+        controller.drain_local_audio_quality_batch_responses();
+        let popup = controller
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .expect("batch progress popup");
+        assert_eq!((popup.completed, popup.total), (1, 2));
+        assert!(popup.pending);
+        assert!(popup.report.contains("[1/2]"));
+        assert_eq!(controller.local_audio_quality_cache.len(), 1);
+
+        controller.dispatch(UiAction::CopyAudioQualityReport);
+        let first_copy = controller
+            .take_clipboard_request()
+            .expect("first report copy request");
+        assert!(matches!(
+            first_copy.subject,
+            ClipboardSubject::AudioQualityReport(_)
+        ));
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                generation,
+                index: 2,
+                total: 2,
+                path: second.clone(),
+                result: Ok(band_limited_audio_quality_report(&second)),
+            })
+            .expect("send second result");
+        controller.drain_local_audio_quality_batch_responses();
+        controller.report_clipboard_result(Ok("mock clipboard".to_owned()));
+        assert_eq!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .and_then(|popup| popup.action_status.as_deref()),
+            None,
+            "a completion for an older report revision must not claim the newer report was copied"
+        );
+
+        controller.dispatch(UiAction::CopyAudioQualityReport);
+        let final_copy = controller
+            .take_clipboard_request()
+            .expect("final report copy request");
+        assert_eq!(
+            final_copy.text,
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .expect("current report popup")
+                .report
+        );
+        controller.report_clipboard_result(Ok("mock clipboard".to_owned()));
+        assert_eq!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .and_then(|popup| popup.action_status.as_deref()),
+            Some("Copied with mock clipboard")
+        );
+
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::Finished {
+                generation,
+                total: 2,
+                stopped_for_missing_ffmpeg: false,
+            })
+            .expect("finish batch");
+        controller.drain_local_audio_quality_batch_responses();
+        let popup = controller
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .expect("terminal batch popup");
+        assert!(!popup.pending);
+        assert_eq!((popup.completed, popup.total), (2, 2));
+        assert!(popup.summary.contains("2 succeeded, 0 failed"));
+        assert_eq!(controller.local_audio_quality_cache.len(), 2);
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn audio_quality_cancel_retains_completions_already_queued_by_the_worker() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary quality cancellation completion fixture",
+        );
+        let audio = media.path().join("single.flac");
+        let album = media.path().join("album");
+        let batch_audio = album.join("batch.flac");
+        std::fs::write(&audio, b"single quality fixture").expect("write single fixture");
+        std::fs::create_dir(&album).expect("create batch folder");
+        std::fs::write(&batch_audio, b"batch quality fixture").expect("write batch fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "FLAC", None);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            cancellation,
+            ..
+        } = requests.recv().expect("single quality request")
+        else {
+            panic!("selected audio must use a single request");
+        };
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: audio.clone(),
+                result: Ok(band_limited_audio_quality_report(&audio)),
+            })
+            .expect("queue completed single result");
+        controller.dispatch(UiAction::CancelAudioQualityAnalysis);
+        assert!(cancellation.is_cancelled());
+        controller.drain_local_audio_quality_responses();
+        let popup = controller
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .expect("single result popup");
+        assert!(!popup.pending);
+        assert_eq!((popup.completed, popup.total), (1, 1));
+        assert!(popup.report.contains("[1/1]"));
+
+        select_local_audio_quality_fixture(&mut controller, media.path(), &album);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation,
+            cancellation,
+            ..
+        } = requests.recv().expect("batch quality request")
+        else {
+            panic!("selected folder must use a batch request");
+        };
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation,
+                total: 1,
+            })
+            .expect("queue batch target count");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                generation,
+                index: 1,
+                total: 1,
+                path: batch_audio.clone(),
+                result: Ok(band_limited_audio_quality_report(&batch_audio)),
+            })
+            .expect("queue completed batch row");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::Finished {
+                generation,
+                total: 1,
+                stopped_for_missing_ffmpeg: false,
+            })
+            .expect("queue batch completion");
+        controller.dispatch(UiAction::CancelAudioQualityAnalysis);
+        assert!(cancellation.is_cancelled());
+        controller.drain_local_audio_quality_batch_responses();
+        let popup = controller
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .expect("batch result popup");
+        assert!(!popup.pending);
+        assert_eq!((popup.completed, popup.total), (1, 1));
+        assert!(popup.report.contains("[1/1]"));
+        assert!(popup.summary.contains("1 succeeded"));
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn leaving_local_finalizes_a_quality_request_waiting_for_metadata() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary deferred quality route-change fixture",
+        );
+        let audio = media.path().join("deferred.mp3");
+        std::fs::write(&audio, b"deferred quality fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (_requests, _responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        assert!(controller.pending_local_audio_quality.is_some());
+
+        controller.show_screen(Screen::Search);
+
+        assert!(controller.pending_local_audio_quality.is_none());
+        let popup = controller
+            .view
+            .audio_quality_popup
+            .as_ref()
+            .expect("terminal quality popup");
+        assert!(!popup.pending);
+        assert!(popup.summary.contains("cancelled"));
+        controller.dispatch(UiAction::DismissAudioQualityPopup);
+        assert!(controller.view.audio_quality_popup.is_none());
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn show_now_playing_finalizes_deferred_local_audio_quality() {
+        let media = crate::test_support::canonical_tempdir(
+            "temporary deferred quality now-playing fixture",
+        );
+        let audio = media.path().join("deferred.mp3");
+        std::fs::write(&audio, b"deferred quality fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (_requests, _responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        assert!(controller.pending_local_audio_quality.is_some());
+        let playing = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(playing.clone())];
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&playing, None));
+
+        controller.dispatch(UiAction::ShowNowPlaying);
+
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending && popup.summary.contains("cancelled"))
+        );
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn show_now_playing_cancels_active_local_audio_quality() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary active quality now-playing fixture");
+        let audio = media.path().join("active.flac");
+        std::fs::write(&audio, b"active quality fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "FLAC", None);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            cancellation,
+        } = requests.recv().expect("active quality request")
+        else {
+            panic!("selected audio must use a single request");
+        };
+        let playing = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(playing.clone())];
+        controller
+            .playback_queue
+            .push(queue_item_from_video(&playing, None));
+
+        controller.dispatch(UiAction::ShowNowPlaying);
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            controller
+                .pending_local_audio_quality
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested)
+        );
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: request.path().to_owned(),
+                result: Err(AudioQualityError::Cancelled),
+            })
+            .expect("cancelled now-playing completion");
+        controller.drain_local_audio_quality_responses();
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending && popup.summary.contains("cancelled"))
+        );
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn dropping_another_path_cancels_active_local_audio_quality() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary active quality file-drop fixture");
+        let audio = media.path().join("active.flac");
+        let other_folder = media.path().join("other");
+        let other_audio = other_folder.join("other.flac");
+        std::fs::write(&audio, b"active quality fixture").expect("write audio fixture");
+        std::fs::create_dir(&other_folder).expect("create dropped folder");
+        std::fs::write(&other_audio, b"other audio fixture").expect("write dropped audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, responses, _batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "FLAC", None);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::Analyze {
+            generation,
+            request,
+            cancellation,
+        } = requests.recv().expect("active quality request")
+        else {
+            panic!("selected audio must use a single request");
+        };
+
+        controller.dispatch(UiAction::OpenDroppedPaths(vec![other_audio]));
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            controller
+                .pending_local_audio_quality
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested)
+        );
+        responses
+            .send(LocalAudioQualityWorkerResponse {
+                generation,
+                path: request.path().to_owned(),
+                result: Err(AudioQualityError::Cancelled),
+            })
+            .expect("cancelled dropped-path completion");
+        controller.drain_local_audio_quality_responses();
+        assert!(controller.pending_local_audio_quality.is_none());
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_batch_cancel_empty_limits_and_missing_ffmpeg_are_explicit() {
+        let media =
+            crate::test_support::canonical_tempdir("temporary quality batch terminal fixture");
+        let album = media.path().join("album");
+        let audio = album.join("track.flac");
+        std::fs::create_dir(&album).expect("create album fixture");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (requests, _responses, batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        select_local_audio_quality_fixture(&mut controller, media.path(), &album);
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation: cancelled_generation,
+            cancellation,
+            ..
+        } = requests.recv().expect("captured cancellable batch")
+        else {
+            panic!("folder analysis must use a batch request");
+        };
+        controller.dispatch(UiAction::CancelAudioQualityAnalysis);
+        assert!(cancellation.is_cancelled());
+        assert!(
+            controller
+                .pending_local_audio_quality_batch
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested)
+        );
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation: cancelled_generation,
+                total: 1,
+            })
+            .expect("send obsolete progress");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::Finished {
+                generation: cancelled_generation,
+                total: 1,
+                stopped_for_missing_ffmpeg: false,
+            })
+            .expect("send obsolete finish");
+        controller.drain_local_audio_quality_batch_responses();
+        assert!(controller.pending_local_audio_quality_batch.is_none());
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending && popup.summary.contains("cancelled"))
+        );
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation: empty_generation,
+            ..
+        } = requests.recv().expect("captured empty batch")
+        else {
+            panic!("folder analysis must use a batch request");
+        };
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation: empty_generation,
+                total: 0,
+            })
+            .expect("send empty target count");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::Finished {
+                generation: empty_generation,
+                total: 0,
+                stopped_for_missing_ffmpeg: false,
+            })
+            .expect("finish empty batch");
+        controller.drain_local_audio_quality_batch_responses();
+        assert!(controller.view.audio_quality_popup.as_ref().is_some_and(
+            |popup| !popup.pending && popup.summary.contains("No supported local audio files")
+        ));
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation: limited_generation,
+            ..
+        } = requests.recv().expect("captured limited batch")
+        else {
+            panic!("folder analysis must use a batch request");
+        };
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::CollectionFailed {
+                generation: limited_generation,
+                error: AudioQualityTargetCollectionError::AudioFileLimitReached { maximum: 1 },
+            })
+            .expect("send collection limit failure");
+        controller.drain_local_audio_quality_batch_responses();
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending
+                    && popup.summary.contains("1-audio-file safety limit")
+                    && popup.summary.contains("no files were analyzed"))
+        );
+
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let LocalAudioQualityWorkerRequest::AnalyzeBatch {
+            generation: missing_generation,
+            ..
+        } = requests.recv().expect("captured missing-FFmpeg batch")
+        else {
+            panic!("folder analysis must use a batch request");
+        };
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::TargetsCollected {
+                generation: missing_generation,
+                total: 2,
+            })
+            .expect("send missing-FFmpeg target count");
+        batch_responses
+            .send(LocalAudioQualityBatchWorkerResponse::ItemAnalyzed {
+                generation: missing_generation,
+                index: 1,
+                total: 2,
+                path: audio,
+                result: Err(AudioQualityError::FfmpegUnavailable(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock missing FFmpeg",
+                ))),
+            })
+            .expect("send missing-FFmpeg result");
+        controller.drain_local_audio_quality_batch_responses();
+        assert!(controller.pending_local_audio_quality_batch.is_none());
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.local_audio_quality_pending)
+        );
+        assert!(
+            controller
+                .view
+                .audio_quality_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.pending && popup.summary.contains("1 not analyzed"))
+        );
+        assert!(controller.view.error_popup.as_ref().is_some_and(|popup| {
+            !popup.reportable
+                && popup.title == "FFmpeg required for audio quality analysis"
+                && popup.report.contains("media-video/ffmpeg")
+        }));
+        controller.local_audio_quality_requests = None;
+    }
+
+    #[cfg(all(feature = "audio-quality", unix))]
+    #[test]
+    fn local_audio_quality_batch_paths_escape_controls_non_utf8_and_length() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut raw_path =
+            "/music/line\nname\ttab\u{1b}escape-\u{202e}gpj.exe-\u{2028}fake\u{2029}record-"
+                .as_bytes()
+                .to_vec();
+        raw_path.push(0xff);
+        raw_path.extend(std::iter::repeat_n(
+            b'x',
+            MAX_LOCAL_AUDIO_QUALITY_BATCH_PATH_BYTES * 2,
+        ));
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw_path));
+        let escaped = escaped_local_audio_quality_path(&path);
+
+        assert!(escaped.len() <= MAX_LOCAL_AUDIO_QUALITY_BATCH_PATH_BYTES);
+        assert!(escaped.contains("\\n"));
+        assert!(escaped.contains("\\t"));
+        assert!(escaped.contains("\\u{1b}"));
+        assert!(escaped.contains("\\u{202e}"));
+        assert!(escaped.contains("\\u{2028}"));
+        assert!(escaped.contains("\\u{2029}"));
+        assert!(escaped.contains("\\xFF"));
+        assert!(!escaped.contains('\u{202e}'));
+        assert!(!escaped.contains('\u{2028}'));
+        assert!(!escaped.contains('\u{2029}'));
+        assert!(!escaped.chars().any(char::is_control));
+
+        let error = AudioQualityError::Cancelled;
+        let first = format_local_audio_quality_batch_record(1, 2, &path, Err(&error));
+        let second = format_local_audio_quality_batch_record(2, 2, &path, Err(&error));
+        let copied_report = format!("{first}\n\n{second}");
+        assert_eq!(copied_report.matches("[1/2]").count(), 1);
+        assert_eq!(copied_report.matches("[2/2]").count(), 1);
+        assert!(!copied_report.contains('\t'));
+        assert!(!copied_report.contains('\r'));
+        assert!(!copied_report.contains('\u{1b}'));
+        assert_eq!(first.matches('\n').count(), 1);
+        assert_eq!(second.matches('\n').count(), 1);
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_ram_cache_is_lru_bounded() {
+        let media = crate::test_support::canonical_tempdir("temporary audio quality cache fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let mut keys = Vec::new();
+        for index in 0..MAX_CACHED_LOCAL_AUDIO_QUALITY_REPORTS {
+            let path = media.path().join(format!("{index}.flac"));
+            std::fs::write(&path, [u8::try_from(index).unwrap_or_default()])
+                .expect("write quality cache fixture");
+            let identity = AudioQualityIdentity::from_path(&path).expect("quality cache identity");
+            let key = LocalAudioQualityCacheKey {
+                path,
+                identity: identity.clone(),
+            };
+            controller.cache_local_audio_quality(
+                key.clone(),
+                AudioQualityReport::new(
+                    identity,
+                    DeclaredEncoding::Lossless,
+                    crate::audio_quality::AudioQualityAssessment::Inconclusive,
+                    crate::audio_quality::AudioQualityConfidence::Low,
+                ),
+            );
+            keys.push(key);
+        }
+        controller.promote_local_audio_quality_cache_key(&keys[0]);
+        let newest_path = media.path().join("newest.flac");
+        std::fs::write(&newest_path, b"newest quality fixture")
+            .expect("write newest cache fixture");
+        let newest_identity =
+            AudioQualityIdentity::from_path(&newest_path).expect("newest quality identity");
+        let newest = LocalAudioQualityCacheKey {
+            path: newest_path,
+            identity: newest_identity.clone(),
+        };
+        controller.cache_local_audio_quality(
+            newest.clone(),
+            AudioQualityReport::new(
+                newest_identity,
+                DeclaredEncoding::Lossless,
+                crate::audio_quality::AudioQualityAssessment::Inconclusive,
+                crate::audio_quality::AudioQualityConfidence::Low,
+            ),
+        );
+
+        assert_eq!(
+            controller.local_audio_quality_cache.len(),
+            MAX_CACHED_LOCAL_AUDIO_QUALITY_REPORTS
+        );
+        assert!(controller.local_audio_quality_cache.contains_key(&keys[0]));
+        assert!(!controller.local_audio_quality_cache.contains_key(&keys[1]));
+        assert!(controller.local_audio_quality_cache.contains_key(&newest));
+        assert_eq!(
+            controller.local_audio_quality_cache_order.len(),
+            MAX_CACHED_LOCAL_AUDIO_QUALITY_REPORTS
+        );
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn local_audio_quality_shutdown_cancels_and_joins_active_work() {
+        let media = crate::test_support::canonical_tempdir("temporary quality shutdown fixture");
+        let audio = media.path().join("track.flac");
+        std::fs::write(&audio, b"audio fixture").expect("write audio fixture");
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let started = Arc::new(AtomicBool::new(false));
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        install_local_audio_quality_analyzer(
+            &mut controller,
+            Box::new(CancellationBlockingAudioQualityAnalyzer {
+                started: Arc::clone(&started),
+                observed_cancellation: Arc::clone(&observed_cancellation),
+            }),
+        );
+        controller.pending_local_media_metadata = Some(media.path().join("blocked.flac"));
+        select_local_audio_quality_fixture(&mut controller, media.path(), &audio);
+        cache_local_audio_quality_metadata(&mut controller, &audio, "FLAC", None);
+        controller.dispatch(UiAction::AnalyzeLocalAudioQuality);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.load(AtomicOrdering::Acquire));
+
+        controller.shutdown_local_audio_quality_worker();
+
+        assert!(observed_cancellation.load(AtomicOrdering::Acquire));
+        assert!(controller.pending_local_audio_quality.is_none());
+        assert!(controller.local_audio_quality_requests.is_none());
+        assert!(controller.local_audio_quality_thread.is_none());
+    }
+
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn disconnected_audio_quality_worker_is_actionable_and_not_reportable() {
+        let (_fixture, mut controller) = controller_with_local_audio_quality();
+        let (_requests, responses, batch_responses) =
+            install_captured_local_audio_quality_channels(&mut controller);
+        drop(responses);
+        drop(batch_responses);
+
+        controller.drain_local_audio_quality_responses();
+
+        assert!(controller.local_audio_quality_requests.is_none());
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("disconnected quality worker guidance");
+        assert_eq!(popup.title, "Local audio-quality worker stopped");
+        assert!(!popup.reportable);
+        assert!(popup.report.contains("Restart Youta"));
     }
 
     /// Builds an isolated Local controller and captures incidental Wikidata

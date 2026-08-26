@@ -10,6 +10,7 @@ import { Subscriptions } from "./components/Subscriptions";
 import { Tabs } from "./components/Tabs";
 import { Waveform } from "./components/Waveform";
 import {
+  AudioQualityPopup,
   CredentialEditorNotice,
   ErrorPopup,
   HelpPopup,
@@ -161,7 +162,9 @@ export function App() {
       {/* Drawn in the order `render_frame` draws them, bottom to top. Each
           popup carries its own stacking layer, so the order is stated once
           rather than implied by where a component sits in this tree. */}
-      {view.help_open ? <HelpPopup /> : null}
+      {view.help_open ? (
+        <HelpPopup audioQualitySupported={view.audio_quality_supported} />
+      ) : null}
       {view.project_history_popup ? (
         <ProjectHistoryPopup popup={view.project_history_popup} />
       ) : null}
@@ -179,6 +182,9 @@ export function App() {
         <VideoCommentsPopup popup={view.video_comments_popup} />
       ) : null}
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
+      {view.audio_quality_popup ? (
+        <AudioQualityPopup popup={view.audio_quality_popup} />
+      ) : null}
       {view.error_popup ? (
         <ErrorPopup
           popup={view.error_popup}

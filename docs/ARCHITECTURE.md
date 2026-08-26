@@ -882,6 +882,37 @@ on any row emits an owner-bearing timecode action so it cannot seek unrelated
 media. Played columns use the normal progress style while future columns use a
 muted style, so progress remains distinct even when bold text is unavailable.
 
+Local audio-quality analysis is another explicit, independent pipeline. The
+default-on `audio-quality` feature accepts one selected Local entry or the
+explicitly marked files and folders. A bounded collector expands folders in
+deterministic native-path order, skips symbolic links and non-audio entries,
+and rejects incomplete traversal instead of returning a silent partial set.
+The worker then passes each of at most 256 files, sequentially, to the
+configured `ffmpeg` executable without a shell, streams up to the leading 30
+seconds of bounded decoded PCM, and calculates windowed spectra with RustFFT
+outside the reducer thread. It looks for a stable sharp high-frequency cutoff
+across active windows. The current container, codec, sample rate, channel
+count, and encoded bitrate remain factual metadata; cutoff, evidence strength,
+window agreement, and a qualitative assessment are labelled as inference.
+The analyzer deliberately does not map bandwidth to a codec-neutral bitrate,
+because encoder families use different low-pass behaviour. A spectral cutoff
+cannot prove codec ancestry or recover an exact original bitrate, so a negative
+result also never claims that a source is genuinely lossless. If metadata does
+not provide the current sample rate or channel count, the cutoff remains
+visible but the analyzer suppresses source-history inference. It applies the
+same suppression when an input with more than two channels must be normalized
+to stereo, where downmixing could remove spectral evidence.
+
+The analyzer has a bounded wall-clock deadline and cooperative cancellation;
+selection changes and a second activation terminate obsolete single-file
+work; the modal batch report has its own explicit cancellation control.
+Every request and cached result carries replacement-sensitive file identity,
+so a late completion cannot describe a file replaced at the same path. A
+dedicated worker keeps the reducer and provider workers responsive, emits
+bounded per-file progress into a copyable popup, and a 64-entry RAM-only LRU
+makes an unchanged revisit immediate. Audio bytes, paths, and quality reports
+are never sent over the network or persisted.
+
 Local audio identification is a separate explicit pipeline. The `acoustid`
 feature invokes Chromaprint's official `fpcalc` utility without a shell,
 captures bounded JSON, and posts only its encoded fingerprint and duration to
@@ -1038,10 +1069,11 @@ branch and failure-path assertions matter more than a single percentage.
 Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
 include both official YouTube metadata and Invidious adapters, terminal images,
-offline QR rendering, and the credential-free LibriVox adapter; runtime
+offline QR rendering, local audio-quality analysis, and the credential-free
+LibriVox adapter; runtime
 `providers.youtube_backend` chooses the YouTube adapter. `librivox` is included
-through `app-core`, while `images` and `qr` are independent default-on
-capabilities.
+through `app-core`, while `audio-quality`, `images`, and `qr` are independent
+default-on capabilities.
 The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
 builds omit that dependency and shortcut. Distribution/minimal builds can use
 `--no-default-features`. Human-readable file persistence is part of the core;
@@ -1067,8 +1099,10 @@ signing material exists, and with no automatic updater, because an update
 channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
-exact locked dependency graph. The Gentoo ebuild exposes positive
-default-on `images` and `qr` USE flags, which can be disabled independently.
+exact locked dependency graph. The Gentoo source ebuild exposes positive
+default-on `audio-quality`, `images`, and `qr` USE flags, which can be disabled
+independently. Prebuilt artifacts always contain the analyzer because a binary
+USE flag cannot change compiled code.
 It is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as

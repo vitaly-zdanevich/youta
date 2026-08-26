@@ -201,6 +201,9 @@ export interface DetailView {
   local_trashable: boolean;
   local_fingerprint_available: boolean;
   local_fingerprint_pending: boolean;
+  local_audio_quality_available: boolean;
+  local_audio_quality_pending: boolean;
+  local_audio_quality_description: string;
 }
 
 /**
@@ -259,6 +262,18 @@ export interface ErrorPopupView {
   action_status: string | null;
   yt_dlp_forbidden: YtDlpForbiddenView | null;
   github_issue_submission: GitHubIssueSubmissionView;
+}
+
+/** Copyable progress and results for one local audio-quality batch. */
+export interface AudioQualityPopupView {
+  title: string;
+  summary: string;
+  completed: number;
+  total: number;
+  report: string;
+  action_status: string | null;
+  pending: boolean;
+  scroll_offset: number;
 }
 
 /** One public top-level comment. */
@@ -541,6 +556,8 @@ export interface ViewModel {
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
   error_popup: ErrorPopupView | null;
+  audio_quality_supported: boolean;
+  audio_quality_popup: AudioQualityPopupView | null;
   video_comments_popup: VideoCommentsPopupView | null;
   video_qr_popup: VideoQrPopupView | null;
   preferences_popup: PreferencesPopupView | null;
@@ -632,6 +649,7 @@ export interface ScrollGeometry {
 
 /** The scroll geometry of every popup whose paging keys the reducer resolves. */
 export interface PopupGeometry {
+  audio_quality: ScrollGeometry;
   project_history: ScrollGeometry;
   video_comments: ScrollGeometry;
 }

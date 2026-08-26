@@ -89,6 +89,8 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features app,qr
           cargo test --locked --all-targets --no-default-features --features sqlite-state
           cargo test --locked --all-targets --no-default-features --features tui
+          cargo test --locked --lib --no-default-features --features audio-quality
+          cargo test --locked --all-targets --no-default-features --features tui,audio-quality
           cargo test --locked --all-targets --no-default-features --features qr
           cargo test --locked --all-targets --no-default-features --features tui,local
           cargo test --locked --all-targets --no-default-features --features tui,acoustid,wikidata
@@ -119,6 +121,8 @@ jobs:
           cargo test --locked --doc --no-default-features --features app,qr
           cargo test --locked --doc --no-default-features --features sqlite-state
           cargo test --locked --doc --no-default-features --features tui
+          cargo test --locked --doc --no-default-features --features audio-quality
+          cargo test --locked --doc --no-default-features --features tui,audio-quality
           cargo test --locked --doc --no-default-features --features qr
           cargo test --locked --doc --no-default-features --features tui,local
           cargo test --locked --doc --no-default-features --features tui,acoustid,wikidata

@@ -23,13 +23,14 @@ use std::time::Duration;
 use serde::Serialize;
 
 use youta::domain::{MediaId, SourceKind};
+use youta::keymap::{PopupGeometry, ScrollGeometry};
 use youta::view::{
-    DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadView, ErrorPopupView, GitHubIssueSubmissionView, LocalMoveDestinationView,
-    NowPlayingView, PlaylistChoiceView, PlaylistPopupView, PreferencesPopupView, ProjectCommitView,
-    ProjectHistoryPopupView, QueuePopupView, QueueRowView, RowView, SubscriptionsView,
-    VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
-    YtDlpGentooVersionView, YtDlpVersionLookupView,
+    AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
+    DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
+    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
+    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
+    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView,
+    YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -143,6 +144,8 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     let view = ViewModel::default();
     let mut emitted: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     emitted.insert("ViewModel", emitted_keys(&view));
+    emitted.insert("PopupGeometry", emitted_keys(&PopupGeometry::default()));
+    emitted.insert("ScrollGeometry", emitted_keys(&ScrollGeometry::default()));
     emitted.insert("PlaybackStatus", emitted_keys(&view.playback));
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
     emitted.insert("RowView", emitted_keys(&RowView::default()));
@@ -160,6 +163,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         emitted_keys(&DetailWikidataEntityView::default()),
     );
     emitted.insert("ErrorPopupView", emitted_keys(&ErrorPopupView::default()));
+    emitted.insert(
+        "AudioQualityPopupView",
+        emitted_keys(&AudioQualityPopupView::default()),
+    );
     emitted.insert(
         "YtDlpForbiddenView",
         emitted_keys(&YtDlpForbiddenView::default()),
@@ -268,6 +275,8 @@ fn every_checked_interface_is_actually_declared() {
     let declared = declared_interfaces(&source);
     for interface in [
         "ViewModel",
+        "PopupGeometry",
+        "ScrollGeometry",
         "PlaybackStatus",
         "DetailView",
         "RowView",
@@ -276,6 +285,7 @@ fn every_checked_interface_is_actually_declared() {
         "DetailVideoLinkView",
         "DetailWikidataEntityView",
         "ErrorPopupView",
+        "AudioQualityPopupView",
         "YtDlpForbiddenView",
         "YtDlpGentooVersionView",
         "VideoCommentsPopupView",
@@ -614,6 +624,123 @@ fn the_window_help_documents_the_youtube_shorts_hotkey() {
         source.contains("[\"R · h\", \"refresh subscription videos · show/hide Shorts\"]"),
         "window Help must document the same contextual Shorts binding as the terminal"
     );
+}
+
+#[test]
+fn the_window_exposes_local_audio_quality_analysis_and_its_result_section() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("Details.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "view.audio_quality_supported",
+        "details.local_audio_quality_available",
+        "details.local_audio_quality_pending",
+        "dispatch(\"AnalyzeLocalAudioQuality\")",
+        "Cancel analysis",
+        "Analyze quality",
+        "Audio quality analysis",
+        "details.local_audio_quality_description",
+    ] {
+        assert!(
+            source.contains(required),
+            "Details component no longer contains {required}"
+        );
+    }
+    let fingerprint = source
+        .find("dispatch(\"FingerprintLocalAudio\")")
+        .expect("fingerprint control");
+    let quality = source
+        .find("dispatch(\"AnalyzeLocalAudioQuality\")")
+        .expect("audio quality control");
+    assert!(
+        fingerprint < quality,
+        "audio quality analysis must immediately follow fingerprinting"
+    );
+}
+
+#[test]
+fn the_window_help_documents_the_local_audio_quality_hotkey() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    assert!(
+        source.contains("[\"V\", \"analyze selected/marked files or folder\"]"),
+        "window Help must document the same contextual audio-quality binding as the terminal"
+    );
+}
+
+#[test]
+fn the_window_audio_quality_popup_keeps_progress_copy_cancel_and_close_actions() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "AudioQualityPopupView",
+        "popup.completed",
+        "popup.total",
+        "popup.report",
+        "popup.action_status",
+        "Discovering audio files…",
+        "role=\"status\"",
+        "CopyAudioQualityReport",
+        "CancelAudioQualityAnalysis",
+        "DismissAudioQualityPopup",
+        "dismissLabel={popup.pending ? \"Cancel analysis\" : \"Close\"}",
+        "SetAudioQualityPopupScroll",
+        "disabled={popup.report.length === 0}",
+    ] {
+        assert!(
+            source.contains(required),
+            "audio-quality popup no longer contains {required}"
+        );
+    }
+}
+
+#[test]
+fn the_window_marks_local_batch_rows_and_hides_unsupported_quality_help() {
+    let row_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("RowList.tsx");
+    let row_source = std::fs::read_to_string(&row_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", row_path.display()));
+    assert!(row_source.contains("row.local_marked"));
+
+    let popup_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let popup_source = std::fs::read_to_string(&popup_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", popup_path.display()));
+    assert!(popup_source.contains("audioQualitySupported ?"));
+    assert!(
+        popup_source.contains("[\"Shift+J · Shift+K\", \"mark Local row and move down · up\"]")
+    );
+
+    let app_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("App.tsx");
+    let app_source = std::fs::read_to_string(&app_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", app_path.display()));
+    assert!(app_source.contains("audioQualitySupported={view.audio_quality_supported}"));
 }
 
 /// The four credential-bearing editors must stay out of the window's vocabulary.

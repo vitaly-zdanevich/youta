@@ -169,8 +169,10 @@ jobs:
           cargo check --locked --no-default-features --features qr
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib
+          cargo check --locked --no-default-features --features audio-quality --lib
           cargo check --locked --no-default-features --features acoustid --lib
           cargo check --locked --no-default-features --features tui,waveform
+          cargo check --locked --no-default-features --features tui,audio-quality
           cargo check --locked --no-default-features --features tui,local-browser
           cargo check --locked --no-default-features --features tui,local-metadata
           cargo check --locked --no-default-features --features tui,local-rename
@@ -220,14 +222,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,images,qr
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,qr
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm,images
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,gpm
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,images,qr
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,qr
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,images
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,qr
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality
 
       - name: Validate and start the i686 executable
         run: |
@@ -301,6 +303,9 @@ jobs:
 
       - name: Test the desktop crate
         run: cargo test --locked -p youta-gui --all-targets
+
+      - name: Test the desktop crate without default capabilities
+        run: cargo test --locked -p youta-gui --all-targets --no-default-features
 
       - name: Run blocking Clippy lint groups on the desktop crate
         run: >-

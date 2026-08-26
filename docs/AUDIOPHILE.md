@@ -118,6 +118,43 @@ or WAV increases size without restoring information. Keep the original Opus
 stream when possible. For Commons transfer, remux an eligible existing Opus
 stream rather than decode/re-encode it when the container requirements permit.
 
+## Estimating source quality
+
+A file exposes its current encoding, not a trustworthy history. A FLAC stream
+can contain samples decoded from MP3, and a nominal 320 kb/s MP3 can be made
+from a 128 kb/s MP3. Neither wrapper reveals that earlier encoder setting, so
+Youta's explicit `[V] Analyze quality` action reports evidence rather than a
+“real bitrate.” It accepts one selected audio file, a selected folder, or the
+currently marked files and folders. Folder batches are traversed
+deterministically and analyzed one file at a time; their bounded progress popup
+keeps completed rows available to copy.
+
+The analyzer examines active FFT windows from up to the leading 30 seconds,
+calculates Hann-windowed spectra, and looks for a stable sharp high-frequency
+cutoff with a quiet band above it. It reports that measured evidence without
+converting it into a codec-neutral bitrate class: Opus, AAC, MP3, Vorbis, and
+other encoders apply different low-pass behaviour. A stable cutoff can still
+support a cautious `band-limited` assessment, but it is a heuristic:
+
+- old recordings, speech, dark masters, and deliberate low-pass filtering can
+  produce the same cutoff without any lossy ancestor;
+- some high-quality and modern lossy encoders retain broad bandwidth, so an
+  earlier encode can evade this test;
+- sample rate, bit depth, file size, and a FLAC integrity checksum do not prove
+  that the source master was lossless;
+- when the current sample rate or channel count is unavailable, or a stream
+  with more than two channels must be normalized to stereo, Youta retains
+  cutoff evidence but suppresses source-history inference;
+- the output labels its assessment as heuristic, gives evidence strength and
+  window agreement, and never calls an exact earlier bitrate recovered, an
+  up-encode proven, or a file genuine.
+
+More codec-specific research can strengthen later detectors—for example the
+[AES Lossless Audio Checker paper](https://aes.org/publications/elibrary-page/?id=17972)—but
+it does not make provenance cryptographically recoverable. Youta performs the
+current FFT analysis locally with [RustFFT](https://docs.rs/rustfft/) over PCM
+decoded by the configured FFmpeg helper.
+
 ## CPU frequency and “monotonic CPU usage”
 
 Youta will not set a CPU governor or pin a frequency.

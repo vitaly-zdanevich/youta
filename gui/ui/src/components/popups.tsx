@@ -11,6 +11,7 @@
 // preserves their shape — never markup.
 
 import type {
+  AudioQualityPopupView,
   ErrorPopupView,
   GitHubIssueSubmissionView,
   LocalFilePopupView,
@@ -38,7 +39,8 @@ export const LAYER = {
   queue: 6,
   videoComments: 7,
   videoQr: 8,
-  error: 9,
+  audioQuality: 9,
+  error: 10,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -54,7 +56,7 @@ function Body({ children }: { children: React.ReactNode }) {
  * and its GPM requirement, none of which exist here. What both lists must agree
  * on is the bindings themselves, which come from the one shared map.
  */
-export function HelpPopup() {
+export function HelpPopup({ audioQualitySupported }: { audioQualitySupported: boolean }) {
   const sections: Array<[string, Array<[string, string]>]> = [
     [
       "Navigation",
@@ -92,6 +94,12 @@ export function HelpPopup() {
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
         ["i", "expand artwork"],
+        ["Shift+J · Shift+K", "mark Local row and move down · up"],
+        ...(audioQualitySupported
+          ? ([
+              ["V", "analyze selected/marked files or folder"],
+            ] satisfies Array<[string, string]>)
+          : []),
         ["? · Esc", "this help · close"],
       ],
     ],
@@ -134,6 +142,73 @@ export function HelpPopup() {
           ))}
         </div>
       </Body>
+    </Popup>
+  );
+}
+
+/** Immediate progress and copyable results for a local audio-quality batch. */
+export function AudioQualityPopup({ popup }: { popup: AudioQualityPopupView }) {
+  const dismiss = popup.pending ? "CancelAudioQualityAnalysis" : "DismissAudioQualityPopup";
+  const progress = popup.pending && popup.total === 0
+    ? "Discovering audio files…"
+    : `${popup.completed} / ${popup.total} complete`;
+  const report = popup.report.length === 0
+    ? popup.pending
+      ? "Waiting for the first result…"
+      : "No audio-quality results."
+    : popup.report;
+
+  return (
+    <Popup
+      title={popup.title || "Audio quality analysis"}
+      subtitle={progress}
+      layer={LAYER.audioQuality}
+      onDismiss={() => void dispatch(dismiss)}
+      dismissLabel={popup.pending ? "Cancel analysis" : "Close"}
+      footer={
+        <>
+          {popup.action_status ? (
+            <span role="status" className="mr-auto text-ink-dim">
+              {popup.action_status}
+            </span>
+          ) : null}
+          <PopupButton
+            disabled={popup.report.length === 0}
+            onClick={() => void dispatch("CopyAudioQualityReport")}
+          >
+            Copy report
+          </PopupButton>
+          {popup.pending ? (
+            <PopupButton onClick={() => void dispatch("CancelAudioQualityAnalysis")}>
+              Cancel
+            </PopupButton>
+          ) : (
+            <PopupButton onClick={() => void dispatch("DismissAudioQualityPopup")}>
+              Close
+            </PopupButton>
+          )}
+        </>
+      }
+    >
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+        <p
+          title={popup.summary || undefined}
+          className="truncate border-b border-line px-[18px] py-[9px] text-xs text-ink-dim"
+        >
+          {popup.summary || (popup.pending ? "Preparing audio files…" : "Analysis finished.")}
+        </p>
+        <ScrollingText
+          popup="audio_quality"
+          offset={popup.scroll_offset}
+          onScroll={(offset) => {
+            if (offset !== popup.scroll_offset) {
+              void dispatch({ SetAudioQualityPopupScroll: offset });
+            }
+          }}
+        >
+          {report}
+        </ScrollingText>
+      </div>
     </Popup>
   );
 }

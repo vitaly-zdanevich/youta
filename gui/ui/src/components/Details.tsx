@@ -242,6 +242,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
     view.external_opener_available &&
     (kind === "Video" || kind === "Podcast" || kind === "Radio" || kind === "YandexMusic");
   const yandex = view.yandex_music_actions;
+  const audioQuality = fact(details.local_audio_quality_description);
 
   return (
     <aside
@@ -361,6 +362,16 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             {details.local_fingerprint_pending ? "Identifying…" : "Identify"}
           </Action>
         ) : null}
+        {view.audio_quality_supported &&
+        kind === "Local" &&
+        details.local_audio_quality_available ? (
+          <Action
+            active={details.local_audio_quality_pending}
+            onClick={() => void dispatch("AnalyzeLocalAudioQuality")}
+          >
+            {details.local_audio_quality_pending ? "Cancel analysis" : "Analyze quality"}
+          </Action>
+        ) : null}
         {kind === "YandexMusic" && yandex.track_selected ? (
           <>
             <Action
@@ -399,6 +410,18 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         videoLinks={details.video_links}
         mediaId={details.media_id}
       />
+
+      {kind === "Local" && audioQuality !== null ? (
+        <section
+          aria-label="Audio quality analysis"
+          className="mt-3 border-t border-line pt-[10px] text-xs"
+        >
+          <h3 className="mb-[4px] text-[11px] tracking-wide text-ink-faint uppercase">
+            Audio quality analysis
+          </h3>
+          <p className="m-0 whitespace-pre-wrap text-ink-dim">{audioQuality}</p>
+        </section>
+      ) : null}
 
       {fact(details.wikidata) && details.links.length === 0 ? (
         <p className="mt-3 border-t border-line pt-[10px] text-xs text-ink-faint">

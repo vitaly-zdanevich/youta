@@ -113,7 +113,7 @@ export function dispatch(action: UiAction): Promise<void> {
  * Sends one key press to the shared keyboard map.
  *
  * The window reports the press and how much it rendered, and nothing else.
- * Which action a key produces depends on a seventeen-level chain of modal
+ * Which action a key produces depends on an ordered chain of modal
  * priorities that lives in `src/keymap.rs` and serves the terminal too;
  * restating any part of it here is how the two front-ends drift apart.
  */

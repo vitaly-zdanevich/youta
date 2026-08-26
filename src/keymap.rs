@@ -1,6 +1,6 @@
 //! One keyboard map shared by every Youta front-end.
 //!
-//! The terminal owns a seventeen-level chain of modal priorities in which the
+//! The terminal owns an ordered chain of modal priorities in which the
 //! first match consumes the key: an error popup outranks Preferences, which
 //! outranks the playlist editor, and so on down to ordinary list navigation.
 //! Restating that chain in a second language would guarantee the two
@@ -125,6 +125,8 @@ pub struct ScrollGeometry {
 /// then left alone rather than paged against a guess.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PopupGeometry {
+    /// Local audio-quality progress/results popup.
+    pub audio_quality: ScrollGeometry,
     /// Project-history popup.
     pub project_history: ScrollGeometry,
     /// Video-comments popup.
@@ -232,6 +234,21 @@ pub fn key_action(
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
     if view.error_popup.is_none()
+        && let Some(popup) = view.audio_quality_popup.as_ref()
+    {
+        return if let Some(popups) = popups {
+            audio_quality_key_action(
+                key,
+                popup,
+                popups.audio_quality.offset,
+                popups.audio_quality.maximum,
+                popups.audio_quality.page_lines,
+            )
+        } else {
+            audio_quality_control_action(key, popup)
+        };
+    }
+    if view.error_popup.is_none()
         && view.project_history_popup.is_some()
         && let Some(popups) = popups
     {
@@ -255,6 +272,47 @@ pub fn key_action(
     }
     unfiltered_key_action(key, view, page_rows)
         .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps modal local audio-quality report controls.
+fn audio_quality_key_action(
+    key: KeyPress,
+    popup: &AudioQualityPopupView,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    if let Some(action) = audio_quality_control_action(key, popup) {
+        return Some(action);
+    }
+    let page_lines = page_lines.max(1);
+    match key.key {
+        Key::Up | Key::Left | Key::Char('k') => Some(UiAction::SetAudioQualityPopupScroll(
+            offset.saturating_sub(1),
+        )),
+        Key::Down | Key::Right | Key::Char('j') => Some(UiAction::SetAudioQualityPopupScroll(
+            offset.saturating_add(1).min(maximum),
+        )),
+        Key::PageUp => Some(UiAction::SetAudioQualityPopupScroll(
+            offset.saturating_sub(page_lines),
+        )),
+        Key::PageDown => Some(UiAction::SetAudioQualityPopupScroll(
+            offset.saturating_add(page_lines).min(maximum),
+        )),
+        Key::Home => Some(UiAction::SetAudioQualityPopupScroll(0)),
+        Key::End => Some(UiAction::SetAudioQualityPopupScroll(maximum)),
+        _ => None,
+    }
+}
+
+/// Maps audio-quality controls that do not depend on rendered geometry.
+fn audio_quality_control_action(key: KeyPress, popup: &AudioQualityPopupView) -> Option<UiAction> {
+    match key.key {
+        Key::Esc if popup.pending => Some(UiAction::CancelAudioQualityAnalysis),
+        Key::Esc => Some(UiAction::DismissAudioQualityPopup),
+        Key::Char('c' | 'C') if !popup.report.is_empty() => Some(UiAction::CopyAudioQualityReport),
+        _ => None,
+    }
 }
 
 /// Maps modal project-history navigation to one resize-aware wrapped-line offset.
@@ -790,6 +848,17 @@ fn unfiltered_key_action(
         {
             Some(UiAction::FingerprintLocalAudio)
         }
+        Key::Char('V')
+            if !key.chorded()
+                && view.screen == Screen::Local
+                && view.audio_quality_supported
+                && view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.local_audio_quality_available) =>
+        {
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        }
         Key::Char('r') if view.screen == Screen::Radio => Some(UiAction::ToggleRadioRecording),
         Key::Char('T') => Some(UiAction::ToggleChapterTimestamps),
         #[cfg(feature = "local-rename")]
@@ -798,19 +867,19 @@ fn unfiltered_key_action(
         Key::Char('m') if view.screen == Screen::Local && !key.modified() => {
             Some(UiAction::BeginLocalMove)
         }
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         Key::Char('J') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         Key::Char('K') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         Key::Char('j') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         Key::Char('k') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }

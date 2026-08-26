@@ -42,6 +42,9 @@ pub(crate) mod terminal_environment;
 pub mod text_file_open;
 pub mod waveform;
 
+#[cfg(feature = "audio-quality")]
+pub mod audio_quality;
+
 #[cfg(feature = "waveform")]
 pub mod local_waveform;
 

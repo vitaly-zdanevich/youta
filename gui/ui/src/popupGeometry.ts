@@ -25,6 +25,7 @@ type Scrollable = keyof PopupGeometry;
 const EMPTY: ScrollGeometry = { offset: 0, maximum: 0, page_lines: 1 };
 
 const measured: Record<Scrollable, ScrollGeometry> = {
+  audio_quality: { ...EMPTY },
   project_history: { ...EMPTY },
   video_comments: { ...EMPTY },
 };
@@ -32,9 +33,10 @@ const measured: Record<Scrollable, ScrollGeometry> = {
 /**
  * Records what a popup rendered.
  *
- * `offset` is not measured: it is the offset the reducer published, because the
- * reducer owns it. Reading the DOM's `scrollTop` back would let rounding drift
- * accumulate into a scroll position neither side agrees on.
+ * `offset` starts with the reducer-published value and is clamped to the
+ * currently rendered maximum. Reading the DOM's `scrollTop` back would let
+ * rounding drift accumulate, while leaving an offset above a resized viewport
+ * would make the first Up key appear stuck.
  */
 export function reportGeometry(popup: Scrollable, element: HTMLElement | null, offset: number) {
   if (element === null) {
@@ -43,14 +45,19 @@ export function reportGeometry(popup: Scrollable, element: HTMLElement | null, o
   }
   const pageLines = Math.max(1, Math.floor(element.clientHeight / POPUP_LINE_HEIGHT));
   const totalLines = Math.ceil(element.scrollHeight / POPUP_LINE_HEIGHT);
+  const maximum = Math.max(0, totalLines - pageLines);
   measured[popup] = {
-    offset,
-    maximum: Math.max(0, totalLines - pageLines),
+    offset: Math.min(offset, maximum),
+    maximum,
     page_lines: pageLines,
   };
 }
 
 /** Reads the current geometry for a key press. */
 export function popupGeometry(): PopupGeometry {
-  return { project_history: measured.project_history, video_comments: measured.video_comments };
+  return {
+    audio_quality: measured.audio_quality,
+    project_history: measured.project_history,
+    video_comments: measured.video_comments,
+  };
 }

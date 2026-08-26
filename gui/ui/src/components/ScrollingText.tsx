@@ -17,7 +17,7 @@ export function ScrollingText({
   onScroll,
   children,
 }: {
-  popup: "project_history" | "video_comments";
+  popup: "audio_quality" | "project_history" | "video_comments";
   offset: number;
   onScroll: (offset: number) => void;
   children: ReactNode;
@@ -48,8 +48,8 @@ export function ScrollingText({
       onWheel={(event) => {
         const lines = Math.round(event.deltaY / POPUP_LINE_HEIGHT) || Math.sign(event.deltaY);
         if (lines !== 0) {
-          const { maximum } = popupGeometry()[popup];
-          onScroll(Math.min(maximum, Math.max(0, offset + lines)));
+          const { offset: renderedOffset, maximum } = popupGeometry()[popup];
+          onScroll(Math.min(maximum, Math.max(0, renderedOffset + lines)));
         }
       }}
       className="h-full overflow-hidden px-[18px] py-[10px] font-mono text-[11px] whitespace-pre-wrap"

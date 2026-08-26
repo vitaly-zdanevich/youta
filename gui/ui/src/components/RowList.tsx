@@ -73,13 +73,14 @@ export function RowList({
               aria-current={current}
               onClick={() => void dispatch({ SelectRow: item.index })}
               onDoubleClick={() => void dispatch("ActivateSelection")}
-              className={`absolute top-0 left-0 grid w-full grid-cols-[18px_34px_minmax(0,1fr)_auto] items-center gap-[10px] rounded-[5px] px-2 text-left focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
+              className={`absolute top-0 left-0 grid w-full grid-cols-[28px_34px_minmax(0,1fr)_auto] items-center gap-[10px] rounded-[5px] px-2 text-left focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
                 current ? "bg-raised" : ""
               }`}
               style={{ height: item.size, transform: `translateY(${item.start}px)` }}
             >
-              <span className="text-[11px] text-accent">
+              <span className="inline-flex gap-[2px] text-[11px] text-accent">
                 {isPlaying(row, playing) ? "▶" : row.subscribed ? "◆" : ""}
+                {row.local_marked ? "✓" : ""}
               </span>
               <Artwork url={row.thumbnail_url} className="size-[34px] rounded object-cover" />
               <span className="min-w-0">

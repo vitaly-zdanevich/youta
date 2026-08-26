@@ -1616,6 +1616,16 @@ struct HitMap {
     buttons: Vec<(UiAction, Rect)>,
     now_playing: Option<Rect>,
     error_buttons: Vec<(UiAction, Rect)>,
+    /// Copy/cancel/close controls rendered inside the audio-quality popup.
+    audio_quality_buttons: Vec<(UiAction, Rect)>,
+    /// Wrapped report viewport inside the audio-quality popup.
+    audio_quality_text_area: Rect,
+    /// Actual first wrapped audio-quality report line rendered.
+    audio_quality_scroll_offset: usize,
+    /// Largest wrapped-line offset that changes the audio-quality viewport.
+    audio_quality_scroll_maximum: usize,
+    /// Number of wrapped audio-quality report lines visible on one page.
+    audio_quality_page_lines: usize,
     /// Buttons rendered inside the public-comments popup.
     video_comments_buttons: Vec<(UiAction, Rect)>,
     /// Close control rendered inside the selected-video QR popup.
@@ -2090,6 +2100,7 @@ fn render_frame(
     hit_map.buttons.clear();
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
+        || view.audio_quality_popup.is_some()
         || view.project_history_popup.is_some()
         || view.youtube_setup_popup.is_some()
         || view.yandex_music_setup_popup.is_some()
@@ -2223,6 +2234,11 @@ fn render_frame(
         render_private_note_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.error_buttons.clear();
+    hit_map.audio_quality_buttons.clear();
+    hit_map.audio_quality_text_area = Rect::default();
+    hit_map.audio_quality_scroll_offset = 0;
+    hit_map.audio_quality_scroll_maximum = 0;
+    hit_map.audio_quality_page_lines = 0;
     hit_map.video_comments_buttons.clear();
     hit_map.video_comments_text_area = Rect::default();
     hit_map.video_comments_scroll_offset = 0;
@@ -2237,6 +2253,9 @@ fn render_frame(
         if let Some(popup) = view.video_qr_popup.as_ref() {
             render_video_qr_popup(frame, popup, &theme, hit_map);
         }
+    }
+    if let Some(popup) = view.audio_quality_popup.as_ref() {
+        render_audio_quality_popup(frame, popup, &theme, hit_map);
     }
     if let Some(error) = view.error_popup.as_ref() {
         render_error_popup(
@@ -3605,6 +3624,7 @@ fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hot
         UiAction::ToggleSubscription => Some(button("s", "Unsubscribe (locally)", show_hotkeys)),
         UiAction::ToggleRadioRecording => Some(button("r", "Stop recording", show_hotkeys)),
         UiAction::FingerprintLocalAudio => Some(button("f", "Fingerprinting |", show_hotkeys)),
+        UiAction::AnalyzeLocalAudioQuality => Some(button("V", "Cancel analysis", show_hotkeys)),
         UiAction::ToggleYandexMusicLike => Some(button("L", "Remove like", show_hotkeys)),
         UiAction::ToggleYandexMusicDislike => Some(button("X", "Remove dislike", show_hotkeys)),
         _ => None,
@@ -3774,6 +3794,38 @@ fn push_left_detail_button<'a>(
     }
 }
 
+/// Builds the scrollable Details body while keeping analysis visibly distinct.
+///
+/// Appending enrichment after the provider description preserves the byte
+/// offsets owned by its timecodes and video-link actions.
+fn compose_details_body(details: &DetailView) -> String {
+    let mut body = details.description.clone();
+    append_details_body_section(
+        &mut body,
+        "Last.fm artist description:",
+        &details.lastfm_artist_description,
+    );
+    append_details_body_section(
+        &mut body,
+        "Audio quality analysis:",
+        &details.local_audio_quality_description,
+    );
+    body
+}
+
+/// Appends one labelled section without manufacturing empty headings.
+fn append_details_body_section(body: &mut String, heading: &str, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    body.push_str(heading);
+    body.push('\n');
+    body.push_str(content);
+}
+
 fn render_information_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3833,7 +3885,7 @@ fn render_information_panel(
     } else {
         Vec::new()
     };
-    let mut right_buttons = Vec::with_capacity(4);
+    let mut right_buttons = Vec::with_capacity(5);
     if show_text_selection
         && kind == InformationPanelKind::Video
         && view.video_comments_available
@@ -3970,6 +4022,31 @@ fn render_information_panel(
                 theme.accent
             },
             UiAction::FingerprintLocalAudio,
+        );
+    }
+    if view.audio_quality_supported
+        && kind == InformationPanelKind::Local
+        && details.local_audio_quality_available
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button(
+                "V",
+                if details.local_audio_quality_pending {
+                    "Cancel analysis"
+                } else {
+                    "Analyze quality"
+                },
+                show_hotkeys,
+            ),
+            if details.local_audio_quality_pending {
+                theme.selected
+            } else {
+                theme.accent
+            },
+            UiAction::AnalyzeLocalAudioQuality,
         );
     }
     if cfg!(feature = "local-move") && kind == InformationPanelKind::Local && details.local_movable
@@ -4374,10 +4451,13 @@ fn render_information_panel(
         .as_ref()
         .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
     let visible_local_video = details.local_video_thumbnail.as_ref();
+    let has_details_body = !details.description.is_empty()
+        || !details.lastfm_artist_description.is_empty()
+        || !details.local_audio_quality_description.is_empty();
     let text_reserve = if details.thumbnail_expanded {
         0
     } else {
-        u16::from(!details.description.is_empty()) + u16::from(!details.links.is_empty())
+        u16::from(has_details_body) + u16::from(!details.links.is_empty())
     };
     let compact_metadata_height = u16::try_from(
         lines
@@ -4559,10 +4639,10 @@ fn render_information_panel(
         }
     }
     if !details.links.is_empty() && remaining_height > 0 {
-        let description_reserve = if details.description.is_empty() {
-            0
-        } else {
+        let description_reserve = if has_details_body {
             remaining_height.min(1)
+        } else {
+            0
         };
         let mut link_rows = Vec::with_capacity(details.links.len().saturating_mul(2));
         for (index, link) in details.links.iter().enumerate() {
@@ -4729,23 +4809,9 @@ fn render_information_panel(
             |entity| entity.text.as_str(),
         )
     });
-    let lastfm_description = (!details.lastfm_artist_description.is_empty()).then(|| {
-        if details.description.is_empty() {
-            format!(
-                "Last.fm artist description:\n{}",
-                details.lastfm_artist_description
-            )
-        } else {
-            format!(
-                "{}\n\nLast.fm artist description:\n{}",
-                details.description, details.lastfm_artist_description
-            )
-        }
-    });
+    let details_body = compose_details_body(details);
     let body_is_wikidata = expanded_wikidata_text.is_some();
-    let body_source = expanded_wikidata_text
-        .or_else(|| lastfm_description.as_deref())
-        .unwrap_or(&details.description);
+    let body_source = expanded_wikidata_text.unwrap_or(details_body.as_str());
     let wikidata_value_links = expanded_wikidata_entity
         .map(|entity| entity.value_links.as_slice())
         .unwrap_or_default();
@@ -6125,14 +6191,25 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     frame.render_widget(Clear, area);
     let mut local_help =
         "  Local: Esc parent     PageUp/Down page     H all files     Z size".to_owned();
+    let mut local_actions = Vec::new();
     if cfg!(feature = "local-rename") {
-        local_help.push_str("     r rename");
+        local_actions.push("r rename");
     }
     if cfg!(feature = "local-move") {
-        local_help.push_str("     m move     Shift+J/K mark");
+        local_actions.push("m move");
+    }
+    if cfg!(any(feature = "local-move", feature = "audio-quality")) {
+        local_actions.push("Shift+J/K mark");
     }
     if cfg!(feature = "local-trash") {
-        local_help.push_str("     Delete trash");
+        local_actions.push("Delete trash");
+    }
+    if view.audio_quality_supported {
+        local_actions.push("V audio quality");
+    }
+    if !local_actions.is_empty() {
+        local_help.push_str("\n    ");
+        local_help.push_str(&local_actions.join("  "));
     }
     if !cfg!(feature = "local-browser") {
         local_help.clear();
@@ -6612,6 +6689,185 @@ fn github_issue_submission_notice(state: &GitHubIssueSubmissionView) -> Option<S
         GitHubIssueSubmissionView::Failed { message } => {
             Some(format!("GitHub issue submission failed:\n{message}"))
         }
+    }
+}
+
+/// Renders one immediate, copyable local audio-quality batch popup.
+fn render_audio_quality_popup(
+    frame: &mut Frame<'_>,
+    popup: &AudioQualityPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(92, 88, frame.area());
+    frame.render_widget(Clear, area);
+    let title = if popup.title.trim().is_empty() {
+        " Audio quality analysis ".to_owned()
+    } else {
+        format!(" {} ", popup.title.trim())
+    };
+    frame.render_widget(panel_block(&title, theme), area);
+
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let summary = if popup.summary.trim().is_empty() {
+        if popup.pending {
+            "Preparing audio files…"
+        } else {
+            "Analysis finished."
+        }
+    } else {
+        popup.summary.trim()
+    };
+    let progress = if popup.pending && popup.total == 0 {
+        "Discovering audio files…".to_owned()
+    } else {
+        format!("{} / {} complete", popup.completed, popup.total)
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(summary.to_owned(), theme.heading),
+            Line::styled(progress, theme.muted),
+        ]),
+        sections[0],
+    );
+
+    let content_area = sections[1];
+    let (text_area, scrollbar_area) = if content_area.width > 1 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(content_area);
+        (columns[0], columns[1])
+    } else {
+        (content_area, Rect::default())
+    };
+    let visible_body = if popup.report.is_empty() {
+        if popup.pending {
+            "Waiting for the first result…"
+        } else {
+            "No audio-quality results."
+        }
+    } else {
+        &popup.report
+    };
+    let report_lines = wrap_diagnostic_report(visible_body, usize::from(text_area.width.max(1)));
+    let visible_lines = usize::from(text_area.height);
+    let maximum_offset = report_lines.len().saturating_sub(visible_lines);
+    let offset = popup.scroll_offset.min(maximum_offset);
+    hit_map.audio_quality_text_area = text_area;
+    hit_map.audio_quality_scroll_offset = offset;
+    hit_map.audio_quality_scroll_maximum = maximum_offset;
+    hit_map.audio_quality_page_lines = visible_lines.max(1);
+    frame.render_widget(
+        Paragraph::new(
+            report_lines
+                .iter()
+                .skip(offset)
+                .take(visible_lines)
+                .cloned()
+                .map(Line::raw)
+                .collect::<Vec<_>>(),
+        )
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        text_area,
+    );
+    if maximum_offset > 0 && scrollbar_area.width > 0 && scrollbar_area.height > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.muted)
+            .thumb_symbol("█")
+            .thumb_style(theme.accent);
+        let mut state = ScrollbarState::new(report_lines.len())
+            .position(offset)
+            .viewport_content_length(visible_lines);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+    }
+
+    let first_line = if report_lines.is_empty() || visible_lines == 0 {
+        0
+    } else {
+        offset.saturating_add(1)
+    };
+    let last_line = offset.saturating_add(visible_lines).min(report_lines.len());
+    frame.render_widget(
+        Paragraph::new(popup.action_status.as_deref().unwrap_or_default()).style(theme.accent),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Lines {first_line}–{last_line} of {}",
+            report_lines.len()
+        ))
+        .alignment(Alignment::Right)
+        .style(theme.muted),
+        sections[3],
+    );
+
+    let mut buttons = vec![(
+        "[c] Copy report",
+        (!popup.report.is_empty()).then_some(UiAction::CopyAudioQualityReport),
+    )];
+    if popup.pending {
+        buttons.push(("[Esc] Cancel", Some(UiAction::CancelAudioQualityAnalysis)));
+    } else {
+        buttons.push(("[Esc] Close", Some(UiAction::DismissAudioQualityPopup)));
+    }
+    let labels_width = buttons
+        .iter()
+        .map(|(label, _)| terminal_text_width(label))
+        .sum::<u16>()
+        .saturating_add(u16::try_from(buttons.len().saturating_sub(1) * 3).unwrap_or(u16::MAX));
+    let mut x = sections[4]
+        .x
+        .saturating_add(sections[4].width.saturating_sub(labels_width) / 2);
+    let mut controls = Vec::new();
+    for (index, (label, action)) in buttons.iter().enumerate() {
+        if index > 0 {
+            controls.push(Span::styled("   ", theme.muted));
+        }
+        controls.push(Span::styled(
+            *label,
+            if action.is_some() {
+                theme.accent
+            } else {
+                theme.muted
+            },
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(controls)).alignment(Alignment::Center),
+        sections[4],
+    );
+    for (label, action) in buttons {
+        let width = terminal_text_width(label);
+        let clipped_width = sections[4].right().saturating_sub(x).min(width);
+        if clipped_width > 0
+            && let Some(action) = action
+        {
+            hit_map
+                .audio_quality_buttons
+                .push((action, Rect::new(x, sections[4].y, clipped_width, 1)));
+        }
+        x = x.saturating_add(width).saturating_add(3);
     }
 }
 
@@ -9012,7 +9268,7 @@ fn render_local_rename_field(
 /// suppresses this layer. Omitting it from the next frame makes Ratatui hide
 /// the terminal cursor automatically.
 fn render_local_rename_cursor(frame: &mut Frame<'_>, view: &ViewModel, enabled: bool) {
-    if !enabled || view.error_popup.is_some() {
+    if !enabled || view.error_popup.is_some() || view.audio_quality_popup.is_some() {
         return;
     }
     let Some(LocalFilePopupView::Rename {
@@ -9313,6 +9569,11 @@ fn key_press(key: KeyEvent) -> Option<KeyPress> {
 /// Reports the rendered popup scroll state the shared map needs for paging.
 fn popup_geometry(hit_map: &HitMap) -> PopupGeometry {
     PopupGeometry {
+        audio_quality: ScrollGeometry {
+            offset: hit_map.audio_quality_scroll_offset,
+            maximum: hit_map.audio_quality_scroll_maximum,
+            page_lines: hit_map.audio_quality_page_lines,
+        },
         project_history: ScrollGeometry {
             offset: hit_map.project_history_scroll_offset,
             maximum: hit_map.project_history_scroll_maximum,
@@ -9399,6 +9660,33 @@ fn mouse_action_unfiltered(
             }
             MouseEventKind::ScrollUp => {
                 Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
+            }
+            _ => None,
+        };
+    }
+    if view.audio_quality_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .audio_quality_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown
+                if contains(hit_map.audio_quality_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetAudioQualityPopupScroll(
+                    hit_map
+                        .audio_quality_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.audio_quality_scroll_maximum),
+                ))
+            }
+            MouseEventKind::ScrollUp
+                if contains(hit_map.audio_quality_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetAudioQualityPopupScroll(
+                    hit_map.audio_quality_scroll_offset.saturating_sub(3),
+                ))
             }
             _ => None,
         };
@@ -12437,9 +12725,15 @@ mod tests {
         if cfg!(feature = "local-browser") {
             assert!(rendered.contains("Local: Esc parent"));
             assert!(rendered.contains("PageUp/Down page"));
+            if cfg!(feature = "audio-quality") {
+                assert!(rendered.contains("V audio quality"));
+            } else {
+                assert!(!rendered.contains("V audio quality"));
+            }
         } else {
             assert!(!rendered.contains("Local: Esc parent"));
             assert!(!rendered.contains("PageUp/Down page"));
+            assert!(!rendered.contains("V audio quality"));
         }
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
         assert!(rendered.contains("h Shorts on/off"));
@@ -12457,6 +12751,14 @@ mod tests {
         #[cfg(not(feature = "qr"))]
         assert!(!rendered.contains("Q selected YouTube video QR code"));
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
+        let unsupported = ViewModel {
+            audio_quality_supported: false,
+            ..ViewModel::default()
+        };
+        terminal
+            .draw(|frame| render_help(frame, &unsupported, &Theme::new(false)))
+            .expect("draw Help without audio-quality support");
+        assert!(!rendered_text(&terminal).contains("V audio quality"));
         for border in ['┌', '┐', '└', '┘'] {
             assert!(
                 rendered.contains(border),
@@ -25136,6 +25438,368 @@ prose 07:25 remains clickable but is not a chapter";
                 &folder
             ),
             Some(UiAction::FingerprintLocalAudio)
+        );
+    }
+
+    #[test]
+    fn local_audio_quality_action_is_scoped_cancelable_and_scrollable() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            audio_quality_supported: true,
+            details: Some(DetailView {
+                title: "01 - Track.flac".to_owned(),
+                source: "Local audio".to_owned(),
+                description: "Full path: /music/01 - Track.flac".to_owned(),
+                local_fingerprint_available: true,
+                local_audio_quality_available: true,
+                local_audio_quality_description: concat!(
+                    "Verdict: band-limited audio\n",
+                    "Current encoding: lossless encoding\n",
+                    "Current sample rate: 44.1 kHz\n",
+                    "Current channels: 2\n",
+                    "Measured bandwidth: 15.8 kHz\n",
+                    "Evidence strength: high"
+                )
+                .to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Local audio quality action");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[V] Analyze quality"));
+        assert!(rendered.contains("Audio quality analysis:"));
+        assert!(rendered.contains("Verdict: band-limited audio"));
+        assert!(hit_map.details_scroll_maximum > 0);
+        let fingerprint_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::FingerprintLocalAudio).then_some(*area)
+            })
+            .expect("fingerprint control");
+        let quality_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::AnalyzeLocalAudioQuality).then_some(*area)
+            })
+            .expect("audio quality control");
+        assert_eq!(
+            quality_area.y,
+            fingerprint_area.y.saturating_add(1),
+            "quality analysis must immediately follow fingerprinting"
+        );
+        assert_eq!(quality_area.right(), hit_map.details_panel.right());
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: quality_area.x,
+                    row: quality_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+
+        let details = view.details.as_mut().expect("Local audio details");
+        details.local_audio_quality_pending = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw cancelable Local audio quality action");
+        assert!(rendered_text(&terminal).contains("[V] Cancel analysis"));
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality),
+            "a second activation must reach the controller so it can cancel"
+        );
+
+        let details = view.details.as_mut().expect("Local audio details");
+        details.local_audio_quality_available = false;
+        details.local_audio_quality_pending = false;
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+
+        view.audio_quality_supported = false;
+        view.details
+            .as_mut()
+            .expect("Local audio details")
+            .local_audio_quality_available = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw a build without audio-quality support");
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::AnalyzeLocalAudioQuality)
+        );
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+
+        let non_local = ViewModel {
+            screen: Screen::History,
+            details: Some(DetailView {
+                local_audio_quality_available: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_ne!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &non_local,
+            ),
+            Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+    }
+
+    #[test]
+    fn audio_quality_batch_popup_is_immediate_scrollable_copyable_and_cancelable() {
+        let backend = TestBackend::new(92, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            audio_quality_supported: true,
+            audio_quality_popup: Some(AudioQualityPopupView {
+                title: "Audio quality analysis".to_owned(),
+                summary: "Analyzing library/track-02.flac".to_owned(),
+                completed: 1,
+                total: 3,
+                report: (0..30)
+                    .map(|index| format!("track-{index:02}.flac\tMeasured bandwidth: 16.0 kHz"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                action_status: Some("Copied with OSC 52".to_owned()),
+                pending: true,
+                scroll_offset: 2,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &view,
+                None,
+                None,
+            ),
+            None,
+            "scrolling must wait for renderer-owned popup geometry"
+        );
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw pending audio-quality batch popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Audio quality analysis"));
+        assert!(rendered.contains("1 / 3"));
+        assert!(rendered.contains("Copied with OSC 52"));
+        assert!(rendered.contains("[c] Copy report"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        assert!(hit_map.audio_quality_scroll_maximum > 0);
+        let copy_area = hit_map
+            .audio_quality_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::CopyAudioQualityReport).then_some(*area)
+            })
+            .expect("copy control");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: copy_area.x,
+                    row: copy_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CopyAudioQualityReport)
+        );
+        let cancel_area = hit_map
+            .audio_quality_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::CancelAudioQualityAnalysis).then_some(*area)
+            })
+            .expect("cancel control");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: cancel_area.x,
+                    row: cancel_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CancelAudioQualityAnalysis)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: hit_map.audio_quality_text_area.x,
+                    row: hit_map.audio_quality_text_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetAudioQualityPopupScroll(
+                hit_map
+                    .audio_quality_scroll_offset
+                    .saturating_add(3)
+                    .min(hit_map.audio_quality_scroll_maximum)
+            ))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::CancelAudioQualityAnalysis)
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::CopyAudioQualityReport)
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetAudioQualityPopupScroll(
+                hit_map
+                    .audio_quality_scroll_offset
+                    .saturating_add(hit_map.audio_quality_page_lines)
+                    .min(hit_map.audio_quality_scroll_maximum)
+            ))
+        );
+        let maximum = hit_map.audio_quality_scroll_maximum;
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetAudioQualityPopupScroll(maximum))
+        );
+        view.audio_quality_popup
+            .as_mut()
+            .expect("popup")
+            .scroll_offset = maximum;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw audio-quality popup at its end");
+        assert_eq!(hit_map.audio_quality_scroll_offset, maximum);
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetAudioQualityPopupScroll(
+                maximum.saturating_sub(1)
+            )),
+            "Up must leave End instead of subtracting from usize::MAX"
+        );
+
+        view.audio_quality_popup.as_mut().expect("popup").pending = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw completed audio-quality batch popup");
+        assert!(rendered_text(&terminal).contains("[Esc] Close"));
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::DismissAudioQualityPopup)
+        );
+    }
+
+    #[test]
+    fn empty_audio_quality_popup_disables_copy() {
+        let backend = TestBackend::new(92, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            audio_quality_popup: Some(AudioQualityPopupView {
+                title: "Audio quality analysis".to_owned(),
+                summary: "Preparing files…".to_owned(),
+                total: 0,
+                pending: true,
+                ..AudioQualityPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw immediate empty batch popup");
+
+        assert!(rendered_text(&terminal).contains("[c] Copy report"));
+        assert!(rendered_text(&terminal).contains("Discovering audio files"));
+        assert!(
+            hit_map
+                .audio_quality_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::CopyAudioQualityReport)
+        );
+        assert_ne!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::CopyAudioQualityReport)
         );
     }
 

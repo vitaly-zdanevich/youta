@@ -23,6 +23,7 @@ export function Popup({
   width = "760px",
   layer,
   onDismiss,
+  dismissLabel = "Close",
   dismissDisabled = false,
   footer,
   children,
@@ -39,6 +40,8 @@ export function Popup({
    */
   layer: number;
   onDismiss: () => void;
+  /** Accessible meaning of the Escape control for this popup state. */
+  dismissLabel?: string;
   /** Prevents closing while an irreversible background action is unresolved. */
   dismissDisabled?: boolean;
   footer?: ReactNode;
@@ -69,7 +72,7 @@ export function Popup({
               ) : null}
               <button
                 type="button"
-                aria-label="Close"
+                aria-label={dismissLabel}
                 disabled={dismissDisabled}
                 onClick={onDismiss}
                 className="ml-auto shrink-0 rounded-[5px] border border-line-strong px-[7px] py-[2px] text-[11px] text-ink-dim disabled:cursor-not-allowed disabled:opacity-40 not-disabled:hover:border-ink-faint not-disabled:hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
