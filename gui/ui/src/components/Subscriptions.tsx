@@ -135,11 +135,20 @@ function Pane({
 }
 
 /** One pane-footer control. */
-function PaneButton({ onClick, children }: { onClick: () => void; children: ReactNode }) {
+function PaneButton({
+  onClick,
+  pressed,
+  children,
+}: {
+  onClick: () => void;
+  pressed?: boolean;
+  children: ReactNode;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
+      aria-pressed={pressed}
       className="rounded-[5px] border border-line-strong px-[8px] py-[3px] text-[11px] whitespace-nowrap text-ink-dim hover:border-ink-faint hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
     >
       {children}
@@ -219,6 +228,14 @@ export function Subscriptions({
           <PaneButton onClick={() => void dispatch("RefreshSubscriptionVideos")}>
             {subscriptions.loading ? `Refreshing ${noun}…` : `Refresh ${noun}`}
           </PaneButton>
+          {subscriptions.source_kind === "you-tube" ? (
+            <PaneButton
+              pressed={subscriptions.show_youtube_shorts}
+              onClick={() => void dispatch("ToggleSubscriptionShorts")}
+            >
+              Shorts: {subscriptions.show_youtube_shorts ? "on" : "off"}
+            </PaneButton>
+          ) : null}
           {subscriptions.items.length > 0 ? (
             <PaneButton onClick={() => void dispatch("ToggleSubscriptionDescription")}>
               {subscriptions.description_expanded ? `Back to ${noun}` : "Details"}

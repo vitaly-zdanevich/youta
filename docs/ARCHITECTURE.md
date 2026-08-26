@@ -502,7 +502,9 @@ Official YouTube results use `player` embed dimensions returned by the existing
 batched video-resource request. Invidious selected-video details use encoded
 format dimensions. Unknown rows retain the normal title color, avoiding
 per-result network fan-out and false portrait classifications from letterboxed
-artwork.
+artwork. The YouTube subscription Shorts toggle projects this same confirmed
+vertical flag over the cached source rows. It defaults to showing every row;
+hiding Shorts never deletes the cached list or issues a per-row request.
 
 Wikidata matching is advisory. Exact external-ID claims rank above URL and
 normalized-title matches. Ambiguous title matches are displayed as suggestions,

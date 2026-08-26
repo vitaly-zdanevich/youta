@@ -1418,7 +1418,10 @@ subscription-source root. Youta provides two layouts:
   videos or episodes in the usual list-and-Details view; `Backspace` or `Esc`
   returns to the source list. `[R] Refresh videos` requests a YouTube channel's
   first page again, while `[R] Refresh episodes` reloads an RSS or Atom feed.
-  The `[A] Autoplay: on/off` control follows the refresh action.
+  For YouTube, `[h] Shorts: on/off` follows the refresh action and controls
+  whether provider-confirmed vertical videos remain in the list. Shorts are
+  shown by default and retain their existing distinct title color. The
+  `[A] Autoplay: on/off` control follows the Shorts control.
 - `split` keeps sources on the left and the selected source's videos or
   episodes on the right. Moving across sources uses only cached rows and makes
   no provider request; press `Enter` to activate the source, loading it
@@ -1447,11 +1450,13 @@ skip_advertisement_chapters = true
 
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
+show_youtube_shorts = true
 show_local_folder_sizes = true
 youtube_thumbnail_size = 'automatic'
 ```
 
 `YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
+`YOUTA_UI__SHOW_YOUTUBE_SHORTS=false` and
 `YOUTA_PLAYBACK__AUTOPLAY=true` and
 `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false` and
 `YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` override the corresponding

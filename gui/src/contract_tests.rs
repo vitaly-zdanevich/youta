@@ -563,6 +563,59 @@ fn the_window_dispatches_only_actions_the_reducer_declares() {
     );
 }
 
+#[test]
+fn the_window_exposes_the_youtube_shorts_toggle_with_pressed_state() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("Subscriptions.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "aria-pressed={pressed}",
+        "subscriptions.source_kind === \"you-tube\"",
+        "pressed={subscriptions.show_youtube_shorts}",
+        "dispatch(\"ToggleSubscriptionShorts\")",
+        "Shorts: {subscriptions.show_youtube_shorts ? \"on\" : \"off\"}",
+    ] {
+        assert!(
+            source.contains(required),
+            "Subscriptions component no longer contains {required}"
+        );
+    }
+    let refresh = source
+        .find("dispatch(\"RefreshSubscriptionVideos\")")
+        .expect("Refresh control");
+    let shorts = source
+        .find("dispatch(\"ToggleSubscriptionShorts\")")
+        .expect("Shorts control");
+    let details = source
+        .find("dispatch(\"ToggleSubscriptionDescription\")")
+        .expect("Details control");
+    assert!(
+        refresh < shorts && shorts < details,
+        "Shorts must follow Refresh and precede Details"
+    );
+}
+
+#[test]
+fn the_window_help_documents_the_youtube_shorts_hotkey() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    assert!(
+        source.contains("[\"R · h\", \"refresh subscription videos · show/hide Shorts\"]"),
+        "window Help must document the same contextual Shorts binding as the terminal"
+    );
+}
+
 /// The four credential-bearing editors must stay out of the window's vocabulary.
 ///
 /// `src/view.rs` skips them when serializing, so declaring them here could only

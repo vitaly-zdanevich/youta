@@ -68,6 +68,11 @@ show_button_hotkeys = true
 # YOUTA_UI__SUBSCRIPTIONS_LAYOUT has higher precedence.
 subscriptions_layout = 'drill-down'
 
+# Include YouTube Shorts in subscription video lists. The contextual Shorts
+# control changes this value without affecting cached videos.
+# YOUTA_UI__SHOW_YOUTUBE_SHORTS has higher precedence.
+show_youtube_shorts = true
+
 # One of: `auto`, `dark`, or `light`.
 theme = 'auto'
 

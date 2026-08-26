@@ -485,6 +485,7 @@ export interface SubscriptionsView {
   focus: SubscriptionPane;
   description_expanded: boolean;
   loading: boolean;
+  show_youtube_shorts: boolean;
   source_title: string;
   source_kind: SubscriptionKind;
   source_subscriber_count: number | null;

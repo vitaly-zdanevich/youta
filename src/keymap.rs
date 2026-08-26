@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SubscriptionsLayout;
 use crate::domain::SourceKind;
+use crate::subscriptions::SubscriptionKind;
 use crate::view::*;
 
 /// A key, named independently of any input source.
@@ -213,6 +214,14 @@ mod wire_tests {
 /// Returns whether one key is the editor-local Vim word-delete chord.
 fn is_delete_previous_word_key(key: KeyPress) -> bool {
     key.ctrl && !key.alt && matches!(key.key, Key::Char('w' | 'W'))
+}
+
+/// Returns whether subscription item controls own the current keyboard focus.
+fn subscription_items_active(view: &ViewModel) -> bool {
+    view.screen == Screen::Subscriptions
+        && (view.subscriptions.route == SubscriptionRoute::Items
+            || (view.subscriptions.layout == SubscriptionsLayout::Split
+                && view.subscriptions.focus == SubscriptionPane::Items))
 }
 
 /// Maps one key using the current rendered main-list page capacity.
@@ -826,12 +835,14 @@ fn unfiltered_key_action(
             Some(UiAction::OpenRssSubscriptionPopup)
         }
         Key::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
-        Key::Char('R')
-            if view.screen == Screen::Subscriptions
-                && (view.subscriptions.route == SubscriptionRoute::Items
-                    || (view.subscriptions.layout == SubscriptionsLayout::Split
-                        && view.subscriptions.focus == SubscriptionPane::Items)) =>
+        Key::Char('h')
+            if !key.modified()
+                && subscription_items_active(view)
+                && view.subscriptions.source_kind == SubscriptionKind::YouTube =>
         {
+            Some(UiAction::ToggleSubscriptionShorts)
+        }
+        Key::Char('R') if subscription_items_active(view) => {
             Some(UiAction::RefreshSubscriptionVideos)
         }
         Key::Char('t')

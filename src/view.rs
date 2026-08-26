@@ -734,6 +734,8 @@ pub struct SubscriptionsView {
     pub description_expanded: bool,
     /// Whether the selected source has a provider request in flight.
     pub loading: bool,
+    /// Whether YouTube subscription lists include provider-identified Shorts.
+    pub show_youtube_shorts: bool,
     /// Human-readable source name included in the item-list heading.
     pub source_title: String,
     /// Provider family controlling source-specific headings and actions.
@@ -756,6 +758,7 @@ impl Default for SubscriptionsView {
             focus: SubscriptionPane::Sources,
             description_expanded: false,
             loading: false,
+            show_youtube_shorts: true,
             source_title: String::new(),
             source_kind: SubscriptionKind::YouTube,
             source_subscriber_count: None,
@@ -2311,6 +2314,8 @@ pub enum UiAction {
     ToggleSubscriptionDescription,
     /// Refresh page one for the active subscribed channel.
     RefreshSubscriptionVideos,
+    /// Include or exclude YouTube Shorts in the active subscription list.
+    ToggleSubscriptionShorts,
     /// Show paths a system drag-and-drop delivered, in the Local browser.
     ///
     /// Only a windowed front-end can emit this: a terminal is not a drop
@@ -2406,6 +2411,11 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_shorts_are_visible_by_default() {
+        assert!(SubscriptionsView::default().show_youtube_shorts);
+    }
 
     /// Fills the four editors whose values must never leave this process.
     fn view_holding_every_secret() -> ViewModel {

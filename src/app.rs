@@ -4716,6 +4716,7 @@ impl AppController {
             ..ViewModel::default()
         };
         view.subscriptions.layout = config.ui.subscriptions_layout;
+        view.subscriptions.show_youtube_shorts = config.ui.show_youtube_shorts;
         if let Some(search) = saved_search.as_ref() {
             if view.screen == Screen::Search {
                 view.search_query.clone_from(&search.request.query);
@@ -10986,6 +10987,14 @@ impl AppController {
                 }
                 match result {
                     Ok(details) => {
+                        let selected_subscription_video_id_before = (self.view.screen
+                            == Screen::Subscriptions)
+                            .then(|| self.selected_subscription_item())
+                            .flatten()
+                            .and_then(|item| match item {
+                                SearchItem::Video(video) => Some(video.video_id.clone()),
+                                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
+                            });
                         self.cache_youtube_video_details(&details);
                         let known_orientation = self
                             .youtube_results
@@ -11107,6 +11116,22 @@ impl AppController {
                                 SearchItem::Video(video) if video.video_id == details.video_id
                             )
                         });
+                        if selected_subscription_video_id_before.as_deref()
+                            == Some(details.video_id.as_str())
+                            && !selected_matches
+                            && self.view.screen == Screen::Subscriptions
+                        {
+                            // Lazy orientation enrichment can prove that the
+                            // selected row is a Short after it was displayed.
+                            // Keep an in-flight page refresh aligned with the
+                            // replacement selected by the filtered projection.
+                            self.rebase_pending_subscription_refresh_selection();
+                            if self.view.right_panel_mode == RightPanelMode::Details {
+                                // Replace its now-hidden Details with the row
+                                // selected deterministically by the filter.
+                                self.request_selected_details();
+                            }
+                        }
                         let linked_matches = self
                             .active_description_video
                             .as_ref()
@@ -16966,6 +16991,8 @@ impl AppController {
                                     candidate,
                                     SearchItem::Video(video)
                                         if video.video_id == item.media.id.external_id
+                                            && (self.config.ui.show_youtube_shorts
+                                                || !youtube_video_uses_shorts_style(video))
                                 )
                             })
                             .map(|index| (channel_id.clone(), index))
@@ -16985,10 +17012,18 @@ impl AppController {
                     self.active_subscription_channel_id = Some(channel_id);
                     self.view.subscriptions.route = SubscriptionRoute::Items;
                     self.view.subscriptions.focus = SubscriptionPane::Items;
-                    self.view.subscriptions.selected_item = index;
                     self.view.subscriptions.description_expanded =
                         self.view.subscriptions.layout == SubscriptionsLayout::Split;
                     self.refresh_subscription_video_rows();
+                    self.view.subscriptions.selected_item = self
+                        .view
+                        .subscriptions
+                        .items
+                        .iter()
+                        .position(|row| row.media_id.as_ref() == Some(&item.media.id))
+                        .unwrap_or_else(|| {
+                            index.min(self.view.subscriptions.items.len().saturating_sub(1))
+                        });
                     self.view.right_panel_mode = RightPanelMode::Details;
                     self.request_selected_details();
                     self.view.status_line = format!("Selected playing item: {}", item.media.title);
@@ -19204,11 +19239,12 @@ impl AppController {
             Screen::Subscriptions => {
                 if let Some(channel_id) = self.active_subscription_channel_id.as_ref()
                     && let Some(items) = self.subscription_video_cache.get(channel_id)
-                    && video_at(&items.items, self.view.subscriptions.selected_item)
+                    && let Some(index) = self.selected_subscription_cache_index()
+                    && video_at(&items.items, index)
                 {
                     return Some(AutoplayOrigin::Subscription {
                         channel_id: channel_id.clone(),
-                        index: self.view.subscriptions.selected_item,
+                        index,
                     });
                 }
             }
@@ -19310,7 +19346,10 @@ impl AppController {
                     && let Some(index) = items.items.iter().position(|item| {
                         matches!(
                             item,
-                            SearchItem::Video(video) if video.video_id == media_id.external_id
+                            SearchItem::Video(video)
+                                if video.video_id == media_id.external_id
+                                    && (self.config.ui.show_youtube_shorts
+                                        || !youtube_video_uses_shorts_style(video))
                         )
                     })
                 {
@@ -19506,7 +19545,11 @@ impl AppController {
                     return AutoplayStep::Exhausted;
                 };
                 neighbour_list_step(&cached.items, *index, direction, |index, item| match item {
-                    SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                    SearchItem::Video(video)
+                        if video_is_autoplay_playable(video)
+                            && (self.config.ui.show_youtube_shorts
+                                || !youtube_video_uses_shorts_style(video)) =>
+                    {
                         Some(AutoplayStep::Play {
                             item: Box::new(queue_item_from_video_with_thumbnail_size(
                                 video,
@@ -22580,20 +22623,7 @@ impl AppController {
         }
         self.view.subscriptions.selected_item = index;
         self.view.selected_detail_link = None;
-        let selected_video_id = self
-            .selected_subscription_item()
-            .and_then(|item| match item {
-                SearchItem::Video(video) => Some(video.video_id.clone()),
-                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
-            });
-        if let Some(pending) = self.pending_subscription_refresh.as_mut()
-            && self.active_subscription_channel_id.as_deref() == Some(pending.channel_id.as_str())
-        {
-            // A deliberate selection made while refresh is in flight takes
-            // precedence over the snapshot captured when refresh started.
-            pending.selected_video_id = selected_video_id;
-            pending.fallback_index = index;
-        }
+        self.rebase_pending_subscription_refresh_selection();
         self.view.subscriptions.focus = SubscriptionPane::Items;
         self.view.right_panel_mode = RightPanelMode::Details;
         if matches!(
@@ -22606,6 +22636,29 @@ impl AppController {
         }
         self.load_next_subscription_page_if_needed();
         self.refresh_selected_playlist_state();
+    }
+
+    /// Makes an in-flight refresh restore the selection currently projected.
+    ///
+    /// Both deliberate navigation and visibility toggles can change the row
+    /// that should survive a page-one replacement while the request runs.
+    fn rebase_pending_subscription_refresh_selection(&mut self) {
+        let selected_video_id = self
+            .selected_subscription_item()
+            .and_then(|item| match item {
+                SearchItem::Video(video) => Some(video.video_id.clone()),
+                SearchItem::Channel(_) | SearchItem::PodcastEpisode(_) => None,
+            });
+        let fallback_index = self.view.subscriptions.selected_item;
+        let active_channel_id = self.active_subscription_channel_id.clone();
+        if let Some(pending) = self.pending_subscription_refresh.as_mut()
+            && active_channel_id.as_deref() == Some(pending.channel_id.as_str())
+        {
+            // The current visible selection takes precedence over the
+            // snapshot captured when the refresh started.
+            pending.selected_video_id = selected_video_id;
+            pending.fallback_index = fallback_index;
+        }
     }
 
     fn load_selected_subscription_videos(&mut self) {
@@ -23029,25 +23082,20 @@ impl AppController {
         else {
             return;
         };
-        let refreshed = self
-            .subscription_video_cache
-            .get(channel_id)
-            .map_or(&[][..], |cached| cached.items.as_slice());
         let selected = pending
             .selected_video_id
             .as_deref()
             .and_then(|video_id| {
-                refreshed.iter().position(|item| {
-                    matches!(
-                        item,
-                        SearchItem::Video(video) if video.video_id == video_id
-                    )
+                self.view.subscriptions.items.iter().position(|row| {
+                    row.media_id.as_ref().is_some_and(|media_id| {
+                        media_id.source == SourceKind::YouTube && media_id.external_id == video_id
+                    })
                 })
             })
             .unwrap_or_else(|| {
                 pending
                     .fallback_index
-                    .min(refreshed.len().saturating_sub(1))
+                    .min(self.view.subscriptions.items.len().saturating_sub(1))
             });
         self.view.subscriptions.selected_item = selected;
     }
@@ -23155,6 +23203,13 @@ impl AppController {
     }
 
     fn refresh_subscription_video_rows(&mut self) {
+        let previous_selected_index = self.view.subscriptions.selected_item;
+        let selected_media_id = self
+            .view
+            .subscriptions
+            .items
+            .get(previous_selected_index)
+            .and_then(|row| row.media_id.clone());
         let today = Local::now().date_naive();
         let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
         let active_source_id = self.active_subscription_channel_id.as_deref().or_else(|| {
@@ -23171,10 +23226,11 @@ impl AppController {
             .subscription_video_cache
             .get(active_source_id.unwrap_or_default())
             .map_or(&[][..], |cached| cached.items.as_slice());
-        self.view.subscriptions.items = items
+        self.view.subscriptions.show_youtube_shorts = self.config.ui.show_youtube_shorts;
+        let rows = items
             .iter()
-            .map(|item| {
-                row_from_search_item_with_thumbnail_size(
+            .filter_map(|item| {
+                let row = row_from_search_item_with_thumbnail_size(
                     item,
                     &self.store,
                     &self.subscription_tree,
@@ -23182,14 +23238,23 @@ impl AppController {
                     SearchRowContext::SubscriptionFeed,
                     today,
                     youtube_thumbnail_size,
-                )
+                );
+                (self.config.ui.show_youtube_shorts || !row.vertical).then_some(row)
             })
-            .collect();
-        self.view.subscriptions.selected_item = self
-            .view
-            .subscriptions
-            .selected_item
-            .min(self.view.subscriptions.items.len().saturating_sub(1));
+            .collect::<Vec<_>>();
+        let preserved_selected_item = selected_media_id.as_ref().and_then(|media_id| {
+            rows.iter()
+                .position(|row| row.media_id.as_ref() == Some(media_id))
+        });
+        let selected_item = preserved_selected_item
+            .unwrap_or_else(|| previous_selected_index.min(rows.len().saturating_sub(1)));
+        let selected_was_hidden = selected_media_id.is_some() && preserved_selected_item.is_none();
+        self.view.subscriptions.items = rows;
+        self.view.subscriptions.selected_item = selected_item;
+        if selected_was_hidden && self.view.right_panel_mode == RightPanelMode::Details {
+            self.view.details = None;
+            self.view.selected_detail_link = None;
+        }
     }
 
     fn selected_subscription_item(&self) -> Option<&SearchItem> {
@@ -23203,10 +23268,45 @@ impl AppController {
                 None
             }
         })?;
-        self.subscription_video_cache
-            .get(source_id)?
+        let cached = self.subscription_video_cache.get(source_id)?;
+        let selected_row = self
+            .view
+            .subscriptions
             .items
-            .get(self.view.subscriptions.selected_item)
+            .get(self.view.subscriptions.selected_item)?;
+        let media_id = selected_row.media_id.as_ref()?;
+        cached
+            .items
+            .iter()
+            .find(|item| subscription_item_media_id(item).as_ref() == Some(media_id))
+    }
+
+    /// Resolves the selected visible subscription row back to its canonical cache index.
+    ///
+    /// The visible list may omit Shorts, while playback continuation and cache
+    /// replacement keep using the complete provider ordering.
+    fn selected_subscription_cache_index(&self) -> Option<usize> {
+        let source_id = self.active_subscription_channel_id.as_deref().or_else(|| {
+            #[cfg(feature = "rss")]
+            {
+                self.active_subscription_rss_url.as_deref()
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                None
+            }
+        })?;
+        let cached = self.subscription_video_cache.get(source_id)?;
+        let selected_row = self
+            .view
+            .subscriptions
+            .items
+            .get(self.view.subscriptions.selected_item)?;
+        let media_id = selected_row.media_id.as_ref()?;
+        cached
+            .items
+            .iter()
+            .position(|item| subscription_item_media_id(item).as_ref() == Some(media_id))
     }
 
     fn selected_youtube_item(&self) -> Option<&SearchItem> {
@@ -25823,6 +25923,60 @@ impl AppController {
             format!("Autoplay {}", if autoplay { "enabled" } else { "disabled" });
     }
 
+    /// Persists and applies the YouTube-subscription Shorts projection.
+    ///
+    /// Canonical provider pages remain intact in RAM and on disk. Toggling the
+    /// preference therefore rebuilds only the visible rows and never spends a
+    /// provider request to restore hidden videos.
+    fn toggle_subscription_shorts(&mut self) {
+        let items_visible = self.view.screen == Screen::Subscriptions
+            && self.view.subscriptions.source_kind == SubscriptionKind::YouTube
+            && (self.view.subscriptions.route == SubscriptionRoute::Items
+                || self.view.subscriptions.layout == SubscriptionsLayout::Split);
+        if !items_visible {
+            self.view.status_line =
+                "Open a YouTube subscription's videos before toggling Shorts".to_owned();
+            return;
+        }
+
+        let show_youtube_shorts = !self.config.ui.show_youtube_shorts;
+        if let Err(error) = self.config.save_show_youtube_shorts(show_youtube_shorts) {
+            self.show_error("Could not save Shorts visibility", &error);
+            return;
+        }
+        let previous_media_id = self
+            .view
+            .subscriptions
+            .items
+            .get(self.view.subscriptions.selected_item)
+            .and_then(|row| row.media_id.clone());
+        // Detail-history snapshots retain numeric list positions. Once this
+        // projection changes, restoring either stack could pair an old index
+        // with unrelated Details even when the selected media itself survives.
+        self.detail_navigation_back.clear();
+        self.detail_navigation_forward.clear();
+        self.refresh_subscription_video_rows();
+        self.rebase_pending_subscription_refresh_selection();
+        let selected_media_id = self
+            .view
+            .subscriptions
+            .items
+            .get(self.view.subscriptions.selected_item)
+            .and_then(|row| row.media_id.clone());
+        if previous_media_id != selected_media_id
+            && self.view.right_panel_mode == RightPanelMode::Details
+        {
+            self.request_selected_details();
+        }
+        self.refresh_selected_playlist_state();
+        self.view.status_line = if show_youtube_shorts {
+            "YouTube Shorts shown in subscriptions"
+        } else {
+            "YouTube Shorts hidden from subscriptions"
+        }
+        .to_owned();
+    }
+
     /// Revokes playback ownership without losing a safe completed extraction.
     #[cfg(feature = "tracker-music")]
     fn cancel_pending_tracker_autoplay(&mut self) {
@@ -27345,6 +27499,9 @@ impl UiController for AppController {
             }
             UiAction::ToggleSubscriptionDescription => {
                 self.toggle_subscription_description();
+            }
+            UiAction::ToggleSubscriptionShorts => {
+                self.toggle_subscription_shorts();
             }
             UiAction::RefreshSubscriptionVideos => {
                 self.refresh_selected_subscription_videos();
@@ -31865,7 +32022,7 @@ fn row_from_search_item_with_thumbnail_size(
                 } else {
                     preferred_youtube_thumbnail_url(&video.thumbnails, youtube_thumbnail_size)
                 },
-                vertical: video.orientation == VideoOrientation::Vertical,
+                vertical: youtube_video_uses_shorts_style(video),
                 hide_watched_marker: false,
                 compact: false,
                 radio_favorite: false,
@@ -31926,6 +32083,15 @@ fn row_from_search_item_with_thumbnail_size(
             }
         }
     }
+}
+
+/// Returns whether one provider-confirmed video uses Youta's Shorts styling.
+///
+/// This single predicate owns both the distinct title color and the optional
+/// Subscriptions filter, preventing those two presentations from disagreeing.
+/// Unknown, horizontal, and square rows remain standard videos.
+fn youtube_video_uses_shorts_style(video: &VideoSummary) -> bool {
+    matches!(video.orientation, VideoOrientation::Vertical)
 }
 
 /// Returns the stable playable identity represented by a subscription item.
@@ -45259,6 +45425,327 @@ mod tests {
     }
 
     #[test]
+    fn subscription_shorts_toggle_filters_the_existing_colored_rows_without_losing_cache() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+
+        let mut first = subscription_video_summary();
+        first.orientation = VideoOrientation::Horizontal;
+        let mut short = subscription_video_summary();
+        short.video_id = "shortvideo1".to_owned();
+        short.title = "Colored Short".to_owned();
+        short.orientation = VideoOrientation::Vertical;
+        let mut third = subscription_video_summary();
+        third.video_id = "thirdvideo1".to_owned();
+        third.title = "Third standard video".to_owned();
+        third.orientation = VideoOrientation::Horizontal;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first),
+                    SearchItem::Video(short),
+                    SearchItem::Video(third),
+                ],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.subscriptions.selected_item = 2;
+
+        assert!(controller.view.subscriptions.show_youtube_shorts);
+        assert_eq!(controller.view.subscriptions.items.len(), 3);
+        assert!(
+            controller.view.subscriptions.items[1].vertical,
+            "the exact row styled as a Short must be the row hidden by the toggle"
+        );
+        assert_eq!(
+            controller
+                .selected_subscription_item()
+                .and_then(subscription_item_media_id)
+                .map(|media_id| media_id.external_id),
+            Some("thirdvideo1".to_owned())
+        );
+        let back = controller.take_detail_navigation_snapshot();
+        controller.detail_navigation_back.push_back(back);
+        let forward = controller.take_detail_navigation_snapshot();
+        controller.detail_navigation_forward.push_back(forward);
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        assert!(!controller.config.ui.show_youtube_shorts);
+        assert!(!controller.view.subscriptions.show_youtube_shorts);
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video", "Third standard video"]
+        );
+        assert_eq!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .expect("canonical subscription cache")
+                .items
+                .len(),
+            3,
+            "hiding Shorts must remain a reversible view projection"
+        );
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert!(controller.detail_navigation_back.is_empty());
+        assert!(controller.detail_navigation_forward.is_empty());
+        assert_eq!(
+            controller
+                .selected_subscription_item()
+                .and_then(subscription_item_media_id)
+                .map(|media_id| media_id.external_id),
+            Some("thirdvideo1".to_owned()),
+            "the visible selection must still resolve to the same cached video"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "YouTube Shorts hidden from subscriptions"
+        );
+        let config_contents = std::fs::read_to_string(controller.config.config_file())
+            .expect("saved Shorts visibility");
+        assert!(config_contents.contains("show_youtube_shorts = false"));
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        assert!(controller.config.ui.show_youtube_shorts);
+        assert!(controller.view.subscriptions.show_youtube_shorts);
+        assert_eq!(controller.view.subscriptions.items.len(), 3);
+        assert_eq!(controller.view.subscriptions.selected_item, 2);
+        assert_eq!(
+            controller.view.status_line,
+            "YouTube Shorts shown in subscriptions"
+        );
+    }
+
+    #[test]
+    fn subscription_shorts_toggle_rebases_an_in_flight_refresh_selection() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+
+        let mut first = subscription_video_summary();
+        first.orientation = VideoOrientation::Horizontal;
+        let mut short = subscription_video_summary();
+        short.video_id = "shortvideo1".to_owned();
+        short.title = "Selected Short".to_owned();
+        short.orientation = VideoOrientation::Vertical;
+        let mut third = subscription_video_summary();
+        third.video_id = "thirdvideo1".to_owned();
+        third.title = "Replacement standard video".to_owned();
+        third.orientation = VideoOrientation::Horizontal;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first),
+                    SearchItem::Video(short),
+                    SearchItem::Video(third),
+                ],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.subscriptions.selected_item = 1;
+        controller.pending_subscription_refresh = Some(PendingSubscriptionRefresh {
+            channel_id: "UCfixture".to_owned(),
+            selected_video_id: Some("shortvideo1".to_owned()),
+            fallback_index: 1,
+            staged_cache: None,
+            report_errors: true,
+        });
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        let pending = controller
+            .pending_subscription_refresh
+            .as_ref()
+            .expect("in-flight refresh must remain active");
+        assert_eq!(pending.selected_video_id.as_deref(), Some("thirdvideo1"));
+        assert_eq!(pending.fallback_index, 1);
+
+        controller.view.subscriptions.selected_item = 0;
+        controller.restore_subscription_refresh_selection("UCfixture");
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert_eq!(
+            controller
+                .selected_subscription_item()
+                .and_then(subscription_item_media_id)
+                .map(|media_id| media_id.external_id),
+            Some("thirdvideo1".to_owned()),
+            "the refresh response must restore the post-toggle visible selection"
+        );
+    }
+
+    #[test]
+    fn subscription_shorts_toggle_preserves_an_open_channel_panel() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+
+        let mut short = subscription_video_summary();
+        short.orientation = VideoOrientation::Vertical;
+        let mut standard = subscription_video_summary();
+        standard.video_id = "standardvideo1".to_owned();
+        standard.orientation = VideoOrientation::Horizontal;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(short), SearchItem::Video(standard)],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.details = Some(DetailView {
+            title: "Fixture channel profile".to_owned(),
+            channel_id: "UCfixture".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Channel);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Fixture channel profile"),
+            "changing the item projection must not replace open channel information"
+        );
+    }
+
+    #[test]
+    fn visible_split_shorts_control_works_while_the_source_pane_has_focus() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        assert!(!controller.config.ui.show_youtube_shorts);
+        assert!(!controller.view.subscriptions.show_youtube_shorts);
+        assert_eq!(
+            controller.view.status_line,
+            "YouTube Shorts hidden from subscriptions"
+        );
+    }
+
+    #[test]
+    fn hidden_subscription_shorts_are_skipped_by_same_source_stepping() {
+        let mut config = Config::for_dir("/tmp/youta-hidden-shorts-autoplay-test");
+        config.ui.show_youtube_shorts = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut first = subscription_video_summary();
+        first.orientation = VideoOrientation::Horizontal;
+        let mut short = subscription_video_summary();
+        short.video_id = "shortvideo1".to_owned();
+        short.title = "Hidden Short".to_owned();
+        short.orientation = VideoOrientation::Vertical;
+        let mut third = subscription_video_summary();
+        third.video_id = "thirdvideo1".to_owned();
+        third.title = "Next standard video".to_owned();
+        third.orientation = VideoOrientation::Horizontal;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(first),
+                    SearchItem::Video(short),
+                    SearchItem::Video(third),
+                ],
+                next_page: None,
+            },
+        );
+
+        let step = controller.next_autoplay_step(&AutoplayOrigin::Subscription {
+            channel_id: "UCfixture".to_owned(),
+            index: 0,
+        });
+
+        let AutoplayStep::Play { item, origin } = step else {
+            panic!("the next visible subscription video must remain playable");
+        };
+        assert_eq!(item.media.title, "Next standard video");
+        assert_eq!(
+            origin,
+            AutoplayOrigin::Subscription {
+                channel_id: "UCfixture".to_owned(),
+                index: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn an_all_shorts_projection_exposes_no_hidden_selection() {
+        let mut config = Config::for_dir("/tmp/youta-all-hidden-shorts-test");
+        config.ui.show_youtube_shorts = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let mut short = subscription_video_summary();
+        short.orientation = VideoOrientation::Vertical;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(short)],
+                next_page: None,
+            },
+        );
+
+        controller.refresh_subscription_video_rows();
+
+        assert!(controller.view.subscriptions.items.is_empty());
+        assert!(controller.selected_subscription_item().is_none());
+        assert!(
+            controller.selected_queue_item().is_err(),
+            "queue actions must not reach a Short hidden from an empty visible list"
+        );
+    }
+
+    #[test]
     fn subscription_channel_details_are_debounced_cached_and_applied_to_the_heading() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
@@ -52996,6 +53483,84 @@ mod tests {
             &controller.youtube_results[0],
             SearchItem::Video(video) if video.orientation == VideoOrientation::Vertical
         ));
+    }
+
+    #[test]
+    fn lazy_vertical_details_remove_hidden_shorts_and_rebase_pending_refresh() {
+        let mut config = Config::for_dir("/tmp/youta-hidden-short-details-test");
+        config.ui.show_youtube_shorts = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let first = subscription_video_summary();
+        let mut second = subscription_video_summary();
+        second.video_id = "secondvideo".to_owned();
+        second.title = "Visible standard video".to_owned();
+        second.orientation = VideoOrientation::Horizontal;
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(first.clone()), SearchItem::Video(second)],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.pending_subscription_refresh = Some(PendingSubscriptionRefresh {
+            channel_id: "UCfixture".to_owned(),
+            selected_video_id: Some(first.video_id.clone()),
+            fallback_index: 0,
+            staged_cache: None,
+            report_errors: true,
+        });
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(first),
+            &controller.subscription_tree,
+        ));
+
+        let mut details = subscription_video_details("Confirmed Short");
+        details.orientation = VideoOrientation::Vertical;
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(details),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Visible standard video"]
+        );
+        assert_eq!(
+            controller
+                .selected_subscription_item()
+                .and_then(subscription_item_media_id)
+                .map(|media_id| media_id.external_id),
+            Some("secondvideo".to_owned())
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|detail| detail.media_id.as_ref())
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("secondvideo"),
+            "the right panel must not retain Details for a newly hidden Short"
+        );
+        let pending = controller
+            .pending_subscription_refresh
+            .as_ref()
+            .expect("page-one refresh must remain active");
+        assert_eq!(pending.selected_video_id.as_deref(), Some("secondvideo"));
+        assert_eq!(pending.fallback_index, 0);
     }
 
     #[test]

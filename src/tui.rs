@@ -3013,6 +3013,7 @@ fn render_subscriptions_body(
                 subscriptions.loading,
                 view.search_animation_frame,
                 subscriptions.source_kind,
+                subscriptions.show_youtube_shorts,
                 view.autoplay,
                 show_hotkeys,
                 theme,
@@ -3114,6 +3115,7 @@ fn render_subscriptions_body(
                     subscriptions.loading,
                     view.search_animation_frame,
                     subscriptions.source_kind,
+                    subscriptions.show_youtube_shorts,
                     view.autoplay,
                     show_hotkeys,
                     theme,
@@ -3163,6 +3165,7 @@ fn render_subscriptions_body(
                     subscriptions.loading,
                     view.search_animation_frame,
                     subscriptions.source_kind,
+                    subscriptions.show_youtube_shorts,
                     view.autoplay,
                     show_hotkeys,
                     theme,
@@ -3253,6 +3256,7 @@ fn render_subscription_item_buttons(
     loading: bool,
     animation_frame: usize,
     source_kind: SubscriptionKind,
+    show_youtube_shorts: bool,
     autoplay: bool,
     show_hotkeys: bool,
     theme: &Theme,
@@ -3283,6 +3287,20 @@ fn render_subscription_item_buttons(
         ),
         UiAction::ToggleAutoplay,
     );
+    let shorts = (source_kind == SubscriptionKind::YouTube).then(|| {
+        (
+            button(
+                "h",
+                if show_youtube_shorts {
+                    "Shorts: on"
+                } else {
+                    "Shorts: off"
+                },
+                show_hotkeys,
+            ),
+            UiAction::ToggleSubscriptionShorts,
+        )
+    });
     let description = description_available.then(|| {
         (
             button(
@@ -3300,11 +3318,14 @@ fn render_subscription_item_buttons(
             UiAction::ToggleSubscriptionDescription,
         )
     });
-    let mut buttons = Vec::with_capacity(3);
+    let mut buttons = Vec::with_capacity(4);
     if description_expanded && let Some(description) = description.clone() {
         buttons.push(description);
     }
     buttons.push(refresh);
+    if let Some(shorts) = shorts {
+        buttons.push(shorts);
+    }
     buttons.push(autoplay);
     if !description_expanded && let Some(description) = description {
         buttons.push(description);
@@ -6133,7 +6154,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  ↪ internal video: click the marker after a YouTube URL",
         local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
-        "  Subscriptions channel: R refresh videos     i description",
+        "  Subscriptions channel: R refresh videos     h Shorts on/off     i description",
         "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
@@ -12421,6 +12442,7 @@ mod tests {
             assert!(!rendered.contains("PageUp/Down page"));
         }
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
+        assert!(rendered.contains("h Shorts on/off"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
         assert!(rendered.contains("t Details-only text selection"));
@@ -14665,6 +14687,62 @@ mod tests {
     }
 
     #[test]
+    fn shorts_shortcut_is_scoped_to_youtube_subscription_items() {
+        let shorts = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(shorts, &view),
+            None,
+            "the source root owns no Shorts toggle"
+        );
+        view.subscriptions.route = SubscriptionRoute::Items;
+        view.subscriptions.focus = SubscriptionPane::Items;
+        assert_eq!(
+            key_action(shorts, &view),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
+
+        view.subscriptions.source_kind = SubscriptionKind::Rss;
+        assert_eq!(
+            key_action(shorts, &view),
+            None,
+            "RSS episodes are not Shorts"
+        );
+        view.subscriptions.source_kind = SubscriptionKind::Other;
+        assert_eq!(
+            key_action(shorts, &view),
+            None,
+            "unknown sources are not YouTube"
+        );
+
+        view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        view.subscriptions.layout = SubscriptionsLayout::Split;
+        view.subscriptions.route = SubscriptionRoute::Sources;
+        view.subscriptions.focus = SubscriptionPane::Sources;
+        assert_eq!(
+            key_action(shorts, &view),
+            None,
+            "the source pane owns no Shorts toggle"
+        );
+        view.subscriptions.focus = SubscriptionPane::Items;
+        assert_eq!(
+            key_action(shorts, &view),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
+
+        view.screen = Screen::Search;
+        assert_eq!(
+            key_action(shorts, &view),
+            None,
+            "the shortcut must not leak globally"
+        );
+    }
+
+    #[test]
     fn playlist_shortcuts_require_a_playable_item_and_preserve_modifier_meanings() {
         for screen in [
             Screen::Search,
@@ -15379,7 +15457,7 @@ mod tests {
             "playing subscription videos keep only the active-playback marker"
         );
         assert!(rendered.contains("Expanded fixture description"));
-        assert!(rendered.contains("[R] Refresh videos  [A] Autoplay: off"));
+        assert!(rendered.contains("[R] Refresh videos  [h] Shorts: on  [A] Autoplay: off"));
         let refresh_target = hit_map
             .detail_buttons
             .iter()
@@ -15387,12 +15465,33 @@ mod tests {
                 (action == &UiAction::RefreshSubscriptionVideos).then_some(*target)
             })
             .expect("Refresh videos target");
+        let shorts_target = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| {
+                (action == &UiAction::ToggleSubscriptionShorts).then_some(*target)
+            })
+            .expect("Shorts target");
         let autoplay_target = hit_map
             .detail_buttons
             .iter()
             .find_map(|(action, target)| (action == &UiAction::ToggleAutoplay).then_some(*target))
             .expect("Autoplay target");
-        assert_eq!(autoplay_target.x, refresh_target.right() + 2);
+        assert_eq!(shorts_target.x, refresh_target.right() + 2);
+        assert_eq!(autoplay_target.x, shorts_target.right() + 2);
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: shorts_target.x,
+                    row: shorts_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -15429,8 +15528,20 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw enabled Autoplay beside subscription refresh");
-        assert!(rendered_text(&terminal).contains("[R] Refresh videos  [A] Autoplay: on"));
+        assert!(
+            rendered_text(&terminal)
+                .contains("[R] Refresh videos  [h] Shorts: on  [A] Autoplay: on")
+        );
         view.autoplay = false;
+        view.subscriptions.show_youtube_shorts = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw disabled Shorts beside subscription refresh");
+        assert!(
+            rendered_text(&terminal)
+                .contains("[R] Refresh videos  [h] Shorts: off  [A] Autoplay: off")
+        );
+        view.subscriptions.show_youtube_shorts = true;
 
         view.subscriptions.loading = true;
         view.search_animation_frame = 2;
@@ -15570,6 +15681,13 @@ mod tests {
         assert!(rendered.contains("Fixture RSS show · RSS/Atom"));
         assert!(rendered.contains("Fixture RSS episode"));
         assert!(rendered.contains("[R] Refresh episodes"));
+        assert!(!rendered.contains("Shorts"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::ToggleSubscriptionShorts)
+        );
         assert!(!rendered.contains("subscribers"));
         assert!(!rendered.contains("Refresh videos"));
 
@@ -15692,6 +15810,46 @@ mod tests {
             ),
             Some(UiAction::RefreshSubscriptionVideos)
         );
+    }
+
+    #[test]
+    fn narrow_youtube_item_footer_prioritizes_shorts_before_autoplay() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            subscriptions: SubscriptionsView {
+                route: SubscriptionRoute::Items,
+                focus: SubscriptionPane::Items,
+                items: vec![subscription_row("Video", true)],
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw narrow YouTube subscription footer");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[R] Refresh videos  [h] Shorts: on"));
+        assert!(!rendered.contains("Autoplay"));
+        let refresh = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| {
+                (action == &UiAction::RefreshSubscriptionVideos).then_some(*target)
+            })
+            .expect("narrow Refresh target");
+        let shorts = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, target)| {
+                (action == &UiAction::ToggleSubscriptionShorts).then_some(*target)
+            })
+            .expect("narrow Shorts target");
+        assert_eq!(shorts.x, refresh.right() + 2);
+        assert_eq!(shorts.width, terminal_text_width("[h] Shorts: on"));
     }
 
     #[test]

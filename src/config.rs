@@ -35,6 +35,9 @@ pub const CONFIG_DIR_ENV: &str = "YOUTA_CONFIG_DIR";
 /// Environment variable that overrides the Subscriptions screen layout.
 pub const SUBSCRIPTIONS_LAYOUT_ENV: &str = "YOUTA_UI__SUBSCRIPTIONS_LAYOUT";
 
+/// Environment variable that overrides `YouTube` Shorts visibility.
+pub const SHOW_YOUTUBE_SHORTS_ENV: &str = "YOUTA_UI__SHOW_YOUTUBE_SHORTS";
+
 /// Environment variable that overrides automatic advertisement-chapter skipping.
 pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS";
 
@@ -679,6 +682,47 @@ impl Config {
         Ok(())
     }
 
+    /// Persists whether `YouTube` Shorts are visible in subscription videos.
+    ///
+    /// Existing unrelated settings and comments are preserved.
+    /// [`SHOW_YOUTUBE_SHORTS_ENV`] retains precedence and therefore prevents
+    /// this writer from storing a value that the environment would immediately
+    /// shadow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the environment override is active, the existing
+    /// file is too large or malformed, or the private atomic update fails.
+    #[cfg(feature = "controller")]
+    pub fn save_show_youtube_shorts(
+        &mut self,
+        show_youtube_shorts: bool,
+    ) -> Result<(), ConfigError> {
+        if std::env::var_os(SHOW_YOUTUBE_SHORTS_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{SHOW_YOUTUBE_SHORTS_ENV} overrides config.toml; change or remove it before toggling YouTube Shorts"
+            )));
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let ui = document
+            .as_table_mut()
+            .entry("ui")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`ui` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        ui["show_youtube_shorts"] = value(show_youtube_shorts);
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.ui.show_youtube_shorts = show_youtube_shorts;
+        Ok(())
+    }
+
     /// Persists the selected Bandcamp audio format in `config.toml`.
     ///
     /// Existing unrelated settings and comments are preserved.
@@ -855,6 +899,8 @@ pub struct UiConfig {
     pub prefetch_search_thumbnails: bool,
     /// Measure visible Local folders lazily and show complete recursive sizes.
     pub show_local_folder_sizes: bool,
+    /// Show `YouTube` Shorts in subscription video lists.
+    pub show_youtube_shorts: bool,
     /// Seek-bar foreground color name or terminal palette index.
     pub seekbar_color: String,
     /// Replace the standard seek indicator with Nyan Cat.
@@ -876,6 +922,7 @@ impl Default for UiConfig {
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
             show_local_folder_sizes: true,
+            show_youtube_shorts: true,
             seekbar_color: "cyan".to_owned(),
             nyan_cat_seekbar: false,
             dos_rpg_mode: false,
@@ -1717,6 +1764,7 @@ mod tests {
         assert!(config.ui.prefetch_search_thumbnails);
         assert!(config.ui.show_images_in_tty);
         assert!(config.ui.show_local_folder_sizes);
+        assert!(config.ui.show_youtube_shorts);
         assert_eq!(
             config.ui.subscriptions_layout,
             SubscriptionsLayout::DrillDown
@@ -1760,6 +1808,7 @@ youtube_thumbnail_size = "high"
 prefetch_search_thumbnails = false
 show_images_in_tty = false
 show_local_folder_sizes = false
+show_youtube_shorts = false
 subscriptions_layout = "split"
 
 [providers]
@@ -1782,6 +1831,7 @@ bandcamp_audio_format = "alac"
         assert!(!config.ui.prefetch_search_thumbnails);
         assert!(!config.ui.show_images_in_tty);
         assert!(!config.ui.show_local_folder_sizes);
+        assert!(!config.ui.show_youtube_shorts);
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert_eq!(
             config.providers.bandcamp_audio_format,
@@ -1803,6 +1853,7 @@ bandcamp_audio_format = "alac"
             .expect("load documented configuration");
 
         assert!(config.ui.show_images_in_tty);
+        assert!(config.ui.show_youtube_shorts);
         assert_eq!(config.ui.thumbnails, ThumbnailMode::Auto);
         assert_eq!(
             config.ui.youtube_thumbnail_size,
@@ -1907,6 +1958,7 @@ bandcamp_audio_format = "alac"
             assert!(!config.ui.prefetch_search_thumbnails);
             assert!(!config.ui.show_images_in_tty);
             assert!(!config.ui.show_local_folder_sizes);
+            assert!(!config.ui.show_youtube_shorts);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
             assert_eq!(
                 config.ui.youtube_thumbnail_size,
@@ -1952,6 +2004,7 @@ bandcamp_audio_format = "alac"
             .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
             .env(TTY_IMAGES_ENV, "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
+            .env(SHOW_YOUTUBE_SHORTS_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .env(YOUTUBE_THUMBNAIL_SIZE_ENV, "maxres")
             .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
@@ -2113,6 +2166,40 @@ youtube_api_key = "keep-this-existing-secret"
 
     #[cfg(feature = "controller")]
     #[test]
+    fn youtube_shorts_save_preserves_unrelated_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# keep this comment
+[ui]
+theme = "dark"
+
+[providers]
+youtube_api_key = "keep-this-existing-secret"
+"#,
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_show_youtube_shorts(false)
+            .expect("save YouTube Shorts visibility");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("theme = \"dark\""));
+        assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
+        assert!(contents.contains("show_youtube_shorts = false"));
+        assert!(!config.ui.show_youtube_shorts);
+        let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("reload configuration");
+        assert!(!reloaded.ui.show_youtube_shorts);
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
     fn bandcamp_audio_format_save_preserves_unrelated_configuration() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("config.toml");
@@ -2173,6 +2260,48 @@ youtube_api_key = "keep-this-existing-secret"
             .env(AUTOPLAY_ENV, "true")
             .output()
             .expect("run autoplay environment-lock child");
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn youtube_shorts_environment_override_prevents_file_and_memory_mutation() {
+        const CHILD_MARKER: &str = "YOUTA_SHORTS_SAVE_TEST_CHILD";
+        const TEST_DIRECTORY: &str = "YOUTA_SHORTS_SAVE_TEST_DIR";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory =
+                PathBuf::from(std::env::var(TEST_DIRECTORY).expect("child test directory"));
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            assert!(!config.ui.show_youtube_shorts);
+
+            let error = config
+                .save_show_youtube_shorts(true)
+                .expect_err("the environment override must lock Shorts visibility");
+
+            assert!(error.to_string().contains(SHOW_YOUTUBE_SHORTS_ENV));
+            assert!(!config.ui.show_youtube_shorts);
+            assert!(!directory.join("config.toml").exists());
+            return;
+        }
+
+        let directory = tempdir().expect("temporary directory");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "config::tests::youtube_shorts_environment_override_prevents_file_and_memory_mutation",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(TEST_DIRECTORY, directory.path())
+            .env(CONFIG_DIR_ENV, directory.path())
+            .env(SHOW_YOUTUBE_SHORTS_ENV, "false")
+            .output()
+            .expect("run Shorts visibility environment-lock child");
         assert!(
             output.status.success(),
             "child test failed:\n{}",

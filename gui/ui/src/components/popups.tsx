@@ -66,6 +66,7 @@ export function HelpPopup() {
         ["Backspace", "back"],
         ["F2 · F3 · F4 · F5", "offline · history · playlists · stats"],
         ["S · p · F9", "subscriptions · preferences · recent commits"],
+        ["R · h", "refresh subscription videos · show/hide Shorts"],
       ],
     ],
     [
