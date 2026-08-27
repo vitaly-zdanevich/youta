@@ -541,10 +541,14 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         String::from_utf8_lossy(&output.stderr)
     );
     let first_output = fs::read_to_string(&first_transcript).expect("first transcript");
+    // The pseudo-terminal transcript records ratatui's incremental updates,
+    // so unchanged cells inside a title can be omitted from its byte stream.
+    // Assert a preference unique to this popup instead of requiring its title
+    // to appear as one contiguous substring.
     for expected in [
         "Sources",
         "Fixture channel",
-        "Youta preferences",
+        "Save playback history: on",
         "Split",
         "Prepare selected YouTube audio: off",
     ] {
