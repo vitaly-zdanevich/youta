@@ -123,6 +123,7 @@ fn ready_waveform() -> WaveformView {
 fn preferences() -> PreferencesPopupView {
     PreferencesPopupView {
         subscriptions_layout: youta::config::SubscriptionsLayout::default(),
+        save_playback_history: true,
         skip_advertisement_chapters: false,
         youtube_prewarm: false,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
@@ -133,6 +134,39 @@ fn preferences() -> PreferencesPopupView {
         environment_override: None,
         validation_error: None,
     }
+}
+
+#[test]
+fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
+    let sources = window_sources();
+    let source_named = |suffix: &str| {
+        sources
+            .iter()
+            .find_map(|(path, source)| path.ends_with(suffix).then_some(source.as_str()))
+            .unwrap_or_else(|| panic!("missing window source {suffix}"))
+    };
+    let app = source_named("App.tsx");
+    let popups = source_named("components/popups.tsx");
+
+    for required in [
+        "view.playback_history_enabled",
+        "source.id !== \"History\"",
+        "playbackHistoryEnabled={view.playback_history_enabled}",
+    ] {
+        assert!(app.contains(required), "App no longer contains {required}");
+    }
+    for required in [
+        "Save playback history",
+        "popup.save_playback_history",
+        "dispatch(\"TogglePlaybackHistorySaving\")",
+        "playbackHistoryEnabled ?",
+    ] {
+        assert!(
+            popups.contains(required),
+            "Preferences no longer contains {required}"
+        );
+    }
+    assert!(!popups.contains("[h] Save playback history"));
 }
 
 /// Every declared field must exist in the JSON the reducer publishes.

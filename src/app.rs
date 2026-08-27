@@ -64,9 +64,9 @@ use crate::audio_quality::{
 use crate::build_info::{self, RuntimeProvenance};
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
-    PersistenceBackend, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
-    SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV,
-    YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
+    PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV,
+    YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -4956,8 +4956,14 @@ impl AppController {
             Ok(saved) => (saved, None),
             Err(error) => (None, Some(error)),
         };
+        let disabled_history_was_stored =
+            !config.persistence.save_playback_history && saved.screen == StoredScreen::History;
         let mut view = ViewModel {
-            screen: tui_screen_from_stored(&saved.screen),
+            screen: if disabled_history_was_stored {
+                Screen::Search
+            } else {
+                tui_screen_from_stored(&saved.screen)
+            },
             local_path: saved.local_path.clone().unwrap_or_default(),
             search_query: match saved.screen {
                 StoredScreen::YouTubeMusic => saved.youtube_music_search_text.clone(),
@@ -4971,14 +4977,23 @@ impl AppController {
                 StoredScreen::Radio => saved.radio_filter_text.clone(),
                 _ => saved.search_text.clone(),
             },
-            selected: saved.selected_row,
-            details_focused: saved.focus == PanelFocus::Right,
-            details_scroll: usize::try_from(saved.details_scroll).unwrap_or(usize::MAX),
+            selected: if disabled_history_was_stored {
+                0
+            } else {
+                saved.selected_row
+            },
+            details_focused: !disabled_history_was_stored && saved.focus == PanelFocus::Right,
+            details_scroll: if disabled_history_was_stored {
+                0
+            } else {
+                usize::try_from(saved.details_scroll).unwrap_or(usize::MAX)
+            },
             right_panel_mode: RightPanelMode::Details,
             waveform_visible: cfg!(feature = "waveform")
                 && saved.waveform_visible
                 && matches!(saved.screen, StoredScreen::Local),
             show_chapter_timestamps: !saved.chapter_timestamps_hidden,
+            playback_history_enabled: config.persistence.save_playback_history,
             ..ViewModel::default()
         };
         view.subscriptions.layout = config.ui.subscriptions_layout;
@@ -17240,6 +17255,9 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
         };
+        if self.view.screen == Screen::History {
+            self.cancel_pending_history_replay();
+        }
         let music_origin = item.media.webpage_url.host_str() == Some("music.youtube.com");
 
         #[cfg(feature = "radio")]
@@ -21578,7 +21596,9 @@ impl AppController {
                         self.view.playback.buffering = false;
                         let title = self.current_playback_title();
                         self.view.status_line = format!("Playing {title}");
-                        if let Some(history) = self.pending_history.take()
+                        let pending_history = self.pending_history.take();
+                        if self.config.persistence.save_playback_history
+                            && let Some(history) = pending_history
                             && let Err(error) = self.store.insert_history(&history)
                         {
                             self.show_error("Playing, but history could not be saved", &error);
@@ -22052,6 +22072,19 @@ impl AppController {
     /// Radio filtering is live, so leaving its editor keeps the visible query
     /// instead of restoring the snapshot captured when `/` was pressed.
     fn show_screen(&mut self, screen: Screen) {
+        if screen == Screen::History && !self.config.persistence.save_playback_history {
+            self.view.status_line = if std::env::var_os(SAVE_PLAYBACK_HISTORY_ENV).is_some() {
+                format!(
+                    "Playback history is disabled by {SAVE_PLAYBACK_HISTORY_ENV}; change or remove that environment override"
+                )
+            } else {
+                "Playback history is disabled; enable it in Preferences".to_owned()
+            };
+            return;
+        }
+        if self.view.screen == Screen::History && screen != Screen::History {
+            self.cancel_pending_history_replay();
+        }
         self.clear_detail_navigation_history();
         #[cfg(feature = "yt-dlp")]
         self.cancel_youtube_prewarm();
@@ -22264,6 +22297,16 @@ impl AppController {
             self.populate_librivox();
         }
         self.refresh_selected_playlist_state();
+    }
+
+    /// Revokes an in-flight History replay after its visible row loses ownership.
+    fn cancel_pending_history_replay(&mut self) {
+        if self.pending_history_replay.take().is_none() {
+            return;
+        }
+        // A response without its History owner must not fall through into the
+        // ordinary direct-link handler after `finish_history_replay` rejects it.
+        self.supersede_search_generation();
     }
 
     fn populate_local_screen(&mut self) {
@@ -27285,6 +27328,7 @@ impl AppController {
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
+            SAVE_PLAYBACK_HISTORY_ENV,
         ]
         .into_iter()
         .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
@@ -27299,6 +27343,7 @@ impl AppController {
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
+            save_playback_history: self.config.persistence.save_playback_history,
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
                 .then_some(environment_override),
@@ -27436,6 +27481,20 @@ impl AppController {
             return;
         }
         preferences.youtube_prewarm = !preferences.youtube_prewarm;
+        preferences.validation_error = None;
+    }
+
+    /// Toggles whether future authoritative playback starts enter History.
+    fn toggle_draft_playback_history_saving(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.save_playback_history = !preferences.save_playback_history;
         preferences.validation_error = None;
     }
 
@@ -27623,6 +27682,7 @@ impl AppController {
         #[cfg(not(feature = "images"))]
         let show_images_in_tty = self.config.ui.show_images_in_tty;
         let bandcamp_audio_format = preferences.bandcamp_audio_format;
+        let save_playback_history = preferences.save_playback_history;
         #[cfg(feature = "yt-dlp")]
         let youtube_prewarm_preference_changed =
             self.config.playback.youtube_prewarm != youtube_prewarm;
@@ -27637,12 +27697,17 @@ impl AppController {
             show_local_folder_sizes,
             show_images_in_tty,
             youtube_thumbnail_size,
+            save_playback_history,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
             }
             self.show_error("Could not save Youta preferences", &error);
             return;
+        }
+        self.view.playback_history_enabled = save_playback_history;
+        if !save_playback_history && self.view.screen == Screen::History {
+            self.show_screen(Screen::Statistics);
         }
         if self.config.providers.bandcamp_audio_format != bandcamp_audio_format
             && let Err(error) = self
@@ -27690,7 +27755,7 @@ impl AppController {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; TTY images {}; Bandcamp audio {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; playback History {}; TTY images {}; Bandcamp audio {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
@@ -27698,6 +27763,7 @@ impl AppController {
                 "off"
             },
             if youtube_prewarm { "on" } else { "off" },
+            if save_playback_history { "on" } else { "off" },
             if cfg!(feature = "images") {
                 if show_images_in_tty { "on" } else { "off" }
             } else {
@@ -28933,6 +28999,9 @@ impl UiController for AppController {
                 self.toggle_draft_skip_advertisement_chapters();
             }
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
+            UiAction::TogglePlaybackHistorySaving => {
+                self.toggle_draft_playback_history_saving();
+            }
             UiAction::CycleYouTubeThumbnailSize => {
                 self.cycle_draft_youtube_thumbnail_size();
             }
@@ -48377,6 +48446,7 @@ mod tests {
         controller.view.local_size_sort = LocalSizeSort::Ascending;
         controller.dispatch(UiAction::ToggleLocalFolderSizes);
         controller.dispatch(UiAction::ToggleTtyImages);
+        controller.dispatch(UiAction::TogglePlaybackHistorySaving);
         #[cfg(not(feature = "images"))]
         {
             controller
@@ -48417,6 +48487,8 @@ mod tests {
         assert!(!contents.contains("show_images_in_tty"));
         assert!(contents.contains("[playback]"));
         assert!(contents.contains("youtube_prewarm = false"));
+        assert!(contents.contains("[persistence]"));
+        assert!(contents.contains("save_playback_history = false"));
         #[cfg(feature = "bandcamp")]
         assert!(contents.contains("bandcamp_audio_format = \"flac\""));
         let reloaded =
@@ -48433,11 +48505,280 @@ mod tests {
         #[cfg(not(feature = "images"))]
         assert!(reloaded.ui.show_images_in_tty);
         assert!(!reloaded.playback.youtube_prewarm);
+        assert!(!reloaded.persistence.save_playback_history);
         #[cfg(feature = "bandcamp")]
         assert_eq!(
             reloaded.providers.bandcamp_audio_format,
             BandcampAudioFormat::Flac
         );
+    }
+
+    #[test]
+    fn disabling_playback_history_leaves_history_and_moves_away_from_its_screen() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut existing = HistoryEntry {
+            id: 0,
+            media_id: MediaId::new(
+                SourceKind::RemoteFiles,
+                "https://media.example.test/existing.opus",
+            ),
+            title: "Existing History fixture".to_owned(),
+            replay_locator: None,
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 0,
+            duration_seconds: Some(60),
+            finished: false,
+        };
+        existing.id = store
+            .insert_history(&existing)
+            .expect("existing History row");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::History);
+        let generation = controller.search_generation;
+        controller.pending_history_replay = Some(PendingHistoryReplay {
+            generation,
+            entry: existing,
+        });
+
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::TogglePlaybackHistorySaving);
+        controller.dispatch(UiAction::SubmitPreferences);
+
+        assert!(!controller.config.persistence.save_playback_history);
+        assert!(!controller.view.playback_history_enabled);
+        assert_eq!(controller.view.screen, Screen::Statistics);
+        assert!(controller.pending_history_replay.is_none());
+        assert_ne!(controller.search_generation, generation);
+        assert_eq!(
+            controller
+                .store
+                .history(false, 10)
+                .expect("retained History")
+                .len(),
+            1,
+            "a preference toggle must not delete existing History"
+        );
+
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::TogglePlaybackHistorySaving);
+        controller.dispatch(UiAction::SubmitPreferences);
+
+        assert!(controller.config.persistence.save_playback_history);
+        assert!(controller.view.playback_history_enabled);
+        assert_eq!(
+            controller.view.screen,
+            Screen::Statistics,
+            "re-enabling History must not navigate without an explicit action"
+        );
+        controller.show_screen(Screen::History);
+        assert_eq!(controller.view.screen, Screen::History);
+        assert_eq!(controller.view.rows.len(), 1);
+    }
+
+    #[test]
+    fn failed_playback_history_preference_save_does_not_change_live_policy() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let blocked_root = temporary.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"fixture").expect("blocking regular file");
+        let config = Config::for_dir(blocked_root);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::TogglePlaybackHistorySaving);
+        controller.dispatch(UiAction::SubmitPreferences);
+
+        assert!(controller.config.persistence.save_playback_history);
+        assert!(controller.view.playback_history_enabled);
+        assert!(controller.view.preferences_popup.is_some());
+        assert!(controller.view.error_popup.is_some());
+    }
+
+    #[test]
+    fn saved_history_policy_applies_before_a_later_bandcamp_save_failure() {
+        const CHILD_MARKER: &str = "YOUTA_HISTORY_LATE_SAVE_FAILURE_TEST_CHILD";
+        const TEST_CONFIG_DIR: &str = "YOUTA_HISTORY_LATE_SAVE_FAILURE_TEST_CONFIG_DIR";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config_dir = PathBuf::from(
+                std::env::var(TEST_CONFIG_DIR).expect("child test configuration directory"),
+            );
+            let config = Config::for_dir(config_dir.clone());
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, None);
+            controller.show_screen(Screen::History);
+            controller.dispatch(UiAction::OpenPreferences);
+            let preferences = controller
+                .view
+                .preferences_popup
+                .as_mut()
+                .expect("Preferences popup");
+            // Model an override appearing after the popup opened: the main
+            // atomic writer does not own Bandcamp's separate preference.
+            preferences.environment_override = None;
+            preferences.save_playback_history = false;
+            preferences.bandcamp_audio_format = BandcampAudioFormat::Flac;
+
+            controller.dispatch(UiAction::SubmitPreferences);
+
+            assert!(!controller.config.persistence.save_playback_history);
+            assert!(!controller.view.playback_history_enabled);
+            assert_eq!(controller.view.screen, Screen::Statistics);
+            assert!(controller.view.preferences_popup.is_some());
+            assert!(controller.view.error_popup.is_some());
+            assert!(
+                controller
+                    .view
+                    .preferences_popup
+                    .as_ref()
+                    .and_then(|popup| popup.validation_error.as_deref())
+                    .is_some_and(|error| error.contains(BANDCAMP_AUDIO_FORMAT_ENV))
+            );
+            let reloaded =
+                Config::load_from_dir(config_dir).expect("reload the saved History policy");
+            assert!(!reloaded.persistence.save_playback_history);
+            return;
+        }
+
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config_dir = temporary.path().join("youta");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current controller test executable"),
+        )
+        .args([
+            "--exact",
+            "app::tests::saved_history_policy_applies_before_a_later_bandcamp_save_failure",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env(TEST_CONFIG_DIR, &config_dir)
+        .env(BANDCAMP_AUDIO_FORMAT_ENV, "flac")
+        .output()
+        .expect("run isolated late-save-failure child");
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn disabled_playback_history_rejects_navigation_without_deleting_old_rows() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.persistence.save_playback_history = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        store
+            .insert_history(&HistoryEntry {
+                id: 0,
+                media_id: MediaId::new(
+                    SourceKind::RemoteFiles,
+                    "https://media.example.test/existing.opus",
+                ),
+                title: "Existing History fixture".to_owned(),
+                replay_locator: None,
+                started_at: 1,
+                last_played_at: 2,
+                position_seconds: 0,
+                duration_seconds: Some(60),
+                finished: false,
+            })
+            .expect("existing History row");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::History));
+
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert!(!controller.view.playback_history_enabled);
+        assert!(controller.view.status_line.contains("disabled"));
+        assert_eq!(
+            controller
+                .store
+                .history(false, 10)
+                .expect("retained History")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn disabled_history_navigation_identifies_its_environment_override() {
+        const CHILD_MARKER: &str = "YOUTA_HISTORY_NAVIGATION_ENV_TEST_CHILD";
+        const TEST_CONFIG_DIR: &str = "YOUTA_HISTORY_NAVIGATION_ENV_TEST_CONFIG_DIR";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config_dir = PathBuf::from(
+                std::env::var(TEST_CONFIG_DIR).expect("child test configuration directory"),
+            );
+            let config = Config::load_from_dir(config_dir).expect("load overridden configuration");
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, None);
+
+            controller.dispatch(UiAction::ShowScreen(Screen::History));
+
+            assert_eq!(controller.view.screen, Screen::Search);
+            assert!(
+                controller
+                    .view
+                    .status_line
+                    .contains(SAVE_PLAYBACK_HISTORY_ENV)
+            );
+            assert!(controller.view.status_line.contains("change or remove"));
+            assert!(!controller.view.status_line.contains("Preferences"));
+            return;
+        }
+
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config_dir = temporary.path().join("youta");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current controller test executable"),
+        )
+        .args([
+            "--exact",
+            "app::tests::disabled_history_navigation_identifies_its_environment_override",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env(TEST_CONFIG_DIR, &config_dir)
+        .env(SAVE_PLAYBACK_HISTORY_ENV, "false")
+        .output()
+        .expect("run isolated History environment-override child");
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn disabled_playback_history_does_not_restore_a_stale_history_screen() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.persistence.save_playback_history = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        store
+            .save_session(
+                &SessionState {
+                    screen: StoredScreen::History,
+                    selected_row: 17,
+                    focus: PanelFocus::Right,
+                    details_scroll: 29,
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .expect("stale History session");
+
+        let controller = AppController::new(config, store, None, None);
+
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert_eq!(controller.view.selected, 0);
+        assert!(!controller.view.details_focused);
+        assert_eq!(controller.view.details_scroll, 0);
+        assert!(!controller.view.playback_history_enabled);
     }
 
     #[cfg(feature = "images")]
@@ -66628,6 +66969,77 @@ mod tests {
         assert_eq!(
             commands.get(0..2),
             Some([PlayerCommand::SetVolume(80), PlayerCommand::SetSpeed(1.0)].as_slice())
+        );
+    }
+
+    #[test]
+    fn playback_history_policy_is_sampled_at_authoritative_start() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(3),
+            duration: Some(Duration::from_secs(30)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut disabled, _, _, disabled_events) =
+            controller_with_mock_lifecycle([active.clone()], [PlaybackEvent::MediaLoaded]);
+        let disabled_item = fixture_direct_item("disabled at start");
+        let disabled_media_id = disabled_item.media.id.clone();
+        disabled.play_queue_item(disabled_item, false);
+        disabled.update_player();
+        disabled.config.persistence.save_playback_history = false;
+        disabled.view.playback_history_enabled = false;
+        disabled_events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::PlaybackStarted);
+
+        disabled.update_player();
+
+        assert!(
+            disabled.pending_history.is_none(),
+            "the pre-start snapshot must be released even when saving is disabled"
+        );
+        assert!(
+            disabled
+                .store
+                .history(false, 10)
+                .expect("disabled History")
+                .is_empty(),
+            "turning saving off before the accepted start must omit the appearance"
+        );
+        assert!(
+            disabled
+                .store
+                .progress(&disabled_media_id)
+                .expect("disabled-history progress")
+                .is_some(),
+            "History policy must not disable restart-safe progress"
+        );
+
+        let (mut enabled, _, _, enabled_events) =
+            controller_with_mock_lifecycle([active], [PlaybackEvent::MediaLoaded]);
+        enabled.config.persistence.save_playback_history = false;
+        enabled.view.playback_history_enabled = false;
+        enabled.play_queue_item(fixture_direct_item("enabled at start"), false);
+        enabled.update_player();
+        enabled.config.persistence.save_playback_history = true;
+        enabled.view.playback_history_enabled = true;
+        enabled_events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::PlaybackStarted);
+
+        enabled.update_player();
+
+        assert_eq!(
+            enabled
+                .store
+                .history(false, 10)
+                .expect("enabled History")
+                .len(),
+            1,
+            "turning saving on before the accepted start must record the appearance"
         );
     }
 

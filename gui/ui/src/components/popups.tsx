@@ -56,7 +56,13 @@ function Body({ children }: { children: React.ReactNode }) {
  * and its GPM requirement, none of which exist here. What both lists must agree
  * on is the bindings themselves, which come from the one shared map.
  */
-export function HelpPopup({ audioQualitySupported }: { audioQualitySupported: boolean }) {
+export function HelpPopup({
+  audioQualitySupported,
+  playbackHistoryEnabled,
+}: {
+  audioQualitySupported: boolean;
+  playbackHistoryEnabled: boolean;
+}) {
   const sections: Array<[string, Array<[string, string]>]> = [
     [
       "Navigation",
@@ -66,7 +72,12 @@ export function HelpPopup({ audioQualitySupported }: { audioQualitySupported: bo
         ["j · k · ↑ · ↓", "move the selection"],
         ["Enter", "open or play"],
         ["Backspace", "back"],
-        ["F2 · F3 · F4 · F5", "offline · history · playlists · stats"],
+        [
+          playbackHistoryEnabled ? "F2 · F3 · F4 · F5" : "F2 · F4 · F5",
+          playbackHistoryEnabled
+            ? "offline · history · playlists · stats"
+            : "offline · playlists · stats",
+        ],
         ["S · p · F9", "subscriptions · preferences · recent commits"],
         ["R · h", "refresh subscription videos · show/hide Shorts"],
       ],
@@ -592,6 +603,15 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
     >
       <Body>
         <div className="grid gap-[7px]">
+          <label className="flex items-center justify-between gap-4">
+            <span className="text-ink-dim">Save playback history</span>
+            <PopupButton
+              emphasis={popup.save_playback_history}
+              onClick={() => void dispatch("TogglePlaybackHistorySaving")}
+            >
+              {popup.save_playback_history ? "on" : "off"}
+            </PopupButton>
+          </label>
           {toggles.map(([label, value, action]) => (
             <label key={label} className="flex items-center justify-between gap-4">
               <span className="text-ink-dim">{label}</span>

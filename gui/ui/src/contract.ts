@@ -340,6 +340,7 @@ export interface ProjectHistoryPopupView {
 /** The runtime preferences editor. Values are drafts until it is submitted. */
 export interface PreferencesPopupView {
   subscriptions_layout: string;
+  save_playback_history: boolean;
   skip_advertisement_chapters: boolean;
   youtube_prewarm: boolean;
   youtube_thumbnail_size: string;
@@ -521,6 +522,7 @@ export interface DownloadView {
 /** The published snapshot. */
 export interface ViewModel {
   screen: string;
+  playback_history_enabled: boolean;
   search_editing: boolean;
   search_query: string;
   search_cursor_byte: number;

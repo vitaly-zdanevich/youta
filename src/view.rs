@@ -129,6 +129,16 @@ impl Screen {
         }
     }
 
+    /// Whether this screen is compiled in and allowed by the runtime policy.
+    ///
+    /// [`Self::enabled`] remains the compile-time provider-feature check. This
+    /// separate predicate also accounts for preferences that can hide a
+    /// built-in screen without changing which code was compiled.
+    #[must_use]
+    pub const fn available(self, playback_history_enabled: bool) -> bool {
+        self.enabled() && (playback_history_enabled || !matches!(self, Self::History))
+    }
+
     /// Returns the Details layout this screen's selection is rendered with.
     ///
     /// This lives beside the screen rather than inside a renderer because both
@@ -215,25 +225,25 @@ impl Screen {
         }
     }
 
-    /// Returns the next enabled top-level tab, wrapping at the end.
-    pub(crate) fn next(self) -> Self {
+    /// Returns the next available top-level tab, wrapping at the end.
+    pub(crate) fn next_available(self, playback_history_enabled: bool) -> Self {
         let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
             return Self::ALL[0];
         };
         (1..=Self::ALL.len())
             .map(|offset| Self::ALL[(index + offset) % Self::ALL.len()])
-            .find(|candidate| candidate.enabled())
+            .find(|candidate| candidate.available(playback_history_enabled))
             .unwrap_or(Self::Search)
     }
 
-    /// Returns the previous enabled top-level tab, wrapping at the beginning.
-    pub(crate) fn previous(self) -> Self {
+    /// Returns the previous available top-level tab, wrapping at the beginning.
+    pub(crate) fn previous_available(self, playback_history_enabled: bool) -> Self {
         let Some(index) = Self::ALL.iter().position(|candidate| *candidate == self) else {
             return Self::ALL[Self::ALL.len() - 1];
         };
         (1..=Self::ALL.len())
             .map(|offset| Self::ALL[(index + Self::ALL.len() - offset) % Self::ALL.len()])
-            .find(|candidate| candidate.enabled())
+            .find(|candidate| candidate.available(playback_history_enabled))
             .unwrap_or(Self::Search)
     }
 }
@@ -811,6 +821,8 @@ impl std::fmt::Debug for RssSubscriptionPopupView {
 pub struct PreferencesPopupView {
     /// Draft Subscriptions layout saved only when the user confirms.
     pub subscriptions_layout: SubscriptionsLayout,
+    /// Draft playback-history saving policy saved only on confirmation.
+    pub save_playback_history: bool,
     /// Draft advertisement-chapter behavior saved only on confirmation.
     pub skip_advertisement_chapters: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
@@ -1635,6 +1647,8 @@ pub struct RadioRecordingView {
 pub struct ViewModel {
     /// Active screen.
     pub screen: Screen,
+    /// Whether playback History is available as a top-level screen.
+    pub playback_history_enabled: bool,
     /// Whether text typed by the user edits the search query.
     pub search_editing: bool,
     /// Current search query.
@@ -1858,6 +1872,7 @@ impl Default for ViewModel {
     fn default() -> Self {
         Self {
             screen: Screen::Search,
+            playback_history_enabled: true,
             search_editing: false,
             search_query: String::new(),
             search_cursor_byte: 0,
@@ -2310,6 +2325,8 @@ pub enum UiAction {
     OpenPreferences,
     /// Select one draft Subscriptions layout in the preferences editor.
     SetSubscriptionsLayout(SubscriptionsLayout),
+    /// Toggle playback-history saving in the draft.
+    TogglePlaybackHistorySaving,
     /// Toggle hiding and skipping exact `Реклама` chapters in the draft.
     ToggleSkipAdvertisementChapters,
     /// Toggle selected-video YouTube prewarming in the draft.
@@ -2471,6 +2488,25 @@ mod tests {
     #[test]
     fn subscription_shorts_are_visible_by_default() {
         assert!(SubscriptionsView::default().show_youtube_shorts);
+    }
+
+    #[test]
+    fn playback_history_is_available_by_default_and_runtime_policy_can_hide_it() {
+        let view = ViewModel::default();
+        assert!(view.playback_history_enabled);
+        assert!(Screen::History.available(view.playback_history_enabled));
+        assert!(!Screen::History.available(false));
+        assert!(Screen::Downloaded.available(false));
+        assert_eq!(
+            Screen::YouTubeMusic.available(false),
+            Screen::YouTubeMusic.enabled(),
+            "runtime History policy must not change compile-time provider availability"
+        );
+        assert_eq!(Screen::Downloaded.next_available(false), Screen::Statistics);
+        assert_eq!(
+            Screen::Statistics.previous_available(false),
+            Screen::Downloaded
+        );
     }
 
     /// Fills the four editors whose values must never leave this process.
@@ -2653,6 +2689,7 @@ mod tests {
             UiAction::SeekRelative(-5),
             UiAction::MoveSelection(1),
             UiAction::SubmitSearch,
+            UiAction::TogglePlaybackHistorySaving,
             UiAction::SeekPercent(42.5),
             UiAction::AnalyzeLocalAudioQuality,
             UiAction::CancelAudioQualityAnalysis,

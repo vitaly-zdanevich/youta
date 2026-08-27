@@ -925,6 +925,11 @@ activity. Writes use canonical ordering and same-directory atomic replacement
 so diffs remain readable and an interrupted write does not replace the last
 complete document. Each kind of state has its own document, so saving playback
 progress does not rewrite history, notes, bookmarks, statistics, or playlists.
+`persistence.save_playback_history = false` prevents only new playback History
+entries and hides the History tab. Existing History remains in the selected
+backend, and playback progress, listening statistics, sessions, caches, and
+graceful-shutdown Git synchronization continue normally. Setting it back to
+`true` exposes the retained History again.
 At startup, a corrupt `runtime/` or `cache/` document is preserved beside its
 canonical path under a private hidden `.corrupt` name and replaced with an
 empty valid document. Existing quarantine files are never overwritten.
@@ -1465,7 +1470,8 @@ Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
 skipped, choose whether selected YouTube audio is prepared, choose whether
 Local folder sizes are measured, choose the exact YouTube video-thumbnail
-size, and press `Enter` to save. These preferences can be configured directly:
+size, choose whether new playback History entries are saved, and press `Enter`
+to save. These preferences can be configured directly:
 
 ```toml
 [playback]
@@ -1478,6 +1484,9 @@ subscriptions_layout = 'drill-down' # drill-down or split
 show_youtube_shorts = true
 show_local_folder_sizes = true
 youtube_thumbnail_size = 'automatic'
+
+[persistence]
+save_playback_history = true
 ```
 
 `YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
@@ -1488,7 +1497,11 @@ youtube_thumbnail_size = 'automatic'
 TOML values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
-video-thumbnail entry.
+video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
+new playback History entries and hides the History tab. It does not delete
+existing History or disable playback progress, listening statistics, session
+and cache persistence, or graceful-shutdown Git synchronization. Re-enabling
+it exposes the retained History again.
 While any of these environment variables is present, the Preferences popup
 shows the override and does not partially replace its draft in `config.toml`.
 

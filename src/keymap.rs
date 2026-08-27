@@ -775,12 +775,20 @@ fn unfiltered_key_action(
         Key::F(9) => Some(UiAction::OpenProjectHistory),
         Key::Char('/') => Some(UiAction::BeginSearch),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
-        Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(view.screen.previous())),
-        Key::Tab => Some(UiAction::ShowScreen(view.screen.next())),
-        Key::BackTab => Some(UiAction::ShowScreen(view.screen.previous())),
+        Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(
+            view.screen
+                .previous_available(view.playback_history_enabled),
+        )),
+        Key::Tab => Some(UiAction::ShowScreen(
+            view.screen.next_available(view.playback_history_enabled),
+        )),
+        Key::BackTab => Some(UiAction::ShowScreen(
+            view.screen
+                .previous_available(view.playback_history_enabled),
+        )),
         Key::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
         Key::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
-        Key::F(3) => Some(UiAction::ShowScreen(Screen::History)),
+        Key::F(3) if view.playback_history_enabled => Some(UiAction::ShowScreen(Screen::History)),
         Key::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
         Key::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
         Key::Char('v') if view.screen == Screen::YandexMusic => {

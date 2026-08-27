@@ -2344,17 +2344,17 @@ fn render_tabs(
     }
     const FULL_DIVIDER: &str = " │ ";
     const COMPACT_DIVIDER: &str = "│";
-    let enabled = Screen::ALL
+    let available = Screen::ALL
         .into_iter()
-        .filter(|screen| screen.enabled())
+        .filter(|screen| screen.available(view.playback_history_enabled))
         .collect::<Vec<_>>();
-    let full_width = enabled
+    let full_width = available
         .iter()
         .map(|screen| usize::from(terminal_text_width(screen.label())))
         .sum::<usize>()
         .saturating_add(
             usize::from(terminal_text_width(FULL_DIVIDER))
-                .saturating_mul(enabled.len().saturating_sub(1)),
+                .saturating_mul(available.len().saturating_sub(1)),
         );
     let compact = full_width > usize::from(area.width);
     let divider = if compact {
@@ -2363,19 +2363,21 @@ fn render_tabs(
         FULL_DIVIDER
     };
     let divider_width = terminal_text_width(divider);
-    let compact_width = enabled
+    let compact_width = available
         .iter()
         .map(|screen| usize::from(terminal_text_width(screen.compact_label())))
         .sum::<usize>()
-        .saturating_add(usize::from(divider_width).saturating_mul(enabled.len().saturating_sub(1)));
+        .saturating_add(
+            usize::from(divider_width).saturating_mul(available.len().saturating_sub(1)),
+        );
     let visible = if compact && compact_width > usize::from(area.width) {
-        active_tab_window(&enabled, view.screen, area.width, divider_width)
+        active_tab_window(&available, view.screen, area.width, divider_width)
     } else {
-        0..enabled.len()
+        0..available.len()
     };
     let mut spans = Vec::with_capacity(visible.len().saturating_mul(2));
     let mut x = area.x;
-    for (index, screen) in enabled[visible].iter().copied().enumerate() {
+    for (index, screen) in available[visible].iter().copied().enumerate() {
         if index > 0 {
             if x >= area.right() {
                 break;
@@ -6219,11 +6221,16 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  n private note     t Details-only text selection\n  Q selected YouTube video QR code";
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
+    let history_navigation_help = if view.playback_history_enabled {
+        "  F2 offline     F3 history     Backspace back"
+    } else {
+        "  F2 offline     Backspace back"
+    };
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
-        "  F2 offline     F3 history     Backspace back",
+        history_navigation_help,
         "  F4 playlists     F5 stats     p preferences",
         "  F9 recent commits and installation details",
         search_kind_help(view),
@@ -8619,7 +8626,7 @@ fn render_preferences_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(76, 94, frame.area());
+    let area = centered_rect(76, 98, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -8634,6 +8641,7 @@ fn render_preferences_popup(
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -8685,6 +8693,34 @@ fn render_preferences_popup(
             .push((UiAction::SetSubscriptionsLayout(layout), *choice_area));
     }
 
+    let playback_history_label = format!(
+        "Save playback history: {}",
+        if preferences.save_playback_history {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    frame.render_widget(
+        Paragraph::new(playback_history_label.clone())
+            .style(if preferences.save_playback_history {
+                theme.selected
+            } else {
+                theme.base
+            })
+            .alignment(Alignment::Center),
+        sections[2],
+    );
+    hit_map.preferences_buttons.push((
+        UiAction::TogglePlaybackHistorySaving,
+        Rect::new(
+            centered_line_x(sections[2], terminal_text_width(&playback_history_label)),
+            sections[2].y,
+            terminal_text_width(&playback_history_label).min(sections[2].width),
+            1,
+        ),
+    ));
+
     let advertisement_label = format!(
         "[a] Skip sections named Реклама: {}",
         if preferences.skip_advertisement_chapters {
@@ -8701,14 +8737,14 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[2],
+        sections[3],
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleSkipAdvertisementChapters,
         Rect::new(
-            centered_line_x(sections[2], terminal_text_width(&advertisement_label)),
-            sections[2].y,
-            terminal_text_width(&advertisement_label).min(sections[2].width),
+            centered_line_x(sections[3], terminal_text_width(&advertisement_label)),
+            sections[3].y,
+            terminal_text_width(&advertisement_label).min(sections[3].width),
             1,
         ),
     ));
@@ -8729,14 +8765,14 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[3],
+        sections[4],
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleYouTubePrewarm,
         Rect::new(
-            centered_line_x(sections[3], terminal_text_width(&youtube_prewarm_label)),
-            sections[3].y,
-            terminal_text_width(&youtube_prewarm_label).min(sections[3].width),
+            centered_line_x(sections[4], terminal_text_width(&youtube_prewarm_label)),
+            sections[4].y,
+            terminal_text_width(&youtube_prewarm_label).min(sections[4].width),
             1,
         ),
     ));
@@ -8757,15 +8793,15 @@ fn render_preferences_popup(
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[4],
+        sections[5],
     );
     if cfg!(feature = "images") {
         hit_map.preferences_buttons.push((
             UiAction::CycleYouTubeThumbnailSize,
             Rect::new(
-                centered_line_x(sections[4], terminal_text_width(&youtube_thumbnail_label)),
-                sections[4].y,
-                terminal_text_width(&youtube_thumbnail_label).min(sections[4].width),
+                centered_line_x(sections[5], terminal_text_width(&youtube_thumbnail_label)),
+                sections[5].y,
+                terminal_text_width(&youtube_thumbnail_label).min(sections[5].width),
                 1,
             ),
         ));
@@ -8787,14 +8823,14 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[5],
+        sections[6],
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleLocalFolderSizes,
         Rect::new(
-            centered_line_x(sections[5], terminal_text_width(&folder_size_label)),
-            sections[5].y,
-            terminal_text_width(&folder_size_label).min(sections[5].width),
+            centered_line_x(sections[6], terminal_text_width(&folder_size_label)),
+            sections[6].y,
+            terminal_text_width(&folder_size_label).min(sections[6].width),
             1,
         ),
     ));
@@ -8821,15 +8857,15 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[6],
+        sections[7],
     );
     if cfg!(feature = "images") {
         hit_map.preferences_buttons.push((
             UiAction::ToggleTtyImages,
             Rect::new(
-                centered_line_x(sections[6], terminal_text_width(&tty_images_label)),
-                sections[6].y,
-                terminal_text_width(&tty_images_label).min(sections[6].width),
+                centered_line_x(sections[7], terminal_text_width(&tty_images_label)),
+                sections[7].y,
+                terminal_text_width(&tty_images_label).min(sections[7].width),
                 1,
             ),
         ));
@@ -8851,22 +8887,22 @@ fn render_preferences_popup(
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[7],
+        sections[8],
     );
     if cfg!(feature = "bandcamp") {
         hit_map.preferences_buttons.push((
             UiAction::CycleBandcampAudioFormat,
             Rect::new(
-                centered_line_x(sections[7], terminal_text_width(&bandcamp_format_label)),
-                sections[7].y,
-                terminal_text_width(&bandcamp_format_label).min(sections[7].width),
+                centered_line_x(sections[8], terminal_text_width(&bandcamp_format_label)),
+                sections[8].y,
+                terminal_text_width(&bandcamp_format_label).min(sections[8].width),
                 1,
             ),
         ));
     }
 
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 480×360 through 1366 px, 640×480 through 1920 px, and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI and playback preferences in:\n{}",
+        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 480×360 through 1366 px, 640×480 through 1920 px, and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI, playback, and persistence preferences in:\n{}",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -8889,7 +8925,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[8],
+        sections[9],
     );
 
     let buttons = [
@@ -8905,15 +8941,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[9],
+        sections[10],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[9], total_width);
+    let mut x = centered_line_x(sections[10], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[9].y, width, 1)));
+            .push((action, Rect::new(x, sections[10].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -14828,9 +14864,15 @@ mod tests {
 
     #[test]
     fn tab_shortcuts_cycle_every_enabled_screen_and_wrap() {
-        assert_eq!(Screen::TrackerMusic.next(), Screen::Subscriptions);
-        assert_eq!(Screen::Subscriptions.next(), Screen::Local);
-        assert_eq!(Screen::Local.previous(), Screen::Subscriptions);
+        assert_eq!(
+            Screen::TrackerMusic.next_available(true),
+            Screen::Subscriptions
+        );
+        assert_eq!(Screen::Subscriptions.next_available(true), Screen::Local);
+        assert_eq!(
+            Screen::Local.previous_available(true),
+            Screen::Subscriptions
+        );
 
         let enabled = Screen::ALL
             .into_iter()
@@ -14873,6 +14915,32 @@ mod tests {
                 &ViewModel::default()
             ),
             Some(UiAction::ShowScreen(Screen::Subscriptions))
+        );
+
+        let disabled = ViewModel {
+            screen: Screen::Downloaded,
+            playback_history_enabled: false,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &disabled),
+            Some(UiAction::ShowScreen(Screen::Statistics))
+        );
+        let disabled = ViewModel {
+            screen: Screen::Statistics,
+            ..disabled
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &disabled
+            ),
+            Some(UiAction::ShowScreen(Screen::Downloaded))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE), &disabled),
+            None,
+            "the hidden History screen must not retain a direct keyboard route"
         );
     }
 
@@ -16199,6 +16267,7 @@ mod tests {
         let view = ViewModel {
             preferences_popup: Some(PreferencesPopupView {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
+                save_playback_history: true,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -16219,6 +16288,8 @@ mod tests {
         assert!(rendered.contains("Youta preferences"));
         assert!(rendered.contains("[d] Drill-down"));
         assert!(rendered.contains("[s] Split"));
+        assert!(rendered.contains("Save playback history: on"));
+        assert!(!rendered.contains("[h] Save playback history"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[t] YouTube thumbnails: 640×480 (standard)"));
@@ -16231,6 +16302,7 @@ mod tests {
         assert!(rendered.contains("[i] Show images in TTY: unavailable in this build"));
         #[cfg(feature = "bandcamp")]
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
+        assert!(rendered.contains("UI, playback, and persistence preferences"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
@@ -16243,6 +16315,11 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleYouTubePrewarm)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &view),
+            None,
+            "playback-history saving must not claim a dedicated hotkey"
         );
         #[cfg(feature = "images")]
         assert_eq!(
@@ -16297,6 +16374,32 @@ mod tests {
                 &view,
             ),
             Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split))
+        );
+        let (_, playback_history_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::TogglePlaybackHistorySaving)
+            .expect("playback-history saving target");
+        let visible_label = (playback_history_target.x..playback_history_target.right())
+            .map(|column| {
+                terminal.backend().buffer()[(column, playback_history_target.y)]
+                    .symbol()
+                    .to_owned()
+            })
+            .collect::<String>();
+        assert_eq!(visible_label, "Save playback history: on");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: playback_history_target.x,
+                    row: playback_history_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::TogglePlaybackHistorySaving)
         );
         let (_, youtube_prewarm_target) = hit_map
             .preferences_buttons
@@ -16442,11 +16545,51 @@ mod tests {
     }
 
     #[test]
+    fn narrow_preferences_popup_keeps_wrapped_intro_history_and_footer_visible() {
+        let backend = TestBackend::new(80, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            preferences_popup: Some(PreferencesPopupView {
+                subscriptions_layout: SubscriptionsLayout::DrillDown,
+                save_playback_history: false,
+                skip_advertisement_chapters: true,
+                youtube_prewarm: true,
+                youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
+                show_images_in_tty: true,
+                show_local_folder_sizes: true,
+                bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
+                config_path: "/tmp/youta/config.toml".to_owned(),
+                environment_override: None,
+                validation_error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw narrow preferences");
+        let rendered = rendered_text(&terminal);
+        for required in [
+            "Subscriptions layout.",
+            "Enter to save.",
+            "Save playback history: off",
+            "[Enter] Save   [Esc] Cancel",
+        ] {
+            assert!(
+                rendered.contains(required),
+                "narrow Preferences popup clipped {required}"
+            );
+        }
+    }
+
+    #[test]
     fn diagnostic_keyboard_routing_precedes_stacked_preferences_and_text_selection() {
         let view = ViewModel {
             text_selection_mode: true,
             preferences_popup: Some(PreferencesPopupView {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
+                save_playback_history: true,
                 skip_advertisement_chapters: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -26145,7 +26288,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered_text(&terminal).contains("YT Music"));
         let compact_screens = Screen::ALL
             .into_iter()
-            .filter(|screen| screen.enabled())
+            .filter(|screen| screen.available(view.playback_history_enabled))
             .collect::<Vec<_>>();
         let compact_divider_width = terminal_text_width("│");
         let visible = active_tab_window(&compact_screens, view.screen, 80, compact_divider_width);
@@ -26199,6 +26342,63 @@ prose 07:25 remains clickable but is not a chapter";
                 assert_eq!(mouse_action(divider_click, &compact_hit_map, &view), None);
             }
         }
+    }
+
+    #[test]
+    fn disabled_playback_history_is_absent_from_top_tabs_and_help() {
+        let backend = TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            playback_history_enabled: false,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+            })
+            .expect("draw tabs without History");
+        assert!(
+            hit_map
+                .tabs
+                .iter()
+                .all(|(screen, _)| *screen != Screen::History)
+        );
+        let expected = Screen::ALL
+            .into_iter()
+            .filter(|screen| screen.available(false))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hit_map
+                .tabs
+                .iter()
+                .map(|(screen, _)| *screen)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (screen, target) in &hit_map.tabs {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::ShowScreen(*screen))
+            );
+        }
+
+        terminal
+            .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+            .expect("draw Help without History");
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("F3 history"));
+        assert!(rendered.contains("F2 offline"));
+        assert!(rendered.contains("F4 playlists"));
     }
 
     #[test]

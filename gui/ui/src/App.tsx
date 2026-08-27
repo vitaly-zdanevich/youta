@@ -92,6 +92,9 @@ export function App() {
     return <div className="grid h-full place-items-center text-xs text-ink-faint">Starting…</div>;
   }
 
+  const visibleSources = view.playback_history_enabled
+    ? sources
+    : sources.filter((source) => source.id !== "History");
   const onSubscriptions = view.screen === "Subscriptions";
   // While a subscription *source* is being chosen, the panel is describing a
   // channel or a feed rather than a media item, and those expose an entirely
@@ -103,7 +106,7 @@ export function App() {
     (view.subscriptions.layout === "drill-down"
       ? view.subscriptions.route === "Sources"
       : !view.subscriptions.description_expanded);
-  const active = sources.find((source) => source.id === view.screen);
+  const active = visibleSources.find((source) => source.id === view.screen);
   const kind: InformationPanelKind = showingChannel
     ? "Channel"
     : (active?.details_kind ?? "Generic");
@@ -112,7 +115,7 @@ export function App() {
   return (
     <>
       <div className="grid h-full grid-rows-[auto_auto_minmax(0,1fr)_auto_auto_auto_auto]">
-        <Tabs sources={sources} active={view.screen} />
+        <Tabs sources={visibleSources} active={view.screen} />
 
         {/* Only where the reducer accepts a query; the catalogue says which
             screens those are, so this window never offers a field whose Enter
@@ -163,7 +166,10 @@ export function App() {
           popup carries its own stacking layer, so the order is stated once
           rather than implied by where a component sits in this tree. */}
       {view.help_open ? (
-        <HelpPopup audioQualitySupported={view.audio_quality_supported} />
+        <HelpPopup
+          audioQualitySupported={view.audio_quality_supported}
+          playbackHistoryEnabled={view.playback_history_enabled}
+        />
       ) : null}
       {view.project_history_popup ? (
         <ProjectHistoryPopup popup={view.project_history_popup} />

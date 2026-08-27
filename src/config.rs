@@ -56,6 +56,9 @@ pub const TTY_IMAGES_ENV: &str = "YOUTA_UI__SHOW_IMAGES_IN_TTY";
 /// Environment variable that overrides the selected `YouTube` thumbnail size.
 pub const YOUTUBE_THUMBNAIL_SIZE_ENV: &str = "YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE";
 
+/// Environment variable that overrides whether new playback History rows are saved.
+pub const SAVE_PLAYBACK_HISTORY_ENV: &str = "YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY";
+
 /// Environment variable that overrides the preferred Bandcamp audio format.
 pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
 
@@ -547,18 +550,20 @@ impl Config {
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, selected
     /// YouTube-video prewarming, lazy Local-folder size preference, physical-TTY
-    /// image preference, and exact `YouTube` thumbnail size are written together
-    /// so confirming the popup cannot save only part of the draft.
+    /// image preference, exact `YouTube` thumbnail size, and playback-History
+    /// saving preference are written together so confirming the popup cannot
+    /// save only part of the draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
     /// [`YOUTUBE_PREWARM_ENV`] and
     /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
-    /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] retain precedence and therefore prevent
-    /// this writer from storing a shadowed draft.
+    /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
+    /// precedence and therefore prevent this writer from storing a shadowed
+    /// draft.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
-    /// available for callers that do not edit the playback preference.
+    /// available for callers that do not edit the complete preference draft.
     ///
     /// # Errors
     ///
@@ -566,6 +571,10 @@ impl Config {
     /// existing file is too large or malformed, or an atomic private-file
     /// update fails.
     #[cfg(feature = "controller")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the atomic preference writer keeps each independently documented TOML value explicit"
+    )]
     pub fn save_tui_preferences(
         &mut self,
         layout: SubscriptionsLayout,
@@ -574,6 +583,7 @@ impl Config {
         show_local_folder_sizes: bool,
         show_images_in_tty: bool,
         youtube_thumbnail_size: YouTubeThumbnailSize,
+        save_playback_history: bool,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
@@ -582,6 +592,7 @@ impl Config {
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
+            SAVE_PLAYBACK_HISTORY_ENV,
         ]
         .into_iter()
         .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
@@ -629,6 +640,19 @@ impl Config {
             playback["skip_advertisement_chapters"] = value(skip_advertisement_chapters);
             playback["youtube_prewarm"] = value(youtube_prewarm);
         }
+        {
+            let persistence = document
+                .as_table_mut()
+                .entry("persistence")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`persistence` must be a TOML table before Youta can update it".to_owned(),
+                    )
+                })?;
+            persistence["save_playback_history"] = value(save_playback_history);
+        }
         write_private_config(&path, document.to_string().as_bytes())?;
 
         self.ui.subscriptions_layout = layout;
@@ -642,6 +666,7 @@ impl Config {
         self.ui.youtube_thumbnail_size = youtube_thumbnail_size;
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
         self.playback.youtube_prewarm = youtube_prewarm;
+        self.persistence.save_playback_history = save_playback_history;
         Ok(())
     }
 
@@ -1123,6 +1148,11 @@ pub struct PersistenceConfig {
     pub position_save_interval_seconds: u64,
     /// Completion threshold used by configurable UI and import code.
     pub played_threshold_percent: u8,
+    /// Whether to append a new History row after playback starts.
+    ///
+    /// Disabling this does not delete existing History or stop progress,
+    /// statistics, session, cache, or graceful-shutdown Git persistence.
+    pub save_playback_history: bool,
     /// On graceful shutdown, commit and push the application directory when it
     /// belongs to a Git worktree.
     pub git_commit_on_change: bool,
@@ -1134,6 +1164,7 @@ impl Default for PersistenceConfig {
             backend: PersistenceBackend::Files,
             position_save_interval_seconds: 30,
             played_threshold_percent: PLAYED_THRESHOLD_PERCENT,
+            save_playback_history: true,
             git_commit_on_change: true,
         }
     }
@@ -1755,6 +1786,7 @@ mod tests {
         assert!(config.playback.skip_advertisement_chapters);
         assert_eq!(config.persistence.backend, PersistenceBackend::Files);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
+        assert!(config.persistence.save_playback_history);
         assert!(config.persistence.git_commit_on_change);
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
         assert_eq!(
@@ -1801,6 +1833,9 @@ skip_advertisement_chapters = false
 [subscriptions]
 auto_download = false
 
+[persistence]
+save_playback_history = false
+
 [ui]
 theme = "light"
 thumbnail_height = 14
@@ -1825,6 +1860,7 @@ bandcamp_audio_format = "alac"
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
         assert!(!config.subscriptions.auto_download);
+        assert!(!config.persistence.save_playback_history);
         assert_eq!(config.ui.theme, ThemeMode::Light);
         assert_eq!(config.ui.thumbnail_height, 14);
         assert_eq!(config.ui.youtube_thumbnail_size, YouTubeThumbnailSize::High);
@@ -1854,6 +1890,7 @@ bandcamp_audio_format = "alac"
 
         assert!(config.ui.show_images_in_tty);
         assert!(config.ui.show_youtube_shorts);
+        assert!(config.persistence.save_playback_history);
         assert_eq!(config.ui.thumbnails, ThumbnailMode::Auto);
         assert_eq!(
             config.ui.youtube_thumbnail_size,
@@ -1959,6 +1996,7 @@ bandcamp_audio_format = "alac"
             assert!(!config.ui.show_images_in_tty);
             assert!(!config.ui.show_local_folder_sizes);
             assert!(!config.ui.show_youtube_shorts);
+            assert!(!config.persistence.save_playback_history);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
             assert_eq!(
                 config.ui.youtube_thumbnail_size,
@@ -2005,6 +2043,7 @@ bandcamp_audio_format = "alac"
             .env(TTY_IMAGES_ENV, "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
             .env(SHOW_YOUTUBE_SHORTS_ENV, "false")
+            .env(SAVE_PLAYBACK_HISTORY_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
             .env(YOUTUBE_THUMBNAIL_SIZE_ENV, "maxres")
             .env(BANDCAMP_AUDIO_FORMAT_ENV, "ogg-vorbis")
@@ -2057,7 +2096,7 @@ youtube_api_key = "keep-this-existing-secret"
 
     #[cfg(feature = "controller")]
     #[test]
-    fn tui_preferences_save_both_tables_atomically_and_preserve_unrelated_content() {
+    fn tui_preferences_save_three_tables_atomically_and_preserve_unrelated_content() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("config.toml");
         fs::write(
@@ -2069,6 +2108,9 @@ volume_percent = 35
 [ui]
 theme = "dark"
 subscriptions_layout = "drill-down"
+
+[persistence]
+git_commit_on_change = false
 
 [providers]
 youtube_api_key = "keep-this-existing-secret"
@@ -2086,6 +2128,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 false,
                 YouTubeThumbnailSize::Maxres,
+                false,
             )
             .expect("save TUI preferences");
 
@@ -2093,10 +2136,12 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("# keep this comment"));
         assert!(contents.contains("volume_percent = 35"));
         assert!(contents.contains("theme = \"dark\""));
+        assert!(contents.contains("git_commit_on_change = false"));
         assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("skip_advertisement_chapters = false"));
         assert!(contents.contains("youtube_prewarm = false"));
+        assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
         assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
         #[cfg(feature = "images")]
@@ -2115,6 +2160,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
+        assert!(!config.persistence.save_playback_history);
 
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
@@ -2130,6 +2176,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
         assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
+        assert!(!reloaded.persistence.save_playback_history);
     }
 
     #[cfg(feature = "controller")]
@@ -2322,6 +2369,9 @@ youtube_api_key = "keep-this-existing-secret"
             let mut config =
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
             let original_thumbnail_size = config.ui.youtube_thumbnail_size;
+            if override_name == SAVE_PLAYBACK_HISTORY_ENV {
+                assert!(!config.persistence.save_playback_history);
+            }
             let error = config
                 .save_tui_preferences(
                     SubscriptionsLayout::Split,
@@ -2330,11 +2380,15 @@ youtube_api_key = "keep-this-existing-secret"
                     true,
                     true,
                     YouTubeThumbnailSize::Standard,
+                    true,
                 )
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
             assert_eq!(config.ui.youtube_thumbnail_size, original_thumbnail_size);
+            if override_name == SAVE_PLAYBACK_HISTORY_ENV {
+                assert!(!config.persistence.save_playback_history);
+            }
             return;
         }
 
@@ -2345,6 +2399,7 @@ youtube_api_key = "keep-this-existing-secret"
             (LOCAL_FOLDER_SIZES_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
+            (SAVE_PLAYBACK_HISTORY_ENV, "false"),
         ];
         for (override_name, override_value) in overrides
             .into_iter()

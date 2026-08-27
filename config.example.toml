@@ -123,6 +123,14 @@ dos_rpg_mode = false
 # The files backend holds an exclusive state/.lock while Youta is running.
 # Close Youta before editing state/*.toml by hand.
 backend = 'files'
+
+# Save one new playback History entry after media starts, and expose the
+# History tab. Disabling this prevents only new History entries; it does not
+# delete existing History or disable playback progress, listening statistics,
+# session and cache persistence, or graceful-shutdown Git synchronization.
+# YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY has higher precedence.
+save_playback_history = true
+
 position_save_interval_seconds = 30
 played_threshold_percent = 90
 
