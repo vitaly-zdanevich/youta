@@ -1190,6 +1190,12 @@ pub struct PlaylistMediaSnapshot {
     pub title: String,
     /// Channel, artist, author, or podcast captured when available.
     pub creator: Option<String>,
+    /// Provider- or file-derived primary description captured when added.
+    ///
+    /// Older playlist snapshots omit this additive field and deserialize it
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Canonical public provider page or local `file:` URL.
     pub webpage_url: Url,
     /// Canonical public artwork or local `file:` URL, when available.

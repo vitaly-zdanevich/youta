@@ -1357,7 +1357,10 @@ default human-readable backend, or in `~/.config/youta/state.sqlite3` when the
 optional SQLite backend is selected. A playlist has a required name, an
 optional editable description, and ordered media entries. It stores stable
 replay information rather than copying a local file or persisting an expiring
-remote stream URL.
+remote stream URL. Each entry also retains the available media description, so
+its text, timecodes, and internal video links remain available from `todo` or
+another playlist after a restart. For a saved segment, only description
+timecodes inside that segment are actionable.
 
 Playlist actions appear only when the current selection can be replayed. This
 includes YouTube videos, YouTube Music and Bandcamp tracks, Apple Podcasts

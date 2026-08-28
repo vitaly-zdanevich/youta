@@ -3987,9 +3987,26 @@ mod tests {
             kind: MediaKind::LiveStream,
             title: "Fixture Radio".to_owned(),
             creator: None,
+            description: None,
             webpage_url: webpage_url.clone(),
             thumbnail_url: None,
             duration_seconds: None,
+            replay_locator: webpage_url.to_string(),
+        }
+    }
+
+    fn todo_fixture() -> PlaylistMediaSnapshot {
+        let webpage_url = url::Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .expect("valid fixture video page");
+        PlaylistMediaSnapshot {
+            id: MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"),
+            kind: MediaKind::Video,
+            title: "Fixture video".to_owned(),
+            creator: Some("Fixture channel".to_owned()),
+            description: Some("Saved description\n00:01 Chapter".to_owned()),
+            webpage_url: webpage_url.clone(),
+            thumbnail_url: None,
+            duration_seconds: Some(42),
             replay_locator: webpage_url.to_string(),
         }
     }
@@ -4056,6 +4073,29 @@ mod tests {
             fs::read_to_string(config.state_dir().join("playlists.toml")).expect("playlist TOML");
         assert!(encoded.contains(RADIO_FAVORITES_PLAYLIST_NAME));
         assert!(encoded.contains("fixture-radio"));
+    }
+
+    #[test]
+    fn todo_description_survives_file_restart() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let fixture = todo_fixture();
+        {
+            let store = FileStateStore::open(&config).expect("file state");
+            assert_eq!(
+                store.add_to_todo(&fixture, 1).expect("add fixture to todo"),
+                PlaylistAddOutcome::Added
+            );
+        }
+
+        let store = FileStateStore::open(&config).expect("reopen file state");
+        let todo = store
+            .playlist(TODO_PLAYLIST_ID)
+            .expect("read todo")
+            .expect("persisted todo");
+
+        assert_eq!(todo.entries.len(), 1);
+        assert_eq!(todo.entries[0].media.description, fixture.description);
     }
 
     #[cfg(feature = "yandex-music")]

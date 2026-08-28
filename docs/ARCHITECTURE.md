@@ -80,6 +80,11 @@ data is split by write cadence and purpose:
 | `cache/searches.toml` | regenerable search snapshots |
 | `cache/providers.toml` | regenerable provider summaries and Wikidata cache |
 
+Playlist entries retain bounded, credential-free replay metadata together
+with the captured media description. The same optional snapshot field is
+serialized inside the SQLite JSON payload and the default TOML document;
+entries written by older releases omit it and continue to load as `None`.
+
 Mutations rewrite only their relevant document. In particular, a periodic
 playback save atomically replaces only the 16 KiB-bounded runtime checkpoint;
 its work and bytes do not grow with playback history. A clean media boundary

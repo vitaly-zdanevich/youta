@@ -76,10 +76,11 @@ const MAX_SAVED_SUBSCRIPTION_SOURCE_ID_BYTES: usize = 2 * 1024;
 const MAX_HISTORY_REPLAY_LOCATOR_BYTES: usize = 16 * 1024;
 const MAX_PLAYLIST_ID_BYTES: usize = 128;
 const MAX_PLAYLIST_EXTERNAL_ID_BYTES: usize = 16 * 1024;
-const MAX_PLAYLIST_SNAPSHOT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PLAYLIST_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_PLAYLIST_SEGMENT_BYTES: usize = 16 * 1024;
 const MAX_PLAYLIST_TITLE_BYTES: usize = 4 * 1024;
 const MAX_PLAYLIST_CREATOR_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_PLAYLIST_ITEM_DESCRIPTION_BYTES: usize = 48 * 1024;
 const MAX_PLAYLIST_URL_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 byte length of a local playlist name.
 pub const MAX_PLAYLIST_NAME_BYTES: usize = 256;
@@ -4709,6 +4710,18 @@ fn validate_playlist_snapshot(media: &PlaylistMediaSnapshot) -> Result<(), Persi
              {MAX_PLAYLIST_CREATOR_BYTES} bytes"
         )));
     }
+    if let Some(description) = &media.description
+        && (description.is_empty()
+            || description.len() > MAX_PLAYLIST_ITEM_DESCRIPTION_BYTES
+            || description
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\t')))
+    {
+        return Err(invalid_playlist(format!(
+            "playlist item description must be nonempty, contain no terminal control characters, \
+             and be at most {MAX_PLAYLIST_ITEM_DESCRIPTION_BYTES} bytes"
+        )));
+    }
     validate_playlist_webpage(media)?;
     if let Some(thumbnail_url) = &media.thumbnail_url {
         validate_playlist_thumbnail_url(&media.id.source, thumbnail_url)?;
@@ -7735,6 +7748,7 @@ mod tests {
             kind: MediaKind::Video,
             title: title.to_owned(),
             creator: Some("Fixture channel".to_owned()),
+            description: Some("Fixture description".to_owned()),
             webpage_url: webpage_url.clone(),
             thumbnail_url: Some(
                 Url::parse(&format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"))
@@ -7755,6 +7769,7 @@ mod tests {
             kind: MediaKind::PodcastEpisode,
             title: format!("Fixture episode {episode_id}"),
             creator: Some("Fixture podcast".to_owned()),
+            description: Some("Fixture episode description".to_owned()),
             webpage_url: webpage_url.clone(),
             thumbnail_url: Some(
                 Url::parse("https://is1-ssl.mzstatic.com/image/thumb/fixture/600x600.jpg")
@@ -7773,6 +7788,7 @@ mod tests {
             kind: MediaKind::Audio,
             title: slug.replace('-', " "),
             creator: Some("Fixture Artist".to_owned()),
+            description: None,
             webpage_url: webpage_url.clone(),
             thumbnail_url: Some(
                 Url::parse("https://f4.bcbits.com/img/a1234567890_16.jpg")
@@ -7792,6 +7808,7 @@ mod tests {
             kind: MediaKind::Audio,
             title: "Introduction and Chapter I".to_owned(),
             creator: Some("Alexander Aaronsohn".to_owned()),
+            description: Some("A memoir of Palestine during wartime.".to_owned()),
             webpage_url: Url::parse(
                 "https://librivox.org/with-the-turks-in-palestine-by-alexander-aaronsohn/",
             )
@@ -7813,6 +7830,7 @@ mod tests {
             kind: MediaKind::LiveStream,
             title: "Fixture Radio".to_owned(),
             creator: None,
+            description: None,
             webpage_url: webpage_url.clone(),
             thumbnail_url: None,
             duration_seconds: None,
@@ -7831,6 +7849,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             creator: Some("Fixture Artist".to_owned()),
+            description: None,
             webpage_url: Url::from_file_path(path).expect("fixture media file URL"),
             thumbnail_url: artwork
                 .map(|artwork| Url::from_file_path(artwork).expect("fixture artwork file URL")),
@@ -8427,6 +8446,10 @@ mod tests {
         assert_eq!(playlist.description, None);
         assert_eq!(playlist.entries.len(), 1);
         assert_eq!(playlist.entries[0].media, original);
+        assert_eq!(
+            playlist.entries[0].media.description.as_deref(),
+            Some("Fixture description")
+        );
         assert_eq!(playlist.entries[0].added_at, 10);
         assert!(
             reopened
@@ -8896,8 +8919,22 @@ mod tests {
         remote.replay_locator = remote.webpage_url.to_string();
         let mut oversized = youtube_playlist_media("abcdefghijk", "Oversized");
         oversized.title = "x".repeat(MAX_PLAYLIST_TITLE_BYTES + 1);
+        let mut oversized_description =
+            youtube_playlist_media("9bZkp7q19f0", "Oversized description");
+        oversized_description.description =
+            Some("d".repeat(MAX_PLAYLIST_ITEM_DESCRIPTION_BYTES + 1));
+        let mut terminal_control = youtube_playlist_media("M7lc1UVf-VE", "Terminal control");
+        terminal_control.description = Some("safe text\u{1b}[2J".to_owned());
 
-        for snapshot in [youtube, apple, bandcamp, remote, oversized] {
+        for snapshot in [
+            youtube,
+            apple,
+            bandcamp,
+            remote,
+            oversized,
+            oversized_description,
+            terminal_control,
+        ] {
             assert!(matches!(
                 store.add_playlist_entry(&playlist.id, &snapshot, 2),
                 Err(PersistenceError::InvalidPlaylist { .. })
@@ -8923,6 +8960,23 @@ mod tests {
             ),
             Err(PersistenceError::InvalidPlaylist { .. })
         ));
+    }
+
+    #[test]
+    fn legacy_playlist_snapshot_without_description_remains_readable() {
+        let original = youtube_playlist_media("dQw4w9WgXcQ", "Legacy snapshot");
+        let mut encoded = serde_json::to_value(&original).expect("encode playlist fixture");
+        encoded
+            .as_object_mut()
+            .expect("playlist snapshot object")
+            .remove("description");
+
+        let restored = serde_json::from_value::<PlaylistMediaSnapshot>(encoded)
+            .expect("decode legacy playlist snapshot");
+
+        assert_eq!(restored.description, None);
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.replay_locator, original.replay_locator);
     }
 
     #[test]
