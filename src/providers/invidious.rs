@@ -229,7 +229,6 @@ impl InvidiousProvider {
         }
         self.lock_channel_page_tokens()?
             .token(&request.channel_id, request.page)
-            .map(str::to_owned)
             .map(Some)
             .ok_or_else(|| {
                 ProviderError::InvalidRequest(format!(
@@ -751,11 +750,14 @@ struct ChannelPageTokenCache {
 
 impl ChannelPageTokenCache {
     /// Returns the token previously learned for one numbered page.
-    fn token(&self, channel_id: &str, page: u32) -> Option<&str> {
-        self.channels
+    fn token(&mut self, channel_id: &str, page: u32) -> Option<String> {
+        let token = self
+            .channels
             .get(channel_id)
             .and_then(|pages| pages.get(&page))
-            .map(String::as_str)
+            .cloned()?;
+        self.touch_channel(channel_id);
+        Some(token)
     }
 
     /// Records the next token while invalidating stale descendants.
@@ -789,6 +791,15 @@ impl ChannelPageTokenCache {
                 break;
             };
             pages.remove(&oldest);
+        }
+        self.touch_channel(channel_id);
+    }
+
+    /// Marks one cached channel as the most recent owner of its token chain.
+    fn touch_channel(&mut self, channel_id: &str) {
+        self.order.retain(|cached| cached != channel_id);
+        if self.channels.contains_key(channel_id) {
+            self.order.push_back(channel_id.to_owned());
         }
     }
 }
@@ -2223,10 +2234,35 @@ mod tests {
             "per-channel continuation storage must remain bounded"
         );
         cache.remember_next_page(channel_id, 1, Some("replacement".to_owned()));
-        assert_eq!(cache.token(channel_id, 2), Some("replacement"));
+        assert_eq!(cache.token(channel_id, 2).as_deref(), Some("replacement"));
         assert!(
             cache.token(channel_id, 3).is_none(),
             "page-one reload must clear the old continuation chain"
+        );
+    }
+
+    #[test]
+    fn channel_continuation_reads_refresh_lru_ownership() {
+        let mut cache = ChannelPageTokenCache::default();
+        let retained_channel = format!("UC{:022}", 0);
+        for index in 0..MAX_CACHED_CHANNELS {
+            cache.remember_next_page(&format!("UC{index:022}"), 1, Some(format!("token-{index}")));
+        }
+
+        assert!(cache.token(&retained_channel, 2).is_some());
+        cache.remember_next_page(
+            &format!("UC{:022}", MAX_CACHED_CHANNELS),
+            1,
+            Some("new-token".to_owned()),
+        );
+
+        assert!(
+            cache.channels.contains_key(&retained_channel),
+            "using a continuation must keep its opaque token chain resident"
+        );
+        assert!(
+            !cache.channels.contains_key(&format!("UC{:022}", 1)),
+            "the least recently used untouched channel should be evicted"
         );
     }
 

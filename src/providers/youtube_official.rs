@@ -3,10 +3,10 @@
 //! Search uses `search.list`, then enriches the ordered identifiers with one
 //! batched `videos.list` or `channels.list` request. Channel uploads use the
 //! documented uploads playlist: one cached `channels.list` lookup followed by
-//! `playlistItems.list` and a batched `videos.list`. `YouTube` exposes opaque
-//! page tokens rather than page numbers, so this adapter keeps small, bounded
-//! token caches. Callers must request pages sequentially, starting with page
-//! one.
+//! `playlistItems.list` at its 50-item maximum and a batched `videos.list`.
+//! Search retains its smaller 25-item pages. `YouTube` exposes opaque page
+//! tokens rather than page numbers, so this adapter keeps small, bounded token
+//! caches. Callers must request pages sequentially, starting with page one.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -29,7 +29,20 @@ use super::{
 
 const API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
 const MAX_CONFIGURED_JSON_BYTES: usize = 64 * 1024 * 1024;
-const RESULTS_PER_PAGE: u8 = 25;
+/// Search pages retain the existing result count used by the interactive UI.
+const SEARCH_RESULTS_PER_PAGE: u8 = 25;
+/// `playlistItems.list` and ID-filtered `videos.list` accept at most 50 rows.
+const CHANNEL_UPLOADS_RESULTS_PER_PAGE: u8 = 50;
+/// Bounds the comma-separated `id` filter accepted by `videos.list`.
+const MAX_VIDEO_RESOURCE_IDS: usize = CHANNEL_UPLOADS_RESULTS_PER_PAGE as usize;
+/// Limits the cold channel lookup to its uploads-playlist identifier.
+const CHANNEL_UPLOADS_FIELDS: &str = "items(id,contentDetails/relatedPlaylists/uploads)";
+/// Limits an uploads-playlist response to pagination data consumed here.
+const PLAYLIST_ITEMS_FIELDS: &str = "nextPageToken,items(contentDetails/videoId)";
+/// Limits video enrichment to the fields retained by search and upload rows.
+const VIDEO_SUMMARY_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))";
+/// Retains every field projected into an explicitly requested video Details view.
+const VIDEO_DETAILS_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,tags,liveBroadcastContent,thumbnails),contentDetails/duration,statistics(viewCount,likeCount,commentCount),status/license,player(embedWidth,embedHeight))";
 const MAX_API_KEY_BYTES: usize = 256;
 const MIN_API_KEY_BYTES: usize = 16;
 const MAX_PAGE_TOKEN_BYTES: usize = 2 * 1024;
@@ -42,6 +55,31 @@ const MAX_SERVICE_MESSAGE_CHARS: usize = 512;
 const MAX_CHANNEL_STATISTICS_IDS: usize = 50;
 /// Equal player bounds let the API preserve landscape and portrait ratios.
 const PLAYER_EMBED_BOUND: &str = "1920";
+
+/// Selects the smallest `videos.list` partial response needed by a caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoResourceProjection {
+    /// Metadata retained by search results and channel-upload rows.
+    Summary,
+    /// Metadata rendered after the user explicitly opens video Details.
+    FullDetails,
+}
+
+impl VideoResourceProjection {
+    fn parts(self) -> &'static str {
+        match self {
+            Self::Summary => "snippet,contentDetails,statistics,player",
+            Self::FullDetails => "snippet,contentDetails,statistics,status,player",
+        }
+    }
+
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Summary => VIDEO_SUMMARY_FIELDS,
+            Self::FullDetails => VIDEO_DETAILS_FIELDS,
+        }
+    }
+}
 
 /// Blocking provider backed by the official `YouTube` Data API v3.
 ///
@@ -131,7 +169,7 @@ impl YouTubeOfficialProvider {
             let mut query = url.query_pairs_mut();
             query.append_pair("part", "snippet");
             query.append_pair("q", request.query.trim());
-            query.append_pair("maxResults", &RESULTS_PER_PAGE.to_string());
+            query.append_pair("maxResults", &SEARCH_RESULTS_PER_PAGE.to_string());
             query.append_pair(
                 "type",
                 match request.target {
@@ -334,25 +372,45 @@ impl YouTubeOfficialProvider {
         }
     }
 
+    /// Enriches at most one official 50-ID batch with a partial response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidRequest`] when the caller exceeds the
+    /// documented ID batch limit, and [`ProviderError::InvalidResponse`] when
+    /// the service returns more resources than requested.
     fn fetch_video_resources(
         &self,
         ids: &[String],
+        projection: VideoResourceProjection,
     ) -> Result<HashMap<String, RawVideoResource>, ProviderError> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        if ids.len() > MAX_VIDEO_RESOURCE_IDS {
+            return Err(ProviderError::InvalidRequest(format!(
+                "YouTube video enrichment accepts at most {MAX_VIDEO_RESOURCE_IDS} identifiers"
+            )));
+        }
         let mut url = self.endpoint("videos")?;
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("part", "snippet,contentDetails,statistics,status,player");
+            query.append_pair("part", projection.parts());
             query.append_pair("id", &ids.join(","));
-            query.append_pair("maxResults", &ids.len().to_string());
+            query.append_pair("fields", projection.fields());
             // Equal bounds preserve either orientation while requesting the
             // player dimensions needed to classify the encoded video.
             query.append_pair("maxWidth", PLAYER_EMBED_BOUND);
             query.append_pair("maxHeight", PLAYER_EMBED_BOUND);
         }
         let response: RawVideoListResponse = self.request_json(&url)?;
+        if response.items.len() > ids.len() {
+            return Err(ProviderError::InvalidResponse(format!(
+                "YouTube returned more video resources than requested ({} > {})",
+                response.items.len(),
+                ids.len()
+            )));
+        }
         response
             .items
             .into_iter()
@@ -447,7 +505,6 @@ impl YouTubeOfficialProvider {
         if let Some(playlist_id) = self
             .lock_channel_page_tokens()?
             .uploads_playlist_id(channel_id)
-            .map(str::to_owned)
         {
             return Ok(playlist_id);
         }
@@ -458,6 +515,7 @@ impl YouTubeOfficialProvider {
             query.append_pair("part", "contentDetails");
             query.append_pair("id", channel_id);
             query.append_pair("maxResults", "1");
+            query.append_pair("fields", CHANNEL_UPLOADS_FIELDS);
         }
         let response: RawChannelUploadsListResponse = self.request_json(&url)?;
         let mut items = response.items.into_iter();
@@ -499,7 +557,7 @@ impl YouTubeOfficialProvider {
         }
         self.lock_channel_page_tokens()?
             .page_context(&request.channel_id, request.page)
-            .map(|(playlist_id, token)| (playlist_id.to_owned(), Some(token.to_owned())))
+            .map(|(playlist_id, token)| (playlist_id, Some(token)))
             .ok_or_else(|| {
                 ProviderError::InvalidRequest(format!(
                     "YouTube channel pages must be loaded sequentially; load page {} first",
@@ -520,12 +578,18 @@ impl YouTubeOfficialProvider {
             let mut query = url.query_pairs_mut();
             query.append_pair("part", "contentDetails");
             query.append_pair("playlistId", &playlist_id);
-            query.append_pair("maxResults", &RESULTS_PER_PAGE.to_string());
+            query.append_pair("maxResults", &CHANNEL_UPLOADS_RESULTS_PER_PAGE.to_string());
+            query.append_pair("fields", PLAYLIST_ITEMS_FIELDS);
             if let Some(token) = page_token.as_deref() {
                 query.append_pair("pageToken", token);
             }
         }
         let response: RawPlaylistItemsResponse = self.request_json(&url)?;
+        if response.items.len() > usize::from(CHANNEL_UPLOADS_RESULTS_PER_PAGE) {
+            return Err(ProviderError::InvalidResponse(format!(
+                "YouTube returned more than {CHANNEL_UPLOADS_RESULTS_PER_PAGE} channel uploads"
+            )));
+        }
         let next_token = response
             .next_page_token
             .map(validate_page_token)
@@ -535,24 +599,26 @@ impl YouTubeOfficialProvider {
             .as_ref()
             .filter(|_| request.page < 10_000)
             .map(|_| request.page.saturating_add(1));
-        self.lock_channel_page_tokens()?.remember_next_page(
-            &request.channel_id,
-            request.page,
-            next_token,
-        );
-
         let mut video_ids = Vec::with_capacity(response.items.len());
         for item in response.items {
             validate_response_video_id(&item.content_details.video_id)?;
             video_ids.push(item.content_details.video_id);
         }
-        let mut resources = self.fetch_video_resources(&video_ids)?;
+        let mut resources =
+            self.fetch_video_resources(&video_ids, VideoResourceProjection::Summary)?;
         let items = video_ids
             .into_iter()
             .filter_map(|video_id| resources.remove(&video_id))
             .map(video_summary_from_resource)
             .map(|result| result.map(SearchItem::Video))
             .collect::<Result<Vec<_>, _>>()?;
+        // Publish the opaque continuation only after the complete page has
+        // validated. A failed refresh must leave the last usable chain intact.
+        self.lock_channel_page_tokens()?.remember_next_page(
+            &request.channel_id,
+            request.page,
+            next_token,
+        );
         Ok(SearchPage {
             page: request.page,
             items,
@@ -654,9 +720,9 @@ impl YouTubeOfficialProvider {
         &self,
         raw_items: Vec<RawSearchItem>,
     ) -> Result<Vec<SearchItem>, ProviderError> {
-        if raw_items.len() > usize::from(RESULTS_PER_PAGE) {
+        if raw_items.len() > usize::from(SEARCH_RESULTS_PER_PAGE) {
             return Err(ProviderError::InvalidResponse(format!(
-                "YouTube returned more than {RESULTS_PER_PAGE} video search results"
+                "YouTube returned more than {SEARCH_RESULTS_PER_PAGE} video search results"
             )));
         }
         let raw_item_count = raw_items.len();
@@ -688,7 +754,7 @@ impl YouTubeOfficialProvider {
             }));
         }
         let ids = ordered.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-        let mut resources = self.fetch_video_resources(&ids)?;
+        let mut resources = self.fetch_video_resources(&ids, VideoResourceProjection::Summary)?;
         ordered
             .into_iter()
             .map(|(id, fallback)| {
@@ -796,7 +862,8 @@ impl Provider for YouTubeOfficialProvider {
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
         validate_youtube_video_id(video_id)?;
-        let mut resources = self.fetch_video_resources(&[video_id.to_owned()])?;
+        let mut resources = self
+            .fetch_video_resources(&[video_id.to_owned()], VideoResourceProjection::FullDetails)?;
         let resource = resources.remove(video_id).ok_or_else(|| {
             ProviderError::InvalidResponse("YouTube video was not found or is private".to_owned())
         })?;
@@ -950,16 +1017,21 @@ struct ChannelPageTokenCache {
 }
 
 impl ChannelPageTokenCache {
-    fn uploads_playlist_id(&self, channel_id: &str) -> Option<&str> {
-        self.channels
+    fn uploads_playlist_id(&mut self, channel_id: &str) -> Option<String> {
+        let playlist_id = self
+            .channels
             .get(channel_id)
-            .map(|channel| channel.uploads_playlist_id.as_str())
+            .map(|channel| channel.uploads_playlist_id.clone())?;
+        self.touch_channel(channel_id);
+        Some(playlist_id)
     }
 
-    fn page_context(&self, channel_id: &str, page: u32) -> Option<(&str, &str)> {
+    fn page_context(&mut self, channel_id: &str, page: u32) -> Option<(String, String)> {
         let channel = self.channels.get(channel_id)?;
-        let token = channel.page_tokens.get(&page)?;
-        Some((channel.uploads_playlist_id.as_str(), token.as_str()))
+        let playlist_id = channel.uploads_playlist_id.clone();
+        let token = channel.page_tokens.get(&page)?.clone();
+        self.touch_channel(channel_id);
+        Some((playlist_id, token))
     }
 
     fn remember_uploads_playlist(&mut self, channel_id: &str, playlist_id: &str) {
@@ -968,6 +1040,7 @@ impl ChannelPageTokenCache {
                 playlist_id.clone_into(&mut channel.uploads_playlist_id);
                 channel.page_tokens.clear();
             }
+            self.touch_channel(channel_id);
             return;
         }
         while self.channels.len() >= MAX_CACHED_CHANNELS {
@@ -991,9 +1064,11 @@ impl ChannelPageTokenCache {
         let Some(channel) = self.channels.get_mut(channel_id) else {
             return;
         };
-        if page == 1 {
-            channel.page_tokens.clear();
-        }
+        // Opaque descendants belong to the earlier response chain. Replaying
+        // any page replaces that chain from the following page onward.
+        channel
+            .page_tokens
+            .retain(|cached_page, _| *cached_page <= page);
         if let Some(token) = next_token {
             channel.page_tokens.insert(page.saturating_add(1), token);
         } else {
@@ -1004,6 +1079,15 @@ impl ChannelPageTokenCache {
                 break;
             };
             channel.page_tokens.remove(&oldest);
+        }
+        self.touch_channel(channel_id);
+    }
+
+    /// Marks one cached channel as the most recently used owner of its tokens.
+    fn touch_channel(&mut self, channel_id: &str) {
+        self.order.retain(|cached| cached != channel_id);
+        if self.channels.contains_key(channel_id) {
+            self.order.push_back(channel_id.to_owned());
         }
     }
 }
@@ -2118,6 +2202,32 @@ mod tests {
         }]
     }"#;
 
+    fn uploads_page(video_ids: &[String], next_page_token: Option<&str>) -> String {
+        let token = next_page_token
+            .map(|token| format!(r#""nextPageToken":"{token}","#))
+            .unwrap_or_default();
+        let items = video_ids
+            .iter()
+            .map(|video_id| format!(r#"{{"contentDetails":{{"videoId":"{video_id}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{{token}"items":[{items}]}}"#)
+    }
+
+    fn video_resources(video_ids: &[String]) -> String {
+        let items = video_ids
+            .iter()
+            .enumerate()
+            .map(|(index, video_id)| {
+                format!(
+                    r#"{{"id":"{video_id}","snippet":{{"channelId":"{CHANNEL_ID}","title":"Upload {index}","channelTitle":"Fixture channel"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"items":[{items}]}}"#)
+    }
+
     fn provider_with_server(responses: Vec<String>) -> (YouTubeOfficialProvider, MockServer) {
         let server = MockServer::spawn(responses);
         let provider = YouTubeOfficialProvider::with_base_url(
@@ -2187,6 +2297,7 @@ mod tests {
         let pairs = url.query_pairs().collect::<HashMap<_, _>>();
 
         assert_eq!(pairs.get("q").map(AsRef::as_ref), Some("ambient & drone"));
+        assert_eq!(pairs.get("maxResults").map(AsRef::as_ref), Some("25"));
         assert_eq!(pairs.get("type").map(AsRef::as_ref), Some("video"));
         assert_eq!(pairs.get("order").map(AsRef::as_ref), Some("viewCount"));
         assert_eq!(pairs.get("regionCode").map(AsRef::as_ref), Some("GE"));
@@ -2316,9 +2427,20 @@ mod tests {
         assert!(requests[1].starts_with("/videos?"));
         assert!(requests_contain_part(
             &requests,
-            "snippet%2CcontentDetails%2Cstatistics%2Cstatus%2Cplayer"
+            "snippet%2CcontentDetails%2Cstatistics%2Cplayer"
         ));
         let resource_pairs = query_pairs(&requests[1]);
+        assert_eq!(resource_pairs.get("id").map(String::as_str), Some(VIDEO_ID));
+        assert!(
+            !resource_pairs.contains_key("maxResults"),
+            "videos.list does not need maxResults when an ID filter is supplied"
+        );
+        assert_eq!(
+            resource_pairs.get("fields").map(String::as_str),
+            Some(
+                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))"
+            )
+        );
         assert_eq!(
             resource_pairs.get("maxWidth").map(String::as_str),
             Some(PLAYER_EMBED_BOUND)
@@ -2442,7 +2564,7 @@ mod tests {
         }"#;
         let oversized_page = format!(
             r#"{{"nextPageToken":"must_not_survive","items":[{}]}}"#,
-            vec![item; usize::from(RESULTS_PER_PAGE) + 1].join(",")
+            vec![item; usize::from(SEARCH_RESULTS_PER_PAGE) + 1].join(",")
         );
         let (provider, server) =
             provider_with_server(vec![json_response("200 OK", &oversized_page)]);
@@ -2748,6 +2870,10 @@ mod tests {
             channel_pairs.get("id").map(String::as_str),
             Some(CHANNEL_ID)
         );
+        assert_eq!(
+            channel_pairs.get("fields").map(String::as_str),
+            Some("items(id,contentDetails/relatedPlaylists/uploads)")
+        );
 
         assert!(requests[1].starts_with("/playlistItems?"));
         let first_playlist_pairs = query_pairs(&requests[1]);
@@ -2759,8 +2885,24 @@ mod tests {
             first_playlist_pairs.get("part").map(String::as_str),
             Some("contentDetails")
         );
+        assert_eq!(
+            first_playlist_pairs.get("maxResults").map(String::as_str),
+            Some("50")
+        );
+        assert_eq!(
+            first_playlist_pairs.get("fields").map(String::as_str),
+            Some("nextPageToken,items(contentDetails/videoId)")
+        );
         assert!(!first_playlist_pairs.contains_key("pageToken"));
         assert!(requests[2].starts_with("/videos?"));
+        let first_video_pairs = query_pairs(&requests[2]);
+        assert!(!first_video_pairs.contains_key("maxResults"));
+        assert_eq!(
+            first_video_pairs.get("fields").map(String::as_str),
+            Some(
+                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))"
+            )
+        );
 
         assert!(requests[3].starts_with("/playlistItems?"));
         let second_playlist_pairs = query_pairs(&requests[3]);
@@ -2802,6 +2944,151 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn channel_uploads_accept_exactly_fifty_rows_in_one_video_batch() {
+        let video_ids = (0..50)
+            .map(|index| format!("v{index:010}"))
+            .collect::<Vec<_>>();
+        let playlist = uploads_page(&video_ids, None);
+        let resources = video_resources(&video_ids);
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", &playlist),
+            json_response("200 OK", &resources),
+        ]);
+
+        let page = provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect("the documented 50-item uploads page must be accepted");
+        let requests = server.finish();
+
+        assert_eq!(page.items.len(), 50);
+        assert_eq!(requests.len(), 3);
+        let playlist_pairs = query_pairs(&requests[1]);
+        assert_eq!(
+            playlist_pairs.get("maxResults").map(String::as_str),
+            Some("50")
+        );
+        let video_pairs = query_pairs(&requests[2]);
+        let requested_ids = video_ids.join(",");
+        assert_eq!(
+            video_pairs.get("id").map(String::as_str),
+            Some(requested_ids.as_str())
+        );
+        assert!(!video_pairs.contains_key("maxResults"));
+    }
+
+    #[test]
+    fn channel_uploads_reject_fifty_one_rows_before_video_enrichment() {
+        let video_ids = (0..51)
+            .map(|index| format!("v{index:010}"))
+            .collect::<Vec<_>>();
+        let playlist = uploads_page(&video_ids, Some("must_not_survive"));
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", &playlist),
+        ]);
+
+        let error = provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect_err("an oversized uploads page must be rejected");
+        let mut second_page = ChannelVideosRequest::new(CHANNEL_ID);
+        second_page.page = 2;
+        assert!(matches!(
+            provider.channel_videos(&second_page),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("page 1")
+        ));
+        let requests = server.finish();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message)
+                if message.contains("more than 50 channel uploads")
+        ));
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("/videos?")),
+            "an oversized playlist page must fail before video enrichment"
+        );
+    }
+
+    #[test]
+    fn failed_page_one_enrichment_preserves_the_previous_continuation_chain() {
+        let page_one_old = uploads_page(&[VIDEO_ID.to_owned()], Some("old_page_2"));
+        let page_one_new = uploads_page(&[VIDEO_ID.to_owned()], Some("new_page_2"));
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", CHANNEL_UPLOADS_RESOURCE),
+            json_response("200 OK", &page_one_old),
+            json_response("200 OK", VIDEO_RESOURCE),
+            json_response("200 OK", &page_one_new),
+            json_response(
+                "500 Internal Server Error",
+                r#"{"error":{"message":"temporary enrichment failure"}}"#,
+            ),
+            json_response("200 OK", r#"{"items":[]}"#),
+        ]);
+
+        provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect("the original page should seed its continuation");
+        provider
+            .channel_videos(&ChannelVideosRequest::new(CHANNEL_ID))
+            .expect_err("the replacement enrichment should fail");
+        let mut continuation = ChannelVideosRequest::new(CHANNEL_ID);
+        continuation.page = 2;
+        provider
+            .channel_videos(&continuation)
+            .expect("the previous continuation should remain usable");
+        let requests = server.finish();
+
+        let continuation_pairs = query_pairs(&requests[5]);
+        assert_eq!(
+            continuation_pairs.get("pageToken").map(String::as_str),
+            Some("old_page_2"),
+            "an incomplete refresh must not replace the last committed token chain"
+        );
+    }
+
+    #[test]
+    fn video_enrichment_rejects_more_than_fifty_identifiers_before_network() {
+        let (provider, server) = provider_with_server(Vec::new());
+        let video_ids = (0..51)
+            .map(|index| format!("v{index:010}"))
+            .collect::<Vec<_>>();
+
+        let error = provider
+            .fetch_video_resources(&video_ids, VideoResourceProjection::Summary)
+            .expect_err("videos.list accepts at most 50 identifiers");
+        let requests = server.finish();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidRequest(message) if message.contains("at most 50 identifiers")
+        ));
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn video_enrichment_rejects_more_resources_than_requested() {
+        let returned_ids = [VIDEO_ID.to_owned(), "aaaaaaaaaaa".to_owned()];
+        let response = video_resources(&returned_ids);
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &response)]);
+
+        let error = provider
+            .fetch_video_resources(&[VIDEO_ID.to_owned()], VideoResourceProjection::Summary)
+            .expect_err("an oversized videos.list response must be rejected");
+        let requests = server.finish();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse(message)
+                if message.contains("more video resources than requested (2 > 1)")
+        ));
+        assert_eq!(requests.len(), 1);
     }
 
     #[test]
@@ -2973,7 +3260,21 @@ mod tests {
         );
         assert_eq!(details.published_at, Some(1_704_164_645));
         assert_eq!(details.orientation, VideoOrientation::Vertical);
-        assert!(requests[0].contains("id=dQw4w9WgXcQ"));
+        let pairs = query_pairs(&requests[0]);
+        assert_eq!(pairs.get("id").map(String::as_str), Some(VIDEO_ID));
+        assert_eq!(
+            pairs.get("part").map(String::as_str),
+            Some("snippet,contentDetails,statistics,status,player")
+        );
+        let fields = pairs
+            .get("fields")
+            .expect("a video-details request should use a partial response");
+        for retained_field in ["tags", "likeCount", "commentCount", "status/license"] {
+            assert!(
+                fields.contains(retained_field),
+                "the full-details projection must retain {retained_field}"
+            );
+        }
         assert!(requests[0].contains(&format!("key={TEST_KEY}")));
     }
 
@@ -3418,6 +3719,41 @@ mod tests {
         let pages = &cache.channels[&channel_id].page_tokens;
         assert_eq!(pages.len(), 1);
         assert_eq!(pages.get(&2).map(String::as_str), Some("fresh-token"));
+
+        cache.remember_next_page(&channel_id, 2, Some("page-three-old".to_owned()));
+        cache.remember_next_page(&channel_id, 3, Some("page-four-stale".to_owned()));
+        cache.remember_next_page(&channel_id, 2, Some("page-three-new".to_owned()));
+        let pages = &cache.channels[&channel_id].page_tokens;
+        assert_eq!(pages.get(&2).map(String::as_str), Some("fresh-token"));
+        assert_eq!(pages.get(&3).map(String::as_str), Some("page-three-new"));
+        assert!(
+            !pages.contains_key(&4),
+            "replaying a page must invalidate every opaque descendant token"
+        );
+    }
+
+    #[test]
+    fn channel_token_cache_continuation_reads_refresh_lru_ownership() {
+        let mut cache = ChannelPageTokenCache::default();
+        let retained_channel = format!("UC{:022}", 0);
+        for index in 0..MAX_CACHED_CHANNELS {
+            let channel_id = format!("UC{index:022}");
+            cache.remember_uploads_playlist(&channel_id, &format!("UU{index:022}"));
+            cache.remember_next_page(&channel_id, 1, Some(format!("token-{index}")));
+        }
+
+        assert!(cache.page_context(&retained_channel, 2).is_some());
+        let newest_channel = format!("UC{:022}", MAX_CACHED_CHANNELS);
+        cache.remember_uploads_playlist(&newest_channel, "UU0000000000000000000032");
+
+        assert!(
+            cache.channels.contains_key(&retained_channel),
+            "using a continuation must keep its opaque token chain resident"
+        );
+        assert!(
+            !cache.channels.contains_key(&format!("UC{:022}", 1)),
+            "the least recently used untouched channel should be evicted"
+        );
     }
 
     struct MockServer {
