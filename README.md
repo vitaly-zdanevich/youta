@@ -169,13 +169,14 @@ written to its own tty; the window uses the platform clipboard directly, since
 it has no tty and an escape there would be written into nothing and then
 reported as a successful copy.
 
-Description timecodes become exact chapter split and mouse-seek targets. Dense
-chapter labels grow to as many as four rows when the terminal has spare height;
-`T` toggles between timestamps plus names and names only without moving those
-targets. This label preference is restored with the previous session. By
-default, Youta hides and skips only chapters whose normalized title is
-exactly `Реклама`; set `playback.skip_advertisement_chapters` to `false` to
-retain them.
+Description timecodes become chapter splits and exact mouse-seek actions. Chapter
+navigation stays on one row: the current name is centered, with `◀ Prev` and
+`Next ▶` controls when the terminal width leaves room. Proportional splits stay
+on the track; splits that round to one terminal cell share a composite marker.
+`T` toggles the current chapter's timestamp without moving the controls or track
+markers. This label preference is restored with the previous session. By
+default, Youta hides and skips only chapters whose normalized title is exactly
+`Реклама`; set `playback.skip_advertisement_chapters` to `false` to retain them.
 
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player

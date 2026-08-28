@@ -496,11 +496,14 @@ so an HTML failure cannot remove the primary description or genre metadata.
 Description links, hashtags, timecodes, and YouTube IDs are parsed into typed
 spans. Following an internal media link pushes the current detail state onto a
 bounded navigation stack. Back restores the exact selection and scroll offset.
-Timecode navigation also records a previous playback position. Chapter labels
-may reserve up to four rows when the terminal has height to spare, and the
-timestamp prefix can be hidden without changing exact seek targets. The
-inverse visibility bit is stored in the restart-safe session so older session
-documents keep timestamps visible by default.
+Timecode navigation also records a previous playback position. Terminal chapter
+navigation reserves at most one row: it centers the current chapter and adds
+compact previous and next controls only when they fit. Proportional chapter
+splits remain on the track, with coincident terminal columns represented by one
+composite marker, and every rendered label seeks to its exact timestamp. The
+current timestamp prefix can be hidden without moving either layer. The inverse
+visibility bit is stored in the restart-safe session so older session documents
+keep timestamps visible by default.
 
 Video orientation is provider metadata, never a thumbnail-ratio heuristic.
 Official YouTube results use `player` embed dimensions returned by the existing

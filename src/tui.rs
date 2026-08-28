@@ -69,10 +69,17 @@ const PLAYBACK_PLAYING_SYMBOL: &str = "▶";
 /// Marker shown while the current media is paused.
 const PLAYBACK_PAUSED_SYMBOL: &str = "⏸";
 
-/// Most chapter-label rows Youta may reserve above the seek track.
-const MAX_CHAPTER_LABEL_ROWS: u16 = 4;
+/// Chapter navigation always occupies at most one row above the seek track.
+const CHAPTER_LABEL_ROWS: u16 = 1;
 
-/// Body rows retained even when a dense chapter timeline requests more space.
+/// Blank cells separating an optional chapter control from the current title.
+const CHAPTER_NAVIGATION_GAP: u16 = 2;
+
+/// Compact controls shown only when the current title leaves enough room.
+const PREVIOUS_CHAPTER_LABEL: &str = "◀ Prev";
+const NEXT_CHAPTER_LABEL: &str = "Next ▶";
+
+/// Body rows retained when chapter navigation is visible.
 const MIN_BODY_ROWS: u16 = 8;
 
 /// Maximum number of terminal rows used by the expanded local waveform.
@@ -1740,15 +1747,15 @@ fn render(frame: &mut Frame<'_>, view: &ViewModel, settings: &UiSettings, hit_ma
     normalize_physical_linux_console_frame(frame, view);
 }
 
-/// Chooses a bounded chapter-label height without taking space from the
-/// minimum usable body, seek track, playback status, or controls.
+/// Reserves one chapter-navigation row without taking space from the minimum
+/// usable body, seek track, playback status, or controls.
 fn chapter_label_row_count(
     view: &ViewModel,
     terminal_width: u16,
     terminal_height: u16,
     has_download: bool,
 ) -> u16 {
-    if view.playback_chapters.is_empty() {
+    if terminal_width == 0 || view.playback_chapters.is_empty() {
         return 0;
     }
 
@@ -1757,238 +1764,124 @@ fn chapter_label_row_count(
         .saturating_add(if has_download { 2 } else { 0 })
         .saturating_add(2)
         .saturating_add(2);
-    let available_rows = terminal_height
-        .saturating_sub(fixed_rows)
-        .min(MAX_CHAPTER_LABEL_ROWS);
-    if available_rows == 0 {
+    if terminal_height.saturating_sub(fixed_rows) == 0 {
         return 0;
     }
 
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
-    if duration.is_zero() {
-        return 1;
-    }
-    let duration_seconds = duration.as_secs();
-    let visible_chapters = view
-        .playback_chapters
-        .iter()
-        .filter(|chapter| {
-            chapter.start_seconds < duration_seconds
-                && (!view.skip_advertisement_chapters
-                    || !is_advertisement_chapter_title(&chapter.title))
-        })
-        .count();
-    if visible_chapters == 0 {
-        return 0;
-    }
-    if visible_chapters == 1 {
-        return 1;
-    }
-
-    required_chapter_label_rows(view, duration, terminal_width)
-        .min(available_rows)
-        .min(MAX_CHAPTER_LABEL_ROWS)
+    u16::from(!visible_chapter_indices(view, duration).is_empty())
 }
 
-/// Simulates the renderer's interval placement to reserve enough label rows.
-///
-/// Using the real truncated label widths keeps timestamped and names-only
-/// layouts consistent with the number of rows they receive.
-fn required_chapter_label_rows(view: &ViewModel, duration: Duration, width: u16) -> u16 {
-    if duration.is_zero() || width == 0 {
-        return u16::from(!view.playback_chapters.is_empty() && width > 0);
-    }
-    let layout = chapter_label_layout(view, duration, width, MAX_CHAPTER_LABEL_ROWS);
-    if layout.saturated {
-        MAX_CHAPTER_LABEL_ROWS
-    } else {
-        layout
-            .placements
-            .iter()
-            .map(|placement| placement.row.saturating_add(1))
-            .max()
-            .unwrap_or_default()
-    }
-}
-
-/// One packed chapter label whose marker remains independently time-aligned.
+/// One label or control in the single-row chapter navigation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ChapterLabelPlacement {
+    /// Chapter reached when this placement is clicked.
     index: usize,
+    /// Retained explicitly so render geometry and tests state the one-row rule.
     row: u16,
     start: u16,
     width: u16,
     text: String,
 }
 
-/// Result of bounded chapter-label packing.
+/// Width-dependent single-row chapter navigation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ChapterLabelLayout {
     placements: Vec<ChapterLabelPlacement>,
-    saturated: bool,
 }
 
-/// Packs chapter labels into the nearest available horizontal intervals.
+/// Centers the current chapter and adds compact adjacent controls when they fit.
 ///
-/// Exact marker-aligned positions are preferred across all rows. When those
-/// collide, the closest free interval is used, preferring the right side on an
-/// equal-distance tie. The current, first, and last visible chapters receive
-/// priority so a dense early cluster cannot consume every label row.
+/// Labels are deliberately independent from proportional timecode positions:
+/// chapter splits remain on the seek track, while this row stays stable no
+/// matter how many chapters the media exposes. Splits that round to the same
+/// terminal cell share a composite marker. Hidden advertisement chapters are
+/// omitted when selecting the adjacent targets.
 fn chapter_label_layout(
     view: &ViewModel,
     duration: Duration,
     width: u16,
     row_limit: u16,
 ) -> ChapterLabelLayout {
-    if duration.is_zero() || width == 0 || row_limit == 0 {
+    if width == 0 || row_limit == 0 {
         return ChapterLabelLayout::default();
     }
     let visible = visible_chapter_indices(view, duration);
     let current = current_visible_chapter_index(view, &visible);
-    let mut order = Vec::with_capacity(visible.len());
-    for candidate in current
-        .into_iter()
-        .chain(visible.first().copied())
-        .chain(visible.last().copied())
-        .chain(visible.iter().copied())
-    {
-        if !order.contains(&candidate) {
-            order.push(candidate);
-        }
-    }
-
-    let mut occupied = vec![Vec::<(u16, u16)>::new(); usize::from(row_limit)];
     let mut layout = ChapterLabelLayout::default();
-    let show_hours = duration.as_secs() >= 60 * 60;
-    for index in order {
-        let chapter = &view.playback_chapters[index];
-        let marker = rounded_duration_column(
-            Duration::from_secs(chapter.start_seconds),
-            duration,
-            width.saturating_sub(1),
-        );
-        let maximum_width = usize::from(width).min(if Some(index) == current { 36 } else { 20 });
-        let text = truncate_terminal_text(
-            &chapter_timeline_label(
-                chapter,
-                Some(index) == current,
-                view.show_chapter_timestamps,
-                show_hours,
-            ),
-            maximum_width,
-        );
-        let label_width = terminal_text_width(&text).min(width);
-        if label_width == 0 {
-            continue;
+
+    let Some(current) = current else {
+        if let Some(next) = visible.first().copied() {
+            let control_width = terminal_text_width(NEXT_CHAPTER_LABEL);
+            if control_width <= width {
+                layout.placements.push(ChapterLabelPlacement {
+                    index: next,
+                    row: 0,
+                    start: width.saturating_sub(control_width),
+                    width: control_width,
+                    text: NEXT_CHAPTER_LABEL.to_owned(),
+                });
+            }
         }
-        let preferred = marker.min(width.saturating_sub(label_width));
-        let exact_row = occupied.iter().position(|ranges| {
-            interval_is_free(ranges, preferred, preferred.saturating_add(label_width))
-        });
-        let (row, start) = if let Some(row) = exact_row {
-            (row, preferred)
-        } else if let Some(candidate) =
-            nearest_free_label_slot(&occupied, width, label_width, preferred)
-        {
-            candidate
-        } else {
-            layout.saturated = true;
-            continue;
-        };
-        occupied[row].push((start, start.saturating_add(label_width)));
-        occupied[row].sort_unstable_by_key(|range| range.0);
+        return layout;
+    };
+    let Some(current_position) = visible.iter().position(|index| *index == current) else {
+        return layout;
+    };
+    let chapter = &view.playback_chapters[current];
+    let show_hours = duration.as_secs() >= 60 * 60 || chapter.start_seconds >= 60 * 60;
+    let current_label = if duration.is_zero() && view.show_chapter_timestamps {
+        format!(
+            "▶ {} {}",
+            format_duration(Duration::from_secs(chapter.start_seconds)),
+            chapter_title_for_display(&chapter.title),
+        )
+    } else {
+        chapter_timeline_label(chapter, true, view.show_chapter_timestamps, show_hours)
+    };
+    let text = truncate_terminal_text(&current_label, usize::from(width));
+    let current_width = terminal_text_width(&text).min(width);
+    let current_start = width.saturating_sub(current_width) / 2;
+    if current_width > 0 {
         layout.placements.push(ChapterLabelPlacement {
-            index,
-            row: u16::try_from(row).unwrap_or(row_limit.saturating_sub(1)),
-            start,
-            width: label_width,
+            index: current,
+            row: 0,
+            start: current_start,
+            width: current_width,
             text,
         });
     }
-    expand_chapter_labels_into_free_space(&mut layout.placements, view, current, show_hours, width);
+    let previous_width = terminal_text_width(PREVIOUS_CHAPTER_LABEL);
+    if let Some(previous) = current_position
+        .checked_sub(1)
+        .and_then(|position| visible.get(position))
+        .copied()
+        && current_start >= previous_width.saturating_add(CHAPTER_NAVIGATION_GAP)
+    {
+        layout.placements.push(ChapterLabelPlacement {
+            index: previous,
+            row: 0,
+            start: 0,
+            width: previous_width,
+            text: PREVIOUS_CHAPTER_LABEL.to_owned(),
+        });
+    }
+
+    let next_width = terminal_text_width(NEXT_CHAPTER_LABEL);
+    let current_end = current_start.saturating_add(current_width);
+    if let Some(next) = visible.get(current_position.saturating_add(1)).copied()
+        && width.saturating_sub(current_end) >= next_width.saturating_add(CHAPTER_NAVIGATION_GAP)
+    {
+        layout.placements.push(ChapterLabelPlacement {
+            index: next,
+            row: 0,
+            start: width.saturating_sub(next_width),
+            width: next_width,
+            text: NEXT_CHAPTER_LABEL.to_owned(),
+        });
+    }
+
     layout
-}
-
-/// Expands packed labels to the next occupied interval on the same row.
-///
-/// Conservative widths still decide collision-free placement, including the
-/// active chapter's priority. Once those positions are stable, labels may use
-/// otherwise blank cells to their right without moving or overlapping a
-/// neighbour.
-fn expand_chapter_labels_into_free_space(
-    placements: &mut [ChapterLabelPlacement],
-    view: &ViewModel,
-    current: Option<usize>,
-    show_hours: bool,
-    width: u16,
-) {
-    let row_count = placements
-        .iter()
-        .map(|placement| usize::from(placement.row).saturating_add(1))
-        .max()
-        .unwrap_or_default();
-    let mut row_starts = vec![Vec::new(); row_count];
-    for placement in placements.iter() {
-        row_starts[usize::from(placement.row)].push(placement.start);
-    }
-    for starts in &mut row_starts {
-        starts.sort_unstable();
-    }
-
-    for placement in placements {
-        let starts = &row_starts[usize::from(placement.row)];
-        let next_index = starts.partition_point(|start| *start <= placement.start);
-        let free_end = starts.get(next_index).copied().unwrap_or(width);
-        let available_width = free_end.saturating_sub(placement.start);
-        let text = truncate_terminal_text(
-            &chapter_timeline_label(
-                &view.playback_chapters[placement.index],
-                Some(placement.index) == current,
-                view.show_chapter_timestamps,
-                show_hours,
-            ),
-            usize::from(available_width),
-        );
-        placement.width = terminal_text_width(&text).min(available_width);
-        placement.text = text;
-    }
-}
-
-fn interval_is_free(ranges: &[(u16, u16)], start: u16, end: u16) -> bool {
-    ranges
-        .iter()
-        .all(|(used_start, used_end)| start >= *used_end || end <= *used_start)
-}
-
-/// Finds the closest shifted label position among every free row interval.
-fn nearest_free_label_slot(
-    occupied: &[Vec<(u16, u16)>],
-    width: u16,
-    label_width: u16,
-    preferred: u16,
-) -> Option<(usize, u16)> {
-    let mut best: Option<(u16, bool, usize, u16)> = None;
-    for (row, ranges) in occupied.iter().enumerate() {
-        let mut cursor = 0_u16;
-        let mut consider_interval = |free_start: u16, free_end: u16| {
-            if free_end.saturating_sub(free_start) >= label_width {
-                let latest = free_end.saturating_sub(label_width);
-                let start = preferred.clamp(free_start, latest);
-                let distance = start.abs_diff(preferred);
-                let left_of_preferred = start < preferred;
-                let score = (distance, left_of_preferred, row, start);
-                if best.is_none_or(|current| score < current) {
-                    best = Some(score);
-                }
-            }
-        };
-        for (used_start, used_end) in ranges {
-            consider_interval(cursor, *used_start);
-            cursor = cursor.max(*used_end);
-        }
-        consider_interval(cursor, width);
-    }
-    best.map(|(_, _, row, start)| (row, start))
 }
 
 /// Renders expanded artwork as a modal once its terminal pixels are ready.
@@ -5914,24 +5807,9 @@ fn render_chapter_timeline(
     let visible_indices = visible_chapter_indices(view, duration);
     let current = current_visible_chapter_index(view, &visible_indices);
     if duration.is_zero() {
-        if !label_area.is_empty()
-            && let Some(index) = current
-        {
-            let chapter = &view.playback_chapters[index];
-            let label = truncate_terminal_text(
-                &if view.show_chapter_timestamps {
-                    format!(
-                        "▶ {} {}",
-                        format_duration(Duration::from_secs(chapter.start_seconds)),
-                        chapter_title_for_display(&chapter.title)
-                    )
-                } else {
-                    format!("▶ {}", chapter_title_for_display(&chapter.title))
-                },
-                usize::from(label_area.width),
-            );
-            frame.render_widget(Paragraph::new(label).style(theme.accent), label_area);
-        }
+        render_chapter_navigation_labels(
+            frame, label_area, view, duration, current, theme, hit_map,
+        );
         return;
     }
 
@@ -5992,15 +5870,27 @@ fn render_chapter_timeline(
         }
     }
 
+    render_chapter_navigation_labels(frame, label_area, view, duration, current, theme, hit_map);
+}
+
+/// Renders the centered current title and optional adjacent chapter controls.
+fn render_chapter_navigation_labels(
+    frame: &mut Frame<'_>,
+    label_area: Rect,
+    view: &ViewModel,
+    duration: Duration,
+    current: Option<usize>,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
     if label_area.is_empty() {
         return;
     }
-
     let layout = chapter_label_layout(
         view,
         duration,
         label_area.width,
-        label_area.height.min(MAX_CHAPTER_LABEL_ROWS),
+        label_area.height.min(CHAPTER_LABEL_ROWS),
     );
     for placement in layout.placements {
         let chapter = &view.playback_chapters[placement.index];
@@ -6018,8 +5908,14 @@ fn render_chapter_timeline(
             }),
             label_rect,
         );
-        if let Some(action) = marker_action(chapter.start_seconds) {
-            hit_map.seek_markers.push((action, label_rect));
+        if let Some(media_id) = view.playing_media_id.as_ref() {
+            hit_map.seek_markers.push((
+                UiAction::ActivateTimecode {
+                    media_id: media_id.clone(),
+                    seconds: chapter.start_seconds,
+                },
+                label_rect,
+            ));
         }
     }
 }
@@ -22198,7 +22094,7 @@ mod tests {
     }
 
     #[test]
-    fn chapter_label_height_adapts_to_density_mode_and_terminal_space() {
+    fn chapter_navigation_reserves_at_most_one_row() {
         let chapters = (0..29)
             .map(|index| Chapter {
                 title: format!("Chapter {index}"),
@@ -22216,13 +22112,13 @@ mod tests {
             ..ViewModel::default()
         };
 
-        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 4);
-        assert_eq!(chapter_label_row_count(&view, 80, 32, false), 4);
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 1);
+        assert_eq!(chapter_label_row_count(&view, 80, 32, false), 1);
         assert_eq!(chapter_label_row_count(&view, 240, 15, false), 1);
         assert_eq!(chapter_label_row_count(&view, 240, 14, false), 0);
         assert_eq!(chapter_label_row_count(&view, 240, 16, true), 0);
         view.show_chapter_timestamps = false;
-        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 4);
+        assert_eq!(chapter_label_row_count(&view, 240, 32, false), 1);
         view.playback.duration = None;
         assert_eq!(chapter_label_row_count(&view, 240, 32, false), 1);
         view.playback_chapters.clear();
@@ -22230,113 +22126,114 @@ mod tests {
     }
 
     #[test]
-    fn chapter_label_sizing_uses_fractional_duration_like_rendering() {
+    fn wide_chapter_navigation_shows_only_current_and_adjacent_controls() {
         let view = ViewModel {
             playback: PlaybackStatus {
-                duration: Some(Duration::from_millis(31_900)),
+                position: Duration::from_secs(250),
+                duration: Some(Duration::from_secs(500)),
                 ..PlaybackStatus::default()
             },
             playback_chapters: vec![
                 Chapter {
-                    title: "First boundary chapter title".to_owned(),
-                    start_seconds: 14,
-                    end_seconds: None,
-                },
-                Chapter {
-                    title: "Second boundary chapter title".to_owned(),
-                    start_seconds: 22,
-                    end_seconds: None,
-                },
-            ],
-            show_chapter_timestamps: true,
-            ..ViewModel::default()
-        };
-
-        assert_eq!(
-            chapter_label_row_count(&view, 80, 32, false),
-            2,
-            "the sizing pass must preserve the renderer's fractional column geometry"
-        );
-    }
-
-    #[test]
-    fn inactive_unicode_chapter_label_borrows_free_lane_space_before_activation() {
-        let target_title = "Возникновение “Скелы” и криминализация украинской армии";
-        let mut view = ViewModel {
-            playback: PlaybackStatus {
-                position: Duration::ZERO,
-                duration: Some(Duration::from_secs(1_000)),
-                ..PlaybackStatus::default()
-            },
-            playback_chapters: vec![
-                Chapter {
-                    title: "Вступление".to_owned(),
+                    title: "Distant first".to_owned(),
                     start_seconds: 0,
+                    end_seconds: Some(100),
+                },
+                Chapter {
+                    title: "Previous chapter".to_owned(),
+                    start_seconds: 100,
+                    end_seconds: Some(200),
+                },
+                Chapter {
+                    title: "Current chapter".to_owned(),
+                    start_seconds: 200,
+                    end_seconds: Some(300),
+                },
+                Chapter {
+                    title: "Next chapter".to_owned(),
+                    start_seconds: 300,
                     end_seconds: Some(400),
                 },
                 Chapter {
-                    title: target_title.to_owned(),
+                    title: "Distant last".to_owned(),
                     start_seconds: 400,
-                    end_seconds: Some(900),
-                },
-                Chapter {
-                    title: "Заключение".to_owned(),
-                    start_seconds: 900,
-                    end_seconds: Some(1_000),
+                    end_seconds: None,
                 },
             ],
-            show_chapter_timestamps: true,
             ..ViewModel::default()
         };
 
-        let inactive_layout = chapter_label_layout(&view, Duration::from_secs(1_000), 100, 1);
-        let inactive = inactive_layout
-            .placements
-            .iter()
-            .find(|placement| placement.index == 1)
-            .expect("inactive Unicode chapter placement");
-        let following = inactive_layout
-            .placements
-            .iter()
-            .filter(|placement| placement.row == inactive.row && placement.start > inactive.start)
-            .min_by_key(|placement| placement.start)
-            .expect("following occupied interval");
-
-        assert!(
-            inactive.width > 20,
-            "an inactive label must not retain the conservative placement width"
-        );
+        let layout = chapter_label_layout(&view, Duration::from_secs(500), 80, 1);
         assert_eq!(
-            inactive.start + inactive.width,
-            following.start,
-            "the long inactive label should use every free cell before its neighbour"
+            layout
+                .placements
+                .iter()
+                .map(|placement| placement.index)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1, 2, 3]),
         );
-        assert!(
-            inactive.text.contains("Возникновение “Скелы”"),
-            "Unicode text beyond the former 20-cell cap must remain visible: {}",
-            inactive.text
-        );
+        assert!(layout.placements.iter().all(|placement| placement.row == 0));
 
-        view.playback.position = Duration::from_secs(400);
-        let active_layout = chapter_label_layout(&view, Duration::from_secs(1_000), 100, 1);
-        let active = active_layout
+        let previous = layout
             .placements
             .iter()
             .find(|placement| placement.index == 1)
-            .expect("active Unicode chapter placement");
-        let active_following = active_layout
+            .expect("previous control");
+        let current = layout
             .placements
             .iter()
-            .filter(|placement| placement.row == active.row && placement.start > active.start)
-            .min_by_key(|placement| placement.start)
-            .expect("occupied interval after active chapter");
+            .find(|placement| placement.index == 2)
+            .expect("current chapter");
+        let next = layout
+            .placements
+            .iter()
+            .find(|placement| placement.index == 3)
+            .expect("next control");
+        assert_eq!(previous.text, "◀ Prev");
+        assert_eq!(previous.start, 0);
+        assert_eq!(current.text, "▶ Current chapter");
+        assert_eq!(current.start, (80 - current.width) / 2);
+        assert_eq!(next.text, "Next ▶");
+        assert_eq!(next.start + next.width, 80);
+    }
 
-        assert_eq!(inactive.start, active.start);
-        assert!(
-            active.start.saturating_add(active.width) <= active_following.start,
-            "the priority active label must not overlap its following interval"
-        );
-        assert!(active.text.starts_with("▶ 06:40 Возникновение"));
+    #[test]
+    fn narrow_chapter_navigation_keeps_only_the_truncated_current_name() {
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                position: Duration::from_secs(150),
+                duration: Some(Duration::from_secs(300)),
+                ..PlaybackStatus::default()
+            },
+            playback_chapters: vec![
+                Chapter {
+                    title: "Previous".to_owned(),
+                    start_seconds: 0,
+                    end_seconds: Some(100),
+                },
+                Chapter {
+                    title: "Текущая глава с длинным названием".to_owned(),
+                    start_seconds: 100,
+                    end_seconds: Some(200),
+                },
+                Chapter {
+                    title: "Next".to_owned(),
+                    start_seconds: 200,
+                    end_seconds: Some(300),
+                },
+            ],
+            ..ViewModel::default()
+        };
+
+        let layout = chapter_label_layout(&view, Duration::from_secs(300), 18, 1);
+        assert_eq!(layout.placements.len(), 1);
+        let current = &layout.placements[0];
+        assert_eq!(current.index, 1);
+        assert_eq!(current.row, 0);
+        assert_eq!(current.start, 0);
+        assert_eq!(current.width, 18);
+        assert!(current.text.starts_with("▶ "));
+        assert!(current.text.ends_with('…'));
     }
 
     #[test]
@@ -22552,30 +22449,86 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn chapter_labels_use_two_rows_before_hiding_collisions() {
-        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
-        let view = ViewModel {
+    fn chapter_navigation_controls_follow_visible_boundaries() {
+        let mut view = ViewModel {
             playback: PlaybackStatus {
-                position: Duration::from_secs(10),
+                position: Duration::from_secs(50),
                 duration: Some(Duration::from_secs(100)),
                 ..PlaybackStatus::default()
             },
-            playing_media_id: Some(media_id),
             playback_chapters: vec![
                 Chapter {
-                    title: "First nearby chapter".to_owned(),
-                    start_seconds: 10,
-                    end_seconds: Some(11),
+                    title: "Introduction".to_owned(),
+                    start_seconds: 0,
+                    end_seconds: Some(30),
                 },
                 Chapter {
-                    title: "Second nearby chapter".to_owned(),
-                    start_seconds: 11,
+                    title: "Реклама".to_owned(),
+                    start_seconds: 30,
+                    end_seconds: Some(45),
+                },
+                Chapter {
+                    title: "Main section".to_owned(),
+                    start_seconds: 45,
+                    end_seconds: Some(70),
+                },
+                Chapter {
+                    title: "Finish".to_owned(),
+                    start_seconds: 70,
                     end_seconds: Some(100),
+                },
+            ],
+            skip_advertisement_chapters: true,
+            ..ViewModel::default()
+        };
+
+        let indices = |view: &ViewModel| {
+            chapter_label_layout(view, Duration::from_secs(100), 80, 1)
+                .placements
+                .into_iter()
+                .map(|placement| placement.index)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(indices(&view), std::collections::BTreeSet::from([0, 2, 3]));
+
+        view.playback.position = Duration::ZERO;
+        assert_eq!(indices(&view), std::collections::BTreeSet::from([0, 2]));
+
+        view.playback.position = Duration::from_secs(80);
+        assert_eq!(indices(&view), std::collections::BTreeSet::from([2, 3]));
+    }
+
+    #[test]
+    fn unknown_duration_chapter_navigation_keeps_exact_controls_clickable() {
+        let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
+        let mut view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(15),
+                duration: None,
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(media_id.clone()),
+            playback_chapters: vec![
+                Chapter {
+                    title: "Previous".to_owned(),
+                    start_seconds: 0,
+                    end_seconds: Some(10),
+                },
+                Chapter {
+                    title: "Current".to_owned(),
+                    start_seconds: 10,
+                    end_seconds: Some(20),
+                },
+                Chapter {
+                    title: "Next".to_owned(),
+                    start_seconds: 20,
+                    end_seconds: None,
                 },
             ],
             ..ViewModel::default()
         };
-        let backend = TestBackend::new(80, 4);
+        let backend = TestBackend::new(80, 3);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
 
@@ -22590,47 +22543,109 @@ prose 07:25 remains clickable but is not a chapter";
                     &mut hit_map,
                 );
             })
-            .expect("draw two-line chapter labels");
+            .expect("draw unknown-duration chapter navigation");
 
-        let mut label_rows = hit_map
+        let targets = hit_map
             .seek_markers
             .iter()
-            .filter_map(|(_, area)| (area.y < hit_map.seek_bar.y).then_some(area.y))
+            .filter_map(|(action, area)| match action {
+                UiAction::ActivateTimecode { seconds, .. } if area.y < hit_map.seek_bar.y => {
+                    Some((*seconds, *area))
+                }
+                _ => None,
+            })
             .collect::<Vec<_>>();
-        label_rows.sort_unstable();
-        label_rows.dedup();
         assert_eq!(
-            label_rows,
-            [0, 1],
-            "overlapping chapter labels should use both rows before one is hidden"
+            targets
+                .iter()
+                .map(|(seconds, _)| *seconds)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 10, 20]),
+            "unknown duration must not disable exact chapter controls"
         );
-        assert_eq!(hit_map.seek_bar, Rect::new(0, 2, 80, 1));
-        let status_row = (0..80)
-            .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
-            .collect::<String>();
-        assert!(status_row.contains("0:10 / 1:40"));
+        let (_, next_area) = targets
+            .iter()
+            .find(|(seconds, _)| *seconds == 20)
+            .expect("next chapter control");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: next_area.x,
+                    row: next_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateTimecode {
+                media_id: media_id.clone(),
+                seconds: 20,
+            })
+        );
+
+        view.playback.position = Duration::ZERO;
+        view.playback_chapters[0].start_seconds = 5;
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw chapter navigation before the first chapter");
+        let (next_action, next_area) = hit_map
+            .seek_markers
+            .iter()
+            .find(|(action, area)| {
+                action
+                    == &UiAction::ActivateTimecode {
+                        media_id: media_id.clone(),
+                        seconds: 5,
+                    }
+                    && area.y < hit_map.seek_bar.y
+            })
+            .expect("clickable next control before the first chapter");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: next_area.x,
+                    row: next_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(next_action.clone())
+        );
     }
 
     #[test]
-    fn dense_chapter_labels_use_four_clickable_rows_when_space_allows() {
+    fn dense_chapter_navigation_uses_one_row_and_keeps_every_track_marker() {
         let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
         let view = ViewModel {
             playback: PlaybackStatus {
-                position: Duration::from_secs(17),
-                duration: Some(Duration::from_secs(100)),
+                idle: false,
+                position: Duration::from_secs(105),
+                duration: Some(Duration::from_secs(200)),
                 ..PlaybackStatus::default()
             },
-            playing_media_id: Some(media_id),
-            playback_chapters: (10..18)
-                .map(|seconds| Chapter {
-                    title: format!("Clustered chapter {seconds}"),
-                    start_seconds: seconds,
+            playing_media_id: Some(media_id.clone()),
+            playback_chapters: (0..20)
+                .map(|index| Chapter {
+                    title: format!("C{index}"),
+                    start_seconds: index * 10,
                     end_seconds: None,
                 })
                 .collect(),
             ..ViewModel::default()
         };
-        let backend = TestBackend::new(80, 6);
+        let backend = TestBackend::new(80, 3);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
 
@@ -22645,21 +22660,63 @@ prose 07:25 remains clickable but is not a chapter";
                     &mut hit_map,
                 );
             })
-            .expect("draw adaptive chapter labels");
+            .expect("draw compact chapter navigation");
 
-        let mut label_rows = hit_map
+        assert_eq!(hit_map.seek_bar, Rect::new(0, 1, 80, 1));
+        let label_targets = hit_map
             .seek_markers
             .iter()
-            .filter_map(|(_, area)| (area.y < hit_map.seek_bar.y).then_some(area.y))
+            .filter_map(|(action, area)| {
+                if area.y >= hit_map.seek_bar.y {
+                    return None;
+                }
+                match action {
+                    UiAction::ActivateTimecode { seconds, .. } => Some((*seconds, *area)),
+                    _ => None,
+                }
+            })
             .collect::<Vec<_>>();
-        label_rows.sort_unstable();
-        label_rows.dedup();
-        assert_eq!(label_rows, [0, 1, 2, 3]);
-        assert_eq!(hit_map.seek_bar, Rect::new(0, 4, 80, 1));
+        assert_eq!(
+            label_targets
+                .iter()
+                .map(|(seconds, _)| *seconds)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([90, 100, 110]),
+        );
+        assert_eq!(
+            hit_map
+                .seek_markers
+                .iter()
+                .filter(|(_, area)| area.y == hit_map.seek_bar.y)
+                .count(),
+            20,
+        );
+
+        let previous = label_targets
+            .iter()
+            .find(|(seconds, _)| *seconds == 90)
+            .expect("previous chapter control");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: previous.1.x,
+                    row: previous.1.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateTimecode {
+                media_id,
+                seconds: 90,
+            }),
+        );
+
         let status_row = (0..80)
-            .map(|x| terminal.backend().buffer()[(x, 5)].symbol())
+            .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
             .collect::<String>();
-        assert!(status_row.contains("0:17 / 1:40"));
+        assert!(status_row.contains("1:45 / 3:20"));
     }
 
     #[test]
@@ -22667,6 +22724,7 @@ prose 07:25 remains clickable but is not a chapter";
         let media_id = MediaId::new(SourceKind::YouTube, "abcdefghijk");
         let mut view = ViewModel {
             playback: PlaybackStatus {
+                position: Duration::from_secs(10),
                 duration: Some(Duration::from_secs(100)),
                 ..PlaybackStatus::default()
             },
@@ -22724,7 +22782,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn chapter_labels_hide_one_final_period_but_preserve_ellipses() {
-        let view = ViewModel {
+        let mut view = ViewModel {
             playback: PlaybackStatus {
                 position: Duration::from_secs(10),
                 duration: Some(Duration::from_secs(100)),
@@ -22765,6 +22823,21 @@ prose 07:25 remains clickable but is not a chapter";
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Sentence title"));
         assert!(!rendered.contains("Sentence title."));
+
+        view.playback.position = Duration::from_secs(70);
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &UiSettings::default(),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw ellipsis chapter label");
+        let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Wait..."));
     }
 
@@ -22976,7 +23049,17 @@ prose 07:25 remains clickable but is not a chapter";
             rendered.contains('…'),
             "the active chapter title must be truncated explicitly: {rendered}"
         );
-        assert!(hit_map.seek_markers.is_empty());
+        assert_eq!(
+            hit_map.seek_markers,
+            vec![(
+                UiAction::ActivateTimecode {
+                    media_id: MediaId::new(SourceKind::YouTube, "abcdefghijk"),
+                    seconds: 11,
+                },
+                Rect::new(0, 0, 8, 1),
+            )],
+            "unknown duration keeps the exact current-label target without inventing a proportional marker"
+        );
     }
 
     #[test]
