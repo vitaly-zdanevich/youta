@@ -92,6 +92,24 @@ impl PlaybackTick {
     }
 }
 
+/// Reconciles the retained reducer snapshot and classifies a playback-only change.
+///
+/// The high-frequency group is written into `previous` before comparing it
+/// with the controller. When that explains the complete change, all row and
+/// subscription allocations remain owned by `previous`; callers can apply the
+/// returned tick to other retained snapshots in place. A change outside the
+/// group falls back to a complete clone so omitted fields can never go stale.
+fn reconcile_view_change(previous: &mut ViewModel, current: &ViewModel) -> Option<PlaybackTick> {
+    let tick = PlaybackTick::of(current);
+    tick.apply_to(previous);
+    if *previous == *current {
+        Some(tick)
+    } else {
+        previous.clone_from(current);
+        None
+    }
+}
+
 /// Largest number of waveform columns the window may ask for at once.
 ///
 /// A window is a few thousand device pixels wide at most. The cap is here so a
@@ -676,20 +694,24 @@ fn run<R: Runtime>(
         // comparison instead of a serialization and an IPC message.
         if *controller.view() != last {
             let current = controller.view();
-            let tick = PlaybackTick::of(current);
-
             // Ask whether the high-frequency group explains the whole change.
             // Getting this wrong can only cost a full snapshot, never a stale
             // window, because the comparison is against the real thing.
-            let mut probe = last.clone();
-            tick.apply_to(&mut probe);
-            let only_playback_moved = probe == *current;
-
-            last = current.clone();
-            // Recorded before the snapshot leaves, so the artwork endpoint can
-            // never be asked about a URL it has not seen yet.
-            artwork.record(&last);
-            *published.lock().unwrap_or_else(PoisonError::into_inner) = last.clone();
+            let playback_tick = reconcile_view_change(&mut last, current);
+            if let Some(tick) = playback_tick.as_ref() {
+                // Playback cannot introduce artwork or list rows. Patch the
+                // published snapshot in place so its large lists retain their
+                // allocations just as `last` does.
+                tick.apply_to(&mut published.lock().unwrap_or_else(PoisonError::into_inner));
+            } else {
+                // Recorded before the snapshot leaves, so the artwork endpoint can
+                // never be asked about a URL it has not seen yet.
+                artwork.record(&last);
+                published
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone_from(&last);
+            }
 
             // The window title, the tray, and a track-change notification read
             // the same published snapshot the page does, so they cannot show
@@ -705,7 +727,7 @@ fn run<R: Runtime>(
                 media.publish(&last);
             }
 
-            let emitted = if only_playback_moved {
+            let emitted = if let Some(tick) = playback_tick {
                 traffic.record_tick(&tick);
                 app.emit(PLAYBACK_EVENT, &tick)
             } else {
@@ -735,7 +757,7 @@ mod tests {
         StateStore, WindowFocus, start,
     };
 
-    use super::{PlaybackTick, ViewModel};
+    use super::{PlaybackTick, ViewModel, reconcile_view_change};
 
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex};
@@ -880,6 +902,43 @@ mod tests {
         let mut probe = before;
         PlaybackTick::of(&also_selected).apply_to(&mut probe);
         assert_ne!(probe, also_selected, "a list change must force a snapshot");
+    }
+
+    /// Playback-only publication must retain both snapshots' large row buffers.
+    #[test]
+    fn playback_reconciliation_reuses_subscription_row_allocations() {
+        use std::time::Duration;
+
+        let mut previous = ViewModel::default();
+        previous.subscriptions.items = vec![youta::view::RowView {
+            title: "a retained subscription item".to_owned(),
+            ..youta::view::RowView::default()
+        }];
+        let mut published = previous.clone();
+        let mut current = previous.clone();
+        current.playback.position = Duration::from_secs(41);
+        let previous_items = previous.subscriptions.items.as_ptr();
+        let previous_title = previous.subscriptions.items[0].title.as_ptr();
+        let published_items = published.subscriptions.items.as_ptr();
+        let published_title = published.subscriptions.items[0].title.as_ptr();
+
+        let tick = reconcile_view_change(&mut previous, &current)
+            .expect("a moved position is a playback-only publication");
+        tick.apply_to(&mut published);
+
+        assert_eq!(tick, PlaybackTick::of(&current));
+        assert_eq!(previous, current);
+        assert_eq!(published, current);
+        assert_eq!(previous.subscriptions.items.as_ptr(), previous_items);
+        assert_eq!(
+            previous.subscriptions.items[0].title.as_ptr(),
+            previous_title
+        );
+        assert_eq!(published.subscriptions.items.as_ptr(), published_items);
+        assert_eq!(
+            published.subscriptions.items[0].title.as_ptr(),
+            published_title
+        );
     }
 
     /// The split only pays if the tick is far smaller than the snapshot.
