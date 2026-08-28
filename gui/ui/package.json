@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "npm run test && tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test src/subscriptionPageRows.test.mjs src/subscriptionsBehavior.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

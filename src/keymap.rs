@@ -984,7 +984,7 @@ fn unfiltered_key_action(
         Key::PageUp
             if matches!(
                 view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio
+                Screen::LibriVox | Screen::Local | Screen::Radio | Screen::Subscriptions
             ) =>
         {
             page_rows
@@ -994,7 +994,7 @@ fn unfiltered_key_action(
         Key::PageDown
             if matches!(
                 view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio
+                Screen::LibriVox | Screen::Local | Screen::Radio | Screen::Subscriptions
             ) =>
         {
             page_rows

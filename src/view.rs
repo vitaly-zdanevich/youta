@@ -727,7 +727,7 @@ pub enum SubscriptionRoute {
 }
 
 /// Pane receiving list navigation in split Subscriptions mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SubscriptionPane {
     /// The source list.
     #[default]
@@ -757,10 +757,19 @@ pub struct SubscriptionsView {
     pub description_expanded: bool,
     /// Whether the selected source has a provider request in flight.
     pub loading: bool,
+    /// Whether a continuation page is loading behind the already usable list.
+    #[serde(default)]
+    pub loading_more: bool,
+    /// Whether selected-video metadata is waiting for its debounce deadline.
+    #[serde(default)]
+    pub metadata_pending: bool,
     /// Whether YouTube subscription lists include provider-identified Shorts.
     pub show_youtube_shorts: bool,
     /// Human-readable source name included in the item-list heading.
     pub source_title: String,
+    /// Opaque owner generation for front-end virtual-list reset decisions.
+    #[serde(default)]
+    pub source_generation: u64,
     /// Provider family controlling source-specific headings and actions.
     pub source_kind: SubscriptionKind,
     /// Public subscriber count for the selected source, when exposed.
@@ -781,8 +790,11 @@ impl Default for SubscriptionsView {
             focus: SubscriptionPane::Sources,
             description_expanded: false,
             loading: false,
+            loading_more: false,
+            metadata_pending: false,
             show_youtube_shorts: true,
             source_title: String::new(),
+            source_generation: 0,
             source_kind: SubscriptionKind::YouTube,
             source_subscriber_count: None,
             source_created: String::new(),
@@ -2381,6 +2393,10 @@ pub enum UiAction {
     SelectSubscriptionSource(usize),
     /// Select an exact subscription item row.
     SelectSubscriptionItem(usize),
+    /// Give keyboard paging to the subscription pane the pointer used.
+    FocusSubscriptionPane(SubscriptionPane),
+    /// Report the final item visible in the windowed subscription viewport.
+    PrefetchSubscriptionVideosThrough(usize),
     /// Toggle the selected subscription item's expanded description.
     ToggleSubscriptionDescription,
     /// Refresh page one for the active subscribed channel.
@@ -2488,6 +2504,18 @@ mod tests {
     #[test]
     fn subscription_shorts_are_visible_by_default() {
         assert!(SubscriptionsView::default().show_youtube_shorts);
+    }
+
+    #[test]
+    fn subscription_continuation_is_idle_by_default_and_serialized_for_front_ends() {
+        let subscriptions = SubscriptionsView::default();
+        assert!(!subscriptions.loading_more);
+        assert!(!subscriptions.metadata_pending);
+        assert_eq!(
+            serde_json::to_value(subscriptions).expect("serialize subscription continuation state")
+                ["loading_more"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]

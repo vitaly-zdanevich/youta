@@ -79,6 +79,7 @@ export function HelpPopup({
             : "offline · playlists · stats",
         ],
         ["S · p · F9", "subscriptions · preferences · recent commits"],
+		["PageUp · PageDown", "page through Subscriptions"],
         ["R · h", "refresh subscription videos · show/hide Shorts"],
       ],
     ],

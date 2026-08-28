@@ -645,6 +645,84 @@ fn the_window_exposes_the_youtube_shorts_toggle_with_pressed_state() {
 }
 
 #[test]
+fn the_window_virtualizes_subscription_lists_and_pages_the_focused_viewport() {
+    let sources = window_sources();
+    let source_named = |suffix: &str| {
+        sources
+            .iter()
+            .find_map(|(path, source)| path.ends_with(suffix).then_some(source.as_str()))
+            .unwrap_or_else(|| panic!("missing window source {suffix}"))
+    };
+    let app = source_named("App.tsx");
+    let subscriptions = source_named("components/Subscriptions.tsx");
+
+    for required in [
+        "data-subscriptions-screen",
+        "[data-subscription-pane='focused']",
+        "subscriptionPageRows(height)",
+    ] {
+        assert!(app.contains(required), "App no longer contains {required}");
+    }
+    for required in [
+        "useVirtualizer",
+        "SUBSCRIPTION_ROW_HEIGHT",
+        "virtualizer.scrollToIndex(selected, { align: 'auto' })",
+        "[selected, selectedIdentity, virtualizer]",
+        "data-subscription-pane={focused ? 'focused' : 'inactive'}",
+        "FocusSubscriptionPane",
+        "PrefetchSubscriptionVideosThrough",
+        "onPointerDown={focusPane}",
+        "onFocusCapture={focusPane}",
+        "onScroll={() => reportViewport()}",
+        "lastReportedViewportEnd",
+        "[rows.length, virtualizer]",
+        "event.deltaY > 0",
+        "onDoubleClick={() => void dispatch(\"ActivateSelection\")}",
+        "aria-current={current}",
+        "aria-posinset={item.index + 1}",
+        "aria-setsize={rows.length}",
+        "className=\"overflow-y-auto\"",
+        "role=\"region\"",
+    ] {
+        assert!(
+            subscriptions.contains(required),
+            "Subscriptions component no longer contains {required}"
+        );
+    }
+    assert!(
+        !subscriptions.contains("[focused, selected, selectedIdentity, virtualizer]"),
+        "a focus-only transition must not snap a manually scrolled pane to selection"
+    );
+    assert!(
+        !subscriptions.contains("[selected, rows.length, virtualizer]"),
+        "appending a continuation must not snap native scrolling back to selection"
+    );
+}
+
+#[test]
+fn subscription_continuation_has_a_static_indicator_without_animating_refresh() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("Subscriptions.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "subscriptions.loading && !subscriptions.loading_more",
+        "subscriptions.loading_more ?",
+        "Loading more…",
+        "role='status'",
+    ] {
+        assert!(
+            source.contains(required),
+            "subscription continuation UI no longer contains {required}"
+        );
+    }
+}
+
+#[test]
 fn the_window_help_documents_the_youtube_shorts_hotkey() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ui")
@@ -657,6 +735,10 @@ fn the_window_help_documents_the_youtube_shorts_hotkey() {
     assert!(
         source.contains("[\"R · h\", \"refresh subscription videos · show/hide Shorts\"]"),
         "window Help must document the same contextual Shorts binding as the terminal"
+    );
+    assert!(
+        source.contains("[\"PageUp · PageDown\", \"page through Subscriptions\"]"),
+        "window Help must document subscription page navigation"
     );
 }
 

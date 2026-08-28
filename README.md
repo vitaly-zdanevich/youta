@@ -1460,6 +1460,30 @@ subscription-source root. Youta provides two layouts:
   `Esc` returns to the item list. The source-aware `[R]` refresh action is
   available after the source has been opened.
 
+`PageUp` and `PageDown` move by the number of rows rendered in the active
+Subscriptions pane. For an official YouTube channel, Youta requests the API's
+50-upload maximum and keeps one continuation page ahead of the current
+selection or desktop viewport; the first successful page therefore starts
+loading page two before the user reaches the final rows. Continuation loading
+uses a quiet status instead of animating the Refresh action. A dedicated
+foreground lane prevents selected-video and channel metadata from delaying
+pagination, while quickly changing the selection replaces optional metadata
+that has not started yet.
+When hidden Shorts leave too few visible rows, Youta follows only a bounded
+number of speculative pages per navigation gesture. `PageDown` or another
+downward scroll continues a sparse list from the retained token; `Enter`
+continues when filtering leaves the list empty, without loading the whole
+channel at once.
+
+[YouTube continuation tokens are sequential and
+opaque](https://developers.google.com/youtube/v3/guides/implementation/pagination),
+so the API cannot jump directly to an arbitrary middle page of a channel. Youta
+can retain more than 1,000 loaded videos in bounded process memory, but it must
+discover those pages in order. The restart snapshot remains the newest 50
+items; later pages are process-local and are fetched again after a restart. The
+controller does not automatically retry a failed channel page, and a failure
+leaves already loaded rows available.
+
 Refresh deliberately bypasses the process-local item cache so newly published
 videos or episodes can appear. The current rows remain visible while the
 request runs, and Youta restores the selected item by its stable source identity
@@ -1522,9 +1546,13 @@ The alternative adapter uses the documented [Invidious channel-videos
 endpoint](https://docs.invidious.io/api/channels_endpoint/). Youta loads
 another page when selection approaches the current page's end. It keeps a
 bounded, process-local cache of recently opened channels, so switching back
-does not immediately repeat the request. It retains at most 24 channels and
-250 videos per channel under a shared approximate 8 MiB heap budget; list
-descriptions and thumbnails are compacted before caching.
+does not immediately repeat the request. It retains at most 24 sources under a
+shared approximate 8 MiB inactive-source target. The active YouTube channel may
+hold up to 5,000 videos or 32 MiB, whichever comes first; RSS feeds remain
+limited to 250 episodes. List descriptions, thumbnails, and collection storage
+are compacted before caching. A filtered page-one refresh may temporarily hold
+one equally bounded replacement beside the visible cache until it can be
+promoted or safely discarded.
 
 A compact first-page snapshot also survives restarts in the selected cache
 backend. Activating a channel renders that snapshot immediately, then refreshes

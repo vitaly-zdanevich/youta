@@ -25,6 +25,7 @@ import {
 import { namedKey } from "./keys";
 import { sendKey } from "./ipc";
 import { popupGeometry } from "./popupGeometry";
+import { subscriptionPageRows } from "./subscriptionPageRows";
 import { useYouta } from "./useYouta";
 
 /** Whether the user currently has text selected anywhere in the window. */
@@ -38,7 +39,13 @@ export function App() {
 
   /** Reports how many list rows are on screen, for page-sized movement. */
   const pageRows = useCallback((): number | null => {
-    const height = body.current?.clientHeight ?? 0;
+	const root = body.current;
+	if (root?.hasAttribute('data-subscriptions-screen')) {
+		const focusedPane = root.querySelector<HTMLElement>("[data-subscription-pane='focused']");
+		const height = focusedPane?.clientHeight ?? 0;
+		return subscriptionPageRows(height);
+	}
+	const height = root?.clientHeight ?? 0;
     return height > 0 ? Math.max(1, Math.floor(height / ROW_HEIGHT)) : null;
   }, []);
 
@@ -127,7 +134,7 @@ export function App() {
         )}
 
         {onSubscriptions ? (
-          <div ref={body} className="grid min-h-0">
+		<div ref={body} data-subscriptions-screen className="grid min-h-0">
             <Subscriptions
               subscriptions={view.subscriptions}
               playing={view.playing_media_id}

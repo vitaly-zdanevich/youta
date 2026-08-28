@@ -593,18 +593,40 @@ uses `channels.list` to find the uploads playlist,
 [`playlistItems.list`](https://developers.google.com/youtube/v3/docs/playlistItems/list)
 to preserve upload order, and
 [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list) to
-batch row metadata. The Invidious worker uses its documented [channel videos
-endpoint](https://docs.invidious.io/api/channels_endpoint/). Both adapters
-translate provider continuation tokens into sequential page numbers at the
-provider boundary.
+batch row metadata. Uploads pages use the documented maximum of 50 IDs, and
+partial-response field selectors keep both requests limited to the row data
+the model consumes. The Invidious worker uses its documented [channel videos
+endpoint](https://docs.invidious.io/api/channels_endpoint/) and its provider-set
+page size. Both adapters translate opaque continuation tokens into sequential
+page numbers at the provider boundary; neither can seek directly to an
+arbitrary channel offset.
 
 Moving across split-view sources performs no remote work. Arrow navigation may
 render an existing RAM or restart snapshot, but only `Enter` activates a source
 and starts its initial provider load or refresh. The controller keeps a bounded
-least-recently-used RAM cache: at most 24 sources and 250 items per source under
-a shared approximate 8 MiB heap budget. YouTube description excerpts and
-thumbnail sets are compacted before insertion. Approaching the end of visible
-YouTube rows requests the next page; bounded automatic continuation skips
+least-recently-used RAM cache for at most 24 sources under a shared approximate
+8 MiB inactive-source target. One active YouTube channel may retain up to 5,000
+compacted summaries or 32 MiB, whichever comes first; one RSS/Atom feed remains
+limited to 250 episodes. Reaching a YouTube limit removes its continuation and
+is reported explicitly rather than looking like provider exhaustion.
+
+Page one immediately primes one continuation, and a selection or desktop
+viewport within 50 visible rows of the loaded end primes the next one.
+Shorts-filtered projections use the same rule, with a fixed speculative-page
+budget per navigation gesture; this can cross a hidden-only page without
+recursively loading the whole channel. `PageDown`, native scrolling, or explicit
+continuation resets that small budget, so later standard videos remain
+reachable. A page-one refresh that initially contains only hidden Shorts keeps
+the old visible cache alongside one separately bounded staged replacement. That
+temporary replacement has the same 5,000-item/32-MiB ceiling, making the
+explicit refresh-only total at most 10,000 items/64 MiB. It is promoted only
+after it contributes a visible row (or Shorts are enabled), and is discarded at
+provider exhaustion instead of blanking useful cached rows.
+
+Channel-video pages use a dedicated foreground provider lane. Optional video
+Details, subscriber-count, and Wikidata work waits for a stable selection on
+the general lane, so a request already running there cannot hold pagination
+behind its timeout. Bounded automatic continuation still skips
 private/unavailable-only pages. RSS/Atom refreshes replace one bounded
 whole-feed result instead. Every response carries a subscription generation; a
 response for an older selection is ignored and cannot replace the newly

@@ -15,35 +15,15 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 #[cfg(feature = "yt-dlp")]
 use std::sync::Mutex;
-#[cfg(any(
-    feature = "apple-podcasts",
-    feature = "bandcamp",
-    feature = "librivox",
-    feature = "rss",
-    feature = "yandex-music",
-    feature = "youtube-music"
-))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-#[cfg(any(
-    feature = "acoustid",
-    feature = "audio-quality",
-    feature = "apple-podcasts",
-    feature = "librivox",
-    feature = "rss",
-    feature = "waveform",
-    feature = "yandex-music",
-    feature = "yt-dlp"
-))]
-use crossbeam_channel::{TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, unbounded};
 #[cfg(feature = "yandex-music")]
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
@@ -3446,9 +3426,27 @@ enum BandcampResolutionOwner {
 
 /// Maximum subscription collections retained by the process-local LRU cache.
 const MAX_CACHED_SUBSCRIPTION_CHANNELS: usize = 24;
-/// Maximum playable summaries retained for one subscribed source.
-const MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL: usize = 250;
-/// Approximate heap budget shared by all process-local subscription summaries.
+/// Official YouTube API page size used as the subscription lookahead window.
+const YOUTUBE_SUBSCRIPTION_PAGE_ROWS: usize = 50;
+/// Maximum video summaries retained for one YouTube channel in RAM.
+const MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL: usize = 5_000;
+/// Maximum episode summaries retained for one RSS feed in RAM.
+#[cfg(feature = "rss")]
+const MAX_CACHED_RSS_SUBSCRIPTION_EPISODES_PER_FEED: usize = 250;
+/// Conservative owned-heap ceiling for one YouTube channel's RAM cache.
+const MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL: usize = 32 * 1024 * 1024;
+/// Temporary total while a filtered page-one refresh stages a replacement.
+#[cfg(test)]
+const MAX_TRANSIENT_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL: usize =
+    MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL * 2;
+/// Temporary owned-heap total for the live and staged channel values together.
+#[cfg(test)]
+const MAX_TRANSIENT_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL: usize =
+    MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL * 2;
+/// Soft heap budget shared by cached inactive subscription sources.
+///
+/// The selected source is preserved even when its independently enforced
+/// per-channel ceiling lets it exceed this cross-source eviction target.
 const MAX_CACHED_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 /// Description excerpt retained until the selected-video details request wins.
 const MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES: usize = 4 * 1024;
@@ -3458,8 +3456,12 @@ const MAX_CACHED_SUBSCRIPTION_LABEL_BYTES: usize = 2 * 1024;
 const MAX_CACHED_SUBSCRIPTION_FIELD_BYTES: usize = 2 * 1024;
 /// Consecutive empty pages followed before requiring explicit continuation.
 const MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES: u32 = 3;
+/// Speculative pages allowed per selection gesture while filling lookahead.
+const MAX_AUTOMATIC_SUBSCRIPTION_PREFETCH_PAGES: u8 = 2;
 /// Stable channel selections wait briefly before optional metadata traffic.
 const CHANNEL_DETAILS_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Selected subscription videos wait briefly before optional metadata traffic.
+const SUBSCRIPTION_VIDEO_METADATA_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Maximum compact channel records retained by the process.
 const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
 /// Maximum full YouTube video-detail records retained by the process.
@@ -3502,16 +3504,43 @@ struct CachedSubscriptionVideos {
     next_page: Option<u32>,
     /// Consecutive empty remote pages since the last playable page.
     consecutive_empty_pages: u8,
+    /// Whether the local count or estimated-byte ceiling stopped pagination.
+    limit_reached: bool,
 }
 
 impl CachedSubscriptionVideos {
     /// Returns a conservative approximation of owned heap bytes.
     fn estimated_heap_bytes(&self) -> usize {
+        let inline_item_bytes = std::mem::size_of::<SearchItem>();
+        let vector_storage = self.items.capacity().saturating_mul(inline_item_bytes);
         self.items
             .iter()
-            .map(subscription_item_estimated_heap_bytes)
-            .fold(0usize, usize::saturating_add)
+            .map(|item| {
+                subscription_item_estimated_heap_bytes(item).saturating_sub(inline_item_bytes)
+            })
+            .fold(vector_storage, usize::saturating_add)
     }
+}
+
+/// Exact subscription video whose optional metadata waits for stable selection.
+#[derive(Clone, Debug)]
+struct ScheduledSubscriptionVideoMetadata {
+    /// Details generation that owns the eventual visible update.
+    generation: u64,
+    /// Active subscription channel that owns the selected item.
+    channel_id: String,
+    /// Owned summary used after the debounce without rereading a moved selection.
+    selected: SearchItem,
+    /// Whether full provider details were absent from the RAM cache.
+    request_details: bool,
+    /// Wikidata generation invalidated as soon as this selection became visible.
+    #[cfg(feature = "wikidata")]
+    wikidata_generation: u64,
+    /// Whether a fresh Wikidata cache entry was unavailable.
+    #[cfg(feature = "wikidata")]
+    request_wikidata: bool,
+    /// Earliest instant at which optional provider work may start.
+    due_at: Instant,
 }
 
 /// One channel record scheduled after the selected source settles.
@@ -3654,6 +3683,11 @@ struct PendingSubscriptionRefresh {
     /// Previous index used when the selected video disappeared.
     fallback_index: usize,
     /// Replacement pages staged while filtered page one is temporarily empty.
+    ///
+    /// This refresh-only value uses the same 5,000-item/32-MiB bound as the
+    /// canonical cache. While old rows remain visible, one active refresh may
+    /// therefore raise that channel's explicit temporary totals to 10,000
+    /// items/64 MiB until the replacement is promoted or discarded.
     staged_cache: Option<CachedSubscriptionVideos>,
     /// Whether a failed refresh should interrupt the cached view with a popup.
     ///
@@ -4419,6 +4453,8 @@ pub struct AppController {
     subscription_tree: SubscriptionTree,
     /// Current OPML leaves in stable folder order.
     subscription_entries: Vec<FlattenedSubscription>,
+    /// Exact active OPML identity kept private from serialized front-end state.
+    subscription_source_owner_id: Option<String>,
     /// Process-local bounded channel-video pages keyed by channel identifier.
     subscription_video_cache: HashMap<String, CachedSubscriptionVideos>,
     /// Least-recently-used eviction order for channel-video pages.
@@ -4430,6 +4466,10 @@ pub struct AppController {
     active_subscription_rss_url: Option<String>,
     /// Generation rejecting responses queued for an older source selection.
     subscription_generation: u64,
+    /// Bounded speculative pages queued since the last item-selection gesture.
+    subscription_automatic_prefetch_count: u8,
+    /// Last item currently exposed at the end of the desktop virtual viewport.
+    subscription_viewport_end: Option<usize>,
     /// Selection restored after an explicit page-one refresh completes.
     pending_subscription_refresh: Option<PendingSubscriptionRefresh>,
     /// RSS refresh selection restored after one whole-feed replacement.
@@ -4501,6 +4541,8 @@ pub struct AppController {
     channel_details_generation: u64,
     /// Debounced metadata request for the stable subscription source.
     scheduled_channel_details: Option<ScheduledChannelDetails>,
+    /// Debounced optional metadata for the stable subscription-video selection.
+    scheduled_subscription_video_metadata: Option<ScheduledSubscriptionVideoMetadata>,
     /// Debounced Wikidata lookup for the stable subscription source.
     #[cfg(feature = "wikidata")]
     scheduled_channel_wikidata: Option<ScheduledChannelWikidata>,
@@ -5531,12 +5573,15 @@ impl AppController {
             tracker_results: Vec::new(),
             subscription_tree,
             subscription_entries: Vec::new(),
+            subscription_source_owner_id: None,
             subscription_video_cache: HashMap::new(),
             subscription_cache_order: VecDeque::new(),
             active_subscription_channel_id: None,
             #[cfg(feature = "rss")]
             active_subscription_rss_url: None,
             subscription_generation: 0,
+            subscription_automatic_prefetch_count: 0,
+            subscription_viewport_end: None,
             pending_subscription_refresh: None,
             #[cfg(feature = "rss")]
             pending_rss_subscription_refresh: None,
@@ -5584,6 +5629,7 @@ impl AppController {
             pending_channel_details: HashSet::new(),
             channel_details_generation: 0,
             scheduled_channel_details: None,
+            scheduled_subscription_video_metadata: None,
             #[cfg(feature = "wikidata")]
             scheduled_channel_wikidata: None,
             #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
@@ -5918,7 +5964,9 @@ impl AppController {
 
     /// Advances the shared ASCII activity frame for searches or channel loads.
     fn advance_search_animation(&mut self) {
-        if self.view.search_activity.is_some() || self.view.subscriptions.loading {
+        if self.view.search_activity.is_some()
+            || (self.view.subscriptions.loading && !self.view.subscriptions.loading_more)
+        {
             self.view.search_animation_frame = self.view.search_animation_frame.wrapping_add(1);
         }
     }
@@ -6139,6 +6187,17 @@ impl AppController {
             return;
         }
 
+        // The supervisor publishes one shared replacement to both lanes, but
+        // calls that already cloned the old provider may still complete. Bump
+        // every YouTube-owned generation before retrying so those responses
+        // cannot repopulate caches or restore an obsolete continuation chain.
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        self.clear_subscription_loading_state();
+        self.pending_subscription_refresh = None;
+        self.subscription_automatic_prefetch_count = 0;
+        self.subscription_viewport_end = None;
+        self.invalidate_subscription_video_metadata_ownership();
         self.youtube_channel_statistics_mode = channel_statistics_mode;
         self.youtube_provider_generation = self.youtube_provider_generation.wrapping_add(1);
         self.channel_subscriber_cache.clear();
@@ -8848,6 +8907,7 @@ impl AppController {
     }
 
     fn request_selected_details(&mut self) {
+        self.clear_scheduled_subscription_video_metadata();
         self.invalidate_youtube_video_comments_popup();
         self.clear_detail_navigation_history();
         self.previous_detail = None;
@@ -8868,6 +8928,7 @@ impl AppController {
             return;
         }
         self.details_generation = self.details_generation.wrapping_add(1);
+        let generation = self.details_generation;
         let mut detail = preliminary_detail_with_thumbnail_size(
             &selected,
             &self.subscription_tree,
@@ -8879,17 +8940,71 @@ impl AppController {
         self.apply_cached_channel_webpage_to_detail(&mut detail);
         self.view.details = Some(detail);
         if let SearchItem::Video(video) = &selected
+            && self.view.screen == Screen::Subscriptions
+            && let Some(channel_id) = self.active_subscription_channel_id.clone()
+        {
+            let request_details = if self.youtube_provider_available {
+                if let Some(details) = self.cached_youtube_video_details(&video.video_id) {
+                    self.handle_provider_response(ProviderResponse::Details {
+                        generation,
+                        result: Ok(details),
+                    });
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            // Cached orientation can immediately remove a hidden Short and choose a
+            // replacement. Do not schedule the obsolete identity after that update.
+            if generation != self.details_generation
+                || !self.subscription_video_selection_matches(&channel_id, &video.video_id)
+            {
+                return;
+            }
+            #[cfg(feature = "wikidata")]
+            let (wikidata_generation, request_wikidata) = {
+                use crate::providers::wikidata::WikidataExternalKind;
+
+                self.invalidate_wikidata_lookup();
+                let wikidata_generation = self.wikidata_generation;
+                let cached = self.apply_fresh_cached_wikidata(
+                    WikidataExternalKind::YouTubeVideo,
+                    &video.video_id,
+                );
+                if !cached && let Some(details) = self.view.details.as_mut() {
+                    details.wikidata.clear();
+                }
+                (wikidata_generation, !cached)
+            };
+            #[cfg(not(feature = "wikidata"))]
+            self.request_selected_wikidata(&selected);
+            self.schedule_subscription_video_metadata(ScheduledSubscriptionVideoMetadata {
+                generation,
+                channel_id,
+                selected,
+                request_details,
+                #[cfg(feature = "wikidata")]
+                wikidata_generation,
+                #[cfg(feature = "wikidata")]
+                request_wikidata,
+                due_at: Instant::now() + SUBSCRIPTION_VIDEO_METADATA_DEBOUNCE,
+            });
+            return;
+        }
+        if let SearchItem::Video(video) = &selected
             && self.youtube_provider_available
         {
             if let Some(details) = self.cached_youtube_video_details(&video.video_id) {
                 self.handle_provider_response(ProviderResponse::Details {
-                    generation: self.details_generation,
+                    generation,
                     result: Ok(details),
                 });
             } else {
                 self.send_provider_request(
                     ProviderRequest::Details {
-                        generation: self.details_generation,
+                        generation,
                         video_id: video.video_id.clone(),
                     },
                     "Could not load YouTube video details",
@@ -8898,6 +9013,64 @@ impl AppController {
         }
         self.request_selected_channel_subscriber_count(&selected);
         self.request_selected_wikidata(&selected);
+    }
+
+    /// Returns whether the visible subscription still owns an exact video.
+    fn subscription_video_selection_matches(&self, channel_id: &str, video_id: &str) -> bool {
+        self.view.screen == Screen::Subscriptions
+			&& self.active_subscription_channel_id.as_deref() == Some(channel_id)
+			&& self.selected_youtube_item().is_some_and(|selected| {
+				matches!(selected, SearchItem::Video(video) if video.video_id == video_id)
+			})
+    }
+
+    /// Starts optional metadata only after a subscription selection settles.
+    fn request_due_subscription_video_metadata(&mut self, now: Instant) {
+        let Some(mut scheduled) = self.scheduled_subscription_video_metadata.take() else {
+            self.view.subscriptions.metadata_pending = false;
+            return;
+        };
+        self.view.subscriptions.metadata_pending = false;
+        if now < scheduled.due_at {
+            self.schedule_subscription_video_metadata(scheduled);
+            return;
+        }
+        let SearchItem::Video(video) = &scheduled.selected else {
+            return;
+        };
+        if scheduled.generation != self.details_generation
+            || !self.subscription_video_selection_matches(&scheduled.channel_id, &video.video_id)
+        {
+            return;
+        }
+        if self.view.subscriptions.loading {
+            // Channel pages are the foreground interaction. Keep optional
+            // Details/subscriber/Wikidata work out of the general lane until
+            // the next visible page is ready.
+            scheduled.due_at = now + SUBSCRIPTION_VIDEO_METADATA_DEBOUNCE;
+            self.schedule_subscription_video_metadata(scheduled);
+            return;
+        }
+        if scheduled.request_details {
+            self.send_provider_request(
+                ProviderRequest::Details {
+                    generation: scheduled.generation,
+                    video_id: video.video_id.clone(),
+                },
+                "Could not load YouTube video details",
+            );
+        }
+        self.request_selected_channel_subscriber_count(&scheduled.selected);
+        #[cfg(feature = "wikidata")]
+        if scheduled.request_wikidata && scheduled.wikidata_generation == self.wikidata_generation {
+            use crate::providers::wikidata::WikidataExternalKind;
+
+            let _ = self.send_wikidata_request(
+                scheduled.wikidata_generation,
+                WikidataExternalKind::YouTubeVideo,
+                &video.video_id,
+            );
+        }
     }
 
     /// Seeds subscriber counts already present in channel-search results.
@@ -10820,7 +10993,7 @@ impl AppController {
                 {
                     return;
                 }
-                self.view.subscriptions.loading = false;
+                self.clear_subscription_loading_state();
                 let pending = self
                     .pending_rss_subscription_refresh
                     .take()
@@ -10837,7 +11010,7 @@ impl AppController {
                                     &requested_url,
                                 )))
                             })
-                            .take(MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
+                            .take(MAX_CACHED_RSS_SUBSCRIPTION_EPISODES_PER_FEED)
                             .collect::<Vec<_>>();
                         for item in &mut items {
                             compact_subscription_item(item);
@@ -10860,16 +11033,15 @@ impl AppController {
                             &source_url,
                             feed.artwork_url.clone(),
                         );
-                        self.subscription_video_cache.insert(
+                        self.insert_subscription_cache_value(
                             source_url.clone(),
                             CachedSubscriptionVideos {
                                 items,
                                 next_page: None,
                                 consecutive_empty_pages: 0,
+                                limit_reached: false,
                             },
                         );
-                        self.touch_subscription_cache(&source_url);
-                        self.enforce_subscription_cache_byte_budget(&source_url);
                         if let Err(error) = self.persist_rss_subscription_snapshot(&source_url) {
                             self.show_error("Could not save cached podcast episodes", &error);
                         }
@@ -10942,9 +11114,22 @@ impl AppController {
                 {
                     return;
                 }
-                self.view.subscriptions.loading = false;
+                self.clear_subscription_loading_state();
                 match result {
                     Ok(mut page) => {
+                        if request.page == 1
+                            && self
+                                .pending_subscription_refresh
+                                .as_ref()
+                                .is_some_and(|pending| pending.channel_id == request.channel_id)
+                            && let Some(live) =
+                                self.subscription_video_cache.get_mut(&request.channel_id)
+                        {
+                            // A completed replacement page one starts a new opaque-token
+                            // chain. Its result may still fail controller validation, so
+                            // invalidate the old live continuation before inspecting it.
+                            live.next_page = None;
+                        }
                         if page.page != request.page
                             || page.next_page.is_some_and(|next_page| {
                                 request.page.checked_add(1) != Some(next_page) || next_page > 10_000
@@ -10988,6 +11173,26 @@ impl AppController {
                                     if video.duration_seconds == Some(0) && !video.live
                             )
                         });
+                        let received_page_has_visible_item =
+                            youtube_subscription_items_have_visible_video(
+                                &page.items,
+                                self.config.ui.show_youtube_shorts,
+                            );
+                        let live_cache_has_visible_item = self
+                            .subscription_video_cache
+                            .get(&request.channel_id)
+                            .is_some_and(|cached| {
+                                youtube_subscription_items_have_visible_video(
+                                    &cached.items,
+                                    self.config.ui.show_youtube_shorts,
+                                )
+                            });
+                        let selected_media_id_before = self
+                            .view
+                            .subscriptions
+                            .items
+                            .get(self.view.subscriptions.selected_item)
+                            .and_then(|row| row.media_id.clone());
                         let received_page_empty = page.items.is_empty();
                         let stage_refresh =
                             self.pending_subscription_refresh
@@ -10995,7 +11200,8 @@ impl AppController {
                                 .is_some_and(|pending| {
                                     pending.channel_id == request.channel_id
                                         && (pending.staged_cache.is_some()
-                                            || (request.page == 1 && received_page_empty))
+                                            || (request.page == 1
+                                                && !received_page_has_visible_item))
                                 });
                         let persist_snapshot = if stage_refresh {
                             let pending = self
@@ -11006,11 +11212,15 @@ impl AppController {
                                 .staged_cache
                                 .get_or_insert_with(CachedSubscriptionVideos::default);
                             Self::apply_subscription_video_page(staged, page);
-                            let continue_empty_refresh = received_page_empty
-                                && u32::from(staged.consecutive_empty_pages)
-                                    < MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES
+                            let staged_has_visible_item =
+                                youtube_subscription_items_have_visible_video(
+                                    &staged.items,
+                                    self.config.ui.show_youtube_shorts,
+                                );
+                            let continue_filtered_refresh = !staged_has_visible_item
+                                && request.page < MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES
                                 && staged.next_page.is_some();
-                            if continue_empty_refresh {
+                            if continue_filtered_refresh {
                                 let next_page =
                                     staged.next_page.expect("continuation was checked above");
                                 self.view.status_line = format!(
@@ -11023,14 +11233,63 @@ impl AppController {
                                 );
                                 return;
                             }
+                            if !staged_has_visible_item
+                                && !staged.items.is_empty()
+                                && live_cache_has_visible_item
+                            {
+                                if staged.next_page.is_some() {
+                                    // Keep the canonical rows and the staged token separate.
+                                    // The next deliberate navigation gesture resumes this
+                                    // refresh without spending every token on an all-Shorts
+                                    // channel in one uninterrupted chain.
+                                    self.subscription_automatic_prefetch_count =
+                                        MAX_AUTOMATIC_SUBSCRIPTION_PREFETCH_PAGES;
+                                    self.view.status_line = format!(
+                                        "Showing {} cached videos for {}; refresh found only hidden Shorts through page {}; press PageDown or scroll again to continue",
+                                        self.view.subscriptions.items.len(),
+                                        self.view.subscriptions.source_title,
+                                        request.page
+                                    );
+                                    return;
+                                }
+
+                                // Exhaustion or the staged hard limit left no row under the
+                                // current projection. Drop the candidate without replacing
+                                // useful canonical rows or persisting an empty snapshot.
+                                let staged_limit_reached = staged.limit_reached;
+                                self.pending_subscription_refresh = None;
+                                self.view.status_line = if staged_limit_reached {
+                                    format!(
+                                        "Showing {} cached videos for {}; refresh reached its temporary in-memory limit before finding a visible video",
+                                        self.view.subscriptions.items.len(),
+                                        self.view.subscriptions.source_title
+                                    )
+                                } else {
+                                    format!(
+                                        "Showing {} cached videos for {}; refresh found no {}",
+                                        self.view.subscriptions.items.len(),
+                                        self.view.subscriptions.source_title,
+                                        if self.config.ui.show_youtube_shorts {
+                                            "playable videos"
+                                        } else {
+                                            "standard videos"
+                                        }
+                                    )
+                                };
+                                return;
+                            }
+                            if !staged_has_visible_item && staged.next_page.is_some() {
+                                self.subscription_automatic_prefetch_count =
+                                    MAX_AUTOMATIC_SUBSCRIPTION_PREFETCH_PAGES;
+                            }
                             let staged = pending
                                 .staged_cache
                                 .take()
                                 .expect("the refresh cache was initialized above");
-                            self.subscription_video_cache
-                                .insert(request.channel_id.clone(), staged);
-                            self.touch_subscription_cache(&request.channel_id);
-                            self.enforce_subscription_cache_byte_budget(&request.channel_id);
+                            self.insert_subscription_cache_value(
+                                request.channel_id.clone(),
+                                staged,
+                            );
                             true
                         } else {
                             let first_page = request.page == 1;
@@ -11065,11 +11324,8 @@ impl AppController {
                             self.restore_subscription_refresh_selection(&request.channel_id);
                         }
                         let count = self.view.subscriptions.items.len();
-                        self.view.status_line = format!(
-                            "{count} video{} loaded for {}",
-                            if count == 1 { "" } else { "s" },
-                            self.view.subscriptions.source_title
-                        );
+                        self.view.status_line =
+                            self.subscription_video_count_status(&request.channel_id, false);
                         let next_page = self
                             .subscription_video_cache
                             .get(&request.channel_id)
@@ -11099,15 +11355,39 @@ impl AppController {
                                 )
                             };
                         }
+                        if !received_page_empty {
+                            self.load_next_subscription_page_if_needed(Some(request.page));
+                        }
+                        let selected_media_id = self
+                            .view
+                            .subscriptions
+                            .items
+                            .get(self.view.subscriptions.selected_item)
+                            .and_then(|row| row.media_id.clone());
+                        let displayed_media_id = self
+                            .view
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.media_id.clone());
                         if count > 0
                             && (self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
                                 || self.view.subscriptions.focus == SubscriptionPane::Items)
+                            && (selected_media_id_before != selected_media_id
+                                || displayed_media_id != selected_media_id)
                         {
                             self.request_selected_details();
                         }
                         self.refresh_selected_playlist_state();
                     }
                     Err(error) => {
+                        let continuation_failure = request.page > 1;
+                        let staged_refresh_failure = self
+                            .pending_subscription_refresh
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.channel_id == request.channel_id
+                                    && pending.staged_cache.is_some()
+                            });
                         let report_errors = self
                             .pending_subscription_refresh
                             .as_ref()
@@ -11121,7 +11401,26 @@ impl AppController {
                             self.pending_subscription_refresh = None;
                         }
                         if self.view.screen == Screen::Subscriptions {
-                            if report_errors {
+                            if continuation_failure {
+                                self.view.status_line = if staged_refresh_failure {
+                                    format!(
+                                        "Showing cached videos for {}; refresh page {} failed, press R to retry: {error}",
+                                        self.view.subscriptions.source_title, request.page
+                                    )
+                                } else if self.view.subscriptions.items.is_empty() {
+                                    format!(
+                                        "Could not load continuation page {}; press Enter to retry: {error}",
+                                        request.page
+                                    )
+                                } else {
+                                    format!(
+                                        "Showing {} loaded videos for {}; continuation page {} failed, scroll again to retry: {error}",
+                                        self.view.subscriptions.items.len(),
+                                        self.view.subscriptions.source_title,
+                                        request.page
+                                    )
+                                };
+                            } else if report_errors {
                                 self.show_error_message("Subscription videos failed", error);
                             } else {
                                 self.view.status_line = format!(
@@ -11401,25 +11700,36 @@ impl AppController {
                                 .ok();
                             }
                         }
+                        let active_subscription_channel =
+                            self.active_subscription_channel_id.clone();
+                        let mut active_subscription_limit_reached = false;
                         let mut updated_cached_channels = Vec::new();
                         for (channel_id, cached) in &mut self.subscription_video_cache {
-                            let mut channel_updated = false;
-                            for item in &mut cached.items {
-                                if let SearchItem::Video(summary) = item
-                                    && summary.video_id == details.video_id
-                                {
-                                    *summary = compacted_cache_summary.clone();
-                                    channel_updated = true;
-                                }
-                            }
-                            if channel_updated {
+                            let previously_limited = cached.limit_reached;
+                            if Self::apply_subscription_video_summary_with_byte_limit(
+                                cached,
+                                &compacted_cache_summary,
+                                MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL,
+                            ) {
                                 updated_cached_channels.push(channel_id.clone());
                             }
+                            if !previously_limited
+                                && cached.limit_reached
+                                && active_subscription_channel.as_deref()
+                                    == Some(channel_id.as_str())
+                            {
+                                active_subscription_limit_reached = true;
+                            }
                         }
+                        // Linked Details may enrich only an inactive cache. The
+                        // shared budget must still preserve the source whose
+                        // rows are currently visible.
                         let preserved_channel = self
                             .active_subscription_channel_id
                             .clone()
-                            .filter(|channel_id| updated_cached_channels.contains(channel_id))
+                            .filter(|channel_id| {
+                                self.subscription_video_cache.contains_key(channel_id)
+                            })
                             .or_else(|| updated_cached_channels.first().cloned());
                         if let Some(channel_id) = preserved_channel {
                             self.touch_subscription_cache(&channel_id);
@@ -11431,6 +11741,13 @@ impl AppController {
                             self.refresh_youtube_music_rows();
                         } else if self.view.screen == Screen::Subscriptions {
                             self.refresh_subscription_video_rows();
+                            if active_subscription_limit_reached
+                                && let Some(channel_id) =
+                                    self.active_subscription_channel_id.as_deref()
+                            {
+                                self.view.status_line =
+                                    self.subscription_video_count_status(channel_id, false);
+                            }
                         }
                         let selected_matches = self.selected_youtube_item().is_some_and(|item| {
                             matches!(
@@ -16460,7 +16777,7 @@ impl AppController {
             if self.view.subscriptions.focus == SubscriptionPane::Items
                 && self.view.subscriptions.items.is_empty()
             {
-                self.load_next_subscription_page_if_needed();
+                self.load_next_subscription_page_explicitly();
                 if !self.view.subscriptions.loading {
                     self.view.status_line = format!(
                         "This subscription has no loaded playable {}",
@@ -17736,6 +18053,7 @@ impl AppController {
 
     /// Restores one move-only Details location and invalidates stale responses.
     fn restore_detail_navigation_snapshot(&mut self, snapshot: DetailNavigationSnapshot) {
+        self.clear_scheduled_subscription_video_metadata();
         self.invalidate_youtube_video_comments_popup();
         self.details_generation = self.details_generation.wrapping_add(1);
         #[cfg(feature = "wikidata")]
@@ -17798,6 +18116,7 @@ impl AppController {
 
     /// Opens a description-linked `YouTube` video in the existing Details pane.
     fn activate_description_video(&mut self, video_id: String, start_seconds: Option<u64>) {
+        self.clear_scheduled_subscription_video_metadata();
         self.invalidate_youtube_video_comments_popup();
         if let Err(error) = validate_youtube_video_id(&video_id) {
             self.show_error_message("Cannot open description video", error.to_string());
@@ -17985,6 +18304,7 @@ impl AppController {
                 && self.view.subscriptions.route == SubscriptionRoute::Items
             {
                 self.pending_subscription_refresh = None;
+                self.cancel_subscription_item_work_for_navigation();
                 self.view.subscriptions.route = SubscriptionRoute::Sources;
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
@@ -17996,6 +18316,7 @@ impl AppController {
                 && self.view.subscriptions.focus == SubscriptionPane::Items
             {
                 self.pending_subscription_refresh = None;
+                self.cancel_subscription_item_work_for_navigation();
                 self.view.subscriptions.focus = SubscriptionPane::Sources;
                 self.update_selected_subscription_source();
                 self.view.status_line = "Subscription source list focused".to_owned();
@@ -22082,6 +22403,7 @@ impl AppController {
             };
             return;
         }
+        self.clear_scheduled_subscription_video_metadata();
         if self.view.screen == Screen::History && screen != Screen::History {
             self.cancel_pending_history_replay();
         }
@@ -22267,7 +22589,8 @@ impl AppController {
                 // still populate that channel's cache in the background.
                 self.subscription_generation = self.subscription_generation.wrapping_add(1);
             }
-            self.view.subscriptions.loading = false;
+            self.clear_subscription_loading_state();
+            self.clear_scheduled_subscription_video_metadata();
         }
         self.view.details = None;
         self.view.details_focused = false;
@@ -23785,7 +24108,10 @@ impl AppController {
         self.view.subscriptions.route = SubscriptionRoute::Sources;
         self.view.subscriptions.focus = SubscriptionPane::Sources;
         self.view.subscriptions.description_expanded = false;
-        self.view.subscriptions.loading = false;
+        self.clear_subscription_loading_state();
+        self.subscription_automatic_prefetch_count = 0;
+        self.subscription_viewport_end = None;
+        self.invalidate_subscription_video_metadata_ownership();
         self.view.subscriptions.items.clear();
         self.view.subscriptions.selected_item = 0;
         self.active_subscription_channel_id = None;
@@ -23870,6 +24196,10 @@ impl AppController {
         else {
             self.view.details = None;
             self.view.subscriptions.source_title.clear();
+            if self.subscription_source_owner_id.take().is_some() {
+                self.view.subscriptions.source_generation =
+                    self.view.subscriptions.source_generation.wrapping_add(1);
+            }
             self.view.subscriptions.source_subscriber_count = None;
             self.view.subscriptions.source_created.clear();
             return;
@@ -23877,6 +24207,20 @@ impl AppController {
         let subscription = entry.subscription;
         self.view.subscriptions.source_kind = subscription.kind;
         let channel_id = subscription.youtube_channel_id().unwrap_or_default();
+        let source_owner_id = if channel_id.is_empty() {
+            format!(
+                "{}:{}",
+                subscription_kind_label(subscription.kind),
+                subscription.url
+            )
+        } else {
+            format!("youtube:{channel_id}")
+        };
+        if self.subscription_source_owner_id.as_deref() != Some(source_owner_id.as_str()) {
+            self.subscription_source_owner_id = Some(source_owner_id);
+            self.view.subscriptions.source_generation =
+                self.view.subscriptions.source_generation.wrapping_add(1);
+        }
         let channel_webpage_url = (subscription.kind == SubscriptionKind::YouTube)
             .then(|| {
                 self.cached_channel_webpage_url(&channel_id).or_else(|| {
@@ -23969,13 +24313,25 @@ impl AppController {
         if index >= self.subscription_entries.len() {
             return;
         }
+        if index == self.view.subscriptions.selected_source {
+            // Clamped PageUp/PageDown and a second pointer click mean "focus
+            // this pane", not "reopen this source". Reopening would discard
+            // the Items selection and virtual scroll position for no identity
+            // change.
+            self.focus_subscription_pane(SubscriptionPane::Sources);
+            self.refresh_selected_playlist_state();
+            return;
+        }
         #[cfg(feature = "yt-dlp")]
         self.cancel_youtube_prewarm();
         self.view.subscriptions.selected_source = index;
         self.view.subscriptions.selected_item = 0;
         self.view.subscriptions.description_expanded = false;
         self.view.subscriptions.focus = SubscriptionPane::Sources;
-        self.view.subscriptions.loading = false;
+        self.clear_subscription_loading_state();
+        self.subscription_automatic_prefetch_count = 0;
+        self.subscription_viewport_end = None;
+        self.invalidate_subscription_video_metadata_ownership();
         self.view.subscriptions.items.clear();
         self.view.selected_detail_link = None;
         self.active_subscription_channel_id = None;
@@ -24046,16 +24402,7 @@ impl AppController {
         if self.subscription_video_cache.contains_key(&channel_id) {
             self.touch_subscription_cache(&channel_id);
             self.refresh_subscription_video_rows();
-            self.view.status_line = format!(
-                "{} cached video{} for {}",
-                self.view.subscriptions.items.len(),
-                if self.view.subscriptions.items.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                self.view.subscriptions.source_title
-            );
+            self.view.status_line = self.subscription_video_count_status(&channel_id, true);
         } else {
             self.view.status_line = format!(
                 "Press Enter to load videos for {}",
@@ -24064,25 +24411,128 @@ impl AppController {
         }
     }
 
+    /// Formats one YouTube cache count without hiding a local terminal limit.
+    fn subscription_video_count_status(&self, channel_id: &str, cached: bool) -> String {
+        let count = self.view.subscriptions.items.len();
+        let limit_reached = self
+            .subscription_video_cache
+            .get(channel_id)
+            .is_some_and(|videos| videos.limit_reached);
+        let state = if cached { "cached" } else { "loaded" };
+        if limit_reached {
+            format!(
+                "{count} {state} videos for {}; in-memory channel limit reached",
+                self.view.subscriptions.source_title
+            )
+        } else {
+            format!(
+                "{count} {state} video{} for {}",
+                if count == 1 { "" } else { "s" },
+                self.view.subscriptions.source_title
+            )
+        }
+    }
+
     fn select_subscription_item(&mut self, index: usize) {
         if index >= self.view.subscriptions.items.len() {
             return;
         }
+        let previous_media_id = self
+            .view
+            .subscriptions
+            .items
+            .get(self.view.subscriptions.selected_item)
+            .and_then(|row| row.media_id.clone());
+        let item_pane_was_active = self.view.subscriptions.focus == SubscriptionPane::Items
+            && (self.view.subscriptions.layout == SubscriptionsLayout::Split
+                || self.view.subscriptions.route == SubscriptionRoute::Items)
+            && self.view.right_panel_mode == RightPanelMode::Details;
         self.view.subscriptions.selected_item = index;
+        let selected_media_id = self
+            .view
+            .subscriptions
+            .items
+            .get(index)
+            .and_then(|row| row.media_id.clone());
         self.view.selected_detail_link = None;
         self.rebase_pending_subscription_refresh_selection();
         self.view.subscriptions.focus = SubscriptionPane::Items;
         self.view.right_panel_mode = RightPanelMode::Details;
-        if matches!(
-            self.selected_subscription_item(),
-            Some(SearchItem::PodcastEpisode(_))
-        ) {
-            self.update_selected_rss_episode_detail();
-        } else {
-            self.request_selected_details();
+        self.view.details_focused = false;
+        self.subscription_automatic_prefetch_count = 0;
+        // Pagination is foreground list work. Queue it before optional metadata so
+        // the provider worker prepares the next screen first.
+        self.load_next_subscription_page_if_needed(None);
+        if !item_pane_was_active || previous_media_id != selected_media_id {
+            if matches!(
+                self.selected_subscription_item(),
+                Some(SearchItem::PodcastEpisode(_))
+            ) {
+                self.update_selected_rss_episode_detail();
+            } else {
+                self.request_selected_details();
+            }
         }
-        self.load_next_subscription_page_if_needed();
         self.refresh_selected_playlist_state();
+    }
+
+    /// Gives pointer-driven paging to one visible Subscriptions pane.
+    fn focus_subscription_pane(&mut self, pane: SubscriptionPane) {
+        if self.view.screen != Screen::Subscriptions {
+            return;
+        }
+        let visible = match (self.view.subscriptions.layout, pane) {
+            (SubscriptionsLayout::Split, _) => true,
+            (SubscriptionsLayout::DrillDown, SubscriptionPane::Sources) => {
+                self.view.subscriptions.route == SubscriptionRoute::Sources
+            }
+            (SubscriptionsLayout::DrillDown, SubscriptionPane::Items) => {
+                self.view.subscriptions.route == SubscriptionRoute::Items
+            }
+        };
+        if !visible {
+            return;
+        }
+        if pane == SubscriptionPane::Sources {
+            self.view.subscriptions.description_expanded = false;
+        }
+        if self.view.subscriptions.focus != pane {
+            match pane {
+                SubscriptionPane::Sources => {
+                    self.invalidate_subscription_video_metadata_ownership();
+                    self.view.subscriptions.focus = SubscriptionPane::Sources;
+                    self.update_selected_subscription_source();
+                }
+                SubscriptionPane::Items if !self.view.subscriptions.items.is_empty() => {
+                    self.select_subscription_item(self.view.subscriptions.selected_item);
+                    return;
+                }
+                SubscriptionPane::Items => {
+                    self.view.subscriptions.focus = SubscriptionPane::Items;
+                }
+            }
+        }
+        self.view.details_focused = false;
+    }
+
+    /// Keeps a continuation ready beyond the desktop viewport without moving selection.
+    fn prefetch_subscription_videos_through(&mut self, visible_end: usize) {
+        if self.view.screen != Screen::Subscriptions
+            || self.view.subscriptions.source_kind != SubscriptionKind::YouTube
+            || self.view.subscriptions.focus != SubscriptionPane::Items
+            || self.active_subscription_channel_id.is_none()
+            || self.view.subscriptions.items.is_empty()
+            || (self.view.subscriptions.layout == SubscriptionsLayout::DrillDown
+                && self.view.subscriptions.route != SubscriptionRoute::Items)
+        {
+            return;
+        }
+        self.subscription_viewport_end =
+            Some(visible_end.min(self.view.subscriptions.items.len().saturating_sub(1)));
+        if !self.view.subscriptions.loading {
+            self.subscription_automatic_prefetch_count = 0;
+            self.load_next_subscription_page_if_needed(None);
+        }
     }
 
     /// Makes an in-flight refresh restore the selection currently projected.
@@ -24106,6 +24556,46 @@ impl AppController {
             pending.selected_video_id = selected_video_id;
             pending.fallback_index = fallback_index;
         }
+    }
+
+    /// Clears both the general and continuation-specific loading indicators.
+    fn clear_subscription_loading_state(&mut self) {
+        self.view.subscriptions.loading = false;
+        self.view.subscriptions.loading_more = false;
+    }
+
+    /// Clears the deferred metadata owner and its front-end wakeup signal.
+    fn clear_scheduled_subscription_video_metadata(&mut self) {
+        self.scheduled_subscription_video_metadata = None;
+        self.view.subscriptions.metadata_pending = false;
+    }
+
+    /// Publishes one deferred metadata owner and requests a bounded UI wakeup.
+    fn schedule_subscription_video_metadata(
+        &mut self,
+        scheduled: ScheduledSubscriptionVideoMetadata,
+    ) {
+        self.scheduled_subscription_video_metadata = Some(scheduled);
+        self.view.subscriptions.metadata_pending = true;
+    }
+
+    /// Rejects queued metadata responses after the subscription item loses ownership.
+    fn invalidate_subscription_video_metadata_ownership(&mut self) {
+        self.details_generation = self.details_generation.wrapping_add(1);
+        self.clear_scheduled_subscription_video_metadata();
+        #[cfg(feature = "wikidata")]
+        self.invalidate_wikidata_lookup();
+    }
+
+    /// Invalidates an item-page response after its visible route is abandoned.
+    fn cancel_subscription_item_work_for_navigation(&mut self) {
+        if self.view.subscriptions.loading {
+            self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        }
+        self.clear_subscription_loading_state();
+        self.subscription_automatic_prefetch_count = 0;
+        self.subscription_viewport_end = None;
+        self.invalidate_subscription_video_metadata_ownership();
     }
 
     fn load_selected_subscription_videos(&mut self) {
@@ -24198,16 +24688,15 @@ impl AppController {
                 episode.stream_url = None;
             }
         }
-        self.subscription_video_cache.insert(
+        self.insert_subscription_cache_value(
             source_url.to_owned(),
             CachedSubscriptionVideos {
                 items: snapshot.items,
                 next_page: None,
                 consecutive_empty_pages: 0,
+                limit_reached: false,
             },
         );
-        self.touch_subscription_cache(source_url);
-        self.enforce_subscription_cache_byte_budget(source_url);
     }
 
     /// Replaces the restart snapshot with current compact RSS episodes.
@@ -24260,9 +24749,11 @@ impl AppController {
             },
             "Could not load podcast episodes",
         ) {
+            self.clear_subscription_loading_state();
             return;
         }
         self.view.subscriptions.loading = true;
+        self.view.subscriptions.loading_more = false;
         self.view.status_line = format!(
             "Loading episodes for {}…",
             self.view.subscriptions.source_title
@@ -24308,6 +24799,7 @@ impl AppController {
 
     /// Rebuilds Details directly from the selected RSS episode summary.
     fn update_selected_rss_episode_detail(&mut self) {
+        self.clear_scheduled_subscription_video_metadata();
         #[cfg(feature = "rss")]
         {
             let Some(SearchItem::PodcastEpisode(episode)) =
@@ -24353,16 +24845,15 @@ impl AppController {
                 video.stream_url = None;
             }
         }
-        self.subscription_video_cache.insert(
+        self.insert_subscription_cache_value(
             channel_id.to_owned(),
             CachedSubscriptionVideos {
                 items: snapshot.items,
                 next_page: None,
                 consecutive_empty_pages: 0,
+                limit_reached: false,
             },
         );
-        self.touch_subscription_cache(channel_id);
-        self.enforce_subscription_cache_byte_budget(channel_id);
     }
 
     /// Replaces the restart snapshot with the current compact first page.
@@ -24398,12 +24889,16 @@ impl AppController {
 
     /// Queues one guarded sequential channel page and marks the pane loading.
     fn request_subscription_videos(&mut self, channel_id: String, page: u32) {
+        if page == 1 {
+            self.subscription_automatic_prefetch_count = 0;
+        }
         let report_errors = self
             .pending_subscription_refresh
             .as_ref()
             .filter(|pending| pending.channel_id == channel_id)
             .is_none_or(|pending| pending.report_errors);
         if !self.youtube_provider_available {
+            self.clear_subscription_loading_state();
             if report_errors {
                 self.open_youtube_setup();
             } else {
@@ -24432,6 +24927,7 @@ impl AppController {
                 .is_some_and(|sender| sender.send(provider_request).is_ok())
         };
         if !sent {
+            self.clear_subscription_loading_state();
             if !report_errors {
                 self.view.status_line = format!(
                     "Showing cached videos for {}; background refresh is unavailable",
@@ -24442,6 +24938,7 @@ impl AppController {
             return;
         }
         self.view.subscriptions.loading = true;
+        self.view.subscriptions.loading_more = page > 1;
         self.view.status_line = format!(
             "Loading videos for {}…",
             self.view.subscriptions.source_title
@@ -24452,7 +24949,8 @@ impl AppController {
     ///
     /// The current video identity remains visible while the provider works and
     /// is restored after replacement when the refreshed page still contains
-    /// it. A second request is ignored until the first one completes.
+    /// it. An explicit refresh supersedes speculative continuation work, while
+    /// a second page-one request is ignored until the first one completes.
     fn refresh_selected_subscription_videos(&mut self) {
         #[cfg(feature = "rss")]
         if self.active_subscription_rss_url.is_some() {
@@ -24476,10 +24974,17 @@ impl AppController {
             return;
         }
         if self.view.subscriptions.loading {
-            if report_errors {
-                self.view.status_line = "Subscription videos are already loading".to_owned();
+            if report_errors && self.view.subscriptions.loading_more {
+                // Page-one refresh is an explicit replacement. Advancing the
+                // generation below makes any queued or active continuation
+                // response stale without trying to cancel blocking I/O.
+                self.clear_subscription_loading_state();
+            } else {
+                if report_errors {
+                    self.view.status_line = "Subscription videos are already loading".to_owned();
+                }
+                return;
             }
-            return;
         }
         let Some(channel_id) = self.active_subscription_channel_id.clone() else {
             if report_errors {
@@ -24547,24 +25052,125 @@ impl AppController {
         self.view.subscriptions.selected_item = selected;
     }
 
-    /// Loads the next page near the visible end or after empty-list Enter.
-    fn load_next_subscription_page_if_needed(&mut self) {
-        if self.view.subscriptions.loading
-            || self.view.subscriptions.selected_item.saturating_add(2)
-                < self.view.subscriptions.items.len()
+    /// Promotes a staged refresh once the current Shorts projection can show it.
+    fn promote_visible_staged_subscription_refresh(&mut self, channel_id: &str) -> bool {
+        let show_youtube_shorts = self.config.ui.show_youtube_shorts;
+        let staged = self
+            .pending_subscription_refresh
+            .as_mut()
+            .filter(|pending| pending.channel_id == channel_id)
+            .and_then(|pending| {
+                let visible = pending.staged_cache.as_ref().is_some_and(|staged| {
+                    youtube_subscription_items_have_visible_video(
+                        &staged.items,
+                        show_youtube_shorts,
+                    )
+                });
+                visible.then(|| pending.staged_cache.take()).flatten()
+            });
+        let Some(staged) = staged else {
+            return false;
+        };
+
+        self.insert_subscription_cache_value(channel_id.to_owned(), staged);
+        if let Err(error) = self.persist_subscription_video_snapshot(channel_id)
+            && self.view.screen == Screen::Subscriptions
         {
-            return;
+            self.show_error("Could not save cached subscription videos", &error);
+        }
+        self.refresh_subscription_video_rows();
+        self.restore_subscription_refresh_selection(channel_id);
+        true
+    }
+
+    /// Prefetches one page when fewer than one official page follows selection.
+    ///
+    /// Page one is special-cased so the first continuation is ready before a
+    /// typical PageDown. Later decisions use the Shorts-filtered visible rows so
+    /// hidden pages cannot strand standard videos. Each selection gesture owns a
+    /// small fixed speculative budget, preventing an all-Shorts channel from
+    /// recursively loading every provider page.
+    fn load_next_subscription_page_if_needed(&mut self, just_loaded_page: Option<u32>) -> bool {
+        if self.view.subscriptions.loading {
+            return false;
         }
         let Some(channel_id) = self.active_subscription_channel_id.clone() else {
-            return;
+            return false;
         };
-        let next_page = self
-            .subscription_video_cache
-            .get(&channel_id)
-            .and_then(|cached| cached.next_page);
-        if let Some(page) = next_page {
-            self.request_subscription_videos(channel_id, page);
+        let staged_cache = self
+            .pending_subscription_refresh
+            .as_ref()
+            .filter(|pending| pending.channel_id == channel_id)
+            .and_then(|pending| pending.staged_cache.as_ref());
+        let staged_continuation = staged_cache.is_some();
+        let next_page = staged_cache.map_or_else(
+            || {
+                self.subscription_video_cache
+                    .get(&channel_id)
+                    .and_then(|cached| cached.next_page)
+            },
+            |staged| staged.next_page,
+        );
+        let Some(next_page) = next_page else {
+            return false;
+        };
+        let first_continuation = just_loaded_page == Some(1) && next_page == 2;
+        let visible_items = self.view.subscriptions.items.len();
+        let lookahead_index = self
+            .subscription_viewport_end
+            .unwrap_or(self.view.subscriptions.selected_item)
+            .max(self.view.subscriptions.selected_item);
+        let selection_needs_lookahead = if visible_items == 0 {
+            just_loaded_page.is_some()
+        } else {
+            lookahead_index.saturating_add(YOUTUBE_SUBSCRIPTION_PAGE_ROWS) >= visible_items
+        };
+        if !staged_continuation && !first_continuation && !selection_needs_lookahead {
+            return false;
         }
+        if self.subscription_automatic_prefetch_count >= MAX_AUTOMATIC_SUBSCRIPTION_PREFETCH_PAGES {
+            self.view.status_line.push_str(if visible_items == 0 {
+                "; press Enter to load more"
+            } else {
+                "; press PageDown or scroll again to load more"
+            });
+            return false;
+        }
+        self.request_subscription_videos(channel_id, next_page);
+        if self.view.subscriptions.loading {
+            self.subscription_automatic_prefetch_count =
+                self.subscription_automatic_prefetch_count.saturating_add(1);
+        }
+        self.view.subscriptions.loading
+    }
+
+    /// Requests a retained continuation after the user explicitly presses Enter.
+    fn load_next_subscription_page_explicitly(&mut self) -> bool {
+        if self.view.subscriptions.loading {
+            return false;
+        }
+        let Some(channel_id) = self.active_subscription_channel_id.clone() else {
+            return false;
+        };
+        let staged_cache = self
+            .pending_subscription_refresh
+            .as_ref()
+            .filter(|pending| pending.channel_id == channel_id)
+            .and_then(|pending| pending.staged_cache.as_ref());
+        let next_page = staged_cache.map_or_else(
+            || {
+                self.subscription_video_cache
+                    .get(&channel_id)
+                    .and_then(|cached| cached.next_page)
+            },
+            |staged| staged.next_page,
+        );
+        let Some(next_page) = next_page else {
+            return false;
+        };
+        self.subscription_automatic_prefetch_count = 0;
+        self.request_subscription_videos(channel_id, next_page);
+        self.view.subscriptions.loading
     }
 
     /// Replaces page one or appends a later page within the per-channel cap.
@@ -24573,16 +25179,7 @@ impl AppController {
     /// channels. Empty pages retain their continuation because private videos
     /// can otherwise hide a later playable page.
     fn cache_subscription_video_page(&mut self, channel_id: &str, page: SearchPage) {
-        if page.page == 1 && !self.subscription_video_cache.contains_key(channel_id) {
-            while self.subscription_video_cache.len() >= MAX_CACHED_SUBSCRIPTION_CHANNELS {
-                let Some(oldest) = self.subscription_cache_order.pop_front() else {
-                    break;
-                };
-                if oldest != channel_id {
-                    self.subscription_video_cache.remove(&oldest);
-                }
-            }
-        }
+        self.prepare_subscription_cache_insert(channel_id);
         let cached = self
             .subscription_video_cache
             .entry(channel_id.to_owned())
@@ -24592,27 +25189,103 @@ impl AppController {
         self.enforce_subscription_cache_byte_budget(channel_id);
     }
 
-    /// Applies one validated sequential page to a bounded cache value.
+    /// Applies one validated sequential YouTube page to a bounded cache value.
+    ///
+    /// Both the item count and the conservative owned-heap estimate are hard
+    /// per-channel limits. Reaching either records an explicit terminal state so
+    /// the UI can distinguish local bounding from provider exhaustion.
     fn apply_subscription_video_page(cached: &mut CachedSubscriptionVideos, mut page: SearchPage) {
         if page.page == 1 {
             cached.items.clear();
+            cached.items.shrink_to_fit();
             cached.consecutive_empty_pages = 0;
+            cached.limit_reached = false;
         }
         for item in &mut page.items {
             compact_subscription_item(item);
         }
-        let remaining =
-            MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL.saturating_sub(cached.items.len());
         let page_is_empty = page.items.is_empty();
-        cached.items.extend(page.items.into_iter().take(remaining));
+        let provider_has_more = page.next_page.is_some();
+        let mut omitted_items = false;
+        for item in page.items {
+            if cached.items.len() >= MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL {
+                omitted_items = true;
+                break;
+            }
+            cached.items.push(item);
+            if cached.estimated_heap_bytes() > MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL {
+                cached.items.pop();
+                cached.items.shrink_to_fit();
+                omitted_items = true;
+                break;
+            }
+        }
         cached.consecutive_empty_pages = if page_is_empty {
             cached.consecutive_empty_pages.saturating_add(1)
         } else {
             0
         };
-        cached.next_page = (cached.items.len() < MAX_CACHED_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
-            .then_some(page.next_page)
-            .flatten();
+        let count_ceiling_reached =
+            cached.items.len() >= MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL;
+        let byte_ceiling_reached =
+            cached.estimated_heap_bytes() >= MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL;
+        cached.limit_reached =
+            omitted_items || ((count_ceiling_reached || byte_ceiling_reached) && provider_has_more);
+        cached.next_page = (!cached.limit_reached).then_some(page.next_page).flatten();
+    }
+
+    /// Replaces matching cached summaries without crossing an owned-heap ceiling.
+    ///
+    /// Full Details remains visible even when the compact enrichment cannot fit;
+    /// the prior playable summary stays cached and pagination becomes explicitly
+    /// terminal instead of silently growing past the channel's RAM contract.
+    fn apply_subscription_video_summary_with_byte_limit(
+        cached: &mut CachedSubscriptionVideos,
+        replacement: &VideoSummary,
+        maximum_bytes: usize,
+    ) -> bool {
+        let mut changed = false;
+        if cached.estimated_heap_bytes() > maximum_bytes {
+            cached.items.shrink_to_fit();
+        }
+        // Defensive recovery handles an oversized persisted or legacy cache. New
+        // provider pages are bounded during insertion, so this tail trimming is
+        // exceptional and keeps the hard per-channel contract true on enrichment.
+        while cached.estimated_heap_bytes() > maximum_bytes && !cached.items.is_empty() {
+            cached.items.pop();
+            cached.items.shrink_to_fit();
+            changed = true;
+        }
+        if changed {
+            cached.limit_reached = true;
+            cached.next_page = None;
+        }
+        let mut estimated_bytes = cached.estimated_heap_bytes();
+        let replacement_item = SearchItem::Video(replacement.clone());
+        let replacement_bytes = subscription_item_estimated_heap_bytes(&replacement_item);
+        for item in &mut cached.items {
+            let previous_bytes = subscription_item_estimated_heap_bytes(item);
+            let SearchItem::Video(summary) = item else {
+                continue;
+            };
+            if summary.video_id != replacement.video_id {
+                continue;
+            }
+            let prospective_bytes = estimated_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(replacement_bytes);
+            if prospective_bytes <= maximum_bytes {
+                *summary = replacement.clone();
+                estimated_bytes = prospective_bytes;
+                changed = true;
+            } else {
+                let previous_limit_reached = cached.limit_reached;
+                let previous_next_page = cached.next_page.take();
+                cached.limit_reached = true;
+                changed |= !previous_limit_reached || previous_next_page.is_some();
+            }
+        }
+        changed
     }
 
     /// Evicts least-recently-used channels until the shared byte budget holds.
@@ -24649,6 +25322,38 @@ impl AppController {
             .push_back(channel_id.to_owned());
     }
 
+    /// Reserves one bounded LRU slot before any subscription-source ingress.
+    fn prepare_subscription_cache_insert(&mut self, source_id: &str) {
+        if self.subscription_video_cache.contains_key(source_id) {
+            return;
+        }
+        while self.subscription_video_cache.len() >= MAX_CACHED_SUBSCRIPTION_CHANNELS {
+            let oldest = self.subscription_cache_order.pop_front().or_else(|| {
+                self.subscription_video_cache
+                    .keys()
+                    .find(|cached| cached.as_str() != source_id)
+                    .cloned()
+            });
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.subscription_video_cache.remove(&oldest);
+        }
+    }
+
+    /// Inserts or replaces one source and applies both cache bounds centrally.
+    fn insert_subscription_cache_value(
+        &mut self,
+        source_id: String,
+        cached: CachedSubscriptionVideos,
+    ) {
+        self.prepare_subscription_cache_insert(&source_id);
+        self.subscription_video_cache
+            .insert(source_id.clone(), cached);
+        self.touch_subscription_cache(&source_id);
+        self.enforce_subscription_cache_byte_budget(&source_id);
+    }
+
     fn refresh_subscription_video_rows(&mut self) {
         let previous_selected_index = self.view.subscriptions.selected_item;
         let selected_media_id = self
@@ -24674,10 +25379,10 @@ impl AppController {
             .get(active_source_id.unwrap_or_default())
             .map_or(&[][..], |cached| cached.items.as_slice());
         self.view.subscriptions.show_youtube_shorts = self.config.ui.show_youtube_shorts;
-        let rows = items
+        let mut rows = items
             .iter()
             .filter_map(|item| {
-                let row = row_from_search_item_with_thumbnail_size(
+                let row = row_from_search_item_without_progress_with_thumbnail_size(
                     item,
                     &self.store,
                     &self.subscription_tree,
@@ -24689,6 +25394,7 @@ impl AppController {
                 (self.config.ui.show_youtube_shorts || !row.vertical).then_some(row)
             })
             .collect::<Vec<_>>();
+        hydrate_row_playback_progress(&self.store, &mut rows);
         let preserved_selected_item = selected_media_id.as_ref().and_then(|media_id| {
             rows.iter()
                 .position(|row| row.media_id.as_ref() == Some(media_id))
@@ -24698,6 +25404,10 @@ impl AppController {
         let selected_was_hidden = selected_media_id.is_some() && preserved_selected_item.is_none();
         self.view.subscriptions.items = rows;
         self.view.subscriptions.selected_item = selected_item;
+        self.subscription_viewport_end = self
+            .subscription_viewport_end
+            .map(|index| index.min(self.view.subscriptions.items.len().saturating_sub(1)))
+            .filter(|_| !self.view.subscriptions.items.is_empty());
         if selected_was_hidden && self.view.right_panel_mode == RightPanelMode::Details {
             self.view.details = None;
             self.view.selected_detail_link = None;
@@ -27407,8 +28117,17 @@ impl AppController {
         // with unrelated Details even when the selected media itself survives.
         self.detail_navigation_back.clear();
         self.detail_navigation_forward.clear();
-        self.refresh_subscription_video_rows();
-        self.rebase_pending_subscription_refresh_selection();
+        let promoted_staged_refresh = show_youtube_shorts
+            && self
+                .active_subscription_channel_id
+                .clone()
+                .is_some_and(|channel_id| {
+                    self.promote_visible_staged_subscription_refresh(&channel_id)
+                });
+        if !promoted_staged_refresh {
+            self.refresh_subscription_video_rows();
+            self.rebase_pending_subscription_refresh_selection();
+        }
         let selected_media_id = self
             .view
             .subscriptions
@@ -29053,6 +29772,12 @@ impl UiController for AppController {
             UiAction::SelectSubscriptionItem(index) => {
                 self.select_subscription_item(index);
             }
+            UiAction::FocusSubscriptionPane(pane) => {
+                self.focus_subscription_pane(pane);
+            }
+            UiAction::PrefetchSubscriptionVideosThrough(index) => {
+                self.prefetch_subscription_videos_through(index);
+            }
             UiAction::ToggleSubscriptionDescription => {
                 self.toggle_subscription_description();
             }
@@ -29061,6 +29786,10 @@ impl UiController for AppController {
             }
             UiAction::RefreshSubscriptionVideos => {
                 self.refresh_selected_subscription_videos();
+                // The explicit command starts page one first. Only then may
+                // focusing Items evaluate speculative continuation, which the
+                // loading guard will reject until the refresh completes.
+                self.focus_subscription_pane(SubscriptionPane::Items);
             }
             UiAction::OpenDroppedPaths(paths) => self.open_dropped_paths(paths),
         }
@@ -29184,7 +29913,8 @@ impl UiController for AppController {
                 Err(TryRecvError::Disconnected) => {
                     self.clear_search_activity();
                     self.pending_subscription_refresh = None;
-                    self.view.subscriptions.loading = false;
+                    self.clear_subscription_loading_state();
+                    self.clear_scheduled_subscription_video_metadata();
                     if !self.provider_disconnect_reported {
                         self.provider_disconnect_reported = true;
                         self.show_error_message(
@@ -29207,6 +29937,7 @@ impl UiController for AppController {
         self.revalidate_displayed_local_audio_quality(now);
         #[cfg(feature = "acoustid")]
         self.revalidate_displayed_local_fingerprint(now);
+        self.request_due_subscription_video_metadata(now);
         self.request_due_channel_details(now);
         #[cfg(feature = "wikidata")]
         self.request_due_channel_wikidata(now);
@@ -30030,13 +30761,6 @@ fn remap_local_autoplay_origin(origin: &mut AutoplayOrigin, mappings: &[LocalMov
 /// Each lane has capacity one. The cloned receiver removes only work that its
 /// worker has not accepted, so repeated UI actions retain the newest request
 /// without accumulating an unbounded shutdown backlog.
-#[cfg(any(
-    feature = "apple-podcasts",
-    feature = "bandcamp",
-    feature = "librivox",
-    feature = "rss",
-    feature = "youtube-music"
-))]
 fn replace_latest_provider_request<T>(
     sender: &Sender<T>,
     pending: &Receiver<T>,
@@ -30986,6 +31710,163 @@ fn yandex_music_download_batch_worker(
     });
 }
 
+/// Provider and monotonically changing ownership epoch shared by worker lanes.
+struct YouTubeProviderState {
+    epoch: u64,
+    provider: Option<Arc<dyn Provider>>,
+}
+
+/// Provider state shared by independently scheduled YouTube worker lanes.
+type SharedYouTubeProvider = Arc<RwLock<YouTubeProviderState>>;
+
+/// Routing-time provider ownership retained by one YouTube request.
+#[derive(Clone)]
+struct YouTubeProviderSnapshot {
+    epoch: u64,
+    provider: Option<Arc<dyn Provider>>,
+}
+
+/// One request queued for the serial general-provider worker.
+struct GeneralProviderRequest {
+    request: ProviderRequest,
+    /// Present only for requests implemented by the replaceable provider.
+    youtube_provider: Option<YouTubeProviderSnapshot>,
+}
+
+/// One foreground channel page routed to the latest-only pagination lane.
+struct YouTubePaginationRequest {
+    generation: u64,
+    request: ChannelVideosRequest,
+    youtube_provider: YouTubeProviderSnapshot,
+}
+
+/// Child worker whose unexpected exit changes supervisor availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderChildWorker {
+    General,
+    YouTubePagination,
+}
+
+const YOUTUBE_PROVIDER_CHANGED_ERROR: &str =
+    "YouTube provider changed before the queued request started";
+
+/// Returns the current provider and ownership epoch without retaining the lock.
+fn youtube_provider_snapshot(provider: &SharedYouTubeProvider) -> YouTubeProviderSnapshot {
+    let state = provider
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    YouTubeProviderSnapshot {
+        epoch: state.epoch,
+        provider: state.provider.clone(),
+    }
+}
+
+/// Reports whether queued work still belongs to the published provider.
+fn youtube_provider_snapshot_is_current(
+    provider: &SharedYouTubeProvider,
+    snapshot: &YouTubeProviderSnapshot,
+) -> bool {
+    provider
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .epoch
+        == snapshot.epoch
+}
+
+/// Atomically publishes a replacement to both YouTube request lanes.
+fn replace_shared_youtube_provider(
+    provider: &SharedYouTubeProvider,
+    replacement: Box<dyn Provider>,
+) {
+    let mut state = provider
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.epoch = state.epoch.wrapping_add(1);
+    state.provider = Some(Arc::from(replacement));
+}
+
+/// Executes one page against its routing-time provider snapshot.
+fn load_youtube_channel_page(
+    snapshot: &YouTubeProviderSnapshot,
+    request: &ChannelVideosRequest,
+) -> Result<SearchPage, String> {
+    snapshot.provider.as_ref().map_or_else(
+        || Err("YouTube provider is not configured".to_owned()),
+        |provider| {
+            provider
+                .channel_videos(request)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// Identifies requests implemented by the replaceable YouTube provider.
+fn provider_request_uses_youtube_provider(request: &ProviderRequest) -> bool {
+    matches!(
+        request,
+        ProviderRequest::Search { .. }
+            | ProviderRequest::ChannelVideos { .. }
+            | ProviderRequest::Details { .. }
+            | ProviderRequest::VideoComments { .. }
+            | ProviderRequest::ChannelDetails { .. }
+            | ProviderRequest::ChannelSubscriberCounts { .. }
+    )
+}
+
+/// Runs serial channel pages independently from optional provider metadata.
+fn youtube_pagination_worker(
+    provider: SharedYouTubeProvider,
+    requests: Receiver<YouTubePaginationRequest>,
+    responses: Sender<ProviderResponse>,
+    stopping: Arc<AtomicBool>,
+) {
+    while let Ok(work) = requests.recv() {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        if !youtube_provider_snapshot_is_current(&provider, &work.youtube_provider) {
+            if responses
+                .send(ProviderResponse::ChannelVideos {
+                    generation: work.generation,
+                    request: work.request,
+                    result: Err(YOUTUBE_PROVIDER_CHANGED_ERROR.to_owned()),
+                })
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_youtube_channel_page(&work.youtube_provider, &work.request)
+        }));
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                Err("YouTube pagination worker panicked while loading the channel page".to_owned())
+            }
+        };
+        if responses
+            .send(ProviderResponse::ChannelVideos {
+                generation: work.generation,
+                request: work.request,
+                result,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Supervises independent foreground pagination and general provider lanes.
+///
+/// The controller-facing request and response channels remain unchanged. This
+/// router applies provider replacement once, coalesces only queued channel
+/// pages, and signals both children before waiting for either during shutdown.
 fn provider_worker(
     provider: Option<Box<dyn Provider>>,
     requests: Receiver<ProviderRequest>,
@@ -31000,7 +31881,213 @@ fn provider_worker(
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
     provider_storage_root: PathBuf,
 ) {
-    let mut provider = provider;
+    let provider = Arc::new(RwLock::new(YouTubeProviderState {
+        epoch: 0,
+        provider: provider.map(Arc::<dyn Provider>::from),
+    }));
+    let (child_exit_sender, child_exits) = unbounded();
+
+    let (pagination_sender, pagination_receiver) = bounded(1);
+    let pagination_pending = pagination_receiver.clone();
+    let pagination_stopping = Arc::new(AtomicBool::new(false));
+    let pagination_thread = {
+        let provider = Arc::clone(&provider);
+        let responses = responses.clone();
+        let stopping = Arc::clone(&pagination_stopping);
+        let child_exit_sender = child_exit_sender.clone();
+        thread::Builder::new()
+            .name("youta-youtube-pagination".to_owned())
+            .spawn(move || {
+                youtube_pagination_worker(provider, pagination_receiver, responses, stopping);
+                let _ = child_exit_sender.send(ProviderChildWorker::YouTubePagination);
+            })
+    };
+    let (mut pagination_sender, mut pagination_pending, pagination_thread, mut pagination_error) =
+        match pagination_thread {
+            Ok(thread) => (
+                Some(pagination_sender),
+                Some(pagination_pending),
+                Some(thread),
+                None,
+            ),
+            Err(error) => (
+                None,
+                None,
+                None,
+                Some(format!(
+                    "could not start YouTube pagination worker: {error}"
+                )),
+            ),
+        };
+
+    let (general_sender, general_receiver) = unbounded();
+    let general_stopping = Arc::new(AtomicBool::new(false));
+    let general_thread = {
+        let provider = Arc::clone(&provider);
+        let responses = responses.clone();
+        let stopping = Arc::clone(&general_stopping);
+        let child_exit_sender = child_exit_sender.clone();
+        thread::Builder::new()
+            .name("youta-provider-general".to_owned())
+            .spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    general_provider_worker(
+                        provider,
+                        general_receiver,
+                        responses,
+                        stopping,
+                        allow_insecure_http,
+                        mod_archive_api_key,
+                        jamendo_client_id,
+                        #[cfg(feature = "apple-podcasts")]
+                        apple_client,
+                        #[cfg(feature = "bandcamp")]
+                        bandcamp_search_client,
+                        #[cfg(feature = "librivox")]
+                        librivox_client,
+                        #[cfg(feature = "rss")]
+                        rss_client,
+                        #[cfg(feature = "youtube-music")]
+                        youtube_music_client,
+                        provider_storage_root,
+                    );
+                }));
+                let _ = child_exit_sender.send(ProviderChildWorker::General);
+            })
+    };
+    let general_thread = match general_thread {
+        Ok(thread) => thread,
+        Err(_) => {
+            pagination_stopping.store(true, AtomicOrdering::Release);
+            drop(pagination_sender.take());
+            drop(pagination_pending.take());
+            if let Some(thread) = pagination_thread {
+                let _ = thread.join();
+            }
+            return;
+        }
+    };
+    drop(child_exit_sender);
+
+    loop {
+        crossbeam_channel::select! {
+            recv(requests) -> incoming => {
+                let Ok(request) = incoming else {
+                    break;
+                };
+                match request {
+                    ProviderRequest::ReplaceYouTubeProvider { provider: replacement } => {
+                        replace_shared_youtube_provider(&provider, replacement);
+                    }
+                    ProviderRequest::ChannelVideos { generation, request } => {
+                        let dispatch = pagination_sender
+                            .as_ref()
+                            .zip(pagination_pending.as_ref())
+                            .ok_or_else(|| {
+                                pagination_error.clone().unwrap_or_else(|| {
+                                    "YouTube pagination worker stopped".to_owned()
+                                })
+                            })
+                            .and_then(|(sender, pending)| {
+                                replace_latest_provider_request(
+                                    sender,
+                                    pending,
+                                    YouTubePaginationRequest {
+                                        generation,
+                                        request: request.clone(),
+                                        youtube_provider: youtube_provider_snapshot(&provider),
+                                    },
+                                )
+                                .map_err(|()| "YouTube pagination worker stopped".to_owned())
+                            });
+                        if let Err(error) = dispatch {
+                            pagination_sender = None;
+                            pagination_pending = None;
+                            pagination_error = Some(error.clone());
+                            if responses
+                                .send(ProviderResponse::ChannelVideos {
+                                    generation,
+                                    request,
+                                    result: Err(error),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    ProviderRequest::Shutdown => break,
+                    other => {
+                        let youtube_provider = provider_request_uses_youtube_provider(&other)
+                            .then(|| youtube_provider_snapshot(&provider));
+                        if general_sender
+                            .send(GeneralProviderRequest {
+                                request: other,
+                                youtube_provider,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            recv(child_exits) -> exited => {
+                match exited {
+                    Ok(ProviderChildWorker::General) | Err(_) => break,
+                    Ok(ProviderChildWorker::YouTubePagination) => {
+                        if let Some(pending) = pagination_pending.as_ref() {
+                            while let Ok(work) = pending.try_recv() {
+                                let _ = responses.send(ProviderResponse::ChannelVideos {
+                                    generation: work.generation,
+                                    request: work.request,
+                                    result: Err("YouTube pagination worker stopped".to_owned()),
+                                });
+                            }
+                        }
+                        pagination_sender = None;
+                        pagination_pending = None;
+                        pagination_error = Some("YouTube pagination worker stopped".to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Close the public input before joining so callers never wait behind an
+    // active child while trying to enqueue work after shutdown.
+    drop(requests);
+    general_stopping.store(true, AtomicOrdering::Release);
+    pagination_stopping.store(true, AtomicOrdering::Release);
+    drop(pagination_sender.take());
+    drop(pagination_pending.take());
+    let _ = general_sender.send(GeneralProviderRequest {
+        request: ProviderRequest::Shutdown,
+        youtube_provider: None,
+    });
+    drop(general_sender);
+    let _ = general_thread.join();
+    if let Some(thread) = pagination_thread {
+        let _ = thread.join();
+    }
+}
+
+/// Runs all blocking provider operations except foreground channel pages.
+fn general_provider_worker(
+    provider: SharedYouTubeProvider,
+    requests: Receiver<GeneralProviderRequest>,
+    responses: Sender<ProviderResponse>,
+    stopping: Arc<AtomicBool>,
+    allow_insecure_http: bool,
+    mod_archive_api_key: Option<String>,
+    jamendo_client_id: Option<String>,
+    #[cfg(feature = "apple-podcasts")] apple_client: Box<dyn AppleProviderClient>,
+    #[cfg(feature = "bandcamp")] bandcamp_search_client: Box<dyn BandcampSearchProvider>,
+    #[cfg(feature = "librivox")] librivox_client: Box<dyn LibrivoxProviderClient>,
+    #[cfg(feature = "rss")] rss_client: Box<dyn RssFeedClient>,
+    #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
+    provider_storage_root: PathBuf,
+) {
     #[cfg(feature = "rss")]
     let (rss_requests, rss_pending, rss_stopping, rss_thread, rss_start_error) = {
         let (rss_requests, rss_receiver) = bounded(1);
@@ -31208,18 +32295,32 @@ fn provider_worker(
     #[cfg(not(feature = "jamendo"))]
     let _ = jamendo_client_id;
 
-    while let Ok(request) = requests.recv() {
+    while let Ok(work) = requests.recv() {
+        if stopping.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let GeneralProviderRequest {
+            request,
+            youtube_provider,
+        } = work;
+        if youtube_provider
+            .as_ref()
+            .is_some_and(|snapshot| !youtube_provider_snapshot_is_current(&provider, snapshot))
+        {
+            continue;
+        }
+        let routed_youtube_provider = youtube_provider.and_then(|snapshot| snapshot.provider);
         match request {
             ProviderRequest::ReplaceYouTubeProvider {
                 provider: replacement,
             } => {
-                provider = Some(replacement);
+                replace_shared_youtube_provider(&provider, replacement);
             }
             ProviderRequest::Search {
                 generation,
                 request,
             } => {
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| provider.search(&request).map_err(|error| error.to_string()),
                 );
@@ -31579,7 +32680,7 @@ fn provider_worker(
                 generation,
                 request,
             } => {
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
@@ -31602,7 +32703,7 @@ fn provider_worker(
                 generation,
                 video_id,
             } => {
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
@@ -31621,7 +32722,7 @@ fn provider_worker(
                 generation,
                 video_id,
             } => {
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
@@ -31675,7 +32776,7 @@ fn provider_worker(
                 provider_generation,
                 channel_id,
             } => {
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
@@ -31720,7 +32821,7 @@ fn provider_worker(
                 channel_ids,
             } => {
                 let requested_ids = channel_ids.clone();
-                let result = provider.as_ref().map_or_else(
+                let result = routed_youtube_provider.as_ref().map_or_else(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| {
                         provider
@@ -33948,11 +35049,64 @@ fn row_from_search_item_with_thumbnail_size(
     today: NaiveDate,
     youtube_thumbnail_size: YouTubeThumbnailSize,
 ) -> RowView {
+    row_from_search_item_with_progress_mode(
+        item,
+        store,
+        subscriptions,
+        channel_subscribers,
+        context,
+        today,
+        youtube_thumbnail_size,
+        true,
+    )
+}
+
+/// Builds one subscription row for later batch progress hydration.
+fn row_from_search_item_without_progress_with_thumbnail_size(
+    item: &SearchItem,
+    store: &StateStore,
+    subscriptions: &SubscriptionTree,
+    channel_subscribers: &HashMap<String, Option<u64>>,
+    context: SearchRowContext,
+    today: NaiveDate,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+) -> RowView {
+    row_from_search_item_with_progress_mode(
+        item,
+        store,
+        subscriptions,
+        channel_subscribers,
+        context,
+        today,
+        youtube_thumbnail_size,
+        false,
+    )
+}
+
+/// Converts one provider item with either immediate or deferred progress state.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row context is shared with the public presentation wrapper"
+)]
+fn row_from_search_item_with_progress_mode(
+    item: &SearchItem,
+    store: &StateStore,
+    subscriptions: &SubscriptionTree,
+    channel_subscribers: &HashMap<String, Option<u64>>,
+    context: SearchRowContext,
+    today: NaiveDate,
+    youtube_thumbnail_size: YouTubeThumbnailSize,
+    load_progress_individually: bool,
+) -> RowView {
     match item {
         SearchItem::Video(video) => {
-            let progress = store
-                .progress(&MediaId::new(SourceKind::YouTube, &video.video_id))
-                .ok()
+            let progress = load_progress_individually
+                .then(|| {
+                    store
+                        .progress(&MediaId::new(SourceKind::YouTube, &video.video_id))
+                        .ok()
+                        .flatten()
+                })
                 .flatten();
             let playback = PlaybackRowState::from_progress(progress.as_ref());
             let subscriber_count = match context {
@@ -34005,7 +35159,9 @@ fn row_from_search_item_with_thumbnail_size(
                     SourceKind::Rss,
                     podcast_episode_external_id(&episode.feed_url, &episode.episode_id),
                 );
-                let progress = store.progress(&media_id).ok().flatten();
+                let progress = load_progress_individually
+                    .then(|| store.progress(&media_id).ok().flatten())
+                    .flatten();
                 let playback = PlaybackRowState::from_progress(progress.as_ref());
                 let mut metadata = Vec::with_capacity(3);
                 if let Some(published) = episode.published_at {
@@ -34050,6 +35206,20 @@ fn row_from_search_item_with_thumbnail_size(
 /// Unknown, horizontal, and square rows remain standard videos.
 fn youtube_video_uses_shorts_style(video: &VideoSummary) -> bool {
     matches!(video.orientation, VideoOrientation::Vertical)
+}
+
+/// Whether one canonical YouTube page/cache contributes a currently shown row.
+fn youtube_subscription_items_have_visible_video(
+    items: &[SearchItem],
+    show_youtube_shorts: bool,
+) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            SearchItem::Video(video)
+                if show_youtube_shorts || !youtube_video_uses_shorts_style(video)
+        )
+    })
 }
 
 /// Returns the stable playable identity represented by a subscription item.
@@ -34601,10 +35771,12 @@ fn compact_subscription_item(item: &mut SearchItem) {
                 compact_cached_string(author, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
             }
             episode.authors.truncate(16);
+            episode.authors.shrink_to_fit();
             for category in &mut episode.categories {
                 compact_cached_string(category, MAX_CACHED_SUBSCRIPTION_FIELD_BYTES);
             }
             episode.categories.truncate(32);
+            episode.categories.shrink_to_fit();
             if let Some(language) = episode.language.as_mut() {
                 compact_cached_string(language, 128);
             }
@@ -34687,6 +35859,19 @@ fn subscription_item_estimated_heap_bytes(item: &SearchItem) -> usize {
             base.saturating_add(strings)
         }
         SearchItem::PodcastEpisode(episode) => {
+            let collection_storage = std::mem::size_of_val(episode.as_ref())
+                .saturating_add(
+                    episode
+                        .authors
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    episode
+                        .categories
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                );
             let strings = episode
                 .feed_url
                 .as_str()
@@ -34728,7 +35913,8 @@ fn subscription_item_estimated_heap_bytes(item: &SearchItem) -> usize {
                         .as_ref()
                         .map_or(0, String::capacity),
                 );
-            base.saturating_add(strings)
+            base.saturating_add(collection_storage)
+                .saturating_add(strings)
         }
     }
 }
@@ -37958,6 +39144,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use crossbeam_channel::bounded;
 
     use super::*;
 
@@ -43369,6 +44557,31 @@ mod tests {
     }
 
     #[test]
+    fn subscription_rows_defer_progress_to_one_batch_hydration() {
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let media_id = MediaId::new(SourceKind::YouTube, "v0000000000");
+        let mut progress = PlaybackProgress::new(media_id, Some(100), 1);
+        progress.record_position(45, 2);
+        store.upsert_progress(&progress).expect("saved progress");
+        let item = indexed_subscription_video(0);
+        let mut rows = vec![row_from_search_item_without_progress_with_thumbnail_size(
+            &item,
+            &store,
+            &SubscriptionTree::default(),
+            &HashMap::new(),
+            SearchRowContext::SubscriptionFeed,
+            Local::now().date_naive(),
+            YouTubeThumbnailSize::Standard,
+        )];
+
+        assert_eq!(rows[0].watched_percent, 0);
+        assert!(!rows[0].playback_started);
+        hydrate_row_playback_progress(&store, &mut rows);
+        assert_eq!(rows[0].watched_percent, 45);
+        assert!(rows[0].playback_started);
+    }
+
+    #[test]
     fn zero_position_progress_and_explicit_overrides_restore_distinct_row_states() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
@@ -44628,6 +45841,8 @@ mod tests {
         controller.subscription_tree = subscriptions;
         controller.subscription_entries = controller.subscription_tree.flattened_subscriptions();
         controller.rebuild_subscription_source_rows();
+        controller.update_selected_subscription_source();
+        let source_generation = controller.view.subscriptions.source_generation;
         let thumbnail_url =
             url::Url::parse("https://yt3.ggpht.com/fixture=s800").expect("fixture thumbnail");
         controller.view.subscriptions.sources[0].thumbnail_url = Some(thumbnail_url.clone());
@@ -44654,12 +45869,74 @@ mod tests {
             "youtube.com/@providerFixture"
         );
         assert_eq!(
+            controller.view.subscriptions.source_generation, source_generation,
+            "presentation-only alias enrichment must not replace virtual-list ownership"
+        );
+        assert_eq!(
             controller.view.subscriptions.sources[0]
                 .thumbnail_url
                 .as_ref(),
             Some(&thumbnail_url),
             "URL enrichment must not rebuild away cached artwork"
         );
+    }
+
+    #[test]
+    fn subscription_source_generation_changes_only_with_exact_source_identity() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfirst", "UCsecond"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        let first_generation = controller.view.subscriptions.source_generation;
+        controller.update_selected_subscription_source();
+        assert_eq!(
+            controller.view.subscriptions.source_generation, first_generation,
+            "rebuilding presentation for one source must preserve its owner"
+        );
+
+        controller.dispatch(UiAction::SelectSubscriptionSource(1));
+        assert_ne!(
+            controller.view.subscriptions.source_generation, first_generation,
+            "a different exact source must reset front-end list ownership"
+        );
+    }
+
+    #[test]
+    fn reselecting_a_clamped_subscription_source_preserves_its_item_position() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, _captured_requests) =
+            controller_with_standard_subscription_cache(config);
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.view.subscriptions.description_expanded = true;
+        controller.view.subscriptions.selected_item = 1;
+        let source_generation = controller.view.subscriptions.source_generation;
+        let stale_details_generation = controller.details_generation;
+
+        controller.dispatch(UiAction::SelectSubscriptionSource(0));
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: stale_details_generation,
+            result: Err("stale fixture timeout".to_owned()),
+        });
+        controller.dispatch(UiAction::MoveSelection(-1));
+
+        assert_eq!(controller.view.subscriptions.selected_source, 0);
+        assert_eq!(
+            controller.view.subscriptions.selected_item, 1,
+            "PageUp or a second click on the first source must not reset Items"
+        );
+        assert_eq!(
+            controller.view.subscriptions.source_generation,
+            source_generation
+        );
+        assert!(!controller.view.subscriptions.description_expanded);
+        assert!(controller.view.error_popup.is_none());
+        assert_eq!(controller.view.subscriptions.items.len(), 2);
     }
 
     #[test]
@@ -45594,6 +46871,1287 @@ mod tests {
         }
     }
 
+    /// Builds one unique compact video summary for subscription paging tests.
+    fn indexed_subscription_video(index: usize) -> SearchItem {
+        let mut video = subscription_video_summary();
+        video.video_id = format!("v{index:010}");
+        video.title = format!("Fixture video {index}");
+        SearchItem::Video(video)
+    }
+
+    /// Builds one official-sized provider page with stable global identities.
+    fn indexed_subscription_page(page: u32, next_page: Option<u32>) -> SearchPage {
+        let offset = usize::try_from(page.saturating_sub(1))
+            .unwrap_or_default()
+            .saturating_mul(YOUTUBE_SUBSCRIPTION_PAGE_ROWS);
+        SearchPage {
+            page,
+            items: (offset..offset.saturating_add(YOUTUBE_SUBSCRIPTION_PAGE_ROWS))
+                .map(indexed_subscription_video)
+                .collect(),
+            next_page,
+        }
+    }
+
+    /// Builds one opened YouTube subscription with an existing visible cache.
+    fn controller_with_standard_subscription_cache(
+        config: Config,
+    ) -> (AppController, Receiver<ProviderRequest>) {
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.config.ui.show_youtube_shorts = false;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(0), indexed_subscription_video(1)],
+                next_page: None,
+            }),
+        });
+        while captured_requests.try_recv().is_ok() {}
+        (controller, captured_requests)
+    }
+
+    /// Builds one official-sized page whose videos are all hidden as Shorts.
+    fn hidden_subscription_shorts_page(page: u32, next_page: Option<u32>) -> SearchPage {
+        let mut page = indexed_subscription_page(page, next_page);
+        for item in &mut page.items {
+            let SearchItem::Video(video) = item else {
+                panic!("fixture must be a video");
+            };
+            video.orientation = VideoOrientation::Vertical;
+        }
+        page
+    }
+
+    #[test]
+    fn youtube_subscription_cache_keeps_more_than_one_thousand_videos_and_continuation() {
+        let config = Config::for_dir("/tmp/youta-large-subscription-cache-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for page in 1..=22 {
+            controller.cache_subscription_video_page(
+                "UCfixture",
+                indexed_subscription_page(page, Some(page.saturating_add(1))),
+            );
+        }
+
+        let cached = controller
+            .subscription_video_cache
+            .get("UCfixture")
+            .expect("large channel cache");
+        assert_eq!(cached.items.len(), 1_100);
+        assert_eq!(cached.next_page, Some(23));
+        assert!(!cached.limit_reached);
+    }
+
+    #[test]
+    fn every_subscription_cache_ingress_shares_the_source_count_bound() {
+        let config = Config::for_dir("/tmp/youta-subscription-source-count-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
+        for index in 0..=MAX_CACHED_SUBSCRIPTION_CHANNELS {
+            controller.insert_subscription_cache_value(
+                format!("source-{index:02}"),
+                CachedSubscriptionVideos {
+                    items: vec![indexed_subscription_video(index)],
+                    ..CachedSubscriptionVideos::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            controller.subscription_video_cache.len(),
+            MAX_CACHED_SUBSCRIPTION_CHANNELS
+        );
+        assert!(
+            !controller
+                .subscription_video_cache
+                .contains_key("source-00")
+        );
+        assert!(
+            controller
+                .subscription_video_cache
+                .contains_key(&format!("source-{MAX_CACHED_SUBSCRIPTION_CHANNELS:02}"))
+        );
+    }
+
+    #[test]
+    fn youtube_subscription_cache_reports_its_terminal_ram_limit() {
+        let config = Config::for_dir("/tmp/youta-subscription-cache-limit-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.view.subscriptions.source_title = "Fixture channel".to_owned();
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        for page in 1..=99 {
+            controller.cache_subscription_video_page(
+                "UCfixture",
+                indexed_subscription_page(page, Some(page.saturating_add(1))),
+            );
+        }
+        controller.refresh_subscription_video_rows();
+        let generation = controller.subscription_generation;
+        let request = ChannelVideosRequest {
+            channel_id: "UCfixture".to_owned(),
+            page: 100,
+        };
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(indexed_subscription_page(100, Some(101))),
+        });
+
+        let cached = controller
+            .subscription_video_cache
+            .get("UCfixture")
+            .expect("bounded channel cache");
+        assert_eq!(
+            cached.items.len(),
+            MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL
+        );
+        assert!(cached.limit_reached);
+        assert_eq!(cached.next_page, None);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("in-memory channel limit reached")
+        );
+    }
+
+    #[test]
+    fn subscription_cache_heap_estimate_includes_outer_vector_spare_capacity() {
+        let mut cached = CachedSubscriptionVideos::default();
+        cached.items.reserve(128);
+        cached.items.push(indexed_subscription_video(0));
+
+        assert!(
+            cached.estimated_heap_bytes()
+                >= cached
+                    .items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SearchItem>())
+        );
+    }
+
+    #[test]
+    fn podcast_cache_compaction_bounds_vectors_and_accounts_for_their_storage() {
+        let mut authors = Vec::with_capacity(4_096);
+        authors.resize_with(16, String::new);
+        let mut categories = Vec::with_capacity(4_096);
+        categories.resize_with(32, String::new);
+        let mut item = SearchItem::PodcastEpisode(Box::new(PodcastEpisodeSummary {
+            feed_url: url::Url::parse("https://feeds.example/show.xml").expect("fixture feed URL"),
+            episode_id: String::new(),
+            feed_title: String::new(),
+            title: String::new(),
+            authors,
+            description: String::new(),
+            language: None,
+            categories,
+            duration_seconds: None,
+            published_at: None,
+            webpage_url: None,
+            feed_webpage_url: None,
+            artwork_url: None,
+            stream_url: None,
+            stream_mime_type: None,
+            stream_byte_length: None,
+        }));
+
+        compact_subscription_item(&mut item);
+
+        let SearchItem::PodcastEpisode(episode) = &item else {
+            panic!("compacted fixture must remain a podcast episode");
+        };
+        assert!(episode.authors.capacity() <= 16);
+        assert!(episode.categories.capacity() <= 32);
+        let structural_heap_bytes = std::mem::size_of::<SearchItem>()
+            .saturating_add(std::mem::size_of::<PodcastEpisodeSummary>())
+            .saturating_add(
+                episode
+                    .authors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                episode
+                    .categories
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            );
+        assert!(subscription_item_estimated_heap_bytes(&item) >= structural_heap_bytes);
+    }
+
+    #[test]
+    fn subscription_details_enrichment_cannot_cross_channel_byte_ceiling() {
+        let original = indexed_subscription_video(0);
+        let mut cached = CachedSubscriptionVideos {
+            items: vec![original.clone()],
+            next_page: Some(2),
+            consecutive_empty_pages: 0,
+            limit_reached: false,
+        };
+        cached.items.shrink_to_fit();
+        let maximum_bytes = cached.estimated_heap_bytes().saturating_add(16);
+        let SearchItem::Video(mut replacement) = original else {
+            panic!("fixture must be a video");
+        };
+        replacement.title = "T".repeat(MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+        replacement.description = "D".repeat(MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES);
+        let mut compacted = SearchItem::Video(replacement);
+        compact_subscription_item(&mut compacted);
+        let SearchItem::Video(replacement) = compacted else {
+            panic!("compacted fixture must remain a video");
+        };
+
+        assert!(
+            AppController::apply_subscription_video_summary_with_byte_limit(
+                &mut cached,
+                &replacement,
+                maximum_bytes,
+            )
+        );
+
+        assert!(cached.estimated_heap_bytes() <= maximum_bytes);
+        assert!(cached.limit_reached);
+        assert_eq!(cached.next_page, None);
+        assert!(matches!(
+            cached.items.first(),
+            Some(SearchItem::Video(video)) if video.title == "Fixture video 0"
+        ));
+    }
+
+    #[test]
+    fn subscription_details_byte_limit_is_reported_immediately_for_the_active_channel() {
+        let config = Config::for_dir("/tmp/youta-subscription-details-limit-status-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.view.subscriptions.source_title = "Fixture channel".to_owned();
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let target = subscription_video_summary();
+        let mut oversized_tail = target.clone();
+        oversized_tail.video_id = "oversized02".to_owned();
+        oversized_tail.description = "x".repeat(MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL);
+        controller.subscription_video_cache.insert(
+            "UCfixture".to_owned(),
+            CachedSubscriptionVideos {
+                items: vec![SearchItem::Video(target), SearchItem::Video(oversized_tail)],
+                next_page: Some(2),
+                consecutive_empty_pages: 0,
+                limit_reached: false,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.status_line = "Earlier useful status".to_owned();
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(subscription_video_details("Detailed fixture video")),
+        });
+
+        let cached = controller
+            .subscription_video_cache
+            .get("UCfixture")
+            .expect("active channel cache");
+        assert!(cached.estimated_heap_bytes() <= MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL);
+        assert!(cached.limit_reached);
+        assert_eq!(cached.next_page, None);
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("in-memory channel limit reached")
+        );
+    }
+
+    #[test]
+    fn inactive_details_enrichment_never_evicts_the_visible_subscription_cache() {
+        let config = Config::for_dir("/tmp/youta-subscription-active-cache-preservation-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.view.subscriptions.source_title = "Active fixture".to_owned();
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.active_subscription_channel_id = Some("UCactive".to_owned());
+
+        let inactive_item = SearchItem::Video(subscription_video_summary());
+        let inactive_item_bytes = subscription_item_estimated_heap_bytes(&inactive_item);
+        let mut detailed =
+            subscription_video_details(&"T".repeat(MAX_CACHED_SUBSCRIPTION_LABEL_BYTES));
+        detailed.description = "D".repeat(MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES);
+        let mut replacement = SearchItem::Video(summary_from_details(&detailed));
+        compact_subscription_item(&mut replacement);
+        let replacement_growth = subscription_item_estimated_heap_bytes(&replacement)
+            .saturating_sub(inactive_item_bytes);
+        assert!(replacement_growth > 0);
+
+        let inactive = CachedSubscriptionVideos {
+            items: vec![inactive_item],
+            next_page: None,
+            consecutive_empty_pages: 0,
+            limit_reached: false,
+        };
+        let mut active = CachedSubscriptionVideos {
+            items: Vec::with_capacity(MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL),
+            next_page: None,
+            consecutive_empty_pages: 0,
+            limit_reached: false,
+        };
+        loop {
+            let total_before = active
+                .estimated_heap_bytes()
+                .saturating_add(inactive.estimated_heap_bytes());
+            if !active.items.is_empty()
+                && total_before.saturating_add(replacement_growth) > MAX_CACHED_SUBSCRIPTION_BYTES
+            {
+                assert!(total_before <= MAX_CACHED_SUBSCRIPTION_BYTES);
+                break;
+            }
+            let mut item = indexed_subscription_video(active.items.len().saturating_add(1));
+            let SearchItem::Video(video) = &mut item else {
+                panic!("fixture must be a video");
+            };
+            video.description = "A".repeat(MAX_CACHED_SUBSCRIPTION_DESCRIPTION_BYTES);
+            compact_subscription_item(&mut item);
+            active.items.push(item);
+            assert!(
+                active.items.len() < MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL,
+                "the compact fixture should cross the shared budget before the item cap"
+            );
+        }
+
+        controller
+            .subscription_video_cache
+            .insert("UCinactive".to_owned(), inactive);
+        controller
+            .subscription_video_cache
+            .insert("UCactive".to_owned(), active);
+        controller.subscription_cache_order =
+            VecDeque::from(["UCinactive".to_owned(), "UCactive".to_owned()]);
+        controller.refresh_subscription_video_rows();
+        let visible_rows_before = controller.view.subscriptions.items.len();
+        assert!(visible_rows_before > 0);
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(detailed),
+        });
+
+        assert!(
+            controller.subscription_video_cache.contains_key("UCactive"),
+            "enriching an inactive cached video must preserve the visible channel"
+        );
+        assert_eq!(
+            controller.view.subscriptions.items.len(),
+            visible_rows_before,
+            "cross-source eviction must not blank the visible subscription list"
+        );
+        assert!(
+            !controller
+                .subscription_video_cache
+                .contains_key("UCinactive"),
+            "the inactive cache should yield when enrichment crosses the shared budget"
+        );
+    }
+
+    #[test]
+    fn revisiting_a_capped_subscription_restores_the_limit_explanation() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfirst", "UCsecond"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.cache_subscription_video_page(
+            "UCfirst",
+            SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(0)],
+                next_page: Some(2),
+            },
+        );
+        let cached = controller
+            .subscription_video_cache
+            .get_mut("UCfirst")
+            .expect("first channel cache");
+        cached.limit_reached = true;
+        cached.next_page = None;
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+
+        controller.select_subscription_source(1);
+        controller.select_subscription_source(0);
+
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("in-memory channel limit reached")
+        );
+    }
+
+    #[cfg(feature = "rss")]
+    #[test]
+    fn rss_subscription_cache_retains_its_existing_250_episode_limit() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let feed_url =
+            url::Url::parse("https://podcasts.example/feed.xml").expect("fixture feed URL");
+        save_fixture_rss_subscription(&config, &feed_url);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, requested_url) = match captured_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("RSS request")
+        {
+            ProviderRequest::RssFeed {
+                generation,
+                source_url,
+            } => (generation, source_url),
+            _ => panic!("expected RSS request"),
+        };
+        let mut feed = fixture_rss_feed(&feed_url, &["template"]);
+        let template = feed.episodes.pop().expect("template episode");
+        feed.episodes = (0..300)
+            .map(|index| {
+                let mut episode = template.clone();
+                episode.id = format!("episode-{index:03}");
+                episode.title = Some(format!("Fixture episode {index}"));
+                episode
+            })
+            .collect();
+
+        controller.handle_provider_response(ProviderResponse::RssFeed {
+            generation,
+            requested_url,
+            result: Ok(feed),
+        });
+
+        let cached = controller
+            .subscription_video_cache
+            .get(feed_url.as_str())
+            .expect("RSS cache");
+        assert_eq!(
+            cached.items.len(),
+            MAX_CACHED_RSS_SUBSCRIPTION_EPISODES_PER_FEED
+        );
+        assert!(!cached.limit_reached);
+    }
+
+    #[test]
+    fn subscription_page_one_prefetches_exactly_one_page_before_details() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert!(!controller.view.subscriptions.loading_more);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(indexed_subscription_page(1, Some(2))),
+        });
+
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        assert!(controller.view.subscriptions.loading);
+        assert!(controller.view.subscriptions.loading_more);
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("selected-video metadata debounce");
+        assert!(controller.view.subscriptions.metadata_pending);
+        controller.request_due_subscription_video_metadata(
+            scheduled
+                .due_at
+                .checked_sub(Duration::from_millis(1))
+                .expect("debounce deadline has an earlier instant"),
+        );
+        assert!(controller.view.subscriptions.metadata_pending);
+        assert!(captured_requests.try_recv().is_err());
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+        assert!(
+            controller.view.subscriptions.metadata_pending,
+            "optional metadata must remain deferred while page two is loading"
+        );
+        assert!(captured_requests.try_recv().is_err());
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(indexed_subscription_page(2, Some(3))),
+        });
+        assert!(!controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert_no_channel_request(
+            &captured_requests,
+            "one lookahead page must not recursively load the whole channel",
+        );
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("metadata remains owned after pagination completes");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+        assert!(!controller.view.subscriptions.metadata_pending);
+        assert!(matches!(
+            captured_requests.try_recv(),
+            Ok(ProviderRequest::Details { video_id, .. }) if video_id == "v0000000000"
+        ));
+    }
+
+    #[test]
+    fn hidden_shorts_lookahead_reaches_a_later_standard_video_without_loading_all_pages() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.config.ui.show_youtube_shorts = false;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        let page_items = |page: u32, first_is_standard: bool| {
+            let offset = usize::try_from(page.saturating_sub(1))
+                .unwrap_or_default()
+                .saturating_mul(YOUTUBE_SUBSCRIPTION_PAGE_ROWS);
+            (offset..offset.saturating_add(YOUTUBE_SUBSCRIPTION_PAGE_ROWS))
+                .enumerate()
+                .map(|(page_index, index)| {
+                    let SearchItem::Video(mut video) = indexed_subscription_video(index) else {
+                        panic!("fixture must be a video");
+                    };
+                    video.orientation = if first_is_standard && page_index == 0 {
+                        VideoOrientation::Horizontal
+                    } else {
+                        VideoOrientation::Vertical
+                    };
+                    SearchItem::Video(video)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: page_items(1, true),
+                next_page: Some(2),
+            }),
+        });
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 2,
+                items: page_items(2, false),
+                next_page: Some(3),
+            }),
+        });
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 3);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 3,
+                items: page_items(3, true),
+                next_page: Some(4),
+            }),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video 0", "Fixture video 100"]
+        );
+        assert_no_channel_request(
+            &captured_requests,
+            "the bounded hidden-page lookahead must stop before page four",
+        );
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("press PageDown or scroll again")
+        );
+        controller.dispatch(UiAction::MoveSelection(
+            i32::try_from(YOUTUBE_SUBSCRIPTION_PAGE_ROWS).expect("page size fits i32"),
+        ));
+        let (_, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 4);
+    }
+
+    #[test]
+    fn all_hidden_shorts_prompt_enter_after_bounded_lookahead() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.config.ui.show_youtube_shorts = false;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        let vertical_page = |page: u32, next_page| {
+            let mut page = indexed_subscription_page(page, next_page);
+            for item in &mut page.items {
+                let SearchItem::Video(video) = item else {
+                    panic!("fixture must be a video");
+                };
+                video.orientation = VideoOrientation::Vertical;
+            }
+            page
+        };
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        for page in 1..=3 {
+            let (generation, request) = receive_channel_request(&captured_requests);
+            assert_eq!(request.page, page);
+            controller.handle_provider_response(ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result: Ok(vertical_page(page, Some(page.saturating_add(1)))),
+            });
+        }
+
+        assert!(controller.view.subscriptions.items.is_empty());
+        assert_no_channel_request(
+            &captured_requests,
+            "the all-Shorts lookahead must stop at its fixed speculative budget",
+        );
+        assert!(controller.view.status_line.contains("press Enter"));
+        assert!(!controller.view.status_line.contains("press PageDown"));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (_, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 4);
+    }
+
+    #[test]
+    fn rapid_subscription_selection_requests_only_final_settled_metadata() {
+        let config = Config::for_dir("/tmp/youta-subscription-details-debounce-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: (0..3).map(indexed_subscription_video).collect(),
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+
+        controller.request_selected_details();
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        controller.dispatch(UiAction::SelectSubscriptionItem(2));
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("final selected-video metadata debounce");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+
+        let queued = captured_requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued
+                .iter()
+                .filter_map(|request| match request {
+                    ProviderRequest::Details { video_id, .. } => Some(video_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["v0000000002"]
+        );
+        #[cfg(feature = "wikidata")]
+        assert_eq!(
+            queued
+                .iter()
+                .filter_map(|request| match request {
+                    ProviderRequest::Wikidata { external_id, .. } => Some(external_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["v0000000002"]
+        );
+    }
+
+    #[test]
+    fn repeated_clamped_subscription_selection_prefetches_without_duplicate_details() {
+        let config = Config::for_dir("/tmp/youta-subscription-clamped-selection-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller.refresh_subscription_video_rows();
+        controller.view.subscriptions.selected_item = YOUTUBE_SUBSCRIPTION_PAGE_ROWS - 1;
+        controller.request_selected_details();
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("initial selected-video metadata debounce");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+
+        controller.dispatch(UiAction::SelectSubscriptionItem(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS - 1,
+        ));
+        controller.dispatch(UiAction::SelectSubscriptionItem(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS - 1,
+        ));
+
+        let queued = captured_requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|request| matches!(request, ProviderRequest::ChannelVideos { .. }))
+                .count(),
+            1,
+            "the unchanged end selection must still prefetch exactly once"
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|request| matches!(request, ProviderRequest::Details { .. }))
+                .count(),
+            1,
+            "the unchanged selection must not enqueue duplicate Details"
+        );
+    }
+
+    #[test]
+    fn direct_subscription_item_selection_returns_page_keys_to_the_items_pane() {
+        let config = Config::for_dir("/tmp/youta-subscription-direct-focus-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(0)],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.details_focused = true;
+
+        controller.dispatch(UiAction::SelectSubscriptionItem(0));
+
+        assert!(!controller.view.details_focused);
+    }
+
+    #[test]
+    fn subscription_page_sized_move_selects_expected_row_and_prefetches_once() {
+        let config = Config::for_dir("/tmp/youta-subscription-page-move-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(2, Some(3)));
+        controller.refresh_subscription_video_rows();
+        controller.view.details = Some(preliminary_detail(
+            &indexed_subscription_video(0),
+            &controller.subscription_tree,
+        ));
+
+        controller.dispatch(UiAction::MoveSelection(
+            i32::try_from(YOUTUBE_SUBSCRIPTION_PAGE_ROWS).expect("page size fits i32"),
+        ));
+
+        assert_eq!(
+            controller.view.subscriptions.selected_item,
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS
+        );
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .get(YOUTUBE_SUBSCRIPTION_PAGE_ROWS)
+                .and_then(|row| row.media_id.as_ref())
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("v0000000050")
+        );
+        let queued = captured_requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued
+                .iter()
+                .filter_map(|request| match request {
+                    ProviderRequest::ChannelVideos { request, .. } => Some(request.page),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    #[test]
+    fn subscription_viewport_prefetches_without_moving_the_selected_item() {
+        let config = Config::for_dir("/tmp/youta-subscription-viewport-prefetch-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(2, Some(3)));
+        controller.refresh_subscription_video_rows();
+        controller.view.details_focused = true;
+
+        controller.dispatch(UiAction::FocusSubscriptionPane(SubscriptionPane::Items));
+        controller.dispatch(UiAction::PrefetchSubscriptionVideosThrough(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS,
+        ));
+
+        assert_eq!(controller.view.subscriptions.focus, SubscriptionPane::Items);
+        assert!(!controller.view.details_focused);
+        assert_eq!(controller.view.subscriptions.selected_item, 0);
+        let (_, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 3);
+        assert!(controller.view.subscriptions.loading_more);
+        assert_eq!(controller.subscription_automatic_prefetch_count, 1);
+        controller.dispatch(UiAction::PrefetchSubscriptionVideosThrough(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS,
+        ));
+        assert_eq!(
+            controller.subscription_automatic_prefetch_count, 1,
+            "a viewport report during the same in-flight page must retain its speculative budget"
+        );
+        assert_no_channel_request(
+            &captured_requests,
+            "one viewport report must enqueue only one continuation",
+        );
+    }
+
+    #[test]
+    fn inactive_subscription_items_viewport_cannot_spend_provider_quota() {
+        let config = Config::for_dir("/tmp/youta-inactive-subscription-viewport-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller.refresh_subscription_video_rows();
+
+        controller.dispatch(UiAction::PrefetchSubscriptionVideosThrough(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS - 1,
+        ));
+
+        assert_no_channel_request(
+            &captured_requests,
+            "an inactive split-view Items pane must not request continuations",
+        );
+        assert!(!controller.view.subscriptions.loading);
+        assert_eq!(controller.subscription_viewport_end, None);
+    }
+
+    #[test]
+    fn explicit_refresh_focuses_inactive_items_after_queueing_page_one() {
+        let config = Config::for_dir("/tmp/youta-focused-subscription-refresh-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller.refresh_subscription_video_rows();
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+
+        let (_, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 1);
+        assert_eq!(controller.view.subscriptions.focus, SubscriptionPane::Items);
+        assert!(controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert_no_channel_request(
+            &captured_requests,
+            "focusing after explicit refresh must not enqueue continuation page two",
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_supersedes_focus_started_subscription_continuation() {
+        let config = Config::for_dir("/tmp/youta-superseding-subscription-refresh-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.view.subscriptions.layout = SubscriptionsLayout::Split;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller
+            .cache_subscription_video_page("UCfixture", indexed_subscription_page(1, Some(2)));
+        controller.refresh_subscription_video_rows();
+
+        controller.dispatch(UiAction::FocusSubscriptionPane(SubscriptionPane::Items));
+        let (continuation_generation, continuation_request) =
+            receive_channel_request(&captured_requests);
+        assert_eq!(continuation_request.page, 2);
+        assert!(controller.view.subscriptions.loading_more);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+
+        let (refresh_generation, refresh_request) = receive_channel_request(&captured_requests);
+        assert_eq!(
+            refresh_request.page, 1,
+            "an explicit refresh must replace page one"
+        );
+        assert_eq!(
+            refresh_generation,
+            continuation_generation.wrapping_add(1),
+            "the replacement must invalidate the speculative continuation"
+        );
+        assert!(controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert!(controller.pending_subscription_refresh.is_some());
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: continuation_generation,
+            request: continuation_request,
+            result: Ok(indexed_subscription_page(2, Some(3))),
+        });
+        assert_eq!(
+            controller.view.subscriptions.items.len(),
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS
+        );
+        assert!(controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: refresh_generation,
+            request: refresh_request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(10_000)],
+                next_page: None,
+            }),
+        });
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller.view.subscriptions.items[0]
+                .media_id
+                .as_ref()
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("v0000010000")
+        );
+        assert!(!controller.view.subscriptions.loading);
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert_no_channel_request(
+            &captured_requests,
+            "the replacement page has no continuation",
+        );
+    }
+
+    #[test]
+    fn stale_subscription_details_cannot_replace_new_debounced_selection() {
+        let config = Config::for_dir("/tmp/youta-subscription-stale-details-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: (0..2).map(indexed_subscription_video).collect(),
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+
+        controller.request_selected_details();
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("first selected-video metadata debounce");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+        let stale_generation = captured_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Details {
+                    generation,
+                    video_id,
+                } if video_id == "v0000000000" => Some(generation),
+                _ => None,
+            })
+            .expect("first Details request");
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        let expected_generation = controller.details_generation;
+
+        let mut stale_details = subscription_video_details("Stale first video");
+        stale_details.video_id = "v0000000000".to_owned();
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: stale_generation,
+            result: Ok(stale_details),
+        });
+
+        assert_eq!(controller.details_generation, expected_generation);
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .map(|media_id| media_id.external_id.as_str()),
+            Some("v0000000001")
+        );
+        assert_eq!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .map(|details| details.title.as_str()),
+            Some("Fixture video 1")
+        );
+    }
+
+    #[test]
+    fn in_flight_subscription_details_error_is_ignored_after_returning_to_sources() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(0)],
+                next_page: None,
+            }),
+        });
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("selected-video metadata debounce");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+        let details_generation = captured_requests
+            .try_iter()
+            .find_map(|request| match request {
+                ProviderRequest::Details { generation, .. } => Some(generation),
+                _ => None,
+            })
+            .expect("in-flight Details request");
+
+        controller.dispatch(UiAction::GoBack);
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: details_generation,
+            result: Err("fixture timeout".to_owned()),
+        });
+
+        assert_eq!(
+            controller.view.subscriptions.route,
+            SubscriptionRoute::Sources
+        );
+        assert!(controller.view.error_popup.is_none());
+        assert_eq!(controller.view.right_panel_mode, RightPanelMode::Channel);
+    }
+
+    #[cfg(feature = "wikidata")]
+    #[test]
+    fn unrelated_wikidata_invalidation_does_not_cancel_debounced_details() {
+        let config = Config::for_dir("/tmp/youta-subscription-wikidata-generation-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.cache_subscription_video_page(
+            "UCfixture",
+            SearchPage {
+                page: 1,
+                items: vec![indexed_subscription_video(0)],
+                next_page: None,
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.request_selected_details();
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("selected-video metadata debounce");
+        controller.invalidate_wikidata_lookup();
+
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
+
+        let queued = captured_requests.try_iter().collect::<Vec<_>>();
+        assert!(queued.iter().any(|request| matches!(
+            request,
+            ProviderRequest::Details { video_id, .. } if video_id == "v0000000000"
+        )));
+        assert!(
+            queued
+                .iter()
+                .all(|request| !matches!(request, ProviderRequest::Wikidata { .. }))
+        );
+    }
+
+    #[test]
+    fn subscription_loading_more_clears_on_error_and_navigation() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(indexed_subscription_page(1, Some(2))),
+        });
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert!(controller.view.subscriptions.loading_more);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Err("fixture timeout".to_owned()),
+        });
+        assert!(!controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert!(controller.view.error_popup.is_none());
+        assert_eq!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.next_page),
+            Some(2),
+            "a failed continuation must remain retryable"
+        );
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("scroll again to retry")
+        );
+
+        controller.dispatch(UiAction::SelectSubscriptionItem(
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS - 1,
+        ));
+        let _ = receive_channel_request(&captured_requests);
+        assert!(controller.view.subscriptions.loading_more);
+        controller.view.details_focused = true;
+        controller.dispatch(UiAction::ShowScreen(Screen::Search));
+        assert!(!controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert!(controller.scheduled_subscription_video_metadata.is_none());
+        assert!(!controller.view.subscriptions.metadata_pending);
+    }
+
     #[test]
     fn drill_down_subscriptions_load_only_after_enter_and_tab_returns_to_sources() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
@@ -45657,6 +48215,15 @@ mod tests {
                 .map(|media_id| media_id.external_id.as_str()),
             Some("dQw4w9WgXcQ")
         );
+        assert!(
+            captured_requests.try_recv().is_err(),
+            "subscription Details must wait for stable selection"
+        );
+        let scheduled = controller
+            .scheduled_subscription_video_metadata
+            .clone()
+            .expect("lazy details debounce");
+        controller.request_due_subscription_video_metadata(scheduled.due_at);
         assert!(matches!(
             captured_requests
                 .recv_timeout(Duration::from_secs(1))
@@ -46217,6 +48784,388 @@ mod tests {
             Some("M7lc1UVf-VE")
         );
         assert!(controller.pending_subscription_refresh.is_none());
+    }
+
+    #[test]
+    fn subscription_refresh_stages_shorts_hidden_page_without_blanking_standard_rows() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        save_fixture_subscriptions(&config, &["UCfixture"]);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_available = true;
+        controller.config.ui.show_youtube_shorts = false;
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let first = indexed_subscription_video(0);
+        let selected = indexed_subscription_video(1);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![first.clone(), selected.clone()],
+                next_page: None,
+            }),
+        });
+        while captured_requests.try_recv().is_ok() {}
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        while captured_requests.try_recv().is_ok() {}
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let mut hidden_short = indexed_subscription_video(50);
+        let SearchItem::Video(hidden_short_video) = &mut hidden_short else {
+            panic!("fixture must be a video");
+        };
+        hidden_short_video.orientation = VideoOrientation::Vertical;
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![hidden_short],
+                next_page: Some(2),
+            }),
+        });
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video 0", "Fixture video 1"],
+            "the old visible cache must remain until the staged refresh finds a visible row"
+        );
+        assert_eq!(controller.view.subscriptions.selected_item, 1);
+        assert!(controller.pending_subscription_refresh.is_some());
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 2);
+        let replacement = indexed_subscription_video(100);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 2,
+                items: vec![replacement],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller.view.subscriptions.items[0].title,
+            "Fixture video 100"
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert!(matches!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.items.first()),
+            Some(SearchItem::Video(video)) if video.orientation == VideoOrientation::Vertical
+        ));
+
+        while captured_requests.try_recv().is_ok() {}
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        let mut hidden_short = indexed_subscription_video(150);
+        let SearchItem::Video(hidden_short_video) = &mut hidden_short else {
+            panic!("fixture must be a video");
+        };
+        hidden_short_video.orientation = VideoOrientation::Vertical;
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![hidden_short],
+                next_page: Some(2),
+            }),
+        });
+        assert_eq!(
+            controller.view.subscriptions.items[0].title,
+            "Fixture video 100"
+        );
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Err("fixture timeout".to_owned()),
+        });
+
+        assert_eq!(
+            controller.view.subscriptions.items[0].title,
+            "Fixture video 100"
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert!(controller.view.error_popup.is_none());
+        assert!(controller.view.status_line.contains("press R to retry"));
+        assert!(!controller.view.status_line.contains("scroll again"));
+    }
+
+    #[test]
+    fn bounded_hidden_shorts_refresh_keeps_old_rows_and_resumes_on_page_down() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, captured_requests) =
+            controller_with_standard_subscription_cache(config);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        for page in 1..=MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES {
+            let (generation, request) = receive_channel_request(&captured_requests);
+            assert_eq!(request.page, page);
+            controller.handle_provider_response(ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result: Ok(hidden_subscription_shorts_page(
+                    page,
+                    Some(page.saturating_add(1)),
+                )),
+            });
+        }
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video 0", "Fixture video 1"],
+            "bounded filtered lookahead must not replace useful cached rows"
+        );
+        let staged = controller
+            .pending_subscription_refresh
+            .as_ref()
+            .and_then(|pending| pending.staged_cache.as_ref())
+            .expect("parked staged refresh");
+        assert_eq!(
+            staged.next_page,
+            Some(4),
+            "the staged refresh must retain its sequential continuation"
+        );
+        assert!(staged.estimated_heap_bytes() <= MAX_CACHED_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL);
+        assert!(
+            staged.estimated_heap_bytes().saturating_add(
+                controller
+                    .subscription_video_cache
+                    .get("UCfixture")
+                    .expect("visible canonical cache")
+                    .estimated_heap_bytes(),
+            ) <= MAX_TRANSIENT_YOUTUBE_SUBSCRIPTION_BYTES_PER_CHANNEL,
+            "one active refresh may retain only one additional bounded cache value"
+        );
+        assert!(
+            staged.items.len().saturating_add(
+                controller
+                    .subscription_video_cache
+                    .get("UCfixture")
+                    .expect("visible canonical cache")
+                    .items
+                    .len(),
+            ) <= MAX_TRANSIENT_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL
+        );
+        assert!(controller.view.status_line.contains("PageDown"));
+
+        controller.dispatch(UiAction::MoveSelection(
+            i32::try_from(YOUTUBE_SUBSCRIPTION_PAGE_ROWS).expect("page size fits i32"),
+        ));
+        let (generation, request) = receive_channel_request(&captured_requests);
+        assert_eq!(request.page, 4);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(SearchPage {
+                page: 4,
+                items: vec![indexed_subscription_video(200)],
+                next_page: None,
+            }),
+        });
+
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller.view.subscriptions.items[0].title,
+            "Fixture video 200"
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+    }
+
+    #[test]
+    fn abandoned_hidden_refresh_clears_the_old_continuation_chain() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, captured_requests) =
+            controller_with_standard_subscription_cache(config);
+        controller
+            .subscription_video_cache
+            .get_mut("UCfixture")
+            .expect("visible canonical cache")
+            .next_page = Some(3);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Ok(hidden_subscription_shorts_page(1, Some(2))),
+        });
+
+        assert_eq!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.next_page),
+            None,
+            "new page one invalidates every continuation from the old token chain"
+        );
+        let (generation, request) = receive_channel_request(&captured_requests);
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation,
+            request,
+            result: Err("fixture timeout".to_owned()),
+        });
+        controller.dispatch(UiAction::MoveSelection(
+            i32::try_from(YOUTUBE_SUBSCRIPTION_PAGE_ROWS).expect("page size fits i32"),
+        ));
+
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert_no_channel_request(
+            &captured_requests,
+            "an abandoned refresh cannot append a new-chain page to old cached rows",
+        );
+        assert!(controller.view.status_line.contains("press R to retry"));
+    }
+
+    #[test]
+    fn enabling_shorts_promotes_a_parked_hidden_refresh() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, captured_requests) =
+            controller_with_standard_subscription_cache(config);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        for page in 1..=MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES {
+            let (generation, request) = receive_channel_request(&captured_requests);
+            controller.handle_provider_response(ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result: Ok(hidden_subscription_shorts_page(
+                    page,
+                    Some(page.saturating_add(1)),
+                )),
+            });
+        }
+
+        controller.dispatch(UiAction::ToggleSubscriptionShorts);
+
+        assert!(controller.config.ui.show_youtube_shorts);
+        assert_eq!(
+            controller.view.subscriptions.items.len(),
+            YOUTUBE_SUBSCRIPTION_PAGE_ROWS.saturating_mul(
+                usize::try_from(MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES)
+                    .expect("page budget fits usize"),
+            ),
+            "the newer staged Shorts should become the canonical visible cache"
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert!(matches!(
+            controller
+                .subscription_video_cache
+                .get("UCfixture")
+                .and_then(|cached| cached.items.first()),
+            Some(SearchItem::Video(video)) if video.orientation == VideoOrientation::Vertical
+        ));
+    }
+
+    #[test]
+    fn exhausted_hidden_shorts_refresh_keeps_old_standard_rows() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, captured_requests) =
+            controller_with_standard_subscription_cache(config);
+
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        for page in 1..=MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES {
+            let (generation, request) = receive_channel_request(&captured_requests);
+            controller.handle_provider_response(ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result: Ok(hidden_subscription_shorts_page(
+                    page,
+                    (page < MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES).then(|| page.saturating_add(1)),
+                )),
+            });
+        }
+
+        assert_eq!(
+            controller
+                .view
+                .subscriptions
+                .items
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Fixture video 0", "Fixture video 1"]
+        );
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert!(controller.view.status_line.contains("no standard videos"));
+    }
+
+    #[test]
+    fn hidden_shorts_refresh_reports_its_staged_item_limit() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let (mut controller, _captured_requests) =
+            controller_with_standard_subscription_cache(config);
+        let mut staged_items = (0..MAX_CACHED_YOUTUBE_SUBSCRIPTION_VIDEOS_PER_CHANNEL)
+            .map(indexed_subscription_video)
+            .collect::<Vec<_>>();
+        for item in &mut staged_items {
+            let SearchItem::Video(video) = item else {
+                panic!("fixture must be a video");
+            };
+            video.orientation = VideoOrientation::Vertical;
+        }
+        controller.pending_subscription_refresh = Some(PendingSubscriptionRefresh {
+            channel_id: "UCfixture".to_owned(),
+            selected_video_id: Some("v0000000000".to_owned()),
+            fallback_index: 0,
+            staged_cache: Some(CachedSubscriptionVideos {
+                items: staged_items,
+                next_page: Some(100),
+                consecutive_empty_pages: 0,
+                limit_reached: false,
+            }),
+            report_errors: true,
+        });
+
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: controller.subscription_generation,
+            request: ChannelVideosRequest {
+                channel_id: "UCfixture".to_owned(),
+                page: 100,
+            },
+            result: Ok(hidden_subscription_shorts_page(100, Some(101))),
+        });
+
+        assert_eq!(controller.view.subscriptions.items.len(), 2);
+        assert!(controller.pending_subscription_refresh.is_none());
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("temporary in-memory limit")
+        );
+        assert!(!controller.view.status_line.contains("found no standard"));
     }
 
     #[test]
@@ -46995,6 +49944,11 @@ mod tests {
         assert_eq!(
             request.page,
             MAX_AUTOMATIC_EMPTY_SUBSCRIPTION_PAGES.saturating_add(1)
+        );
+        assert!(controller.view.subscriptions.loading);
+        assert!(
+            controller.view.subscriptions.loading_more,
+            "an explicit Enter continuation is still a page-more load"
         );
         controller.handle_provider_response(ProviderResponse::ChannelVideos {
             generation,
@@ -57758,6 +60712,209 @@ mod tests {
         }
     }
 
+    /// YouTube provider with independently gated Details and channel-page calls.
+    struct BlockingYouTubeLaneProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        details_gate: Option<(&'static str, Sender<()>, Receiver<()>)>,
+        page_gate: Option<(u32, Sender<()>, Receiver<()>)>,
+    }
+
+    impl Provider for BlockingYouTubeLaneProvider {
+        fn id(&self) -> &'static str {
+            self.name
+        }
+
+        fn display_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                video_search: true,
+                pagination: true,
+                video_details: true,
+                ..crate::providers::ProviderCapabilities::default()
+            }
+        }
+
+        fn search(
+            &self,
+            request: &SearchRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            self.calls
+                .lock()
+                .expect("YouTube lane calls")
+                .push(format!("{}:search:{}", self.name, request.query));
+            Ok(SearchPage {
+                page: request.page,
+                items: Vec::new(),
+                next_page: None,
+            })
+        }
+
+        fn channel_videos(
+            &self,
+            request: &ChannelVideosRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            self.calls
+                .lock()
+                .expect("YouTube lane calls")
+                .push(format!("{}:page:{}", self.name, request.page));
+            if let Some((blocked_page, started, release)) = &self.page_gate
+                && request.page == *blocked_page
+            {
+                started.send(()).expect("test observes blocked page");
+                release.recv().expect("test releases blocked page");
+            }
+            Ok(SearchPage {
+                page: request.page,
+                items: Vec::new(),
+                next_page: request.page.checked_add(1),
+            })
+        }
+
+        fn video_details(
+            &self,
+            video_id: &str,
+        ) -> Result<VideoDetails, crate::providers::ProviderError> {
+            self.calls
+                .lock()
+                .expect("YouTube lane calls")
+                .push(format!("{}:details:{video_id}", self.name));
+            if let Some((blocked_video_id, started, release)) = &self.details_gate
+                && video_id == *blocked_video_id
+            {
+                started.send(()).expect("test observes blocked Details");
+                release.recv().expect("test releases blocked Details");
+            }
+            let mut details = subscription_video_details("Worker fixture details");
+            details.video_id = video_id.to_owned();
+            Ok(details)
+        }
+    }
+
+    /// Provider proving a page panic is converted into an owned failure.
+    struct PanickingPaginationProvider {
+        calls: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Provider for PanickingPaginationProvider {
+        fn id(&self) -> &'static str {
+            "panicking-pagination"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Panicking pagination"
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                pagination: true,
+                ..crate::providers::ProviderCapabilities::default()
+            }
+        }
+
+        fn search(
+            &self,
+            _request: &SearchRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            Err(crate::providers::ProviderError::Unsupported)
+        }
+
+        fn channel_videos(
+            &self,
+            request: &ChannelVideosRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            self.calls
+                .lock()
+                .expect("pagination panic calls")
+                .push(request.page);
+            assert_ne!(request.page, 1, "fixture page panic");
+            Ok(SearchPage {
+                page: request.page,
+                items: Vec::new(),
+                next_page: None,
+            })
+        }
+
+        fn video_details(
+            &self,
+            _video_id: &str,
+        ) -> Result<VideoDetails, crate::providers::ProviderError> {
+            Err(crate::providers::ProviderError::Unsupported)
+        }
+    }
+
+    /// Provider proving a general-child panic disconnects the supervisor.
+    struct PanickingDetailsProvider;
+
+    impl Provider for PanickingDetailsProvider {
+        fn id(&self) -> &'static str {
+            "panicking-details"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Panicking Details"
+        }
+
+        fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+            crate::providers::ProviderCapabilities {
+                video_details: true,
+                ..crate::providers::ProviderCapabilities::default()
+            }
+        }
+
+        fn search(
+            &self,
+            _request: &SearchRequest,
+        ) -> Result<SearchPage, crate::providers::ProviderError> {
+            Err(crate::providers::ProviderError::Unsupported)
+        }
+
+        fn video_details(
+            &self,
+            _video_id: &str,
+        ) -> Result<VideoDetails, crate::providers::ProviderError> {
+            panic!("fixture Details panic");
+        }
+    }
+
+    /// Starts the production provider supervisor with deterministic test clients.
+    fn spawn_test_provider_supervisor(
+        provider: Box<dyn Provider>,
+        requests: Receiver<ProviderRequest>,
+        responses: Sender<ProviderResponse>,
+    ) -> (JoinHandle<()>, tempfile::TempDir) {
+        let storage = crate::test_support::canonical_tempdir("provider storage");
+        let storage_path = storage.path().to_owned();
+        let worker = thread::spawn(move || {
+            provider_worker(
+                Some(provider),
+                requests,
+                responses,
+                false,
+                None,
+                None,
+                #[cfg(feature = "apple-podcasts")]
+                Box::new(SystemAppleProviderClient::new()),
+                #[cfg(feature = "bandcamp")]
+                Box::new(BandcampSearchClient::new()),
+                #[cfg(feature = "librivox")]
+                Box::new(LibrivoxClient::new()),
+                #[cfg(feature = "rss")]
+                Box::new(RssPodcastProvider::new()),
+                #[cfg(feature = "youtube-music")]
+                Box::new(YouTubeMusicSearch::new(YouTubeMusicSearchConfig {
+                    executable: PathBuf::from("yt-dlp"),
+                    ..YouTubeMusicSearchConfig::default()
+                })),
+                storage_path,
+            );
+        });
+        (worker, storage)
+    }
+
     #[cfg(feature = "yt-dlp")]
     struct MockRunningDownload {
         progress: Option<Cursor<Vec<u8>>>,
@@ -58256,6 +61413,7 @@ mod tests {
                 items: vec![SearchItem::Video(video.clone())],
                 next_page: None,
                 consecutive_empty_pages: 0,
+                limit_reached: false,
             },
         );
         controller.active_subscription_channel_id = Some("UCfixture".to_owned());
@@ -58477,6 +61635,22 @@ mod tests {
                 .map(|popup| popup.title.as_str()),
             Some("YouTube search failed")
         );
+    }
+
+    #[test]
+    fn static_subscription_continuation_does_not_advance_the_shared_animation() {
+        let config = Config::for_dir("/tmp/youta-subscription-static-continuation-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.subscriptions.loading = true;
+        controller.view.subscriptions.loading_more = true;
+
+        controller.advance_search_animation();
+
+        assert_eq!(controller.view.search_animation_frame, 0);
+        controller.view.subscriptions.loading_more = false;
+        controller.advance_search_animation();
+        assert_eq!(controller.view.search_animation_frame, 1);
     }
 
     #[test]
@@ -58918,6 +62092,11 @@ mod tests {
             .as_mut()
             .expect("setup popup")
             .api_key = "AIzaSyFixture_key_123456789012345678".to_owned();
+        controller.view.subscriptions.loading = true;
+        controller.view.subscriptions.loading_more = true;
+        let previous_subscription_generation = controller.subscription_generation;
+        let previous_details_generation = controller.details_generation;
+        let previous_search_generation = controller.search_generation;
 
         controller.dispatch(UiAction::SubmitYouTubeSetup);
 
@@ -58932,6 +62111,11 @@ mod tests {
         assert!(controller.pending_youtube_video_comments.is_none());
         assert!(controller.view.video_comments_popup.is_none());
         assert!(!controller.view.video_comments_available);
+        assert!(!controller.view.subscriptions.loading);
+        assert!(!controller.view.subscriptions.loading_more);
+        assert!(controller.subscription_generation > previous_subscription_generation);
+        assert!(controller.details_generation > previous_details_generation);
+        assert!(controller.search_generation > previous_search_generation);
         assert_eq!(
             controller.view.search_activity,
             Some(SearchActivity::YouTube)
@@ -68939,6 +72123,686 @@ mod tests {
                 .is_err()
         );
         assert!(parse_direct_youtube_input("https://youtu.be/not-an-id").is_err());
+    }
+
+    #[test]
+    fn channel_videos_bypass_a_blocked_general_details_call() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (details_started_sender, details_started) = bounded(1);
+        let (details_release, details_release_receiver) = bounded(1);
+        let provider = BlockingYouTubeLaneProvider {
+            name: "isolated",
+            calls: Arc::clone(&calls),
+            details_gate: Some((
+                "blocked-video",
+                details_started_sender,
+                details_release_receiver,
+            )),
+            page_gate: None,
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) =
+            spawn_test_provider_supervisor(Box::new(provider), request_receiver, response_sender);
+
+        requests
+            .send(ProviderRequest::Details {
+                generation: 1,
+                video_id: "blocked-video".to_owned(),
+            })
+            .expect("dispatch blocked Details");
+        details_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Details becomes active");
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 2,
+                request: ChannelVideosRequest {
+                    channel_id: "UCfixture".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch foreground channel page");
+
+        match responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("channel page bypasses blocked Details")
+        {
+            ProviderResponse::ChannelVideos {
+                generation,
+                request,
+                result,
+            } => {
+                assert_eq!(generation, 2);
+                assert_eq!(request.page, 1);
+                assert!(result.is_ok());
+            }
+            _ => panic!("blocked Details responded before the foreground page"),
+        }
+
+        details_release.send(()).expect("release Details");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("released Details response"),
+            ProviderResponse::Details { generation: 1, .. }
+        ));
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *calls.lock().expect("YouTube lane calls"),
+            [
+                "isolated:details:blocked-video".to_owned(),
+                "isolated:page:1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_general_youtube_work_does_not_cross_provider_replacement() {
+        let old_calls = Arc::new(Mutex::new(Vec::new()));
+        let new_calls = Arc::new(Mutex::new(Vec::new()));
+        let (details_started_sender, details_started) = bounded(1);
+        let (details_release, details_release_receiver) = bounded(1);
+        let old_provider = BlockingYouTubeLaneProvider {
+            name: "old-general",
+            calls: Arc::clone(&old_calls),
+            details_gate: Some((
+                "active-details",
+                details_started_sender,
+                details_release_receiver,
+            )),
+            page_gate: None,
+        };
+        let new_provider = BlockingYouTubeLaneProvider {
+            name: "new-general",
+            calls: Arc::clone(&new_calls),
+            details_gate: None,
+            page_gate: None,
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, storage) = spawn_test_provider_supervisor(
+            Box::new(old_provider),
+            request_receiver,
+            response_sender,
+        );
+
+        requests
+            .send(ProviderRequest::Details {
+                generation: 1,
+                video_id: "active-details".to_owned(),
+            })
+            .expect("dispatch active old-provider Details");
+        details_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old-provider Details becomes active");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 2,
+                request: SearchRequest::new("queued-before-replacement", SearchTarget::Videos),
+            })
+            .expect("queue stale old-provider search");
+        requests
+            .send(ProviderRequest::LocalFolderSize {
+                generation: 3,
+                path: storage.path().to_owned(),
+                cancellation: Arc::new(AtomicU64::new(3)),
+                cached: None,
+            })
+            .expect("queue provider-independent work");
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 4,
+                request: ChannelVideosRequest {
+                    channel_id: "UCrouterbarrier".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch routing barrier");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("pagination barrier response"),
+            ProviderResponse::ChannelVideos { generation: 4, .. }
+        ));
+
+        requests
+            .send(ProviderRequest::ReplaceYouTubeProvider {
+                provider: Box::new(new_provider),
+            })
+            .expect("replace YouTube provider");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 5,
+                request: SearchRequest::new("routed-after-replacement", SearchTarget::Videos),
+            })
+            .expect("queue replacement-provider search");
+        details_release
+            .send(())
+            .expect("release active old-provider Details");
+
+        let mut saw_active_details = false;
+        let mut saw_local_folder_size = false;
+        let mut saw_replacement_search = false;
+        while !(saw_active_details && saw_local_folder_size && saw_replacement_search) {
+            match responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued general response")
+            {
+                ProviderResponse::Details { generation: 1, .. } => {
+                    saw_active_details = true;
+                }
+                ProviderResponse::LocalFolderSize { generation: 3, .. } => {
+                    saw_local_folder_size = true;
+                }
+                ProviderResponse::Search { generation: 5, .. } => {
+                    saw_replacement_search = true;
+                }
+                ProviderResponse::Search { generation: 2, .. } => {
+                    panic!("pre-replacement queued search must be discarded")
+                }
+                _ => panic!("unexpected provider response"),
+            }
+        }
+
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *old_calls.lock().expect("old-provider calls"),
+            [
+                "old-general:details:active-details".to_owned(),
+                "old-general:page:1".to_owned(),
+            ]
+        );
+        assert_eq!(
+            *new_calls.lock().expect("new-provider calls"),
+            ["new-general:search:routed-after-replacement".to_owned()],
+            "queued old-provider work must neither run nor mutate the replacement provider"
+        );
+    }
+
+    #[test]
+    fn queued_channel_page_does_not_cross_provider_replacement() {
+        let old_calls = Arc::new(Mutex::new(Vec::new()));
+        let new_calls = Arc::new(Mutex::new(Vec::new()));
+        let (page_started_sender, page_started) = bounded(1);
+        let (page_release, page_release_receiver) = bounded(1);
+        let old_provider = BlockingYouTubeLaneProvider {
+            name: "old-page",
+            calls: Arc::clone(&old_calls),
+            details_gate: None,
+            page_gate: Some((1, page_started_sender, page_release_receiver)),
+        };
+        let new_provider = BlockingYouTubeLaneProvider {
+            name: "new-page",
+            calls: Arc::clone(&new_calls),
+            details_gate: None,
+            page_gate: None,
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) = spawn_test_provider_supervisor(
+            Box::new(old_provider),
+            request_receiver,
+            response_sender,
+        );
+
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 1,
+                request: ChannelVideosRequest {
+                    channel_id: "UCactiveold".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch active old-provider page");
+        page_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old-provider page becomes active");
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 2,
+                request: ChannelVideosRequest {
+                    channel_id: "UCqueuedold".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("queue stale old-provider page");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 3,
+                request: SearchRequest::new("before-replacement", SearchTarget::Videos),
+            })
+            .expect("dispatch pre-replacement routing barrier");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("pre-replacement barrier response"),
+            ProviderResponse::Search { generation: 3, .. }
+        ));
+
+        requests
+            .send(ProviderRequest::ReplaceYouTubeProvider {
+                provider: Box::new(new_provider),
+            })
+            .expect("replace YouTube provider");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 4,
+                request: SearchRequest::new("after-replacement", SearchTarget::Videos),
+            })
+            .expect("dispatch post-replacement routing barrier");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("post-replacement barrier response"),
+            ProviderResponse::Search { generation: 4, .. }
+        ));
+        page_release
+            .send(())
+            .expect("release active old-provider page");
+
+        let ProviderResponse::ChannelVideos {
+            generation: 1,
+            result: active_result,
+            ..
+        } = responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active old-provider page response")
+        else {
+            panic!("unexpected active page response");
+        };
+        assert!(active_result.is_ok());
+        let ProviderResponse::ChannelVideos {
+            generation: 2,
+            result: queued_result,
+            ..
+        } = responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale queued page response")
+        else {
+            panic!("unexpected stale page response");
+        };
+        assert!(
+            queued_result
+                .expect_err("stale queued page must be skipped")
+                .contains("provider changed")
+        );
+
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 5,
+                request: ChannelVideosRequest {
+                    channel_id: "UCcurrentnew".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch replacement-provider page");
+        let ProviderResponse::ChannelVideos {
+            generation: 5,
+            result: current_result,
+            ..
+        } = responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement-provider page response")
+        else {
+            panic!("unexpected replacement page response");
+        };
+        assert!(current_result.is_ok());
+
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *old_calls.lock().expect("old-provider calls"),
+            [
+                "old-page:page:1".to_owned(),
+                "old-page:search:before-replacement".to_owned(),
+            ]
+        );
+        assert_eq!(
+            *new_calls.lock().expect("new-provider calls"),
+            [
+                "new-page:search:after-replacement".to_owned(),
+                "new-page:page:1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_video_lane_replaces_a_queued_obsolete_source_with_the_latest() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (page_started_sender, page_started) = bounded(1);
+        let (page_release, page_release_receiver) = bounded(1);
+        let provider = BlockingYouTubeLaneProvider {
+            name: "latest",
+            calls: Arc::clone(&calls),
+            details_gate: None,
+            page_gate: Some((2, page_started_sender, page_release_receiver)),
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) =
+            spawn_test_provider_supervisor(Box::new(provider), request_receiver, response_sender);
+        let page_request = |generation, channel_id: &str, page| ProviderRequest::ChannelVideos {
+            generation,
+            request: ChannelVideosRequest {
+                channel_id: channel_id.to_owned(),
+                page,
+            },
+        };
+
+        requests
+            .send(page_request(1, "UCactive", 2))
+            .expect("dispatch active page");
+        page_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first page becomes active");
+        requests
+            .send(page_request(2, "UCobsolete", 1))
+            .expect("queue obsolete source");
+        requests
+            .send(page_request(3, "UClatest", 1))
+            .expect("replace queued source");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 10,
+                request: SearchRequest::new("router-barrier", SearchTarget::Videos),
+            })
+            .expect("dispatch router barrier");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("general barrier response while page one is blocked"),
+            ProviderResponse::Search { generation: 10, .. }
+        ));
+        page_release.send(()).expect("release active page");
+
+        let mut completed_channels = Vec::new();
+        for _ in 0..2 {
+            let ProviderResponse::ChannelVideos {
+                request, result, ..
+            } = responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("channel page response")
+            else {
+                panic!("unexpected provider response");
+            };
+            assert!(result.is_ok());
+            completed_channels.push(request.channel_id);
+        }
+        assert_eq!(completed_channels, ["UCactive", "UClatest"]);
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *calls.lock().expect("YouTube lane calls"),
+            [
+                "latest:page:2".to_owned(),
+                "latest:search:router-barrier".to_owned(),
+                "latest:page:1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_provider_replacement_is_shared_by_both_worker_lanes() {
+        let old_calls = Arc::new(Mutex::new(Vec::new()));
+        let new_calls = Arc::new(Mutex::new(Vec::new()));
+        let (page_started_sender, page_started) = bounded(1);
+        let (page_release, page_release_receiver) = bounded(1);
+        let old_provider = BlockingYouTubeLaneProvider {
+            name: "old",
+            calls: Arc::clone(&old_calls),
+            details_gate: None,
+            page_gate: Some((1, page_started_sender, page_release_receiver)),
+        };
+        let new_provider = BlockingYouTubeLaneProvider {
+            name: "new",
+            calls: Arc::clone(&new_calls),
+            details_gate: None,
+            page_gate: None,
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) = spawn_test_provider_supervisor(
+            Box::new(old_provider),
+            request_receiver,
+            response_sender,
+        );
+
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 1,
+                request: ChannelVideosRequest {
+                    channel_id: "UCfixture".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch old-provider page");
+        page_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old-provider page becomes active");
+        requests
+            .send(ProviderRequest::ReplaceYouTubeProvider {
+                provider: Box::new(new_provider),
+            })
+            .expect("replace YouTube provider");
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 2,
+                request: ChannelVideosRequest {
+                    channel_id: "UCreplacement".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("queue new-provider page");
+        requests
+            .send(ProviderRequest::Search {
+                generation: 3,
+                request: SearchRequest::new("after-replacement", SearchTarget::Videos),
+            })
+            .expect("dispatch new-provider search");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("new-provider general response"),
+            ProviderResponse::Search { generation: 3, .. }
+        ));
+        page_release.send(()).expect("release old-provider page");
+        for expected_page in [1, 1] {
+            let ProviderResponse::ChannelVideos { request, .. } = responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("channel page response")
+            else {
+                panic!("unexpected provider response");
+            };
+            assert_eq!(request.page, expected_page);
+        }
+
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *old_calls.lock().expect("old-provider calls"),
+            ["old:page:1".to_owned()]
+        );
+        assert_eq!(
+            *new_calls.lock().expect("new-provider calls"),
+            [
+                "new:search:after-replacement".to_owned(),
+                "new:page:1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_supervisor_shutdown_skips_both_lanes_queued_work() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (details_started_sender, details_started) = bounded(1);
+        let (details_release, details_release_receiver) = bounded(1);
+        let (page_started_sender, page_started) = bounded(1);
+        let (page_release, page_release_receiver) = bounded(1);
+        let provider = BlockingYouTubeLaneProvider {
+            name: "shutdown",
+            calls: Arc::clone(&calls),
+            details_gate: Some((
+                "active-details",
+                details_started_sender,
+                details_release_receiver,
+            )),
+            page_gate: Some((1, page_started_sender, page_release_receiver)),
+        };
+        let (requests, request_receiver) = bounded(0);
+        let (response_sender, _responses) = unbounded();
+        let (worker, _storage) =
+            spawn_test_provider_supervisor(Box::new(provider), request_receiver, response_sender);
+
+        requests
+            .send(ProviderRequest::Details {
+                generation: 1,
+                video_id: "active-details".to_owned(),
+            })
+            .expect("dispatch active Details");
+        details_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Details becomes active");
+        requests
+            .send(ProviderRequest::ChannelVideos {
+                generation: 2,
+                request: ChannelVideosRequest {
+                    channel_id: "UCfixture".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch active page");
+        page_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("page becomes active");
+        requests
+            .send(ProviderRequest::Details {
+                generation: 3,
+                video_id: "queued-details".to_owned(),
+            })
+            .expect("queue stale Details");
+        for page in [2, 3] {
+            requests
+                .send(ProviderRequest::ChannelVideos {
+                    generation: u64::from(page),
+                    request: ChannelVideosRequest {
+                        channel_id: "UCfixture".to_owned(),
+                        page,
+                    },
+                })
+                .expect("queue stale page");
+        }
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("dispatch supervisor shutdown");
+        assert!(
+            requests
+                .send(ProviderRequest::Search {
+                    generation: 9,
+                    request: SearchRequest::new("after-shutdown", SearchTarget::Videos),
+                })
+                .is_err(),
+            "the outer receiver must close before either blocked child is joined"
+        );
+        details_release.send(()).expect("release active Details");
+        page_release.send(()).expect("release active page");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(
+            *calls.lock().expect("YouTube lane calls"),
+            [
+                "shutdown:details:active-details".to_owned(),
+                "shutdown:page:1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pagination_panic_returns_an_error_and_the_lane_accepts_the_next_page() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = PanickingPaginationProvider {
+            calls: Arc::clone(&calls),
+        };
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) =
+            spawn_test_provider_supervisor(Box::new(provider), request_receiver, response_sender);
+        let page_request = |page| ProviderRequest::ChannelVideos {
+            generation: u64::from(page),
+            request: ChannelVideosRequest {
+                channel_id: "UCfixture".to_owned(),
+                page,
+            },
+        };
+
+        requests.send(page_request(1)).expect("dispatch panic page");
+        let ProviderResponse::ChannelVideos { result, .. } = responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("panic page response")
+        else {
+            panic!("unexpected provider response");
+        };
+        assert!(
+            result
+                .expect_err("page panic must become an error")
+                .contains("panicked")
+        );
+
+        requests
+            .send(page_request(2))
+            .expect("dispatch page after panic");
+        let ProviderResponse::ChannelVideos {
+            request, result, ..
+        } = responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("post-panic page response")
+        else {
+            panic!("unexpected provider response");
+        };
+        assert_eq!(request.page, 2);
+        assert!(result.is_ok());
+        requests
+            .send(ProviderRequest::Shutdown)
+            .expect("shutdown provider supervisor");
+        worker.join().expect("provider supervisor stops");
+        assert_eq!(*calls.lock().expect("pagination panic calls"), [1, 2]);
+    }
+
+    #[test]
+    fn general_worker_panic_disconnects_the_supervisor_response_channel() {
+        let (requests, request_receiver) = unbounded();
+        let (response_sender, responses) = unbounded();
+        let (worker, _storage) = spawn_test_provider_supervisor(
+            Box::new(PanickingDetailsProvider),
+            request_receiver,
+            response_sender,
+        );
+
+        requests
+            .send(ProviderRequest::Details {
+                generation: 1,
+                video_id: "panic-video".to_owned(),
+            })
+            .expect("dispatch panic Details");
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(1)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        worker
+            .join()
+            .expect("provider supervisor stops after child panic");
+        assert!(requests.send(ProviderRequest::Shutdown).is_err());
     }
 
     #[test]

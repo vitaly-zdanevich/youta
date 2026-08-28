@@ -501,8 +501,12 @@ export interface SubscriptionsView {
   focus: SubscriptionPane;
   description_expanded: boolean;
   loading: boolean;
+	loading_more: boolean;
+	metadata_pending: boolean;
   show_youtube_shorts: boolean;
   source_title: string;
+	/** Opaque active-source generation used to reset virtual-list ownership. */
+	source_generation: number;
   source_kind: SubscriptionKind;
   source_subscriber_count: number | null;
   source_created: string;

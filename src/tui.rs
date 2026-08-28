@@ -933,7 +933,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                             if let Some(action) = key_action_with_page_rows(
                                 key,
                                 controller.view(),
-                                visible_main_list_page_rows(&hit_map),
+                                visible_main_list_page_rows(&hit_map, controller.view()),
                                 Some(&hit_map),
                             ) {
                                 controller.dispatch(action);
@@ -1435,7 +1435,10 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
         || matches!(view.waveform, WaveformView::Loading { .. })
     {
         playback_wait.min(LOCAL_BROWSE_RESPONSE_POLL_INTERVAL)
-    } else if view.search_activity.is_some() || view.subscriptions.loading || view.playback_starting
+    } else if view.search_activity.is_some()
+        || view.subscriptions.loading
+        || view.subscriptions.metadata_pending
+        || view.playback_starting
     {
         playback_wait.min(settings.playing_tick)
     } else {
@@ -1589,9 +1592,13 @@ struct HitMap {
     subscription_source_rows: Rect,
     /// First model source represented by the visible source-list rectangle.
     subscription_source_first_index: usize,
+    /// Physical terminal rows occupied by one subscription-source model row.
+    subscription_source_row_height: u16,
     subscription_item_rows: Rect,
     /// First model item represented by the visible subscription-item rectangle.
     subscription_item_first_index: usize,
+    /// Physical terminal rows occupied by one subscription-item model row.
+    subscription_item_row_height: u16,
     subscription_source_buttons: Vec<(UiAction, Rect)>,
     details_panel: Rect,
     /// Last information-panel owner rendered into the terminal pane.
@@ -2653,8 +2660,10 @@ fn render_body(
     hit_map.rows_row_height = 2;
     hit_map.subscription_source_rows = Rect::default();
     hit_map.subscription_source_first_index = 0;
+    hit_map.subscription_source_row_height = 2;
     hit_map.subscription_item_rows = Rect::default();
     hit_map.subscription_item_first_index = 0;
+    hit_map.subscription_item_row_height = 2;
     hit_map.subscription_source_buttons.clear();
 
     if view.screen == Screen::Subscriptions {
@@ -2995,6 +3004,7 @@ fn render_subscriptions_body(
     let subscriptions = &view.subscriptions;
     match subscriptions.layout {
         SubscriptionsLayout::DrillDown if subscriptions.route == SubscriptionRoute::Items => {
+            hit_map.subscription_item_row_height = row_list_height(&subscriptions.items);
             let panes = Layout::default()
                 .direction(if area.width >= 80 {
                     Direction::Horizontal
@@ -3032,6 +3042,7 @@ fn render_subscriptions_body(
                 false,
                 false,
                 subscriptions.loading,
+                subscriptions.loading_more,
                 view.search_animation_frame,
                 subscriptions.source_kind,
                 subscriptions.show_youtube_shorts,
@@ -3134,6 +3145,7 @@ fn render_subscriptions_body(
                     true,
                     true,
                     subscriptions.loading,
+                    subscriptions.loading_more,
                     view.search_animation_frame,
                     subscriptions.source_kind,
                     subscriptions.show_youtube_shorts,
@@ -3158,6 +3170,7 @@ fn render_subscriptions_body(
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(panes[1]);
+                hit_map.subscription_item_row_height = row_list_height(&subscriptions.items);
                 let heading = subscription_items_heading(subscriptions);
                 (
                     hit_map.subscription_item_rows,
@@ -3184,6 +3197,7 @@ fn render_subscriptions_body(
                     !subscriptions.items.is_empty(),
                     false,
                     subscriptions.loading,
+                    subscriptions.loading_more,
                     view.search_animation_frame,
                     subscriptions.source_kind,
                     subscriptions.show_youtube_shorts,
@@ -3207,6 +3221,7 @@ fn render_subscription_source_list(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) -> (Rect, usize) {
+    hit_map.subscription_source_row_height = row_list_height(&view.subscriptions.sources);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -3275,6 +3290,7 @@ fn render_subscription_item_buttons(
     description_available: bool,
     description_expanded: bool,
     loading: bool,
+    loading_more: bool,
     animation_frame: usize,
     source_kind: SubscriptionKind,
     show_youtube_shorts: bool,
@@ -3286,7 +3302,7 @@ fn render_subscription_item_buttons(
     if area.is_empty() {
         return;
     }
-    let refresh_label = if loading {
+    let refresh_label = if loading && !loading_more {
         let frame = ASCII_ACTIVITY_FRAMES[animation_frame % ASCII_ACTIVITY_FRAMES.len()];
         format!("Refresh {} {frame}", subscription_item_noun(source_kind))
     } else {
@@ -3362,6 +3378,17 @@ fn render_subscription_item_buttons(
         frame.render_widget(Paragraph::new(label).style(theme.accent), target);
         hit_map.detail_buttons.push((action, target));
         x = x.saturating_add(width).saturating_add(2);
+    }
+    if loading_more {
+        let label = "Loading more…";
+        let available = area.right().saturating_sub(x);
+        let width = terminal_text_width(label).min(available);
+        if width > 0 {
+            frame.render_widget(
+                Paragraph::new(label).style(theme.muted),
+                Rect::new(x, area.y, width, 1),
+            );
+        }
     }
 }
 
@@ -6238,7 +6265,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  ↪ internal video: click the marker after a YouTube URL",
         local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
-        "  Subscriptions channel: R refresh videos     h Shorts on/off     i description",
+        "  Subscriptions: PageUp/Down page     R refresh videos     h Shorts on/off     i description",
         "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
@@ -9557,12 +9584,38 @@ fn wrap_diagnostic_report(report: &str, width: usize) -> Vec<String> {
 /// A non-empty sub-row rectangle still represents one selectable row. An empty
 /// rectangle produces no page action, which avoids surprising jumps in
 /// terminals too small to render the list.
-fn visible_main_list_page_rows(hit_map: &HitMap) -> Option<usize> {
-    if hit_map.rows.height == 0 {
+fn visible_main_list_page_rows(hit_map: &HitMap, view: &ViewModel) -> Option<usize> {
+    let (rows, row_height) = if view.screen == Screen::Subscriptions {
+        match view.subscriptions.layout {
+            SubscriptionsLayout::DrillDown
+                if view.subscriptions.route == SubscriptionRoute::Items =>
+            {
+                (
+                    hit_map.subscription_item_rows,
+                    hit_map.subscription_item_row_height,
+                )
+            }
+            SubscriptionsLayout::DrillDown => (
+                hit_map.subscription_source_rows,
+                hit_map.subscription_source_row_height,
+            ),
+            SubscriptionsLayout::Split if view.subscriptions.focus == SubscriptionPane::Items => (
+                hit_map.subscription_item_rows,
+                hit_map.subscription_item_row_height,
+            ),
+            SubscriptionsLayout::Split => (
+                hit_map.subscription_source_rows,
+                hit_map.subscription_source_row_height,
+            ),
+        }
+    } else {
+        (hit_map.rows, hit_map.rows_row_height)
+    };
+    if rows.height == 0 {
         return None;
     }
-    let row_height = hit_map.rows_row_height.max(1);
-    Some(usize::from((hit_map.rows.height / row_height).max(1)))
+    let row_height = row_height.max(1);
+    Some(usize::from((rows.height / row_height).max(1)))
 }
 
 /// Translates one Crossterm key event into the shared vocabulary.
@@ -10136,7 +10189,9 @@ fn mouse_action_unfiltered(
                 let relative_row = mouse.row.saturating_sub(hit_map.subscription_source_rows.y);
                 let index = hit_map
                     .subscription_source_first_index
-                    .saturating_add(usize::from(relative_row / 2));
+                    .saturating_add(usize::from(
+                        relative_row / hit_map.subscription_source_row_height.max(1),
+                    ));
                 if index < view.subscriptions.sources.len() {
                     return Some(UiAction::SelectSubscriptionSource(index));
                 }
@@ -10145,7 +10200,9 @@ fn mouse_action_unfiltered(
                 let relative_row = mouse.row.saturating_sub(hit_map.subscription_item_rows.y);
                 let index = hit_map
                     .subscription_item_first_index
-                    .saturating_add(usize::from(relative_row / 2));
+                    .saturating_add(usize::from(
+                        relative_row / hit_map.subscription_item_row_height.max(1),
+                    ));
                 if index < view.subscriptions.items.len() {
                     return Some(UiAction::SelectSubscriptionItem(index));
                 }
@@ -10166,6 +10223,34 @@ fn mouse_action_unfiltered(
                 .any(|(_, area)| contains(*area, mouse.column, mouse.row))
             {
                 Some(UiAction::MoveDetailLink(1))
+            } else if view.screen == Screen::Subscriptions
+                && contains(hit_map.subscription_source_rows, mouse.column, mouse.row)
+            {
+                if view.subscriptions.sources.is_empty() {
+                    return Some(UiAction::FocusSubscriptionPane(SubscriptionPane::Sources));
+                }
+                let selected = view.subscriptions.selected_source;
+                let next = selected
+                    .saturating_add(1)
+                    .min(view.subscriptions.sources.len().saturating_sub(1));
+                Some(if next == selected {
+                    UiAction::FocusSubscriptionPane(SubscriptionPane::Sources)
+                } else {
+                    UiAction::SelectSubscriptionSource(next)
+                })
+            } else if view.screen == Screen::Subscriptions
+                && contains(hit_map.subscription_item_rows, mouse.column, mouse.row)
+            {
+                if view.subscriptions.items.is_empty() {
+                    Some(UiAction::FocusSubscriptionPane(SubscriptionPane::Items))
+                } else {
+                    Some(UiAction::SelectSubscriptionItem(
+                        view.subscriptions
+                            .selected_item
+                            .saturating_add(1)
+                            .min(view.subscriptions.items.len().saturating_sub(1)),
+                    ))
+                }
             } else {
                 Some(UiAction::MoveSelection(1))
             }
@@ -10181,6 +10266,29 @@ fn mouse_action_unfiltered(
                 .any(|(_, area)| contains(*area, mouse.column, mouse.row))
             {
                 Some(UiAction::MoveDetailLink(-1))
+            } else if view.screen == Screen::Subscriptions
+                && contains(hit_map.subscription_source_rows, mouse.column, mouse.row)
+            {
+                if view.subscriptions.sources.is_empty() {
+                    return Some(UiAction::FocusSubscriptionPane(SubscriptionPane::Sources));
+                }
+                let selected = view.subscriptions.selected_source;
+                let previous = selected.saturating_sub(1);
+                Some(if previous == selected {
+                    UiAction::FocusSubscriptionPane(SubscriptionPane::Sources)
+                } else {
+                    UiAction::SelectSubscriptionSource(previous)
+                })
+            } else if view.screen == Screen::Subscriptions
+                && contains(hit_map.subscription_item_rows, mouse.column, mouse.row)
+            {
+                if view.subscriptions.items.is_empty() {
+                    Some(UiAction::FocusSubscriptionPane(SubscriptionPane::Items))
+                } else {
+                    Some(UiAction::SelectSubscriptionItem(
+                        view.subscriptions.selected_item.saturating_sub(1),
+                    ))
+                }
             } else {
                 Some(UiAction::MoveSelection(-1))
             }
@@ -11053,7 +11161,21 @@ mod tests {
         view.search_activity = None;
         view.subscriptions.loading = true;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
+        view.subscriptions.loading_more = true;
+        assert_eq!(
+            event_wait(&view, &settings),
+            Duration::from_millis(250),
+            "background continuation must keep polling for its worker response"
+        );
+        view.subscriptions.loading_more = false;
         view.subscriptions.loading = false;
+        view.subscriptions.metadata_pending = true;
+        assert_eq!(
+            event_wait(&view, &settings),
+            Duration::from_millis(250),
+            "a debounced subscription selection must wake near its deadline"
+        );
+        view.subscriptions.metadata_pending = false;
         view.playback_starting = true;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
         view.playback_starting = false;
@@ -12773,6 +12895,7 @@ mod tests {
         }
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
         assert!(rendered.contains("h Shorts on/off"));
+        assert!(rendered.contains("Subscriptions: PageUp/Down page"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
         assert!(rendered.contains("t Details-only text selection"));
@@ -13116,22 +13239,135 @@ mod tests {
     }
 
     #[test]
+    fn subscription_page_keys_use_the_rendered_active_pane_capacity() {
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            ..ViewModel::default()
+        };
+        for (layout, route, focus) in [
+            (
+                SubscriptionsLayout::DrillDown,
+                SubscriptionRoute::Sources,
+                SubscriptionPane::Sources,
+            ),
+            (
+                SubscriptionsLayout::DrillDown,
+                SubscriptionRoute::Items,
+                SubscriptionPane::Items,
+            ),
+            (
+                SubscriptionsLayout::Split,
+                SubscriptionRoute::Sources,
+                SubscriptionPane::Sources,
+            ),
+            (
+                SubscriptionsLayout::Split,
+                SubscriptionRoute::Sources,
+                SubscriptionPane::Items,
+            ),
+        ] {
+            view.subscriptions.layout = layout;
+            view.subscriptions.route = route;
+            view.subscriptions.focus = focus;
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                    &view,
+                    Some(8),
+                    None,
+                ),
+                Some(UiAction::MoveSelection(-8)),
+                "{layout:?} {route:?} {focus:?} must page its active pane"
+            );
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &view,
+                    Some(8),
+                    None,
+                ),
+                Some(UiAction::MoveSelection(8)),
+                "{layout:?} {route:?} {focus:?} must page its active pane"
+            );
+        }
+
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &view,
+                None,
+                None,
+            ),
+            None,
+            "an unrendered subscription pane must not guess its page size"
+        );
+        view.details_focused = true;
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &view,
+                Some(8),
+                None,
+            ),
+            Some(UiAction::ScrollDetails(DetailsScroll::Pages(1))),
+            "focused Details must retain priority over subscription paging"
+        );
+    }
+
+    #[test]
     fn visible_local_page_capacity_tracks_compact_rows_and_tiny_terminals() {
         let mut hit_map = HitMap {
             rows: Rect::new(0, 0, 40, 9),
             rows_row_height: 1,
             ..HitMap::default()
         };
-        assert_eq!(visible_main_list_page_rows(&hit_map), Some(9));
+        assert_eq!(
+            visible_main_list_page_rows(&hit_map, &ViewModel::default()),
+            Some(9)
+        );
 
         hit_map.rows_row_height = 2;
-        assert_eq!(visible_main_list_page_rows(&hit_map), Some(4));
+        assert_eq!(
+            visible_main_list_page_rows(&hit_map, &ViewModel::default()),
+            Some(4)
+        );
 
         hit_map.rows.height = 1;
-        assert_eq!(visible_main_list_page_rows(&hit_map), Some(1));
+        assert_eq!(
+            visible_main_list_page_rows(&hit_map, &ViewModel::default()),
+            Some(1)
+        );
 
         hit_map.rows.height = 0;
-        assert_eq!(visible_main_list_page_rows(&hit_map), None);
+        assert_eq!(
+            visible_main_list_page_rows(&hit_map, &ViewModel::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn subscription_page_capacity_tracks_the_rendered_focused_pane() {
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            ..ViewModel::default()
+        };
+        let hit_map = HitMap {
+            subscription_source_rows: Rect::new(0, 0, 30, 9),
+            subscription_source_row_height: 1,
+            subscription_item_rows: Rect::new(30, 0, 30, 11),
+            subscription_item_row_height: 2,
+            ..HitMap::default()
+        };
+
+        assert_eq!(visible_main_list_page_rows(&hit_map, &view), Some(9));
+        view.subscriptions.route = SubscriptionRoute::Items;
+        view.subscriptions.focus = SubscriptionPane::Items;
+        assert_eq!(visible_main_list_page_rows(&hit_map, &view), Some(5));
+        view.subscriptions.layout = SubscriptionsLayout::Split;
+        view.subscriptions.focus = SubscriptionPane::Sources;
+        assert_eq!(visible_main_list_page_rows(&hit_map, &view), Some(9));
+        view.subscriptions.focus = SubscriptionPane::Items;
+        assert_eq!(visible_main_list_page_rows(&hit_map, &view), Some(5));
     }
 
     #[test]
@@ -15919,6 +16155,15 @@ mod tests {
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw animated subscription refresh");
         assert!(rendered_text(&terminal).contains("[R] Refresh videos -"));
+        view.subscriptions.loading_more = true;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw static subscription continuation");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[R] Refresh videos"));
+        assert!(!rendered.contains("[R] Refresh videos -"));
+        assert!(rendered.contains("Loading more…"));
+        view.subscriptions.loading_more = false;
         view.subscriptions.loading = false;
 
         view.subscriptions.layout = SubscriptionsLayout::Split;
@@ -16122,6 +16367,109 @@ mod tests {
         assert_eq!(
             mouse_action(click(30), &hit_map, &view),
             Some(UiAction::SelectSubscriptionItem(0))
+        );
+    }
+
+    #[test]
+    fn compact_subscription_mouse_rows_use_the_rendered_one_line_height() {
+        let compact_rows = |prefix: &str| {
+            (0..3)
+                .map(|index| RowView {
+                    title: format!("{prefix} {index}"),
+                    compact: true,
+                    ..RowView::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            subscriptions: SubscriptionsView {
+                layout: SubscriptionsLayout::Split,
+                sources: compact_rows("Source"),
+                items: compact_rows("Episode"),
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let hit_map = HitMap {
+            subscription_source_rows: Rect::new(1, 2, 20, 3),
+            subscription_source_row_height: 1,
+            subscription_item_rows: Rect::new(30, 2, 20, 3),
+            subscription_item_row_height: 1,
+            ..HitMap::default()
+        };
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            mouse_action(click(1), &hit_map, &view),
+            Some(UiAction::SelectSubscriptionSource(2))
+        );
+        assert_eq!(
+            mouse_action(click(30), &hit_map, &view),
+            Some(UiAction::SelectSubscriptionItem(2))
+        );
+    }
+
+    #[test]
+    fn subscription_wheel_moves_the_pane_under_the_pointer() {
+        let rows = || {
+            (0..3)
+                .map(|index| RowView {
+                    title: format!("Fixture {index}"),
+                    ..RowView::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            subscriptions: SubscriptionsView {
+                layout: SubscriptionsLayout::Split,
+                focus: SubscriptionPane::Items,
+                selected_source: 0,
+                selected_item: 2,
+                sources: rows(),
+                items: rows(),
+                ..SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        let hit_map = HitMap {
+            subscription_source_rows: Rect::new(1, 2, 20, 6),
+            subscription_item_rows: Rect::new(30, 2, 20, 6),
+            ..HitMap::default()
+        };
+        let wheel = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            mouse_action(wheel(MouseEventKind::ScrollDown, 1), &hit_map, &view,),
+            Some(UiAction::SelectSubscriptionSource(1))
+        );
+        assert_eq!(
+            mouse_action(wheel(MouseEventKind::ScrollUp, 30), &hit_map, &view,),
+            Some(UiAction::SelectSubscriptionItem(1))
+        );
+
+        let mut empty_items = view.clone();
+        empty_items.subscriptions.focus = SubscriptionPane::Sources;
+        empty_items.subscriptions.items.clear();
+        assert_eq!(
+            mouse_action(
+                wheel(MouseEventKind::ScrollDown, 30),
+                &hit_map,
+                &empty_items,
+            ),
+            Some(UiAction::FocusSubscriptionPane(SubscriptionPane::Items)),
+            "an empty Items pane must not scroll the Sources selection underneath it"
         );
     }
 
