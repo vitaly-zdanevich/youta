@@ -12881,16 +12881,14 @@ mod tests {
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
         if cfg!(feature = "local-browser") {
-            assert!(rendered.contains("Local: Esc parent"));
-            assert!(rendered.contains("PageUp/Down page"));
+            assert!(rendered.contains("Local: Esc parent     PageUp/Down page"));
             if cfg!(feature = "audio-quality") {
                 assert!(rendered.contains("V audio quality"));
             } else {
                 assert!(!rendered.contains("V audio quality"));
             }
         } else {
-            assert!(!rendered.contains("Local: Esc parent"));
-            assert!(!rendered.contains("PageUp/Down page"));
+            assert!(!rendered.contains("Local: Esc parent     PageUp/Down page"));
             assert!(!rendered.contains("V audio quality"));
         }
         assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));

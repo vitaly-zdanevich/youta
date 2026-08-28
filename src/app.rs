@@ -112,7 +112,7 @@ use crate::playback::{
 };
 #[cfg(test)]
 use crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES;
-#[cfg(feature = "rss")]
+#[cfg(any(feature = "rss", test))]
 use crate::providers::PodcastEpisodeSummary;
 #[cfg(feature = "apple-podcasts")]
 use crate::providers::apple_podcasts::{
@@ -72275,8 +72275,23 @@ mod tests {
             })
             .expect("replace YouTube provider");
         requests
-            .send(ProviderRequest::Search {
+            .send(ProviderRequest::ChannelVideos {
                 generation: 5,
+                request: ChannelVideosRequest {
+                    channel_id: "UCreplacementbarrier".to_owned(),
+                    page: 1,
+                },
+            })
+            .expect("dispatch post-replacement routing barrier");
+        assert!(matches!(
+            responses
+                .recv_timeout(Duration::from_secs(1))
+                .expect("post-replacement pagination barrier response"),
+            ProviderResponse::ChannelVideos { generation: 5, .. }
+        ));
+        requests
+            .send(ProviderRequest::Search {
+                generation: 6,
                 request: SearchRequest::new("routed-after-replacement", SearchTarget::Videos),
             })
             .expect("queue replacement-provider search");
@@ -72298,7 +72313,7 @@ mod tests {
                 ProviderResponse::LocalFolderSize { generation: 3, .. } => {
                     saw_local_folder_size = true;
                 }
-                ProviderResponse::Search { generation: 5, .. } => {
+                ProviderResponse::Search { generation: 6, .. } => {
                     saw_replacement_search = true;
                 }
                 ProviderResponse::Search { generation: 2, .. } => {
@@ -72321,7 +72336,10 @@ mod tests {
         );
         assert_eq!(
             *new_calls.lock().expect("new-provider calls"),
-            ["new-general:search:routed-after-replacement".to_owned()],
+            [
+                "new-general:page:1".to_owned(),
+                "new-general:search:routed-after-replacement".to_owned(),
+            ],
             "queued old-provider work must neither run nor mutate the replacement provider"
         );
     }
