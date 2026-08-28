@@ -44703,18 +44703,31 @@ mod tests {
 
     #[test]
     fn downloaded_playlist_snapshot_matches_its_visible_primary_details() {
-        let (mut controller, _) = controller_with_mock_statuses([]);
-        let downloads = controller.config.downloads_dir();
-        std::fs::create_dir_all(&downloads).expect("downloads directory");
-        std::fs::write(downloads.join("Shown name.flac"), b"fixture local audio")
-            .expect("downloaded fixture");
+        let temporary = crate::test_support::canonical_tempdir("temporary downloaded snapshot");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        config.ensure_directories().expect("private Youta folders");
+        let downloaded = config.downloads_dir().join("Shown name.flac");
+        std::fs::write(&downloaded, b"fixture local audio").expect("downloaded fixture");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+
         controller.show_screen(Screen::Downloaded);
+        assert_eq!(controller.view.rows.len(), 1);
+        let media_id = controller.view.rows[0]
+            .media_id
+            .as_ref()
+            .expect("Downloaded Local media identity");
+        assert_eq!(
+            local_path_from_media_id(media_id).as_deref(),
+            Some(downloaded.as_path())
+        );
         let details = controller
             .view
             .details
             .as_ref()
             .expect("Downloaded Details")
             .clone();
+        assert_eq!(details.media_id.as_ref(), Some(media_id));
 
         let snapshot = controller
             .selected_playlist_snapshot()
