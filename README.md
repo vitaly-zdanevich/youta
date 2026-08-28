@@ -15,6 +15,8 @@
 
 ![Youta logo](gui/icons/icon.png)
 
+![Youta subscriptions screen](screenshot.webp)
+
 Youta is a low-resource terminal YouTube audio player and subscription manager
 written in Rust. It saves and shows listening progress. Subscriptions are
 currently stored and managed locally; YouTube-account synchronization is not

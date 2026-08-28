@@ -9,6 +9,7 @@
 # Artwork is matched by content heuristics anyway; saying so is cheaper than
 # trusting them with a file whose first bytes could look like text.
 *.png binary
+*.webp binary
 *.ico binary
 *.icns binary
 
