@@ -2617,12 +2617,16 @@ impl PrivateWorkspace {
                 "youta-codex-summary-{}-{timestamp}-{sequence}-{attempt}",
                 std::process::id()
             ));
-            let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = fs::DirBuilder::new();
                 builder.mode(0o700);
-            }
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
             match builder.create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
