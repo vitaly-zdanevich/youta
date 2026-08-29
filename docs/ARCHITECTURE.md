@@ -952,7 +952,7 @@ makes an unchanged revisit immediate. Audio bytes, paths, and quality reports
 are never sent over the network or persisted.
 
 Video summarization is a separate explicit pipeline behind the default-on,
-independently removable `video-summary` feature. Runtime configuration remains
+independently removable `summary` feature. Runtime configuration remains
 Off until the user selects Codex, and no external helper starts merely because
 the feature is compiled. An exact YouTube Details action submits a
 generation-owned job to a dedicated capacity-one worker. The worker asks the
@@ -1153,8 +1153,8 @@ include both official YouTube metadata and Invidious adapters, terminal images,
 offline QR rendering, local audio-quality analysis, explicit Codex video
 summaries, and the credential-free LibriVox adapter; runtime
 `providers.youtube_backend` chooses the YouTube adapter. `librivox` is included
-through `app-core`, while `audio-quality`, `images`, `qr`, and `video-summary`
-are independent default-on capabilities. The video-summary runtime backend is
+through `app-core`, while `audio-quality`, `images`, `qr`, and `summary`
+are independent default-on capabilities. The summary runtime backend is
 Off by default even when its code is present.
 The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
 builds omit that dependency and shortcut. Distribution/minimal builds can use
@@ -1182,7 +1182,7 @@ channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
-default-on `audio-quality`, `images`, `qr`, and `video-summary` USE flags and
+default-on `audio-quality`, `images`, `qr`, and `summary` USE flags and
 maps them to their corresponding Cargo features; each source-build capability
 can be disabled independently. Prebuilt artifacts always contain the analyzer
 and summary integration because a binary USE flag cannot change compiled code.

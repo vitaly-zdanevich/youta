@@ -195,19 +195,19 @@ fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
     let application = feature_closure(&manifest, "app");
-    let video_summary = feature_closure(&manifest, "video-summary");
+    let video_summary = feature_closure(&manifest, "summary");
 
-    assert!(default.contains("video-summary"));
+    assert!(default.contains("summary"));
     assert!(video_summary.contains("yt-dlp"));
     assert!(video_summary.contains("dep:rustix"));
     assert!(
-        !application.contains("video-summary"),
+        !application.contains("summary"),
         "`app` must not make the default-on Codex integration impossible to disable"
     );
     for renderer in ["controller", "tui", "dep:crossterm", "dep:ratatui"] {
         assert!(
             !video_summary.contains(renderer),
-            "`video-summary` must not require `{renderer}`"
+            "`summary` must not require `{renderer}`"
         );
     }
 
@@ -218,24 +218,22 @@ fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
             .as_array()
             .expect("the GUI declares its default feature profile")
             .iter()
-            .any(|feature| feature.as_str() == Some("video-summary")),
+            .any(|feature| feature.as_str() == Some("summary")),
         "ordinary GUI builds must retain video summaries"
     );
     assert_eq!(
-        gui_manifest["features"]["video-summary"][0].as_str(),
-        Some("youta/video-summary"),
+        gui_manifest["features"]["summary"][0].as_str(),
+        Some("youta/summary"),
         "the GUI feature must disable the summary UI and backend in both crates"
     );
 
     let readme = read_repository_file("README.md");
-    assert!(readme.contains("`video-summary` is the independently removable Codex summary"));
-    assert!(readme.contains("`USE=\"-video-summary\"` removes the Codex summary UI and backend"));
+    assert!(readme.contains("`summary` is the independently removable Codex summary"));
+    assert!(readme.contains("`USE=\"-summary\"` removes the Codex summary UI and backend"));
 
     let ci = read_repository_file(".github/workflows/ci.yml");
-    assert!(
-        ci.contains("cargo check --locked --no-default-features --features video-summary --lib")
-    );
-    assert!(ci.contains("cargo check --locked --no-default-features --features tui,video-summary"));
+    assert!(ci.contains("cargo check --locked --no-default-features --features summary --lib"));
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,summary"));
 }
 
 #[test]
@@ -344,14 +342,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,gpm,images,qr,video-summary",
-        "cargo_features=app,audio-quality,gpm,qr,video-summary",
-        "cargo_features=app,audio-quality,gpm,images,video-summary",
-        "cargo_features=app,audio-quality,gpm,video-summary",
-        "cargo_features=app,audio-quality,images,qr,video-summary",
-        "cargo_features=app,audio-quality,qr,video-summary",
-        "cargo_features=app,audio-quality,images,video-summary",
-        "cargo_features=app,audio-quality,video-summary",
+        "cargo_features=app,audio-quality,gpm,images,qr,summary",
+        "cargo_features=app,audio-quality,gpm,qr,summary",
+        "cargo_features=app,audio-quality,gpm,images,summary",
+        "cargo_features=app,audio-quality,gpm,summary",
+        "cargo_features=app,audio-quality,images,qr,summary",
+        "cargo_features=app,audio-quality,qr,summary",
+        "cargo_features=app,audio-quality,images,summary",
+        "cargo_features=app,audio-quality,summary",
     ] {
         assert!(
             script
@@ -550,14 +548,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,gpm,images,qr,video-summary",
-        "app,audio-quality,gpm,qr,video-summary",
-        "app,audio-quality,gpm,images,video-summary",
-        "app,audio-quality,gpm,video-summary",
-        "app,audio-quality,images,qr,video-summary",
-        "app,audio-quality,qr,video-summary",
-        "app,audio-quality,images,video-summary",
-        "app,audio-quality,video-summary",
+        "app,audio-quality,gpm,images,qr,summary",
+        "app,audio-quality,gpm,qr,summary",
+        "app,audio-quality,gpm,images,summary",
+        "app,audio-quality,gpm,summary",
+        "app,audio-quality,images,qr,summary",
+        "app,audio-quality,qr,summary",
+        "app,audio-quality,images,summary",
+        "app,audio-quality,summary",
     ] {
         assert!(
             ci.contains(&format!(

@@ -14,7 +14,7 @@ use youta::persistence::{ANOTHER_INSTANCE_MESSAGE, PersistenceError};
 #[cfg(feature = "yt-dlp")]
 use youta::playback::ytdlp::{YtDlp, YtDlpConfig};
 use youta::providers::{SearchItem, SearchRequest, SearchTarget, configured_youtube_provider};
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 use youta::video_summary::CodexVideoSummarizer;
 
 /// Low-resource terminal `YouTube` audio player using `yt-dlp`.
@@ -114,7 +114,7 @@ fn probe_diagnostic_helpers(
     };
     #[cfg(not(feature = "acoustid"))]
     let _ = fpcalc_executable;
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     let helpers = {
         let mut helpers = helpers;
         if let Some(codex_executable) = codex_executable {
@@ -122,7 +122,7 @@ fn probe_diagnostic_helpers(
         }
         helpers
     };
-    #[cfg(not(feature = "video-summary"))]
+    #[cfg(not(feature = "summary"))]
     let _ = codex_executable;
     ExternalHelper::probe_many(helpers)
 }
@@ -393,7 +393,7 @@ struct HelperCheck {
 /// In particular, a bare `codex` may resolve to npm's `codex.cmd` shim on
 /// Windows. An Off backend returns [`None`] and therefore performs no probe.
 fn selected_codex_program(config: &Config) -> Option<PathBuf> {
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     {
         (config.video_summary.backend == youta::config::VideoSummaryBackend::Codex).then(|| {
             PathBuf::from(
@@ -401,7 +401,7 @@ fn selected_codex_program(config: &Config) -> Option<PathBuf> {
             )
         })
     }
-    #[cfg(not(feature = "video-summary"))]
+    #[cfg(not(feature = "summary"))]
     {
         let _ = config;
         None
@@ -509,8 +509,8 @@ fn run_doctor(config: &Config) -> Result<()> {
     if !cfg!(feature = "acoustid") {
         println!("fpcalc: skipped (AcoustID feature omitted at build time)");
     }
-    if !cfg!(feature = "video-summary") {
-        println!("codex: skipped (video-summary feature omitted at build time)");
+    if !cfg!(feature = "summary") {
+        println!("codex: skipped (summary feature omitted at build time)");
     } else if config.video_summary.backend != youta::config::VideoSummaryBackend::Codex {
         println!("codex: skipped (video summaries disabled at runtime)");
     }
@@ -678,7 +678,7 @@ fn print_config(config: &Config) {
 
 /// Renders the non-secret effective video-summary settings for `youta config`.
 fn video_summary_config_lines(config: &Config) -> [String; 2] {
-    let backend = if cfg!(feature = "video-summary") {
+    let backend = if cfg!(feature = "summary") {
         config.video_summary.backend
     } else {
         youta::config::VideoSummaryBackend::Off
@@ -695,7 +695,7 @@ fn video_summary_config_lines(config: &Config) -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     use youta::config::VideoSummaryBackend;
     use youta::config::{Config, PlaybackBackend};
 
@@ -742,7 +742,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn doctor_probes_codex_only_after_explicit_runtime_selection() {
         let temporary = tempdir().expect("temporary directory");
@@ -771,11 +771,11 @@ mod tests {
         let temporary = tempdir().expect("temporary directory");
         let mut config = Config::for_dir(temporary.path());
         config.video_summary.codex_executable = "/opt/openai/bin/codex".into();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             config.video_summary.backend = VideoSummaryBackend::Codex;
         }
-        #[cfg(not(feature = "video-summary"))]
+        #[cfg(not(feature = "summary"))]
         {
             config.video_summary.backend = youta::config::VideoSummaryBackend::Codex;
         }
@@ -785,7 +785,7 @@ mod tests {
             [
                 format!(
                     "video_summary_backend = {}",
-                    if cfg!(feature = "video-summary") {
+                    if cfg!(feature = "summary") {
                         "codex"
                     } else {
                         "off"

@@ -45,7 +45,7 @@ pub mod waveform;
 #[cfg(feature = "audio-quality")]
 pub mod audio_quality;
 
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 pub mod video_summary;
 
 #[cfg(feature = "waveform")]

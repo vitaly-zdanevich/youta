@@ -37,7 +37,7 @@ default = [
     "gpm",
     "images",
     "qr",
-    "video-summary",
+    "summary",
 ]
 
 # Complete application profile shared by default and text-only builds.
@@ -151,7 +151,7 @@ audio-quality = ["local-browser", "dep:rustfft", "dep:rustix"]
 # the existing yt-dlp process boundary without adding an SDK or credential
 # dependency. Keeping the feature renderer-free lets every front-end expose the
 # same capability while distributors remove both its UI and backend.
-video-summary = ["yt-dlp"]
+summary = ["yt-dlp"]
 # Remote artwork fetching and its private on-disk cache, with no renderer.
 #
 # `src/artwork.rs` turns a provider URL into bytes under Youta's network and

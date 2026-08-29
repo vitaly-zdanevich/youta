@@ -1995,7 +1995,7 @@ impl Default for ViewModel {
             error_popup: None,
             audio_quality_supported: cfg!(feature = "audio-quality"),
             audio_quality_popup: None,
-            video_summary_supported: cfg!(feature = "video-summary"),
+            video_summary_supported: cfg!(feature = "summary"),
             video_summary_available: false,
             video_summary_popup: None,
             video_comments_available: false,

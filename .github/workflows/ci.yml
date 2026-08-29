@@ -170,11 +170,11 @@ jobs:
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib
           cargo check --locked --no-default-features --features audio-quality --lib
-          cargo check --locked --no-default-features --features video-summary --lib
+          cargo check --locked --no-default-features --features summary --lib
           cargo check --locked --no-default-features --features acoustid --lib
           cargo check --locked --no-default-features --features tui,waveform
           cargo check --locked --no-default-features --features tui,audio-quality
-          cargo check --locked --no-default-features --features tui,video-summary
+          cargo check --locked --no-default-features --features tui,summary
           cargo check --locked --no-default-features --features tui,local-browser
           cargo check --locked --no-default-features --features tui,local-metadata
           cargo check --locked --no-default-features --features tui,local-rename
@@ -224,14 +224,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images,qr,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,qr,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images,qr,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,qr,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images,video-summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,video-summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,images,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,gpm,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,images,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,summary
 
       - name: Validate and start the i686 executable
         run: |

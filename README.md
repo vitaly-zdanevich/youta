@@ -539,7 +539,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,qr,video-summary
+	--features app,audio-quality,qr,summary
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -550,14 +550,14 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,qr,video-summary
+	--features app-core,audio-quality,images,qr,summary
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
 `qr` to remove QR encoding and its shortcut from any custom build. Cargo
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
-`video-summary` is the independently removable Codex summary integration, and
+`summary` is the independently removable Codex summary integration, and
 `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, video summaries,
 Yandex Music, and GPM.
@@ -1174,7 +1174,7 @@ These are distinct integration modes:
 
 ### Codex video summaries
 
-The default build includes the `video-summary` feature, but its runtime backend
+The default build includes the `summary` feature, but its runtime backend
 is **Off** until the user explicitly selects **Codex** in Preferences or sets
 `video_summary.backend = 'codex'`. Install the
 [Codex CLI](https://developers.openai.com/codex/cli/) and authenticate it once
@@ -1373,7 +1373,7 @@ known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
 dependencies while retaining the other defaults, build with
-`--no-default-features --features app,audio-quality,qr,video-summary`. For a
+`--no-default-features --features app,audio-quality,qr,summary`. For a
 smaller custom build, omit `images`; include it explicitly to restore rendering.
 The rendering integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
@@ -1559,7 +1559,7 @@ Drill-down or Split, choose whether exact `Реклама` chapters are hidden a
 skipped, choose whether selected YouTube audio is prepared, choose whether
 Local folder sizes are measured, choose the exact YouTube video-thumbnail
 size, choose whether new playback History entries are saved, choose the
-explicit video-summary backend, and press `Enter` to save. These preferences
+explicit summary backend, and press `Enter` to save. These preferences
 can be configured directly:
 
 ```toml
@@ -1906,9 +1906,9 @@ it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
 arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
-The source package maps the default-enabled `audio-quality` and `video-summary`
+The source package maps the default-enabled `audio-quality` and `summary`
 flags to their Cargo features. `USE="-audio-quality"` removes the analyzer and
-RustFFT dependency. `USE="-video-summary"` removes the Codex summary UI and backend.
+RustFFT dependency. `USE="-summary"` removes the Codex summary UI and backend.
 Prebuilt executables contain the fixed upstream feature set and keep both
 capabilities enabled; offering binary USE switches would require another copy
 of every Linux release variant rather than changing installed code.

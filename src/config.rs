@@ -70,7 +70,7 @@ pub const VIDEO_SUMMARY_BACKEND_ENV: &str = "YOUTA_VIDEO_SUMMARY__BACKEND";
 #[cfg(feature = "controller")]
 pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) -> bool {
     (cfg!(feature = "images") || variable != TTY_IMAGES_ENV)
-        && (cfg!(feature = "video-summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
+        && (cfg!(feature = "summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -673,7 +673,7 @@ impl Config {
                 })?;
             persistence["save_playback_history"] = value(save_playback_history);
         }
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             let video_summary = document
                 .as_table_mut()
@@ -688,7 +688,7 @@ impl Config {
                 })?;
             video_summary["backend"] = value(video_summary_backend.as_config_value());
         }
-        #[cfg(not(feature = "video-summary"))]
+        #[cfg(not(feature = "summary"))]
         let _ = video_summary_backend;
         write_private_config(&path, document.to_string().as_bytes())?;
 
@@ -704,7 +704,7 @@ impl Config {
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
         self.playback.youtube_prewarm = youtube_prewarm;
         self.persistence.save_playback_history = save_playback_history;
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             self.video_summary.backend = video_summary_backend;
         }
@@ -1894,7 +1894,7 @@ mod tests {
         );
         assert_eq!(
             tui_preference_environment_variable_is_relevant(VIDEO_SUMMARY_BACKEND_ENV),
-            cfg!(feature = "video-summary")
+            cfg!(feature = "summary")
         );
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
@@ -2286,12 +2286,12 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
         assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             assert!(contents.contains("[video_summary]"));
             assert!(contents.contains("backend = \"codex\""));
         }
-        #[cfg(not(feature = "video-summary"))]
+        #[cfg(not(feature = "summary"))]
         assert!(!contents.contains("[video_summary]"));
         #[cfg(feature = "images")]
         assert!(contents.contains("show_images_in_tty = false"));
@@ -2312,7 +2312,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!config.persistence.save_playback_history);
         assert_eq!(
             config.video_summary.backend,
-            if cfg!(feature = "video-summary") {
+            if cfg!(feature = "summary") {
                 VideoSummaryBackend::Codex
             } else {
                 VideoSummaryBackend::Off
@@ -2336,7 +2336,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!reloaded.persistence.save_playback_history);
         assert_eq!(
             reloaded.video_summary.backend,
-            if cfg!(feature = "video-summary") {
+            if cfg!(feature = "summary") {
                 VideoSummaryBackend::Codex
             } else {
                 VideoSummaryBackend::Off
@@ -2344,7 +2344,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
     }
 
-    #[cfg(all(feature = "controller", not(feature = "video-summary")))]
+    #[cfg(all(feature = "controller", not(feature = "summary")))]
     #[test]
     fn feature_off_preferences_preserve_existing_video_summary_toml() {
         let directory = tempdir().expect("temporary directory");

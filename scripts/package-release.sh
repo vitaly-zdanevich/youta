@@ -64,35 +64,35 @@ esac
 case "${variant}" in
 	images)
 		executable_suffix=
-		cargo_features=app,audio-quality,gpm,images,qr,video-summary
+		cargo_features=app,audio-quality,gpm,images,qr,summary
 		;;
 	text)
 		executable_suffix=-text
-		cargo_features=app,audio-quality,gpm,qr,video-summary
+		cargo_features=app,audio-quality,gpm,qr,summary
 		;;
 	images-no-qr)
 		executable_suffix=-no-qr
-		cargo_features=app,audio-quality,gpm,images,video-summary
+		cargo_features=app,audio-quality,gpm,images,summary
 		;;
 	text-no-qr)
 		executable_suffix=-text-no-qr
-		cargo_features=app,audio-quality,gpm,video-summary
+		cargo_features=app,audio-quality,gpm,summary
 		;;
 	images-no-gpm)
 		executable_suffix=-no-gpm
-		cargo_features=app,audio-quality,images,qr,video-summary
+		cargo_features=app,audio-quality,images,qr,summary
 		;;
 	text-no-gpm)
 		executable_suffix=-text-no-gpm
-		cargo_features=app,audio-quality,qr,video-summary
+		cargo_features=app,audio-quality,qr,summary
 		;;
 	images-no-qr-no-gpm)
 		executable_suffix=-no-qr-no-gpm
-		cargo_features=app,audio-quality,images,video-summary
+		cargo_features=app,audio-quality,images,summary
 		;;
 	text-no-qr-no-gpm)
 		executable_suffix=-text-no-qr-no-gpm
-		cargo_features=app,audio-quality,video-summary
+		cargo_features=app,audio-quality,summary
 		;;
 	*)
 		echo "Unsupported release variant: ${variant}" >&2

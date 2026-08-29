@@ -190,7 +190,7 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 use crate::video_summary::{
     CodexVideoSummarizer, VideoSummarizer, VideoSummaryCancellation, VideoSummaryError,
     VideoSummaryRequest, YouTubeCaptionError, YouTubeCaptionExtractor,
@@ -211,7 +211,7 @@ use crate::view::RadioRecordingView;
 use crate::view::RadioSort;
 #[cfg(feature = "qr")]
 use crate::view::VideoQrPopupView;
-#[cfg(any(feature = "video-summary", test))]
+#[cfg(any(feature = "summary", test))]
 use crate::view::VideoSummaryPopupView;
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
@@ -256,7 +256,7 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
 /// Describes the summary preference without advertising code omitted at build
 /// time.
 fn video_summary_preference_status(backend: VideoSummaryBackend) -> &'static str {
-    if cfg!(feature = "video-summary") {
+    if cfg!(feature = "summary") {
         backend.label()
     } else {
         "unavailable in this build"
@@ -271,11 +271,11 @@ pub const MAX_PRIVATE_NOTE_BYTES: usize = 16 * 1024;
 /// Individual reports are already bounded by the video-summary parser. The
 /// entry ceiling prevents explicit requests across many videos from growing
 /// the session cache without limit.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 const MAX_CACHED_VIDEO_SUMMARIES: usize = 32;
 
 /// Maximum estimated string heap retained by completed video summaries.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 const MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum LibriVox books retained for one public catalogue location.
@@ -1500,7 +1500,7 @@ struct LocalAudioQualityWorkerResponse {
 }
 
 /// One explicit, generation-owned video-summary request.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 struct PendingVideoSummary {
     generation: u64,
     /// Exact YouTube identity that will own a successful cache entry.
@@ -1509,7 +1509,7 @@ struct PendingVideoSummary {
 }
 
 /// One successful, transcript-free summary retained for this process only.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 #[derive(Clone)]
 struct CachedVideoSummary {
     caption_source: String,
@@ -1517,7 +1517,7 @@ struct CachedVideoSummary {
 }
 
 /// Commands accepted by the dedicated caption-and-Codex worker.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 enum VideoSummaryWorkerRequest {
     Generate {
         generation: u64,
@@ -1528,7 +1528,7 @@ enum VideoSummaryWorkerRequest {
 }
 
 /// Safe worker failure that never contains the caption transcript.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 #[derive(Debug, thiserror::Error)]
 enum VideoSummaryWorkerError {
     #[error("Could not retrieve YouTube captions: {0}")]
@@ -1537,7 +1537,7 @@ enum VideoSummaryWorkerError {
     Codex(#[from] VideoSummaryError),
 }
 
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 impl VideoSummaryWorkerError {
     /// Returns whether either subprocess observed an explicit cancellation.
     fn is_cancelled(&self) -> bool {
@@ -1550,7 +1550,7 @@ impl VideoSummaryWorkerError {
 }
 
 /// Progress and terminal responses from the dedicated summary worker.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 enum VideoSummaryWorkerResponse {
     Generating {
         generation: u64,
@@ -4342,33 +4342,33 @@ pub struct AppController {
     /// Report revision attached to the summary copy awaiting its result.
     awaiting_video_summary_clipboard_revision: Option<u64>,
     /// Single-slot requests for the dedicated caption-and-Codex worker.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_requests: Option<Sender<VideoSummaryWorkerRequest>>,
     /// Progress and completions drained by the UI event loop.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_responses: Receiver<VideoSummaryWorkerResponse>,
     /// Join handle for the sole caption-and-Codex worker.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_thread: Option<JoinHandle<()>>,
     /// Monotonic owner rejecting stale summary progress and completions.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_generation: u64,
     /// Generation allowed to mutate the currently visible summary popup.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_popup_owner_generation: Option<u64>,
     /// Exact explicit summary operation currently owned by the worker.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     pending_video_summary: Option<PendingVideoSummary>,
     /// Successful rendered summaries retained only until this controller drops.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_cache: HashMap<String, CachedVideoSummary>,
     /// Least-recently-used order for the bounded summary cache.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_cache_order: VecDeque<String>,
     /// Monotonic popup revision rejecting stale clipboard completions.
     video_summary_popup_revision: u64,
     /// Whether an unexpected worker disconnect was already handled.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     video_summary_disconnect_reported: bool,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
@@ -4901,9 +4901,9 @@ impl AppController {
         #[cfg(feature = "audio-quality")]
         let (local_audio_quality_batch_response_sender, local_audio_quality_batch_responses) =
             unbounded();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let (video_summary_request_sender, video_summary_request_receiver) = bounded(1);
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let (video_summary_response_sender, video_summary_responses) = bounded(2);
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
@@ -5099,11 +5099,11 @@ impl AppController {
         let local_audio_quality_requests = local_audio_quality_thread
             .as_ref()
             .map(|_| local_audio_quality_request_sender);
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let video_summary_yt_dlp = config.providers.yt_dlp_executable.clone();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let video_summary_codex = config.video_summary.codex_executable.clone();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let video_summary_thread_result = thread::Builder::new()
             .name("youta-video-summary".to_owned())
             .spawn(move || {
@@ -5114,12 +5114,12 @@ impl AppController {
                     CodexVideoSummarizer::new(video_summary_codex),
                 );
             });
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let (video_summary_thread, video_summary_thread_error) = match video_summary_thread_result {
             Ok(handle) => (Some(handle), None),
             Err(error) => (None, Some(error)),
         };
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let video_summary_requests = video_summary_thread
             .as_ref()
             .map(|_| video_summary_request_sender);
@@ -5603,24 +5603,24 @@ impl AppController {
             awaiting_audio_quality_clipboard_revision: None,
             pending_video_summary_clipboard_revision: None,
             awaiting_video_summary_clipboard_revision: None,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_requests,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_responses,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_thread,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_generation: 0,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_popup_owner_generation: None,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             pending_video_summary: None,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_cache: HashMap::new(),
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_cache_order: VecDeque::new(),
             video_summary_popup_revision: 0,
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             video_summary_disconnect_reported: false,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
@@ -6037,7 +6037,7 @@ impl AppController {
                 format!("Could not start the local audio-quality worker: {error}"),
             );
         }
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         if let Some(error) = video_summary_thread_error
             && controller.config.video_summary.backend == VideoSummaryBackend::Codex
         {
@@ -26543,7 +26543,7 @@ impl AppController {
                 ));
                 helpers
             };
-            #[cfg(feature = "video-summary")]
+            #[cfg(feature = "summary")]
             let helpers = {
                 let mut helpers = helpers;
                 if self.config.video_summary.backend == VideoSummaryBackend::Codex {
@@ -28471,7 +28471,7 @@ impl AppController {
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             save_playback_history: self.config.persistence.save_playback_history,
             video_summary_backend: self.config.video_summary.backend,
-            video_summary_supported: cfg!(feature = "video-summary"),
+            video_summary_supported: cfg!(feature = "summary"),
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
                 .then_some(environment_override),
@@ -28714,9 +28714,9 @@ impl AppController {
         let Some(preferences) = self.view.preferences_popup.as_mut() else {
             return;
         };
-        if !cfg!(feature = "video-summary") {
+        if !cfg!(feature = "summary") {
             preferences.validation_error =
-                Some("this build omits the `video-summary` feature".to_owned());
+                Some("this build omits the `summary` feature".to_owned());
             return;
         }
         if preferences.environment_override.is_some() {
@@ -28729,7 +28729,7 @@ impl AppController {
     }
 
     /// Returns one completed summary and promotes it in the process-local LRU.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn cached_video_summary(&mut self, video_id: &str) -> Option<CachedVideoSummary> {
         let cached = self.video_summary_cache.get(video_id)?.clone();
         self.touch_video_summary_cache(video_id);
@@ -28737,7 +28737,7 @@ impl AppController {
     }
 
     /// Inserts one successful rendered summary and enforces both RAM bounds.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn cache_video_summary(&mut self, video_id: String, cached: CachedVideoSummary) {
         let candidate_bytes = video_id
             .capacity()
@@ -28768,7 +28768,7 @@ impl AppController {
     }
 
     /// Promotes one exact video identity without duplicating its LRU key.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn touch_video_summary_cache(&mut self, video_id: &str) {
         self.video_summary_cache_order
             .retain(|cached| cached != video_id);
@@ -28777,7 +28777,7 @@ impl AppController {
     }
 
     /// Estimates string-owned heap in both the cache map and its LRU index.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn video_summary_cache_estimated_owned_bytes(&self) -> usize {
         let entries = self
             .video_summary_cache
@@ -28801,8 +28801,8 @@ impl AppController {
     /// subscriptions, and linked-video navigation do not all have a matching
     /// row in the foreground provider list.
     fn refresh_video_summary_availability(&mut self) {
-        self.view.video_summary_supported = cfg!(feature = "video-summary");
-        #[cfg(feature = "video-summary")]
+        self.view.video_summary_supported = cfg!(feature = "summary");
+        #[cfg(feature = "summary")]
         let cached_for_selected_video = self
             .view
             .details
@@ -28813,11 +28813,11 @@ impl AppController {
                     && validate_youtube_video_id(&media_id.external_id).is_ok()
                     && self.video_summary_cache.contains_key(&media_id.external_id)
             });
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         let worker_available = (self.video_summary_requests.is_some() || cached_for_selected_video)
             && self.pending_video_summary.is_none()
             && self.view.video_summary_popup.is_none();
-        #[cfg(not(feature = "video-summary"))]
+        #[cfg(not(feature = "summary"))]
         let worker_available = false;
         self.view.video_summary_available = worker_available
             && self.config.video_summary.backend == VideoSummaryBackend::Codex
@@ -28834,11 +28834,11 @@ impl AppController {
 
     /// Starts one explicit, RAM-only video summary request.
     fn generate_video_summary(&mut self) {
-        #[cfg(not(feature = "video-summary"))]
+        #[cfg(not(feature = "summary"))]
         {
-            self.view.status_line = "This build omits video-summary support".to_owned();
+            self.view.status_line = "This build omits summary support".to_owned();
         }
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             if self.pending_video_summary.is_some() {
                 self.view.status_line =
@@ -28952,7 +28952,7 @@ impl AppController {
 
     /// Cooperatively cancels the active caption or Codex subprocess tree.
     fn cancel_video_summary(&mut self) {
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         if let Some(pending) = self.pending_video_summary.as_ref() {
             pending.cancellation.cancel();
         }
@@ -29000,7 +29000,7 @@ impl AppController {
             return;
         }
         self.view.video_summary_popup = None;
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         {
             self.video_summary_popup_owner_generation = None;
         }
@@ -29013,7 +29013,7 @@ impl AppController {
     }
 
     /// Applies every currently available summary progress or completion.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn drain_video_summary_responses(&mut self) {
         loop {
             match self.video_summary_responses.try_recv() {
@@ -29064,7 +29064,7 @@ impl AppController {
 
     /// Applies one response only when its generation still owns the request
     /// and visible popup.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn handle_video_summary_response(&mut self, response: VideoSummaryWorkerResponse) {
         match response {
             VideoSummaryWorkerResponse::Generating {
@@ -29513,7 +29513,7 @@ impl AppController {
     }
 
     /// Cancels, stops, and joins the dedicated caption-and-Codex worker.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn shutdown_video_summary_worker(&mut self) {
         if let Some(pending) = self.pending_video_summary.as_ref() {
             pending.cancellation.cancel();
@@ -29806,7 +29806,7 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         self.shutdown_video_summary_worker();
         #[cfg(feature = "audio-quality")]
         self.shutdown_local_audio_quality_worker();
@@ -30825,7 +30825,7 @@ impl UiController for AppController {
         self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
-        #[cfg(feature = "video-summary")]
+        #[cfg(feature = "summary")]
         self.drain_video_summary_responses();
         #[cfg(feature = "audio-quality")]
         self.drain_local_audio_quality_responses();
@@ -31393,7 +31393,7 @@ fn local_audio_quality_worker(
 
 /// Retrieves bounded captions and summarizes only their transcript outside
 /// the UI and general provider workers.
-#[cfg(feature = "video-summary")]
+#[cfg(feature = "summary")]
 fn video_summary_worker(
     requests: Receiver<VideoSummaryWorkerRequest>,
     responses: Sender<VideoSummaryWorkerResponse>,
@@ -43564,7 +43564,7 @@ mod tests {
     }
 
     /// Replaces the system summary worker with deterministic captured lanes.
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     fn install_captured_video_summary_worker(
         controller: &mut AppController,
     ) -> (
@@ -43595,7 +43595,7 @@ mod tests {
         controller.refresh_video_summary_availability();
         assert_eq!(
             controller.view.video_summary_available,
-            cfg!(feature = "video-summary")
+            cfg!(feature = "summary")
         );
 
         controller
@@ -43612,7 +43612,7 @@ mod tests {
     fn preference_status_does_not_claim_codex_is_available_in_a_reduced_build() {
         assert_eq!(
             video_summary_preference_status(VideoSummaryBackend::Codex),
-            if cfg!(feature = "video-summary") {
+            if cfg!(feature = "summary") {
                 "Codex CLI"
             } else {
                 "unavailable in this build"
@@ -43651,7 +43651,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_progress_and_completion_require_the_current_generation() {
         let temporary = crate::test_support::canonical_tempdir("captured summary worker");
@@ -43784,7 +43784,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_cache_uses_the_requested_identity_after_details_change() {
         let temporary = crate::test_support::canonical_tempdir("identity-owned summary cache");
@@ -43851,7 +43851,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_cache_is_lru_and_byte_bounded() {
         let temporary = crate::test_support::canonical_tempdir("bounded summary cache");
@@ -43918,7 +43918,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_cancellation_wins_a_queued_success_race() {
         let temporary = crate::test_support::canonical_tempdir("cancelled summary worker");
@@ -43962,7 +43962,7 @@ mod tests {
         assert!(controller.video_summary_cache.is_empty());
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn dismissed_cancelled_video_summary_cannot_be_reopened_by_completion() {
         let temporary = crate::test_support::canonical_tempdir("dismissed summary worker");
@@ -43997,7 +43997,7 @@ mod tests {
         assert!(controller.view.video_summary_available);
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_shutdown_does_not_wait_for_a_full_request_lane() {
         let temporary = crate::test_support::canonical_tempdir("full summary request lane");
@@ -44023,7 +44023,7 @@ mod tests {
         assert!(controller.pending_video_summary.is_none());
     }
 
-    #[cfg(feature = "video-summary")]
+    #[cfg(feature = "summary")]
     #[test]
     fn video_summary_disconnect_fails_only_its_owned_popup() {
         let temporary = crate::test_support::canonical_tempdir("disconnected summary worker");
