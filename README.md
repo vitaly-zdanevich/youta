@@ -1908,11 +1908,10 @@ enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality` and `video-summary`
 flags to their Cargo features. `USE="-audio-quality"` removes the analyzer and
-RustFFT dependency, while `USE="-video-summary"` removes the Codex summary UI
-and backend. Prebuilt executables contain the fixed upstream feature set and
-keep both capabilities enabled; offering binary USE switches would require
-another copy of every Linux release variant rather than changing installed
-code.
+RustFFT dependency. `USE="-video-summary"` removes the Codex summary UI and backend.
+Prebuilt executables contain the fixed upstream feature set and keep both
+capabilities enabled; offering binary USE switches would require another copy
+of every Linux release variant rather than changing installed code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.
