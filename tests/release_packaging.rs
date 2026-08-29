@@ -191,6 +191,54 @@ fn audio_quality_is_default_but_remains_a_removable_local_capability() {
 }
 
 #[test]
+fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let video_summary = feature_closure(&manifest, "video-summary");
+
+    assert!(default.contains("video-summary"));
+    assert!(video_summary.contains("yt-dlp"));
+    assert!(video_summary.contains("dep:rustix"));
+    assert!(
+        !application.contains("video-summary"),
+        "`app` must not make the default-on Codex integration impossible to disable"
+    );
+    for renderer in ["controller", "tui", "dep:crossterm", "dep:ratatui"] {
+        assert!(
+            !video_summary.contains(renderer),
+            "`video-summary` must not require `{renderer}`"
+        );
+    }
+
+    let gui_manifest: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("gui/Cargo.toml must remain valid TOML");
+    assert!(
+        gui_manifest["features"]["default"]
+            .as_array()
+            .expect("the GUI declares its default feature profile")
+            .iter()
+            .any(|feature| feature.as_str() == Some("video-summary")),
+        "ordinary GUI builds must retain video summaries"
+    );
+    assert_eq!(
+        gui_manifest["features"]["video-summary"][0].as_str(),
+        Some("youta/video-summary"),
+        "the GUI feature must disable the summary UI and backend in both crates"
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("`video-summary` is the independently removable Codex summary"));
+    assert!(readme.contains("`USE=\"-video-summary\"` removes the Codex summary UI and backend"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("cargo check --locked --no-default-features --features video-summary --lib")
+    );
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,video-summary"));
+}
+
+#[test]
 fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     let manifest = manifest();
     let yandex_music = feature_closure(&manifest, "yandex-music");
@@ -296,14 +344,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,gpm,images,qr",
-        "cargo_features=app,audio-quality,gpm,qr",
-        "cargo_features=app,audio-quality,gpm,images",
-        "cargo_features=app,audio-quality,gpm",
-        "cargo_features=app,audio-quality,images,qr",
-        "cargo_features=app,audio-quality,qr",
-        "cargo_features=app,audio-quality,images",
-        "cargo_features=app,audio-quality",
+        "cargo_features=app,audio-quality,gpm,images,qr,video-summary",
+        "cargo_features=app,audio-quality,gpm,qr,video-summary",
+        "cargo_features=app,audio-quality,gpm,images,video-summary",
+        "cargo_features=app,audio-quality,gpm,video-summary",
+        "cargo_features=app,audio-quality,images,qr,video-summary",
+        "cargo_features=app,audio-quality,qr,video-summary",
+        "cargo_features=app,audio-quality,images,video-summary",
+        "cargo_features=app,audio-quality,video-summary",
     ] {
         assert!(
             script
@@ -502,14 +550,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,gpm,images,qr",
-        "app,audio-quality,gpm,qr",
-        "app,audio-quality,gpm,images",
-        "app,audio-quality,gpm",
-        "app,audio-quality,images,qr",
-        "app,audio-quality,qr",
-        "app,audio-quality,images",
-        "app,audio-quality",
+        "app,audio-quality,gpm,images,qr,video-summary",
+        "app,audio-quality,gpm,qr,video-summary",
+        "app,audio-quality,gpm,images,video-summary",
+        "app,audio-quality,gpm,video-summary",
+        "app,audio-quality,images,qr,video-summary",
+        "app,audio-quality,qr,video-summary",
+        "app,audio-quality,images,video-summary",
+        "app,audio-quality,video-summary",
     ] {
         assert!(
             ci.contains(&format!(

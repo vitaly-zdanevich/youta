@@ -330,6 +330,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {kind === "Video" && view.video_comments_available && isYouTube ? (
           <Action onClick={() => void dispatch("OpenVideoComments")}>Comments</Action>
         ) : null}
+        {kind === "Video" && view.video_summary_available && isYouTube ? (
+          <Action onClick={() => void dispatch("GenerateVideoSummary")}>Summarize</Action>
+        ) : null}
         {kind === "Video" && isYouTube ? (
           <Action onClick={() => void dispatch("OpenVideoQr")}>QR</Action>
         ) : null}

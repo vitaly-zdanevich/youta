@@ -14,6 +14,8 @@ use youta::persistence::{ANOTHER_INSTANCE_MESSAGE, PersistenceError};
 #[cfg(feature = "yt-dlp")]
 use youta::playback::ytdlp::{YtDlp, YtDlpConfig};
 use youta::providers::{SearchItem, SearchRequest, SearchTarget, configured_youtube_provider};
+#[cfg(feature = "video-summary")]
+use youta::video_summary::CodexVideoSummarizer;
 
 /// Low-resource terminal `YouTube` audio player using `yt-dlp`.
 #[derive(Debug, Parser)]
@@ -71,6 +73,7 @@ fn main() -> ExitCode {
                         PathBuf::from("mpv"),
                         PathBuf::from("yt-dlp"),
                         PathBuf::from("fpcalc"),
+                        None,
                     ),
                 );
                 eprintln!("{}", report.render());
@@ -95,6 +98,7 @@ fn probe_diagnostic_helpers(
     mpv_executable: PathBuf,
     yt_dlp_executable: PathBuf,
     fpcalc_executable: PathBuf,
+    codex_executable: Option<PathBuf>,
 ) -> Vec<ExternalHelper> {
     let helpers = vec![
         (ExternalHelperKind::Mpv, Some(mpv_executable)),
@@ -110,6 +114,16 @@ fn probe_diagnostic_helpers(
     };
     #[cfg(not(feature = "acoustid"))]
     let _ = fpcalc_executable;
+    #[cfg(feature = "video-summary")]
+    let helpers = {
+        let mut helpers = helpers;
+        if let Some(codex_executable) = codex_executable {
+            helpers.push((ExternalHelperKind::Codex, Some(codex_executable)));
+        }
+        helpers
+    };
+    #[cfg(not(feature = "video-summary"))]
+    let _ = codex_executable;
     ExternalHelper::probe_many(helpers)
 }
 
@@ -150,6 +164,7 @@ fn run_tui(config: Config) -> Result<()> {
     let diagnostic_mpv = config.providers.mpv_executable.clone();
     let diagnostic_yt_dlp = config.providers.yt_dlp_executable.clone();
     let diagnostic_fpcalc = config.providers.fpcalc_executable.clone();
+    let diagnostic_codex = selected_codex_program(&config);
     let (provider, provider_startup_error) = match configured_youtube_provider(&config.providers) {
         Ok(provider) => (provider, None),
         Err(error) => (None, Some(error)),
@@ -183,6 +198,7 @@ fn run_tui(config: Config) -> Result<()> {
                 diagnostic_mpv.clone(),
                 diagnostic_yt_dlp.clone(),
                 diagnostic_fpcalc.clone(),
+                diagnostic_codex.clone(),
             ),
         )
         .render();
@@ -228,6 +244,7 @@ fn run_tui(config: Config) -> Result<()> {
                 diagnostic_mpv.clone(),
                 diagnostic_yt_dlp.clone(),
                 diagnostic_fpcalc.clone(),
+                diagnostic_codex.clone(),
             );
             let report = DiagnosticReport::capture_error(&error, helpers).render();
             controller.enter_fatal_diagnostic_mode("Terminal UI failed", report);
@@ -251,6 +268,7 @@ fn run_tui(config: Config) -> Result<()> {
                     diagnostic_mpv,
                     diagnostic_yt_dlp,
                     diagnostic_fpcalc,
+                    diagnostic_codex,
                 ))
                 .render();
             controller.enter_fatal_diagnostic_mode("Youta panicked", report);
@@ -362,12 +380,32 @@ fn list_extractors(config: &Config) -> Result<()> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct HelperCheck<'a> {
+#[derive(Clone, Debug)]
+struct HelperCheck {
     name: &'static str,
-    executable: &'a Path,
+    executable: PathBuf,
     arguments: &'static [&'static str],
     required: bool,
+}
+
+/// Resolves the selected Codex executable exactly as the summary worker does.
+///
+/// In particular, a bare `codex` may resolve to npm's `codex.cmd` shim on
+/// Windows. An Off backend returns [`None`] and therefore performs no probe.
+fn selected_codex_program(config: &Config) -> Option<PathBuf> {
+    #[cfg(feature = "video-summary")]
+    {
+        (config.video_summary.backend == youta::config::VideoSummaryBackend::Codex).then(|| {
+            PathBuf::from(
+                CodexVideoSummarizer::new(config.video_summary.codex_executable.clone()).program(),
+            )
+        })
+    }
+    #[cfg(not(feature = "video-summary"))]
+    {
+        let _ = config;
+        None
+    }
 }
 
 /// Returns actionable package guidance for an unavailable optional helper.
@@ -376,14 +414,14 @@ fn helper_install_guidance(name: &str) -> Option<&'static str> {
     (name == "fpcalc").then_some(youta::audio_identification::FPCALC_INSTALL_GUIDANCE)
 }
 
-fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
+fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck> {
     use youta::config::PlaybackBackend;
 
-    let mut checks = Vec::with_capacity(5);
+    let mut checks = Vec::with_capacity(6);
     if cfg!(feature = "backend-mpv") && config.playback.backend == PlaybackBackend::Mpv {
         checks.push(HelperCheck {
             name: "mpv",
-            executable: config.providers.mpv_executable.as_path(),
+            executable: config.providers.mpv_executable.clone(),
             arguments: &["--version"],
             required: true,
         });
@@ -391,7 +429,7 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
     if cfg!(feature = "yt-dlp") {
         checks.push(HelperCheck {
             name: "yt-dlp",
-            executable: config.providers.yt_dlp_executable.as_path(),
+            executable: config.providers.yt_dlp_executable.clone(),
             arguments: &["--version"],
             required: true,
         });
@@ -399,21 +437,29 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck<'_>> {
     if cfg!(feature = "acoustid") {
         checks.push(HelperCheck {
             name: "fpcalc",
-            executable: config.providers.fpcalc_executable.as_path(),
+            executable: config.providers.fpcalc_executable.clone(),
             arguments: &["-version"],
             required: config.providers.acoustid_client_key.is_some(),
+        });
+    }
+    if let Some(executable) = selected_codex_program(config) {
+        checks.push(HelperCheck {
+            name: "codex",
+            executable,
+            arguments: &["--version"],
+            required: true,
         });
     }
     checks.extend([
         HelperCheck {
             name: "ffmpeg",
-            executable: &config.providers.ffmpeg_executable,
+            executable: config.providers.ffmpeg_executable.clone(),
             arguments: &["-version"],
             required: false,
         },
         HelperCheck {
             name: "ffprobe",
-            executable: &config.providers.ffprobe_executable,
+            executable: config.providers.ffprobe_executable.clone(),
             arguments: &["-version"],
             required: false,
         },
@@ -463,10 +509,15 @@ fn run_doctor(config: &Config) -> Result<()> {
     if !cfg!(feature = "acoustid") {
         println!("fpcalc: skipped (AcoustID feature omitted at build time)");
     }
+    if !cfg!(feature = "video-summary") {
+        println!("codex: skipped (video-summary feature omitted at build time)");
+    } else if config.video_summary.backend != youta::config::VideoSummaryBackend::Codex {
+        println!("codex: skipped (video summaries disabled at runtime)");
+    }
 
     let mut missing_required = false;
     for check in doctor_helper_checks(config) {
-        match helper_version(check.executable, check.arguments) {
+        match helper_version(&check.executable, check.arguments) {
             Ok(version) => println!("{}: {version}", check.name),
             Err(error) => {
                 println!("{}: unavailable ({error})", check.name);
@@ -513,7 +564,7 @@ fn run_doctor(config: &Config) -> Result<()> {
     );
 
     if missing_required {
-        bail!("one or more required playback helpers are unavailable")
+        bail!("one or more required helpers are unavailable")
     }
     Ok(())
 }
@@ -596,6 +647,9 @@ fn print_config(config: &Config) {
         "fpcalc_executable = {}",
         config.providers.fpcalc_executable.display()
     );
+    for line in video_summary_config_lines(config) {
+        println!("{line}");
+    }
     println!(
         "youtube_api_key = {}",
         if config.providers.youtube_api_key.is_some() {
@@ -622,14 +676,32 @@ fn print_config(config: &Config) {
     );
 }
 
+/// Renders the non-secret effective video-summary settings for `youta config`.
+fn video_summary_config_lines(config: &Config) -> [String; 2] {
+    let backend = if cfg!(feature = "video-summary") {
+        config.video_summary.backend
+    } else {
+        youta::config::VideoSummaryBackend::Off
+    };
+    [
+        format!("video_summary_backend = {backend}"),
+        format!(
+            "codex_executable = {}",
+            config.video_summary.codex_executable.display()
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+    #[cfg(feature = "video-summary")]
+    use youta::config::VideoSummaryBackend;
     use youta::config::{Config, PlaybackBackend};
 
-    use super::doctor_helper_checks;
     #[cfg(feature = "acoustid")]
     use super::helper_install_guidance;
+    use super::{doctor_helper_checks, video_summary_config_lines};
 
     #[test]
     fn doctor_checks_only_helpers_required_by_compiled_features() {
@@ -667,6 +739,60 @@ mod tests {
             doctor_helper_checks(&config)
                 .iter()
                 .all(|check| check.name != "mpv")
+        );
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn doctor_probes_codex_only_after_explicit_runtime_selection() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.video_summary.codex_executable = "custom-codex".into();
+
+        assert!(
+            doctor_helper_checks(&config)
+                .iter()
+                .all(|check| check.name != "codex"),
+            "the Off default must not launch even a Codex version probe"
+        );
+
+        config.video_summary.backend = VideoSummaryBackend::Codex;
+        let check = doctor_helper_checks(&config)
+            .into_iter()
+            .find(|check| check.name == "codex")
+            .expect("the selected Codex backend must be diagnosed");
+        assert_eq!(check.executable, std::path::Path::new("custom-codex"));
+        assert_eq!(check.arguments, ["--version"]);
+        assert!(check.required);
+    }
+
+    #[test]
+    fn config_output_names_the_effective_summary_backend_and_executable() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.video_summary.codex_executable = "/opt/openai/bin/codex".into();
+        #[cfg(feature = "video-summary")]
+        {
+            config.video_summary.backend = VideoSummaryBackend::Codex;
+        }
+        #[cfg(not(feature = "video-summary"))]
+        {
+            config.video_summary.backend = youta::config::VideoSummaryBackend::Codex;
+        }
+
+        assert_eq!(
+            video_summary_config_lines(&config),
+            [
+                format!(
+                    "video_summary_backend = {}",
+                    if cfg!(feature = "video-summary") {
+                        "codex"
+                    } else {
+                        "off"
+                    }
+                ),
+                "codex_executable = /opt/openai/bin/codex".to_owned(),
+            ]
         );
     }
 

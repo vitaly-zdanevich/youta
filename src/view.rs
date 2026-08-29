@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{BandcampAudioFormat, SubscriptionsLayout, YouTubeThumbnailSize};
+use crate::config::{
+    BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
+};
 use crate::domain::{Chapter, MediaId, MediaKind};
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "qr")]
@@ -835,6 +837,10 @@ pub struct PreferencesPopupView {
     pub subscriptions_layout: SubscriptionsLayout,
     /// Draft playback-history saving policy saved only on confirmation.
     pub save_playback_history: bool,
+    /// Draft provider for explicit, on-demand video summaries.
+    pub video_summary_backend: VideoSummaryBackend,
+    /// Whether this binary contains the removable summary capability.
+    pub video_summary_supported: bool,
     /// Draft advertisement-chapter behavior saved only on confirmation.
     pub skip_advertisement_chapters: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
@@ -1446,6 +1452,47 @@ pub struct AudioQualityPopupView {
     pub scroll_offset: usize,
 }
 
+/// Progress state for one explicit Codex video-summary request.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum VideoSummaryPopupState {
+    /// Youta is retrieving and normalizing one bounded caption track.
+    #[default]
+    FetchingCaptions,
+    /// The bounded transcript has been handed to the selected Codex CLI.
+    Generating,
+    /// A validated structured result is ready.
+    Ready,
+    /// The user cancelled the active request.
+    Cancelled,
+    /// Caption extraction or Codex generation failed.
+    Failed(String),
+}
+
+impl VideoSummaryPopupState {
+    /// Whether the worker may still replace the popup contents.
+    #[must_use]
+    pub const fn pending(&self) -> bool {
+        matches!(self, Self::FetchingCaptions | Self::Generating)
+    }
+}
+
+/// One bounded, RAM-only video summary and its copy status.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct VideoSummaryPopupView {
+    /// Selected video title captured when generation began.
+    pub title: String,
+    /// Caption language and provenance used as the summary source.
+    pub caption_source: String,
+    /// Current extraction, generation, or terminal state.
+    pub state: VideoSummaryPopupState,
+    /// Validated plain-text rendering copied exactly by the controller.
+    pub report: String,
+    /// Result of the most recent copy request.
+    pub action_status: Option<String>,
+    /// Zero-based wrapped-line offset at the top of the report viewport.
+    pub scroll_offset: usize,
+}
+
 /// One public top-level comment rendered in the selected-video popup.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct VideoCommentView {
@@ -1793,6 +1840,12 @@ pub struct ViewModel {
     pub audio_quality_supported: bool,
     /// Immediate progress and copyable results for local quality analysis.
     pub audio_quality_popup: Option<AudioQualityPopupView>,
+    /// Whether this build contains the removable Codex summary capability.
+    pub video_summary_supported: bool,
+    /// Whether the current exact YouTube selection can be summarized now.
+    pub video_summary_available: bool,
+    /// Immediate progress or a RAM-only Codex video summary.
+    pub video_summary_popup: Option<VideoSummaryPopupView>,
     /// Whether the selected YouTube video supports loading public comments.
     pub video_comments_available: bool,
     /// Scrollable bounded public-comments popup.
@@ -1942,6 +1995,9 @@ impl Default for ViewModel {
             error_popup: None,
             audio_quality_supported: cfg!(feature = "audio-quality"),
             audio_quality_popup: None,
+            video_summary_supported: cfg!(feature = "video-summary"),
+            video_summary_available: false,
+            video_summary_popup: None,
             video_comments_available: false,
             video_comments_popup: None,
             #[cfg(feature = "qr")]
@@ -2271,6 +2327,16 @@ pub enum UiAction {
     SetVideoCommentsScroll(usize),
     /// Close the public-comments popup without changing Details.
     DismissVideoComments,
+    /// Retrieve bounded captions and summarize the selected YouTube video.
+    GenerateVideoSummary,
+    /// Cancel the active caption or Codex process tree.
+    CancelVideoSummary,
+    /// Copy the complete validated summary through the front-end clipboard seam.
+    CopyVideoSummary,
+    /// Close a completed or cancelled video-summary popup.
+    DismissVideoSummary,
+    /// Set the renderer-clamped wrapped-line offset of the summary report.
+    SetVideoSummaryScroll(usize),
     /// Generate and show a QR code for the selected YouTube video.
     #[cfg(feature = "qr")]
     OpenVideoQr,
@@ -2351,6 +2417,8 @@ pub enum UiAction {
     ToggleTtyImages,
     /// Cycle the preferred Bandcamp playback encoding in the draft.
     CycleBandcampAudioFormat,
+    /// Cycle the closed Off/Codex video-summary provider selection.
+    CycleVideoSummaryBackend,
     /// Persist the draft preference and close the editor.
     SubmitPreferences,
     /// Close the preferences editor without saving.
@@ -2448,6 +2516,8 @@ pub enum ClipboardSubject {
     DetailsText(usize),
     /// A local audio-quality report, measured in Unicode scalar values.
     AudioQualityReport(usize),
+    /// A Codex video summary, measured in Unicode scalar values.
+    VideoSummary(usize),
 }
 
 /// Text the controller decided to copy but deliberately does not copy itself.
@@ -2724,6 +2794,12 @@ mod tests {
             UiAction::CopyAudioQualityReport,
             UiAction::DismissAudioQualityPopup,
             UiAction::SetAudioQualityPopupScroll(3),
+            UiAction::GenerateVideoSummary,
+            UiAction::CancelVideoSummary,
+            UiAction::CopyVideoSummary,
+            UiAction::DismissVideoSummary,
+            UiAction::SetVideoSummaryScroll(5),
+            UiAction::CycleVideoSummaryBackend,
         ];
         for action in actions {
             let encoded = serde_json::to_string(&action).expect("actions must serialize");
@@ -2761,6 +2837,38 @@ mod tests {
         assert_eq!(
             json["audio_quality_popup"]["report"],
             "one.flac\tVerdict: band-limited audio"
+        );
+    }
+
+    #[test]
+    fn video_summary_popup_serializes_progress_result_and_failure_states() {
+        let ready = ViewModel {
+            video_summary_supported: true,
+            video_summary_available: true,
+            video_summary_popup: Some(VideoSummaryPopupView {
+                title: "Fixture video".to_owned(),
+                caption_source: "English human captions".to_owned(),
+                state: VideoSummaryPopupState::Ready,
+                report: "Overview\n\nKey points:\n- [00:12] Opening".to_owned(),
+                action_status: None,
+                scroll_offset: 2,
+            }),
+            ..ViewModel::default()
+        };
+        let json = serde_json::to_value(ready).expect("serialize video-summary popup");
+        assert_eq!(json["video_summary_supported"], true);
+        assert_eq!(json["video_summary_available"], true);
+        assert_eq!(json["video_summary_popup"]["state"], "Ready");
+        assert_eq!(json["video_summary_popup"]["scroll_offset"], 2);
+
+        let failed = serde_json::to_value(VideoSummaryPopupView {
+            state: VideoSummaryPopupState::Failed("captions unavailable".to_owned()),
+            ..VideoSummaryPopupView::default()
+        })
+        .expect("serialize video-summary failure");
+        assert_eq!(
+            failed["state"]["Failed"],
+            serde_json::Value::String("captions unavailable".to_owned())
         );
     }
 }

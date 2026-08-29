@@ -37,6 +37,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
+    VideoSummaryBackend,
 };
 use crate::domain::{Chapter, MediaId, SourceKind, decode_url_path_segment_once};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
@@ -1640,6 +1641,16 @@ struct HitMap {
     audio_quality_scroll_maximum: usize,
     /// Number of wrapped audio-quality report lines visible on one page.
     audio_quality_page_lines: usize,
+    /// Copy/cancel/close controls rendered inside the video-summary popup.
+    video_summary_buttons: Vec<(UiAction, Rect)>,
+    /// Wrapped report viewport inside the video-summary popup.
+    video_summary_text_area: Rect,
+    /// Actual first wrapped video-summary line rendered.
+    video_summary_scroll_offset: usize,
+    /// Largest wrapped-line offset that changes the video-summary viewport.
+    video_summary_scroll_maximum: usize,
+    /// Number of wrapped video-summary lines visible on one page.
+    video_summary_page_lines: usize,
     /// Buttons rendered inside the public-comments popup.
     video_comments_buttons: Vec<(UiAction, Rect)>,
     /// Close control rendered inside the selected-video QR popup.
@@ -2001,6 +2012,7 @@ fn render_frame(
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
         || view.audio_quality_popup.is_some()
+        || view.video_summary_popup.is_some()
         || view.project_history_popup.is_some()
         || view.youtube_setup_popup.is_some()
         || view.yandex_music_setup_popup.is_some()
@@ -2139,6 +2151,11 @@ fn render_frame(
     hit_map.audio_quality_scroll_offset = 0;
     hit_map.audio_quality_scroll_maximum = 0;
     hit_map.audio_quality_page_lines = 0;
+    hit_map.video_summary_buttons.clear();
+    hit_map.video_summary_text_area = Rect::default();
+    hit_map.video_summary_scroll_offset = 0;
+    hit_map.video_summary_scroll_maximum = 0;
+    hit_map.video_summary_page_lines = 0;
     hit_map.video_comments_buttons.clear();
     hit_map.video_comments_text_area = Rect::default();
     hit_map.video_comments_scroll_offset = 0;
@@ -2153,6 +2170,9 @@ fn render_frame(
         if let Some(popup) = view.video_qr_popup.as_ref() {
             render_video_qr_popup(frame, popup, &theme, hit_map);
         }
+    }
+    if let Some(popup) = view.video_summary_popup.as_ref() {
+        render_video_summary_popup(frame, popup, &theme, hit_map);
     }
     if let Some(popup) = view.audio_quality_popup.as_ref() {
         render_audio_quality_popup(frame, popup, &theme, hit_map);
@@ -3823,6 +3843,16 @@ fn render_information_panel(
             button("F6", "Twenty comments", show_hotkeys),
             theme.accent,
             UiAction::OpenVideoComments,
+        );
+    }
+    if show_text_selection && kind == InformationPanelKind::Video && view.video_summary_available {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("G", "Summarize", show_hotkeys),
+            theme.accent,
+            UiAction::GenerateVideoSummary,
         );
     }
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
@@ -6149,6 +6179,11 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         "  F2 offline     Backspace back"
     };
+    let video_actions_help = if view.video_summary_supported {
+        "  o video page     G summarize selected YouTube video with Codex"
+    } else {
+        "  o video page"
+    };
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -6175,7 +6210,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "",
         "Actions",
         "  Ctrl+n play next     a add to queue     u show queue     d download",
-        "  o video page",
+        video_actions_help,
         "  l toggle todo     P choose playlist",
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
@@ -6795,6 +6830,191 @@ fn render_audio_quality_popup(
         {
             hit_map
                 .audio_quality_buttons
+                .push((action, Rect::new(x, sections[4].y, clipped_width, 1)));
+        }
+        x = x.saturating_add(width).saturating_add(3);
+    }
+}
+
+/// Renders one RAM-only Codex summary with resize-aware report scrolling.
+fn render_video_summary_popup(
+    frame: &mut Frame<'_>,
+    popup: &VideoSummaryPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(92, 88, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Codex video summary ", theme), area);
+
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let state_label = match &popup.state {
+        VideoSummaryPopupState::FetchingCaptions => "Fetching and normalizing captions…",
+        VideoSummaryPopupState::Generating => "Generating summary with Codex…",
+        VideoSummaryPopupState::Ready => "Summary ready.",
+        VideoSummaryPopupState::Cancelled => "Summary generation cancelled.",
+        VideoSummaryPopupState::Failed(_) => "Summary generation failed.",
+    };
+    let caption_source = if popup.caption_source.trim().is_empty() {
+        "Captions: determining source…".to_owned()
+    } else {
+        format!("Captions: {}", popup.caption_source.trim())
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                if popup.title.trim().is_empty() {
+                    "Selected YouTube video".to_owned()
+                } else {
+                    popup.title.trim().to_owned()
+                },
+                theme.heading,
+            ),
+            Line::styled(
+                state_label,
+                if popup.state.pending() {
+                    theme.selected
+                } else {
+                    theme.base
+                },
+            ),
+            Line::styled(caption_source, theme.muted),
+        ]),
+        sections[0],
+    );
+
+    let content_area = sections[1];
+    let (text_area, scrollbar_area) = if content_area.width > 1 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(content_area);
+        (columns[0], columns[1])
+    } else {
+        (content_area, Rect::default())
+    };
+    let visible_body = if !popup.report.is_empty() {
+        popup.report.as_str()
+    } else if let VideoSummaryPopupState::Failed(message) = &popup.state {
+        message.as_str()
+    } else {
+        state_label
+    };
+    let report_lines = wrap_diagnostic_report(visible_body, usize::from(text_area.width.max(1)));
+    let visible_lines = usize::from(text_area.height);
+    let maximum_offset = report_lines.len().saturating_sub(visible_lines);
+    let offset = popup.scroll_offset.min(maximum_offset);
+    hit_map.video_summary_text_area = text_area;
+    hit_map.video_summary_scroll_offset = offset;
+    hit_map.video_summary_scroll_maximum = maximum_offset;
+    hit_map.video_summary_page_lines = visible_lines.max(1);
+    frame.render_widget(
+        Paragraph::new(
+            report_lines
+                .iter()
+                .skip(offset)
+                .take(visible_lines)
+                .cloned()
+                .map(Line::raw)
+                .collect::<Vec<_>>(),
+        )
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        text_area,
+    );
+    if maximum_offset > 0 && scrollbar_area.width > 0 && scrollbar_area.height > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.muted)
+            .thumb_symbol("█")
+            .thumb_style(theme.accent);
+        let mut state = ScrollbarState::new(report_lines.len())
+            .position(offset)
+            .viewport_content_length(visible_lines);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+    }
+
+    let first_line = if report_lines.is_empty() || visible_lines == 0 {
+        0
+    } else {
+        offset.saturating_add(1)
+    };
+    let last_line = offset.saturating_add(visible_lines).min(report_lines.len());
+    frame.render_widget(
+        Paragraph::new(popup.action_status.as_deref().unwrap_or_default()).style(theme.accent),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Lines {first_line}–{last_line} of {}",
+            report_lines.len()
+        ))
+        .alignment(Alignment::Right)
+        .style(theme.muted),
+        sections[3],
+    );
+
+    let mut buttons = vec![(
+        "[c] Copy summary",
+        (!popup.report.is_empty()).then_some(UiAction::CopyVideoSummary),
+    )];
+    if popup.state.pending() {
+        buttons.push(("[Esc] Cancel", Some(UiAction::CancelVideoSummary)));
+    } else {
+        buttons.push(("[Esc] Close", Some(UiAction::DismissVideoSummary)));
+    }
+    let labels_width = buttons
+        .iter()
+        .map(|(label, _)| terminal_text_width(label))
+        .sum::<u16>()
+        .saturating_add(u16::try_from(buttons.len().saturating_sub(1) * 3).unwrap_or(u16::MAX));
+    let mut x = sections[4]
+        .x
+        .saturating_add(sections[4].width.saturating_sub(labels_width) / 2);
+    let mut controls = Vec::new();
+    for (index, (label, action)) in buttons.iter().enumerate() {
+        if index > 0 {
+            controls.push(Span::styled("   ", theme.muted));
+        }
+        controls.push(Span::styled(
+            *label,
+            if action.is_some() {
+                theme.accent
+            } else {
+                theme.muted
+            },
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(controls)).alignment(Alignment::Center),
+        sections[4],
+    );
+    for (label, action) in buttons {
+        let width = terminal_text_width(label);
+        let clipped_width = sections[4].right().saturating_sub(x).min(width);
+        if clipped_width > 0
+            && let Some(action) = action
+        {
+            hit_map
+                .video_summary_buttons
                 .push((action, Rect::new(x, sections[4].y, clipped_width, 1)));
         }
         x = x.saturating_add(width).saturating_add(3);
@@ -8571,6 +8791,7 @@ fn render_preferences_popup(
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
+            Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
@@ -8824,8 +9045,42 @@ fn render_preferences_popup(
         ));
     }
 
+    let video_summary_label = if preferences.video_summary_supported {
+        format!(
+            "[c] Video summaries: {}",
+            preferences.video_summary_backend.label()
+        )
+    } else {
+        "Video summaries: unavailable in this build".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(video_summary_label.clone())
+            .style(if preferences.video_summary_supported {
+                if preferences.video_summary_backend == VideoSummaryBackend::Codex {
+                    theme.selected
+                } else {
+                    theme.base
+                }
+            } else {
+                theme.muted
+            })
+            .alignment(Alignment::Center),
+        sections[9],
+    );
+    if preferences.video_summary_supported {
+        hit_map.preferences_buttons.push((
+            UiAction::CycleVideoSummaryBackend,
+            Rect::new(
+                centered_line_x(sections[9], terminal_text_width(&video_summary_label)),
+                sections[9].y,
+                terminal_text_width(&video_summary_label).min(sections[9].width),
+                1,
+            ),
+        ));
+    }
+
     let mut notes = format!(
-        "Drill-down is the low-width default. Split is useful on wide terminals.\nYouTube preparation keeps one short-lived result in RAM; folder sizes are measured lazily.\nAutomatic YouTube thumbnails use 480×360 through 1366 px, 640×480 through 1920 px, and 1280×720 above it; explicit sizes never fall back.\nTTY images use the pixelated half-block fallback; graphical terminal images are independent.\nBandcamp resolves the selected encoding only after an explicit playback action.\nWill save UI, playback, and persistence preferences in:\n{}",
+        "Will save UI, playback, persistence, and summary preferences in:\n{}\n\nCodex receives bounded captions only after Summarize; Youta does not read Codex credentials or save summaries.\nDrill-down is the low-width default. YouTube preparation is short-lived; folder sizes are measured lazily.\nThumbnail and terminal-image behavior follows build support. Bandcamp resolves audio only after playback.",
         preferences.config_path
     );
     if let Some(variable) = preferences.environment_override.as_deref() {
@@ -8848,7 +9103,7 @@ fn render_preferences_popup(
                 },
             )
             .wrap(Wrap { trim: false }),
-        sections[9],
+        sections[10],
     );
 
     let buttons = [
@@ -8864,15 +9119,15 @@ fn render_preferences_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[10],
+        sections[11],
     );
     let total_width = u16::try_from(Span::raw(&controls).width()).unwrap_or(u16::MAX);
-    let mut x = centered_line_x(sections[10], total_width);
+    let mut x = centered_line_x(sections[11], total_width);
     for (label, action) in buttons {
         let width = terminal_text_width(label);
         hit_map
             .preferences_buttons
-            .push((action, Rect::new(x, sections[10].y, width, 1)));
+            .push((action, Rect::new(x, sections[11].y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
 }
@@ -9559,6 +9814,11 @@ fn popup_geometry(hit_map: &HitMap) -> PopupGeometry {
             maximum: hit_map.audio_quality_scroll_maximum,
             page_lines: hit_map.audio_quality_page_lines,
         },
+        video_summary: ScrollGeometry {
+            offset: hit_map.video_summary_scroll_offset,
+            maximum: hit_map.video_summary_scroll_maximum,
+            page_lines: hit_map.video_summary_page_lines,
+        },
         project_history: ScrollGeometry {
             offset: hit_map.project_history_scroll_offset,
             maximum: hit_map.project_history_scroll_maximum,
@@ -9671,6 +9931,33 @@ fn mouse_action_unfiltered(
             {
                 Some(UiAction::SetAudioQualityPopupScroll(
                     hit_map.audio_quality_scroll_offset.saturating_sub(3),
+                ))
+            }
+            _ => None,
+        };
+    }
+    if view.video_summary_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .video_summary_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown
+                if contains(hit_map.video_summary_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetVideoSummaryScroll(
+                    hit_map
+                        .video_summary_scroll_offset
+                        .saturating_add(3)
+                        .min(hit_map.video_summary_scroll_maximum),
+                ))
+            }
+            MouseEventKind::ScrollUp
+                if contains(hit_map.video_summary_text_area, mouse.column, mouse.row) =>
+            {
+                Some(UiAction::SetVideoSummaryScroll(
+                    hit_map.video_summary_scroll_offset.saturating_sub(3),
                 ))
             }
             _ => None,
@@ -12807,6 +13094,10 @@ mod tests {
         assert!(rendered.contains("Q selected YouTube video QR code"));
         #[cfg(not(feature = "qr"))]
         assert!(!rendered.contains("Q selected YouTube video QR code"));
+        assert_eq!(
+            rendered.contains("G summarize selected YouTube video with Codex"),
+            ViewModel::default().video_summary_supported
+        );
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         let unsupported = ViewModel {
             audio_quality_supported: false,
@@ -16528,6 +16819,8 @@ mod tests {
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
+                video_summary_backend: VideoSummaryBackend::Codex,
+                video_summary_supported: true,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
                 validation_error: None,
@@ -16556,7 +16849,8 @@ mod tests {
         assert!(rendered.contains("[i] Show images in TTY: unavailable in this build"));
         #[cfg(feature = "bandcamp")]
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
-        assert!(rendered.contains("UI, playback, and persistence preferences"));
+        assert!(rendered.contains("[c] Video summaries: Codex CLI"));
+        assert!(rendered.contains("UI, playback, persistence, and summary preferences"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
@@ -16603,6 +16897,10 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &view),
             Some(UiAction::CycleBandcampAudioFormat)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &view),
+            Some(UiAction::CycleVideoSummaryBackend)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &view),
@@ -16762,6 +17060,24 @@ mod tests {
                 Some(UiAction::CycleBandcampAudioFormat)
             );
         }
+        let (_, video_summary_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::CycleVideoSummaryBackend)
+            .expect("video-summary backend target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: video_summary_target.x,
+                    row: video_summary_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CycleVideoSummaryBackend)
+        );
         for (action, label) in [
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
@@ -16812,6 +17128,8 @@ mod tests {
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
+                video_summary_backend: VideoSummaryBackend::Off,
+                video_summary_supported: true,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
                 validation_error: None,
@@ -16850,6 +17168,8 @@ mod tests {
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
+                video_summary_backend: VideoSummaryBackend::Off,
+                video_summary_supported: true,
                 config_path: "/tmp/youta/config.toml".to_owned(),
                 environment_override: None,
                 validation_error: Some("save failed".to_owned()),
@@ -26164,6 +26484,159 @@ prose 07:25 remains clickable but is not a chapter";
                 &non_local,
             ),
             Some(UiAction::AnalyzeLocalAudioQuality)
+        );
+    }
+
+    #[test]
+    fn codex_video_summary_action_and_popup_are_modal_copyable_and_scrollable() {
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            video_summary_supported: true,
+            video_summary_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "summary-fixture")),
+                title: "A long fixture video".to_owned(),
+                source: "YouTube".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw video summary action");
+        assert!(rendered_text(&terminal).contains("[G] Summarize"));
+        let summary_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::GenerateVideoSummary).then_some(*area))
+            .expect("video summary control");
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                &view,
+            ),
+            Some(UiAction::GenerateVideoSummary)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: summary_area.x,
+                    row: summary_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::GenerateVideoSummary)
+        );
+
+        view.video_summary_popup = Some(VideoSummaryPopupView {
+            title: "A long fixture video".to_owned(),
+            caption_source: "English manual captions".to_owned(),
+            state: VideoSummaryPopupState::Ready,
+            report: (0..30)
+                .map(|index| format!("{index:02}:00 Fixture summary point {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            action_status: Some("Copied with OSC 52".to_owned()),
+            scroll_offset: 2,
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw ready video summary popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Codex video summary"));
+        assert!(rendered.contains("English manual captions"));
+        assert!(rendered.contains("Copied with OSC 52"));
+        assert!(rendered.contains("[c] Copy summary"));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(hit_map.video_summary_scroll_maximum > 0);
+        let copy_area = hit_map
+            .video_summary_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::CopyVideoSummary).then_some(*area))
+            .expect("copy summary control");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: copy_area.x,
+                    row: copy_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::CopyVideoSummary)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: hit_map.video_summary_text_area.x,
+                    row: hit_map.video_summary_text_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SetVideoSummaryScroll(
+                hit_map
+                    .video_summary_scroll_offset
+                    .saturating_add(3)
+                    .min(hit_map.video_summary_scroll_maximum)
+            ))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetVideoSummaryScroll(
+                hit_map
+                    .video_summary_scroll_offset
+                    .saturating_add(hit_map.video_summary_page_lines)
+                    .min(hit_map.video_summary_scroll_maximum)
+            ))
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::DismissVideoSummary)
+        );
+
+        let popup = view.video_summary_popup.as_mut().expect("summary popup");
+        popup.state = VideoSummaryPopupState::Generating;
+        popup.report.clear();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw pending video summary popup");
+        assert!(rendered_text(&terminal).contains("[Esc] Cancel"));
+        assert!(
+            hit_map
+                .video_summary_buttons
+                .iter()
+                .all(|(action, _)| action != &UiAction::CopyVideoSummary)
+        );
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::CancelVideoSummary)
         );
     }
 

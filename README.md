@@ -539,7 +539,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,qr
+	--features app,audio-quality,qr,video-summary
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -550,16 +550,17 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,qr
+	--features app-core,audio-quality,images,qr,video-summary
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
 `qr` to remove QR encoding and its shortcut from any custom build. Cargo
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
-and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
-default feature set still enables audio-quality analysis, Yandex Music, and
-GPM.
+`video-summary` is the independently removable Codex summary integration, and
+`gpm` is the positive opt-in for virtual-console mouse input. The ordinary
+default feature set still enables audio-quality analysis, video summaries,
+Yandex Music, and GPM.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -1171,6 +1172,60 @@ These are distinct integration modes:
   Users are responsible for the terms, copyright, and laws that apply to media
   they access.
 
+### Codex video summaries
+
+The default build includes the `video-summary` feature, but its runtime backend
+is **Off** until the user explicitly selects **Codex** in Preferences or sets
+`video_summary.backend = 'codex'`. Install the
+[Codex CLI](https://developers.openai.com/codex/cli/) and authenticate it once
+with `codex login`; Youta neither asks for an OpenAI API key nor reads or copies
+Codex authentication files. On an exact YouTube video Details page, press
+`[G] Summarize` or select the same button. No automatic background summary is
+requested.
+
+For each explicit request, Youta asks `yt-dlp` for captions and prefers a human
+caption track. When only automatic captions exist, it prefers the
+source-language `*-orig` track over YouTube auto-translations, avoiding their
+known HTTP 429 failure path. A remaining HTTP 429 is surfaced without an
+automatic retry or browser-credential import. Youta does not download the
+audiovisual stream or transcribe audio when captions are absent. This automated
+caption route is not an official YouTube API capability;
+the [YouTube Terms of Service](https://www.youtube.com/static?template=terms)
+and rights warning above applies. Long caption tracks are
+timeline-sampled into a bounded, timestamped transcript. Only that transcript
+is written to the Codex process's standard
+input by Youta: it does not add the video URL, title, Youta configuration, or
+private files. The Codex CLI transmits that transcript to OpenAI to generate the
+summary. During extraction, `yt-dlp` writes one bounded caption file in a new
+per-request temporary directory (mode `0700` on Unix; inherited temporary-area
+ACL on Windows); Youta removes that directory as soon as extraction finishes.
+A process or system crash can leave it in the operating system's temporary
+area. The normalized transcript is not cached after the request. Successful
+rendered results enter a process-local LRU bounded to 32 entries and 4 MiB of
+estimated string-owned heap, so pressing `[G] Summarize` for the same video
+reopens its result immediately after the popup is closed. Neither transcripts
+nor results are written to Youta's history, persistent cache, configuration, or
+session state; the RAM cache disappears when Youta exits. A visible result can
+be copied explicitly.
+
+Youta invokes [`codex exec`](https://developers.openai.com/codex/noninteractive/)
+in an ephemeral session that ignores `config.toml`, user and project execpolicy
+rules, and project `AGENTS.md` files. It supplies a dedicated permission profile
+with no model-triggered filesystem or network tools and refuses approval
+requests. The Codex CLI itself still uses its existing authentication and an
+outbound connection to reach OpenAI. Current Codex versions can still load the
+global `$CODEX_HOME/AGENTS.md`; that file may therefore enter the model context
+and should not contain secrets. The built-in Codex instructions and OpenAI's
+normal account-side data handling also apply: `--ephemeral` disables local
+session-file persistence, not service-side handling or retention. Ignoring
+`config.toml` also means a custom model or model-provider selection there is not
+used for summaries. Caption text is untrusted input, summaries can be incomplete
+or mistaken, and the installed Codex CLI must support custom permission
+profiles. Cancellation terminates the active caption or Codex process tree.
+Windows descendant termination is best-effort through `taskkill /T`, matching
+Youta's existing helper-process boundary. Youta does not retry a failed summary
+automatically.
+
 Bandcamp audio defaults to **Best available** (`best-available`). The `[b]`
 control in the `[p]` Preferences popup cycles the same closed set accepted by
 `providers.bandcamp_audio_format` and
@@ -1318,9 +1373,9 @@ known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
 dependencies while retaining the other defaults, build with
-`--no-default-features --features app,audio-quality,qr`. For a smaller custom build, omit
-`images`; include it explicitly to restore rendering. The rendering integration
-uses
+`--no-default-features --features app,audio-quality,qr,video-summary`. For a
+smaller custom build, omit `images`; include it explicitly to restore rendering.
+The rendering integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
 
 ## Mouse input on a Linux virtual console
@@ -1503,8 +1558,9 @@ Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
 skipped, choose whether selected YouTube audio is prepared, choose whether
 Local folder sizes are measured, choose the exact YouTube video-thumbnail
-size, choose whether new playback History entries are saved, and press `Enter`
-to save. These preferences can be configured directly:
+size, choose whether new playback History entries are saved, choose the
+explicit video-summary backend, and press `Enter` to save. These preferences
+can be configured directly:
 
 ```toml
 [playback]
@@ -1520,6 +1576,10 @@ youtube_thumbnail_size = 'automatic'
 
 [persistence]
 save_playback_history = true
+
+[video_summary]
+backend = 'off' # off or codex
+codex_executable = 'codex'
 ```
 
 `YOUTA_UI__SUBSCRIPTIONS_LAYOUT=split` and
@@ -1534,9 +1594,13 @@ video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
 new playback History entries and hides the History tab. It does not delete
 existing History or disable playback progress, listening statistics, session
 and cache persistence, or graceful-shutdown Git synchronization. Re-enabling
-it exposes the retained History again.
-While any of these environment variables is present, the Preferences popup
-shows the override and does not partially replace its draft in `config.toml`.
+it exposes the retained History again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
+enables the same explicit summary action without editing the TOML file;
+`YOUTA_VIDEO_SUMMARY__CODEX_EXECUTABLE=/path/to/codex` selects another CLI
+executable. The executable is not edited in Preferences, so that path override
+does not lock the popup. While an environment variable for an editable
+preference is present, the Preferences popup shows the override and does not
+partially replace its draft in `config.toml`.
 
 One Local visit schedules at most 256 folder measurements, with one request in
 flight. A folder traversal inspects at most 25,000 entries to depth 64; a
@@ -1842,10 +1906,11 @@ it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
 arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
-The source package also maps default-enabled `audio-quality` directly to the
-Cargo feature, so `USE="-audio-quality"` removes its analyzer and RustFFT
-dependency. Prebuilt executables contain the fixed upstream feature set and
-keep audio-quality analysis enabled; offering a binary USE switch would require
+The source package maps the default-enabled `audio-quality` and `video-summary`
+flags to their Cargo features. `USE="-audio-quality"` removes the analyzer and
+RustFFT dependency, while `USE="-video-summary"` removes the Codex summary UI
+and backend. Prebuilt executables contain the fixed upstream feature set and
+keep both capabilities enabled; offering binary USE switches would require
 another copy of every Linux release variant rather than changing installed
 code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The

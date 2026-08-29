@@ -12,11 +12,12 @@ publish = false
 unsafe_code = "forbid"
 
 [features]
-default = ["audio-quality"]
-# Forward the source package's independently removable analyzer. Release and
-# ordinary GUI builds retain it through this crate's defaults; distributors
-# can disable both layers with `--no-default-features`.
+default = ["audio-quality", "video-summary"]
+# Forward the source package's independently removable capabilities. Release
+# and ordinary GUI builds retain them through this crate's defaults;
+# distributors can disable both layers with `--no-default-features`.
 audio-quality = ["youta/audio-quality"]
+video-summary = ["youta/video-summary"]
 
 [dependencies]
 # The reducer, the view contract, persistence, providers, and playback come

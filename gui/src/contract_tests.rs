@@ -29,8 +29,8 @@ use youta::view::{
     DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
     LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
     PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, ViewModel, WaveformView,
-    YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
+    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
+    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::waveform::PeakPyramid;
 
@@ -124,6 +124,8 @@ fn preferences() -> PreferencesPopupView {
     PreferencesPopupView {
         subscriptions_layout: youta::config::SubscriptionsLayout::default(),
         save_playback_history: true,
+        video_summary_backend: youta::config::VideoSummaryBackend::default(),
+        video_summary_supported: true,
         skip_advertisement_chapters: false,
         youtube_prewarm: false,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
@@ -212,6 +214,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     emitted.insert(
         "VideoCommentsPopupView",
         emitted_keys(&VideoCommentsPopupView::default()),
+    );
+    emitted.insert(
+        "VideoSummaryPopupView",
+        emitted_keys(&VideoSummaryPopupView::default()),
     );
     emitted.insert(
         "VideoCommentView",
@@ -323,6 +329,7 @@ fn every_checked_interface_is_actually_declared() {
         "YtDlpForbiddenView",
         "YtDlpGentooVersionView",
         "VideoCommentsPopupView",
+        "VideoSummaryPopupView",
         "VideoCommentView",
         "ProjectHistoryPopupView",
         "ProjectCommitView",
@@ -892,6 +899,108 @@ fn the_window_marks_local_batch_rows_and_hides_unsupported_quality_help() {
     let app_source = std::fs::read_to_string(&app_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", app_path.display()));
     assert!(app_source.contains("audioQualitySupported={view.audio_quality_supported}"));
+}
+
+#[test]
+fn the_window_exposes_only_available_codex_video_summaries() {
+    let sources = window_sources();
+    let source_named = |suffix: &str| {
+        sources
+            .iter()
+            .find_map(|(path, source)| path.ends_with(suffix).then_some(source.as_str()))
+            .unwrap_or_else(|| panic!("missing window source {suffix}"))
+    };
+    let app = source_named("App.tsx");
+    let details = source_named("components/Details.tsx");
+    let popups = source_named("components/popups.tsx");
+
+    for required in [
+        "view.video_summary_available",
+        "isYouTube",
+        "dispatch(\"GenerateVideoSummary\")",
+        "Summarize",
+    ] {
+        assert!(
+            details.contains(required),
+            "Details no longer contains {required}"
+        );
+    }
+    for required in [
+        "videoSummarySupported={view.video_summary_supported}",
+        "view.video_summary_popup",
+        "<VideoSummaryPopup popup={view.video_summary_popup}",
+    ] {
+        assert!(app.contains(required), "App no longer contains {required}");
+    }
+    for required in [
+        "videoSummarySupported",
+        "[\"G\", \"summarize selected YouTube video with Codex\"]",
+    ] {
+        assert!(
+            popups.contains(required),
+            "window Help no longer contains {required}"
+        );
+    }
+}
+
+#[test]
+fn the_window_preferences_make_codex_summary_consent_explicit() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "popup.video_summary_supported",
+        "popup.video_summary_backend",
+        "dispatch(\"CycleVideoSummaryBackend\")",
+        "Video summaries",
+        "authenticated Codex CLI",
+        "only when you request a summary",
+        "does not store an API key",
+    ] {
+        assert!(
+            source.contains(required),
+            "Preferences no longer contains {required}"
+        );
+    }
+}
+
+#[test]
+fn the_window_video_summary_popup_keeps_progress_copy_cancel_close_and_scroll_actions() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "VideoSummaryPopupView",
+        "FetchingCaptions",
+        "Generating",
+        "Ready",
+        "Cancelled",
+        "state.Failed",
+        "popup.caption_source",
+        "popup.report",
+        "popup.action_status",
+        "CopyVideoSummary",
+        "CancelVideoSummary",
+        "DismissVideoSummary",
+        "SetVideoSummaryScroll",
+        "popup=\"video_summary\"",
+        "disabled={!ready || popup.report.length === 0}",
+    ] {
+        assert!(
+            source.contains(required),
+            "video-summary popup no longer contains {required}"
+        );
+    }
 }
 
 /// The four credential-bearing editors must stay out of the window's vocabulary.

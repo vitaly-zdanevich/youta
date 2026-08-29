@@ -296,6 +296,24 @@ export interface VideoCommentsPopupView {
   scroll_offset: number;
 }
 
+/** Progress of one explicit, RAM-only Codex video-summary request. */
+export type VideoSummaryPopupState =
+  | "FetchingCaptions"
+  | "Generating"
+  | "Ready"
+  | "Cancelled"
+  | { Failed: string };
+
+/** A bounded Codex video summary and its copy status. */
+export interface VideoSummaryPopupView {
+  title: string;
+  caption_source: string;
+  state: VideoSummaryPopupState;
+  report: string;
+  action_status: string | null;
+  scroll_offset: number;
+}
+
 /** An offline QR matrix, without its mandatory quiet zone. */
 export interface QrMatrix {
   width: number;
@@ -341,6 +359,8 @@ export interface ProjectHistoryPopupView {
 export interface PreferencesPopupView {
   subscriptions_layout: string;
   save_playback_history: boolean;
+  video_summary_backend: "off" | "codex";
+  video_summary_supported: boolean;
   skip_advertisement_chapters: boolean;
   youtube_prewarm: boolean;
   youtube_thumbnail_size: string;
@@ -564,6 +584,9 @@ export interface ViewModel {
   error_popup: ErrorPopupView | null;
   audio_quality_supported: boolean;
   audio_quality_popup: AudioQualityPopupView | null;
+  video_summary_supported: boolean;
+  video_summary_available: boolean;
+  video_summary_popup: VideoSummaryPopupView | null;
   video_comments_popup: VideoCommentsPopupView | null;
   video_qr_popup: VideoQrPopupView | null;
   preferences_popup: PreferencesPopupView | null;
@@ -656,6 +679,7 @@ export interface ScrollGeometry {
 /** The scroll geometry of every popup whose paging keys the reducer resolves. */
 export interface PopupGeometry {
   audio_quality: ScrollGeometry;
+  video_summary: ScrollGeometry;
   project_history: ScrollGeometry;
   video_comments: ScrollGeometry;
 }

@@ -127,6 +127,8 @@ pub struct ScrollGeometry {
 pub struct PopupGeometry {
     /// Local audio-quality progress/results popup.
     pub audio_quality: ScrollGeometry,
+    /// Codex video-summary progress/results popup.
+    pub video_summary: ScrollGeometry,
     /// Project-history popup.
     pub project_history: ScrollGeometry,
     /// Video-comments popup.
@@ -137,7 +139,7 @@ pub struct PopupGeometry {
 mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
-    use crate::view::{UiAction, ViewModel};
+    use crate::view::{UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel};
 
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
     /// part of the contract rather than an implementation detail of Serde.
@@ -279,6 +281,50 @@ mod wire_tests {
             );
         }
     }
+
+    #[test]
+    fn uppercase_g_opens_only_an_available_video_summary() {
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('G')), &view, None, None),
+            None
+        );
+        view.video_summary_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('G')), &view, None, None),
+            Some(UiAction::GenerateVideoSummary)
+        );
+    }
+
+    #[test]
+    fn video_summary_popup_owns_cancel_copy_and_rendered_paging() {
+        let mut view = ViewModel {
+            video_summary_popup: Some(VideoSummaryPopupView::default()),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::CancelVideoSummary)
+        );
+
+        view.video_summary_popup = Some(VideoSummaryPopupView {
+            state: VideoSummaryPopupState::Ready,
+            report: "summary".to_owned(),
+            ..VideoSummaryPopupView::default()
+        });
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('c')), &view, None, None),
+            Some(UiAction::CopyVideoSummary)
+        );
+        let mut geometry = PopupGeometry::default();
+        geometry.video_summary.offset = 3;
+        geometry.video_summary.maximum = 20;
+        geometry.video_summary.page_lines = 7;
+        assert_eq!(
+            key_action(KeyPress::new(Key::PageDown), &view, None, Some(geometry),),
+            Some(UiAction::SetVideoSummaryScroll(10))
+        );
+    }
 }
 
 /// Returns whether one key is the editor-local Vim word-delete chord.
@@ -314,6 +360,21 @@ pub fn key_action(
             )
         } else {
             audio_quality_control_action(key, popup)
+        };
+    }
+    if view.error_popup.is_none()
+        && let Some(popup) = view.video_summary_popup.as_ref()
+    {
+        return if let Some(popups) = popups {
+            video_summary_key_action(
+                key,
+                popup,
+                popups.video_summary.offset,
+                popups.video_summary.maximum,
+                popups.video_summary.page_lines,
+            )
+        } else {
+            video_summary_control_action(key, popup)
         };
     }
     if view.error_popup.is_none()
@@ -379,6 +440,47 @@ fn audio_quality_control_action(key: KeyPress, popup: &AudioQualityPopupView) ->
         Key::Esc if popup.pending => Some(UiAction::CancelAudioQualityAnalysis),
         Key::Esc => Some(UiAction::DismissAudioQualityPopup),
         Key::Char('c' | 'C') if !popup.report.is_empty() => Some(UiAction::CopyAudioQualityReport),
+        _ => None,
+    }
+}
+
+/// Maps modal video-summary report controls.
+fn video_summary_key_action(
+    key: KeyPress,
+    popup: &VideoSummaryPopupView,
+    offset: usize,
+    maximum: usize,
+    page_lines: usize,
+) -> Option<UiAction> {
+    if let Some(action) = video_summary_control_action(key, popup) {
+        return Some(action);
+    }
+    let page_lines = page_lines.max(1);
+    match key.key {
+        Key::Up | Key::Left | Key::Char('k') => {
+            Some(UiAction::SetVideoSummaryScroll(offset.saturating_sub(1)))
+        }
+        Key::Down | Key::Right | Key::Char('j') => Some(UiAction::SetVideoSummaryScroll(
+            offset.saturating_add(1).min(maximum),
+        )),
+        Key::PageUp => Some(UiAction::SetVideoSummaryScroll(
+            offset.saturating_sub(page_lines),
+        )),
+        Key::PageDown => Some(UiAction::SetVideoSummaryScroll(
+            offset.saturating_add(page_lines).min(maximum),
+        )),
+        Key::Home => Some(UiAction::SetVideoSummaryScroll(0)),
+        Key::End => Some(UiAction::SetVideoSummaryScroll(maximum)),
+        _ => None,
+    }
+}
+
+/// Maps video-summary controls that do not depend on rendered geometry.
+fn video_summary_control_action(key: KeyPress, popup: &VideoSummaryPopupView) -> Option<UiAction> {
+    match key.key {
+        Key::Esc if popup.state.pending() => Some(UiAction::CancelVideoSummary),
+        Key::Esc => Some(UiAction::DismissVideoSummary),
+        Key::Char('c' | 'C') if !popup.report.is_empty() => Some(UiAction::CopyVideoSummary),
         _ => None,
     }
 }
@@ -692,6 +794,9 @@ fn unfiltered_key_action(
             Key::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
             Key::Char('b') if cfg!(feature = "bandcamp") => {
                 Some(UiAction::CycleBandcampAudioFormat)
+            }
+            Key::Char('c') if preferences.video_summary_supported => {
+                Some(UiAction::CycleVideoSummaryBackend)
             }
             Key::Char('d') => Some(UiAction::SetSubscriptionsLayout(
                 SubscriptionsLayout::DrillDown,
@@ -1083,6 +1188,9 @@ fn unfiltered_key_action(
                 }) =>
         {
             Some(UiAction::OpenVideoComments)
+        }
+        Key::Char('G') if !key.chorded() && view.video_summary_available => {
+            Some(UiAction::GenerateVideoSummary)
         }
         Key::Enter if alt && detail_link_count > 0 => {
             let selected = view

@@ -142,6 +142,26 @@ played_threshold_percent = 90
 # Existing .gitignore rules are authoritative. Set this to false to opt out.
 git_commit_on_change = true
 
+[video_summary]
+# Video summaries are compiled into default builds but remain off until the
+# user explicitly selects Codex here or in Preferences. One of: `off`,
+# `codex`. An explicit Summarize action sends only a bounded caption transcript
+# through the independently authenticated Codex CLI. Youta never reads or
+# copies Codex authentication files and does not add the transcript or result
+# to its persistent state. Caption extraction uses a short-lived temporary
+# file inside a mode-0700 directory on Unix and inherits the temporary-area ACL
+# on Windows. The Codex CLI transmits the transcript to OpenAI. Ephemeral mode
+# only disables local Codex session files, and Codex may still load its global
+# $CODEX_HOME/AGENTS.md instructions. Youta ignores the Codex user
+# configuration, including custom model and provider selection, for this task.
+# YOUTA_VIDEO_SUMMARY__BACKEND has higher precedence.
+backend = 'off'
+
+# The user-installed Codex CLI executable. Sign in with `codex login` outside
+# Youta; this path is not a credential. The environment override is
+# YOUTA_VIDEO_SUMMARY__CODEX_EXECUTABLE.
+codex_executable = 'codex'
+
 [providers]
 # The built-in Radio tab needs no API key or instance URL. It is a static
 # catalogue compiled by the `radio` feature; selecting a station is the first

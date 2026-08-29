@@ -26,6 +26,7 @@ const EMPTY: ScrollGeometry = { offset: 0, maximum: 0, page_lines: 1 };
 
 const measured: Record<Scrollable, ScrollGeometry> = {
   audio_quality: { ...EMPTY },
+  video_summary: { ...EMPTY },
   project_history: { ...EMPTY },
   video_comments: { ...EMPTY },
 };
@@ -57,6 +58,7 @@ export function reportGeometry(popup: Scrollable, element: HTMLElement | null, o
 export function popupGeometry(): PopupGeometry {
   return {
     audio_quality: measured.audio_quality,
+    video_summary: measured.video_summary,
     project_history: measured.project_history,
     video_comments: measured.video_comments,
   };

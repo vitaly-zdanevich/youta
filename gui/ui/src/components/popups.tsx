@@ -6,9 +6,9 @@
 // makes the two front-ends the same application rather than two applications
 // with a shared backend.
 //
-// SECURITY: comment bodies, error reports, and commit messages are untrusted
-// text. They are rendered as text children, and `whitespace-pre-wrap` is what
-// preserves their shape — never markup.
+// SECURITY: comment bodies, video summaries, error reports, and commit messages
+// are untrusted text. They are rendered as text children, and
+// `whitespace-pre-wrap` is what preserves their shape — never markup.
 
 import type {
   AudioQualityPopupView,
@@ -21,6 +21,7 @@ import type {
   QueuePopupView,
   VideoCommentsPopupView,
   VideoQrPopupView,
+  VideoSummaryPopupView,
   YtDlpForbiddenView,
   YtDlpVersionLookupView,
 } from "../contract";
@@ -39,8 +40,9 @@ export const LAYER = {
   queue: 6,
   videoComments: 7,
   videoQr: 8,
-  audioQuality: 9,
-  error: 10,
+  videoSummary: 9,
+  audioQuality: 10,
+  error: 11,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -59,9 +61,11 @@ function Body({ children }: { children: React.ReactNode }) {
 export function HelpPopup({
   audioQualitySupported,
   playbackHistoryEnabled,
+  videoSummarySupported,
 }: {
   audioQualitySupported: boolean;
   playbackHistoryEnabled: boolean;
+  videoSummarySupported: boolean;
 }) {
   const sections: Array<[string, Array<[string, string]>]> = [
     [
@@ -106,6 +110,11 @@ export function HelpPopup({
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
         ["i", "expand artwork"],
+        ...(videoSummarySupported
+          ? ([
+              ["G", "summarize selected YouTube video with Codex"],
+            ] satisfies Array<[string, string]>)
+          : []),
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
         ...(audioQualitySupported
           ? ([
@@ -219,6 +228,91 @@ export function AudioQualityPopup({ popup }: { popup: AudioQualityPopupView }) {
           }}
         >
           {report}
+        </ScrollingText>
+      </div>
+    </Popup>
+  );
+}
+
+/** Progress and the copyable result of one explicit Codex summary request. */
+export function VideoSummaryPopup({ popup }: { popup: VideoSummaryPopupView }) {
+  const state = popup.state;
+  const pending = state === "FetchingCaptions" || state === "Generating";
+  const ready = state === "Ready";
+  const failed = typeof state === "object";
+  const progress =
+    state === "FetchingCaptions"
+      ? "Retrieving captions…"
+      : state === "Generating"
+        ? "Generating with Codex…"
+        : ready
+          ? "Summary ready"
+          : state === "Cancelled"
+            ? "Cancelled"
+            : "Summary failed";
+  const report =
+    popup.report.length > 0
+      ? popup.report
+      : failed
+        ? state.Failed
+        : state === "Cancelled"
+          ? "Summary generation was cancelled."
+          : pending
+            ? "The result will appear here."
+            : "Codex returned no summary.";
+
+  return (
+    <Popup
+      title="Video summary"
+      subtitle={popup.title}
+      layer={LAYER.videoSummary}
+      onDismiss={() => void dispatch(pending ? "CancelVideoSummary" : "DismissVideoSummary")}
+      dismissLabel={pending ? "Cancel summary" : "Close"}
+      footer={
+        <>
+          {popup.action_status ? (
+            <span role="status" className="mr-auto text-ink-dim">
+              {popup.action_status}
+            </span>
+          ) : null}
+          <PopupButton
+            disabled={!ready || popup.report.length === 0}
+            onClick={() => void dispatch("CopyVideoSummary")}
+          >
+            Copy summary
+          </PopupButton>
+          {pending ? (
+            <PopupButton onClick={() => void dispatch("CancelVideoSummary")}>Cancel</PopupButton>
+          ) : (
+            <PopupButton onClick={() => void dispatch("DismissVideoSummary")}>Close</PopupButton>
+          )}
+        </>
+      }
+    >
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+        <p
+          title={popup.caption_source || undefined}
+          className="truncate border-b border-line px-[18px] py-[9px] text-xs text-ink-dim"
+        >
+          {progress}
+          {popup.caption_source ? ` · ${popup.caption_source}` : ""}
+        </p>
+        <ScrollingText
+          popup="video_summary"
+          offset={popup.scroll_offset}
+          onScroll={(offset) => {
+            if (offset !== popup.scroll_offset) {
+              void dispatch({ SetVideoSummaryScroll: offset });
+            }
+          }}
+        >
+          {failed ? (
+            <span role="alert" className="text-accent">
+              {report}
+            </span>
+          ) : (
+            report
+          )}
         </ScrollingText>
       </div>
     </Popup>
@@ -613,6 +707,27 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
               {popup.save_playback_history ? "on" : "off"}
             </PopupButton>
           </label>
+          {popup.video_summary_supported ? (
+            <section className="grid gap-[4px] border-y border-line py-[7px]">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-ink-dim">Video summaries</span>
+                <PopupButton
+                  emphasis={popup.video_summary_backend === "codex"}
+                  onClick={() => void dispatch("CycleVideoSummaryBackend")}
+                >
+                  {popup.video_summary_backend === "codex" ? "Codex CLI" : "off"}
+                </PopupButton>
+              </div>
+              <p className="m-0 text-[11px] leading-[16px] text-ink-faint">
+                When enabled, Youta sends bounded video captions to your authenticated Codex CLI
+                only when you request a summary; it does not store an API key.
+              </p>
+            </section>
+          ) : (
+            <p className="m-0 border-y border-line py-[7px] text-[11px] text-ink-faint">
+              Video summaries are not included in this build.
+            </p>
+          )}
           {toggles.map(([label, value, action]) => (
             <label key={label} className="flex items-center justify-between gap-4">
               <span className="text-ink-dim">{label}</span>

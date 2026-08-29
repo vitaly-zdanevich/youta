@@ -951,6 +951,49 @@ bounded per-file progress into a copyable popup, and a 64-entry RAM-only LRU
 makes an unchanged revisit immediate. Audio bytes, paths, and quality reports
 are never sent over the network or persisted.
 
+Video summarization is a separate explicit pipeline behind the default-on,
+independently removable `video-summary` feature. Runtime configuration remains
+Off until the user selects Codex, and no external helper starts merely because
+the feature is compiled. An exact YouTube Details action submits a
+generation-owned job to a dedicated capacity-one worker. The worker asks the
+configured `yt-dlp` executable for caption metadata, prefers a human track,
+and, when only automatic captions exist, prefers the source-language `*-orig`
+track over YouTube auto-translations to avoid their known HTTP 429 failure
+path. A remaining HTTP 429 is surfaced without an automatic retry or
+browser-credential import. The worker rejects a request when no supported
+caption exists. It never downloads the audiovisual stream or falls back to
+audio transcription.
+Caption files, process output, retries, and wall-clock time are bounded. Long
+tracks are sampled across their timeline instead of silently retaining only the
+beginning. Caption extraction uses a per-request temporary directory, mode
+`0700` on Unix and inheriting the temporary-area ACL on Windows, removed after
+the track is normalized. An unclean process or system stop can leave that
+directory for operating-system cleanup.
+
+The normalized timestamped transcript is the only media or application data
+Youta supplies to Codex and thereby transmits to OpenAI; it does not add the
+video URL, title, configuration tree, private notes, or Codex authentication
+files. The CLI runs through
+`codex exec` with an ephemeral session, ignored `config.toml`, ignored user and
+project execpolicy rules, disabled project `AGENTS.md` discovery, no approval
+prompts, and a dedicated permission profile that grants no model-triggered
+filesystem or network tools. The CLI process still owns its normal
+authenticated connection to OpenAI. Current Codex versions independently load
+global `$CODEX_HOME/AGENTS.md` instructions even in this mode, so that file is
+outside Youta's transcript-only input guarantee. Ephemeral mode disables local
+Codex session files, not service-side handling or retention; ignoring user
+configuration also intentionally ignores its model and provider selection.
+Captions arrive through standard input and a strict structured-output schema
+bounds the accepted result. Cooperative cancellation terminates either helper
+tree on Unix and uses best-effort `taskkill /T` descendant termination on
+Windows. Generations reject stale completions. Successful rendered results and
+their caption-source labels enter a process-local LRU bounded to 32 entries and
+4 MiB of estimated string-owned heap; the transcript, title, popup scroll, and
+clipboard status do not. Closing and reopening the same video's popup reuses
+that RAM result without another worker request. Youta writes nothing from the
+request to history, persistent cache, session state, or diagnostics, and the
+summary LRU disappears with the controller at process exit.
+
 Local audio identification is a separate explicit pipeline. The `acoustid`
 feature invokes Chromaprint's official `fpcalc` utility without a shell,
 captures bounded JSON, and posts only its encoded fingerprint and duration to
@@ -1107,11 +1150,12 @@ branch and failure-path assertions matter more than a single percentage.
 Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
 include both official YouTube metadata and Invidious adapters, terminal images,
-offline QR rendering, local audio-quality analysis, and the credential-free
-LibriVox adapter; runtime
+offline QR rendering, local audio-quality analysis, explicit Codex video
+summaries, and the credential-free LibriVox adapter; runtime
 `providers.youtube_backend` chooses the YouTube adapter. `librivox` is included
-through `app-core`, while `audio-quality`, `images`, and `qr` are independent
-default-on capabilities.
+through `app-core`, while `audio-quality`, `images`, `qr`, and `video-summary`
+are independent default-on capabilities. The video-summary runtime backend is
+Off by default even when its code is present.
 The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
 builds omit that dependency and shortcut. Distribution/minimal builds can use
 `--no-default-features`. Human-readable file persistence is part of the core;
@@ -1138,10 +1182,11 @@ channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
-default-on `audio-quality`, `images`, and `qr` USE flags, which can be disabled
-independently. Prebuilt artifacts always contain the analyzer because a binary
-USE flag cannot change compiled code.
-It is maintained as
+default-on `audio-quality`, `images`, `qr`, and `video-summary` USE flags and
+maps them to their corresponding Cargo features; each source-build capability
+can be disabled independently. Prebuilt artifacts always contain the analyzer
+and summary integration because a binary USE flag cannot change compiled code.
+The ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as
 `mpv`, `yt-dlp`, and FFmpeg rather than bundling them.

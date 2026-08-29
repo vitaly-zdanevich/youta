@@ -37,6 +37,7 @@ default = [
     "gpm",
     "images",
     "qr",
+    "video-summary",
 ]
 
 # Complete application profile shared by default and text-only builds.
@@ -44,10 +45,10 @@ default = [
 # Yandex Music is included here so normal builds expose the complete top-level
 # source set. `app-core` remains the equivalent profile for distributors and
 # users who intentionally omit the private, experimental Yandex Music API.
-# Audio-quality analysis, GPM input, image rendering, QR encoding, and SQLite
-# remain independent features. Keeping them outside this profile lets system
-# packages map positive options directly to Cargo features without subtracting
-# a transitive default.
+# Audio-quality analysis, GPM input, image rendering, QR encoding, video
+# summaries, and SQLite remain independent features. Keeping them outside this
+# profile lets system packages map positive options directly to Cargo features
+# without subtracting a transitive default.
 app = [
     "app-core",
     "yandex-music",
@@ -145,6 +146,12 @@ waveform = ["local-browser"]
 # Rust performs the bounded FFT analysis; disabling this feature removes both
 # the action and its DSP dependency.
 audio-quality = ["local-browser", "dep:rustfft", "dep:rustix"]
+# On-demand YouTube transcript summaries through the user's authenticated
+# Codex CLI. Youta continues to own caption retrieval, so the feature selects
+# the existing yt-dlp process boundary without adding an SDK or credential
+# dependency. Keeping the feature renderer-free lets every front-end expose the
+# same capability while distributors remove both its UI and backend.
+video-summary = ["yt-dlp"]
 # Remote artwork fetching and its private on-disk cache, with no renderer.
 #
 # `src/artwork.rs` turns a provider URL into bytes under Youta's network and

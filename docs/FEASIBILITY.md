@@ -62,7 +62,7 @@ roadmap work.
 | Audio-only playback/download | `yt-dlp`/Invidious resolver + player, opt-in | Technically feasible, but not an official YouTube API capability. User is responsible for applicable terms and rights. |
 | Open video in browser/copy URL | Local action | Feasible. Browser launch remains explicit and headless-safe. |
 | Send to NotebookLM | Browser/deep link | A stable public ingestion API is not assumed. Prefer copy/open actions; do not automate a private web UI. |
-| Analyze with Codex/Claude/other CLI | Supervised child adapter | Feasible when installed, explicitly enabled, and given a bounded caption/transcript. Never construct a shell string or expose tokens/private notes. |
+| Summarize with Codex CLI | Supervised `yt-dlp` caption and Codex workers | Implemented as an explicit action with an Off-by-default runtime selector, bounded transcript and structured output, process-tree cancellation, and no model-triggered filesystem or network tools. Youta never reads Codex credentials or exposes private notes. Other AI backends are not implemented. |
 
 The implemented official metadata adapter calls
 [`search.list`](https://developers.google.com/youtube/v3/docs/search/list),

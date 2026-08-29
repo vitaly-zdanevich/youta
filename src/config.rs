@@ -59,6 +59,20 @@ pub const YOUTUBE_THUMBNAIL_SIZE_ENV: &str = "YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE";
 /// Environment variable that overrides whether new playback History rows are saved.
 pub const SAVE_PLAYBACK_HISTORY_ENV: &str = "YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY";
 
+/// Environment variable that overrides the selected video-summary backend.
+pub const VIDEO_SUMMARY_BACKEND_ENV: &str = "YOUTA_VIDEO_SUMMARY__BACKEND";
+
+/// Returns whether an environment override belongs to a capability present in
+/// this binary's in-app preference editor.
+///
+/// An omitted capability must not make unrelated preferences read-only merely
+/// because a shell profile still exports its old setting.
+#[cfg(feature = "controller")]
+pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) -> bool {
+    (cfg!(feature = "images") || variable != TTY_IMAGES_ENV)
+        && (cfg!(feature = "video-summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
+}
+
 /// Environment variable that overrides the preferred Bandcamp audio format.
 pub const BANDCAMP_AUDIO_FORMAT_ENV: &str = "YOUTA_PROVIDERS__BANDCAMP_AUDIO_FORMAT";
 
@@ -129,6 +143,8 @@ pub struct Config {
     pub ui: UiConfig,
     /// State persistence behavior.
     pub persistence: PersistenceConfig,
+    /// Explicit, user-selected AI video-summary behavior.
+    pub video_summary: VideoSummaryConfig,
     /// Network provider endpoints, loaded credentials, and helper executables.
     pub providers: ProviderConfig,
     /// Root for every file and directory written by Youta.
@@ -155,6 +171,7 @@ impl Config {
             subscriptions: SubscriptionConfig::default(),
             ui: UiConfig::default(),
             persistence: PersistenceConfig::default(),
+            video_summary: VideoSummaryConfig::default(),
             providers: ProviderConfig::default(),
             root_dir: config_dir.into(),
         }
@@ -550,9 +567,9 @@ impl Config {
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, selected
     /// YouTube-video prewarming, lazy Local-folder size preference, physical-TTY
-    /// image preference, exact `YouTube` thumbnail size, and playback-History
-    /// saving preference are written together so confirming the popup cannot
-    /// save only part of the draft.
+    /// image preference, exact `YouTube` thumbnail size, playback-History
+    /// saving preference, and (when compiled) video-summary backend are written
+    /// together so confirming the popup cannot save only part of the draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
@@ -560,7 +577,8 @@ impl Config {
     /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
     /// precedence and therefore prevent this writer from storing a shadowed
-    /// draft.
+    /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] does the same when that capability
+    /// is compiled.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the complete preference draft.
@@ -584,6 +602,7 @@ impl Config {
         show_images_in_tty: bool,
         youtube_thumbnail_size: YouTubeThumbnailSize,
         save_playback_history: bool,
+        video_summary_backend: VideoSummaryBackend,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
@@ -593,9 +612,10 @@ impl Config {
             TTY_IMAGES_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
+            VIDEO_SUMMARY_BACKEND_ENV,
         ]
         .into_iter()
-        .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
+        .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
         {
             if std::env::var_os(variable).is_some() {
                 return Err(ConfigError::Invalid(format!(
@@ -653,6 +673,23 @@ impl Config {
                 })?;
             persistence["save_playback_history"] = value(save_playback_history);
         }
+        #[cfg(feature = "video-summary")]
+        {
+            let video_summary = document
+                .as_table_mut()
+                .entry("video_summary")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`video_summary` must be a TOML table before Youta can update it"
+                            .to_owned(),
+                    )
+                })?;
+            video_summary["backend"] = value(video_summary_backend.as_config_value());
+        }
+        #[cfg(not(feature = "video-summary"))]
+        let _ = video_summary_backend;
         write_private_config(&path, document.to_string().as_bytes())?;
 
         self.ui.subscriptions_layout = layout;
@@ -667,6 +704,10 @@ impl Config {
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
         self.playback.youtube_prewarm = youtube_prewarm;
         self.persistence.save_playback_history = save_playback_history;
+        #[cfg(feature = "video-summary")]
+        {
+            self.video_summary.backend = video_summary_backend;
+        }
         Ok(())
     }
 
@@ -1167,6 +1208,76 @@ impl Default for PersistenceConfig {
             save_playback_history: true,
             git_commit_on_change: true,
         }
+    }
+}
+
+/// Runtime selection for on-demand video summaries.
+///
+/// The Cargo feature controls whether the capability exists in the binary;
+/// this setting controls whether an explicit summary action may send a bounded
+/// transcript to the user's independently authenticated Codex CLI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct VideoSummaryConfig {
+    /// Selected summary backend. [`VideoSummaryBackend::Off`] requires no
+    /// process launch and transmits no transcript.
+    pub backend: VideoSummaryBackend,
+    /// Executable name or path for the user-installed Codex CLI.
+    pub codex_executable: PathBuf,
+}
+
+impl Default for VideoSummaryConfig {
+    fn default() -> Self {
+        Self {
+            backend: VideoSummaryBackend::Off,
+            codex_executable: PathBuf::from("codex"),
+        }
+    }
+}
+
+/// Closed set of video-summary backends supported by this release.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VideoSummaryBackend {
+    /// Do not transmit captions to an AI service.
+    #[default]
+    Off,
+    /// Invoke the user's installed and authenticated Codex CLI.
+    Codex,
+}
+
+impl VideoSummaryBackend {
+    /// Stable value written to `config.toml` and environment overrides.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Human-readable preference value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Codex => "Codex CLI",
+        }
+    }
+
+    /// Advances the future-compatible closed selector.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Codex,
+            Self::Codex => Self::Off,
+        }
+    }
+}
+
+impl fmt::Display for VideoSummaryBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_config_value())
     }
 }
 
@@ -1774,6 +1885,22 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "controller")]
+    #[test]
+    fn preference_environment_locks_follow_compiled_capabilities() {
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(TTY_IMAGES_ENV),
+            cfg!(feature = "images")
+        );
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(VIDEO_SUMMARY_BACKEND_ENV),
+            cfg!(feature = "video-summary")
+        );
+        assert!(tui_preference_environment_variable_is_relevant(
+            SAVE_PLAYBACK_HISTORY_ENV
+        ));
+    }
+
     #[test]
     fn defaults_are_low_resource_and_paths_are_confined() {
         let root = PathBuf::from("/tmp/youta-config-test");
@@ -1788,6 +1915,11 @@ mod tests {
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert!(config.persistence.save_playback_history);
         assert!(config.persistence.git_commit_on_change);
+        assert_eq!(config.video_summary.backend, VideoSummaryBackend::Off);
+        assert_eq!(
+            config.video_summary.codex_executable,
+            PathBuf::from("codex")
+        );
         assert_eq!(config.ui.thumbnail_height, DEFAULT_THUMBNAIL_HEIGHT);
         assert_eq!(
             config.ui.youtube_thumbnail_size,
@@ -1848,6 +1980,10 @@ subscriptions_layout = "split"
 
 [providers]
 bandcamp_audio_format = "alac"
+
+[video_summary]
+backend = "codex"
+codex_executable = "/opt/openai/bin/codex"
 "#,
         )
         .expect("write test TOML");
@@ -1872,6 +2008,11 @@ bandcamp_audio_format = "alac"
         assert_eq!(
             config.providers.bandcamp_audio_format,
             BandcampAudioFormat::Alac
+        );
+        assert_eq!(config.video_summary.backend, VideoSummaryBackend::Codex);
+        assert_eq!(
+            config.video_summary.codex_executable,
+            PathBuf::from("/opt/openai/bin/codex")
         );
         assert_eq!(config.config_dir(), directory.path());
     }
@@ -2129,6 +2270,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 YouTubeThumbnailSize::Maxres,
                 false,
+                VideoSummaryBackend::Codex,
             )
             .expect("save TUI preferences");
 
@@ -2144,6 +2286,13 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
         assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
+        #[cfg(feature = "video-summary")]
+        {
+            assert!(contents.contains("[video_summary]"));
+            assert!(contents.contains("backend = \"codex\""));
+        }
+        #[cfg(not(feature = "video-summary"))]
+        assert!(!contents.contains("[video_summary]"));
         #[cfg(feature = "images")]
         assert!(contents.contains("show_images_in_tty = false"));
         #[cfg(not(feature = "images"))]
@@ -2161,6 +2310,14 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
         assert!(!config.persistence.save_playback_history);
+        assert_eq!(
+            config.video_summary.backend,
+            if cfg!(feature = "video-summary") {
+                VideoSummaryBackend::Codex
+            } else {
+                VideoSummaryBackend::Off
+            }
+        );
 
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
@@ -2177,6 +2334,47 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
         assert!(!reloaded.persistence.save_playback_history);
+        assert_eq!(
+            reloaded.video_summary.backend,
+            if cfg!(feature = "video-summary") {
+                VideoSummaryBackend::Codex
+            } else {
+                VideoSummaryBackend::Off
+            }
+        );
+    }
+
+    #[cfg(all(feature = "controller", not(feature = "video-summary")))]
+    #[test]
+    fn feature_off_preferences_preserve_existing_video_summary_toml() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# retain summary settings for another build\n[video_summary]\nbackend = \"codex\"\ncodex_executable = \"/opt/openai/bin/codex\"\n",
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_tui_preferences(
+                SubscriptionsLayout::Split,
+                false,
+                false,
+                false,
+                false,
+                YouTubeThumbnailSize::High,
+                false,
+                VideoSummaryBackend::Off,
+            )
+            .expect("save supported preferences");
+
+        let contents = fs::read_to_string(path).expect("read configuration");
+        assert!(contents.contains("# retain summary settings for another build"));
+        assert!(contents.contains("backend = \"codex\""));
+        assert!(contents.contains("codex_executable = \"/opt/openai/bin/codex\""));
+        assert_eq!(config.video_summary.backend, VideoSummaryBackend::Codex);
     }
 
     #[cfg(feature = "controller")]
@@ -2381,6 +2579,7 @@ youtube_api_key = "keep-this-existing-secret"
                     true,
                     YouTubeThumbnailSize::Standard,
                     true,
+                    VideoSummaryBackend::Codex,
                 )
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
@@ -2400,10 +2599,11 @@ youtube_api_key = "keep-this-existing-secret"
             (TTY_IMAGES_ENV, "false"),
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
             (SAVE_PLAYBACK_HISTORY_ENV, "false"),
+            (VIDEO_SUMMARY_BACKEND_ENV, "codex"),
         ];
         for (override_name, override_value) in overrides
             .into_iter()
-            .filter(|(name, _)| cfg!(feature = "images") || *name != TTY_IMAGES_ENV)
+            .filter(|(name, _)| tui_preference_environment_variable_is_relevant(name))
         {
             let directory = tempdir().expect("temporary directory");
             let output = Command::new(std::env::current_exe().expect("test executable"))

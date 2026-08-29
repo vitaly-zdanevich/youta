@@ -21,6 +21,7 @@ import {
   QueuePopup,
   VideoCommentsPopup,
   VideoQrPopup,
+  VideoSummaryPopup,
 } from "./components/popups";
 import { namedKey } from "./keys";
 import { sendKey } from "./ipc";
@@ -176,6 +177,7 @@ export function App() {
         <HelpPopup
           audioQualitySupported={view.audio_quality_supported}
           playbackHistoryEnabled={view.playback_history_enabled}
+          videoSummarySupported={view.video_summary_supported}
         />
       ) : null}
       {view.project_history_popup ? (
@@ -195,6 +197,9 @@ export function App() {
         <VideoCommentsPopup popup={view.video_comments_popup} />
       ) : null}
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
+      {view.video_summary_popup ? (
+        <VideoSummaryPopup popup={view.video_summary_popup} />
+      ) : null}
       {view.audio_quality_popup ? (
         <AudioQualityPopup popup={view.audio_quality_popup} />
       ) : null}

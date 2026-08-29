@@ -1,13 +1,13 @@
 //! Application controller connecting providers, persistence, playback, and TUI.
 //!
-//! General provider requests run on one blocking worker. Apple Podcasts,
-//! Bandcamp search, YouTube Music search, Bandcamp media resolution, Local
-//! directory listings, and selected-video YouTube prewarming use dedicated
-//! workers; action queues are bounded or generation-owned. Slow catalogue or
-//! speculative media requests therefore cannot delay YouTube search or
-//! foreground navigation. The terminal event loop never waits for these
-//! responses, while the process avoids an asynchronous runtime and its
-//! additional idle bookkeeping.
+//! General provider requests run on one blocking worker. `Apple Podcasts`,
+//! `Bandcamp` search, `YouTube Music` search, `Bandcamp` media resolution, Local
+//! directory listings, selected-video `YouTube` prewarming, and explicit video
+//! summaries use dedicated workers; action queues are bounded or
+//! generation-owned. Slow catalogue, model, or speculative media requests
+//! therefore cannot delay `YouTube` search or foreground navigation. The
+//! terminal event loop never waits for these responses, while the process
+//! avoids an asynchronous runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "yt-dlp")]
@@ -45,8 +45,9 @@ use crate::build_info::{self, RuntimeProvenance};
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV,
-    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, YOUTUBE_PREWARM_ENV,
-    YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
+    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV,
+    VideoSummaryBackend, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend,
+    YouTubeProviderSetting, YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -189,6 +190,11 @@ use crate::subscriptions::{self, FlattenedSubscription, SubscriptionKind, Subscr
 use crate::text_file_open::{
     TextFileOpenContext, TextFileOpenLifecycle, TextFileOpenPlan, plan_text_file_open,
 };
+#[cfg(feature = "video-summary")]
+use crate::video_summary::{
+    CodexVideoSummarizer, VideoSummarizer, VideoSummaryCancellation, VideoSummaryError,
+    VideoSummaryRequest, YouTubeCaptionError, YouTubeCaptionExtractor,
+};
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
 use crate::view::DetailLinkInternalTarget;
@@ -205,6 +211,8 @@ use crate::view::RadioRecordingView;
 use crate::view::RadioSort;
 #[cfg(feature = "qr")]
 use crate::view::VideoQrPopupView;
+#[cfg(any(feature = "video-summary", test))]
+use crate::view::VideoSummaryPopupView;
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
@@ -215,9 +223,9 @@ use crate::view::{
     ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView,
     QueueRowView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity,
     SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
-    VideoCommentsPopupState, VideoCommentsPopupView, ViewModel, WaveformView,
-    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
+    VideoCommentsPopupState, VideoCommentsPopupView, VideoSummaryPopupState, ViewModel,
+    WaveformView, YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort,
+    YouTubeSetupField, YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::view::{
@@ -245,8 +253,30 @@ fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
     value.truncate(boundary);
 }
 
+/// Describes the summary preference without advertising code omitted at build
+/// time.
+fn video_summary_preference_status(backend: VideoSummaryBackend) -> &'static str {
+    if cfg!(feature = "video-summary") {
+        backend.label()
+    } else {
+        "unavailable in this build"
+    }
+}
+
 /// Maximum UTF-8 payload stored for one private local note.
 pub const MAX_PRIVATE_NOTE_BYTES: usize = 16 * 1024;
+
+/// Maximum completed video summaries retained in process memory.
+///
+/// Individual reports are already bounded by the video-summary parser. The
+/// entry ceiling prevents explicit requests across many videos from growing
+/// the session cache without limit.
+#[cfg(feature = "video-summary")]
+const MAX_CACHED_VIDEO_SUMMARIES: usize = 32;
+
+/// Maximum estimated string heap retained by completed video summaries.
+#[cfg(feature = "video-summary")]
+const MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum LibriVox books retained for one public catalogue location.
 #[cfg(feature = "librivox")]
@@ -1467,6 +1497,69 @@ struct LocalAudioQualityWorkerResponse {
     generation: u64,
     path: PathBuf,
     result: Result<AudioQualityReport, AudioQualityError>,
+}
+
+/// One explicit, generation-owned video-summary request.
+#[cfg(feature = "video-summary")]
+struct PendingVideoSummary {
+    generation: u64,
+    /// Exact YouTube identity that will own a successful cache entry.
+    video_id: String,
+    cancellation: VideoSummaryCancellation,
+}
+
+/// One successful, transcript-free summary retained for this process only.
+#[cfg(feature = "video-summary")]
+#[derive(Clone)]
+struct CachedVideoSummary {
+    caption_source: String,
+    report: String,
+}
+
+/// Commands accepted by the dedicated caption-and-Codex worker.
+#[cfg(feature = "video-summary")]
+enum VideoSummaryWorkerRequest {
+    Generate {
+        generation: u64,
+        video_id: String,
+        cancellation: VideoSummaryCancellation,
+    },
+    Shutdown,
+}
+
+/// Safe worker failure that never contains the caption transcript.
+#[cfg(feature = "video-summary")]
+#[derive(Debug, thiserror::Error)]
+enum VideoSummaryWorkerError {
+    #[error("Could not retrieve YouTube captions: {0}")]
+    Captions(#[from] YouTubeCaptionError),
+    #[error("Could not generate the Codex summary: {0}")]
+    Codex(#[from] VideoSummaryError),
+}
+
+#[cfg(feature = "video-summary")]
+impl VideoSummaryWorkerError {
+    /// Returns whether either subprocess observed an explicit cancellation.
+    fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::Captions(YouTubeCaptionError::Cancelled)
+                | Self::Codex(VideoSummaryError::Cancelled)
+        )
+    }
+}
+
+/// Progress and terminal responses from the dedicated summary worker.
+#[cfg(feature = "video-summary")]
+enum VideoSummaryWorkerResponse {
+    Generating {
+        generation: u64,
+        caption_source: String,
+    },
+    Finished {
+        generation: u64,
+        result: Result<String, VideoSummaryWorkerError>,
+    },
 }
 
 /// Collection, progress, and terminal events from one sequential batch.
@@ -4244,6 +4337,39 @@ pub struct AppController {
     /// Report revision attached to the quality copy awaiting its result.
     #[cfg(feature = "audio-quality")]
     awaiting_audio_quality_clipboard_revision: Option<u64>,
+    /// Report revision attached to a summary copy not yet taken by a front-end.
+    pending_video_summary_clipboard_revision: Option<u64>,
+    /// Report revision attached to the summary copy awaiting its result.
+    awaiting_video_summary_clipboard_revision: Option<u64>,
+    /// Single-slot requests for the dedicated caption-and-Codex worker.
+    #[cfg(feature = "video-summary")]
+    video_summary_requests: Option<Sender<VideoSummaryWorkerRequest>>,
+    /// Progress and completions drained by the UI event loop.
+    #[cfg(feature = "video-summary")]
+    video_summary_responses: Receiver<VideoSummaryWorkerResponse>,
+    /// Join handle for the sole caption-and-Codex worker.
+    #[cfg(feature = "video-summary")]
+    video_summary_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner rejecting stale summary progress and completions.
+    #[cfg(feature = "video-summary")]
+    video_summary_generation: u64,
+    /// Generation allowed to mutate the currently visible summary popup.
+    #[cfg(feature = "video-summary")]
+    video_summary_popup_owner_generation: Option<u64>,
+    /// Exact explicit summary operation currently owned by the worker.
+    #[cfg(feature = "video-summary")]
+    pending_video_summary: Option<PendingVideoSummary>,
+    /// Successful rendered summaries retained only until this controller drops.
+    #[cfg(feature = "video-summary")]
+    video_summary_cache: HashMap<String, CachedVideoSummary>,
+    /// Least-recently-used order for the bounded summary cache.
+    #[cfg(feature = "video-summary")]
+    video_summary_cache_order: VecDeque<String>,
+    /// Monotonic popup revision rejecting stale clipboard completions.
+    video_summary_popup_revision: u64,
+    /// Whether an unexpected worker disconnect was already handled.
+    #[cfg(feature = "video-summary")]
+    video_summary_disconnect_reported: bool,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -4775,6 +4901,10 @@ impl AppController {
         #[cfg(feature = "audio-quality")]
         let (local_audio_quality_batch_response_sender, local_audio_quality_batch_responses) =
             unbounded();
+        #[cfg(feature = "video-summary")]
+        let (video_summary_request_sender, video_summary_request_receiver) = bounded(1);
+        #[cfg(feature = "video-summary")]
+        let (video_summary_response_sender, video_summary_responses) = bounded(2);
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
         #[cfg(feature = "acoustid")]
@@ -4969,6 +5099,30 @@ impl AppController {
         let local_audio_quality_requests = local_audio_quality_thread
             .as_ref()
             .map(|_| local_audio_quality_request_sender);
+        #[cfg(feature = "video-summary")]
+        let video_summary_yt_dlp = config.providers.yt_dlp_executable.clone();
+        #[cfg(feature = "video-summary")]
+        let video_summary_codex = config.video_summary.codex_executable.clone();
+        #[cfg(feature = "video-summary")]
+        let video_summary_thread_result = thread::Builder::new()
+            .name("youta-video-summary".to_owned())
+            .spawn(move || {
+                video_summary_worker(
+                    video_summary_request_receiver,
+                    video_summary_response_sender,
+                    YouTubeCaptionExtractor::new(video_summary_yt_dlp),
+                    CodexVideoSummarizer::new(video_summary_codex),
+                );
+            });
+        #[cfg(feature = "video-summary")]
+        let (video_summary_thread, video_summary_thread_error) = match video_summary_thread_result {
+            Ok(handle) => (Some(handle), None),
+            Err(error) => (None, Some(error)),
+        };
+        #[cfg(feature = "video-summary")]
+        let video_summary_requests = video_summary_thread
+            .as_ref()
+            .map(|_| video_summary_request_sender);
         #[cfg(feature = "waveform")]
         let waveform_ffmpeg = config.providers.ffmpeg_executable.clone();
         #[cfg(feature = "waveform")]
@@ -5447,6 +5601,27 @@ impl AppController {
             pending_audio_quality_clipboard_revision: None,
             #[cfg(feature = "audio-quality")]
             awaiting_audio_quality_clipboard_revision: None,
+            pending_video_summary_clipboard_revision: None,
+            awaiting_video_summary_clipboard_revision: None,
+            #[cfg(feature = "video-summary")]
+            video_summary_requests,
+            #[cfg(feature = "video-summary")]
+            video_summary_responses,
+            #[cfg(feature = "video-summary")]
+            video_summary_thread,
+            #[cfg(feature = "video-summary")]
+            video_summary_generation: 0,
+            #[cfg(feature = "video-summary")]
+            video_summary_popup_owner_generation: None,
+            #[cfg(feature = "video-summary")]
+            pending_video_summary: None,
+            #[cfg(feature = "video-summary")]
+            video_summary_cache: HashMap::new(),
+            #[cfg(feature = "video-summary")]
+            video_summary_cache_order: VecDeque::new(),
+            video_summary_popup_revision: 0,
+            #[cfg(feature = "video-summary")]
+            video_summary_disconnect_reported: false,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
@@ -5862,6 +6037,15 @@ impl AppController {
                 format!("Could not start the local audio-quality worker: {error}"),
             );
         }
+        #[cfg(feature = "video-summary")]
+        if let Some(error) = video_summary_thread_error
+            && controller.config.video_summary.backend == VideoSummaryBackend::Codex
+        {
+            controller.show_actionable_message(
+                "Video summaries unavailable",
+                format!("Could not start the caption-and-Codex worker: {error}"),
+            );
+        }
         #[cfg(feature = "acoustid")]
         if let Some(error) = local_fingerprint_thread_error {
             controller.show_error_message("Could not start local fingerprinting", error);
@@ -5900,6 +6084,7 @@ impl AppController {
             }
         }
         controller.refresh_selected_playlist_state();
+        controller.refresh_video_summary_availability();
         #[cfg(feature = "yandex-music")]
         if controller.view.screen == Screen::YandexMusic {
             // My Wave uses the foreground provider lane. Queue it before
@@ -16520,12 +16705,18 @@ impl AppController {
                 matches!(subject, ClipboardSubject::AudioQualityReport(_))
                     .then_some(self.local_audio_quality_popup_revision);
         }
+        self.pending_video_summary_clipboard_revision =
+            matches!(subject, ClipboardSubject::VideoSummary(_))
+                .then_some(self.video_summary_popup_revision);
         self.pending_clipboard_request = Some(ClipboardRequest { text, subject });
         self.view.status_line = match subject {
             ClipboardSubject::Link => "Copying the link…".to_owned(),
             ClipboardSubject::DetailsText(count) => format!("Copying {count} characters…"),
             ClipboardSubject::AudioQualityReport(count) => {
                 format!("Copying an audio quality report ({count} characters)…")
+            }
+            ClipboardSubject::VideoSummary(count) => {
+                format!("Copying a video summary ({count} characters)…")
             }
         };
     }
@@ -26352,6 +26543,22 @@ impl AppController {
                 ));
                 helpers
             };
+            #[cfg(feature = "video-summary")]
+            let helpers = {
+                let mut helpers = helpers;
+                if self.config.video_summary.backend == VideoSummaryBackend::Codex {
+                    helpers.push((
+                        ExternalHelperKind::Codex,
+                        Some(PathBuf::from(
+                            CodexVideoSummarizer::new(
+                                self.config.video_summary.codex_executable.clone(),
+                            )
+                            .program(),
+                        )),
+                    ));
+                }
+                helpers
+            };
             self.diagnostic_helpers_cache = Some(ExternalHelper::probe_many(helpers));
         }
         self.diagnostic_helpers_cache
@@ -28247,9 +28454,10 @@ impl AppController {
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
+            VIDEO_SUMMARY_BACKEND_ENV,
         ]
         .into_iter()
-        .filter(|variable| cfg!(feature = "images") || *variable != TTY_IMAGES_ENV)
+        .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
         .filter(|variable| std::env::var_os(variable).is_some())
         .collect::<Vec<_>>()
         .join(", ");
@@ -28262,6 +28470,8 @@ impl AppController {
             show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             save_playback_history: self.config.persistence.save_playback_history,
+            video_summary_backend: self.config.video_summary.backend,
+            video_summary_supported: cfg!(feature = "video-summary"),
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
                 .then_some(environment_override),
@@ -28499,6 +28709,451 @@ impl AppController {
         preferences.validation_error = None;
     }
 
+    /// Advances the explicit Off/Codex summary-provider selector.
+    fn cycle_draft_video_summary_backend(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if !cfg!(feature = "video-summary") {
+            preferences.validation_error =
+                Some("this build omits the `video-summary` feature".to_owned());
+            return;
+        }
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.video_summary_backend = preferences.video_summary_backend.next();
+        preferences.validation_error = None;
+    }
+
+    /// Returns one completed summary and promotes it in the process-local LRU.
+    #[cfg(feature = "video-summary")]
+    fn cached_video_summary(&mut self, video_id: &str) -> Option<CachedVideoSummary> {
+        let cached = self.video_summary_cache.get(video_id)?.clone();
+        self.touch_video_summary_cache(video_id);
+        Some(cached)
+    }
+
+    /// Inserts one successful rendered summary and enforces both RAM bounds.
+    #[cfg(feature = "video-summary")]
+    fn cache_video_summary(&mut self, video_id: String, cached: CachedVideoSummary) {
+        let candidate_bytes = video_id
+            .capacity()
+            .saturating_mul(2)
+            .saturating_add(cached.caption_source.capacity())
+            .saturating_add(cached.report.capacity());
+        if candidate_bytes > MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES {
+            self.video_summary_cache.remove(&video_id);
+            self.video_summary_cache_order
+                .retain(|existing| existing != &video_id);
+            return;
+        }
+        self.video_summary_cache.insert(video_id.clone(), cached);
+        self.touch_video_summary_cache(&video_id);
+        while self.video_summary_cache.len() > MAX_CACHED_VIDEO_SUMMARIES
+            || self.video_summary_cache_estimated_owned_bytes()
+                > MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES
+        {
+            let oldest = self
+                .video_summary_cache_order
+                .pop_front()
+                .or_else(|| self.video_summary_cache.keys().next().cloned());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.video_summary_cache.remove(&oldest);
+        }
+    }
+
+    /// Promotes one exact video identity without duplicating its LRU key.
+    #[cfg(feature = "video-summary")]
+    fn touch_video_summary_cache(&mut self, video_id: &str) {
+        self.video_summary_cache_order
+            .retain(|cached| cached != video_id);
+        self.video_summary_cache_order
+            .push_back(video_id.to_owned());
+    }
+
+    /// Estimates string-owned heap in both the cache map and its LRU index.
+    #[cfg(feature = "video-summary")]
+    fn video_summary_cache_estimated_owned_bytes(&self) -> usize {
+        let entries = self
+            .video_summary_cache
+            .iter()
+            .map(|(video_id, cached)| {
+                video_id
+                    .capacity()
+                    .saturating_add(cached.caption_source.capacity())
+                    .saturating_add(cached.report.capacity())
+            })
+            .fold(0usize, usize::saturating_add);
+        self.video_summary_cache_order
+            .iter()
+            .map(String::capacity)
+            .fold(entries, usize::saturating_add)
+    }
+
+    /// Recomputes whether the selected Details item may be summarized.
+    ///
+    /// The exact Details identity is authoritative because History, playlists,
+    /// subscriptions, and linked-video navigation do not all have a matching
+    /// row in the foreground provider list.
+    fn refresh_video_summary_availability(&mut self) {
+        self.view.video_summary_supported = cfg!(feature = "video-summary");
+        #[cfg(feature = "video-summary")]
+        let cached_for_selected_video = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.media_id.as_ref())
+            .is_some_and(|media_id| {
+                media_id.source == SourceKind::YouTube
+                    && validate_youtube_video_id(&media_id.external_id).is_ok()
+                    && self.video_summary_cache.contains_key(&media_id.external_id)
+            });
+        #[cfg(feature = "video-summary")]
+        let worker_available = (self.video_summary_requests.is_some() || cached_for_selected_video)
+            && self.pending_video_summary.is_none()
+            && self.view.video_summary_popup.is_none();
+        #[cfg(not(feature = "video-summary"))]
+        let worker_available = false;
+        self.view.video_summary_available = worker_available
+            && self.config.video_summary.backend == VideoSummaryBackend::Codex
+            && self
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .is_some_and(|media_id| {
+                    media_id.source == SourceKind::YouTube
+                        && validate_youtube_video_id(&media_id.external_id).is_ok()
+                });
+    }
+
+    /// Starts one explicit, RAM-only video summary request.
+    fn generate_video_summary(&mut self) {
+        #[cfg(not(feature = "video-summary"))]
+        {
+            self.view.status_line = "This build omits video-summary support".to_owned();
+        }
+        #[cfg(feature = "video-summary")]
+        {
+            if self.pending_video_summary.is_some() {
+                self.view.status_line =
+                    "Wait for the current video summary to stop before starting another".to_owned();
+                return;
+            }
+            if self.view.video_summary_popup.is_some() {
+                self.view.status_line =
+                    "Close the current video summary before starting another".to_owned();
+                return;
+            }
+            let Some(details) = self.view.details.as_ref() else {
+                self.view.status_line = "No video Details are available to summarize".to_owned();
+                return;
+            };
+            let Some(media_id) = details.media_id.as_ref().filter(|media_id| {
+                media_id.source == SourceKind::YouTube
+                    && validate_youtube_video_id(&media_id.external_id).is_ok()
+            }) else {
+                self.view.status_line =
+                    "Only a selected YouTube video can be summarized".to_owned();
+                return;
+            };
+            if self.config.video_summary.backend != VideoSummaryBackend::Codex {
+                self.view.status_line =
+                    "Enable Codex video summaries in Preferences first".to_owned();
+                return;
+            }
+            let video_id = media_id.external_id.clone();
+            let title = details.title.clone();
+            if let Some(cached) = self.cached_video_summary(&video_id) {
+                self.advance_video_summary_popup_revision();
+                self.video_summary_popup_owner_generation = None;
+                self.view.video_summary_popup = Some(VideoSummaryPopupView {
+                    title,
+                    caption_source: cached.caption_source,
+                    state: VideoSummaryPopupState::Ready,
+                    report: cached.report,
+                    ..VideoSummaryPopupView::default()
+                });
+                self.view.status_line = "Video summary loaded from memory".to_owned();
+                return;
+            }
+            let Some(sender) = self.video_summary_requests.clone() else {
+                self.advance_video_summary_popup_revision();
+                self.video_summary_generation = self.video_summary_generation.wrapping_add(1);
+                self.video_summary_popup_owner_generation = Some(self.video_summary_generation);
+                self.view.video_summary_popup = Some(VideoSummaryPopupView {
+                    title,
+                    state: VideoSummaryPopupState::Failed(
+                        "The video-summary worker is unavailable; restart Youta and retry"
+                            .to_owned(),
+                    ),
+                    ..VideoSummaryPopupView::default()
+                });
+                self.view.status_line = "Video summaries are unavailable".to_owned();
+                return;
+            };
+            self.video_summary_generation = self.video_summary_generation.wrapping_add(1);
+            let generation = self.video_summary_generation;
+            let cancellation = VideoSummaryCancellation::default();
+            self.advance_video_summary_popup_revision();
+            self.video_summary_popup_owner_generation = Some(generation);
+            self.view.video_summary_popup = Some(VideoSummaryPopupView {
+                title,
+                state: VideoSummaryPopupState::FetchingCaptions,
+                ..VideoSummaryPopupView::default()
+            });
+            self.pending_video_summary = Some(PendingVideoSummary {
+                generation,
+                video_id: video_id.clone(),
+                cancellation: cancellation.clone(),
+            });
+            self.view.status_line = "Fetching bounded YouTube captions…".to_owned();
+            match sender.try_send(VideoSummaryWorkerRequest::Generate {
+                generation,
+                video_id,
+                cancellation,
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    if let Some(pending) = self.pending_video_summary.take() {
+                        pending.cancellation.cancel();
+                    }
+                    if let Some(popup) = self.view.video_summary_popup.as_mut() {
+                        popup.state = VideoSummaryPopupState::Failed(
+                            "The video-summary worker is busy; retry after its current request"
+                                .to_owned(),
+                        );
+                    }
+                    self.advance_video_summary_popup_revision();
+                    self.view.status_line = "Could not queue the video summary".to_owned();
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Some(pending) = self.pending_video_summary.take() {
+                        pending.cancellation.cancel();
+                    }
+                    self.video_summary_requests = None;
+                    self.video_summary_disconnect_reported = true;
+                    if let Some(popup) = self.view.video_summary_popup.as_mut() {
+                        popup.state = VideoSummaryPopupState::Failed(
+                            "The video-summary worker stopped; restart Youta and retry".to_owned(),
+                        );
+                    }
+                    self.advance_video_summary_popup_revision();
+                    self.view.status_line = "Video-summary worker stopped".to_owned();
+                }
+            }
+        }
+    }
+
+    /// Cooperatively cancels the active caption or Codex subprocess tree.
+    fn cancel_video_summary(&mut self) {
+        #[cfg(feature = "video-summary")]
+        if let Some(pending) = self.pending_video_summary.as_ref() {
+            pending.cancellation.cancel();
+        }
+        if let Some(popup) = self.view.video_summary_popup.as_mut()
+            && popup.state.pending()
+        {
+            popup.state = VideoSummaryPopupState::Cancelled;
+            popup.action_status = Some("Cancellation requested".to_owned());
+            self.advance_video_summary_popup_revision();
+            self.view.status_line = "Video summary cancellation requested".to_owned();
+        }
+    }
+
+    /// Copies the validated summary through the renderer-owned clipboard seam.
+    fn copy_video_summary(&mut self) {
+        let Some(report) = self
+            .view
+            .video_summary_popup
+            .as_ref()
+            .filter(|popup| popup.state == VideoSummaryPopupState::Ready)
+            .map(|popup| popup.report.clone())
+            .filter(|report| !report.is_empty())
+        else {
+            self.view.status_line = "No completed video summary is available to copy".to_owned();
+            return;
+        };
+        self.request_clipboard_copy(
+            report.clone(),
+            ClipboardSubject::VideoSummary(report.chars().count()),
+        );
+    }
+
+    /// Closes a terminal popup without writing its contents to persistent state.
+    ///
+    /// A successful report remains in the bounded process-local cache so the
+    /// same video can reopen immediately during this Youta session.
+    fn dismiss_video_summary(&mut self) {
+        if self
+            .view
+            .video_summary_popup
+            .as_ref()
+            .is_some_and(|popup| popup.state.pending())
+        {
+            self.cancel_video_summary();
+            return;
+        }
+        self.view.video_summary_popup = None;
+        #[cfg(feature = "video-summary")]
+        {
+            self.video_summary_popup_owner_generation = None;
+        }
+        self.advance_video_summary_popup_revision();
+    }
+
+    /// Invalidates clipboard completions owned by an older summary popup.
+    fn advance_video_summary_popup_revision(&mut self) {
+        self.video_summary_popup_revision = self.video_summary_popup_revision.wrapping_add(1);
+    }
+
+    /// Applies every currently available summary progress or completion.
+    #[cfg(feature = "video-summary")]
+    fn drain_video_summary_responses(&mut self) {
+        loop {
+            match self.video_summary_responses.try_recv() {
+                Ok(response) => self.handle_video_summary_response(response),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.video_summary_requests = None;
+                    if !self.video_summary_disconnect_reported {
+                        self.video_summary_disconnect_reported = true;
+                        let pending = self.pending_video_summary.take();
+                        let mut status = (self.config.video_summary.backend
+                            == VideoSummaryBackend::Codex)
+                            .then(|| "Video-summary worker stopped".to_owned());
+                        if let Some(pending) = pending {
+                            let cancellation_requested = pending.cancellation.is_cancelled();
+                            pending.cancellation.cancel();
+                            if self.video_summary_popup_owner_generation == Some(pending.generation)
+                            {
+                                if let Some(popup) = self.view.video_summary_popup.as_mut() {
+                                    if cancellation_requested
+                                        || matches!(popup.state, VideoSummaryPopupState::Cancelled)
+                                    {
+                                        popup.state = VideoSummaryPopupState::Cancelled;
+                                        popup.action_status = Some("Cancelled".to_owned());
+                                        status = Some("Video summary cancelled".to_owned());
+                                    } else {
+                                        popup.state = VideoSummaryPopupState::Failed(
+                                            "The video-summary worker stopped; restart Youta and retry"
+                                                .to_owned(),
+                                        );
+                                        popup.action_status = None;
+                                        status = Some("Video-summary worker stopped".to_owned());
+                                    }
+                                }
+                                self.advance_video_summary_popup_revision();
+                            }
+                        }
+                        if let Some(status) = status {
+                            self.view.status_line = status;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        self.refresh_video_summary_availability();
+    }
+
+    /// Applies one response only when its generation still owns the request
+    /// and visible popup.
+    #[cfg(feature = "video-summary")]
+    fn handle_video_summary_response(&mut self, response: VideoSummaryWorkerResponse) {
+        match response {
+            VideoSummaryWorkerResponse::Generating {
+                generation,
+                caption_source,
+            } => {
+                let Some(pending) = self.pending_video_summary.as_ref() else {
+                    return;
+                };
+                if pending.generation != generation
+                    || pending.cancellation.is_cancelled()
+                    || self.video_summary_popup_owner_generation != Some(generation)
+                {
+                    return;
+                }
+                let Some(popup) = self.view.video_summary_popup.as_mut() else {
+                    return;
+                };
+                if !popup.state.pending() {
+                    return;
+                }
+                popup.caption_source = caption_source;
+                popup.state = VideoSummaryPopupState::Generating;
+                popup.action_status = None;
+                self.view.status_line = "Generating a bounded summary with Codex…".to_owned();
+            }
+            VideoSummaryWorkerResponse::Finished { generation, result } => {
+                if self
+                    .pending_video_summary
+                    .as_ref()
+                    .map(|pending| pending.generation)
+                    != Some(generation)
+                {
+                    return;
+                }
+                let Some(pending) = self.pending_video_summary.take() else {
+                    return;
+                };
+                if self.video_summary_popup_owner_generation != Some(generation) {
+                    return;
+                }
+                let Some(popup) = self.view.video_summary_popup.as_mut() else {
+                    return;
+                };
+                let cancellation_requested = pending.cancellation.is_cancelled()
+                    || matches!(popup.state, VideoSummaryPopupState::Cancelled);
+                let completed_cache_entry = match result {
+                    _ if cancellation_requested => {
+                        popup.state = VideoSummaryPopupState::Cancelled;
+                        popup.report.clear();
+                        popup.action_status = Some("Cancelled".to_owned());
+                        self.view.status_line = "Video summary cancelled".to_owned();
+                        None
+                    }
+                    Err(error) if error.is_cancelled() => {
+                        popup.state = VideoSummaryPopupState::Cancelled;
+                        popup.report.clear();
+                        popup.action_status = Some("Cancelled".to_owned());
+                        self.view.status_line = "Video summary cancelled".to_owned();
+                        None
+                    }
+                    Err(error) => {
+                        popup.state = VideoSummaryPopupState::Failed(error.to_string());
+                        popup.report.clear();
+                        popup.action_status = None;
+                        self.view.status_line = "Could not generate the video summary".to_owned();
+                        None
+                    }
+                    Ok(report) => {
+                        let cached = CachedVideoSummary {
+                            caption_source: popup.caption_source.clone(),
+                            report: report.clone(),
+                        };
+                        popup.state = VideoSummaryPopupState::Ready;
+                        popup.report = report;
+                        popup.action_status = None;
+                        popup.scroll_offset = 0;
+                        self.view.status_line = "Video summary ready".to_owned();
+                        Some(cached)
+                    }
+                };
+                self.advance_video_summary_popup_revision();
+                if let Some(cached) = completed_cache_entry {
+                    self.cache_video_summary(pending.video_id, cached);
+                }
+            }
+        }
+    }
+
     /// Cycles Local size ordering while retaining the exact selected path.
     fn toggle_local_size_sort(&mut self) {
         if self.view.screen != Screen::Local || !self.config.ui.show_local_folder_sizes {
@@ -28610,6 +29265,9 @@ impl AppController {
         let show_images_in_tty = self.config.ui.show_images_in_tty;
         let bandcamp_audio_format = preferences.bandcamp_audio_format;
         let save_playback_history = preferences.save_playback_history;
+        let video_summary_backend = preferences.video_summary_backend;
+        let video_summary_backend_changed =
+            self.config.video_summary.backend != video_summary_backend;
         #[cfg(feature = "yt-dlp")]
         let youtube_prewarm_preference_changed =
             self.config.playback.youtube_prewarm != youtube_prewarm;
@@ -28625,6 +29283,7 @@ impl AppController {
             show_images_in_tty,
             youtube_thumbnail_size,
             save_playback_history,
+            video_summary_backend,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
@@ -28674,6 +29333,10 @@ impl AppController {
             self.schedule_local_folder_sizes();
         }
         self.view.show_images_in_tty = show_images_in_tty;
+        if video_summary_backend_changed {
+            self.diagnostic_helpers_cache = None;
+        }
+        self.refresh_video_summary_availability();
         if youtube_thumbnail_preference_changed {
             self.refresh_youtube_thumbnail_projection();
         }
@@ -28682,7 +29345,7 @@ impl AppController {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; playback History {}; TTY images {}; Bandcamp audio {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; playback History {}; video summaries {}; TTY images {}; Bandcamp audio {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
@@ -28691,6 +29354,7 @@ impl AppController {
             },
             if youtube_prewarm { "on" } else { "off" },
             if save_playback_history { "on" } else { "off" },
+            video_summary_preference_status(video_summary_backend),
             if cfg!(feature = "images") {
                 if show_images_in_tty { "on" } else { "off" }
             } else {
@@ -28846,6 +29510,25 @@ impl AppController {
             self.local_move_persistence_failure = Some(message.clone());
             self.show_error_message("Local move completion is unknown", message);
         }
+    }
+
+    /// Cancels, stops, and joins the dedicated caption-and-Codex worker.
+    #[cfg(feature = "video-summary")]
+    fn shutdown_video_summary_worker(&mut self) {
+        if let Some(pending) = self.pending_video_summary.as_ref() {
+            pending.cancellation.cancel();
+        }
+        if let Some(sender) = self.video_summary_requests.take() {
+            // Dropping a full request sender is sufficient: the cancelled
+            // queued request runs next, then `recv` observes disconnection.
+            // Never block shutdown while waiting for that queue slot.
+            let _ = sender.try_send(VideoSummaryWorkerRequest::Shutdown);
+        }
+        if let Some(handle) = self.video_summary_thread.take() {
+            let _ = handle.join();
+        }
+        while self.video_summary_responses.try_recv().is_ok() {}
+        self.pending_video_summary = None;
     }
 
     /// Cancels, stops, and joins the dedicated local audio-quality analyzer.
@@ -29123,6 +29806,8 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        #[cfg(feature = "video-summary")]
+        self.shutdown_video_summary_worker();
         #[cfg(feature = "audio-quality")]
         self.shutdown_local_audio_quality_worker();
         #[cfg(feature = "acoustid")]
@@ -29655,6 +30340,15 @@ impl UiController for AppController {
                     popup.scroll_offset = offset;
                 }
             }
+            UiAction::GenerateVideoSummary => self.generate_video_summary(),
+            UiAction::CancelVideoSummary => self.cancel_video_summary(),
+            UiAction::CopyVideoSummary => self.copy_video_summary(),
+            UiAction::DismissVideoSummary => self.dismiss_video_summary(),
+            UiAction::SetVideoSummaryScroll(offset) => {
+                if let Some(popup) = self.view.video_summary_popup.as_mut() {
+                    popup.scroll_offset = offset;
+                }
+            }
             UiAction::ToggleRepeat => {
                 if self
                     .current_media
@@ -29937,6 +30631,9 @@ impl UiController for AppController {
             UiAction::CycleBandcampAudioFormat => {
                 self.cycle_draft_bandcamp_audio_format();
             }
+            UiAction::CycleVideoSummaryBackend => {
+                self.cycle_draft_video_summary_backend();
+            }
             UiAction::SubmitPreferences => self.submit_preferences(),
             UiAction::DismissPreferences => {
                 self.view.preferences_popup = None;
@@ -30007,6 +30704,7 @@ impl UiController for AppController {
         // folder/marked batches deliberately remain independent of navigation.
         #[cfg(feature = "audio-quality")]
         self.cancel_stale_local_audio_quality();
+        self.refresh_video_summary_availability();
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
             && !self.diagnostic_only
@@ -30033,6 +30731,8 @@ impl UiController for AppController {
             self.awaiting_audio_quality_clipboard_revision =
                 self.pending_audio_quality_clipboard_revision.take();
         }
+        self.awaiting_video_summary_clipboard_revision =
+            self.pending_video_summary_clipboard_revision.take();
         Some(request)
     }
 
@@ -30040,6 +30740,7 @@ impl UiController for AppController {
         let subject = self.awaiting_clipboard_subject.take();
         #[cfg(feature = "audio-quality")]
         let quality_revision = self.awaiting_audio_quality_clipboard_revision.take();
+        let summary_revision = self.awaiting_video_summary_clipboard_revision.take();
         #[cfg(feature = "audio-quality")]
         let quality_status = match (&result, subject) {
             (Ok(transport), Some(ClipboardSubject::AudioQualityReport(_))) => {
@@ -30057,6 +30758,21 @@ impl UiController for AppController {
         {
             popup.action_status = Some(status);
         }
+        let summary_status = match (&result, subject) {
+            (Ok(transport), Some(ClipboardSubject::VideoSummary(_))) => {
+                Some(format!("Copied with {transport}"))
+            }
+            (Err(error), Some(ClipboardSubject::VideoSummary(_))) => {
+                Some(format!("Copy failed: {error}"))
+            }
+            _ => None,
+        };
+        if summary_revision == Some(self.video_summary_popup_revision)
+            && let Some(status) = summary_status
+            && let Some(popup) = self.view.video_summary_popup.as_mut()
+        {
+            popup.action_status = Some(status);
+        }
         self.view.status_line = match (result, subject) {
             (Ok(transport), Some(ClipboardSubject::DetailsText(count))) => {
                 format!("Copied {count} characters with {transport}")
@@ -30064,12 +30780,18 @@ impl UiController for AppController {
             (Ok(transport), Some(ClipboardSubject::AudioQualityReport(count))) => {
                 format!("Copied an audio quality report ({count} characters) with {transport}")
             }
+            (Ok(transport), Some(ClipboardSubject::VideoSummary(count))) => {
+                format!("Copied a video summary ({count} characters) with {transport}")
+            }
             (Ok(transport), _) => format!("Copied the link with {transport}"),
             (Err(error), Some(ClipboardSubject::DetailsText(_))) => {
                 format!("Could not copy Details text: {error}")
             }
             (Err(error), Some(ClipboardSubject::AudioQualityReport(_))) => {
                 format!("Could not copy the audio quality report: {error}")
+            }
+            (Err(error), Some(ClipboardSubject::VideoSummary(_))) => {
+                format!("Could not copy the video summary: {error}")
             }
             (Err(error), _) => format!("Could not copy the link: {error}"),
         };
@@ -30103,6 +30825,8 @@ impl UiController for AppController {
         self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "video-summary")]
+        self.drain_video_summary_responses();
         #[cfg(feature = "audio-quality")]
         self.drain_local_audio_quality_responses();
         #[cfg(feature = "audio-quality")]
@@ -30165,6 +30889,7 @@ impl UiController for AppController {
         self.request_due_radio_now_playing(now);
         #[cfg(feature = "waveform")]
         self.synchronize_local_waveform();
+        self.refresh_video_summary_availability();
         if self.session_dirty && self.last_session_save.elapsed() >= Duration::from_secs(30) {
             self.save_session();
         }
@@ -30662,6 +31387,70 @@ fn local_audio_quality_worker(
                 }
             }
             LocalAudioQualityWorkerRequest::Shutdown => break,
+        }
+    }
+}
+
+/// Retrieves bounded captions and summarizes only their transcript outside
+/// the UI and general provider workers.
+#[cfg(feature = "video-summary")]
+fn video_summary_worker(
+    requests: Receiver<VideoSummaryWorkerRequest>,
+    responses: Sender<VideoSummaryWorkerResponse>,
+    caption_extractor: YouTubeCaptionExtractor,
+    summarizer: CodexVideoSummarizer,
+) {
+    while let Ok(command) = requests.recv() {
+        let VideoSummaryWorkerRequest::Generate {
+            generation,
+            video_id,
+            cancellation,
+        } = command
+        else {
+            break;
+        };
+        let captions = match caption_extractor.extract(&video_id, &cancellation) {
+            Ok(captions) => captions,
+            Err(error) => {
+                if responses
+                    .send(VideoSummaryWorkerResponse::Finished {
+                        generation,
+                        result: Err(error.into()),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        let caption_source = if captions.sampled() {
+            format!("{}; sampled across the timeline", captions.source())
+        } else {
+            captions.source().to_string()
+        };
+        if responses
+            .send(VideoSummaryWorkerResponse::Generating {
+                generation,
+                caption_source,
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        // Deliberately exclude the video URL, title, local configuration, and
+        // every other UI field from the model request.
+        let request = VideoSummaryRequest::new(captions.transcript().to_owned());
+        let result = summarizer
+            .summarize(&request, &cancellation)
+            .map(|summary| summary.render_text())
+            .map_err(VideoSummaryWorkerError::from);
+        if responses
+            .send(VideoSummaryWorkerResponse::Finished { generation, result })
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -42772,6 +43561,532 @@ mod tests {
         ));
         controller.refresh_selected_playlist_state();
         media_id
+    }
+
+    /// Replaces the system summary worker with deterministic captured lanes.
+    #[cfg(feature = "video-summary")]
+    fn install_captured_video_summary_worker(
+        controller: &mut AppController,
+    ) -> (
+        Receiver<VideoSummaryWorkerRequest>,
+        Sender<VideoSummaryWorkerResponse>,
+    ) {
+        controller.shutdown_video_summary_worker();
+        let (request_sender, requests) = bounded(1);
+        let (responses, response_receiver) = bounded(2);
+        controller.video_summary_requests = Some(request_sender);
+        controller.video_summary_responses = response_receiver;
+        controller.video_summary_disconnect_reported = false;
+        (requests, responses)
+    }
+
+    #[test]
+    fn video_summary_availability_follows_consent_build_and_exact_details_identity() {
+        let temporary = crate::test_support::canonical_tempdir("temporary summary availability");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+
+        controller.refresh_video_summary_availability();
+        assert!(!controller.view.video_summary_available);
+
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        controller.refresh_video_summary_availability();
+        assert_eq!(
+            controller.view.video_summary_available,
+            cfg!(feature = "video-summary")
+        );
+
+        controller
+            .view
+            .details
+            .as_mut()
+            .expect("fixture Details")
+            .media_id = Some(MediaId::new(SourceKind::Local, "/music/fixture.flac"));
+        controller.refresh_video_summary_availability();
+        assert!(!controller.view.video_summary_available);
+    }
+
+    #[test]
+    fn preference_status_does_not_claim_codex_is_available_in_a_reduced_build() {
+        assert_eq!(
+            video_summary_preference_status(VideoSummaryBackend::Codex),
+            if cfg!(feature = "video-summary") {
+                "Codex CLI"
+            } else {
+                "unavailable in this build"
+            }
+        );
+    }
+
+    #[test]
+    fn completed_video_summary_uses_the_frontend_clipboard_seam() {
+        let temporary = crate::test_support::canonical_tempdir("temporary summary clipboard");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.video_summary_popup = Some(VideoSummaryPopupView {
+            state: VideoSummaryPopupState::Ready,
+            report: "A bounded summary".to_owned(),
+            ..VideoSummaryPopupView::default()
+        });
+
+        controller.dispatch(UiAction::CopyVideoSummary);
+        assert_eq!(
+            controller.take_clipboard_request(),
+            Some(ClipboardRequest {
+                text: "A bounded summary".to_owned(),
+                subject: ClipboardSubject::VideoSummary(17),
+            })
+        );
+        controller.report_clipboard_result(Ok("test clipboard".to_owned()));
+        assert_eq!(
+            controller
+                .view
+                .video_summary_popup
+                .as_ref()
+                .and_then(|popup| popup.action_status.as_deref()),
+            Some("Copied with test clipboard")
+        );
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_progress_and_completion_require_the_current_generation() {
+        let temporary = crate::test_support::canonical_tempdir("captured summary worker");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, responses) = install_captured_video_summary_worker(&mut controller);
+        let media_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert!(controller.view.video_summary_popup.is_none());
+
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        controller.dispatch(UiAction::GenerateVideoSummary);
+
+        let generation = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summary request")
+        {
+            VideoSummaryWorkerRequest::Generate {
+                generation,
+                video_id,
+                cancellation,
+            } => {
+                assert_eq!(video_id, media_id.external_id);
+                assert!(!cancellation.is_cancelled());
+                generation
+            }
+            VideoSummaryWorkerRequest::Shutdown => panic!("unexpected summary shutdown"),
+        };
+        assert_eq!(
+            controller
+                .view
+                .video_summary_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(&VideoSummaryPopupState::FetchingCaptions)
+        );
+        assert!(!controller.view.video_summary_available);
+
+        responses
+            .send(VideoSummaryWorkerResponse::Generating {
+                generation: generation.wrapping_add(1),
+                caption_source: "stale captions".to_owned(),
+            })
+            .expect("stale progress");
+        responses
+            .send(VideoSummaryWorkerResponse::Generating {
+                generation,
+                caption_source: "Human-provided captions (en)".to_owned(),
+            })
+            .expect("current progress");
+        controller.drain_video_summary_responses();
+        responses
+            .send(VideoSummaryWorkerResponse::Finished {
+                generation: generation.wrapping_add(1),
+                result: Ok("stale report".to_owned()),
+            })
+            .expect("stale completion");
+        controller.drain_video_summary_responses();
+
+        let popup = controller
+            .view
+            .video_summary_popup
+            .as_ref()
+            .expect("summary popup");
+        assert_eq!(popup.state, VideoSummaryPopupState::Generating);
+        assert_eq!(popup.caption_source, "Human-provided captions (en)");
+        assert!(popup.report.is_empty());
+
+        responses
+            .send(VideoSummaryWorkerResponse::Finished {
+                generation,
+                result: Ok("Fixture overview\n\n- First point".to_owned()),
+            })
+            .expect("current completion");
+        controller.drain_video_summary_responses();
+
+        let popup = controller
+            .view
+            .video_summary_popup
+            .as_ref()
+            .expect("completed summary popup");
+        assert_eq!(popup.state, VideoSummaryPopupState::Ready);
+        assert_eq!(popup.report, "Fixture overview\n\n- First point");
+        assert!(controller.pending_video_summary.is_none());
+        assert!(!controller.view.video_summary_available);
+        let popup = controller
+            .view
+            .video_summary_popup
+            .as_mut()
+            .expect("completed summary popup");
+        popup.scroll_offset = 7;
+        popup.action_status = Some("Copied with fixture".to_owned());
+
+        controller.dispatch(UiAction::DismissVideoSummary);
+        assert!(controller.view.video_summary_popup.is_none());
+        assert!(controller.view.video_summary_available);
+        let _retained_worker_sender = controller
+            .video_summary_requests
+            .take()
+            .expect("captured summary sender");
+        controller.refresh_video_summary_availability();
+        assert!(
+            controller.view.video_summary_available,
+            "a RAM-cached summary must remain available without a worker"
+        );
+
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        assert!(
+            matches!(requests.try_recv(), Err(TryRecvError::Empty)),
+            "a completed summary must reopen without another worker request"
+        );
+        let popup = controller
+            .view
+            .video_summary_popup
+            .as_ref()
+            .expect("RAM-cached summary popup");
+        assert_eq!(popup.state, VideoSummaryPopupState::Ready);
+        assert_eq!(popup.title, "Fixture video");
+        assert_eq!(popup.caption_source, "Human-provided captions (en)");
+        assert_eq!(popup.report, "Fixture overview\n\n- First point");
+        assert_eq!(popup.scroll_offset, 0);
+        assert_eq!(popup.action_status, None);
+        assert!(controller.pending_video_summary.is_none());
+        assert_eq!(
+            controller.view.status_line,
+            "Video summary loaded from memory"
+        );
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_cache_uses_the_requested_identity_after_details_change() {
+        let temporary = crate::test_support::canonical_tempdir("identity-owned summary cache");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, responses) = install_captured_video_summary_worker(&mut controller);
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        let first_id = select_fixture_youtube_video(&mut controller, Screen::Search);
+
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        let generation = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first summary request")
+        {
+            VideoSummaryWorkerRequest::Generate { generation, .. } => generation,
+            VideoSummaryWorkerRequest::Shutdown => panic!("unexpected summary shutdown"),
+        };
+        responses
+            .send(VideoSummaryWorkerResponse::Generating {
+                generation,
+                caption_source: "Automatic captions (ja)".to_owned(),
+            })
+            .expect("summary progress");
+        controller.drain_video_summary_responses();
+
+        let second_id = "9bZkp7q19f0";
+        let details = controller.view.details.as_mut().expect("fixture Details");
+        details.media_id = Some(MediaId::new(SourceKind::YouTube, second_id));
+        details.title = "Second fixture video".to_owned();
+        responses
+            .send(VideoSummaryWorkerResponse::Finished {
+                generation,
+                result: Ok("First identity summary".to_owned()),
+            })
+            .expect("first summary completion");
+        controller.drain_video_summary_responses();
+
+        assert!(
+            controller
+                .video_summary_cache
+                .contains_key(&first_id.external_id)
+        );
+        assert!(!controller.video_summary_cache.contains_key(second_id));
+        controller.dispatch(UiAction::DismissVideoSummary);
+        controller.dispatch(UiAction::GenerateVideoSummary);
+
+        match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second summary request")
+        {
+            VideoSummaryWorkerRequest::Generate { video_id, .. } => {
+                assert_eq!(video_id, second_id);
+            }
+            VideoSummaryWorkerRequest::Shutdown => panic!("unexpected summary shutdown"),
+        }
+        assert!(matches!(
+            controller
+                .view
+                .video_summary_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(VideoSummaryPopupState::FetchingCaptions)
+        ));
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_cache_is_lru_and_byte_bounded() {
+        let temporary = crate::test_support::canonical_tempdir("bounded summary cache");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let video_id = |index: usize| format!("{index:011}");
+
+        for index in 0..MAX_CACHED_VIDEO_SUMMARIES {
+            controller.cache_video_summary(
+                video_id(index),
+                CachedVideoSummary {
+                    caption_source: "Human-provided captions (en)".to_owned(),
+                    report: format!("Summary {index}"),
+                },
+            );
+        }
+        controller
+            .cached_video_summary(&video_id(0))
+            .expect("oldest cache entry");
+        controller.cache_video_summary(
+            video_id(MAX_CACHED_VIDEO_SUMMARIES),
+            CachedVideoSummary {
+                caption_source: "Automatic captions (ja)".to_owned(),
+                report: "Newest summary".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            controller.video_summary_cache.len(),
+            MAX_CACHED_VIDEO_SUMMARIES
+        );
+        assert!(controller.video_summary_cache.contains_key(&video_id(0)));
+        assert!(!controller.video_summary_cache.contains_key(&video_id(1)));
+        assert!(
+            controller
+                .video_summary_cache
+                .contains_key(&video_id(MAX_CACHED_VIDEO_SUMMARIES))
+        );
+        assert_eq!(
+            controller.video_summary_cache_order.len(),
+            MAX_CACHED_VIDEO_SUMMARIES
+        );
+
+        controller.cache_video_summary(
+            video_id(MAX_CACHED_VIDEO_SUMMARIES + 1),
+            CachedVideoSummary {
+                caption_source: String::new(),
+                report: "x".repeat(MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES + 1),
+            },
+        );
+        assert!(
+            controller.video_summary_cache_estimated_owned_bytes()
+                <= MAX_CACHED_VIDEO_SUMMARY_OWNED_BYTES
+        );
+        assert!(
+            !controller
+                .video_summary_cache
+                .contains_key(&video_id(MAX_CACHED_VIDEO_SUMMARIES + 1))
+        );
+        assert_eq!(
+            controller.video_summary_cache.len(),
+            MAX_CACHED_VIDEO_SUMMARIES
+        );
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_cancellation_wins_a_queued_success_race() {
+        let temporary = crate::test_support::canonical_tempdir("cancelled summary worker");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, responses) = install_captured_video_summary_worker(&mut controller);
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        let (generation, cancellation) = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summary request")
+        {
+            VideoSummaryWorkerRequest::Generate {
+                generation,
+                cancellation,
+                ..
+            } => (generation, cancellation),
+            VideoSummaryWorkerRequest::Shutdown => panic!("unexpected summary shutdown"),
+        };
+
+        controller.dispatch(UiAction::CancelVideoSummary);
+        assert!(cancellation.is_cancelled());
+        responses
+            .send(VideoSummaryWorkerResponse::Finished {
+                generation,
+                result: Ok("must not become visible".to_owned()),
+            })
+            .expect("racing completion");
+        controller.drain_video_summary_responses();
+
+        let popup = controller
+            .view
+            .video_summary_popup
+            .as_ref()
+            .expect("cancelled popup");
+        assert_eq!(popup.state, VideoSummaryPopupState::Cancelled);
+        assert!(popup.report.is_empty());
+        assert!(controller.pending_video_summary.is_none());
+        assert!(controller.video_summary_cache.is_empty());
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn dismissed_cancelled_video_summary_cannot_be_reopened_by_completion() {
+        let temporary = crate::test_support::canonical_tempdir("dismissed summary worker");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, responses) = install_captured_video_summary_worker(&mut controller);
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        let generation = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summary request")
+        {
+            VideoSummaryWorkerRequest::Generate { generation, .. } => generation,
+            VideoSummaryWorkerRequest::Shutdown => panic!("unexpected summary shutdown"),
+        };
+
+        controller.dispatch(UiAction::CancelVideoSummary);
+        controller.dispatch(UiAction::DismissVideoSummary);
+        assert!(controller.view.video_summary_popup.is_none());
+        responses
+            .send(VideoSummaryWorkerResponse::Finished {
+                generation,
+                result: Ok("must remain hidden".to_owned()),
+            })
+            .expect("late completion");
+        controller.drain_video_summary_responses();
+
+        assert!(controller.view.video_summary_popup.is_none());
+        assert!(controller.pending_video_summary.is_none());
+        assert!(controller.view.video_summary_available);
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_shutdown_does_not_wait_for_a_full_request_lane() {
+        let temporary = crate::test_support::canonical_tempdir("full summary request lane");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, _responses) = install_captured_video_summary_worker(&mut controller);
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::GenerateVideoSummary);
+
+        controller.shutdown_video_summary_worker();
+
+        let cancellation = match requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued request")
+        {
+            VideoSummaryWorkerRequest::Generate { cancellation, .. } => cancellation,
+            VideoSummaryWorkerRequest::Shutdown => panic!("full lane replaced the request"),
+        };
+        assert!(cancellation.is_cancelled());
+        assert!(controller.video_summary_requests.is_none());
+        assert!(controller.pending_video_summary.is_none());
+    }
+
+    #[cfg(feature = "video-summary")]
+    #[test]
+    fn video_summary_disconnect_fails_only_its_owned_popup() {
+        let temporary = crate::test_support::canonical_tempdir("disconnected summary worker");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (requests, responses) = install_captured_video_summary_worker(&mut controller);
+        controller.config.video_summary.backend = VideoSummaryBackend::Codex;
+        select_fixture_youtube_video(&mut controller, Screen::Search);
+        controller.dispatch(UiAction::GenerateVideoSummary);
+        let _accepted_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summary request");
+        drop(responses);
+
+        controller.drain_video_summary_responses();
+
+        assert!(controller.video_summary_requests.is_none());
+        assert!(controller.pending_video_summary.is_none());
+        assert!(matches!(
+            controller
+                .view
+                .video_summary_popup
+                .as_ref()
+                .map(|popup| &popup.state),
+            Some(VideoSummaryPopupState::Failed(message))
+                if message.contains("worker stopped")
+        ));
+        assert!(controller.view.error_popup.is_none());
+    }
+
+    #[test]
+    fn stale_video_summary_clipboard_result_cannot_mutate_a_new_popup() {
+        let temporary = crate::test_support::canonical_tempdir("stale summary clipboard");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.video_summary_popup = Some(VideoSummaryPopupView {
+            state: VideoSummaryPopupState::Ready,
+            report: "First summary".to_owned(),
+            ..VideoSummaryPopupView::default()
+        });
+        controller.dispatch(UiAction::CopyVideoSummary);
+        let _ = controller
+            .take_clipboard_request()
+            .expect("first summary copy");
+
+        controller.advance_video_summary_popup_revision();
+        controller.view.video_summary_popup = Some(VideoSummaryPopupView {
+            state: VideoSummaryPopupState::Ready,
+            report: "Second summary".to_owned(),
+            ..VideoSummaryPopupView::default()
+        });
+        controller.report_clipboard_result(Ok("late clipboard".to_owned()));
+
+        assert_eq!(
+            controller
+                .view
+                .video_summary_popup
+                .as_ref()
+                .and_then(|popup| popup.action_status.as_deref()),
+            None
+        );
     }
 
     fn assert_private_note_target(

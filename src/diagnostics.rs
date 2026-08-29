@@ -51,6 +51,9 @@ pub enum ExternalHelperKind {
     Ffmpeg,
     /// The `ffprobe` media inspector, queried with `-version`.
     Ffprobe,
+    /// The Codex CLI selected for explicit video summaries.
+    #[cfg(feature = "video-summary")]
+    Codex,
 }
 
 impl ExternalHelperKind {
@@ -62,6 +65,8 @@ impl ExternalHelperKind {
             Self::YtDlp => "yt-dlp",
             Self::Ffmpeg => "ffmpeg",
             Self::Ffprobe => "ffprobe",
+            #[cfg(feature = "video-summary")]
+            Self::Codex => "codex",
         }
     }
 
@@ -71,6 +76,8 @@ impl ExternalHelperKind {
             Self::Ffmpeg | Self::Ffprobe => &["-version"],
             #[cfg(feature = "acoustid")]
             Self::Fpcalc => &["-version"],
+            #[cfg(feature = "video-summary")]
+            Self::Codex => &["--version"],
         }
     }
 }
@@ -513,6 +520,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "torrent",
         "tracker-music",
         "tui",
+        "video-summary",
         "vimeo",
         "vk",
         "waveform",
@@ -1693,5 +1701,9 @@ VERSION="42 (Stable)"
         );
         assert_eq!(features.contains(&"gpm"), cfg!(feature = "gpm"));
         assert_eq!(features.contains(&"qr"), cfg!(feature = "qr"));
+        assert_eq!(
+            features.contains(&"video-summary"),
+            cfg!(feature = "video-summary")
+        );
     }
 }
