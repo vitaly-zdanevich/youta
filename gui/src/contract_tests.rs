@@ -743,6 +743,36 @@ fn the_window_help_documents_the_youtube_shorts_hotkey() {
 }
 
 #[test]
+fn the_window_help_names_each_chapter_hotkey_direction() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    assert!(
+        source.contains("[\"[ · ]\", \"previous · next chapter\"]"),
+        "window Help must name the direction owned by each chapter key"
+    );
+
+    let player_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("Player.tsx");
+    let player = std::fs::read_to_string(&player_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", player_path.display()));
+    for label in ["Previous chapter (hotkey: [)", "Next chapter (hotkey: ])"] {
+        assert!(
+            player.contains(label),
+            "the window player must expose the {label} tooltip"
+        );
+    }
+}
+
+#[test]
 fn the_window_exposes_local_audio_quality_analysis_and_its_result_section() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ui")

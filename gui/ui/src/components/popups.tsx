@@ -91,7 +91,7 @@ export function HelpPopup({
         ["0–9", "seek by ten percent"],
         ["↑ · ↓", "volume"],
         ["< · >", "speed"],
-        ["[ · ]", "chapter"],
+        ["[ · ]", "previous · next chapter"],
         ["{ · }", "previous · next item in the queue"],
         ["T", "chapter timestamps"],
         ["r · A", "repeat · autoplay"],

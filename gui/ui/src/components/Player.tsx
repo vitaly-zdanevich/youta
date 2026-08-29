@@ -224,10 +224,10 @@ export function Player({
 
         {chapters.length > 0 ? (
           <div className="flex items-center gap-[6px]">
-            <Control label="Previous chapter" onClick={() => void dispatch({ ChangeChapter: -1 })}>
+            <Control label="Previous chapter (hotkey: [)" onClick={() => void dispatch({ ChangeChapter: -1 })}>
               |◀
             </Control>
-            <Control label="Next chapter" onClick={() => void dispatch({ ChangeChapter: 1 })}>
+            <Control label="Next chapter (hotkey: ])" onClick={() => void dispatch({ ChangeChapter: 1 })}>
               ▶|
             </Control>
           </div>

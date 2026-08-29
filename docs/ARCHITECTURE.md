@@ -506,9 +506,11 @@ navigation reserves at most one row: it centers the current chapter and adds
 compact previous and next controls only when they fit. Proportional chapter
 splits remain on the track, with coincident terminal columns represented by one
 composite marker, and every rendered label seeks to its exact timestamp. The
-current timestamp prefix can be hidden without moving either layer. The inverse
-visibility bit is stored in the restart-safe session so older session documents
-keep timestamps visible by default.
+shared key map binds bare `[` to the previous navigable chapter and bare `]` to
+the next; from before the first marker, forward movement begins at that marker.
+The current timestamp prefix can be hidden without moving either layer. The
+inverse visibility bit is stored in the restart-safe session so older session
+documents keep timestamps visible by default.
 
 Video orientation is provider metadata, never a thumbnail-ratio heuristic.
 Official YouTube results use `player` embed dimensions returned by the existing

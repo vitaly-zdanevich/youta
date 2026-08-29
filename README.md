@@ -173,6 +173,9 @@ Description timecodes become chapter splits and exact mouse-seek actions. Chapte
 navigation stays on one row: the current name is centered, with `◀ Prev` and
 `Next ▶` controls when the terminal width leaves room. Proportional splits stay
 on the track; splits that round to one terminal cell share a composite marker.
+`[` selects the previous chapter and `]` selects the next chapter in both the
+terminal and desktop interfaces. Before the first marker, `]` selects that first
+chapter instead of skipping it.
 `T` toggles the current chapter's timestamp without moving the controls or track
 markers. This label preference is restored with the previous session. By
 default, Youta hides and skips only chapters whose normalized title is exactly

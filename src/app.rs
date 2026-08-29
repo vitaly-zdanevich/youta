@@ -20986,18 +20986,23 @@ impl AppController {
         if navigable.is_empty() {
             return;
         }
-        let current = navigable
-            .partition_point(|index| {
-                self.view.playback_chapters[*index].start_seconds
-                    <= self.view.playback.position.as_secs()
-            })
-            .saturating_sub(1);
-        let destination_position = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs() as usize)
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(navigable.len().saturating_sub(1))
+        let started_chapter_count = navigable.partition_point(|index| {
+            self.view.playback_chapters[*index].start_seconds
+                <= self.view.playback.position.as_secs()
+        });
+        // The interval before the first marker is virtual chapter -1, so one
+        // forward step reaches chapter 0. Checked bounds make absent previous
+        // and next controls no-ops at both ends of the visible chapter list.
+        let Ok(current_position) = i64::try_from(started_chapter_count) else {
+            return;
+        };
+        let Some(destination_position) = current_position
+            .checked_sub(1)
+            .and_then(|current| current.checked_add(i64::from(delta)))
+            .and_then(|destination| usize::try_from(destination).ok())
+            .filter(|destination| *destination < navigable.len())
+        else {
+            return;
         };
         let Some(chapter) = navigable
             .get(destination_position)
@@ -62179,6 +62184,60 @@ mod tests {
             ]
         );
         assert!(controller.seek_back.is_empty());
+    }
+
+    #[test]
+    fn parsed_chapter_navigation_agrees_with_visible_boundaries() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        let mut video = subscription_video_summary();
+        video.duration_seconds = Some(60);
+        video.description =
+            "00:05 Delayed introduction\n00:10 Реклама\n00:20 Main section".to_owned();
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ActivateSelection);
+        controller.view.playback.position = Duration::ZERO;
+        state.lock().expect("mock state").commands.clear();
+
+        controller.dispatch(UiAction::ChangeChapter(-1));
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "there is no previous chapter before the first marker"
+        );
+
+        controller.dispatch(UiAction::ChangeChapter(1));
+        assert_eq!(
+            state.lock().expect("mock state").commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(5))],
+            "next chapter must agree with the seek-bar control before any chapter has started"
+        );
+
+        controller.view.playback.position = Duration::from_secs(6);
+        state.lock().expect("mock state").commands.clear();
+        controller.dispatch(UiAction::ChangeChapter(-1));
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "the first visible chapter has no previous control"
+        );
+
+        controller.dispatch(UiAction::ChangeChapter(1));
+        assert_eq!(
+            state.lock().expect("mock state").commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_secs(20))],
+            "next chapter must advance past a hidden advertisement chapter"
+        );
+
+        controller.view.playback.position = Duration::from_secs(21);
+        state.lock().expect("mock state").commands.clear();
+        controller.dispatch(UiAction::ChangeChapter(1));
+        assert!(
+            state.lock().expect("mock state").commands.is_empty(),
+            "the last visible chapter has no next control"
+        );
     }
 
     #[test]

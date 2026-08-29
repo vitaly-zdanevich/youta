@@ -6168,7 +6168,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "",
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
-        "  ↑/↓ volume     </> speed 10%     [/] chapter     T chapter times",
+        "  ↑/↓ volume </> speed 10% [ prev chapter ] next chapter T chapter times",
         "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
@@ -12776,6 +12776,10 @@ mod tests {
         assert!(rendered.contains("Details: Alt+←/→ history"));
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
+        assert!(rendered.contains("speed 10%"));
+        assert!(rendered.contains("[ prev chapter"));
+        assert!(rendered.contains("] next chapter"));
+        assert!(rendered.contains("T chapter times"));
         if cfg!(feature = "local-browser") {
             assert!(rendered.contains("Local: Esc parent     PageUp/Down page"));
             if cfg!(feature = "audio-quality") {
@@ -12847,6 +12851,14 @@ mod tests {
         );
         let five = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE);
         assert_eq!(key_action(five, &view), Some(UiAction::SeekPercent(50.0)));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), &view),
+            Some(UiAction::ChangeChapter(-1))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), &view),
+            Some(UiAction::ChangeChapter(1))
+        );
         let mut live = ViewModel {
             playback: PlaybackStatus {
                 idle: false,

@@ -135,7 +135,9 @@ pub struct PopupGeometry {
 
 #[cfg(test)]
 mod wire_tests {
-    use super::{Key, KeyPress, PopupGeometry};
+    use super::{Key, KeyPress, PopupGeometry, key_action};
+    use crate::playback::PlaybackStatus;
+    use crate::view::{UiAction, ViewModel};
 
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
     /// part of the contract rather than an implementation detail of Serde.
@@ -210,6 +212,72 @@ mod wire_tests {
             }
             .chorded()
         );
+    }
+
+    #[test]
+    fn bracket_keys_navigate_chapters_without_replacing_queue_navigation() {
+        let finite = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('[')), &finite, None, None),
+            Some(UiAction::ChangeChapter(-1))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char(']')), &finite, None, None),
+            Some(UiAction::ChangeChapter(1))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('{')), &finite, None, None),
+            Some(UiAction::PlayQueueNeighbour(-1))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('}')), &finite, None, None),
+            Some(UiAction::PlayQueueNeighbour(1))
+        );
+
+        let live = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                live: true,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('[')), &live, None, None),
+            None
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char(']')), &live, None, None),
+            None
+        );
+
+        for modified in [
+            KeyPress {
+                ctrl: true,
+                ..KeyPress::new(Key::Char('['))
+            },
+            KeyPress {
+                alt: true,
+                ..KeyPress::new(Key::Char(']'))
+            },
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::Char('['))
+            },
+        ] {
+            assert_eq!(
+                key_action(modified, &finite, None, None),
+                None,
+                "chapter navigation is reserved for bare bracket keys"
+            );
+        }
     }
 }
 
@@ -1040,10 +1108,14 @@ fn unfiltered_key_action(
         Key::Down => Some(UiAction::ChangeVolume(-5)),
         Key::Char('<') | Key::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
         Key::Char('>') | Key::Char('.') => Some(UiAction::ChangeSpeed(0.1)),
-        Key::Char('[') if view.playback.seeking_available() && !view.playback.live => {
+        Key::Char('[')
+            if !key.modified() && view.playback.seeking_available() && !view.playback.live =>
+        {
             Some(UiAction::ChangeChapter(-1))
         }
-        Key::Char(']') if view.playback.seeking_available() && !view.playback.live => {
+        Key::Char(']')
+            if !key.modified() && view.playback.seeking_available() && !view.playback.live =>
+        {
             Some(UiAction::ChangeChapter(1))
         }
         // Shifted neighbours of the chapter keys, for the next size up: `[`/`]`
