@@ -53,7 +53,11 @@ pub mod waveform;
 #[cfg(feature = "audio-quality")]
 pub mod audio_quality;
 
-#[cfg(any(feature = "summary", feature = "evernote"))]
+#[cfg(any(
+    feature = "summary",
+    feature = "evernote",
+    feature = "youtube-captions"
+))]
 pub mod video_summary;
 
 #[cfg(feature = "waveform")]

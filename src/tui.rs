@@ -1653,6 +1653,9 @@ struct HitMap {
     video_comments_scroll_maximum: usize,
     /// Number of wrapped comment lines visible on one page.
     video_comments_page_lines: usize,
+    /// Visible caption rows mapped directly to their seek timestamp.
+    #[cfg(feature = "youtube-captions")]
+    youtube_caption_rows: Vec<(u64, Rect)>,
     /// Close control rendered inside the recent-project-history popup.
     project_history_buttons: Vec<(UiAction, Rect)>,
     /// Wrapped commit/provenance viewport inside the project-history popup.
@@ -1992,11 +1995,20 @@ fn render_frame(
             view.download.is_some(),
         )
     };
+    #[cfg(feature = "youtube-captions")]
+    let caption_rows = u16::from(
+        view.youtube_caption_line
+            .as_deref()
+            .is_some_and(|caption| !caption.is_empty()),
+    );
+    #[cfg(not(feature = "youtube-captions"))]
+    let caption_rows = 0;
     let player_rows = if view.waveform_visible {
         WAVEFORM_PLAYER_ROWS
     } else {
         2_u16.saturating_add(chapter_label_rows)
-    };
+    }
+    .saturating_add(caption_rows);
     let footer_notice = view
         .transient_footer_notice
         .as_deref()
@@ -2030,6 +2042,8 @@ fn render_frame(
         || view.local_file_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    #[cfg(feature = "youtube-captions")]
+    let thumbnail_is_obscured = thumbnail_is_obscured || view.youtube_captions_popup.is_some();
     #[cfg(feature = "commons-upload")]
     let thumbnail_is_obscured = thumbnail_is_obscured
         || view.commons_upload_popup.is_some()
@@ -2223,6 +2237,13 @@ fn render_frame(
     hit_map.video_comments_page_lines = 0;
     if let Some(popup) = view.video_comments_popup.as_ref() {
         render_video_comments_popup(frame, popup, &theme, hit_map);
+    }
+    #[cfg(feature = "youtube-captions")]
+    {
+        hit_map.youtube_caption_rows.clear();
+        if let Some(popup) = view.youtube_captions_popup.as_ref() {
+            render_youtube_captions_popup(frame, popup, &theme, hit_map);
+        }
     }
     #[cfg(feature = "qr")]
     {
@@ -5604,6 +5625,27 @@ fn render_seek_bar(
     hit_map.seek_markers.clear();
     hit_map.waveform_seek = None;
     hit_map.now_playing = None;
+    #[cfg(feature = "youtube-captions")]
+    let area = if let Some(caption) = view
+        .youtube_caption_line
+        .as_deref()
+        .filter(|caption| !caption.is_empty())
+        && area.height > 1
+    {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(format!("CC  {caption}"))
+                .style(theme.heading)
+                .alignment(Alignment::Center),
+            rows[0],
+        );
+        rows[1]
+    } else {
+        area
+    };
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
     let ratio = if duration.is_zero() {
         0.0
@@ -6273,11 +6315,14 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         "  F2 offline     Backspace back"
     };
-    let video_actions_help = if view.video_summary_supported {
-        "  o video page     G summarize selected YouTube video with Codex"
-    } else {
-        "  o video page"
-    };
+    let mut video_actions_help = "  o video page".to_owned();
+    #[cfg(feature = "youtube-captions")]
+    if view.youtube_captions_supported {
+        video_actions_help.push_str("     Y captions/search/seek");
+    }
+    if view.video_summary_supported {
+        video_actions_help.push_str("     G summarize with Codex");
+    }
     let mut playlist_actions_help = String::new();
     #[cfg(feature = "commons-upload")]
     playlist_actions_help.push_str("  U Commons audio  ");
@@ -6315,7 +6360,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "",
         "Actions",
         "  Ctrl+n play next     a add to queue     u show queue     d download",
-        video_actions_help,
+        video_actions_help.as_str(),
         playlist_actions_help.as_str(),
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
@@ -7261,6 +7306,115 @@ fn render_error_popup(
         theme,
         hit_map,
         buttons_area,
+    );
+}
+
+/// Renders searchable captions and direct seek targets for one YouTube video.
+#[cfg(feature = "youtube-captions")]
+fn render_youtube_captions_popup(
+    frame: &mut Frame<'_>,
+    popup: &YouTubeCaptionsPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(88, 86, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" YouTube captions ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(popup.video_title.as_str()).style(theme.heading),
+        sections[0],
+    );
+    let source = if popup.caption_source.is_empty() {
+        "Selecting a caption track…"
+    } else {
+        popup.caption_source.as_str()
+    };
+    frame.render_widget(Paragraph::new(source).style(theme.muted), sections[1]);
+    frame.render_widget(
+        Paragraph::new(format!("Search: {}▏", popup.query)).style(theme.base),
+        sections[2],
+    );
+
+    match &popup.state {
+        YouTubeCaptionsPopupState::Loading => frame.render_widget(
+            Paragraph::new("Loading and normalizing captions…")
+                .style(theme.muted)
+                .alignment(Alignment::Center),
+            sections[3],
+        ),
+        YouTubeCaptionsPopupState::Failed(error) => frame.render_widget(
+            Paragraph::new(format!("Could not load captions: {error}"))
+                .style(theme.accent)
+                .wrap(Wrap { trim: true }),
+            sections[3],
+        ),
+        YouTubeCaptionsPopupState::Ready if popup.cues.is_empty() => frame.render_widget(
+            Paragraph::new("No captions match this search.")
+                .style(theme.muted)
+                .alignment(Alignment::Center),
+            sections[3],
+        ),
+        YouTubeCaptionsPopupState::Ready => {
+            let visible_rows = usize::from(sections[3].height).max(1);
+            let selected = popup.selected.min(popup.cues.len().saturating_sub(1));
+            let first = selected
+                .saturating_sub(visible_rows / 2)
+                .min(popup.cues.len().saturating_sub(visible_rows));
+            for (visible_index, cue) in popup.cues.iter().enumerate().skip(first).take(visible_rows)
+            {
+                let row = Rect::new(
+                    sections[3].x,
+                    sections[3]
+                        .y
+                        .saturating_add(u16::try_from(visible_index - first).unwrap_or(u16::MAX)),
+                    sections[3].width,
+                    1,
+                );
+                let prefix = if visible_index == selected {
+                    "▶ "
+                } else {
+                    "  "
+                };
+                let line = format!("{prefix}{}  {}", cue.timestamp, cue.text);
+                frame.render_widget(
+                    Paragraph::new(truncate_terminal_text(&line, usize::from(row.width))).style(
+                        if visible_index == selected {
+                            theme.selected
+                        } else {
+                            theme.base
+                        },
+                    ),
+                    row,
+                );
+                hit_map
+                    .youtube_caption_rows
+                    .push((cue.start_milliseconds, row));
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new("[↑/↓] Select   [Enter/click] Seek   [Esc] Close")
+            .style(theme.accent)
+            .alignment(Alignment::Center),
+        sections[4],
     );
 }
 
@@ -10812,6 +10966,21 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+    #[cfg(feature = "youtube-captions")]
+    if view.youtube_captions_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .youtube_caption_rows
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(start_milliseconds, _)| {
+                    UiAction::ActivateYouTubeCaption(*start_milliseconds)
+                }),
+            MouseEventKind::ScrollDown => Some(UiAction::MoveYouTubeCaptionSelection(3)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveYouTubeCaptionSelection(-3)),
+            _ => None,
+        };
+    }
     if view.audio_quality_popup.is_some() {
         return match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => hit_map
@@ -12162,6 +12331,68 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn captions_render_near_the_seekbar_and_popup_rows_seek_on_click() {
+        let mut terminal = Terminal::new(TestBackend::new(110, 28)).expect("caption terminal");
+        let cue = YouTubeCaptionCueView {
+            start_milliseconds: 12_500,
+            end_milliseconds: 14_000,
+            timestamp: "0:12".to_owned(),
+            text: "Preserve this spoken history".to_owned(),
+        };
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                duration: Some(Duration::from_secs(60)),
+                position: Duration::from_secs(13),
+                ..PlaybackStatus::default()
+            },
+            youtube_caption_line: Some(cue.text.clone()),
+            youtube_captions_popup: Some(YouTubeCaptionsPopupView {
+                video_id: "dQw4w9WgXcQ".to_owned(),
+                video_title: "Fixture video".to_owned(),
+                caption_source: "Human-provided captions (en)".to_owned(),
+                state: YouTubeCaptionsPopupState::Ready,
+                cues: vec![cue],
+                ..YouTubeCaptionsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw captions");
+
+        let text = rendered_text(&terminal);
+        assert!(text.contains("YouTube captions"));
+        assert!(text.contains("Preserve this spoken history"));
+        let (_, target) = hit_map
+            .youtube_caption_rows
+            .first()
+            .expect("visible caption target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ActivateYouTubeCaption(12_500))
+        );
+
+        let mut seek_only = view;
+        seek_only.youtube_captions_popup = None;
+        terminal
+            .draw(|frame| render(frame, &seek_only, &UiSettings::default(), &mut hit_map))
+            .expect("draw active caption line");
+        assert!(rendered_text(&terminal).contains("CC  Preserve this spoken history"));
     }
 
     /// Builds the structured yt-dlp failure used by keyboard and renderer tests.
@@ -14002,9 +14233,11 @@ mod tests {
         #[cfg(not(feature = "qr"))]
         assert!(!rendered.contains("Q selected YouTube video QR code"));
         assert_eq!(
-            rendered.contains("G summarize selected YouTube video with Codex"),
+            rendered.contains("G summarize with Codex"),
             ViewModel::default().video_summary_supported
         );
+        #[cfg(feature = "youtube-captions")]
+        assert!(rendered.contains("Y captions/search/seek"));
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         let unsupported = ViewModel {
             audio_quality_supported: false,

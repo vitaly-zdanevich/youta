@@ -317,6 +317,28 @@ export interface VideoSummaryPopupView {
   scroll_offset: number;
 }
 
+/** Retrieval state of one searchable caption transcript. */
+export type YouTubeCaptionsPopupState = 'Loading' | 'Ready' | { Failed: string };
+
+/** One normalized caption cue and its exact seek interval. */
+export interface YouTubeCaptionCueView {
+	start_milliseconds: number;
+	end_milliseconds: number;
+	timestamp: string;
+	text: string;
+}
+
+/** Searchable captions for one exact selected YouTube video. */
+export interface YouTubeCaptionsPopupView {
+	video_id: string;
+	video_title: string;
+	caption_source: string;
+	state: YouTubeCaptionsPopupState;
+	query: string;
+	cues: YouTubeCaptionCueView[];
+	selected: number;
+}
+
 /** An offline QR matrix, without its mandatory quiet zone. */
 export interface QrMatrix {
   width: number;
@@ -689,6 +711,10 @@ export interface ViewModel {
   video_summary_supported: boolean;
   video_summary_available: boolean;
   video_summary_popup: VideoSummaryPopupView | null;
+  youtube_captions_supported: boolean;
+  youtube_captions_available: boolean;
+  youtube_caption_line: string | null;
+  youtube_captions_popup: YouTubeCaptionsPopupView | null;
   video_comments_popup: VideoCommentsPopupView | null;
   video_qr_popup: VideoQrPopupView | null;
   preferences_popup: PreferencesPopupView | null;
@@ -723,6 +749,7 @@ export interface PlaybackTick {
   playback_start_animation_frame: number;
   search_animation_frame: number;
   local_fingerprint_animation_frame: number;
+  youtube_caption_line: string | null;
 }
 
 /**

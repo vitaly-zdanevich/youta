@@ -66,6 +66,8 @@ struct PlaybackTick {
     playback_start_animation_frame: usize,
     search_animation_frame: usize,
     local_fingerprint_animation_frame: usize,
+    #[cfg(feature = "youtube-captions")]
+    youtube_caption_line: Option<String>,
 }
 
 impl PlaybackTick {
@@ -78,6 +80,8 @@ impl PlaybackTick {
             playback_start_animation_frame: view.playback_start_animation_frame,
             search_animation_frame: view.search_animation_frame,
             local_fingerprint_animation_frame: view.local_fingerprint_animation_frame,
+            #[cfg(feature = "youtube-captions")]
+            youtube_caption_line: view.youtube_caption_line.clone(),
         }
     }
 
@@ -89,6 +93,11 @@ impl PlaybackTick {
         view.playback_start_animation_frame = self.playback_start_animation_frame;
         view.search_animation_frame = self.search_animation_frame;
         view.local_fingerprint_animation_frame = self.local_fingerprint_animation_frame;
+        #[cfg(feature = "youtube-captions")]
+        {
+            view.youtube_caption_line
+                .clone_from(&self.youtube_caption_line);
+        }
     }
 }
 

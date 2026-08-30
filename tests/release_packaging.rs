@@ -361,6 +361,48 @@ fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
 }
 
 #[test]
+fn youtube_captions_are_default_but_remain_a_removable_renderer_free_capability() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let captions = feature_closure(&manifest, "youtube-captions");
+
+    assert!(default.contains("youtube-captions"));
+    assert!(captions.contains("yt-dlp"));
+    assert!(captions.contains("dep:rustix"));
+    assert!(
+        !application.contains("youtube-captions"),
+        "`app` must not make YouTube captions impossible to compile out"
+    );
+    for renderer in ["controller", "tui", "dep:crossterm", "dep:ratatui"] {
+        assert!(
+            !captions.contains(renderer),
+            "`youtube-captions` must not require `{renderer}`"
+        );
+    }
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("youtube-captions"))
+    );
+    assert_eq!(
+        gui["features"]["youtube-captions"][0].as_str(),
+        Some("youta/youtube-captions")
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("`youtube-captions` is the independently removable caption browser"));
+    assert!(
+        readme.contains("`USE=\"-youtube-captions\"` removes caption loading, search, and seeking")
+    );
+}
+
+#[test]
 fn evernote_is_default_but_remains_a_removable_export_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -514,14 +556,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
     ] {
         assert!(
             script

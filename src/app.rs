@@ -222,7 +222,11 @@ use crate::video_summary::{
     CodexVideoSummarizer, VideoSummarizer, VideoSummaryError, VideoSummaryRequest,
     YouTubeCaptionError,
 };
-#[cfg(any(feature = "summary", feature = "evernote"))]
+#[cfg(any(
+    feature = "summary",
+    feature = "evernote",
+    feature = "youtube-captions"
+))]
 use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
@@ -278,6 +282,8 @@ use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
     YandexMusicSetupPopupView,
 };
+#[cfg(feature = "youtube-captions")]
+use crate::view::{YouTubeCaptionCueView, YouTubeCaptionsPopupState, YouTubeCaptionsPopupView};
 
 /// Truncates a clipboard payload without splitting a UTF-8 character.
 fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
@@ -1598,6 +1604,31 @@ enum VideoSummaryWorkerResponse {
         generation: u64,
         result: Result<String, VideoSummaryWorkerError>,
     },
+}
+
+/// One complete normalized transcript retained only for the current process.
+#[cfg(feature = "youtube-captions")]
+#[derive(Clone)]
+struct LoadedYouTubeCaptions {
+    video_id: String,
+    caption_source: String,
+    cues: Vec<YouTubeCaptionCueView>,
+}
+
+/// Ownership and cooperative cancellation for one caption retrieval.
+#[cfg(feature = "youtube-captions")]
+struct PendingYouTubeCaptions {
+    generation: u64,
+    video_id: String,
+    cancellation: VideoSummaryCancellation,
+}
+
+/// Terminal response from the short-lived caption extractor thread.
+#[cfg(feature = "youtube-captions")]
+struct YouTubeCaptionsWorkerResponse {
+    generation: u64,
+    video_id: String,
+    result: Result<LoadedYouTubeCaptions, String>,
 }
 
 /// Collection, progress, and terminal events from one sequential batch.
@@ -4552,6 +4583,24 @@ pub struct AppController {
     /// Whether an unexpected worker disconnect was already handled.
     #[cfg(feature = "summary")]
     video_summary_disconnect_reported: bool,
+    /// Completed caption retrievals drained by the UI event loop.
+    #[cfg(feature = "youtube-captions")]
+    youtube_captions_responses: Receiver<YouTubeCaptionsWorkerResponse>,
+    /// Sender cloned into the one short-lived caption thread.
+    #[cfg(feature = "youtube-captions")]
+    youtube_captions_response_sender: Sender<YouTubeCaptionsWorkerResponse>,
+    /// Join handle for the active caption retrieval.
+    #[cfg(feature = "youtube-captions")]
+    youtube_captions_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner rejecting stale caption completions.
+    #[cfg(feature = "youtube-captions")]
+    youtube_captions_generation: u64,
+    /// Explicit caption request currently running.
+    #[cfg(feature = "youtube-captions")]
+    pending_youtube_captions: Option<PendingYouTubeCaptions>,
+    /// Last successfully loaded transcript, also driving the seek-bar line.
+    #[cfg(feature = "youtube-captions")]
+    loaded_youtube_captions: Option<LoadedYouTubeCaptions>,
     /// Watched row states hydrated once for the current Local listing.
     local_progress_cache: HashMap<MediaId, PlaybackRowState>,
     /// Complete selected-file metadata retained for fast in-process revisits.
@@ -5168,6 +5217,8 @@ impl AppController {
         let (video_summary_request_sender, video_summary_request_receiver) = bounded(1);
         #[cfg(feature = "summary")]
         let (video_summary_response_sender, video_summary_responses) = bounded(2);
+        #[cfg(feature = "youtube-captions")]
+        let (youtube_captions_response_sender, youtube_captions_responses) = unbounded();
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
         #[cfg(feature = "acoustid")]
@@ -5903,6 +5954,18 @@ impl AppController {
             video_summary_popup_revision: 0,
             #[cfg(feature = "summary")]
             video_summary_disconnect_reported: false,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_responses,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_response_sender,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_thread: None,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_generation: 0,
+            #[cfg(feature = "youtube-captions")]
+            pending_youtube_captions: None,
+            #[cfg(feature = "youtube-captions")]
+            loaded_youtube_captions: None,
             local_progress_cache: HashMap::new(),
             local_media_cache: HashMap::new(),
             local_media_cache_order: VecDeque::new(),
@@ -30615,12 +30678,327 @@ impl AppController {
             .fold(entries, usize::saturating_add)
     }
 
+    /// Recomputes whether the selected Details item can open captions.
+    #[cfg(feature = "youtube-captions")]
+    fn refresh_youtube_captions_availability(&mut self) {
+        self.view.youtube_captions_supported = true;
+        self.view.youtube_captions_available = self.pending_youtube_captions.is_none()
+            && self.view.youtube_captions_popup.is_none()
+            && self
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .is_some_and(|media_id| {
+                    media_id.source == SourceKind::YouTube
+                        && validate_youtube_video_id(&media_id.external_id).is_ok()
+                });
+    }
+
+    /// Opens cached cues or starts one bounded caption retrieval.
+    #[cfg(feature = "youtube-captions")]
+    fn open_youtube_captions(&mut self) {
+        if self.view.youtube_captions_popup.is_some() {
+            return;
+        }
+        let Some((video_id, video_title)) = self.view.details.as_ref().and_then(|details| {
+            let media_id = details.media_id.as_ref()?;
+            (media_id.source == SourceKind::YouTube
+                && validate_youtube_video_id(&media_id.external_id).is_ok())
+            .then(|| (media_id.external_id.clone(), details.title.clone()))
+        }) else {
+            self.view.status_line = "Select an exact YouTube video to load captions".to_owned();
+            return;
+        };
+        if let Some(loaded) = self
+            .loaded_youtube_captions
+            .as_ref()
+            .filter(|loaded| loaded.video_id == video_id)
+        {
+            self.view.youtube_captions_popup = Some(YouTubeCaptionsPopupView {
+                video_id,
+                video_title,
+                caption_source: loaded.caption_source.clone(),
+                state: YouTubeCaptionsPopupState::Ready,
+                query: String::new(),
+                cues: loaded.cues.clone(),
+                selected: 0,
+            });
+            self.view.status_line = "YouTube captions loaded from memory".to_owned();
+            return;
+        }
+        if self.pending_youtube_captions.is_some() || self.youtube_captions_thread.is_some() {
+            self.view.status_line = "Wait for the current caption retrieval to finish".to_owned();
+            return;
+        }
+
+        self.youtube_captions_generation = self.youtube_captions_generation.wrapping_add(1);
+        let generation = self.youtube_captions_generation;
+        let cancellation = VideoSummaryCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let executable = self.config.providers.yt_dlp_executable.clone();
+        let sender = self.youtube_captions_response_sender.clone();
+        let worker_video_id = video_id.clone();
+        let thread = thread::Builder::new()
+            .name("youta-youtube-captions".to_owned())
+            .spawn(move || {
+                let result = YouTubeCaptionExtractor::new(executable)
+                    .extract(&worker_video_id, &worker_cancellation)
+                    .map(|captions| LoadedYouTubeCaptions {
+                        video_id: worker_video_id.clone(),
+                        caption_source: captions.source().to_string(),
+                        cues: captions
+                            .cues()
+                            .iter()
+                            .map(|cue| YouTubeCaptionCueView {
+                                start_milliseconds: cue.start_milliseconds(),
+                                end_milliseconds: cue.end_milliseconds(),
+                                timestamp: format_caption_popup_timestamp(cue.start_milliseconds()),
+                                text: cue.text().to_owned(),
+                            })
+                            .collect(),
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(YouTubeCaptionsWorkerResponse {
+                    generation,
+                    video_id: worker_video_id,
+                    result,
+                });
+            });
+        match thread {
+            Ok(thread) => {
+                self.youtube_captions_thread = Some(thread);
+                self.pending_youtube_captions = Some(PendingYouTubeCaptions {
+                    generation,
+                    video_id: video_id.clone(),
+                    cancellation,
+                });
+                self.view.youtube_captions_popup = Some(YouTubeCaptionsPopupView {
+                    video_id,
+                    video_title,
+                    state: YouTubeCaptionsPopupState::Loading,
+                    ..YouTubeCaptionsPopupView::default()
+                });
+                self.view.status_line = "Loading bounded YouTube captions…".to_owned();
+            }
+            Err(error) => self.show_error("Could not start the YouTube caption worker", &error),
+        }
+    }
+
+    /// Applies every completed short-lived caption request.
+    #[cfg(feature = "youtube-captions")]
+    fn drain_youtube_captions_responses(&mut self) {
+        while let Ok(response) = self.youtube_captions_responses.try_recv() {
+            if let Some(thread) = self.youtube_captions_thread.take() {
+                let _ = thread.join();
+            }
+            let Some(pending) = self.pending_youtube_captions.take() else {
+                continue;
+            };
+            if pending.generation != response.generation
+                || pending.video_id != response.video_id
+                || pending.cancellation.is_cancelled()
+            {
+                continue;
+            }
+            let popup_matches = self
+                .view
+                .youtube_captions_popup
+                .as_ref()
+                .is_some_and(|popup| popup.video_id == response.video_id);
+            match response.result {
+                Ok(loaded) => {
+                    if popup_matches && let Some(popup) = self.view.youtube_captions_popup.as_mut()
+                    {
+                        popup.caption_source.clone_from(&loaded.caption_source);
+                        popup.state = YouTubeCaptionsPopupState::Ready;
+                        popup.cues.clone_from(&loaded.cues);
+                        popup.selected = 0;
+                    }
+                    self.loaded_youtube_captions = Some(loaded);
+                    self.view.status_line =
+                        "YouTube captions ready; Enter seeks to a cue".to_owned();
+                }
+                Err(error) => {
+                    if popup_matches && let Some(popup) = self.view.youtube_captions_popup.as_mut()
+                    {
+                        popup.state = YouTubeCaptionsPopupState::Failed(error);
+                        popup.cues.clear();
+                        popup.selected = 0;
+                    }
+                    self.view.status_line = "Could not load YouTube captions".to_owned();
+                }
+            }
+        }
+        if self
+            .youtube_captions_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(thread) = self.youtube_captions_thread.take() {
+                let _ = thread.join();
+            }
+            let pending = self.pending_youtube_captions.take();
+            if let Some(pending) = pending
+                && !pending.cancellation.is_cancelled()
+                && let Some(popup) = self
+                    .view
+                    .youtube_captions_popup
+                    .as_mut()
+                    .filter(|popup| popup.video_id == pending.video_id)
+            {
+                popup.state = YouTubeCaptionsPopupState::Failed(
+                    "The caption worker stopped; restart Youta and retry".to_owned(),
+                );
+                popup.cues.clear();
+                popup.selected = 0;
+                self.view.status_line = "YouTube caption worker stopped".to_owned();
+            }
+        }
+    }
+
+    /// Rebuilds filtered popup cues while preserving the nearest timestamp.
+    #[cfg(feature = "youtube-captions")]
+    fn filter_youtube_captions_popup(&mut self) {
+        let Some((video_id, query, selected_start)) =
+            self.view.youtube_captions_popup.as_ref().map(|popup| {
+                (
+                    popup.video_id.clone(),
+                    popup.query.to_lowercase(),
+                    popup
+                        .cues
+                        .get(popup.selected)
+                        .map(|cue| cue.start_milliseconds),
+                )
+            })
+        else {
+            return;
+        };
+        let Some(loaded) = self
+            .loaded_youtube_captions
+            .as_ref()
+            .filter(|loaded| loaded.video_id == video_id)
+        else {
+            return;
+        };
+        let cues = loaded
+            .cues
+            .iter()
+            .filter(|cue| query.is_empty() || cue.text.to_lowercase().contains(&query))
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = selected_start
+            .and_then(|start| cues.iter().position(|cue| cue.start_milliseconds >= start))
+            .unwrap_or_default()
+            .min(cues.len().saturating_sub(1));
+        if let Some(popup) = self.view.youtube_captions_popup.as_mut() {
+            popup.cues = cues;
+            popup.selected = selected;
+        }
+    }
+
+    /// Updates the caption filter with one bounded printable character.
+    #[cfg(feature = "youtube-captions")]
+    fn append_youtube_caption_search(&mut self, character: char) {
+        let Some(popup) = self.view.youtube_captions_popup.as_mut() else {
+            return;
+        };
+        if !character.is_control() && popup.query.len().saturating_add(character.len_utf8()) <= 256
+        {
+            popup.query.push(character);
+        }
+        self.filter_youtube_captions_popup();
+    }
+
+    /// Deletes one character or word from the caption filter.
+    #[cfg(feature = "youtube-captions")]
+    fn delete_youtube_caption_search(&mut self, word: bool) {
+        let Some(popup) = self.view.youtube_captions_popup.as_mut() else {
+            return;
+        };
+        if word {
+            let mut cursor = popup.query.len();
+            delete_previous_editor_word(&mut popup.query, &mut cursor);
+        } else {
+            popup.query.pop();
+        }
+        self.filter_youtube_captions_popup();
+    }
+
+    /// Moves within the currently filtered caption rows.
+    #[cfg(feature = "youtube-captions")]
+    fn move_youtube_caption_selection(&mut self, delta: i32) {
+        let Some(popup) = self.view.youtube_captions_popup.as_mut() else {
+            return;
+        };
+        popup.selected = moved_index(popup.selected, popup.cues.len(), delta).unwrap_or_default();
+    }
+
+    /// Seeks the active item with millisecond precision or starts the selection.
+    #[cfg(feature = "youtube-captions")]
+    fn activate_youtube_caption(&mut self, start_milliseconds: u64) {
+        let Some(video_id) = self.view.youtube_captions_popup.as_ref().and_then(|popup| {
+            popup
+                .cues
+                .iter()
+                .any(|cue| cue.start_milliseconds == start_milliseconds)
+                .then(|| popup.video_id.clone())
+        }) else {
+            self.view.status_line =
+                "That caption is no longer in the filtered transcript".to_owned();
+            return;
+        };
+        let media_id = MediaId::new(SourceKind::YouTube, video_id);
+        let target = Duration::from_millis(start_milliseconds);
+        if self.current_media.as_ref() == Some(&media_id) && self.player.is_some() {
+            self.seek_active_timecode(media_id, target, start_milliseconds / 1_000);
+        } else {
+            self.activate_timecode(media_id, start_milliseconds / 1_000);
+        }
+    }
+
+    /// Closes the transcript and cooperatively cancels an in-flight retrieval.
+    #[cfg(feature = "youtube-captions")]
+    fn dismiss_youtube_captions(&mut self) {
+        if let Some(pending) = self.pending_youtube_captions.as_ref() {
+            pending.cancellation.cancel();
+            self.view.status_line = "YouTube caption retrieval cancellation requested".to_owned();
+        }
+        self.view.youtube_captions_popup = None;
+    }
+
+    /// Selects the cue active at the authoritative playback position.
+    #[cfg(feature = "youtube-captions")]
+    fn refresh_youtube_caption_line(&mut self) {
+        let Some(loaded) = self.loaded_youtube_captions.as_ref() else {
+            self.view.youtube_caption_line = None;
+            return;
+        };
+        let matches_playback = !self.view.playback.idle
+            && self.current_media.as_ref().is_some_and(|media_id| {
+                media_id.source == SourceKind::YouTube && media_id.external_id == loaded.video_id
+            });
+        if !matches_playback {
+            self.view.youtube_caption_line = None;
+            return;
+        }
+        let position = u64::try_from(self.view.playback.position.as_millis()).unwrap_or(u64::MAX);
+        self.view.youtube_caption_line = loaded
+            .cues
+            .iter()
+            .rev()
+            .find(|cue| cue.start_milliseconds <= position && position <= cue.end_milliseconds)
+            .map(|cue| cue.text.clone());
+    }
+
     /// Recomputes whether the selected Details item may be summarized.
     ///
     /// The exact Details identity is authoritative because History, playlists,
     /// subscriptions, and linked-video navigation do not all have a matching
     /// row in the foreground provider list.
     fn refresh_video_summary_availability(&mut self) {
+        #[cfg(feature = "youtube-captions")]
+        self.refresh_youtube_captions_availability();
         self.view.video_summary_supported = cfg!(feature = "summary");
         #[cfg(feature = "summary")]
         let cached_for_selected_video = self
@@ -31672,6 +32050,16 @@ impl AppController {
         self.clear_playback_start_activity();
         #[cfg(feature = "summary")]
         self.shutdown_video_summary_worker();
+        #[cfg(feature = "youtube-captions")]
+        {
+            if let Some(pending) = self.pending_youtube_captions.as_ref() {
+                pending.cancellation.cancel();
+            }
+            if let Some(thread) = self.youtube_captions_thread.take() {
+                let _ = thread.join();
+            }
+            self.pending_youtube_captions = None;
+        }
         #[cfg(feature = "audio-quality")]
         self.shutdown_local_audio_quality_worker();
         #[cfg(feature = "acoustid")]
@@ -32223,6 +32611,38 @@ impl UiController for AppController {
                     popup.scroll_offset = offset;
                 }
             }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::OpenYouTubeCaptions => self.open_youtube_captions(),
+            #[cfg(feature = "youtube-captions")]
+            UiAction::AppendYouTubeCaptionSearch(character) => {
+                self.append_youtube_caption_search(character);
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::DeleteYouTubeCaptionSearchCharacter => {
+                self.delete_youtube_caption_search(false);
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::DeleteYouTubeCaptionSearchWord => {
+                self.delete_youtube_caption_search(true);
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::MoveYouTubeCaptionSelection(delta) => {
+                self.move_youtube_caption_selection(delta);
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::SelectYouTubeCaption(index) => {
+                if let Some(popup) = self.view.youtube_captions_popup.as_mut()
+                    && !popup.cues.is_empty()
+                {
+                    popup.selected = index.min(popup.cues.len() - 1);
+                }
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::ActivateYouTubeCaption(start_milliseconds) => {
+                self.activate_youtube_caption(start_milliseconds);
+            }
+            #[cfg(feature = "youtube-captions")]
+            UiAction::DismissYouTubeCaptions => self.dismiss_youtube_captions(),
             UiAction::ToggleRepeat => {
                 if self
                     .current_media
@@ -32971,6 +33391,8 @@ impl UiController for AppController {
         self.drain_local_media_metadata_responses();
         #[cfg(feature = "summary")]
         self.drain_video_summary_responses();
+        #[cfg(feature = "youtube-captions")]
+        self.drain_youtube_captions_responses();
         #[cfg(feature = "audio-quality")]
         self.drain_local_audio_quality_responses();
         #[cfg(feature = "audio-quality")]
@@ -33029,6 +33451,8 @@ impl UiController for AppController {
         #[cfg(feature = "yt-dlp")]
         self.poll_download_at(Instant::now());
         self.update_player();
+        #[cfg(feature = "youtube-captions")]
+        self.refresh_youtube_caption_line();
         #[cfg(feature = "yt-dlp")]
         self.update_youtube_prewarm_for_imminent_next(Instant::now());
         #[cfg(feature = "radio")]
@@ -42095,6 +42519,12 @@ fn format_seconds(seconds: u64) -> String {
     } else {
         format!("{minutes}:{seconds:02}")
     }
+}
+
+/// Formats a caption timestamp without exposing millisecond noise in the list.
+#[cfg(feature = "youtube-captions")]
+fn format_caption_popup_timestamp(milliseconds: u64) -> String {
+    format_seconds(milliseconds / 1_000)
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -65923,6 +66353,82 @@ mod tests {
             status_queue,
             event_queue,
         )
+    }
+
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn loaded_youtube_captions_filter_and_follow_the_playback_clock() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let video_id = "dQw4w9WgXcQ".to_owned();
+        let cues = vec![
+            YouTubeCaptionCueView {
+                start_milliseconds: 1_000,
+                end_milliseconds: 2_000,
+                timestamp: "0:01".to_owned(),
+                text: "Opening words".to_owned(),
+            },
+            YouTubeCaptionCueView {
+                start_milliseconds: 4_000,
+                end_milliseconds: 5_000,
+                timestamp: "0:04".to_owned(),
+                text: "Different ending".to_owned(),
+            },
+        ];
+        controller.loaded_youtube_captions = Some(LoadedYouTubeCaptions {
+            video_id: video_id.clone(),
+            caption_source: "Human-provided captions (en)".to_owned(),
+            cues: cues.clone(),
+        });
+        controller.view.youtube_captions_popup = Some(YouTubeCaptionsPopupView {
+            video_id: video_id.clone(),
+            state: YouTubeCaptionsPopupState::Ready,
+            cues,
+            ..YouTubeCaptionsPopupView::default()
+        });
+
+        controller.append_youtube_caption_search('e');
+        controller.append_youtube_caption_search('n');
+        controller.append_youtube_caption_search('d');
+        let popup = controller
+            .view
+            .youtube_captions_popup
+            .as_ref()
+            .expect("caption popup");
+        assert_eq!(popup.query, "end");
+        assert_eq!(popup.cues.len(), 1);
+        assert_eq!(popup.cues[0].start_milliseconds, 4_000);
+
+        controller.current_media = Some(MediaId::new(SourceKind::YouTube, video_id));
+        controller.view.playback.idle = false;
+        controller.view.playback.position = Duration::from_millis(4_500);
+        controller.refresh_youtube_caption_line();
+        assert_eq!(
+            controller.view.youtube_caption_line.as_deref(),
+            Some("Different ending")
+        );
+
+        controller.view.playback.position = Duration::from_millis(3_000);
+        controller.refresh_youtube_caption_line();
+        assert_eq!(controller.view.youtube_caption_line, None);
+    }
+
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn caption_availability_requires_one_exact_youtube_video() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::Local, "/tmp/audio.opus")),
+            ..DetailView::default()
+        });
+        controller.refresh_youtube_captions_availability();
+        assert!(!controller.view.youtube_captions_available);
+
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+            ..DetailView::default()
+        });
+        controller.refresh_youtube_captions_availability();
+        assert!(controller.view.youtube_captions_available);
     }
 
     #[test]

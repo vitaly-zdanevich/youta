@@ -10,6 +10,8 @@
 // are untrusted text. They are rendered as text children, and
 // `whitespace-pre-wrap` is what preserves their shape — never markup.
 
+import { useEffect, useRef } from 'react';
+
 import type {
   AudioQualityPopupView,
   CommonsCredentialsEditorView,
@@ -28,6 +30,7 @@ import type {
   VideoCommentsPopupView,
   VideoQrPopupView,
   VideoSummaryPopupView,
+  YouTubeCaptionsPopupView,
   YtDlpForbiddenView,
   YtDlpVersionLookupView,
 } from "../contract";
@@ -48,8 +51,9 @@ export const LAYER = {
   videoComments: 8,
   videoQr: 9,
   videoSummary: 10,
-  audioQuality: 11,
-  error: 12,
+  youtubeCaptions: 11,
+  audioQuality: 12,
+  error: 13,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -71,12 +75,14 @@ export function HelpPopup({
 	evernoteSupported,
   playbackHistoryEnabled,
   videoSummarySupported,
+  youtubeCaptionsSupported,
 }: {
   audioQualitySupported: boolean;
   commonsUploadSupported: boolean;
 	evernoteSupported: boolean;
   playbackHistoryEnabled: boolean;
   videoSummarySupported: boolean;
+  youtubeCaptionsSupported: boolean;
 }) {
   const sections: Array<[string, Array<[string, string]>]> = [
     [
@@ -135,6 +141,9 @@ export function HelpPopup({
           ? ([
               ["G", "summarize selected YouTube video with Codex"],
             ] satisfies Array<[string, string]>)
+          : []),
+        ...(youtubeCaptionsSupported
+          ? ([['Y', 'search YouTube captions and seek to a cue']] satisfies Array<[string, string]>)
           : []),
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
         ...(audioQualitySupported
@@ -737,6 +746,69 @@ export function VideoSummaryPopup({ popup }: { popup: VideoSummaryPopupView }) {
       </div>
     </Popup>
   );
+}
+
+/** Searchable, timestamped YouTube captions with direct seeking. */
+export function YouTubeCaptionsPopup({ popup }: { popup: YouTubeCaptionsPopupView }) {
+	const selected = useRef<HTMLButtonElement>(null);
+	useEffect(() => {
+		selected.current?.scrollIntoView({ block: 'nearest' });
+	}, [popup.selected, popup.cues]);
+	return (
+		<Popup
+			title='YouTube captions'
+			subtitle={popup.video_title}
+			layer={LAYER.youtubeCaptions}
+			onDismiss={() => void dispatch('DismissYouTubeCaptions')}
+			footer={
+				<>
+					<span className='mr-auto text-ink-dim'>Enter or click seeks to a cue</span>
+					<PopupButton onClick={() => void dispatch('DismissYouTubeCaptions')}>Close</PopupButton>
+				</>
+			}
+		>
+			<div className='grid h-full min-h-0 grid-rows-[auto_auto_minmax(0,1fr)]'>
+				<p className='truncate border-b border-line px-[18px] py-[7px] text-xs text-ink-dim'>
+					{popup.caption_source || 'Selecting a caption track…'}
+				</p>
+				<label className='grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2 border-b border-line px-[18px] py-[8px] text-xs text-ink-dim'>
+					Search
+					<input
+						autoFocus
+						readOnly
+						data-youta-caption-search='true'
+						value={popup.query}
+						placeholder='Type to filter captions'
+						className='rounded-[4px] border border-line bg-ground px-2 py-1 text-ink outline-none focus:border-accent'
+					/>
+				</label>
+				<div className='min-h-0 overflow-y-auto px-[10px] py-[8px] text-xs'>
+					{popup.state === 'Loading' ? (
+						<p className='p-4 text-center text-ink-dim'>Loading and normalizing captions…</p>
+					) : typeof popup.state === 'object' ? (
+						<p role='alert' className='p-4 text-accent'>Could not load captions: {popup.state.Failed}</p>
+					) : popup.cues.length === 0 ? (
+						<p className='p-4 text-center text-ink-dim'>No captions match this search.</p>
+					) : (
+						popup.cues.map((cue, index) => (
+							<button
+								key={`${cue.start_milliseconds}-${index}`}
+								ref={index === popup.selected ? selected : undefined}
+								type='button'
+								onClick={() => void dispatch({ ActivateYouTubeCaption: cue.start_milliseconds })}
+								className={`grid w-full grid-cols-[54px_minmax(0,1fr)] gap-2 rounded-[4px] px-2 py-[5px] text-left hover:bg-raised ${
+									index === popup.selected ? 'bg-raised text-ink' : 'text-ink-dim'
+								}`}
+							>
+								<span className='font-mono text-ink-faint'>{cue.timestamp}</span>
+								<span>{cue.text}</span>
+							</button>
+						))
+					)}
+				</div>
+			</div>
+		</Popup>
+	);
 }
 
 /** Recent commits and how this binary was installed. */

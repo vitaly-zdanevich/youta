@@ -562,7 +562,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,nyan-cat,qr,sponsorblock,summary
+	--features app,audio-quality,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -573,7 +573,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,nyan-cat,qr,sponsorblock,summary
+	--features app-core,audio-quality,images,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -581,13 +581,14 @@ Omit `images` from that command for the Yandex-free text-only variant. Omit
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
 `summary` is the independently removable Codex summary integration,
+`youtube-captions` is the independently removable caption browser,
 `sponsorblock` is the independently removable SponsorBlock client and playback
 skip integration,
 `nyan-cat` is the independently removable rainbow seek-bar renderer,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, SponsorBlock, the
-Nyan Cat renderer, video summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
+Nyan Cat renderer, YouTube captions, video summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
 custom command above to retain archive folders; leaving it out removes the
 archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
 cache, and playback code. The shared ZIP decoder also disappears only when no
@@ -1203,6 +1204,26 @@ These are distinct integration modes:
   configurable tools. Their availability and site compatibility can change.
   Users are responsible for the terms, copyright, and laws that apply to media
   they access.
+
+### YouTube captions
+
+The default `youtube-captions` feature adds a searchable transcript without
+requiring the Codex summary backend. Select an exact YouTube video and press
+`Y`; the help popup is the only permanent place that advertises this hotkey.
+Youta opens a modal, prefers human-provided captions, and otherwise chooses the
+original-language automatic track before translated tracks. Type to filter its
+normalized cue text, use Up/Down to select a result, and press Enter or click a
+line to seek to that cue. After loading succeeds, the cue active at the current
+playback position appears on one line immediately above the seek bar.
+
+Retrieval reuses Youta's bounded, shell-free `yt-dlp` caption extractor. It
+ignores ambient yt-dlp configuration, cookies, browser credentials, plugins,
+and cache data; the temporary caption file is removed after normalization.
+The last loaded normalized cue list remains only in process memory so the
+current-caption line can follow playback, and disappears when Youta exits.
+Custom builds can omit `youtube-captions` while retaining `summary` or
+`evernote`; those features share the bounded extractor implementation without
+selecting the caption UI.
 
 ### Codex video summaries
 
@@ -2016,8 +2037,8 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality`, `commons-upload`,
-`evernote`, `local-archives`, `nyan-cat`, `sponsorblock`, and `summary` flags to
-their Cargo features.
+`evernote`, `local-archives`, `nyan-cat`, `sponsorblock`, `summary`, and
+`youtube-captions` flags to their Cargo features.
 `USE="-audio-quality"` removes the analyzer and RustFFT dependency.
 `USE="-commons-upload"` removes the Commons client and review UI.
 `USE="-evernote"` removes the Evernote EDAM client and note UI.
@@ -2026,6 +2047,8 @@ dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
 unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
 extraction. `USE="-sponsorblock"` removes its API client, preference, cache, and
 playback skip logic. `USE="-summary"` removes the Codex summary UI and backend.
+`USE="-youtube-captions"` removes caption loading, search, and seeking while
+leaving the independent `summary` and `evernote` integrations available.
 `USE="-nyan-cat"` removes the rainbow seek-bar renderers and preference.
 Prebuilt
 executables contain the fixed upstream feature set and keep these capabilities

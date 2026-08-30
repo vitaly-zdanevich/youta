@@ -512,6 +512,7 @@ pub struct ExtractedYouTubeCaptions {
     transcript: String,
     source: YouTubeCaptionSource,
     sampled: bool,
+    cues: Vec<YouTubeCaptionCue>,
 }
 
 impl fmt::Debug for ExtractedYouTubeCaptions {
@@ -521,6 +522,7 @@ impl fmt::Debug for ExtractedYouTubeCaptions {
             .field("transcript_bytes", &self.transcript.len())
             .field("source", &self.source)
             .field("sampled", &self.sampled)
+            .field("cue_count", &self.cues.len())
             .finish()
     }
 }
@@ -542,6 +544,46 @@ impl ExtractedYouTubeCaptions {
     #[must_use]
     pub const fn sampled(&self) -> bool {
         self.sampled
+    }
+
+    /// Returns every normalized cue in chronological source order.
+    ///
+    /// Unlike [`Self::transcript`], this collection is never sampled. Its
+    /// memory remains bounded by the raw-caption and per-cue extractor limits.
+    #[must_use]
+    pub fn cues(&self) -> &[YouTubeCaptionCue] {
+        &self.cues
+    }
+}
+
+/// One normalized, timestamped YouTube caption cue.
+///
+/// Milliseconds are retained so front-ends can display the active cue and
+/// seek without rounding a short cue onto the preceding whole second.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YouTubeCaptionCue {
+    start_milliseconds: u64,
+    end_milliseconds: u64,
+    text: String,
+}
+
+impl YouTubeCaptionCue {
+    /// Returns the inclusive cue start in milliseconds from media start.
+    #[must_use]
+    pub const fn start_milliseconds(&self) -> u64 {
+        self.start_milliseconds
+    }
+
+    /// Returns the inclusive cue end in milliseconds from media start.
+    #[must_use]
+    pub const fn end_milliseconds(&self) -> u64 {
+        self.end_milliseconds
+    }
+
+    /// Returns normalized plain text with subtitle markup removed.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -800,7 +842,7 @@ impl YouTubeCaptionExtractor {
         let format = caption_path.extension().and_then(OsStr::to_str).ok_or(
             YouTubeCaptionError::InvalidCaptions("the caption format is missing"),
         )?;
-        let (transcript, sampled) =
+        let (cues, transcript, sampled) =
             normalize_captions(&bytes, format, self.limits.maximum_transcript_bytes)?;
         let source_language = selected_caption_source_language(&selected);
         Ok(ExtractedYouTubeCaptions {
@@ -814,6 +856,7 @@ impl YouTubeCaptionExtractor {
                 language: source_language,
             },
             sampled,
+            cues,
         })
     }
 
@@ -1375,18 +1418,11 @@ fn read_bounded_caption(path: &Path, maximum: usize) -> Result<Vec<u8>, YouTubeC
     Ok(bytes)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CaptionCue {
-    start_milliseconds: u64,
-    end_milliseconds: u64,
-    text: String,
-}
-
 fn normalize_captions(
     bytes: &[u8],
     format: &str,
     maximum_transcript_bytes: usize,
-) -> Result<(String, bool), YouTubeCaptionError> {
+) -> Result<(Vec<YouTubeCaptionCue>, String, bool), YouTubeCaptionError> {
     if !format.eq_ignore_ascii_case("vtt") && !format.eq_ignore_ascii_case("srt") {
         return Err(YouTubeCaptionError::InvalidCaptions(
             "only VTT and SRT text are supported",
@@ -1396,11 +1432,12 @@ fn normalize_captions(
         .map_err(|_| YouTubeCaptionError::InvalidCaptions("captions are not UTF-8"))?
         .trim_start_matches('\u{feff}');
     let cues = parse_caption_cues(text)?;
-    render_caption_cues(&cues, maximum_transcript_bytes)
+    let (transcript, sampled) = render_caption_cues(&cues, maximum_transcript_bytes)?;
+    Ok((cues, transcript, sampled))
 }
 
-fn parse_caption_cues(text: &str) -> Result<Vec<CaptionCue>, YouTubeCaptionError> {
-    let mut cues: Vec<CaptionCue> = Vec::new();
+fn parse_caption_cues(text: &str) -> Result<Vec<YouTubeCaptionCue>, YouTubeCaptionError> {
+    let mut cues: Vec<YouTubeCaptionCue> = Vec::new();
     let mut timing: Option<(u64, u64)> = None;
     let mut cue_text = String::new();
     let mut skip_block = false;
@@ -1523,7 +1560,7 @@ fn parse_caption_timestamp(value: &str) -> Option<u64> {
 }
 
 fn finish_caption_cue(
-    cues: &mut Vec<CaptionCue>,
+    cues: &mut Vec<YouTubeCaptionCue>,
     timing: Option<(u64, u64)>,
     cue_text: &mut String,
 ) -> Result<(), YouTubeCaptionError> {
@@ -1554,7 +1591,7 @@ fn finish_caption_cue(
             return Ok(());
         }
     }
-    cues.push(CaptionCue {
+    cues.push(YouTubeCaptionCue {
         start_milliseconds,
         end_milliseconds,
         text,
@@ -1613,7 +1650,7 @@ fn caption_markup_bytes(value: &str) -> Option<usize> {
 }
 
 fn render_caption_cues(
-    cues: &[CaptionCue],
+    cues: &[YouTubeCaptionCue],
     maximum: usize,
 ) -> Result<(String, bool), YouTubeCaptionError> {
     let full = cues.iter().map(render_caption_cue).collect::<String>();
@@ -1670,7 +1707,7 @@ fn evenly_spaced_indices(length: usize, count: usize) -> Vec<usize> {
         .collect()
 }
 
-fn render_caption_cue(cue: &CaptionCue) -> String {
+fn render_caption_cue(cue: &YouTubeCaptionCue) -> String {
     format!(
         "[{}] {}\n",
         format_caption_timestamp(cue.start_milliseconds),
@@ -1678,7 +1715,7 @@ fn render_caption_cue(cue: &CaptionCue) -> String {
     )
 }
 
-fn render_caption_cue_bounded(cue: &CaptionCue, maximum: usize) -> String {
+fn render_caption_cue_bounded(cue: &YouTubeCaptionCue, maximum: usize) -> String {
     let prefix = format!("[{}] ", format_caption_timestamp(cue.start_milliseconds));
     if maximum <= prefix.len().saturating_add(1) {
         return String::new();
@@ -3127,10 +3164,12 @@ not a cue
 00:00:05.250 --> 00:00:06.000
 The <b>end</b>.
 "#;
-        let (transcript, sampled) = normalize_captions(fixture.as_bytes(), "vtt", 4 * 1024)
+        let (cues, transcript, sampled) = normalize_captions(fixture.as_bytes(), "vtt", 4 * 1024)
             .expect("normalized caption fixture");
 
         assert!(!sampled);
+        assert_eq!(cues[0].start_milliseconds(), 0);
+        assert_eq!(cues[0].end_milliseconds(), 3_000);
         assert_eq!(
             transcript,
             "[00:00:00] Hello & welcome again\n[00:00:05] The end.\n"
@@ -3140,12 +3179,12 @@ The <b>end</b>.
     #[test]
     fn caption_text_preserves_arrows_and_literal_less_than_signs() {
         let arrow = b"1\n00:00:00,000 --> 00:00:02,000\nUse x --> y\n";
-        let (transcript, _) =
+        let (_, transcript, _) =
             normalize_captions(arrow, "srt", 4 * 1024).expect("arrow in caption text");
         assert_eq!(transcript, "[00:00:00] Use x --> y\n");
 
         let comparison = b"1\n00:00:00,000 --> 00:00:02,000\nx < 5\n";
-        let (transcript, _) =
+        let (_, transcript, _) =
             normalize_captions(comparison, "srt", 4 * 1024).expect("literal less-than sign");
         assert_eq!(transcript, "[00:00:00] x < 5\n");
     }
@@ -3156,7 +3195,7 @@ The <b>end</b>.
             + "left\u{061c}\u{200e}\u{200f}\u{2028}\u{2029}\u{202a}\u{202b}"
             + "\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}right\n";
 
-        let (transcript, sampled) = normalize_captions(fixture.as_bytes(), "vtt", 4 * 1024)
+        let (_, transcript, sampled) = normalize_captions(fixture.as_bytes(), "vtt", 4 * 1024)
             .expect("normalized caption fixture");
 
         assert!(!sampled);
@@ -3167,7 +3206,7 @@ The <b>end</b>.
     #[test]
     fn oversized_transcript_is_sampled_from_start_middle_and_end() {
         let cues = (0..200_u64)
-            .map(|index| CaptionCue {
+            .map(|index| YouTubeCaptionCue {
                 start_milliseconds: index * 1_000,
                 end_milliseconds: index * 1_000 + 900,
                 text: format!("cue-{index:03} with representative transcript words"),
@@ -3264,6 +3303,10 @@ printf '%s\n' 'WEBVTT' '' '00:00:00.000 --> 00:00:02.000' '<v Speaker>Hello &amp
             "[00:00:00] Hello & welcome again\n[00:00:05] The end.\n"
         );
         assert!(!captions.sampled());
+        assert_eq!(captions.cues().len(), 2);
+        assert_eq!(captions.cues()[1].start_milliseconds(), 5_000);
+        assert_eq!(captions.cues()[1].end_milliseconds(), 6_000);
+        assert_eq!(captions.cues()[1].text(), "The end.");
         assert!(!format!("{captions:?}").contains("Hello"));
 
         let calls = fs::read_to_string(&calls_path).expect("captured yt-dlp calls");

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.46.0"
+version = "0.47.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -43,6 +43,7 @@ default = [
     "qr",
     "sponsorblock",
     "summary",
+    "youtube-captions",
 ]
 
 # Complete application profile shared by default and text-only builds.
@@ -158,6 +159,10 @@ audio-quality = ["local-browser", "dep:rustfft", "dep:rustix"]
 # dependency. Keeping the feature renderer-free lets every front-end expose the
 # same capability while distributors remove both its UI and backend.
 summary = ["yt-dlp"]
+# Searchable, timestamp-accurate YouTube captions shared by every front-end.
+# Caption retrieval remains renderer-free and uses the existing bounded yt-dlp
+# process boundary, so distributors can remove its controller UI independently.
+youtube-captions = ["yt-dlp"]
 # Remote artwork fetching and its private on-disk cache, with no renderer.
 #
 # `src/artwork.rs` turns a provider URL into bytes under Youta's network and

@@ -91,6 +91,7 @@ export function Player({
   chapters,
   showChapterTimestamps,
   nyanCatSeekbar,
+  captionLine,
   artwork,
   autoplay,
   repeating,
@@ -102,6 +103,7 @@ export function Player({
   chapters: Chapter[];
   showChapterTimestamps: boolean;
   nyanCatSeekbar: boolean;
+  captionLine: string | null;
   artwork: string | null;
   autoplay: boolean;
   repeating: boolean;
@@ -132,6 +134,11 @@ export function Player({
         )}
 
         <div className="min-w-0 grow">
+          {captionLine ? (
+            <p className="mb-[8px] truncate text-center text-xs font-medium text-ink" title={captionLine}>
+              CC&nbsp;&nbsp;{captionLine}
+            </p>
+          ) : null}
           <div className="relative h-[3px] rounded-[3px] bg-line-strong">
             <Buffered playback={playback} duration={duration} />
             <i

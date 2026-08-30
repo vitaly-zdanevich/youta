@@ -300,6 +300,72 @@ mod wire_tests {
         );
     }
 
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn uppercase_y_opens_only_available_youtube_captions() {
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('Y')), &view, None, None),
+            None
+        );
+        view.youtube_captions_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('Y')), &view, None, None),
+            Some(UiAction::OpenYouTubeCaptions)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('y')), &view, None, None),
+            Some(UiAction::CopyLink),
+            "the existing lowercase copy-link shortcut must remain unchanged"
+        );
+    }
+
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn youtube_caption_popup_owns_search_navigation_and_activation_keys() {
+        let mut view = ViewModel {
+            youtube_captions_popup: Some(crate::view::YouTubeCaptionsPopupView {
+                state: crate::view::YouTubeCaptionsPopupState::Ready,
+                cues: vec![
+                    crate::view::YouTubeCaptionCueView {
+                        start_milliseconds: 1_000,
+                        end_milliseconds: 2_000,
+                        timestamp: "00:01".to_owned(),
+                        text: "first".to_owned(),
+                    },
+                    crate::view::YouTubeCaptionCueView {
+                        start_milliseconds: 3_000,
+                        end_milliseconds: 4_000,
+                        timestamp: "00:03".to_owned(),
+                        text: "second".to_owned(),
+                    },
+                ],
+                ..crate::view::YouTubeCaptionsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('x')), &view, None, None),
+            Some(UiAction::AppendYouTubeCaptionSearch('x'))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Down), &view, None, None),
+            Some(UiAction::MoveYouTubeCaptionSelection(1))
+        );
+        view.youtube_captions_popup
+            .as_mut()
+            .expect("captions popup")
+            .selected = 1;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::ActivateYouTubeCaption(3_000))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissYouTubeCaptions)
+        );
+    }
+
     #[cfg(feature = "commons-upload")]
     #[test]
     fn uppercase_u_opens_only_an_available_commons_upload() {
@@ -477,6 +543,12 @@ pub fn key_action(
     page_rows: Option<usize>,
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
+    #[cfg(feature = "youtube-captions")]
+    if view.error_popup.is_none()
+        && let Some(popup) = view.youtube_captions_popup.as_ref()
+    {
+        return youtube_captions_key_action(key, popup);
+    }
     if view.error_popup.is_none()
         && let Some(popup) = view.audio_quality_popup.as_ref()
     {
@@ -531,6 +603,35 @@ pub fn key_action(
     }
     unfiltered_key_action(key, view, page_rows)
         .filter(|action| view.external_opener_available || !action.requires_external_opener())
+}
+
+/// Maps the searchable caption browser before ordinary application shortcuts.
+#[cfg(feature = "youtube-captions")]
+fn youtube_captions_key_action(
+    key: KeyPress,
+    popup: &YouTubeCaptionsPopupView,
+) -> Option<UiAction> {
+    match key.key {
+        Key::Esc => Some(UiAction::DismissYouTubeCaptions),
+        Key::Up => Some(UiAction::MoveYouTubeCaptionSelection(-1)),
+        Key::Down => Some(UiAction::MoveYouTubeCaptionSelection(1)),
+        Key::Home => Some(UiAction::SelectYouTubeCaption(0)),
+        Key::End if !popup.cues.is_empty() => {
+            Some(UiAction::SelectYouTubeCaption(popup.cues.len() - 1))
+        }
+        Key::Enter => popup
+            .cues
+            .get(popup.selected)
+            .map(|cue| UiAction::ActivateYouTubeCaption(cue.start_milliseconds)),
+        Key::Backspace => Some(UiAction::DeleteYouTubeCaptionSearchCharacter),
+        Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+            Some(UiAction::DeleteYouTubeCaptionSearchWord)
+        }
+        Key::Char(character) if !character.is_control() && !key.chorded() => {
+            Some(UiAction::AppendYouTubeCaptionSearch(character))
+        }
+        _ => None,
+    }
 }
 
 /// Maps modal local audio-quality report controls.
@@ -1510,6 +1611,10 @@ fn unfiltered_key_action(
         }
         Key::Char('G') if !key.chorded() && view.video_summary_available => {
             Some(UiAction::GenerateVideoSummary)
+        }
+        #[cfg(feature = "youtube-captions")]
+        Key::Char('Y') if !key.chorded() && view.youtube_captions_available => {
+            Some(UiAction::OpenYouTubeCaptions)
         }
         Key::Enter if alt && detail_link_count > 0 => {
             let selected = view

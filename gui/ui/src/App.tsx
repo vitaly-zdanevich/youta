@@ -26,6 +26,7 @@ import {
   VideoCommentsPopup,
   VideoQrPopup,
   VideoSummaryPopup,
+  YouTubeCaptionsPopup,
 } from "./components/popups";
 import { namedKey } from "./keys";
 import { sendKey } from "./ipc";
@@ -58,7 +59,10 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       // A text field or slider owns its own keys.
       const target = event.target;
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+      if (
+        target instanceof HTMLTextAreaElement ||
+        (target instanceof HTMLInputElement && target.dataset.youtaCaptionSearch !== 'true')
+      ) {
         return;
       }
       // The platform keeps its window and application chords.
@@ -162,6 +166,7 @@ export function App() {
           chapters={view.playback_chapters}
           showChapterTimestamps={view.show_chapter_timestamps}
           nyanCatSeekbar={view.nyan_cat_seekbar}
+          captionLine={view.youtube_caption_line ?? null}
           artwork={view.details?.thumbnail_url ?? null}
           autoplay={view.autoplay}
           repeating={view.repeating}
@@ -185,6 +190,7 @@ export function App() {
 			evernoteSupported={view.evernote_supported}
           playbackHistoryEnabled={view.playback_history_enabled}
           videoSummarySupported={view.video_summary_supported}
+          youtubeCaptionsSupported={view.youtube_captions_supported ?? false}
         />
       ) : null}
       {view.project_history_popup ? (
@@ -214,6 +220,9 @@ export function App() {
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
       {view.video_summary_popup ? (
         <VideoSummaryPopup popup={view.video_summary_popup} />
+      ) : null}
+      {view.youtube_captions_popup ? (
+        <YouTubeCaptionsPopup popup={view.youtube_captions_popup} />
       ) : null}
       {view.audio_quality_popup ? (
         <AudioQualityPopup popup={view.audio_quality_popup} />

@@ -1572,6 +1572,53 @@ pub struct VideoSummaryPopupView {
     pub scroll_offset: usize,
 }
 
+/// Loading state for one searchable YouTube caption transcript.
+#[cfg(feature = "youtube-captions")]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum YouTubeCaptionsPopupState {
+    /// The bounded `yt-dlp` worker is retrieving one preferred track.
+    #[default]
+    Loading,
+    /// At least one normalized cue is available for search and seeking.
+    Ready,
+    /// Caption retrieval failed without closing the popup.
+    Failed(String),
+}
+
+/// One normalized caption cue exposed to renderer processes.
+#[cfg(feature = "youtube-captions")]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct YouTubeCaptionCueView {
+    /// Inclusive cue start in milliseconds from media start.
+    pub start_milliseconds: u64,
+    /// Inclusive cue end in milliseconds from media start.
+    pub end_milliseconds: u64,
+    /// Compact human-readable start timestamp.
+    pub timestamp: String,
+    /// Normalized plain caption text.
+    pub text: String,
+}
+
+/// Searchable cues for one exact selected YouTube video.
+#[cfg(feature = "youtube-captions")]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct YouTubeCaptionsPopupView {
+    /// Stable YouTube video identifier owning every cue.
+    pub video_id: String,
+    /// Selected video title captured when loading began.
+    pub video_title: String,
+    /// Caption language and whether YouTube generated the track.
+    pub caption_source: String,
+    /// Current retrieval or terminal state.
+    pub state: YouTubeCaptionsPopupState,
+    /// Case-insensitive text filter edited directly in the modal.
+    pub query: String,
+    /// Filtered cues in chronological order.
+    pub cues: Vec<YouTubeCaptionCueView>,
+    /// Selected row inside [`Self::cues`].
+    pub selected: usize,
+}
+
 /// One public top-level comment rendered in the selected-video popup.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct VideoCommentView {
@@ -2100,6 +2147,18 @@ pub struct ViewModel {
     pub video_summary_available: bool,
     /// Immediate progress or a RAM-only Codex video summary.
     pub video_summary_popup: Option<VideoSummaryPopupView>,
+    /// Whether this build contains searchable YouTube captions.
+    #[cfg(feature = "youtube-captions")]
+    pub youtube_captions_supported: bool,
+    /// Whether the exact selection can load a YouTube transcript.
+    #[cfg(feature = "youtube-captions")]
+    pub youtube_captions_available: bool,
+    /// Caption currently active at the authoritative playback position.
+    #[cfg(feature = "youtube-captions")]
+    pub youtube_caption_line: Option<String>,
+    /// Searchable transcript popup for one exact selected video.
+    #[cfg(feature = "youtube-captions")]
+    pub youtube_captions_popup: Option<YouTubeCaptionsPopupView>,
     /// Whether the selected YouTube video supports loading public comments.
     pub video_comments_available: bool,
     /// Scrollable bounded public-comments popup.
@@ -2285,6 +2344,14 @@ impl Default for ViewModel {
             video_summary_supported: cfg!(feature = "summary"),
             video_summary_available: false,
             video_summary_popup: None,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_supported: true,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_available: false,
+            #[cfg(feature = "youtube-captions")]
+            youtube_caption_line: None,
+            #[cfg(feature = "youtube-captions")]
+            youtube_captions_popup: None,
             video_comments_available: false,
             video_comments_popup: None,
             #[cfg(feature = "qr")]
@@ -2724,6 +2791,30 @@ pub enum UiAction {
     DismissVideoSummary,
     /// Set the renderer-clamped wrapped-line offset of the summary report.
     SetVideoSummaryScroll(usize),
+    /// Retrieve or reopen searchable captions for the selected YouTube video.
+    #[cfg(feature = "youtube-captions")]
+    OpenYouTubeCaptions,
+    /// Append one printable character to the caption search filter.
+    #[cfg(feature = "youtube-captions")]
+    AppendYouTubeCaptionSearch(char),
+    /// Remove the last caption-search character.
+    #[cfg(feature = "youtube-captions")]
+    DeleteYouTubeCaptionSearchCharacter,
+    /// Remove the previous word from the caption search filter.
+    #[cfg(feature = "youtube-captions")]
+    DeleteYouTubeCaptionSearchWord,
+    /// Move the selected filtered caption row.
+    #[cfg(feature = "youtube-captions")]
+    MoveYouTubeCaptionSelection(i32),
+    /// Select one exact filtered caption row.
+    #[cfg(feature = "youtube-captions")]
+    SelectYouTubeCaption(usize),
+    /// Seek or start the popup owner at one validated cue timestamp.
+    #[cfg(feature = "youtube-captions")]
+    ActivateYouTubeCaption(u64),
+    /// Close the caption browser, cancelling retrieval when needed.
+    #[cfg(feature = "youtube-captions")]
+    DismissYouTubeCaptions,
     /// Generate and show a QR code for the selected YouTube video.
     #[cfg(feature = "qr")]
     OpenVideoQr,
@@ -3396,5 +3487,38 @@ mod tests {
             failed["state"]["Failed"],
             serde_json::Value::String("captions unavailable".to_owned())
         );
+    }
+
+    #[cfg(feature = "youtube-captions")]
+    #[test]
+    fn youtube_caption_popup_serializes_searchable_exact_timestamps() {
+        let view = ViewModel {
+            youtube_captions_supported: true,
+            youtube_captions_available: true,
+            youtube_caption_line: Some("Current words".to_owned()),
+            youtube_captions_popup: Some(YouTubeCaptionsPopupView {
+                video_id: "dQw4w9WgXcQ".to_owned(),
+                video_title: "Fixture video".to_owned(),
+                caption_source: "Human-provided captions (en)".to_owned(),
+                state: YouTubeCaptionsPopupState::Ready,
+                query: "words".to_owned(),
+                cues: vec![YouTubeCaptionCueView {
+                    start_milliseconds: 12_500,
+                    end_milliseconds: 14_000,
+                    timestamp: "0:12".to_owned(),
+                    text: "Current words".to_owned(),
+                }],
+                selected: 0,
+            }),
+            ..ViewModel::default()
+        };
+
+        let json = serde_json::to_value(view).expect("serialize YouTube captions");
+        assert_eq!(json["youtube_caption_line"], "Current words");
+        assert_eq!(
+            json["youtube_captions_popup"]["cues"][0]["start_milliseconds"],
+            12_500
+        );
+        assert_eq!(json["youtube_captions_popup"]["state"], "Ready");
     }
 }
