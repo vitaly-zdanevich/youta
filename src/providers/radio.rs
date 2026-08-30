@@ -2013,6 +2013,43 @@ mod tests {
         }
     }
 
+    /// Every compiled base-catalogue row must carry useful descriptive copy
+    /// and a safe public page independently of its playback endpoint.
+    #[test]
+    fn every_base_station_has_a_description_and_credential_free_homepage() {
+        for station in all_stations() {
+            assert!(
+                !station.summary.trim().is_empty(),
+                "{} must provide a nonblank description",
+                station.id
+            );
+            let homepage = station
+                .homepage_url()
+                .unwrap_or_else(|error| panic!("{} has an invalid homepage: {error}", station.id));
+            assert!(
+                matches!(homepage.scheme(), "http" | "https"),
+                "{} homepage must use HTTP or HTTPS: {homepage}",
+                station.id
+            );
+            assert!(
+                homepage.host_str().is_some(),
+                "{} homepage must have a host: {homepage}",
+                station.id
+            );
+            assert!(
+                homepage.username().is_empty() && homepage.password().is_none(),
+                "{} homepage must not embed credentials: {homepage}",
+                station.id
+            );
+            assert_ne!(
+                homepage.as_str().trim_end_matches('/'),
+                "https://www.npr.org/stations",
+                "{} must link to its own homepage rather than the generic NPR directory",
+                station.id
+            );
+        }
+    }
+
     #[test]
     fn curated_presets_keep_complete_static_quality_shape() {
         for station in STATIONS {

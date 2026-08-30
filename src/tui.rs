@@ -3908,10 +3908,7 @@ fn render_information_panel(
         let action_text = match kind {
             InformationPanelKind::Podcast => format!("{opener_name} podcast"),
             InformationPanelKind::Audiobook => format!("{opener_name} audiobook"),
-            InformationPanelKind::Radio => details.channel_webpage_url.as_ref().map_or_else(
-                || format!("{opener_name} station website"),
-                |url| format!("{opener_name} · {url}"),
-            ),
+            InformationPanelKind::Radio => format!("{opener_name} homepage"),
             InformationPanelKind::YandexMusic if view.yandex_music_actions.track_selected => {
                 format!("{opener_name} track")
             }
@@ -19056,6 +19053,11 @@ mod tests {
                     url::Url::parse("https://sectorradio.com/").expect("station URL"),
                 ),
                 description: "Lossless progressive electronic music.\n\nQuality: FLAC · variable bitrate · 44.1 kHz\nStream: http://89.223.45.5:8000/progressive-flac".to_owned(),
+                links: vec![DetailLinkView {
+                    label: "Homepage".to_owned(),
+                    url: "https://sectorradio.com/".to_owned(),
+                    ..DetailLinkView::default()
+                }],
                 length: "must not render".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
@@ -19083,12 +19085,11 @@ mod tests {
         assert!(!rendered.contains("42%"));
         assert!(rendered.contains("FLAC · variable bitrate · 44.1 kHz"));
         assert!(!rendered.contains("stereo"));
-        assert!(rendered.contains(&format!(
-            "[O] {} · https://sectorradio.com/",
-            system_url_opener_name()
-        )));
+        assert!(rendered.contains(&format!("[O] {} homepage", system_url_opener_name())));
         assert!(!rendered.contains("External links"));
         assert!(!rendered.contains("Station website"));
+        assert!(rendered.contains("Homepage — https://sectorradio.com/"));
+        assert!(rendered.contains("Lossless progressive electronic music."));
         assert!(!rendered.contains("[B] Sort:"));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
@@ -19098,6 +19099,11 @@ mod tests {
                 .detail_buttons
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenInBrowser)
+        );
+        assert_eq!(
+            hit_map.detail_links.first().map(|(index, _)| *index),
+            Some(0),
+            "the explicit Homepage row must remain mouse-activatable"
         );
         assert!(
             hit_map

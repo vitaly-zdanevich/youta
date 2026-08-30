@@ -817,6 +817,30 @@ fn the_window_exposes_local_audio_quality_analysis_and_its_result_section() {
 }
 
 #[test]
+fn the_window_keeps_radio_homepages_visible_and_openable() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("Details.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "link.presentation.startsWith(\"LabelAndUrl\")",
+        "{link.url}",
+        "kind === \"Radio\" ? \"Open homepage\" : \"Open page\"",
+        "dispatch({ ActivateDetailLink: index })",
+        "dispatch(\"OpenInBrowser\")",
+    ] {
+        assert!(
+            source.contains(required),
+            "Radio Details no longer contains {required}"
+        );
+    }
+}
+
+#[test]
 fn the_window_help_documents_the_local_audio_quality_hotkey() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ui")

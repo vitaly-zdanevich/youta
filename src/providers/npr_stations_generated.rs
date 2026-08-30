@@ -1306,7 +1306,7 @@ pub const NPR_STATIONS: &[RadioStationPreset] = &[
     RadioStationPreset {
         id: "npr-2b3367a0dba94ec3ac3c8867136a4343",
         name: "WHCP 91.7 FM",
-        homepage: "https://www.npr.org/stations",
+        homepage: "https://whcp.org/",
         stream: "https://whcp.broadcasttool.stream/whcp",
         summary: "NPR member-station service. Station: WFHW 90.3 FM (Cambridge, MD); WHCP 91.7 FM (Trappe, MD)",
         codec: Some(RadioCodec::Mp3),

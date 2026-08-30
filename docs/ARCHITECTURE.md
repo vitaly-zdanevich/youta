@@ -336,28 +336,35 @@ maintenance when Bandcamp changes markup, but it remains isolated behind the
 `bandcamp` feature and cannot turn a search result into authenticated access.
 
 The implemented Radio tab is a credential-free static-catalog adapter behind
-the independent `radio` feature. Presets keep a stable application ID, station
-homepage, direct stream or M3U entry point, and only quality fields supported
-by a reviewed source or probe. Merely enabling the feature performs no startup
-network request. Enter starts `MediaKind::LiveStream`; persistent progress,
-chapters, completion, and repeat-one are disabled for that item, while
-listening-time checkpoints update source statistics without creating a
-position row. mpv's `demuxer-cache-state.seekable-ranges` is the sole authority
-for transient rewind: Youta selects the newest contiguous range containing the
-current position, caps its visible rolling window at 24 hours, normalizes its
-transport timestamps to zero for display, and translates clicks or keyboard
-percentages back to bounded absolute backend timestamps. Without such a range,
-the stream remains non-seekable. History and playlists persist the stable ID
-plus canonical homepage, then resolve the current built-in stream at replay
-time.
+the independent `radio` feature. Presets keep a stable application ID, compiled
+description, station homepage, direct stream or M3U entry point, and only
+quality fields supported by a reviewed source or probe. Merely enabling the
+feature performs no startup network request. Enter starts
+`MediaKind::LiveStream`; persistent progress, chapters, completion, and
+repeat-one are disabled for that item, while listening-time checkpoints update
+source statistics without creating a position row. mpv's
+`demuxer-cache-state.seekable-ranges` is the sole authority for transient
+rewind: Youta selects the newest contiguous range containing the current
+position, caps its visible rolling window at 24 hours, normalizes its transport
+timestamps to zero for display, and translates clicks or keyboard percentages
+back to bounded absolute backend timestamps. Without such a range, the stream
+remains non-seekable. The shared Details projection starts with the compiled
+description and exposes the canonical homepage as its first explicit,
+clickable `Homepage — URL` link. Opening the homepage and copying that link use
+the same URL; projecting either field performs no network request. History and
+playlists persist the stable ID plus canonical homepage, then resolve the
+current built-in stream at replay time.
 
 The larger NPR portion is a checked-in generated module rather than a runtime
 directory client. Its maintenance tool queries NPR's official station finder
 once per US state and territory, retains every discovered service with an
 HTTPS audio URL, and deduplicates inherited station records by stream GUID.
-Distinct non-primary services remain separate presets, while their station
-aliases stay in the searchable summary. NPR exposes no pagination/total
-contract and no stream-quality fields, so the snapshot documents its query
+When aliases collapse into one service, a station-specific homepage from any
+alias is retained instead of falling back to NPR's general station directory;
+a service without a safe public homepage on any alias is omitted. Distinct
+non-primary services remain separate presets, while their station aliases stay
+in the searchable summary. NPR exposes no pagination/total contract and no
+stream-quality fields, so the snapshot documents its query
 date and discovered count without claiming exhaustive coverage or guessed
 bitrates. Current-program lookups are passive playback/selection metadata
 requests and tolerate empty schedules; they do not mutate the static

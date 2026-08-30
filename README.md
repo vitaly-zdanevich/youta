@@ -358,11 +358,14 @@ The NPR snapshot is generated from NPR's official
 [station finder](https://www.npr.org/stations), includes primary and additional
 services, and deduplicates inherited transmitters by stream GUID. NPR publishes
 no bitrate, sample-rate, or channel fields in that directory, so Youta does not
-invent them. Verified NPR quality is populated only by the generator's explicit,
-bounded [`ffprobe`](https://ffmpeg.org/ffprobe.html) maintenance mode and stored
-in the checked-in
-[quality sidecar](src/providers/npr_station_quality_generated.json). Normal
-startup and playback never launch `ffprobe` to discover station quality.
+invent them. When aliases collapse into one service, a station-specific
+homepage supplied by any alias is retained instead of falling back to NPR's
+general station directory; a service is omitted when none of its aliases
+provides a safe public homepage. Verified NPR quality is populated only by the
+generator's explicit, bounded
+[`ffprobe`](https://ffmpeg.org/ffprobe.html) maintenance mode and stored in the
+checked-in [quality sidecar](src/providers/npr_station_quality_generated.json).
+Normal startup and playback never launch `ffprobe` to discover station quality.
 
 The unpaginated NPR API has no complete-enumeration contract; the checked-in
 count describes a dated state-and-territory snapshot rather than a permanent
@@ -394,16 +397,20 @@ compression efficiency, but does not guarantee higher fidelity than a 192,
 still matter; Youta does not choose a 64 or 48 kbps AAC alternative merely
 because it uses AAC.
 
-Details shows only quality attributes known for that preset, the readable
-playback endpoint, and a summary. `[O] xdg-open · <URL>` on Linux—or
-`[O] open · <URL>` on macOS—is the sole station website row and opens the
-homepage rather than the audio endpoint. The same stable station identity is
-used for playlists, History replay, private station
-notes, and the now-playing click target; transient redirects are never
-persisted. `[B]` cycles name, high-to-low bitrate, and low-to-high bitrate order
-while the selected station remains stable across ordering changes and
-restarts. Routine two-channel streams omit the repetitive `stereo` label;
-known mono or unusual multichannel streams still disclose that distinction.
+Every station's Details body starts with its compiled description, followed by
+only the quality attributes known for that preset and the readable playback
+endpoint. The first explicit link is the visible, clickable
+`Homepage — <URL>` row. Opening that row, using `[O] xdg-open homepage` on Linux
+or `[O] open homepage` on macOS, and choosing `Copy link` all use the same
+canonical homepage rather than the audio endpoint. This metadata is compiled
+into the catalogue, so showing it performs no request and preserves
+zero-network startup. The same stable station identity is used for playlists,
+History replay, private station notes, and the now-playing click target;
+transient redirects are never persisted. `[B]` cycles name, high-to-low
+bitrate, and low-to-high bitrate order while the selected station remains
+stable across ordering changes and restarts. Routine two-channel streams omit
+the repetitive `stereo` label; known mono or unusual multichannel streams still
+disclose that distinction.
 
 Station ICY metadata observed by `mpv` can appear beside the stable station
 title. Selected presets and generated NPR services also have bounded passive

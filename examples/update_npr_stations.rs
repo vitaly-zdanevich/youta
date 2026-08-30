@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 const API_URL: &str = "https://station.api.npr.org/v3/stations";
+const NPR_STATION_DIRECTORY_URL: &str = "https://www.npr.org/stations";
 const STREAMTHEWORLD_LIVE_SUFFIX: &str = ".live.streamtheworld.com";
 const STREAMTHEWORLD_REDIRECT_BASE: &str =
     "https://playerservices.streamtheworld.com/api/livestream-redirect/";
@@ -1167,7 +1168,7 @@ fn collect_services(responses: Vec<StationResponse>) -> BTreeMap<String, Service
             .iter()
             .find(|link| link.rel == "homepage" && valid_web_url(&link.href))
             .map_or_else(
-                || "https://www.npr.org/stations".to_owned(),
+                || NPR_STATION_DIRECTORY_URL.to_owned(),
                 |link| link.href.clone(),
             );
         let brand = station_brand(&item.attributes.brand);
@@ -1231,13 +1232,29 @@ fn collect_services(responses: Vec<StationResponse>) -> BTreeMap<String, Service
                     let group = entry.get_mut();
                     group.aliases.insert(alias);
                     if compare_candidate(&candidate, &group.selected) == Ordering::Less {
-                        group.selected = candidate;
+                        let previous = std::mem::replace(&mut group.selected, candidate);
+                        retain_specific_service_homepage(&mut group.selected, &previous);
+                    } else {
+                        retain_specific_service_homepage(&mut group.selected, &candidate);
                     }
                 }
             }
         }
     }
+    // A different transmitter may have supplied the service homepage during
+    // deduplication. Only after all aliases have been considered is it safe to
+    // omit services that would otherwise point at NPR's generic directory.
+    services.retain(|_, group| group.selected.homepage != NPR_STATION_DIRECTORY_URL);
     services
+}
+
+/// Replaces NPR's generic directory fallback with a page supplied by any alias.
+fn retain_specific_service_homepage(selected: &mut ServiceCandidate, alternate: &ServiceCandidate) {
+    if selected.homepage == NPR_STATION_DIRECTORY_URL
+        && alternate.homepage != NPR_STATION_DIRECTORY_URL
+    {
+        selected.homepage.clone_from(&alternate.homepage);
+    }
 }
 
 fn audio_choices(urls: &[StreamUrl]) -> Vec<AudioChoice> {
@@ -1682,7 +1699,16 @@ fn clean_option(value: Option<&str>) -> Option<String> {
 }
 
 fn valid_web_url(value: &str) -> bool {
-    value.starts_with("https://") || value.starts_with("http://")
+    if value.chars().any(char::is_control) {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 #[cfg(test)]
@@ -1862,6 +1888,54 @@ mod tests {
         assert_eq!(services["primary-guid"].aliases.len(), 2);
         assert_eq!(services["primary-guid"].selected.org_id, "554");
         assert!(!services.contains_key("insecure-guid"));
+    }
+
+    #[test]
+    fn deduplicated_service_keeps_the_specific_homepage_from_an_alias() {
+        let mut response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        let homepage = std::mem::take(&mut response.items[0].links.brand);
+        response.items[1].links.brand = homepage;
+
+        let services = collect_services(vec![response]);
+
+        assert_eq!(
+            services["primary-guid"].selected.homepage, "https://example.test",
+            "a selected transmitter without a homepage must inherit the service's specific page"
+        );
+    }
+
+    #[test]
+    fn homepage_validation_rejects_credentials_malformed_urls_and_controls() {
+        for value in [
+            "https://user:secret@example.test",
+            "https://",
+            "mailto:radio@example.test",
+            "https://example.test/\nsecond-line",
+        ] {
+            assert!(
+                !valid_web_url(value),
+                "unsafe station homepage must be rejected: {value:?}"
+            );
+        }
+        for value in ["https://example.test/", "http://radio.example.test/live"] {
+            assert!(
+                valid_web_url(value),
+                "public homepage must remain valid: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn services_without_a_specific_homepage_are_omitted_after_alias_deduplication() {
+        let mut response: StationResponse = serde_json::from_str(MOCK_RESPONSE).unwrap();
+        response.items[0].links.brand.clear();
+
+        let services = collect_services(vec![response]);
+
+        assert!(
+            services.is_empty(),
+            "a generated station must never point at NPR's generic directory"
+        );
     }
 
     #[test]

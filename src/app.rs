@@ -23644,18 +23644,28 @@ impl AppController {
             description.push_str("\n\n");
             description.push_str(now_playing);
         }
+        // The station's compiled homepage is always the first explicit link,
+        // so every front-end can show and activate it without a network lookup.
+        let homepage_link = DetailLinkView {
+            label: "Homepage".to_owned(),
+            url: station.homepage.to_owned(),
+            ..DetailLinkView::default()
+        };
         #[cfg(feature = "wikidata")]
-        let links = wikidata_item_ids_for_station(station.id)
-            .iter()
-            .map(|item_id| DetailLinkView {
-                label: format!("{} ({item_id})", station.name),
-                url: format!("https://www.wikidata.org/wiki/{item_id}"),
-                wikidata_item_id: Some((*item_id).to_owned()),
-                ..DetailLinkView::default()
-            })
+        let links = std::iter::once(homepage_link)
+            .chain(
+                wikidata_item_ids_for_station(station.id)
+                    .iter()
+                    .map(|item_id| DetailLinkView {
+                        label: format!("{} ({item_id})", station.name),
+                        url: format!("https://www.wikidata.org/wiki/{item_id}"),
+                        wikidata_item_id: Some((*item_id).to_owned()),
+                        ..DetailLinkView::default()
+                    }),
+            )
             .collect();
         #[cfg(not(feature = "wikidata"))]
-        let links = Vec::new();
+        let links = vec![homepage_link];
         // Artwork is not a Wikidata feature: the item is one of two sources for
         // it, and the homepage that answers for the rest of the catalogue is
         // compiled in beside the station itself.
@@ -70397,6 +70407,78 @@ mod tests {
         assert!(details.views.is_empty());
     }
 
+    /// Every station visible in this build must project its existing summary
+    /// and homepage into every shared browser/copy Details contract.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn every_visible_radio_station_projects_description_and_homepage_link() {
+        let config = Config::for_dir("/tmp/youta-radio-detail-homepage-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.show_screen(Screen::Radio);
+        let stations = all_stations().collect::<Vec<_>>();
+        let representative = stations.first().copied().expect("Radio station");
+
+        #[cfg(feature = "bbc-radio")]
+        assert!(
+            stations
+                .iter()
+                .any(|station| station.stream_kind == RadioStreamKind::BbcSounds),
+            "the default combined catalogue regression set must include BBC stations"
+        );
+        for station in stations {
+            select_radio_station(&mut controller, station.id);
+            assert!(
+                !station.summary.trim().is_empty(),
+                "{} must provide a nonblank description",
+                station.id
+            );
+            let details = controller
+                .view
+                .details
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must project Radio details", station.id));
+            let homepage = station
+                .homepage_url()
+                .unwrap_or_else(|error| panic!("{} has an invalid homepage: {error}", station.id));
+            assert!(
+                details.description.starts_with(station.summary),
+                "{} details must start with its catalogue description",
+                station.id
+            );
+            assert_eq!(
+                details.links.first(),
+                Some(&DetailLinkView {
+                    label: "Homepage".to_owned(),
+                    url: station.homepage.to_owned(),
+                    ..DetailLinkView::default()
+                }),
+                "{} must expose its exact homepage as the first explicit Details link",
+                station.id
+            );
+            assert_eq!(
+                details.channel_webpage_url.as_ref(),
+                Some(&homepage),
+                "{} browser action must use its Details homepage",
+                station.id
+            );
+            assert_eq!(
+                controller.current_url().as_deref(),
+                Some(station.homepage),
+                "{} copy action must use its Details homepage",
+                station.id
+            );
+        }
+
+        select_radio_station(&mut controller, representative.id);
+        controller.dispatch(UiAction::CopyLink);
+        let copy = controller
+            .take_clipboard_request()
+            .expect("Radio homepage copy request");
+        assert_eq!(copy.text, representative.homepage);
+        assert_eq!(copy.subject, ClipboardSubject::Link);
+    }
+
     #[cfg(all(feature = "radio", feature = "wikidata"))]
     #[test]
     fn radio_details_use_verified_qid_without_a_discovery_request() {
@@ -70413,12 +70495,19 @@ mod tests {
         let details = controller.view.details.as_ref().expect("KEXP details");
         assert_eq!(
             details.links,
-            [DetailLinkView {
-                label: "KEXP (Q761627)".to_owned(),
-                url: "https://www.wikidata.org/wiki/Q761627".to_owned(),
-                wikidata_item_id: Some("Q761627".to_owned()),
-                ..DetailLinkView::default()
-            }]
+            [
+                DetailLinkView {
+                    label: "Homepage".to_owned(),
+                    url: "https://www.kexp.org/".to_owned(),
+                    ..DetailLinkView::default()
+                },
+                DetailLinkView {
+                    label: "KEXP (Q761627)".to_owned(),
+                    url: "https://www.wikidata.org/wiki/Q761627".to_owned(),
+                    wikidata_item_id: Some("Q761627".to_owned()),
+                    ..DetailLinkView::default()
+                },
+            ]
         );
         // The same verified QID also resolves the station's logotype, which is
         // the one request selecting a station makes on its own.
@@ -70427,7 +70516,18 @@ mod tests {
             ProviderRequest::RadioArtwork { station_id, item_ids, .. }
                 if station_id == "kexp" && item_ids == ["Q761627"]
         ));
-        controller.dispatch(UiAction::ToggleWikidataStatements(0));
+        let wikidata_index = controller
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .links
+                    .iter()
+                    .position(|link| link.wikidata_item_id.as_deref() == Some("Q761627"))
+            })
+            .expect("KEXP Wikidata link");
+        controller.dispatch(UiAction::ToggleWikidataStatements(wikidata_index));
 
         assert!(matches!(
             next_request_ignoring_radio_artwork(&captured_requests)
@@ -70573,7 +70673,18 @@ mod tests {
         controller.provider_requests = Some(requests);
         controller.show_screen(Screen::Radio);
         select_radio_station(&mut controller, "france-musique");
-        controller.dispatch(UiAction::ToggleWikidataStatements(0));
+        let wikidata_index = controller
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .links
+                    .iter()
+                    .position(|link| link.wikidata_item_id.is_some())
+            })
+            .expect("France Musique Wikidata link");
+        controller.dispatch(UiAction::ToggleWikidataStatements(wikidata_index));
         assert!(matches!(
             next_request_ignoring_radio_artwork(&captured_requests)
                 .expect("explicit Wikidata request"),
@@ -70617,9 +70728,12 @@ mod tests {
             details.media_id.as_ref().map(|id| id.external_id.as_str()),
             Some("fip")
         );
-        assert_eq!(
-            details.links[0].wikidata_item_id.as_deref(),
-            Some("Q961891")
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some("Q961891")),
+            "FIP must retain its own Wikidata link after selection changes"
         );
         assert!(details.expanded_wikidata_item.is_none());
         assert!(details.loading_wikidata_item.is_none());

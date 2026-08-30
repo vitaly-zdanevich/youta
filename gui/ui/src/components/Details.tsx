@@ -336,7 +336,11 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {kind === "Video" && isYouTube ? (
           <Action onClick={() => void dispatch("OpenVideoQr")}>QR</Action>
         ) : null}
-        {openable ? <Action onClick={() => void dispatch("OpenInBrowser")}>Open page</Action> : null}
+        {openable ? (
+          <Action onClick={() => void dispatch("OpenInBrowser")}>
+            {kind === "Radio" ? "Open homepage" : "Open page"}
+          </Action>
+        ) : null}
         {view.external_opener_available &&
         (kind === "Video" || kind === "Channel") &&
         details.channel_webpage_url !== null ? (
