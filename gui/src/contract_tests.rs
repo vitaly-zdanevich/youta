@@ -859,6 +859,22 @@ fn the_window_exposes_local_audio_quality_analysis_and_its_result_section() {
     );
 }
 
+#[test]
+fn the_window_renders_dearrow_title_before_the_original_description() {
+    let details = source_named("components/Details.tsx");
+    let alternate = details
+        .find("DeArrow title: {details.dearrow_title}")
+        .expect("labelled DeArrow title");
+    let description = details
+        .find("text={details.description}")
+        .expect("original description");
+
+    assert!(
+        alternate < description,
+        "the alternate title must precede the original description"
+    );
+}
+
 #[cfg(feature = "commons-upload")]
 #[test]
 fn the_window_exposes_commons_review_without_putting_the_hotkey_on_the_button() {

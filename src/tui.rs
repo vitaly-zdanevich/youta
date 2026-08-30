@@ -4460,6 +4460,14 @@ fn render_information_panel(
             Span::styled(display_license_label(&details.license), theme.accent),
         ]));
     }
+    if let Some(title) = details.dearrow_title.as_deref() {
+        let alternate_title = format!("DeArrow title: {title}");
+        lines.extend(
+            wrap_text_lines(&alternate_title, inner.width)
+                .into_iter()
+                .map(Line::raw),
+        );
+    }
     let mut detail_buttons = [
         radio_favorite_button,
         yandex_like_button,
@@ -27382,6 +27390,36 @@ prose 07:25 remains clickable but is not a chapter";
             ),
             Some(UiAction::FingerprintLocalAudio)
         );
+    }
+
+    #[test]
+    fn dearrow_title_precedes_the_original_description_without_replacing_it() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Original video title".to_owned(),
+                source: "YouTube".to_owned(),
+                dearrow_title: Some("Descriptive alternate title".to_owned()),
+                description: "Original provider description".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw DeArrow title");
+        let rendered = rendered_text(&terminal);
+        let alternate = rendered
+            .find("DeArrow title: Descriptive alternate title")
+            .expect("labelled alternate title");
+        let description = rendered
+            .find("Original provider description")
+            .expect("original description");
+
+        assert!(alternate < description);
     }
 
     #[test]

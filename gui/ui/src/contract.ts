@@ -179,6 +179,7 @@ export interface DetailView {
   channel_links_truncated: boolean;
   length: string;
   description: string;
+  dearrow_title: string | null;
   timecodes: DetailTimecodeView[];
   video_links: DetailVideoLinkView[];
   likes: string;

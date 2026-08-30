@@ -1265,8 +1265,9 @@ checked-format retry also fails.
 SponsorBlock is for crowdsourced in-video segments such as sponsor messages;
 it is not a blocker for YouTube's platform-inserted advertisements. Its
 integration cannot be combined with a policy-compliant official YouTube player.
-DeArrow supplies optional crowdsourced titles and thumbnail timestamps; the
-original title remains available and the feature is toggleable.
+When the `dearrow` build feature is enabled, Youta shows a crowdsourced title
+as `DeArrow title: …` immediately before the original video description. The
+provider title remains the primary title and is never replaced.
 
 ## Thumbnails and real TTYs
 

@@ -100,11 +100,11 @@ Privacy-aware hash-prefix queries should be preferred where practical.
 Submission/voting is a later authenticated feature with upstream rate and
 automation rules; read-only support comes first.
 
-DeArrow can supply a crowdsourced title and thumbnail timestamp. Title
-replacement is toggleable globally and per item, with the original always
-inspectable. A thumbnail timestamp is not itself an image; generation may fail,
-so the detail panel keeps a normal fallback. No thumbnail is fetched on an
-unsupported TTY.
+DeArrow can supply a crowdsourced title and thumbnail timestamp. Youta displays
+the alternate title as a labelled line before the original description; it
+does not replace the provider title. A thumbnail timestamp is not itself an
+image; generation may fail, so the detail panel keeps a normal fallback. No
+thumbnail is fetched on an unsupported TTY.
 
 References:
 

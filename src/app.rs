@@ -150,6 +150,8 @@ use crate::providers::bbc::{
     STATIONS as BBC_STATIONS, station_by_id as bbc_station_by_id,
     station_from_url as bbc_station_from_url,
 };
+#[cfg(feature = "dearrow")]
+use crate::providers::dearrow::{DEFAULT_DEARROW_URL, DeArrowClient};
 #[cfg(feature = "network")]
 use crate::providers::github::{GitHubCommit, GitHubCommitClient};
 #[cfg(feature = "librivox")]
@@ -2365,6 +2367,12 @@ enum ProviderRequest {
         generation: u64,
         video_id: String,
     },
+    #[cfg(feature = "dearrow")]
+    DeArrowTitle {
+        generation: u64,
+        video_id: String,
+        original_title: String,
+    },
     VideoComments {
         generation: u64,
         video_id: String,
@@ -2834,6 +2842,12 @@ enum ProviderResponse {
     Details {
         generation: u64,
         result: Result<VideoDetails, String>,
+    },
+    #[cfg(feature = "dearrow")]
+    DeArrowTitle {
+        generation: u64,
+        video_id: String,
+        result: Result<Option<String>, String>,
     },
     VideoComments {
         generation: u64,
@@ -3664,6 +3678,9 @@ const SUBSCRIPTION_VIDEO_METADATA_DEBOUNCE: Duration = Duration::from_millis(200
 const MAX_CACHED_CHANNEL_DETAILS: usize = 64;
 /// Maximum full YouTube video-detail records retained by the process.
 const MAX_CACHED_YOUTUBE_VIDEO_DETAILS: usize = 64;
+/// Maximum positive or empty DeArrow title results retained by the process.
+#[cfg(feature = "dearrow")]
+const MAX_CACHED_DEARROW_TITLES: usize = 64;
 /// Maximum selected-video comment result sets retained for one process.
 const MAX_CACHED_YOUTUBE_VIDEO_COMMENTS: usize = 64;
 /// Conservative owned-heap budget for process-local YouTube comment results.
@@ -4745,6 +4762,12 @@ pub struct AppController {
     youtube_video_details_cache_order: VecDeque<String>,
     /// Conservative owned-heap estimate for full YouTube video details.
     youtube_video_details_cache_bytes: usize,
+    /// Process-local positive and empty DeArrow results keyed by video ID.
+    #[cfg(feature = "dearrow")]
+    dearrow_title_cache: HashMap<String, Option<String>>,
+    /// Least-recently-used order bounding DeArrow title results.
+    #[cfg(feature = "dearrow")]
+    dearrow_title_cache_order: VecDeque<String>,
     /// Whether the active YouTube provider can load public top-level comments.
     youtube_video_comments_supported: bool,
     /// Process-local positive and empty comment results keyed by video ID.
@@ -5940,6 +5963,10 @@ impl AppController {
             youtube_video_details_cache: HashMap::new(),
             youtube_video_details_cache_order: VecDeque::new(),
             youtube_video_details_cache_bytes: 0,
+            #[cfg(feature = "dearrow")]
+            dearrow_title_cache: HashMap::new(),
+            #[cfg(feature = "dearrow")]
+            dearrow_title_cache_order: VecDeque::new(),
             youtube_video_comments_supported,
             youtube_video_comments_cache: HashMap::new(),
             youtube_video_comments_cache_order: VecDeque::new(),
@@ -9857,6 +9884,61 @@ impl AppController {
             .push_back(video_id.to_owned());
     }
 
+    /// Returns a cached positive or empty DeArrow result and promotes its LRU entry.
+    #[cfg(feature = "dearrow")]
+    fn cached_dearrow_title(&mut self, video_id: &str) -> Option<Option<String>> {
+        let cached = self.dearrow_title_cache.get(video_id).cloned();
+        if cached.is_some() {
+            self.dearrow_title_cache_order
+                .retain(|cached_id| cached_id != video_id);
+            self.dearrow_title_cache_order
+                .push_back(video_id.to_owned());
+        }
+        cached
+    }
+
+    /// Retains one bounded positive or empty DeArrow result for this process.
+    #[cfg(feature = "dearrow")]
+    fn cache_dearrow_title(&mut self, video_id: String, mut title: Option<String>) {
+        if let Some(title) = title.as_mut() {
+            truncate_utf8_bytes(title, MAX_CACHED_SUBSCRIPTION_LABEL_BYTES);
+        }
+        if !self.dearrow_title_cache.contains_key(&video_id) {
+            while self.dearrow_title_cache.len() >= MAX_CACHED_DEARROW_TITLES {
+                let Some(oldest) = self.dearrow_title_cache_order.pop_front() else {
+                    break;
+                };
+                self.dearrow_title_cache.remove(&oldest);
+            }
+        }
+        self.dearrow_title_cache.insert(video_id.clone(), title);
+        self.dearrow_title_cache_order
+            .retain(|cached_id| cached_id != &video_id);
+        self.dearrow_title_cache_order.push_back(video_id);
+    }
+
+    /// Requests one optional alternate title unless this process already knows the answer.
+    #[cfg(feature = "dearrow")]
+    fn request_dearrow_title(&mut self, generation: u64, video_id: &str, original_title: &str) {
+        if let Some(cached) = self.cached_dearrow_title(video_id) {
+            if let Some(details) = self.view.details.as_mut()
+                && details.media_id.as_ref().is_some_and(|media_id| {
+                    media_id.source == SourceKind::YouTube && media_id.external_id == video_id
+                })
+            {
+                details.dearrow_title = cached;
+            }
+            return;
+        }
+        if let Some(requests) = self.provider_requests.as_ref() {
+            let _ = requests.send(ProviderRequest::DeArrowTitle {
+                generation,
+                video_id: video_id.to_owned(),
+                original_title: original_title.to_owned(),
+            });
+        }
+    }
+
     /// Returns cached comments and promotes both positive and empty results.
     fn cached_youtube_video_comments(&mut self, video_id: &str) -> Option<Vec<VideoComment>> {
         let comments = self.youtube_video_comments_cache.get(video_id).cloned();
@@ -12167,6 +12249,12 @@ impl AppController {
                             detail.links = links;
                             preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
                             self.view.details = Some(detail);
+                            #[cfg(feature = "dearrow")]
+                            self.request_dearrow_title(
+                                generation,
+                                &details.video_id,
+                                &details.title,
+                            );
                             if linked_matches {
                                 self.view.status_line = self
                                     .active_description_video
@@ -12195,6 +12283,27 @@ impl AppController {
                     }
                 }
                 self.refresh_selected_playlist_state();
+            }
+            #[cfg(feature = "dearrow")]
+            ProviderResponse::DeArrowTitle {
+                generation,
+                video_id,
+                result,
+            } => {
+                let Ok(title) = result else {
+                    return;
+                };
+                self.cache_dearrow_title(video_id.clone(), title.clone());
+                if generation != self.details_generation {
+                    return;
+                }
+                if let Some(details) = self.view.details.as_mut()
+                    && details.media_id.as_ref().is_some_and(|media_id| {
+                        media_id.source == SourceKind::YouTube && media_id.external_id == video_id
+                    })
+                {
+                    details.dearrow_title = title;
+                }
             }
             ProviderResponse::VideoComments {
                 generation,
@@ -35142,6 +35251,34 @@ fn general_provider_worker(
                     break;
                 }
             }
+            #[cfg(feature = "dearrow")]
+            ProviderRequest::DeArrowTitle {
+                generation,
+                video_id,
+                original_title,
+            } => {
+                let result = url::Url::parse(DEFAULT_DEARROW_URL)
+                    .map_err(|error| error.to_string())
+                    .and_then(|base_url| {
+                        DeArrowClient::new(base_url).map_err(|error| error.to_string())
+                    })
+                    .and_then(|client| {
+                        client
+                            .titles(&video_id, original_title)
+                            .map_err(|error| error.to_string())
+                    })
+                    .map(|titles| titles.dearrow.map(|title| title.labeled.text));
+                if responses
+                    .send(ProviderResponse::DeArrowTitle {
+                        generation,
+                        video_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ProviderRequest::VideoComments {
                 generation,
                 video_id,
@@ -44919,6 +45056,57 @@ mod tests {
             webpage_url: None,
             stream_url: None,
         }
+    }
+
+    #[cfg(feature = "dearrow")]
+    #[test]
+    fn dearrow_request_preserves_the_provider_title_as_context() {
+        let config = Config::for_dir("/tmp/youta-dearrow-title-request-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+
+        controller.request_dearrow_title(11, "dQw4w9WgXcQ", "Original video title");
+
+        let request = requests.try_recv().expect("DeArrow request");
+        assert!(matches!(
+            request,
+            ProviderRequest::DeArrowTitle {
+                generation: 11,
+                video_id,
+                original_title,
+            } if video_id == "dQw4w9WgXcQ" && original_title == "Original video title"
+        ));
+    }
+
+    #[cfg(feature = "dearrow")]
+    #[test]
+    fn dearrow_response_enriches_only_the_matching_detail_title() {
+        let config = Config::for_dir("/tmp/youta-dearrow-title-response-test");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.details_generation = 7;
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+            title: "Original video title".to_owned(),
+            description: "Original provider description".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.handle_provider_response(ProviderResponse::DeArrowTitle {
+            generation: 7,
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            result: Ok(Some("Descriptive alternate title".to_owned())),
+        });
+
+        let details = controller.view.details.as_ref().expect("visible Details");
+        assert_eq!(details.title, "Original video title");
+        assert_eq!(
+            details.dearrow_title.as_deref(),
+            Some("Descriptive alternate title")
+        );
+        assert_eq!(details.description, "Original provider description");
     }
 
     /// Returns one bounded, network-free public-comment fixture.

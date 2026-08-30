@@ -417,6 +417,12 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         ) : null}
       </div>
 
+      {details.dearrow_title !== null ? (
+        <p className="mt-3 border-t border-line pt-[10px] text-xs text-ink-dim">
+          DeArrow title: {details.dearrow_title}
+        </p>
+      ) : null}
+
       <Description
         text={details.description}
         timecodes={details.timecodes}

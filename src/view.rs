@@ -695,6 +695,8 @@ pub struct DetailView {
     pub length: String,
     /// Description text.
     pub description: String,
+    /// Crowdsourced anti-clickbait title displayed alongside the original title.
+    pub dearrow_title: Option<String>,
     /// Full Last.fm artist biography discovered after local fingerprinting.
     ///
     /// This enrichment is kept separate from [`Self::description`] so a late
