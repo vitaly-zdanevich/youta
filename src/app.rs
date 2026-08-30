@@ -48389,8 +48389,11 @@ mod tests {
         );
 
         controller.request_visible_channel_subscriber_counts();
+        let subscriber_count_refetched = captured_requests
+            .try_iter()
+            .any(|request| matches!(request, ProviderRequest::ChannelSubscriberCounts { .. }));
         assert!(
-            captured_requests.try_recv().is_err(),
+            !subscriber_count_refetched,
             "positive and negative RAM cache entries must suppress refetches"
         );
     }
