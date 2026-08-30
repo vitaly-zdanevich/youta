@@ -1857,7 +1857,7 @@ pub enum EvernoteNotePhase {
 #[cfg(feature = "evernote")]
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EvernoteNotePopupView {
-    /// Editable note metadata and immutable source URL.
+    /// Editable note metadata and an optional immutable remote source URL.
     pub draft: EvernoteNoteDraft,
     /// Field currently receiving keyboard input.
     pub selected_field: EvernoteNoteField,
@@ -2616,7 +2616,7 @@ pub enum UiAction {
     /// Open the successful Commons file page.
     #[cfg(feature = "commons-upload")]
     OpenCommonsUploadResult,
-    /// Open the selected remote media in an Evernote audio-note review.
+    /// Open the selected remote or local media in an Evernote audio-note review.
     #[cfg(feature = "evernote")]
     OpenEvernoteNote,
     /// Select one editable Evernote note field.

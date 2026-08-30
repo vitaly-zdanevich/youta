@@ -125,7 +125,7 @@ export function HelpPopup({
           : []),
 		...(evernoteSupported
 			? ([
-					['E', 'save selected remote audio to Evernote'],
+					['E', 'save selected audio to Evernote'],
 				] satisfies Array<[string, string]>)
 			: []),
         ["s · n", "subscribe · private note"],
@@ -535,7 +535,9 @@ export function EvernoteNotePopup({ popup }: { popup: EvernoteNotePopupView }) {
 						<EvernoteField label='Tags (optional)' field='Tags' selected={popup.selected_field === 'Tags'} value={popup.draft.tags} />
 						<div className='grid min-h-[42px] grid-cols-[145px_minmax(0,1fr)] gap-3 rounded-[5px] border border-line-strong px-[9px] py-[6px] text-xs'>
 							<span className='text-ink-faint'>Source URL</span>
-							<span className='truncate'>{popup.draft.source_url}</span>
+							<span className='truncate'>
+								{popup.draft.source_url === '' ? 'Not available for local files' : popup.draft.source_url}
+							</span>
 						</div>
 						<p className='text-[11px] text-ink-faint'>Ctrl+Z undoes changes to the note body.</p>
 					</div>

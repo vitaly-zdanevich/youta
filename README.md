@@ -1756,16 +1756,19 @@ files on Commons](https://commons.wikimedia.org/wiki/Commons:YouTube_files),
 ## Evernote audio notes
 
 The default-on `evernote` feature adds `Save audio to Evernote` for selected
-remote video and audio items. Its uppercase `E` shortcut is documented only in
-Help. A review popup pre-fills the optional title and provider description,
-accepts optional comma-separated tags, and always retains the immutable
-canonical video or audio page as the note source. For YouTube, `Add YouTube
+remote or local video and audio items. Its uppercase `E` shortcut is documented
+only in Help. A review popup pre-fills the optional title and provider
+description, accepts optional comma-separated tags, and retains the immutable
+canonical video or audio page as the note source for remote items. Local notes
+omit the web-only source URL. For YouTube, `Add YouTube
 captions` retrieves the preferred bounded transcript and inserts it into the
 note body as one edit; `Ctrl+Z` restores the previous body state.
 
-On confirmation, Youta stages a private Opus file and creates an ENML note with
-an `audio/ogg` resource. The popup shows a slow activity indicator during
-caption retrieval, audio preparation, and the blocking Evernote request. EDAM
+On confirmation, Youta stages a private Opus file by downloading remote media,
+copying an existing local Opus file, or transcoding another playable local file
+with FFmpeg. It then creates an ENML note with an `audio/ogg` resource. The
+popup shows a slow activity indicator during caption retrieval, audio
+preparation, and the blocking Evernote request. EDAM
 accepts the resource in one Thrift request and exposes no acknowledged byte
 offsets, so Youta shows the staged attachment size rather than an invented
 upload progress bar. A successful save presents the clickable note URL and

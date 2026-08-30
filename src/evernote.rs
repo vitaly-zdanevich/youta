@@ -41,7 +41,7 @@ pub struct EvernoteNoteDraft {
     pub body: String,
     /// Optional comma-separated Evernote tag names.
     pub tags: String,
-    /// Immutable canonical provider link stored as the note's source URL.
+    /// Immutable canonical provider link, or empty for a local file.
     pub source_url: String,
 }
 
@@ -51,7 +51,7 @@ impl EvernoteNoteDraft {
     /// # Errors
     ///
     /// Returns an explanation when a field exceeds Evernote's bounded model or
-    /// the source is not a credential-free remote HTTP(S) link.
+    /// a present source is not a credential-free remote HTTP(S) link.
     pub fn validate(&self) -> Result<Vec<String>, String> {
         let title = self.title.trim();
         if title.len() > 255 || title.chars().any(char::is_control) {
@@ -62,17 +62,19 @@ impl EvernoteNoteDraft {
         if self.body.len() > MAXIMUM_NOTE_BODY_BYTES {
             return Err("The Evernote note body exceeds 512 KiB".to_owned());
         }
-        let source = Url::parse(self.source_url.trim()).map_err(|_| {
-            "The Evernote source URL must be an HTTP(S) video or audio link".to_owned()
-        })?;
-        if !matches!(source.scheme(), "http" | "https")
-            || source.host_str().is_none()
-            || !source.username().is_empty()
-            || source.password().is_some()
-        {
-            return Err(
-                "The Evernote source URL must be an HTTP(S) video or audio link".to_owned(),
-            );
+        if !self.source_url.trim().is_empty() {
+            let source = Url::parse(self.source_url.trim()).map_err(|_| {
+                "The Evernote source URL must be an HTTP(S) video or audio link".to_owned()
+            })?;
+            if !matches!(source.scheme(), "http" | "https")
+                || source.host_str().is_none()
+                || !source.username().is_empty()
+                || source.password().is_some()
+            {
+                return Err(
+                    "The Evernote source URL must be an HTTP(S) video or audio link".to_owned(),
+                );
+            }
         }
 
         let mut tags = Vec::new();
@@ -118,8 +120,10 @@ impl EvernoteNoteDraft {
         if !self.body.is_empty() {
             content.push_str("<div><br/></div>\n");
         }
-        let source = escape_xml(self.source_url.trim());
-        let _ = writeln!(content, "<div><a href=\"{source}\">Source</a></div>");
+        if !self.source_url.trim().is_empty() {
+            let source = escape_xml(self.source_url.trim());
+            let _ = writeln!(content, "<div><a href=\"{source}\">Source</a></div>");
+        }
         let _ = writeln!(
             content,
             "<div><br/></div>\n<en-media type=\"audio/ogg\" hash=\"{audio_hash}\"/>"
@@ -265,7 +269,8 @@ where
             content: Some(draft.enml(&digest_hex)),
             attributes: Some(NoteAttributes {
                 source: Some("youta".to_owned()),
-                source_u_r_l: Some(draft.source_url.trim().to_owned()),
+                source_u_r_l: (!draft.source_url.trim().is_empty())
+                    .then(|| draft.source_url.trim().to_owned()),
                 source_application: Some(EVERNOTE_CLIENT_NAME.to_owned()),
                 ..NoteAttributes::default()
             }),
@@ -543,6 +548,22 @@ mod tests {
             draft.validate().expect_err("local source URL must fail"),
             "The Evernote source URL must be an HTTP(S) video or audio link"
         );
+    }
+
+    #[test]
+    fn local_draft_accepts_an_absent_source_and_omits_the_source_link() {
+        let draft = EvernoteNoteDraft {
+            title: "Local recording".to_owned(),
+            body: "Recorded locally".to_owned(),
+            tags: "archive".to_owned(),
+            source_url: String::new(),
+        };
+
+        assert_eq!(draft.validate().expect("local draft"), vec!["archive"]);
+        let rendered = draft.enml("00112233445566778899aabbccddeeff");
+        assert!(!rendered.contains("href="));
+        assert!(!rendered.contains(">Source</a>"));
+        assert!(rendered.contains("<en-media type=\"audio/ogg\""));
     }
 
     #[test]

@@ -8471,7 +8471,7 @@ fn render_evernote_popup(
     .split(inner);
     frame.render_widget(
 		Paragraph::new(
-			"Youta currently saves audio only. Title, description, and tags are optional; the source link is always included.",
+			"Youta currently saves audio only. Remote items retain their source link; local files do not add one.",
 		)
 		.style(theme.base)
 		.wrap(Wrap { trim: false }),
@@ -8515,9 +8515,14 @@ fn render_evernote_popup(
             hit_map.evernote_fields.push((field, *field_area));
         }
     }
+    let source_url = if popup.draft.source_url.is_empty() {
+        "Not available for local files"
+    } else {
+        &popup.draft.source_url
+    };
     frame.render_widget(
         Paragraph::new(truncate_setup_value(
-            &popup.draft.source_url,
+            source_url,
             usize::from(sections[4].width.saturating_sub(2)),
         ))
         .style(theme.muted)
@@ -20612,6 +20617,13 @@ mod tests {
         assert!(rendered.contains("Fixture title"), "{rendered}");
         assert!(rendered.contains("youtube.com/watch?v=dQw4w9WgXcQ"));
         assert!(rendered.contains("Add YouTube captions"));
+
+        let popup = view.evernote_popup.as_mut().expect("Evernote popup");
+        popup.draft.source_url.clear();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw local Evernote review");
+        assert!(rendered_text(&terminal).contains("Not available for local files"));
 
         let popup = view.evernote_popup.as_mut().expect("Evernote popup");
         popup.phase = EvernoteNotePhase::Saving;

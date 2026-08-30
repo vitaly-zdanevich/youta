@@ -3011,6 +3011,24 @@ struct EvernoteSelection {
     source: OpusAudioSource,
 }
 
+#[cfg(feature = "evernote")]
+impl EvernoteSelection {
+    /// Builds fresh review metadata without exposing a local filesystem URL.
+    fn draft(&self) -> EvernoteNoteDraft {
+        EvernoteNoteDraft {
+            title: self.media.title.clone(),
+            body: self.media.description.clone().unwrap_or_default(),
+            tags: String::new(),
+            source_url: match &self.source {
+                OpusAudioSource::LocalFile(_) => String::new(),
+                OpusAudioSource::PublicPage(_) | OpusAudioSource::YandexMusic { .. } => {
+                    self.media.webpage_url.to_string()
+                }
+            },
+        }
+    }
+}
+
 /// Messages from the sole active Evernote captions or save worker.
 #[cfg(feature = "evernote")]
 enum EvernoteWorkerResponse {
@@ -15450,6 +15468,30 @@ impl AppController {
         }
     }
 
+    /// Returns the selected exportable remote item or exact local file.
+    #[cfg(feature = "evernote")]
+    fn selected_evernote_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen != Screen::Local {
+            return self.selected_queue_item();
+        }
+        let listing = self
+            .local_listing
+            .as_ref()
+            .ok_or_else(|| "No local folder is loaded".to_owned())?;
+        let index = self
+            .local_entry_index()
+            .ok_or_else(|| "Select a local audio, video, or tracker file".to_owned())?;
+        let entry = listing
+            .entries
+            .get(index)
+            .filter(|entry| entry.kind.is_playable() && entry.path.is_file())
+            .ok_or_else(|| "Select an available local media file".to_owned())?;
+        queue_item_from_local(&local_media_item(
+            entry.path.clone(),
+            &self.config.providers.ffprobe_executable,
+        ))
+    }
+
     /// Captures the selected playable item without retaining transient media URLs.
     ///
     /// Provider pages and local paths remain canonical so the resulting
@@ -15836,12 +15878,14 @@ impl AppController {
         }
         #[cfg(feature = "evernote")]
         {
-            self.view.evernote_available = self.selected_queue_item().is_ok_and(|item| {
-                !matches!(
-                    item.media.id.source,
-                    SourceKind::Local | SourceKind::ModArchive | SourceKind::RemoteFiles
-                ) && matches!(item.media.webpage_url.scheme(), "http" | "https")
-            });
+            self.view.evernote_available =
+                self.selected_evernote_queue_item()
+                    .is_ok_and(|item| match item.media.id.source {
+                        SourceKind::Local => local_path_from_media_id(&item.media.id)
+                            .is_some_and(|path| path.is_file()),
+                        SourceKind::ModArchive | SourceKind::RemoteFiles => false,
+                        _ => matches!(item.media.webpage_url.scheme(), "http" | "https"),
+                    });
         }
         self.view.playlist_item = None;
         self.view.playlist_edit_available = self.view.screen == Screen::Playlists
@@ -17109,7 +17153,7 @@ impl AppController {
             "An Evernote operation is already running".clone_into(&mut self.view.status_line);
             return;
         }
-        let item = match self.selected_queue_item() {
+        let item = match self.selected_evernote_queue_item() {
             Ok(item) => item,
             Err(error) => {
                 self.view.status_line = error;
@@ -17118,9 +17162,9 @@ impl AppController {
         };
         if matches!(
             item.media.id.source,
-            SourceKind::Local | SourceKind::ModArchive | SourceKind::RemoteFiles
+            SourceKind::ModArchive | SourceKind::RemoteFiles
         ) {
-            "Evernote audio export requires a remote video or audio source"
+            "Evernote audio export does not support this source"
                 .clone_into(&mut self.view.status_line);
             return;
         }
@@ -17134,34 +17178,43 @@ impl AppController {
         {
             media.description = Some(details.description.clone());
         }
-        let source = if media.id.source == SourceKind::YandexMusic {
-            let Some(token) = self.config.providers.yandex_music_token.clone() else {
-                "Configure Yandex Music before exporting its audio"
-                    .clone_into(&mut self.view.status_line);
-                return;
-            };
-            OpusAudioSource::YandexMusic {
-                track_id: media.id.external_id.clone(),
-                token,
+        let source = match media.id.source {
+            SourceKind::Local => {
+                let Some(path) = local_path_from_media_id(&media.id)
+                    .filter(|path| path.is_absolute() && path.is_file())
+                else {
+                    "The selected local media file is unavailable"
+                        .clone_into(&mut self.view.status_line);
+                    return;
+                };
+                OpusAudioSource::LocalFile(path)
             }
-        } else {
-            let audio_url = url::Url::parse(&item.playback_location)
-                .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https"))
-                .unwrap_or_else(|| media.webpage_url.clone());
-            OpusAudioSource::PublicPage(audio_url)
+            SourceKind::YandexMusic => {
+                let Some(token) = self.config.providers.yandex_music_token.clone() else {
+                    "Configure Yandex Music before exporting its audio"
+                        .clone_into(&mut self.view.status_line);
+                    return;
+                };
+                OpusAudioSource::YandexMusic {
+                    track_id: media.id.external_id.clone(),
+                    token,
+                }
+            }
+            _ => {
+                let audio_url = url::Url::parse(&item.playback_location)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .unwrap_or_else(|| media.webpage_url.clone());
+                OpusAudioSource::PublicPage(audio_url)
+            }
         };
-        let draft = EvernoteNoteDraft {
-            title: media.title.clone(),
-            body: media.description.clone().unwrap_or_default(),
-            tags: String::new(),
-            source_url: media.webpage_url.to_string(),
-        };
+        let selection = EvernoteSelection { media, source };
+        let draft = selection.draft();
         if let Err(error) = draft.validate() {
             self.view.status_line = error;
             return;
         }
-        self.evernote_selection = Some(EvernoteSelection { media, source });
+        self.evernote_selection = Some(selection);
         self.evernote_body_undo.clear();
         if self.config.providers.evernote_auth_token.is_some() {
             self.open_evernote_review(draft);
@@ -17389,15 +17442,13 @@ impl AppController {
             }
             return;
         }
-        let Some(selection) = self.evernote_selection.as_ref() else {
+        let Some(draft) = self
+            .evernote_selection
+            .as_ref()
+            .map(EvernoteSelection::draft)
+        else {
             self.view.evernote_credentials_popup = None;
             return;
-        };
-        let draft = EvernoteNoteDraft {
-            title: selection.media.title.clone(),
-            body: selection.media.description.clone().unwrap_or_default(),
-            tags: String::new(),
-            source_url: selection.media.webpage_url.to_string(),
         };
         self.open_evernote_review(draft);
     }
@@ -47588,6 +47639,54 @@ mod tests {
                 .expect_err("removed file must not be captured")
                 .contains("Only available local")
         );
+    }
+
+    #[cfg(all(feature = "evernote", feature = "local-browser"))]
+    #[test]
+    fn selected_local_audio_opens_an_evernote_review_without_a_source_url() {
+        let temporary = crate::test_support::canonical_tempdir("temporary local audio");
+        let path = temporary.path().join("field-recording.opus");
+        std::fs::write(&path, b"fixture local Opus").expect("local Opus fixture");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.evernote_auth_token = Some("fixture-token".to_owned());
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+            path: temporary.path().to_owned(),
+            parent: None,
+            entries: vec![crate::local_browser::LocalEntry {
+                name: "field-recording.opus".into(),
+                path: path.clone(),
+                kind: crate::local_browser::LocalEntryKind::Audio,
+                size_bytes: Some(18),
+                image_dimensions: None,
+                directory_identity: None,
+            }],
+            truncated: false,
+            inspected_entries: 1,
+        });
+        controller.refresh_local_browser_rows();
+        controller.refresh_selected_playlist_state();
+
+        assert!(controller.view.evernote_available);
+        controller.open_evernote_note();
+
+        let selection = controller
+            .evernote_selection
+            .as_ref()
+            .expect("local Evernote selection");
+        assert!(matches!(
+            &selection.source,
+            OpusAudioSource::LocalFile(selected) if selected == &path
+        ));
+        let popup = controller
+            .view
+            .evernote_popup
+            .as_ref()
+            .expect("Evernote review");
+        assert!(popup.draft.source_url.is_empty());
+        assert!(!popup.captions_available);
     }
 
     #[test]

@@ -1,13 +1,13 @@
-//! Private provider-audio staging shared by explicit remote exports.
+//! Private audio staging shared by explicit remote and local-file exports.
 //!
 //! Public pages are delegated to the user's configured `yt-dlp`; authenticated
-//! Yandex Music tracks retain Youta's native resolver and fetcher. Every path
-//! is confined to a caller-owned private directory and normalized to Opus.
+//! Yandex Music tracks retain Youta's native resolver and fetcher. Local files
+//! are copied or transcoded without a downloader. Every output is confined to
+//! a caller-owned private directory and normalized to Opus.
 
 use std::fs;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "yandex-music")]
 use std::process::{Command, Stdio};
 #[cfg(feature = "yandex-music")]
 use std::sync::Arc;
@@ -40,9 +40,11 @@ pub enum OpusAudioSource {
         /// OAuth token copied only into the worker.
         token: String,
     },
+    /// Existing local media copied or transcoded through the configured `FFmpeg`.
+    LocalFile(PathBuf),
 }
 
-/// Downloads and, when needed, transcodes provider media into one private Opus file.
+/// Copies, downloads, or transcodes selected media into one private Opus file.
 ///
 /// The caller owns `staging_directory`, which must not already exist. Completed
 /// output remains inside that directory so it can be removed after export.
@@ -82,7 +84,59 @@ pub fn prepare_provider_opus(
                 Err("This build omits Yandex Music support".to_owned())
             }
         }
+        OpusAudioSource::LocalFile(path) => {
+            prepare_local_file_opus(path, staging_directory, ffmpeg_executable, progress)
+        }
     }
+}
+
+fn prepare_local_file_opus(
+    source: &Path,
+    staging_directory: &Path,
+    ffmpeg_executable: &Path,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, String> {
+    let source = fs::canonicalize(source)
+        .map_err(|error| format!("Cannot resolve the selected local audio: {error}"))?;
+    let metadata = fs::metadata(&source)
+        .map_err(|error| format!("Cannot inspect the selected local audio: {error}"))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("The selected local audio must be a non-empty regular file".to_owned());
+    }
+    let output = staging_directory.join("audio.opus");
+    if source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("opus"))
+    {
+        fs::copy(&source, &output)
+            .map_err(|error| format!("Could not stage the selected local Opus file: {error}"))?;
+        progress(metadata.len(), Some(metadata.len()));
+        return validate_staged_opus_path(staging_directory, output);
+    }
+
+    let command = Command::new(ffmpeg_executable)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-n", "-i"])
+        .arg(&source)
+        .args(["-vn", "-c:a", "libopus", "-f", "opus"])
+        .arg(&output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("Could not start FFmpeg for local audio: {error}"))?;
+    if !command.status.success() {
+        let diagnostics = String::from_utf8_lossy(&command.stderr);
+        return Err(format!(
+            "FFmpeg could not create Opus audio from the local file: {}",
+            diagnostics.trim()
+        ));
+    }
+    let output_bytes = fs::metadata(&output)
+        .map_err(|error| format!("Cannot inspect the prepared local Opus audio: {error}"))?
+        .len();
+    progress(output_bytes, Some(output_bytes));
+    validate_staged_opus_path(staging_directory, output)
 }
 
 fn prepare_public_page_opus(
@@ -210,4 +264,65 @@ fn validate_staged_opus_path(directory: &Path, path: PathBuf) -> Result<PathBuf,
         return Err("The prepared Opus path escaped its private staging directory".to_owned());
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn local_opus_is_copied_into_private_staging_without_a_downloader() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let source = temporary.path().join("field-recording.opus");
+        fs::write(&source, b"fixture opus bytes").expect("local Opus fixture");
+        let staging = temporary.path().join("staging");
+        let mut progress = Vec::new();
+
+        let prepared = prepare_provider_opus(
+            &OpusAudioSource::LocalFile(source),
+            &staging,
+            Path::new("yt-dlp-must-not-run"),
+            Path::new("ffmpeg-must-not-run"),
+            |written, total| progress.push((written, total)),
+        )
+        .expect("staged local Opus");
+
+        assert_eq!(prepared.parent(), Some(staging.as_path()));
+        assert_eq!(
+            fs::read(prepared).expect("prepared bytes"),
+            b"fixture opus bytes"
+        );
+        assert_eq!(progress, vec![(18, Some(18))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_non_opus_media_is_transcoded_with_ffmpeg() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let source = temporary.path().join("field-recording.flac");
+        fs::write(&source, b"fixture source bytes").expect("local audio fixture");
+        let ffmpeg = temporary.path().join("fixture-ffmpeg");
+        fs::write(&ffmpeg, b"#!/bin/sh\ncp \"$7\" \"${13}\"\n").expect("fixture FFmpeg");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("executable fixture FFmpeg");
+        let staging = temporary.path().join("staging");
+        let mut progress = Vec::new();
+
+        let prepared = prepare_provider_opus(
+            &OpusAudioSource::LocalFile(source),
+            &staging,
+            Path::new("yt-dlp-must-not-run"),
+            &ffmpeg,
+            |written, total| progress.push((written, total)),
+        )
+        .expect("transcoded local audio");
+
+        assert_eq!(
+            fs::read(prepared).expect("prepared bytes"),
+            b"fixture source bytes"
+        );
+        assert_eq!(progress, vec![(20, Some(20))]);
+    }
 }

@@ -1053,16 +1053,18 @@ must preserve the same explicit review boundary.
 
 ### Evernote Opus note transfer
 
-The default `evernote` feature reuses the provider-audio staging boundary but
+The default `evernote` feature reuses the audio-staging boundary but
 keeps a separate review and worker lifecycle:
 
-1. retain the selected remote item's canonical page as an immutable source URL;
+1. retain a selected remote item's canonical page as an immutable source URL,
+   while omitting that web-only attribute for a selected local file;
 2. prefill optional title and description fields and accept optional tags;
 3. optionally retrieve bounded YouTube captions and append them as one undoable
    note-body edit;
-4. stage provider audio as Opus in a private generation-owned runtime directory;
-5. build escaped ENML containing the source link and an `audio/ogg` resource
-   identified by its MD5 body hash;
+4. stage remote audio or copy/transcode a local file as Opus in a private
+   generation-owned runtime directory;
+5. build escaped ENML containing the remote source link when present and an
+   `audio/ogg` resource identified by its MD5 body hash;
 6. discover the account NoteStore through UserStore, create the note in one
    blocking Thrift request, and return the canonical shard note URL.
 

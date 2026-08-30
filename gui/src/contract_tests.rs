@@ -945,11 +945,12 @@ fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button()
 
     let popups = source_named("components/popups.tsx");
     for required in [
-        "['E', 'save selected remote audio to Evernote']",
+        "['E', 'save selected audio to Evernote']",
         "Youta currently saves audio only",
         "EvernoteField label='Title (optional)'",
         "EvernoteField label='Description / body'",
         "EvernoteField label='Tags (optional)'",
+        "Not available for local files",
         "Add YouTube captions",
         "InsertEvernoteCaptions",
         "Ctrl+Z undoes changes to the note body.",
