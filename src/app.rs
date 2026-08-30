@@ -109,7 +109,7 @@ use crate::persistence::SavedYouTubeMusicSearch;
 use crate::persistence::{
     CachedSubscriptionItems, MAX_PLAYLIST_ITEM_DESCRIPTION_BYTES, MAX_PLAYLIST_NAME_BYTES,
     MAX_PLAYLIST_SNAPSHOT_BYTES, MAX_SAVED_SUBSCRIPTION_ITEMS, MAX_SAVED_YOUTUBE_SEARCH_RESULTS,
-    PlaylistCreateOutcome, PlaylistToggleOutcome, SavedYouTubeSearch, StateStore,
+    PersistenceError, PlaylistCreateOutcome, PlaylistToggleOutcome, SavedYouTubeSearch, StateStore,
 };
 #[cfg(feature = "bandcamp")]
 use crate::persistence::{MAX_SAVED_BANDCAMP_SEARCH_RESULTS, SavedBandcampSearch};
@@ -27884,6 +27884,23 @@ impl AppController {
         self.view.status_line = format!("{title}: {message}");
     }
 
+    /// Presents an actionable restart conflict without manufacturing a bug report.
+    fn show_session_save_error(&mut self, error: &PersistenceError) {
+        const TITLE: &str = "Could not save screen state";
+        if matches!(
+            error,
+            PersistenceError::StateDocumentChangedExternally {
+                document: "runtime session"
+            }
+        ) {
+            let message = error.to_string();
+            self.show_actionable_message(TITLE, &message);
+            self.view.status_line = format!("{TITLE}: {message}");
+        } else {
+            self.show_error(TITLE, error);
+        }
+    }
+
     /// Presents the actionable yt-dlp 403 body before starting any helper or
     /// network request, then fills each version row independently.
     #[cfg(feature = "yt-dlp")]
@@ -31032,7 +31049,7 @@ impl AppController {
                 true
             }
             Err(error) => {
-                self.show_error("Could not save screen state", &error);
+                self.show_session_save_error(&error);
                 self.session_dirty = true;
                 false
             }
@@ -48513,6 +48530,37 @@ mod tests {
             std::fs::read_to_string(checkpoint_path).expect("preserved external edit"),
             external
         );
+    }
+
+    #[test]
+    fn externally_changed_runtime_session_shows_only_the_restart_message() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let session_path = config.runtime_dir().join("session.toml");
+        let store = StateStore::open(&config).expect("disk state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        let externally_edited = format!(
+            "{}\n# edited outside Youta\n",
+            std::fs::read_to_string(&session_path).expect("runtime session")
+        );
+        std::fs::write(&session_path, externally_edited).expect("external session edit");
+        controller.session_dirty = true;
+
+        assert!(!controller.save_session());
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("session conflict popup");
+        assert_eq!(popup.title, "Could not save screen state");
+        assert_eq!(
+            popup.report,
+            "runtime session state document changed outside Youta; restart before saving to avoid overwriting the external edit"
+        );
+        assert!(!popup.reportable);
+        assert!(!popup.gh_available);
     }
 
     #[test]
