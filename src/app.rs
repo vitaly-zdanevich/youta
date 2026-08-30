@@ -53,11 +53,11 @@ use crate::commons_upload::{
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
-    PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV,
-    SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV,
-    VIDEO_SUMMARY_BACKEND_ENV, VideoSummaryBackend, YOUTUBE_PREWARM_ENV,
-    YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
-    tui_preference_environment_variable_is_relevant,
+    NYAN_CAT_SEEKBAR_ENV, PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV,
+    SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
+    SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV, VideoSummaryBackend,
+    YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting,
+    YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -5483,6 +5483,7 @@ impl AppController {
                 && matches!(saved.screen, StoredScreen::Local),
             show_chapter_timestamps: !saved.chapter_timestamps_hidden,
             playback_history_enabled: config.persistence.save_playback_history,
+            nyan_cat_seekbar: cfg!(feature = "nyan-cat") && config.ui.nyan_cat_seekbar,
             ..ViewModel::default()
         };
         view.subscriptions.layout = config.ui.subscriptions_layout;
@@ -30203,6 +30204,7 @@ impl AppController {
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
             SPONSORBLOCK_ENABLED_ENV,
+            NYAN_CAT_SEEKBAR_ENV,
             YOUTUBE_PREWARM_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             LOCAL_FOLDER_SIZES_ENV,
@@ -30221,6 +30223,8 @@ impl AppController {
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
             sponsorblock_enabled: self.config.playback.sponsorblock_enabled,
             sponsorblock_supported: cfg!(feature = "sponsorblock"),
+            nyan_cat_seekbar: cfg!(feature = "nyan-cat") && self.config.ui.nyan_cat_seekbar,
+            nyan_cat_supported: cfg!(feature = "nyan-cat"),
             youtube_prewarm: self.config.playback.youtube_prewarm,
             youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
@@ -30380,6 +30384,25 @@ impl AppController {
             return;
         }
         preferences.sponsorblock_enabled = !preferences.sponsorblock_enabled;
+        preferences.validation_error = None;
+    }
+
+    /// Toggles the draft seek-bar renderer without changing playback state.
+    fn toggle_draft_nyan_cat_seekbar(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if !preferences.nyan_cat_supported {
+            preferences.validation_error =
+                Some("this build omits the `nyan-cat` feature".to_owned());
+            return;
+        }
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.nyan_cat_seekbar = !preferences.nyan_cat_seekbar;
         preferences.validation_error = None;
     }
 
@@ -31032,6 +31055,7 @@ impl AppController {
         let layout = preferences.subscriptions_layout;
         let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
         let sponsorblock_enabled = preferences.sponsorblock_enabled;
+        let nyan_cat_seekbar = preferences.nyan_cat_seekbar;
         let youtube_prewarm = preferences.youtube_prewarm;
         let youtube_thumbnail_size = preferences.youtube_thumbnail_size;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
@@ -31058,6 +31082,7 @@ impl AppController {
             layout,
             skip_advertisement_chapters,
             sponsorblock_enabled,
+            nyan_cat_seekbar,
             youtube_prewarm,
             show_local_folder_sizes,
             show_images_in_tty,
@@ -31088,6 +31113,7 @@ impl AppController {
         }
         self.view.subscriptions.layout = layout;
         self.view.skip_advertisement_chapters = skip_advertisement_chapters;
+        self.view.nyan_cat_seekbar = cfg!(feature = "nyan-cat") && nyan_cat_seekbar;
         #[cfg(feature = "sponsorblock")]
         if sponsorblock_preference_changed {
             self.skipped_sponsorblock_segment = None;
@@ -31137,7 +31163,7 @@ impl AppController {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}; SponsorBlock {}; YouTube preparation {}; playback History {}; video summaries {}; TTY images {}; Bandcamp audio {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; SponsorBlock {}; Nyan Cat {}; YouTube preparation {}; playback History {}; video summaries {}; TTY images {}; Bandcamp audio {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
@@ -31146,6 +31172,11 @@ impl AppController {
             },
             if cfg!(feature = "sponsorblock") {
                 if sponsorblock_enabled { "on" } else { "off" }
+            } else {
+                "unavailable in this build"
+            },
+            if cfg!(feature = "nyan-cat") {
+                if nyan_cat_seekbar { "on" } else { "off" }
             } else {
                 "unavailable in this build"
             },
@@ -32682,6 +32713,7 @@ impl UiController for AppController {
             UiAction::ToggleSponsorBlock => {
                 self.toggle_draft_sponsorblock();
             }
+            UiAction::ToggleNyanCatSeekbar => self.toggle_draft_nyan_cat_seekbar(),
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
             UiAction::TogglePlaybackHistorySaving => {
                 self.toggle_draft_playback_history_saving();
@@ -55973,6 +56005,8 @@ mod tests {
         controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
         #[cfg(feature = "sponsorblock")]
         controller.dispatch(UiAction::ToggleSponsorBlock);
+        #[cfg(feature = "nyan-cat")]
+        controller.dispatch(UiAction::ToggleNyanCatSeekbar);
         controller.dispatch(UiAction::ToggleYouTubePrewarm);
         #[cfg(feature = "images")]
         controller.dispatch(UiAction::CycleYouTubeThumbnailSize);
@@ -55999,6 +56033,7 @@ mod tests {
             SubscriptionsLayout::Split
         );
         assert!(!controller.view.local_folder_sizes_enabled);
+        assert_eq!(controller.view.nyan_cat_seekbar, cfg!(feature = "nyan-cat"));
         #[cfg(feature = "images")]
         assert!(!controller.view.show_images_in_tty);
         #[cfg(not(feature = "images"))]
@@ -56012,6 +56047,10 @@ mod tests {
         assert!(contents.contains("[ui]"));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        #[cfg(feature = "nyan-cat")]
+        assert!(contents.contains("nyan_cat_seekbar = true"));
+        #[cfg(not(feature = "nyan-cat"))]
+        assert!(!contents.contains("nyan_cat_seekbar"));
         #[cfg(feature = "images")]
         assert!(contents.contains("youtube_thumbnail_size = \"disabled\""));
         #[cfg(feature = "images")]
@@ -56032,6 +56071,7 @@ mod tests {
             Config::load_from_dir(config.config_dir()).expect("reload saved preferences");
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        assert_eq!(reloaded.ui.nyan_cat_seekbar, cfg!(feature = "nyan-cat"));
         #[cfg(feature = "images")]
         assert_eq!(
             reloaded.ui.youtube_thumbnail_size,

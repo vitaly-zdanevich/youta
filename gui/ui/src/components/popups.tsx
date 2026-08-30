@@ -1163,6 +1163,21 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
               SponsorBlock is not included in this build.
             </p>
           )}
+          {popup.nyan_cat_supported ? (
+            <label className="flex items-center justify-between gap-4">
+              <span className="text-ink-dim">Rainbow Nyan Cat seek bar</span>
+              <PopupButton
+                emphasis={popup.nyan_cat_seekbar}
+                onClick={() => void dispatch('ToggleNyanCatSeekbar')}
+              >
+                {popup.nyan_cat_seekbar ? 'on' : 'off'}
+              </PopupButton>
+            </label>
+          ) : (
+            <p className="m-0 text-[11px] text-ink-faint">
+              Nyan Cat seek bar is not included in this build.
+            </p>
+          )}
           {toggles.map(([label, value, action]) => (
             <label key={label} className="flex items-center justify-between gap-4">
               <span className="text-ink-dim">{label}</span>

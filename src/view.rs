@@ -916,6 +916,10 @@ pub struct PreferencesPopupView {
     pub sponsorblock_enabled: bool,
     /// Whether this binary contains the removable `SponsorBlock` capability.
     pub sponsorblock_supported: bool,
+    /// Draft Nyan Cat seek-bar behavior saved only on confirmation.
+    pub nyan_cat_seekbar: bool,
+    /// Whether this binary contains the removable Nyan Cat renderer.
+    pub nyan_cat_supported: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
     pub youtube_prewarm: bool,
     /// Draft exact `YouTube` thumbnail size saved only on confirmation.
@@ -2042,6 +2046,8 @@ pub struct ViewModel {
     pub show_chapter_timestamps: bool,
     /// Whether exact `Реклама` chapters are hidden from navigation and skipped.
     pub skip_advertisement_chapters: bool,
+    /// Whether the rainbow Nyan Cat renderer replaces the standard seek fill.
+    pub nyan_cat_seekbar: bool,
     /// Local file-browser ordering by known file and lazy folder sizes.
     pub local_size_sort: LocalSizeSort,
     /// Whether Local includes unsupported regular files alongside media.
@@ -2254,6 +2260,7 @@ impl Default for ViewModel {
             playback_chapters: Vec::new(),
             show_chapter_timestamps: false,
             skip_advertisement_chapters: true,
+            nyan_cat_seekbar: false,
             local_size_sort: LocalSizeSort::Off,
             show_all_local_files: false,
             radio_sort: RadioSort::Name,
@@ -2835,6 +2842,8 @@ pub enum UiAction {
     ToggleSkipAdvertisementChapters,
     /// Toggle automatic `SponsorBlock` sponsorship skipping in the draft.
     ToggleSponsorBlock,
+    /// Toggle the rainbow Nyan Cat seek bar in the draft.
+    ToggleNyanCatSeekbar,
     /// Toggle selected-video YouTube prewarming in the draft.
     ToggleYouTubePrewarm,
     /// Cycle the exact YouTube thumbnail size in the draft.

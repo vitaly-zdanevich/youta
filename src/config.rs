@@ -44,6 +44,9 @@ pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTIS
 /// Environment variable that overrides automatic `SponsorBlock` segment skipping.
 pub const SPONSORBLOCK_ENABLED_ENV: &str = "YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED";
 
+/// Environment variable that overrides the rainbow Nyan Cat seek bar.
+pub const NYAN_CAT_SEEKBAR_ENV: &str = "YOUTA_UI__NYAN_CAT_SEEKBAR";
+
 /// Environment variable that overrides automatic same-source queue continuation.
 pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
 
@@ -75,6 +78,7 @@ pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) ->
     (cfg!(feature = "images") || variable != TTY_IMAGES_ENV)
         && (cfg!(feature = "summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
         && (cfg!(feature = "sponsorblock") || variable != SPONSORBLOCK_ENABLED_ENV)
+        && (cfg!(feature = "nyan-cat") || variable != NYAN_CAT_SEEKBAR_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -705,8 +709,9 @@ impl Config {
     /// Persists the preferences currently exposed by the in-app editor.
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, `SponsorBlock`
-    /// behavior (when compiled), selected YouTube-video prewarming, lazy Local
-    /// folder size preference, physical-TTY image preference, exact `YouTube`
+    /// behavior (when compiled), Nyan Cat seek bar (when compiled), selected
+    /// YouTube-video prewarming, lazy Local folder size preference, physical-TTY
+    /// image preference, exact `YouTube`
     /// thumbnail size, playback-History saving preference, and (when compiled)
     /// video-summary backend are written together so confirming the popup
     /// cannot save only part of the draft.
@@ -714,7 +719,7 @@ impl Config {
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
     /// [`SPONSORBLOCK_ENABLED_ENV`] and
-    /// [`YOUTUBE_PREWARM_ENV`] and
+    /// [`NYAN_CAT_SEEKBAR_ENV`], [`YOUTUBE_PREWARM_ENV`] and
     /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
     /// precedence and therefore prevent this writer from storing a shadowed
@@ -739,6 +744,7 @@ impl Config {
         layout: SubscriptionsLayout,
         skip_advertisement_chapters: bool,
         sponsorblock_enabled: bool,
+        nyan_cat_seekbar: bool,
         youtube_prewarm: bool,
         show_local_folder_sizes: bool,
         show_images_in_tty: bool,
@@ -750,6 +756,7 @@ impl Config {
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
             SPONSORBLOCK_ENABLED_ENV,
+            NYAN_CAT_SEEKBAR_ENV,
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
@@ -783,6 +790,10 @@ impl Config {
                 })?;
             ui["subscriptions_layout"] = value(layout.as_config_value());
             ui["show_local_folder_sizes"] = value(show_local_folder_sizes);
+            #[cfg(feature = "nyan-cat")]
+            {
+                ui["nyan_cat_seekbar"] = value(nyan_cat_seekbar);
+            }
             #[cfg(feature = "images")]
             {
                 ui["show_images_in_tty"] = value(show_images_in_tty);
@@ -841,6 +852,12 @@ impl Config {
 
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
+        #[cfg(feature = "nyan-cat")]
+        {
+            self.ui.nyan_cat_seekbar = nyan_cat_seekbar;
+        }
+        #[cfg(not(feature = "nyan-cat"))]
+        let _ = nyan_cat_seekbar;
         #[cfg(feature = "images")]
         {
             self.ui.show_images_in_tty = show_images_in_tty;
@@ -2138,6 +2155,10 @@ mod tests {
             tui_preference_environment_variable_is_relevant(SPONSORBLOCK_ENABLED_ENV),
             cfg!(feature = "sponsorblock")
         );
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(NYAN_CAT_SEEKBAR_ENV),
+            cfg!(feature = "nyan-cat")
+        );
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
         ));
@@ -2511,6 +2532,7 @@ youtube_api_key = "keep-this-existing-secret"
                 SubscriptionsLayout::Split,
                 false,
                 false,
+                true,
                 false,
                 false,
                 false,
@@ -2532,6 +2554,10 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("sponsorblock_enabled = false"));
         #[cfg(not(feature = "sponsorblock"))]
         assert!(!contents.contains("sponsorblock_enabled"));
+        #[cfg(feature = "nyan-cat")]
+        assert!(contents.contains("nyan_cat_seekbar = true"));
+        #[cfg(not(feature = "nyan-cat"))]
+        assert!(!contents.contains("nyan_cat_seekbar"));
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
@@ -2623,6 +2649,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 false,
                 false,
+                false,
                 YouTubeThumbnailSize::High,
                 false,
                 VideoSummaryBackend::Off,
@@ -2634,6 +2661,40 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("backend = \"codex\""));
         assert!(contents.contains("codex_executable = \"/opt/openai/bin/codex\""));
         assert_eq!(config.video_summary.backend, VideoSummaryBackend::Codex);
+    }
+
+    #[cfg(all(feature = "controller", not(feature = "nyan-cat")))]
+    #[test]
+    fn feature_off_preferences_preserve_existing_nyan_cat_toml() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# retain Nyan Cat for another build\n[ui]\nnyan_cat_seekbar = false\ntheme = \"dark\"\n",
+        )
+        .expect("write configuration");
+        let mut config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load configuration");
+
+        config
+            .save_tui_preferences(
+                SubscriptionsLayout::Split,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                YouTubeThumbnailSize::High,
+                false,
+                VideoSummaryBackend::Off,
+            )
+            .expect("save supported preferences");
+
+        let contents = fs::read_to_string(path).expect("read configuration");
+        assert!(contents.contains("# retain Nyan Cat for another build"));
+        assert!(contents.contains("nyan_cat_seekbar = false"));
+        assert!(!config.ui.nyan_cat_seekbar);
     }
 
     #[cfg(feature = "controller")]
@@ -2837,6 +2898,7 @@ youtube_api_key = "keep-this-existing-secret"
                     true,
                     true,
                     true,
+                    true,
                     YouTubeThumbnailSize::Standard,
                     true,
                     VideoSummaryBackend::Codex,
@@ -2855,6 +2917,7 @@ youtube_api_key = "keep-this-existing-secret"
             (SUBSCRIPTIONS_LAYOUT_ENV, "split"),
             (SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false"),
             (SPONSORBLOCK_ENABLED_ENV, "false"),
+            (NYAN_CAT_SEEKBAR_ENV, "true"),
             (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),

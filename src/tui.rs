@@ -91,16 +91,6 @@ const WAVEFORM_ROWS: u16 = 4;
 /// Player rows reserved for the waveform plus its one-line playback status.
 const WAVEFORM_PLAYER_ROWS: u16 = WAVEFORM_ROWS + 1;
 
-/// Seek-bar visual style.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SeekBarStyle {
-    /// A compact terminal gauge.
-    #[default]
-    Line,
-    /// A small animated cat label on the progress marker.
-    NyanCat,
-}
-
 /// UI color and visibility preferences.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiSettings {
@@ -108,8 +98,6 @@ pub struct UiSettings {
     pub show_hotkeys: bool,
     /// Use the humorous DOS-RPG-inspired border palette.
     pub funny_mode: bool,
-    /// Seek-bar rendering mode.
-    pub seek_bar_style: SeekBarStyle,
     /// Whether supported terminals may fetch and render thumbnails.
     pub thumbnails: ThumbnailMode,
     /// Maximum thumbnail height in terminal rows.
@@ -138,7 +126,6 @@ impl Default for UiSettings {
         Self {
             show_hotkeys: true,
             funny_mode: false,
-            seek_bar_style: SeekBarStyle::Line,
             thumbnails: ThumbnailMode::Auto,
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
@@ -5655,7 +5642,7 @@ fn render_seek_bar(
     frame: &mut Frame<'_>,
     area: Rect,
     view: &ViewModel,
-    settings: &UiSettings,
+    _settings: &UiSettings,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -5679,10 +5666,6 @@ fn render_seek_bar(
         None
     };
     let state_suffix = state.map_or_else(String::new, |state| format!(" {state}"));
-    let marker = match settings.seek_bar_style {
-        SeekBarStyle::Line => "",
-        SeekBarStyle::NyanCat => " =^.^= ",
-    };
     let title_spacing = if !view.playback.idle && view.playback.title.is_some() {
         " "
     } else {
@@ -5745,10 +5728,7 @@ fn render_seek_bar(
         .as_deref()
         .map(terminal_text_width)
         .unwrap_or_default();
-    let label = format!(
-        "{status_prefix}{}{marker}",
-        title.as_deref().unwrap_or_default()
-    );
+    let label = format!("{status_prefix}{}", title.as_deref().unwrap_or_default());
     if view.waveform_visible {
         let waveform_height = area.height.saturating_sub(1).min(WAVEFORM_ROWS);
         let waveform_area = Rect::new(area.x, area.y, area.width, waveform_height);
@@ -5807,6 +5787,7 @@ fn render_seek_bar(
             .label("");
         frame.render_widget(gauge, track_area);
         render_buffered_ranges(frame, track_area, &view.playback, duration, theme);
+        render_nyan_cat_seekbar(frame, track_area, view, ratio);
         render_chapter_timeline(
             frame, label_area, track_area, view, duration, theme, hit_map,
         );
@@ -5833,6 +5814,7 @@ fn render_seek_bar(
             .label("");
         frame.render_widget(gauge, track_area);
         render_buffered_ranges(frame, track_area, &view.playback, duration, theme);
+        render_nyan_cat_seekbar(frame, track_area, view, ratio);
         if !view.playback_chapters.is_empty() {
             render_chapter_timeline(
                 frame,
@@ -5867,6 +5849,64 @@ fn render_seek_bar(
         hit_map.seek_bar = area;
     }
 }
+
+/// Paints a terminal-palette rainbow behind a compact cat at the playhead.
+///
+/// The six named ANSI colors remain legible on plain virtual consoles and do
+/// not depend on true-color support. Tiny one-row player layouts retain the
+/// ordinary gauge because they cannot show both this track and playback text.
+#[cfg(feature = "nyan-cat")]
+fn render_nyan_cat_seekbar(frame: &mut Frame<'_>, area: Rect, view: &ViewModel, ratio: f64) {
+    const CAT: &str = "=^.^=";
+    const RAINBOW: [Color; 6] = [
+        Color::Red,
+        Color::Yellow,
+        Color::Green,
+        Color::Cyan,
+        Color::Blue,
+        Color::Magenta,
+    ];
+
+    if !view.nyan_cat_seekbar
+        || view.playback.idle
+        || view
+            .playback
+            .duration
+            .is_none_or(|duration| duration.is_zero())
+        || area.height == 0
+        || area.width < u16::try_from(CAT.len()).unwrap_or(u16::MAX)
+    {
+        return;
+    }
+
+    let played_width = ((ratio * f64::from(area.width)).ceil() as u16).min(area.width);
+    for column in 0..played_width {
+        frame.buffer_mut()[(area.x.saturating_add(column), area.y)]
+            .set_symbol(ratatui::symbols::block::FULL)
+            .set_fg(RAINBOW[usize::from(column) % RAINBOW.len()]);
+    }
+
+    let cat_width = u16::try_from(CAT.len()).unwrap_or(area.width);
+    let playhead = (ratio * f64::from(area.width.saturating_sub(1))).round() as u16;
+    let cat_start = playhead
+        .saturating_sub(cat_width / 2)
+        .min(area.width.saturating_sub(cat_width));
+    for (offset, symbol) in CAT.chars().enumerate() {
+        let x = area
+            .x
+            .saturating_add(cat_start)
+            .saturating_add(u16::try_from(offset).unwrap_or_default());
+        frame.buffer_mut()[(x, area.y)].set_char(symbol).set_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
+/// Leaves the standard seek bar intact when the renderer is compiled out.
+#[cfg(not(feature = "nyan-cat"))]
+fn render_nyan_cat_seekbar(_frame: &mut Frame<'_>, _area: Rect, _view: &ViewModel, _ratio: f64) {}
 
 /// Renders the status beneath the seek track and records only the visible
 /// now-playing title as a mouse target.
@@ -9705,6 +9745,48 @@ fn render_preferences_popup(
             1,
         ),
     ));
+
+    let nyan_cat_label = if preferences.nyan_cat_supported {
+        format!(
+            "[N] Rainbow Nyan Cat seek bar: {}",
+            if preferences.nyan_cat_seekbar {
+                "on"
+            } else {
+                "off"
+            }
+        )
+    } else {
+        "Nyan Cat seek bar: unavailable in this build".to_owned()
+    };
+    let nyan_cat_area = Rect::new(
+        sections[4].x,
+        sections[4].y.saturating_add(1),
+        sections[4].width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(nyan_cat_label.clone())
+            .style(if !preferences.nyan_cat_supported {
+                theme.muted
+            } else if preferences.nyan_cat_seekbar {
+                theme.selected
+            } else {
+                theme.base
+            })
+            .alignment(Alignment::Center),
+        nyan_cat_area,
+    );
+    if preferences.nyan_cat_supported {
+        hit_map.preferences_buttons.push((
+            UiAction::ToggleNyanCatSeekbar,
+            Rect::new(
+                centered_line_x(nyan_cat_area, terminal_text_width(&nyan_cat_label)),
+                nyan_cat_area.y,
+                terminal_text_width(&nyan_cat_label).min(nyan_cat_area.width),
+                1,
+            ),
+        ));
+    }
 
     let youtube_thumbnail_label = if cfg!(feature = "images") {
         format!(
@@ -17687,6 +17769,8 @@ mod tests {
                 skip_advertisement_chapters: true,
                 sponsorblock_enabled: true,
                 sponsorblock_supported: true,
+                nyan_cat_seekbar: true,
+                nyan_cat_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
@@ -17712,6 +17796,7 @@ mod tests {
         assert!(!rendered.contains("[h] Save playback history"));
         assert!(rendered.contains("[S] SponsorBlock sponsored segments: on"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
+        assert!(rendered.contains("[N] Rainbow Nyan Cat seek bar: on"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[t] YouTube thumbnails: 640×480 (standard)"));
         #[cfg(not(feature = "images"))]
@@ -17741,6 +17826,10 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleSponsorBlock)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleNyanCatSeekbar)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &view),
@@ -17848,6 +17937,24 @@ mod tests {
                 &view,
             ),
             Some(UiAction::ToggleSponsorBlock)
+        );
+        let (_, nyan_cat_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleNyanCatSeekbar)
+            .expect("Nyan Cat target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: nyan_cat_target.x,
+                    row: nyan_cat_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleNyanCatSeekbar)
         );
         let (_, youtube_prewarm_target) = hit_map
             .preferences_buttons
@@ -18021,6 +18128,8 @@ mod tests {
                 skip_advertisement_chapters: true,
                 sponsorblock_enabled: true,
                 sponsorblock_supported: true,
+                nyan_cat_seekbar: true,
+                nyan_cat_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
@@ -18063,6 +18172,8 @@ mod tests {
                 skip_advertisement_chapters: true,
                 sponsorblock_enabled: true,
                 sponsorblock_supported: true,
+                nyan_cat_seekbar: true,
+                nyan_cat_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
@@ -24526,7 +24637,8 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn seek_bar_layers_discontinuous_cached_ranges_behind_progress_for_both_styles() {
-        for seek_bar_style in [SeekBarStyle::Line, SeekBarStyle::NyanCat] {
+        for nyan_cat_seekbar in [false, true] {
+            let nyan_cat_rendered = cfg!(feature = "nyan-cat") && nyan_cat_seekbar;
             let backend = TestBackend::new(80, 2);
             let mut terminal = Terminal::new(backend).expect("terminal");
             let view = ViewModel {
@@ -24554,12 +24666,10 @@ prose 07:25 remains clickable but is not a chapter";
                     ],
                     ..PlaybackStatus::default()
                 },
+                nyan_cat_seekbar,
                 ..ViewModel::default()
             };
-            let settings = UiSettings {
-                seek_bar_style,
-                ..UiSettings::default()
-            };
+            let settings = UiSettings::default();
             let mut hit_map = HitMap::default();
 
             terminal
@@ -24576,7 +24686,14 @@ prose 07:25 remains clickable but is not a chapter";
                 .expect("draw");
             let buffer = terminal.backend().buffer();
 
-            assert_eq!(buffer[(4, 0)].fg, Color::Cyan);
+            assert_eq!(
+                buffer[(4, 0)].fg,
+                if nyan_cat_rendered {
+                    Color::Blue
+                } else {
+                    Color::Cyan
+                }
+            );
             assert_eq!(
                 buffer[(4, 0)].symbol(),
                 ratatui::symbols::block::FULL,
@@ -24609,9 +24726,60 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
-            if seek_bar_style == SeekBarStyle::NyanCat {
+            if nyan_cat_rendered {
                 assert!(rendered.contains("=^.^="));
             }
+        }
+    }
+
+    #[cfg(feature = "nyan-cat")]
+    #[test]
+    fn nyan_cat_seekbar_places_the_cat_at_the_playhead_over_rainbow_progress() {
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(50),
+                duration: Some(Duration::from_secs(100)),
+                ..PlaybackStatus::default()
+            },
+            nyan_cat_seekbar: true,
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+
+        terminal
+            .draw(|frame| {
+                render_seek_bar(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &settings,
+                    &Theme::new(false),
+                    &mut HitMap::default(),
+                );
+            })
+            .expect("draw Nyan Cat seek bar");
+
+        let buffer = terminal.backend().buffer();
+        let track = (0..80).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(
+            track.contains("=^.^="),
+            "the cat must occupy the seek track at the current playhead: {track}"
+        );
+        for color in [
+            Color::Red,
+            Color::Yellow,
+            Color::Green,
+            Color::Cyan,
+            Color::Blue,
+            Color::Magenta,
+        ] {
+            assert!(
+                (0..40).any(|x| buffer[(x, 0)].fg == color),
+                "played progress must include {color:?}"
+            );
         }
     }
 

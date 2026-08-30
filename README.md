@@ -562,7 +562,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,qr,sponsorblock,summary
+	--features app,audio-quality,nyan-cat,qr,sponsorblock,summary
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -573,7 +573,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,qr,sponsorblock,summary
+	--features app-core,audio-quality,images,nyan-cat,qr,sponsorblock,summary
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -583,14 +583,16 @@ features are additive: `app-core` is the complete profile without
 `summary` is the independently removable Codex summary integration,
 `sponsorblock` is the independently removable SponsorBlock client and playback
 skip integration,
+`nyan-cat` is the independently removable rainbow seek-bar renderer,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
-default feature set still enables audio-quality analysis, SponsorBlock, video
-summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
+default feature set still enables audio-quality analysis, SponsorBlock, the
+Nyan Cat renderer, video summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
 custom command above to retain archive folders; leaving it out removes the
 archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
 cache, and playback code. The shared ZIP decoder also disappears only when no
 other selected feature, such as tracker archive support, enables `archive-zip`.
+Leave `nyan-cat` out to remove the terminal and desktop rainbow renderer.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -1301,6 +1303,15 @@ lookup discloses the selected YouTube video ID to the public
 SponsorBlock service; Youta does not submit segments or votes. SponsorBlock data
 is supplied by its community; see its
 [database/API licence and attribution terms](https://github.com/ajayyy/SponsorBlock/wiki/Database-and-API-License).
+
+The default build includes the `nyan-cat` renderer, but its runtime preference
+starts off. Enable **Rainbow Nyan Cat seek bar** in Preferences to replace the
+played fill with the six-color terminal palette and place `=^.^=` at the exact
+playhead. The desktop window uses the same shared preference. Set
+`ui.nyan_cat_seekbar = true` or `YOUTA_UI__NYAN_CAT_SEEKBAR=true` for the same
+behavior without the popup. Builds made with `--no-default-features` can omit
+`nyan-cat` to remove both renderers and their preference control.
+
 When the `dearrow` build feature is enabled, Youta shows a crowdsourced title
 as `DeArrow title: …` immediately before the original video description. The
 provider title remains the primary title and is never replaced.
@@ -1601,7 +1612,7 @@ existing rows intact.
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
 skipped, choose whether SponsorBlock segments are skipped, choose whether
-selected YouTube audio is prepared, choose whether Local folder sizes are
+the rainbow Nyan Cat seek bar is used, choose whether selected YouTube audio is prepared, choose whether Local folder sizes are
 measured, choose the exact YouTube video-thumbnail size, choose whether new
 playback History entries are saved, choose the explicit summary backend, and
 press `Enter` to save. These preferences can be configured directly:
@@ -1618,6 +1629,7 @@ subscriptions_layout = 'drill-down' # drill-down or split
 show_youtube_shorts = true
 show_local_folder_sizes = true
 youtube_thumbnail_size = 'automatic'
+nyan_cat_seekbar = false
 
 [persistence]
 save_playback_history = true
@@ -1632,8 +1644,9 @@ codex_executable = 'codex'
 `YOUTA_PLAYBACK__AUTOPLAY=true` and
 `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false` and
 `YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` and
-`YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false` override the corresponding TOML
-values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
+`YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false` and
+`YOUTA_UI__NYAN_CAT_SEEKBAR=true` override the corresponding TOML values.
+`YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
 video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
@@ -2003,8 +2016,8 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality`, `commons-upload`,
-`evernote`, `local-archives`, `sponsorblock`, and `summary` flags to their Cargo
-features.
+`evernote`, `local-archives`, `nyan-cat`, `sponsorblock`, and `summary` flags to
+their Cargo features.
 `USE="-audio-quality"` removes the analyzer and RustFFT dependency.
 `USE="-commons-upload"` removes the Commons client and review UI.
 `USE="-evernote"` removes the Evernote EDAM client and note UI.
@@ -2013,6 +2026,7 @@ dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
 unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
 extraction. `USE="-sponsorblock"` removes its API client, preference, cache, and
 playback skip logic. `USE="-summary"` removes the Codex summary UI and backend.
+`USE="-nyan-cat"` removes the rainbow seek-bar renderers and preference.
 Prebuilt
 executables contain the fixed upstream feature set and keep these capabilities
 enabled; offering binary USE switches would require another copy of every

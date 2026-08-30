@@ -165,7 +165,7 @@ fn run_tui(config: Config) -> Result<()> {
 
     use youta::app::AppController;
     use youta::diagnostics::{DiagnosticReport, format_panic};
-    use youta::tui::{SeekBarStyle, UiSettings};
+    use youta::tui::UiSettings;
 
     let diagnostic_mpv = config.providers.mpv_executable.clone();
     let diagnostic_yt_dlp = config.providers.yt_dlp_executable.clone();
@@ -180,11 +180,6 @@ fn run_tui(config: Config) -> Result<()> {
     let settings = UiSettings {
         show_hotkeys: config.ui.show_button_hotkeys,
         funny_mode: config.ui.dos_rpg_mode,
-        seek_bar_style: if config.ui.nyan_cat_seekbar {
-            SeekBarStyle::NyanCat
-        } else {
-            SeekBarStyle::Line
-        },
         thumbnails: config.ui.thumbnails,
         thumbnail_height: config.ui.thumbnail_height,
         prefetch_search_thumbnails: config.ui.prefetch_search_thumbnails,

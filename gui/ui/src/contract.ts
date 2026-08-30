@@ -366,6 +366,8 @@ export interface PreferencesPopupView {
   skip_advertisement_chapters: boolean;
   sponsorblock_enabled: boolean;
   sponsorblock_supported: boolean;
+  nyan_cat_seekbar: boolean;
+  nyan_cat_supported: boolean;
   youtube_prewarm: boolean;
   youtube_thumbnail_size: string;
   show_local_folder_sizes: boolean;
@@ -665,6 +667,7 @@ export interface ViewModel {
   playback_starting: boolean;
   playback_chapters: Chapter[];
   show_chapter_timestamps: boolean;
+  nyan_cat_seekbar: boolean;
   radio_now_playing: string | null;
   autoplay: boolean;
   repeating: boolean;

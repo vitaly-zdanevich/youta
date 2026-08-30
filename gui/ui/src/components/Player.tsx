@@ -90,6 +90,7 @@ export function Player({
   playback,
   chapters,
   showChapterTimestamps,
+  nyanCatSeekbar,
   artwork,
   autoplay,
   repeating,
@@ -100,6 +101,7 @@ export function Player({
   playback: PlaybackStatus;
   chapters: Chapter[];
   showChapterTimestamps: boolean;
+  nyanCatSeekbar: boolean;
   artwork: string | null;
   autoplay: boolean;
   repeating: boolean;
@@ -132,7 +134,27 @@ export function Player({
         <div className="min-w-0 grow">
           <div className="relative h-[3px] rounded-[3px] bg-line-strong">
             <Buffered playback={playback} duration={duration} />
-            <i className="absolute inset-y-0 left-0 rounded-[3px] bg-accent" style={{ width: `${progress}%` }} />
+            <i
+              className="absolute inset-y-0 left-0 rounded-[3px] bg-accent"
+              style={{
+                width: `${progress}%`,
+                backgroundImage: nyanCatSeekbar
+                  ? 'linear-gradient(90deg, #ef4444, #eab308, #22c55e, #06b6d4, #3b82f6, #d946ef)'
+                  : undefined,
+              }}
+            />
+            {nyanCatSeekbar && !playback.idle && duration > 0 ? (
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute -top-[9px] font-mono text-[9px] leading-none font-bold text-ink"
+                style={{
+                  left: `clamp(14px, ${progress}%, calc(100% - 14px))`,
+                  transform: 'translateX(-50%)',
+                }}
+              >
+                =^.^=
+              </span>
+            ) : null}
             <input
               ref={scrub}
               type="range"

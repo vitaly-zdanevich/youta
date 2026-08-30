@@ -137,6 +137,8 @@ fn preferences() -> PreferencesPopupView {
         skip_advertisement_chapters: false,
         sponsorblock_enabled: true,
         sponsorblock_supported: true,
+        nyan_cat_seekbar: true,
+        nyan_cat_supported: true,
         youtube_prewarm: false,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
         show_local_folder_sizes: false,

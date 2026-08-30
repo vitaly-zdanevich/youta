@@ -161,6 +161,7 @@ export function App() {
           playback={view.playback}
           chapters={view.playback_chapters}
           showChapterTimestamps={view.show_chapter_timestamps}
+          nyanCatSeekbar={view.nyan_cat_seekbar}
           artwork={view.details?.thumbnail_url ?? null}
           autoplay={view.autoplay}
           repeating={view.repeating}

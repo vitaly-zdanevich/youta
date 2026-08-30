@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.44.0"
+version = "0.45.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -39,6 +39,7 @@ default = [
     "gpm",
     "images",
     "local-archives",
+    "nyan-cat",
     "qr",
     "sponsorblock",
     "summary",
@@ -145,6 +146,8 @@ pulseaudio = []
 pipewire = []
 # Lazy local-file peak extraction through the user's existing FFmpeg helper.
 waveform = ["local-browser"]
+# Optional rainbow Nyan Cat seek-bar rendering shared by both front-ends.
+nyan-cat = []
 # On-demand local-file spectral analysis through the configured FFmpeg helper.
 # Rust performs the bounded FFT analysis; disabling this feature removes both
 # the action and its DSP dependency.

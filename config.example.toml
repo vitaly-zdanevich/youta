@@ -118,6 +118,10 @@ prefetch_search_thumbnails = true
 # YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false has higher precedence.
 show_local_folder_sizes = true
 seekbar_color = 'cyan'
+
+# Replace the standard seek fill with a six-color rainbow and place the cat at
+# the current playhead. The renderer is built by default but starts disabled.
+# YOUTA_UI__NYAN_CAT_SEEKBAR=true has higher precedence.
 nyan_cat_seekbar = false
 dos_rpg_mode = false
 

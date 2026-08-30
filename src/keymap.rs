@@ -1096,6 +1096,9 @@ fn unfiltered_key_action(
             Key::Char('S') if preferences.sponsorblock_supported => {
                 Some(UiAction::ToggleSponsorBlock)
             }
+            Key::Char('N') if preferences.nyan_cat_supported => {
+                Some(UiAction::ToggleNyanCatSeekbar)
+            }
             Key::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             Key::Char('t') if cfg!(feature = "images") => Some(UiAction::CycleYouTubeThumbnailSize),
             Key::Char('f') => Some(UiAction::ToggleLocalFolderSizes),

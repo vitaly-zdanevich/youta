@@ -225,6 +225,47 @@ fn sponsorblock_is_default_but_removable_from_both_front_ends() {
 }
 
 #[test]
+fn nyan_cat_seekbar_is_default_but_removable_from_both_front_ends() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+
+    assert!(default.contains("nyan-cat"));
+    assert!(
+        !application.contains("nyan-cat"),
+        "`app` must not make the Nyan Cat renderer impossible to compile out"
+    );
+    assert!(feature_entries(&manifest, "nyan-cat").is_empty());
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("nyan-cat"))
+    );
+    assert_eq!(
+        gui["features"]["nyan-cat"]
+            .as_array()
+            .expect("GUI Nyan Cat forwarding")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        ["youta/nyan-cat"]
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("`nyan-cat` is the independently removable rainbow seek-bar renderer"));
+    assert!(readme.contains("`YOUTA_UI__NYAN_CAT_SEEKBAR=true`"));
+    assert!(readme.contains("`USE=\"-nyan-cat\"` removes the rainbow seek-bar"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,nyan-cat"));
+}
+
+#[test]
 fn audio_quality_is_default_but_remains_a_removable_local_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -400,8 +441,8 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app,audio-quality,qr"));
-    assert!(readme.contains("--features app-core,audio-quality,images,qr"));
+    assert!(readme.contains("--features app,audio-quality,nyan-cat,qr"));
+    assert!(readme.contains("--features app-core,audio-quality,images,nyan-cat,qr"));
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -473,14 +514,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,qr,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,sponsorblock,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {
         assert!(
             script
@@ -679,14 +720,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {
         assert!(
             ci.contains(&format!(
