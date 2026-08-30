@@ -47,6 +47,16 @@ interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
   terminal images are enabled, selecting a finite local video lazily extracts
   its midpoint frame through a bounded `ffmpeg` worker and reuses the persistent
   thumbnail cache on later visits.
+  The default-on `local-archives` feature presents ZIP and RAR files as
+  read-only folders. `Enter` opens an archive or a nested archive, and `Esc`
+  returns to the containing folder while reselecting it. ZIP decoding is
+  in-process; RAR requires the external `unrar` program. Youta validates member
+  paths and types first, streams regular files through per-member and total byte
+  limits into a private regenerable cache beneath `~/.config/youta/cache/`, and
+  never asks `unrar` to choose output paths. Rename, Move, and Trash remain
+  disabled inside archive folders. Reopening an unchanged archive reuses its
+  extraction; replacing the source atomically replaces the one cache entry for
+  that source instead of retaining stale copies.
   `[w]` lazily generates a waveform for a local audio or video file with the
   existing `ffmpeg` helper and replaces the normal seek bar without hiding
   Details. Peak extraction is cancellable, runs outside the UI thread, aligns
@@ -522,7 +532,9 @@ cargo run --locked -- --help
 ```
 
 The default build expects `mpv` and `yt-dlp` at runtime for online playback,
-and `ffmpeg` for explicit local audio-quality analysis and waveform generation.
+`ffmpeg` for explicit local audio-quality analysis and waveform generation, and
+[`unrar`](https://www.rarlab.com/rar_add.htm) when opening RAR files as Local
+folders. ZIP folders need no external extractor.
 It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
 audio identification. On Gentoo, the `tools` USE flag is disabled by default;
 enable it when emerging
@@ -564,10 +576,14 @@ Omit `images` from that command for the Yandex-free text-only variant. Omit
 `qr` to remove QR encoding and its shortcut from any custom build. Cargo
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
-`summary` is the independently removable Codex summary integration, and
-`gpm` is the positive opt-in for virtual-console mouse input. The ordinary
+`summary` is the independently removable Codex summary integration,
+`local-archives` is the independently removable ZIP/RAR Local-folder support,
+and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, video summaries,
-Yandex Music, and GPM.
+ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either custom
+command above to retain archive folders; leaving it out removes the archive
+folder code. The shared ZIP decoder also disappears only when no other selected
+feature, such as tracker archive support, enables `archive-zip`.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -1964,13 +1980,17 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality`, `commons-upload`,
-`evernote`, and `summary` flags to their Cargo features. `USE="-audio-quality"`
-removes the analyzer and RustFFT dependency. `USE="-commons-upload"` removes the
-Commons client and review UI. `USE="-evernote"` removes the Evernote EDAM client
-and note UI. `USE="-summary"` removes the Codex summary UI and backend. Prebuilt
-executables contain the fixed upstream feature set and keep all four
-capabilities enabled; offering binary USE switches would require another copy
-of every Linux release variant rather than changing installed code.
+`evernote`, `local-archives`, and `summary` flags to their Cargo features.
+`USE="-audio-quality"` removes the analyzer and RustFFT dependency.
+`USE="-commons-upload"` removes the Commons client and review UI.
+`USE="-evernote"` removes the Evernote EDAM client and note UI.
+`USE="-local-archives"` removes ZIP/RAR Local-folder browsing and the RAR helper
+dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
+unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
+extraction. `USE="-summary"` removes the Codex summary UI and backend. Prebuilt
+executables contain the fixed upstream feature set and keep these capabilities
+enabled; offering binary USE switches would require another copy of every
+Linux release variant rather than changing installed code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.

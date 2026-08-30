@@ -1567,6 +1567,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -6967,7 +6968,7 @@ dependencies = [
 
 [[package]]
 name = "youta"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -7019,7 +7020,7 @@ dependencies = [
 
 [[package]]
 name = "youta-gui"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -7187,6 +7188,12 @@ dependencies = [
  "memchr",
  "typed-path",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

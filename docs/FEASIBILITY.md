@@ -440,7 +440,7 @@ backup, Discord, and external transcript/LLM tools.
 
 ### Phase 4 — isolated experimental adapters
 
-Proprietary services, archive streaming, Telegram client support, and optional
+Proprietary services, remote archive streaming, Telegram client support, and optional
 torrents. Each ships independently and may remain out of default binaries.
 
 This order creates a dependable player before accumulating fragile services.

@@ -30,6 +30,8 @@ pub mod durability;
 pub mod evernote;
 pub mod file_identity;
 pub mod links;
+#[cfg(feature = "local-archives")]
+pub mod local_archive;
 pub mod local_browser;
 #[cfg(any(feature = "commons-upload", feature = "evernote"))]
 pub mod opus_export;

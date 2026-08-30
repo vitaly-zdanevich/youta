@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -38,6 +38,7 @@ default = [
     "evernote",
     "gpm",
     "images",
+    "local-archives",
     "qr",
     "summary",
 ]
@@ -294,6 +295,9 @@ vk = ["network"]
 # Optional archive and peer-to-peer support.
 archive-zip = ["dep:zip"]
 archive-rar = []
+# Read-only ZIP/RAR folders in the Local browser. ZIP decoding stays in-process;
+# RAR decoding uses the system `unrar` helper to preserve portable cross-builds.
+local-archives = ["local-browser", "archive-zip", "dep:sha2"]
 torrent = []
 
 # Portable release builds can opt into a bundled SQLite library. Distribution
@@ -343,7 +347,7 @@ ratatui-image = { version = "=11.0.6", default-features = false, features = ["cr
 quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
 ureq = { version = "3.3.0", features = ["json"], optional = true }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"], optional = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
 
 # Windows has no stable `std` route to a file's identity: the volume serial
 # number and file index sit behind the unstable `windows_by_handle` feature.

@@ -2960,6 +2960,14 @@ enum LocalBrowseRequest {
         preferred_child: Option<PathBuf>,
         options: crate::local_browser::LocalBrowseOptions,
     },
+    /// Materializes one ZIP/RAR privately, then reads its root listing.
+    #[cfg(feature = "local-archives")]
+    OpenArchive {
+        generation: u64,
+        source: PathBuf,
+        cache_directory: PathBuf,
+        options: crate::local_browser::LocalBrowseOptions,
+    },
     /// Lists only real directories for the non-blocking Move destination chooser.
     #[cfg(feature = "local-move")]
     MoveDestinations { generation: u64, directory: PathBuf },
@@ -2979,6 +2987,18 @@ enum LocalBrowseResponse {
     Browse {
         generation: u64,
         result: Result<crate::local_browser::LocalDirectoryListing, String>,
+    },
+    /// A materialized archive and its first bounded Local listing.
+    #[cfg(feature = "local-archives")]
+    OpenArchive {
+        generation: u64,
+        result: Result<
+            (
+                crate::local_archive::MaterializedLocalArchive,
+                crate::local_browser::LocalDirectoryListing,
+            ),
+            String,
+        >,
     },
     /// A directory-only Move destination snapshot.
     #[cfg(feature = "local-move")]
@@ -4449,6 +4469,9 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// Nested read-only archives containing the current Local directory.
+    #[cfg(feature = "local-archives")]
+    local_archive_stack: Vec<crate::local_archive::MaterializedLocalArchive>,
     /// One selected text-file command awaiting safe TUI lifecycle handling.
     #[cfg(feature = "local-browser")]
     pending_text_file_open: Option<TextFileOpenPlan>,
@@ -5770,6 +5793,8 @@ impl AppController {
             private_note_editor: None,
             pending_playlist_replay: None,
             local_listing: None,
+            #[cfg(feature = "local-archives")]
+            local_archive_stack: Vec::new(),
             #[cfg(feature = "local-browser")]
             pending_text_file_open: None,
             pending_clipboard_request: None,
@@ -13935,6 +13960,8 @@ impl AppController {
                     crate::local_browser::LocalEntryKind::Image
                     | crate::local_browser::LocalEntryKind::Text
                     | crate::local_browser::LocalEntryKind::Other => None,
+                    #[cfg(feature = "local-archives")]
+                    crate::local_browser::LocalEntryKind::Archive => None,
                 })
         } else {
             self.view
@@ -14025,11 +14052,60 @@ impl AppController {
         self.browse_local_directory_with_reselection(directory, None);
     }
 
+    /// Starts private ZIP/RAR materialization without blocking the UI thread.
+    #[cfg(feature = "local-archives")]
+    fn open_local_archive(&mut self, source: PathBuf) {
+        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        self.local_move_marks.clear();
+        self.local_generation = self.local_generation.wrapping_add(1);
+        #[cfg(feature = "waveform")]
+        {
+            self.pending_restored_local_waveform_selection = None;
+        }
+        self.invalidate_local_folder_sizes();
+        self.pending_local_reselection = None;
+        self.local_listing = None;
+        self.view.details = None;
+        self.view.local_browse_pending = false;
+        let name = source.file_name().map_or_else(
+            || source.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let status_line = format!("Opening {name}…");
+        if self.send_local_browse_request(
+            LocalBrowseRequest::OpenArchive {
+                generation: self.local_generation,
+                source,
+                cache_directory: self.config.cache_dir().join("local-archives"),
+                options: crate::local_browser::LocalBrowseOptions {
+                    show_all_files: self.view.show_all_local_files,
+                },
+            },
+            "Could not open the local archive",
+        ) {
+            self.view.local_browse_pending = true;
+            self.view.status_line = status_line;
+        }
+    }
+
     /// Applies one isolated Local worker result only when its owner is current.
     fn handle_local_browse_response(&mut self, response: LocalBrowseResponse) {
         match response {
             LocalBrowseResponse::Browse { generation, result } => {
                 self.handle_local_directory_response(generation, result);
+            }
+            #[cfg(feature = "local-archives")]
+            LocalBrowseResponse::OpenArchive { generation, result } => {
+                if generation != self.local_generation {
+                    return;
+                }
+                match result {
+                    Ok((archive, listing)) => {
+                        self.local_archive_stack.push(archive);
+                        self.handle_local_directory_response(generation, Ok(listing));
+                    }
+                    Err(error) => self.handle_local_directory_response(generation, Err(error)),
+                }
             }
             #[cfg(feature = "local-move")]
             LocalBrowseResponse::MoveDestinations { generation, result } => {
@@ -14067,7 +14143,7 @@ impl AppController {
         match result {
             Ok(listing) => {
                 let truncated = listing.truncated;
-                let path = listing.path.display().to_string();
+                let path = self.local_display_path(&listing.path);
                 let selected = restored_waveform_selection.unwrap_or_default().min(
                     listing
                         .entries
@@ -14126,6 +14202,14 @@ impl AppController {
         directory: PathBuf,
         reselect_child: Option<PathBuf>,
     ) {
+        #[cfg(feature = "local-archives")]
+        if !self
+            .local_archive_stack
+            .last()
+            .is_some_and(|archive| archive.contains(&directory))
+        {
+            self.local_archive_stack.clear();
+        }
         #[cfg(any(feature = "local-move", feature = "audio-quality"))]
         {
             let leaves_current_directory = self
@@ -14154,8 +14238,8 @@ impl AppController {
             self.view.selected = 0;
         }
         self.view.details = None;
-        self.view.local_path = directory.display().to_string();
-        let status_line = format!("Reading {}…", directory.display());
+        self.view.local_path = self.local_display_path(&directory);
+        let status_line = format!("Reading {}…", self.local_display_path(&directory));
         self.view.local_browse_pending = false;
         if self.send_local_browse_request(
             LocalBrowseRequest::Browse {
@@ -14172,6 +14256,30 @@ impl AppController {
             self.view.status_line = status_line;
         } else {
             self.pending_local_reselection = None;
+        }
+    }
+
+    /// Formats cache-backed archive paths as `archive.zip!/folder`.
+    fn local_display_path(&self, path: &Path) -> String {
+        #[cfg(feature = "local-archives")]
+        {
+            return local_archive_display_path(&self.local_archive_stack, path);
+        }
+        #[cfg(not(feature = "local-archives"))]
+        {
+            path.display().to_string()
+        }
+    }
+
+    /// Returns whether the current Local route is backed by archive cache data.
+    fn local_archive_read_only(&self) -> bool {
+        #[cfg(feature = "local-archives")]
+        {
+            return !self.local_archive_stack.is_empty();
+        }
+        #[cfg(not(feature = "local-archives"))]
+        {
+            false
         }
     }
 
@@ -14428,11 +14536,25 @@ impl AppController {
     fn selected_local_path(&self) -> Option<PathBuf> {
         let listing = self.local_listing.as_ref()?;
         if listing.parent.is_some() && self.view.selected == 0 {
-            return listing.parent.clone();
+            return self.local_parent_path(listing);
         }
         self.local_entry_index()
             .and_then(|index| listing.entries.get(index))
             .map(|entry| entry.path.clone())
+    }
+
+    /// Returns the logical directory represented by Local's synthetic `..` row.
+    fn local_parent_path(
+        &self,
+        listing: &crate::local_browser::LocalDirectoryListing,
+    ) -> Option<PathBuf> {
+        #[cfg(feature = "local-archives")]
+        if let Some(archive) = self.local_archive_stack.last()
+            && archive.root_path == listing.path
+        {
+            return archive.source_path.parent().map(Path::to_owned);
+        }
+        listing.parent.clone()
     }
 
     /// Restores one exact Local path after lazy size sorting reorders rows.
@@ -14633,7 +14755,7 @@ impl AppController {
             self.view.rows.clear();
             return;
         };
-        self.view.local_path = listing.path.display().to_string();
+        self.view.local_path = self.local_display_path(&listing.path);
         let mut rows = Vec::with_capacity(
             listing
                 .entries
@@ -14652,6 +14774,8 @@ impl AppController {
         rows.extend(listing.entries.iter().map(|entry| {
             let source = match entry.kind {
                 LocalEntryKind::Directory => "Local folder",
+                #[cfg(feature = "local-archives")]
+                LocalEntryKind::Archive => "Local archive",
                 LocalEntryKind::Audio => "Local audio",
                 LocalEntryKind::Video => "Local video (audio playback)",
                 LocalEntryKind::TrackerModule => "Local tracker module",
@@ -14733,7 +14857,7 @@ impl AppController {
             return;
         };
         if self.view.selected == 0
-            && let Some(parent) = listing.parent.as_ref()
+            && let Some(parent) = self.local_parent_path(listing)
         {
             self.view.details = Some(DetailView {
                 title: "..".to_owned(),
@@ -14777,9 +14901,9 @@ impl AppController {
                     &item.path,
                     item.duration_seconds,
                 ),
-                local_renamable: cfg!(feature = "local-rename"),
-                local_movable: cfg!(feature = "local-move"),
-                local_trashable: cfg!(feature = "local-trash"),
+                local_renamable: cfg!(feature = "local-rename") && !self.local_archive_read_only(),
+                local_movable: cfg!(feature = "local-move") && !self.local_archive_read_only(),
+                local_trashable: cfg!(feature = "local-trash") && !self.local_archive_read_only(),
                 local_audio_quality_available: cfg!(feature = "audio-quality")
                     && entry.kind == LocalEntryKind::Audio,
                 ..DetailView::default()
@@ -14796,6 +14920,8 @@ impl AppController {
                 title: entry.display_name().into_owned(),
                 source: match entry.kind {
                     LocalEntryKind::Directory => "Local folder",
+                    #[cfg(feature = "local-archives")]
+                    LocalEntryKind::Archive => "Local archive",
                     LocalEntryKind::Image => "Local image",
                     LocalEntryKind::Text => "Text file",
                     LocalEntryKind::Other => "File",
@@ -14808,7 +14934,7 @@ impl AppController {
                 .to_owned(),
                 description: format!(
                     "Full path: {}{}{}",
-                    entry.path.display(),
+                    self.local_display_path(&entry.path),
                     known_size
                         .map_or_else(String::new, |size| format!("\nSize: {}", human_bytes(size))),
                     entry
@@ -14820,9 +14946,11 @@ impl AppController {
                 thumbnail_url: (entry.kind == LocalEntryKind::Image)
                     .then(|| url::Url::from_file_path(&entry.path).ok())
                     .flatten(),
-                local_renamable: cfg!(feature = "local-rename") && !is_directory,
-                local_movable: cfg!(feature = "local-move"),
-                local_trashable: cfg!(feature = "local-trash"),
+                local_renamable: cfg!(feature = "local-rename")
+                    && !is_directory
+                    && !self.local_archive_read_only(),
+                local_movable: cfg!(feature = "local-move") && !self.local_archive_read_only(),
+                local_trashable: cfg!(feature = "local-trash") && !self.local_archive_read_only(),
                 ..DetailView::default()
             });
         }
@@ -18961,6 +19089,8 @@ impl AppController {
         let entry = listing.entries[index].clone();
         match entry.kind {
             LocalEntryKind::Directory => self.browse_local_directory(entry.path),
+            #[cfg(feature = "local-archives")]
+            LocalEntryKind::Archive => self.open_local_archive(entry.path),
             LocalEntryKind::Image => {
                 self.view.status_line =
                     "Image preview selected; only audio and video entries are playable".to_owned();
@@ -18993,6 +19123,23 @@ impl AppController {
             };
             return;
         };
+        #[cfg(feature = "local-archives")]
+        if self
+            .local_archive_stack
+            .last()
+            .is_some_and(|archive| archive.root_path == listing.path)
+        {
+            let archive = self
+                .local_archive_stack
+                .pop()
+                .expect("the archive root check requires one context");
+            let Some(parent) = archive.source_path.parent().map(Path::to_owned) else {
+                self.view.status_line = "The archive source has no parent folder".to_owned();
+                return;
+            };
+            self.browse_local_directory_with_reselection(parent, Some(archive.source_path));
+            return;
+        }
         let Some(parent) = listing.parent.clone() else {
             self.view.status_line = "Already at the filesystem root".to_owned();
             return;
@@ -27847,6 +27994,12 @@ impl AppController {
                     Some(self.config.providers.yt_dlp_executable.clone()),
                 ),
             ];
+            #[cfg(feature = "local-archives")]
+            let helpers = {
+                let mut helpers = helpers;
+                helpers.push((ExternalHelperKind::Unrar, Some(PathBuf::from("unrar"))));
+                helpers
+            };
             #[cfg(feature = "acoustid")]
             let helpers = {
                 let mut helpers = helpers;
@@ -27891,6 +28044,12 @@ impl AppController {
                 Some(self.config.providers.yt_dlp_executable.clone()),
             ),
         ];
+        #[cfg(feature = "local-archives")]
+        let helpers = {
+            let mut helpers = helpers;
+            helpers.push(ExternalHelper::new("unrar", Some(PathBuf::from("unrar"))));
+            helpers
+        };
         #[cfg(feature = "acoustid")]
         let helpers = {
             let mut helpers = helpers;
@@ -28527,6 +28686,9 @@ impl AppController {
     }
 
     fn selected_local_regular_file(&self) -> Option<PathBuf> {
+        if self.local_archive_read_only() {
+            return None;
+        }
         let listing = self.local_listing.as_ref()?;
         let index = self.local_entry_index()?;
         let entry = listing.entries.get(index)?;
@@ -28534,6 +28696,9 @@ impl AppController {
     }
 
     fn selected_local_trash_target(&self) -> Option<(PathBuf, PathBuf)> {
+        if self.local_archive_read_only() {
+            return None;
+        }
         let listing = self.local_listing.as_ref()?;
         let index = self.local_entry_index()?;
         let entry = listing.entries.get(index)?;
@@ -28986,6 +29151,10 @@ impl AppController {
     fn begin_local_move(&mut self) {
         if self.view.screen != Screen::Local {
             self.view.status_line = "Move is available in the Local browser".to_owned();
+            return;
+        }
+        if self.local_archive_read_only() {
+            self.view.status_line = "Archive folders are read-only".to_owned();
             return;
         }
         if !self.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Explicit) {
@@ -32626,6 +32795,31 @@ fn bandcamp_resolver_worker(
     }
 }
 
+/// Formats one physical cache path through every containing archive layer.
+#[cfg(feature = "local-archives")]
+fn local_archive_display_path(
+    stack: &[crate::local_archive::MaterializedLocalArchive],
+    path: &Path,
+) -> String {
+    let Some((index, archive)) = stack
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, archive)| archive.contains(path))
+    else {
+        return path.display().to_string();
+    };
+    let source = local_archive_display_path(&stack[..index], &archive.source_path);
+    let relative = path
+        .strip_prefix(&archive.root_path)
+        .unwrap_or_else(|_| Path::new(""));
+    if relative.as_os_str().is_empty() {
+        format!("{source}!/")
+    } else {
+        format!("{source}!/{}", relative.display())
+    }
+}
+
 /// Runs foreground Local listings independently of recursive and remote work.
 fn local_browse_worker(
     requests: Receiver<LocalBrowseRequest>,
@@ -32648,6 +32842,35 @@ fn local_browse_worker(
                     )
                     .map_err(|error| error.to_string());
                 LocalBrowseResponse::Browse { generation, result }
+            }
+            #[cfg(feature = "local-archives")]
+            LocalBrowseRequest::OpenArchive {
+                generation,
+                source,
+                cache_directory,
+                options,
+            } => {
+                let result = crate::local_archive::materialize_local_archive(
+                    &source,
+                    &cache_directory,
+                    crate::local_archive::LocalArchiveLimits::default(),
+                )
+                .and_then(|archive| {
+                    crate::local_browser::list_local_directory_with_options(
+                        &archive.root_path,
+                        crate::local_browser::LocalBrowseLimits::default(),
+                        options,
+                    )
+                    .map(|listing| (archive, listing))
+                    .map_err(|error| {
+                        crate::local_archive::LocalArchiveError::Io {
+                            path: source.clone(),
+                            source: std::io::Error::other(error),
+                        }
+                    })
+                })
+                .map_err(|error| error.to_string());
+                LocalBrowseResponse::OpenArchive { generation, result }
             }
             #[cfg(feature = "local-move")]
             LocalBrowseRequest::MoveDestinations {
@@ -57545,6 +57768,133 @@ mod tests {
             controller.view.status_line,
             "No default action is available for this file type"
         );
+    }
+
+    #[cfg(feature = "local-archives")]
+    #[test]
+    fn activating_a_local_archive_requests_private_materialization() {
+        let fixture = crate::test_support::canonical_tempdir("temporary Local archive folder");
+        let archive = fixture.path().join("album.zip");
+        std::fs::write(&archive, b"mock archive").expect("create archive fixture");
+        let listing = crate::local_browser::list_local_directory(
+            fixture.path(),
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("local archive listing");
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_listing = Some(listing);
+        controller.refresh_local_browser_rows();
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "album.zip")
+            .expect("visible archive row");
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+
+        controller.activate_local_browser_selection();
+
+        let LocalBrowseRequest::OpenArchive {
+            generation,
+            source,
+            cache_directory,
+            ..
+        } = captured.try_recv().expect("archive open request")
+        else {
+            panic!("expected an archive-open request");
+        };
+        assert_eq!(generation, controller.local_generation);
+        assert_eq!(source, archive);
+        assert_eq!(
+            cache_directory,
+            controller.config.cache_dir().join("local-archives")
+        );
+        assert!(state.lock().expect("mock player state").played.is_empty());
+        assert!(controller.view.local_browse_pending);
+        assert_eq!(controller.view.status_line, "Opening album.zip…");
+    }
+
+    #[cfg(feature = "local-archives")]
+    #[test]
+    fn materialized_archive_is_a_read_only_folder_with_logical_parent_navigation() {
+        let fixture = crate::test_support::canonical_tempdir("materialized Local archive");
+        let source = fixture.path().join("album.zip");
+        std::fs::write(&source, b"mock archive").expect("create archive source");
+        let root = fixture.path().join("cache/archive/contents");
+        std::fs::create_dir_all(&root).expect("create materialized root");
+        let track = root.join("track.opus");
+        std::fs::write(&track, b"mock opus").expect("create materialized track");
+        let root = crate::fs_path::canonicalize(&root).expect("canonical materialized root");
+        let listing = crate::local_browser::list_local_directory(
+            &root,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .expect("materialized Local listing");
+        let archive = crate::local_archive::MaterializedLocalArchive {
+            source_path: source.clone(),
+            root_path: root.clone(),
+            reused_cache: false,
+        };
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::Local;
+        controller.local_generation = 17;
+
+        controller.handle_local_browse_response(LocalBrowseResponse::OpenArchive {
+            generation: 17,
+            result: Ok((archive, listing)),
+        });
+
+        assert_eq!(controller.local_archive_stack.len(), 1);
+        assert_eq!(
+            controller.view.local_path,
+            format!("{}!/", source.display())
+        );
+        controller.view.selected = controller
+            .view
+            .rows
+            .iter()
+            .position(|row| row.title == "track.opus")
+            .expect("materialized track row");
+        controller.update_local_browser_detail();
+        let details = controller
+            .view
+            .details
+            .as_ref()
+            .expect("archive member details");
+        assert!(!details.local_renamable);
+        assert!(!details.local_movable);
+        assert!(!details.local_trashable);
+
+        controller.activate_local_browser_selection();
+
+        let playback = state.lock().expect("mock player state");
+        assert_eq!(playback.played.len(), 1);
+        assert_eq!(
+            playback.played[0].location,
+            url::Url::from_file_path(&track)
+                .expect("materialized archive track URL")
+                .to_string()
+        );
+        drop(playback);
+
+        let (requests, captured) = unbounded();
+        controller.local_browse_requests = Some(requests);
+        controller.view.selected = 0;
+        controller.activate_local_browser_selection();
+
+        let LocalBrowseRequest::Browse {
+            directory,
+            preferred_child,
+            ..
+        } = captured.try_recv().expect("archive parent browse request")
+        else {
+            panic!("expected a normal parent-folder browse request");
+        };
+        assert_eq!(directory, fixture.path());
+        assert_eq!(preferred_child.as_deref(), Some(source.as_path()));
+        assert!(controller.local_archive_stack.is_empty());
     }
 
     #[test]

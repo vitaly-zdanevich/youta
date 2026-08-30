@@ -94,6 +94,8 @@ jobs:
             feature_arguments: --no-default-features --features qr
           - feature_set: TUI with Local
             feature_arguments: --no-default-features --features tui,local
+          - feature_set: TUI with Local archive folders
+            feature_arguments: --no-default-features --features tui,local-archives
           - feature_set: TUI with AcoustID
             feature_arguments: --no-default-features --features tui,acoustid,wikidata
           - feature_set: TUI with Apple Podcasts
@@ -182,6 +184,7 @@ jobs:
           cargo check --locked --no-default-features --features tui,local-rename
           cargo check --locked --no-default-features --features tui,local-trash
           cargo check --locked --no-default-features --features tui,local-move
+          cargo check --locked --no-default-features --features tui,local-archives
           cargo check --locked --no-default-features --features images,local-artwork
           cargo check --locked --no-default-features --features tui,local
           cargo check --locked --no-default-features --features librivox --lib
@@ -226,14 +229,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,qr,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,qr,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,qr,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,qr,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,local-archives,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,local-archives,qr,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,local-archives,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,local-archives,summary
 
       - name: Validate and start the i686 executable
         run: |

@@ -41,6 +41,7 @@ The library is divided by responsibility:
 - `subscriptions`: local subscriptions and OPML interchange;
 - `providers`: discovery and metadata interfaces plus provider adapters;
 - `links`: safe extraction and classification of links and timecodes;
+- `local_archive`: bounded ZIP/RAR materialization for read-only Local folders;
 - `playback`: backend interface, process supervision, and player events;
 - `tui`: input mapping, reducer, layout, widgets, and terminal lifecycle.
 
@@ -56,7 +57,7 @@ Youta separates canonical user state from restart-only and regenerable data:
 | configuration | TOML | colors, provider endpoints, player choice |
 | durable library (default) | `state/*.toml` | history, positions, notes, bookmarks, statistics, playlists, Local move journal |
 | restart-only state | `runtime/*.toml` | screen/session state |
-| regenerable metadata | `cache/*.toml` | searches, provider summaries, Wikidata |
+| regenerable data | `cache/` | searches, provider summaries, Wikidata, materialized Local archives |
 | optional durable backend | `state.sqlite3` | the same boundary when `sqlite-state` is selected |
 | interoperable subscriptions | `subscriptions.opml` | podcast/RSS and compatible channel outlines |
 
@@ -150,6 +151,19 @@ and listing size render immediately; one short-lived worker reads tags and runs
 a five-second, stderr-discarding `ffprobe` process for the selected path.
 Completed records enter a 128-entry process-local LRU, and rapid navigation
 never queues more than one metadata read at a time.
+
+With the independent default-on `local-archives` feature, the same Local worker
+materializes a selected ZIP or RAR into one private, source-keyed cache folder.
+ZIP uses the bounded Rust decoder already present for archive payloads. RAR
+uses the external `unrar` reader: Youta parses a bounded technical listing,
+rejects absolute/traversing paths, links, special types, duplicates, and
+wildcard selectors, then requests each exact regular member on standard output
+and applies its own streamed byte limits. The helper never receives an output
+directory. The reducer keeps a stack of archive contexts so ordinary directory
+rows, nested archives, playback, logical `archive.zip!/folder` paths, and `Esc`
+navigation reuse the Local model. All mutating Local actions are disabled while
+that stack is non-empty. A revision marker invalidates the cache when the
+source's length or modification time changes.
 
 When terminal images and local-video thumbnails are enabled, the selected
 finite local video gets one bounded midpoint-frame request after its duration
@@ -1191,10 +1205,11 @@ branch and failure-path assertions matter more than a single percentage.
 Each provider or costly subsystem has a Cargo feature. Features select code;
 runtime configuration selects whether compiled code is active. Default builds
 include both official YouTube metadata and Invidious adapters, terminal images,
-offline QR rendering, local audio-quality analysis, explicit Codex video
-summaries, and the credential-free LibriVox adapter; runtime
+offline QR rendering, local audio-quality analysis, read-only ZIP/RAR Local
+folders, explicit Codex video summaries, and the credential-free LibriVox
+adapter; runtime
 `providers.youtube_backend` chooses the YouTube adapter. `librivox` is included
-through `app-core`, while `audio-quality`, `images`, `qr`, and `summary`
+through `app-core`, while `audio-quality`, `images`, `local-archives`, `qr`, and `summary`
 are independent default-on capabilities. The summary runtime backend is
 Off by default even when its code is present.
 The `qr` feature implies the TUI and QR encoder, while plain `app` or `tui`
@@ -1223,7 +1238,8 @@ channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
-default-on `audio-quality`, `commons-upload`, `evernote`, `images`, `qr`, and `summary` USE
+default-on `audio-quality`, `commons-upload`, `evernote`, `images`,
+`local-archives`, `qr`, and `summary` USE
 flags and maps them to their corresponding Cargo features; each source-build
 capability can be disabled independently. Prebuilt artifacts always contain
 the analyzer, Commons upload client, Evernote client, and summary integration because a binary
@@ -1231,4 +1247,4 @@ USE flag cannot change compiled code.
 The ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as
-`mpv`, `yt-dlp`, and FFmpeg rather than bundling them.
+`mpv`, `yt-dlp`, FFmpeg, and `unrar` rather than bundling them.

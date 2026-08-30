@@ -104,6 +104,9 @@ pub struct LocalFolderSizeMeasurement {
 pub enum LocalEntryKind {
     /// A real directory that can be opened without traversing a symbolic link.
     Directory,
+    /// A ZIP or RAR archive that behaves as a read-only local folder.
+    #[cfg(feature = "local-archives")]
+    Archive,
     /// A supported audio file.
     Audio,
     /// A supported video file. Youta may play audio from it.
@@ -359,6 +362,13 @@ pub fn classify_local_file(path: &Path) -> Option<LocalEntryKind> {
         Some(LocalEntryKind::TrackerModule)
     } else if matches_ascii_case_insensitive(extension, &["jpg", "jpeg", "png", "webp"]) {
         Some(LocalEntryKind::Image)
+    } else if cfg!(feature = "local-archives")
+        && matches_ascii_case_insensitive(extension, &["zip", "rar"])
+    {
+        #[cfg(feature = "local-archives")]
+        return Some(LocalEntryKind::Archive);
+        #[cfg(not(feature = "local-archives"))]
+        return None;
     } else {
         None
     }
@@ -1148,6 +1158,19 @@ mod tests {
             Some(LocalEntryKind::Image)
         );
         assert_eq!(classify_local_file(Path::new("notes.txt")), None);
+    }
+
+    #[cfg(feature = "local-archives")]
+    #[test]
+    fn classifies_zip_and_rar_archives_as_enterable_local_entries() {
+        assert_eq!(
+            classify_local_file(Path::new("album.ZIP")),
+            Some(LocalEntryKind::Archive)
+        );
+        assert_eq!(
+            classify_local_file(Path::new("collection.rAr")),
+            Some(LocalEntryKind::Archive)
+        );
     }
 
     #[test]

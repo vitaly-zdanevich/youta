@@ -54,6 +54,9 @@ pub enum ExternalHelperKind {
     /// The Codex CLI selected for explicit video summaries.
     #[cfg(feature = "summary")]
     Codex,
+    /// The RAR extractor used by Local archive folders.
+    #[cfg(feature = "local-archives")]
+    Unrar,
 }
 
 impl ExternalHelperKind {
@@ -67,6 +70,8 @@ impl ExternalHelperKind {
             Self::Ffprobe => "ffprobe",
             #[cfg(feature = "summary")]
             Self::Codex => "codex",
+            #[cfg(feature = "local-archives")]
+            Self::Unrar => "unrar",
         }
     }
 
@@ -78,6 +83,8 @@ impl ExternalHelperKind {
             Self::Fpcalc => &["-version"],
             #[cfg(feature = "summary")]
             Self::Codex => &["--version"],
+            #[cfg(feature = "local-archives")]
+            Self::Unrar => &[],
         }
     }
 }
@@ -493,6 +500,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "librivox",
         "litres",
         "local",
+        "local-archives",
         "local-artwork",
         "local-browser",
         "local-metadata",

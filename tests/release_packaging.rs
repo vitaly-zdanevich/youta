@@ -142,6 +142,43 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
 }
 
 #[test]
+fn local_archive_folders_are_default_but_removable_from_both_front_ends() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let archives = feature_closure(&manifest, "local-archives");
+
+    assert!(default.contains("local-archives"));
+    assert!(!application.contains("local-archives"));
+    assert_eq!(
+        feature_entries(&manifest, "local-archives"),
+        ["local-browser", "archive-zip", "dep:sha2"]
+    );
+    for requirement in ["local-browser", "archive-zip", "dep:zip", "dep:sha2"] {
+        assert!(archives.contains(requirement));
+    }
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("local-archives"))
+    );
+    assert_eq!(
+        gui["features"]["local-archives"]
+            .as_array()
+            .expect("GUI local-archives forwarding")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        ["youta/local-archives"]
+    );
+}
+
+#[test]
 fn audio_quality_is_default_but_remains_a_removable_local_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -390,14 +427,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,summary",
     ] {
         assert!(
             script
@@ -596,14 +633,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,commons-upload,evernote,gpm,images,qr,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,qr,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,images,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,summary",
-        "app,audio-quality,commons-upload,evernote,images,qr,summary",
-        "app,audio-quality,commons-upload,evernote,qr,summary",
-        "app,audio-quality,commons-upload,evernote,images,summary",
-        "app,audio-quality,commons-upload,evernote,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,qr,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,summary",
     ] {
         assert!(
             ci.contains(&format!(

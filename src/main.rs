@@ -106,6 +106,12 @@ fn probe_diagnostic_helpers(
         (ExternalHelperKind::Ffmpeg, Some(PathBuf::from("ffmpeg"))),
         (ExternalHelperKind::Ffprobe, Some(PathBuf::from("ffprobe"))),
     ];
+    #[cfg(feature = "local-archives")]
+    let helpers = {
+        let mut helpers = helpers;
+        helpers.push((ExternalHelperKind::Unrar, Some(PathBuf::from("unrar"))));
+        helpers
+    };
     #[cfg(feature = "acoustid")]
     let helpers = {
         let mut helpers = helpers;

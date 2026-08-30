@@ -64,35 +64,35 @@ esac
 case "${variant}" in
 	images)
 		executable_suffix=
-		cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,qr,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary
 		;;
 	text)
 		executable_suffix=-text
-		cargo_features=app,audio-quality,commons-upload,evernote,gpm,qr,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary
 		;;
 	images-no-qr)
 		executable_suffix=-no-qr
-		cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary
 		;;
 	text-no-qr)
 		executable_suffix=-text-no-qr
-		cargo_features=app,audio-quality,commons-upload,evernote,gpm,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,summary
 		;;
 	images-no-gpm)
 		executable_suffix=-no-gpm
-		cargo_features=app,audio-quality,commons-upload,evernote,images,qr,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary
 		;;
 	text-no-gpm)
 		executable_suffix=-text-no-gpm
-		cargo_features=app,audio-quality,commons-upload,evernote,qr,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,local-archives,qr,summary
 		;;
 	images-no-qr-no-gpm)
 		executable_suffix=-no-qr-no-gpm
-		cargo_features=app,audio-quality,commons-upload,evernote,images,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,summary
 		;;
 	text-no-qr-no-gpm)
 		executable_suffix=-text-no-qr-no-gpm
-		cargo_features=app,audio-quality,commons-upload,evernote,summary
+		cargo_features=app,audio-quality,commons-upload,evernote,local-archives,summary
 		;;
 	*)
 		echo "Unsupported release variant: ${variant}" >&2
