@@ -24,6 +24,9 @@ const CACHE_DIRECTORY_NAME: &str = "tracker-media-cache";
 const COMPLETE_MARKER: &str = ".complete";
 const DOWNLOADED_PAYLOAD: &str = ".payload";
 const PREFIX_BYTES: usize = 1_084;
+const XPK_HEADER_BYTES: usize = 36;
+const XPK_PREVIEW_START: usize = 16;
+const XPK_PREVIEW_END: usize = 32;
 const MAX_REDIRECTS: usize = 8;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
@@ -114,7 +117,7 @@ pub struct PreparedTrackerModule {
     pub display_name: String,
     /// Canonical lowercase tracker extension.
     pub format: String,
-    /// Uncompressed file size.
+    /// Prepared file size on disk; decoder-supported wrappers may retain compression.
     pub size_bytes: u64,
 }
 
@@ -724,8 +727,20 @@ impl<T: TrackerTransport> TrackerMediaPreparer<T> {
                 output.sync_all()?;
                 drop(output);
                 let prefix = read_prefix(&temporary_path)?;
-                if let Some(format) = sniff_tracker_format(&prefix, Some(&entry_name), name_format)
-                {
+                let xpk_tracker = sniff_xpk_sqsh_tracker(&prefix, size_bytes);
+                let format = xpk_tracker.map_or_else(
+                    || sniff_tracker_format(&prefix, Some(&entry_name), name_format),
+                    |tracker| Some(tracker.format),
+                );
+                if let Some(format) = format {
+                    if let Some(tracker) = xpk_tracker {
+                        declared_uncompressed = account_xpk_sqsh_expansion(
+                            declared_uncompressed,
+                            tracker,
+                            size_bytes,
+                            self.limits.max_uncompressed_bytes,
+                        )?;
+                    }
                     if modules.len() >= self.limits.max_modules {
                         return Err(TrackerPrepareError::TooManyModules {
                             limit: self.limits.max_modules,
@@ -940,6 +955,12 @@ pub fn sniff_tracker_format(
     name_hint: Option<&str>,
     expected_format: Option<&str>,
 ) -> Option<&'static str> {
+    sniff_tracker_signature(prefix, expected_format)
+        .or_else(|| format_hint_from_name(name_hint))
+        .or_else(|| normalized_supported_extension(expected_format))
+}
+
+fn sniff_tracker_signature(prefix: &[u8], expected_format: Option<&str>) -> Option<&'static str> {
     if prefix.starts_with(b"Extended Module: ") {
         return Some("xm");
     }
@@ -995,7 +1016,57 @@ pub fn sniff_tracker_format(
     ) {
         return Some("umx");
     }
-    format_hint_from_name(name_hint).or_else(|| normalized_supported_extension(expected_format))
+    None
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct XpkSqshTracker {
+    format: &'static str,
+    expanded_size: u64,
+}
+
+/// Recognizes the bounded XPK/SQSH header preview emitted for wrapped modules.
+///
+/// The source length must describe the complete member, and the embedded
+/// preview must carry a supported tracker signature. The caller separately
+/// applies the declared expanded size to its archive limit.
+fn sniff_xpk_sqsh_tracker(prefix: &[u8], member_size: u64) -> Option<XpkSqshTracker> {
+    if prefix.len() < XPK_HEADER_BYTES
+        || prefix.get(..4) != Some(b"XPKF")
+        || prefix.get(8..12) != Some(b"SQSH")
+    {
+        return None;
+    }
+    let source_length = u64::from(u32::from_be_bytes(prefix.get(4..8)?.try_into().ok()?));
+    if source_length.checked_add(8)? != member_size {
+        return None;
+    }
+    let expanded_size = u64::from(u32::from_be_bytes(prefix.get(12..16)?.try_into().ok()?));
+    if expanded_size == 0 {
+        return None;
+    }
+    let format = sniff_tracker_signature(prefix.get(XPK_PREVIEW_START..XPK_PREVIEW_END)?, None)?;
+    Some(XpkSqshTracker {
+        format,
+        expanded_size,
+    })
+}
+
+/// Replaces one XPK member's packed contribution with its declared expansion.
+fn account_xpk_sqsh_expansion(
+    declared_uncompressed: u64,
+    tracker: XpkSqshTracker,
+    member_size: u64,
+    limit: u64,
+) -> Result<u64, TrackerPrepareError> {
+    let expansion = tracker.expanded_size.saturating_sub(member_size);
+    let total = declared_uncompressed
+        .checked_add(expansion)
+        .ok_or(TrackerPrepareError::UncompressedTooLarge { limit })?;
+    if total > limit {
+        return Err(TrackerPrepareError::UncompressedTooLarge { limit });
+    }
+    Ok(total)
 }
 
 /// Returns whether a case-insensitive extension is supported for preparation.
@@ -1604,6 +1675,25 @@ mod tests {
         bytes
     }
 
+    fn xpk_sqsh_fixture(preview: &[u8], payload: &[u8], destination_length: u32) -> Vec<u8> {
+        assert!(preview.len() <= 16);
+        let packed_size = u16::try_from(payload.len()).expect("small XPK fixture");
+        let source_length = u32::try_from(36usize + payload.len()).expect("small XPK fixture");
+        let mut bytes = Vec::with_capacity(44 + payload.len());
+        bytes.extend_from_slice(b"XPKF");
+        bytes.extend_from_slice(&source_length.to_be_bytes());
+        bytes.extend_from_slice(b"SQSH");
+        bytes.extend_from_slice(&destination_length.to_be_bytes());
+        bytes.extend_from_slice(preview);
+        bytes.resize(32, 0);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&packed_size.to_be_bytes());
+        bytes.extend_from_slice(&packed_size.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     fn gzip_fixture(name: &str, bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzBuilder::new()
             .filename(name)
@@ -2069,6 +2159,65 @@ mod tests {
         assert_eq!(modules[0].format, "s3m");
         assert_eq!(modules[0].size_bytes, s3m_fixture().len() as u64);
         assert!(modules[0].path.starts_with(preparer.cache_root()));
+    }
+
+    #[test]
+    fn lha_accepts_xpk_sqsh_wrapped_extensionless_module() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let url = "https://aminet.example/mods/atmos/life.lha";
+        let payload = b"MMD1 fixture OctaMED module";
+        let xpk = xpk_sqsh_fixture(
+            b"MMD1",
+            payload,
+            u32::try_from(payload.len()).expect("small fixture"),
+        );
+        let archive = lha_fixture(&[("Highlander/Life", &xpk)]);
+        let transport = MockTransport::once(url, archive);
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        let mut selected = request(url);
+        selected.source_label = Some("Aminet mods".to_owned());
+        selected.expected_format = Some("lha".to_owned());
+
+        let modules = preparer
+            .prepare(&selected)
+            .expect("XPK-wrapped OctaMED preparation");
+
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].format, "med");
+        assert_eq!(modules[0].size_bytes, xpk.len() as u64);
+        assert_eq!(
+            modules[0].path.extension().and_then(|value| value.to_str()),
+            Some("med")
+        );
+    }
+
+    #[test]
+    fn lha_rejects_xpk_expansion_beyond_the_archive_limit() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let url = "https://aminet.example/mods/atmos/oversized.lha";
+        let xpk = xpk_sqsh_fixture(b"MMD1", b"compressed fixture", 256);
+        let archive = lha_fixture(&[("Highlander/Oversized", &xpk)]);
+        let limit = xpk.len() as u64 + 1;
+        let limits = TrackerMediaLimits {
+            max_uncompressed_bytes: limit,
+            ..TrackerMediaLimits::default()
+        };
+        let transport = MockTransport::once(url, archive);
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, limits).expect("preparer");
+
+        let error = preparer
+            .prepare(&request(url))
+            .expect_err("declared XPK expansion must exceed the archive limit");
+
+        assert!(matches!(
+            error,
+            TrackerPrepareError::UncompressedTooLarge {
+                limit: actual_limit
+            } if actual_limit == limit
+        ));
     }
 
     #[test]
