@@ -1752,6 +1752,33 @@ files on Commons](https://commons.wikimedia.org/wiki/Commons:YouTube_files),
 [BotPasswords](https://www.mediawiki.org/wiki/Manual:Bot_passwords), and the
 [MediaWiki upload API](https://www.mediawiki.org/wiki/API:Upload).
 
+## Evernote audio notes
+
+The default-on `evernote` feature adds `Save audio to Evernote` for selected
+remote video and audio items. Its uppercase `E` shortcut is documented only in
+Help. A review popup pre-fills the optional title and provider description,
+accepts optional comma-separated tags, and always retains the immutable
+canonical video or audio page as the note source. For YouTube, `Add YouTube
+captions` retrieves the preferred bounded transcript and inserts it into the
+note body as one edit; `Ctrl+Z` restores the previous body state.
+
+On confirmation, Youta stages a private Opus file and creates an ENML note with
+an `audio/ogg` resource. The popup shows a slow activity indicator during
+caption retrieval, audio preparation, and the blocking Evernote request. EDAM
+accepts the resource in one Thrift request and exposes no acknowledged byte
+offsets, so Youta shows the staged attachment size rather than an invented
+upload progress bar. A successful save presents the clickable note URL and
+“Thanks for preserving the history”.
+
+The authentication token is read from
+`~/.config/youta/secrets/credentials.toml` as
+`providers.evernote_auth_token`, or from
+`YOUTA_PROVIDERS__EVERNOTE_AUTH_TOKEN`. When neither is configured, both
+front-ends show a masked token editor linked to [Evernote's developer-token
+page](https://www.evernote.com/api/DeveloperToken.action). Distributors can
+remove the generated EDAM bindings, hashing, network client, and UI by leaving
+`evernote` out of a `--no-default-features` build.
+
 Internet Archive transfer follows the same explicit-confirmation and duplicate
 check model and is also restricted to material the user may lawfully upload.
 
@@ -1933,10 +1960,11 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality`, `commons-upload`,
-and `summary` flags to their Cargo features. `USE="-audio-quality"` removes the
-analyzer and RustFFT dependency. `USE="-commons-upload"` removes the Commons
-client and review UI. `USE="-summary"` removes the Codex summary UI and backend.
-Prebuilt executables contain the fixed upstream feature set and keep all three
+`evernote`, and `summary` flags to their Cargo features. `USE="-audio-quality"`
+removes the analyzer and RustFFT dependency. `USE="-commons-upload"` removes the
+Commons client and review UI. `USE="-evernote"` removes the Evernote EDAM client
+and note UI. `USE="-summary"` removes the Codex summary UI and backend. Prebuilt
+executables contain the fixed upstream feature set and keep all four
 capabilities enabled; offering binary USE switches would require another copy
 of every Linux release variant rather than changing installed code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The

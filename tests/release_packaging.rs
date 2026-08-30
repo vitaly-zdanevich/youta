@@ -237,6 +237,54 @@ fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
 }
 
 #[test]
+fn evernote_is_default_but_remains_a_removable_export_capability() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let evernote = feature_closure(&manifest, "evernote");
+
+    assert!(default.contains("evernote"));
+    for requirement in [
+        "controller",
+        "network",
+        "yt-dlp",
+        "dep:evernote",
+        "dep:md5",
+        "dep:thrift",
+    ] {
+        assert!(evernote.contains(requirement));
+    }
+    assert!(
+        !application.contains("evernote"),
+        "`app` must not make the default-on Evernote export impossible to disable"
+    );
+
+    let gui_manifest: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("gui/Cargo.toml must remain valid TOML");
+    assert!(
+        gui_manifest["features"]["default"]
+            .as_array()
+            .expect("the GUI declares its default feature profile")
+            .iter()
+            .any(|feature| feature.as_str() == Some("evernote")),
+        "ordinary GUI builds must retain Evernote export"
+    );
+    assert_eq!(
+        gui_manifest["features"]["evernote"][0].as_str(),
+        Some("youta/evernote"),
+        "the GUI feature must disable the Evernote UI and backend in both crates"
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("The default-on `evernote` feature"));
+    assert!(readme.contains("`USE=\"-evernote\"` removes the Evernote EDAM client"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("cargo check --locked --no-default-features --features evernote --lib"));
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,evernote"));
+}
+
+#[test]
 fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     let manifest = manifest();
     let yandex_music = feature_closure(&manifest, "yandex-music");
@@ -342,14 +390,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,gpm,images,qr,summary",
-        "cargo_features=app,audio-quality,gpm,qr,summary",
-        "cargo_features=app,audio-quality,gpm,images,summary",
-        "cargo_features=app,audio-quality,gpm,summary",
-        "cargo_features=app,audio-quality,images,qr,summary",
-        "cargo_features=app,audio-quality,qr,summary",
-        "cargo_features=app,audio-quality,images,summary",
-        "cargo_features=app,audio-quality,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,qr,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,summary",
     ] {
         assert!(
             script
@@ -548,14 +596,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,gpm,images,qr,summary",
-        "app,audio-quality,gpm,qr,summary",
-        "app,audio-quality,gpm,images,summary",
-        "app,audio-quality,gpm,summary",
-        "app,audio-quality,images,qr,summary",
-        "app,audio-quality,qr,summary",
-        "app,audio-quality,images,summary",
-        "app,audio-quality,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,qr,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,qr,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,summary",
+        "app,audio-quality,commons-upload,evernote,images,qr,summary",
+        "app,audio-quality,commons-upload,evernote,qr,summary",
+        "app,audio-quality,commons-upload,evernote,images,summary",
+        "app,audio-quality,commons-upload,evernote,summary",
     ] {
         assert!(
             ci.contains(&format!(

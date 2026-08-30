@@ -1690,6 +1690,14 @@ struct HitMap {
     commons_credentials_fields: Vec<(bool, Rect)>,
     #[cfg(feature = "commons-upload")]
     commons_credentials_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "evernote")]
+    evernote_fields: Vec<(EvernoteNoteField, Rect)>,
+    #[cfg(feature = "evernote")]
+    evernote_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "evernote")]
+    evernote_credentials_field: Option<Rect>,
+    #[cfg(feature = "evernote")]
+    evernote_credentials_buttons: Vec<(UiAction, Rect)>,
     rss_subscription_field: Option<Rect>,
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
@@ -2039,6 +2047,10 @@ fn render_frame(
     let thumbnail_is_obscured = thumbnail_is_obscured
         || view.commons_upload_popup.is_some()
         || view.commons_credentials_popup.is_some();
+    #[cfg(feature = "evernote")]
+    let thumbnail_is_obscured = thumbnail_is_obscured
+        || view.evernote_popup.is_some()
+        || view.evernote_credentials_popup.is_some();
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
@@ -2144,6 +2156,25 @@ fn render_frame(
         hit_map.commons_credentials_buttons.clear();
         if let Some(popup) = view.commons_credentials_popup.as_ref() {
             render_commons_credentials_popup(
+                frame,
+                popup,
+                view.external_opener_available,
+                &theme,
+                hit_map,
+            );
+        }
+    }
+    #[cfg(feature = "evernote")]
+    {
+        hit_map.evernote_fields.clear();
+        hit_map.evernote_buttons.clear();
+        if let Some(popup) = view.evernote_popup.as_ref() {
+            render_evernote_popup(frame, popup, &theme, hit_map);
+        }
+        hit_map.evernote_credentials_field = None;
+        hit_map.evernote_credentials_buttons.clear();
+        if let Some(popup) = view.evernote_credentials_popup.as_ref() {
+            render_evernote_credentials_popup(
                 frame,
                 popup,
                 view.external_opener_available,
@@ -3906,6 +3937,17 @@ fn render_information_panel(
             "Upload to Commons".to_owned(),
             theme.accent,
             UiAction::OpenCommonsUpload,
+        );
+    }
+    #[cfg(feature = "evernote")]
+    if show_text_selection && view.evernote_available {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            "Save audio to Evernote".to_owned(),
+            theme.accent,
+            UiAction::OpenEvernoteNote,
         );
     }
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
@@ -6234,10 +6276,17 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         "  o video page"
     };
+    let mut playlist_actions_help = String::new();
     #[cfg(feature = "commons-upload")]
-    let playlist_actions_help = "  U Commons audio     l toggle todo     P choose playlist";
-    #[cfg(not(feature = "commons-upload"))]
-    let playlist_actions_help = "  l toggle todo     P choose playlist";
+    playlist_actions_help.push_str("  U Commons audio  ");
+    #[cfg(feature = "evernote")]
+    {
+        if playlist_actions_help.is_empty() {
+            playlist_actions_help.push_str("  ");
+        }
+        playlist_actions_help.push_str("E Evernote audio  ");
+    }
+    playlist_actions_help.push_str("  l toggle todo     P choose playlist");
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -6265,7 +6314,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Actions",
         "  Ctrl+n play next     a add to queue     u show queue     d download",
         video_actions_help,
-        playlist_actions_help,
+        playlist_actions_help.as_str(),
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
         private_note_help,
@@ -8358,7 +8407,7 @@ fn render_commons_credentials_popup(
     );
 }
 
-#[cfg(feature = "commons-upload")]
+#[cfg(any(feature = "commons-upload", feature = "evernote"))]
 fn render_inline_popup_buttons(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -8383,6 +8432,232 @@ fn render_inline_popup_buttons(
         targets.push((action.clone(), Rect::new(x, area.y, width, 1)));
         x = x.saturating_add(width).saturating_add(3);
     }
+}
+
+#[cfg(feature = "evernote")]
+fn render_evernote_popup(
+    frame: &mut Frame<'_>,
+    popup: &EvernoteNotePopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(100, 25, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Save Opus audio to Evernote ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+		Paragraph::new(
+			"Youta currently saves audio only. Title, description, and tags are optional; the source link is always included.",
+		)
+		.style(theme.base)
+		.wrap(Wrap { trim: false }),
+		sections[0],
+	);
+    let fields = [
+        (
+            EvernoteNoteField::Title,
+            "Title",
+            popup.draft.title.as_str(),
+        ),
+        (
+            EvernoteNoteField::Body,
+            "Description / note body",
+            popup.draft.body.as_str(),
+        ),
+        (
+            EvernoteNoteField::Tags,
+            "Tags (comma-separated)",
+            popup.draft.tags.as_str(),
+        ),
+    ];
+    for ((field, label, value), field_area) in fields.into_iter().zip(sections[1..=3].iter()) {
+        let selected = popup.selected_field == field && popup.phase == EvernoteNotePhase::Review;
+        let value = value.replace('\n', " ↵ ");
+        frame.render_widget(
+            Paragraph::new(truncate_setup_value(
+                &value,
+                usize::from(field_area.width.saturating_sub(2)),
+            ))
+            .style(if selected { theme.selected } else { theme.base })
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(if selected { theme.accent } else { theme.border })
+                    .title(format!("{} {label}", if selected { "▶" } else { " " })),
+            ),
+            *field_area,
+        );
+        if popup.phase == EvernoteNotePhase::Review {
+            hit_map.evernote_fields.push((field, *field_area));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(truncate_setup_value(
+            &popup.draft.source_url,
+            usize::from(sections[4].width.saturating_sub(2)),
+        ))
+        .style(theme.muted)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .title(" Source URL "),
+        ),
+        sections[4],
+    );
+    let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
+    let animation = frames[(popup.animation_frame / 4) % frames.len()];
+    let status = match popup.phase {
+		EvernoteNotePhase::Review => popup.validation_error.as_deref().unwrap_or(
+			"Tab changes fields. Ctrl+S saves. Ctrl+Z undoes body edits. F2 adds YouTube captions.",
+		).to_owned(),
+		EvernoteNotePhase::LoadingCaptions => format!("{animation} Loading YouTube captions"),
+		EvernoteNotePhase::PreparingAudio => format!("{animation} Preparing Opus audio"),
+		EvernoteNotePhase::Saving => format!(
+			"{animation} Saving {} Opus attachment to Evernote",
+			popup
+				.total_bytes
+				.map_or_else(|| "the".to_owned(), human_bytes)
+		),
+		EvernoteNotePhase::Complete => "Thanks for preserving the history".to_owned(),
+	};
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(if popup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[5],
+    );
+    let controls: Vec<(&str, UiAction)> = match popup.phase {
+        EvernoteNotePhase::Review => {
+            let mut controls = vec![
+                ("Save note", UiAction::SubmitEvernoteNote),
+                ("Cancel", UiAction::DismissEvernoteNote),
+            ];
+            if popup.captions_available {
+                controls.insert(
+                    0,
+                    ("Add YouTube captions", UiAction::InsertEvernoteCaptions),
+                );
+            }
+            controls
+        }
+        EvernoteNotePhase::Complete => vec![
+            ("Open note", UiAction::OpenEvernoteNoteResult),
+            ("Close", UiAction::DismissEvernoteNote),
+        ],
+        _ => Vec::new(),
+    };
+    render_inline_popup_buttons(
+        frame,
+        sections[6],
+        &controls,
+        theme,
+        &mut hit_map.evernote_buttons,
+    );
+}
+
+#[cfg(feature = "evernote")]
+fn render_evernote_credentials_popup(
+    frame: &mut Frame<'_>,
+    popup: &EvernoteCredentialsPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(92, 15, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Configure Evernote ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+		Paragraph::new(
+			"Paste an Evernote authentication token. It is stored only in Youta's private credentials file.",
+		)
+		.style(theme.base)
+		.wrap(Wrap { trim: false }),
+		sections[0],
+	);
+    frame.render_widget(
+        Paragraph::new(masked_setup_value(
+            &popup.token,
+            usize::from(sections[1].width.saturating_sub(2)),
+        ))
+        .style(theme.selected)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme.accent)
+                .title(" ▶ Authentication token (masked) "),
+        ),
+        sections[1],
+    );
+    hit_map.evernote_credentials_field = Some(sections[1]);
+    let storage = format!(
+        "Storage: {}{}",
+        popup.credentials_path,
+        popup
+            .validation_error
+            .as_ref()
+            .map_or_else(String::new, |error| format!("\nError: {error}"))
+    );
+    frame.render_widget(
+        Paragraph::new(storage)
+            .style(if popup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+    let mut controls = vec![
+        ("Save", UiAction::SubmitEvernoteCredentials),
+        ("Cancel", UiAction::DismissEvernoteCredentials),
+    ];
+    if external_opener_available {
+        controls.insert(
+            0,
+            ("Register token", UiAction::OpenEvernoteDeveloperTokenGuide),
+        );
+    }
+    render_inline_popup_buttons(
+        frame,
+        sections[3],
+        &controls,
+        theme,
+        &mut hit_map.evernote_credentials_buttons,
+    );
 }
 
 fn render_rss_subscription_popup(
@@ -10411,6 +10686,38 @@ fn mouse_action_unfiltered(
             }
             MouseEventKind::ScrollDown => Some(UiAction::MoveCommonsCategorySuggestion(1)),
             MouseEventKind::ScrollUp => Some(UiAction::MoveCommonsCategorySuggestion(-1)),
+            _ => None,
+        };
+    }
+    #[cfg(feature = "evernote")]
+    if view.evernote_credentials_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .evernote_credentials_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            _ => None,
+        };
+    }
+    #[cfg(feature = "evernote")]
+    if view.evernote_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((field, _)) = hit_map
+                    .evernote_fields
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::SelectEvernoteNoteField(*field))
+                } else {
+                    hit_map
+                        .evernote_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
             _ => None,
         };
     }
@@ -20230,6 +20537,84 @@ mod tests {
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenCommonsUpload)
         );
+    }
+
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn details_evernote_button_never_renders_its_help_only_hotkey() {
+        let backend = TestBackend::new(140, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Evernote fixture".to_owned(),
+                ..DetailView::default()
+            }),
+            evernote_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Evernote action");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Save audio to Evernote"));
+        assert!(!rendered.contains("[E] Save audio to Evernote"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenEvernoteNote)
+        );
+
+        let help_view = ViewModel {
+            help_open: true,
+            ..ViewModel::default()
+        };
+        terminal
+            .draw(|frame| render(frame, &help_view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Evernote help");
+        assert!(rendered_text(&terminal).contains("E Evernote audio"));
+    }
+
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn evernote_popup_renders_source_caption_button_and_slow_save_animation() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = ViewModel {
+            evernote_popup: Some(EvernoteNotePopupView {
+                draft: crate::evernote::EvernoteNoteDraft {
+                    title: "Fixture title".to_owned(),
+                    body: "Fixture description".to_owned(),
+                    tags: "archive, audio".to_owned(),
+                    source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                },
+                captions_available: true,
+                ..EvernoteNotePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Evernote review");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Fixture title"), "{rendered}");
+        assert!(rendered.contains("youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(rendered.contains("Add YouTube captions"));
+
+        let popup = view.evernote_popup.as_mut().expect("Evernote popup");
+        popup.phase = EvernoteNotePhase::Saving;
+        popup.total_bytes = Some(2 * 1024);
+        popup.animation_frame = 8;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Evernote saving");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Saving 2.0 KiB Opus attachment to Evernote"));
+        assert!(rendered.contains("···"));
     }
 
     #[cfg(feature = "commons-upload")]

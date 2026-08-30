@@ -355,6 +355,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {view.commons_upload_available ? (
           <Action onClick={() => void dispatch("OpenCommonsUpload")}>Upload to Commons</Action>
         ) : null}
+		{view.evernote_available ? (
+			<Action onClick={() => void dispatch('OpenEvernoteNote')}>Save audio to Evernote</Action>
+		) : null}
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}

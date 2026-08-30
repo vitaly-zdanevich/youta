@@ -85,6 +85,9 @@ pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
 /// Environment variable that overrides the Yandex Music OAuth access token.
 pub const YANDEX_MUSIC_TOKEN_ENV: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
 
+/// Environment variable that overrides the Evernote authentication token.
+pub const EVERNOTE_AUTH_TOKEN_ENV: &str = "YOUTA_PROVIDERS__EVERNOTE_AUTH_TOKEN";
+
 /// Environment variable that overrides the Wikimedia Commons username.
 pub const WIKIMEDIA_COMMONS_USERNAME_ENV: &str = "YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_USERNAME";
 
@@ -137,6 +140,7 @@ struct CredentialsFile {
 struct ProviderCredentials {
     youtube_api_key: Option<String>,
     yandex_music_token: Option<String>,
+    evernote_auth_token: Option<String>,
     wikimedia_commons_username: Option<String>,
     wikimedia_commons_password: Option<String>,
     wikimedia_commons_auth_method: WikimediaCommonsAuthMethod,
@@ -307,6 +311,9 @@ impl Config {
         }
         if let Some(token) = self.providers.yandex_music_token.as_deref() {
             validate_generic_credential("providers.yandex_music_token", token)?;
+        }
+        if let Some(token) = self.providers.evernote_auth_token.as_deref() {
+            validate_generic_credential("providers.evernote_auth_token", token)?;
         }
         validate_wikimedia_commons_credentials(
             self.providers.wikimedia_commons_username.as_deref(),
@@ -536,6 +543,52 @@ impl Config {
         )?;
         write_private_config(&config_path, config_document.to_string().as_bytes())?;
         self.providers.yandex_music_token = Some(token);
+        Ok(())
+    }
+
+    /// Persists one Evernote authentication token in the private credentials file.
+    ///
+    /// Existing unrelated settings, comments, and credentials are preserved.
+    /// The token is removed from a legacy public provider table before the
+    /// private file is published. An active environment override prevents the
+    /// write because it would shadow the saved token on the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is empty, contains surrounding
+    /// whitespace or control characters, exceeds 4096 bytes, an environment
+    /// override is active, or either TOML file cannot be updated atomically.
+    #[cfg(all(feature = "controller", feature = "evernote"))]
+    pub fn save_evernote_auth_token(&mut self, token: String) -> Result<(), ConfigError> {
+        if std::env::var_os(EVERNOTE_AUTH_TOKEN_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{EVERNOTE_AUTH_TOKEN_ENV} overrides the saved Evernote token; change or remove it before saving"
+            )));
+        }
+        validate_generic_credential("providers.evernote_auth_token", &token)?;
+
+        self.ensure_directories()?;
+        let config_path = self.config_file();
+        let credentials_path = self.credentials_file();
+        let mut config_document = read_editable_config(&config_path)?;
+        let mut credentials_document = read_editable_credentials(&credentials_path)?;
+        migrate_legacy_provider_credentials(&mut config_document, &mut credentials_document)?;
+
+        if let Some(providers) = config_document
+            .get_mut("providers")
+            .and_then(Item::as_table_mut)
+        {
+            providers.remove("evernote_auth_token");
+        }
+        let providers = editable_table(&mut credentials_document, "providers")?;
+        providers["evernote_auth_token"] = value(token.clone());
+
+        write_private_config(
+            &credentials_path,
+            credentials_document.to_string().as_bytes(),
+        )?;
+        write_private_config(&config_path, config_document.to_string().as_bytes())?;
+        self.providers.evernote_auth_token = Some(token);
         Ok(())
     }
 
@@ -1430,6 +1483,8 @@ pub struct ProviderConfig {
     pub youtube_api_key: Option<String>,
     /// Optional OAuth access token for the user's Yandex Music account.
     pub yandex_music_token: Option<String>,
+    /// Optional Evernote OAuth or personal developer authentication token.
+    pub evernote_auth_token: Option<String>,
     /// Optional Wikimedia Commons account or `BotPassword` username.
     pub wikimedia_commons_username: Option<String>,
     /// Optional Wikimedia Commons account or `BotPassword` password.
@@ -1485,6 +1540,10 @@ impl fmt::Debug for ProviderConfig {
                 &self.yandex_music_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
+                "evernote_auth_token",
+                &self.evernote_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
                 "wikimedia_commons_username",
                 &self.wikimedia_commons_username,
             )
@@ -1531,6 +1590,7 @@ impl Default for ProviderConfig {
             funkwhale_instance_url: None,
             youtube_api_key: None,
             yandex_music_token: None,
+            evernote_auth_token: None,
             wikimedia_commons_username: None,
             wikimedia_commons_password: None,
             wikimedia_commons_auth_method: WikimediaCommonsAuthMethod::default(),
@@ -1754,6 +1814,10 @@ fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
     }
     if let Some(token) = credentials.providers.yandex_music_token.as_deref() {
         validate_generic_credential("providers.yandex_music_token", token)
+            .map_err(|error| credential_file_error(path, error))?;
+    }
+    if let Some(token) = credentials.providers.evernote_auth_token.as_deref() {
+        validate_generic_credential("providers.evernote_auth_token", token)
             .map_err(|error| credential_file_error(path, error))?;
     }
     validate_wikimedia_commons_credentials(
@@ -1980,6 +2044,7 @@ fn migrate_legacy_provider_credentials(
         for field in [
             "youtube_api_key",
             "yandex_music_token",
+            "evernote_auth_token",
             "wikimedia_commons_username",
             "wikimedia_commons_password",
             "wikimedia_commons_auth_method",
@@ -2891,6 +2956,7 @@ youtube_api_key = "keep-this-existing-secret"
         let mut providers = ProviderConfig {
             youtube_api_key: Some("youtube-secret-canary".to_owned()),
             yandex_music_token: Some("yandex-oauth-secret-canary".to_owned()),
+            evernote_auth_token: Some("evernote-secret-canary".to_owned()),
             mod_archive_api_key: Some("mod-secret-canary".to_owned()),
             jamendo_client_id: Some("jamendo-client-canary".to_owned()),
             acoustid_client_key: Some("acoustid-secret-canary".to_owned()),
@@ -2902,6 +2968,7 @@ youtube_api_key = "keep-this-existing-secret"
         for secret in [
             "youtube-secret-canary",
             "yandex-oauth-secret-canary",
+            "evernote-secret-canary",
             "mod-secret-canary",
             "jamendo-client-canary",
             "acoustid-secret-canary",
@@ -3127,6 +3194,7 @@ youtube_api_key = "keep-this-existing-secret"
         for (field, value) in [
             ("youtube_api_key", " AIzaValid_key_123456789012345678"),
             ("yandex_music_token", " yandex-oauth-token"),
+            ("evernote_auth_token", " evernote-auth-token"),
             ("mod_archive_api_key", "mod-archive-key "),
             ("jamendo_client_id", "\tjamendo-client-id"),
             ("acoustid_client_key", "acoustid-key "),
@@ -3167,6 +3235,7 @@ youtube_api_key = "keep-this-existing-secret"
         for (field, value) in [
             ("youtube_api_key", "AIzaValid_key_123456789012345678 "),
             ("yandex_music_token", "yandex-oauth-token "),
+            ("evernote_auth_token", "evernote-auth-token "),
             ("mod_archive_api_key", " mod-archive-key"),
             ("jamendo_client_id", "jamendo-client-id\n"),
             ("acoustid_client_key", "acoustid-client-key "),
@@ -3232,6 +3301,43 @@ youtube_api_key = "keep-this-existing-secret"
                 0o600
             );
         }
+    }
+
+    #[cfg(all(feature = "controller", feature = "evernote"))]
+    #[test]
+    fn evernote_token_saves_privately_and_preserves_unrelated_content() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("youta");
+        fs::create_dir(&root).expect("config directory");
+        fs::write(
+			root.join("config.toml"),
+			"# keep this comment\n[providers]\nevernote_auth_token = \"legacy-token\"\nbandcamp_audio_format = \"flac\"\n",
+		)
+		.expect("legacy configuration");
+        let mut config = Config::load_from_dir_with_environment(root.clone(), false)
+            .expect("load legacy credential");
+        let token = "current-evernote-auth-token";
+
+        config
+            .save_evernote_auth_token(token.to_owned())
+            .expect("save Evernote token");
+
+        let public = fs::read_to_string(config.config_file()).expect("saved configuration");
+        assert!(public.contains("# keep this comment"));
+        assert!(public.contains("bandcamp_audio_format = \"flac\""));
+        assert!(!public.contains("legacy-token"));
+        assert!(!public.contains(token));
+        let private = fs::read_to_string(config.credentials_file()).expect("private credentials");
+        assert!(private.contains(token));
+        assert!(!private.contains("legacy-token"));
+        assert_eq!(config.providers.evernote_auth_token.as_deref(), Some(token));
+
+        let reloaded =
+            Config::load_from_dir_with_environment(root, false).expect("reload saved token");
+        assert_eq!(
+            reloaded.providers.evernote_auth_token.as_deref(),
+            Some(token)
+        );
     }
 
     #[cfg(feature = "controller")]

@@ -15,6 +15,9 @@ import type {
   CommonsCredentialsEditorView,
   CommonsUploadField,
   CommonsUploadPopupView,
+	EvernoteCredentialsEditorView,
+	EvernoteNoteField,
+	EvernoteNotePopupView,
   ErrorPopupView,
   GitHubIssueSubmissionView,
   LocalFilePopupView,
@@ -65,11 +68,13 @@ function Body({ children }: { children: React.ReactNode }) {
 export function HelpPopup({
   audioQualitySupported,
   commonsUploadSupported,
+	evernoteSupported,
   playbackHistoryEnabled,
   videoSummarySupported,
 }: {
   audioQualitySupported: boolean;
   commonsUploadSupported: boolean;
+	evernoteSupported: boolean;
   playbackHistoryEnabled: boolean;
   videoSummarySupported: boolean;
 }) {
@@ -118,6 +123,11 @@ export function HelpPopup({
               ["U", "upload selected YouTube, Yandex Music, or Apple Podcasts audio to Commons"],
             ] satisfies Array<[string, string]>)
           : []),
+		...(evernoteSupported
+			? ([
+					['E', 'save selected remote audio to Evernote'],
+				] satisfies Array<[string, string]>)
+			: []),
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
         ["i", "expand artwork"],
@@ -423,6 +433,156 @@ export function CommonsCredentialsPopup({
       </Body>
     </Popup>
   );
+}
+
+/** One reducer-owned Evernote field; typing remains in the shared keymap. */
+function EvernoteField({
+	label,
+	field,
+	selected,
+	value,
+	multiline = false,
+}: {
+	label: string;
+	field: EvernoteNoteField;
+	selected: boolean;
+	value: string;
+	multiline?: boolean;
+}) {
+	return (
+		<button
+			type='button'
+			onMouseDown={(event) => event.preventDefault()}
+			onClick={() => void dispatch({ SelectEvernoteNoteField: field })}
+			className={`grid min-h-[42px] w-full grid-cols-[145px_minmax(0,1fr)] gap-3 rounded-[5px] border px-[9px] py-[6px] text-left text-xs ${
+				selected ? 'border-accent bg-raised' : 'border-line-strong hover:border-ink-faint'
+			}`}
+		>
+			<span className='text-ink-faint'>{label}</span>
+			<span className={multiline ? 'max-h-[150px] overflow-y-auto whitespace-pre-wrap' : 'truncate'}>
+				{value === '' ? <span className='text-ink-faint'>Empty</span> : value}
+				{selected ? (
+					<span aria-hidden className='ml-px inline-block h-[13px] w-[2px] animate-pulse bg-accent' />
+				) : null}
+			</span>
+		</button>
+	);
+}
+
+/** Evernote metadata review, captions, Opus preparation, save, and result. */
+export function EvernoteNotePopup({ popup }: { popup: EvernoteNotePopupView }) {
+	const active = popup.phase === 'LoadingCaptions' || popup.phase === 'PreparingAudio' || popup.phase === 'Saving';
+	const complete = popup.phase === 'Complete';
+	const activity = '.'.repeat((Math.floor(popup.animation_frame / 4) % 3) + 1);
+	const status = popup.phase === 'LoadingCaptions'
+		? `Loading YouTube captions${activity}`
+		: popup.phase === 'PreparingAudio'
+			? `Preparing Opus audio${activity}`
+			: `Saving the Opus attachment to Evernote${activity}`;
+
+	return (
+		<Popup
+			title='Save Opus audio to Evernote'
+			subtitle='Youta currently saves audio only'
+			layer={LAYER.commonsUpload}
+			width='760px'
+			onDismiss={() => void dispatch('DismissEvernoteNote')}
+			dismissDisabled={active}
+			footer={
+				complete ? (
+					<>
+						<PopupButton emphasis onClick={() => void dispatch('OpenEvernoteNoteResult')}>Open note</PopupButton>
+						<PopupButton onClick={() => void dispatch('DismissEvernoteNote')}>Close</PopupButton>
+					</>
+				) : active ? (
+					<span>{status}</span>
+				) : (
+					<>
+						{popup.captions_available ? (
+							<PopupButton onClick={() => void dispatch('InsertEvernoteCaptions')}>Add YouTube captions</PopupButton>
+						) : null}
+						<PopupButton emphasis onClick={() => void dispatch('SubmitEvernoteNote')}>Save note</PopupButton>
+						<PopupButton onClick={() => void dispatch('DismissEvernoteNote')}>Cancel</PopupButton>
+					</>
+				)
+			}
+		>
+			<Body>
+				{complete ? (
+					<div className='grid gap-3'>
+						<p className='text-base text-ink'>Thanks for preserving the history</p>
+						{popup.result_url ? (
+							<button
+								type='button'
+								onClick={() => void dispatch('OpenEvernoteNoteResult')}
+								className='break-all text-left text-accent underline decoration-dotted underline-offset-2'
+							>
+								{popup.result_url}
+							</button>
+						) : null}
+					</div>
+				) : active ? (
+					<div className='grid gap-3'>
+						<p className='text-ink-dim'>{status}</p>
+						{popup.total_bytes !== null ? (
+							<p className='text-[11px] text-ink-faint'>{popup.total_bytes.toLocaleString()} bytes staged</p>
+						) : null}
+					</div>
+				) : (
+					<div className='grid gap-[8px]'>
+						<EvernoteField label='Title (optional)' field='Title' selected={popup.selected_field === 'Title'} value={popup.draft.title} />
+						<EvernoteField label='Description / body' field='Body' selected={popup.selected_field === 'Body'} value={popup.draft.body} multiline />
+						<EvernoteField label='Tags (optional)' field='Tags' selected={popup.selected_field === 'Tags'} value={popup.draft.tags} />
+						<div className='grid min-h-[42px] grid-cols-[145px_minmax(0,1fr)] gap-3 rounded-[5px] border border-line-strong px-[9px] py-[6px] text-xs'>
+							<span className='text-ink-faint'>Source URL</span>
+							<span className='truncate'>{popup.draft.source_url}</span>
+						</div>
+						<p className='text-[11px] text-ink-faint'>Ctrl+Z undoes changes to the note body.</p>
+					</div>
+				)}
+				<PopupError message={popup.validation_error} />
+			</Body>
+		</Popup>
+	);
+}
+
+/** Redacted Evernote token editor; the token remains in the Rust reducer. */
+export function EvernoteCredentialsPopup({
+	editor,
+}: {
+	editor: EvernoteCredentialsEditorView;
+}) {
+	const summary = editor.token_length === 0
+		? 'Empty'
+		: `${editor.token_length} character${editor.token_length === 1 ? '' : 's'} entered`;
+	return (
+		<Popup
+			title='Evernote authentication'
+			subtitle='The token stays in the Youta process'
+			layer={LAYER.credentialEditor}
+			width='600px'
+			onDismiss={() => void dispatch('DismissEvernoteCredentials')}
+			footer={
+				<>
+					<PopupButton onClick={() => void dispatch('OpenEvernoteDeveloperTokenGuide')}>Register token</PopupButton>
+					<PopupButton emphasis onClick={() => void dispatch('SubmitEvernoteCredentials')}>Save token</PopupButton>
+					<PopupButton onClick={() => void dispatch('DismissEvernoteCredentials')}>Cancel</PopupButton>
+				</>
+			}
+		>
+			<Body>
+				<div className='grid gap-3'>
+					<p className='text-ink-dim'>Type or paste the authentication token. Enter saves it.</p>
+					<button type='button' className='grid min-h-[42px] grid-cols-[170px_minmax(0,1fr)] gap-3 rounded-[5px] border border-accent bg-raised px-[9px] py-[6px] text-left text-xs'>
+						<span className='text-ink-faint'>Token (masked)</span>
+						<span>{summary}</span>
+					</button>
+					<p className='text-[11px] text-ink-faint'>Saved privately in ~/.config/youta/secrets/credentials.toml</p>
+					<PopupError message={editor.validation_failed ? 'Could not save this token. Check it and try again.' : null} />
+				</div>
+			</Body>
+		</Popup>
+	);
 }
 
 /** Immediate progress and copyable results for a local audio-quality batch. */

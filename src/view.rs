@@ -9,15 +9,15 @@
 //!
 //! Most of this vocabulary derives [`Serialize`] so a frontend outside this
 //! process can consume it. Sensitive editor contents deliberately do not cross
-//! that boundary: API keys, OAuth tokens, Commons credentials, private notes,
-//! and potentially private feed URLs stay in this process. A frontend that must
+//! that boundary: API keys, OAuth tokens, Commons credentials, Evernote tokens,
+//! private notes, and potentially private feed URLs stay in this process. A frontend that must
 //! render those editors needs a redacting projection first — deriving
 //! [`Serialize`] on them would place secrets in another process's heap.
 //!
 //! Most secret-bearing [`ViewModel`] fields serialize as a bare `open` boolean
 //! rather than being skipped outright, through `serialize_editor_presence`.
-//! The Commons editor uses a redacted projection containing only field lengths,
-//! focus, login method, and whether validation failed. Withholding even that
+//! The Commons and Evernote editors use redacted projections containing only
+//! field lengths, focus, login method where relevant, and whether validation failed. Withholding even that
 //! state is worse than useless: these editors are modal, so while one is open
 //! the keyboard map routes every key into it. A frontend that cannot see that
 //! an editor exists renders an ordinary screen that silently ignores input —
@@ -38,6 +38,8 @@ use crate::config::{
     BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
 use crate::domain::{Chapter, MediaId, MediaKind};
+#[cfg(feature = "evernote")]
+use crate::evernote::EvernoteNoteDraft;
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "qr")]
 use crate::qr_code::QrMatrix;
@@ -608,6 +610,28 @@ fn serialize_commons_credentials_editor<S: serde::Serializer>(
         password_length: editor.password.chars().count(),
         password_selected: editor.password_selected,
         auth_method: editor.auth_method,
+        validation_failed: editor.validation_error.is_some(),
+    }
+    .serialize(serializer)
+}
+
+/// Serializes only the non-secret shape needed to draw the Evernote token editor.
+#[cfg(feature = "evernote")]
+fn serialize_evernote_credentials_editor<S: serde::Serializer>(
+    editor: &Option<EvernoteCredentialsPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct RedactedEvernoteCredentialsEditor {
+        token_length: usize,
+        validation_failed: bool,
+    }
+
+    let Some(editor) = editor else {
+        return serializer.serialize_none();
+    };
+    RedactedEvernoteCredentialsEditor {
+        token_length: editor.token.chars().count(),
         validation_failed: editor.validation_error.is_some(),
     }
     .serialize(serializer)
@@ -1797,6 +1821,84 @@ impl std::fmt::Debug for CommonsCredentialsPopupView {
     }
 }
 
+/// Editable field focused in the Evernote note review popup.
+#[cfg(feature = "evernote")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EvernoteNoteField {
+    /// Optional note title.
+    #[default]
+    Title,
+    /// Optional multiline note body.
+    Body,
+    /// Optional comma-separated tag names.
+    Tags,
+}
+
+/// Lifecycle shown in the Evernote note popup.
+#[cfg(feature = "evernote")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EvernoteNotePhase {
+    /// Metadata is editable and no worker is active.
+    #[default]
+    Review,
+    /// `YouTube` captions are being extracted for insertion.
+    LoadingCaptions,
+    /// Provider audio is downloading or transcoding to Opus.
+    PreparingAudio,
+    /// Evernote is accepting the note and attachment.
+    Saving,
+    /// Evernote created the note.
+    Complete,
+}
+
+/// Public, serializable Evernote review and progress state.
+#[cfg(feature = "evernote")]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvernoteNotePopupView {
+    /// Editable note metadata and immutable source URL.
+    pub draft: EvernoteNoteDraft,
+    /// Field currently receiving keyboard input.
+    pub selected_field: EvernoteNoteField,
+    /// Current review, caption, audio, save, or completion phase.
+    pub phase: EvernoteNotePhase,
+    /// Monotonic frame counter for a slow activity animation.
+    pub animation_frame: usize,
+    /// Total staged Opus bytes once preparation finishes.
+    pub total_bytes: Option<u64>,
+    /// Inline validation or worker error.
+    pub validation_error: Option<String>,
+    /// Public note page after a successful save.
+    pub result_url: Option<url::Url>,
+    /// Whether the exact selection can provide `YouTube` captions.
+    pub captions_available: bool,
+    /// Whether Ctrl+Z can restore an earlier body state.
+    pub undo_available: bool,
+}
+
+/// Secret-bearing Evernote developer-token editor retained in the process.
+#[cfg(feature = "evernote")]
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct EvernoteCredentialsPopupView {
+    /// Masked authentication token typed by the user.
+    pub token: String,
+    /// Private Youta file that will receive the token.
+    pub credentials_path: String,
+    /// Inline validation or persistence error.
+    pub validation_error: Option<String>,
+}
+
+#[cfg(feature = "evernote")]
+impl std::fmt::Debug for EvernoteCredentialsPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvernoteCredentialsPopupView")
+            .field("token", &"[REDACTED]")
+            .field("credentials_path", &self.credentials_path)
+            .field("validation_error", &self.validation_error)
+            .finish()
+    }
+}
+
 /// Selectable credential field in the YouTube provider setup popup.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum YouTubeSetupField {
@@ -2023,6 +2125,22 @@ pub struct ViewModel {
         serialize_with = "serialize_commons_credentials_editor"
     )]
     pub commons_credentials_popup: Option<CommonsCredentialsPopupView>,
+    /// Whether this build contains the removable Evernote export capability.
+    #[cfg(feature = "evernote")]
+    pub evernote_supported: bool,
+    /// Whether the exact selection can enter the Evernote audio-note flow.
+    #[cfg(feature = "evernote")]
+    pub evernote_available: bool,
+    /// Public note review, progress, and completion state.
+    #[cfg(feature = "evernote")]
+    pub evernote_popup: Option<EvernoteNotePopupView>,
+    /// Secret Evernote token editor shown when configuration has no token.
+    #[cfg(feature = "evernote")]
+    #[serde(
+        rename = "evernote_credentials_editor",
+        serialize_with = "serialize_evernote_credentials_editor"
+    )]
+    pub evernote_credentials_popup: Option<EvernoteCredentialsPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2166,6 +2284,14 @@ impl Default for ViewModel {
             commons_upload_popup: None,
             #[cfg(feature = "commons-upload")]
             commons_credentials_popup: None,
+            #[cfg(feature = "evernote")]
+            evernote_supported: true,
+            #[cfg(feature = "evernote")]
+            evernote_available: false,
+            #[cfg(feature = "evernote")]
+            evernote_popup: None,
+            #[cfg(feature = "evernote")]
+            evernote_credentials_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
@@ -2488,6 +2614,39 @@ pub enum UiAction {
     /// Open the successful Commons file page.
     #[cfg(feature = "commons-upload")]
     OpenCommonsUploadResult,
+    /// Open the selected remote media in an Evernote audio-note review.
+    #[cfg(feature = "evernote")]
+    OpenEvernoteNote,
+    /// Select one editable Evernote note field.
+    #[cfg(feature = "evernote")]
+    SelectEvernoteNoteField(EvernoteNoteField),
+    /// Append one character to the focused Evernote note field.
+    #[cfg(feature = "evernote")]
+    AppendEvernoteNoteCharacter(char),
+    /// Insert a line break in the Evernote note body.
+    #[cfg(feature = "evernote")]
+    InsertEvernoteNoteNewline,
+    /// Remove the final character from the focused Evernote note field.
+    #[cfg(feature = "evernote")]
+    DeleteEvernoteNoteCharacter,
+    /// Remove the final word from the focused Evernote note field.
+    #[cfg(feature = "evernote")]
+    DeleteEvernoteNoteWord,
+    /// Restore the previous state of the Evernote note body.
+    #[cfg(feature = "evernote")]
+    UndoEvernoteNoteBody,
+    /// Fetch and append public captions for the selected `YouTube` video.
+    #[cfg(feature = "evernote")]
+    InsertEvernoteCaptions,
+    /// Start Opus preparation and create the reviewed Evernote note.
+    #[cfg(feature = "evernote")]
+    SubmitEvernoteNote,
+    /// Close the Evernote note review after editing or completion.
+    #[cfg(feature = "evernote")]
+    DismissEvernoteNote,
+    /// Open the successful Evernote note page.
+    #[cfg(feature = "evernote")]
+    OpenEvernoteNoteResult,
     /// Open the canonical item link in a browser.
     OpenInBrowser,
     /// Open the selected item's exact channel page in a browser.
@@ -2630,6 +2789,24 @@ pub enum UiAction {
     /// Open normal Wikimedia account registration.
     #[cfg(feature = "commons-upload")]
     OpenCommonsAccountRegistration,
+    /// Append one character to the masked Evernote token.
+    #[cfg(feature = "evernote")]
+    AppendEvernoteTokenCharacter(char),
+    /// Remove the final Evernote token character.
+    #[cfg(feature = "evernote")]
+    DeleteEvernoteTokenCharacter,
+    /// Remove the final word from the Evernote token.
+    #[cfg(feature = "evernote")]
+    DeleteEvernoteTokenWord,
+    /// Validate and save the Evernote authentication token.
+    #[cfg(feature = "evernote")]
+    SubmitEvernoteCredentials,
+    /// Close the Evernote token editor without saving.
+    #[cfg(feature = "evernote")]
+    DismissEvernoteCredentials,
+    /// Open Evernote's developer-token page.
+    #[cfg(feature = "evernote")]
+    OpenEvernoteDeveloperTokenGuide,
     /// Open or focus the RSS/Atom podcast-feed editor.
     OpenRssSubscriptionPopup,
     /// Add one printable character to the draft RSS feed URL.
@@ -2755,7 +2932,14 @@ impl UiAction {
         );
         #[cfg(not(feature = "commons-upload"))]
         let commons = false;
-        standard || commons
+        #[cfg(feature = "evernote")]
+        let evernote = matches!(
+            self,
+            Self::OpenEvernoteNoteResult | Self::OpenEvernoteDeveloperTokenGuide
+        );
+        #[cfg(not(feature = "evernote"))]
+        let evernote = false;
+        standard || commons || evernote
     }
 }
 
@@ -2888,6 +3072,12 @@ mod tests {
                 credentials_path: "/config/secrets/credentials.toml".to_owned(),
                 validation_error: None,
             }),
+            #[cfg(feature = "evernote")]
+            evernote_credentials_popup: Some(EvernoteCredentialsPopupView {
+                token: "S=s1:U=123:E=TOTALLY_SECRET_EVERNOTE_TOKEN_333333".to_owned(),
+                credentials_path: "/config/secrets/credentials.toml".to_owned(),
+                validation_error: None,
+            }),
             rss_subscription_popup: Some(RssSubscriptionPopupView {
                 url: "https://feeds.example.org/private/SECRET_FEED_GUID".to_owned(),
                 validation_error: None,
@@ -2966,6 +3156,8 @@ mod tests {
             "CommonsSecretUsername",
             #[cfg(feature = "commons-upload")]
             "TOTALLY_SECRET_COMMONS_PASSWORD_222222",
+            #[cfg(feature = "evernote")]
+            "TOTALLY_SECRET_EVERNOTE_TOKEN_333333",
             "SECRET_FEED_GUID",
             "TOTALLY_SECRET_PRIVATE_NOTE_BODY",
             // Paths are not credentials, but they name the file that holds one,
@@ -3036,6 +3228,28 @@ mod tests {
         );
         assert_eq!(
             closed.get("commons_credentials_editor"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    /// Evernote receives only enough secret-editor shape to draw a masked field.
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn evernote_credentials_cross_only_as_a_redacted_editor_projection() {
+        let encoded = serde_json::to_value(view_holding_every_secret())
+            .expect("the view model must serialize");
+        let closed =
+            serde_json::to_value(ViewModel::default()).expect("the view model must serialize");
+
+        assert_eq!(
+            encoded.get("evernote_credentials_editor"),
+            Some(&serde_json::json!({
+                "token_length": 49,
+                "validation_failed": false,
+            }))
+        );
+        assert_eq!(
+            closed.get("evernote_credentials_editor"),
             Some(&serde_json::Value::Null)
         );
     }

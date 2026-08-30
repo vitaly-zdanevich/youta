@@ -26,9 +26,13 @@ pub mod config;
 pub mod diagnostics;
 pub mod domain;
 pub mod durability;
+#[cfg(feature = "evernote")]
+pub mod evernote;
 pub mod file_identity;
 pub mod links;
 pub mod local_browser;
+#[cfg(any(feature = "commons-upload", feature = "evernote"))]
+pub mod opus_export;
 pub mod persistence;
 pub mod playback;
 pub mod private_files;
@@ -47,7 +51,7 @@ pub mod waveform;
 #[cfg(feature = "audio-quality")]
 pub mod audio_quality;
 
-#[cfg(feature = "summary")]
+#[cfg(any(feature = "summary", feature = "evernote"))]
 pub mod video_summary;
 
 #[cfg(feature = "waveform")]

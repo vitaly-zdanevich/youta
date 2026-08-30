@@ -1051,6 +1051,27 @@ The feature intentionally does not claim duplicate/hash discovery, video
 transfer, or structured-data statements yet. Those remain follow-up work and
 must preserve the same explicit review boundary.
 
+### Evernote Opus note transfer
+
+The default `evernote` feature reuses the provider-audio staging boundary but
+keeps a separate review and worker lifecycle:
+
+1. retain the selected remote item's canonical page as an immutable source URL;
+2. prefill optional title and description fields and accept optional tags;
+3. optionally retrieve bounded YouTube captions and append them as one undoable
+   note-body edit;
+4. stage provider audio as Opus in a private generation-owned runtime directory;
+5. build escaped ENML containing the source link and an `audio/ogg` resource
+   identified by its MD5 body hash;
+6. discover the account NoteStore through UserStore, create the note in one
+   blocking Thrift request, and return the canonical shard note URL.
+
+Evernote's EDAM request does not expose server-acknowledged attachment offsets,
+so the front-ends show a slow activity animation and staged byte count rather
+than a misleading progress gauge. The developer token stays process-local and
+is serialized to the desktop window only as its character count and validation
+state.
+
 Internet Archive follows a similar plan with service-specific duplicate keys
 and metadata. A transfer to one service does not imply permission to transfer
 to another.
@@ -1200,10 +1221,10 @@ channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
-default-on `audio-quality`, `commons-upload`, `images`, `qr`, and `summary` USE
+default-on `audio-quality`, `commons-upload`, `evernote`, `images`, `qr`, and `summary` USE
 flags and maps them to their corresponding Cargo features; each source-build
 capability can be disabled independently. Prebuilt artifacts always contain
-the analyzer, Commons upload client, and summary integration because a binary
+the analyzer, Commons upload client, Evernote client, and summary integration because a binary
 USE flag cannot change compiled code.
 The ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)

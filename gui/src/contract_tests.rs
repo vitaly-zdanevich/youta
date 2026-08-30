@@ -25,9 +25,13 @@ use serde::Serialize;
 #[cfg(feature = "commons-upload")]
 use youta::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 use youta::domain::{MediaId, SourceKind};
+#[cfg(feature = "evernote")]
+use youta::evernote::EvernoteNoteDraft;
 use youta::keymap::{PopupGeometry, ScrollGeometry};
 #[cfg(feature = "commons-upload")]
 use youta::view::CommonsUploadPopupView;
+#[cfg(feature = "evernote")]
+use youta::view::EvernoteNotePopupView;
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
@@ -271,6 +275,17 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             }),
         );
     }
+    #[cfg(feature = "evernote")]
+    {
+        emitted.insert(
+            "EvernoteNotePopupView",
+            emitted_keys(&EvernoteNotePopupView::default()),
+        );
+        emitted.insert(
+            "EvernoteNoteDraft",
+            emitted_keys(&EvernoteNoteDraft::default()),
+        );
+    }
     emitted.insert(
         "SubscriptionsView",
         emitted_keys(&SubscriptionsView::default()),
@@ -364,6 +379,8 @@ fn every_checked_interface_is_actually_declared() {
         "CommonsUploadPopupView",
         "CommonsUploadDraft",
         "CommonsCategorySuggestion",
+        "EvernoteNotePopupView",
+        "EvernoteNoteDraft",
         "SubscriptionsView",
         "QueuePopupView",
         "QueueRowView",
@@ -889,6 +906,51 @@ fn the_window_exposes_commons_review_without_putting_the_hotkey_on_the_button() 
     }
 }
 
+#[cfg(feature = "evernote")]
+#[test]
+fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button() {
+    let details = source_named("components/Details.tsx");
+    for required in [
+        "view.evernote_available",
+        "dispatch('OpenEvernoteNote')",
+        ">Save audio to Evernote</Action>",
+    ] {
+        assert!(
+            details.contains(required),
+            "Evernote Details control no longer contains {required}"
+        );
+    }
+    assert!(
+        !details.contains("Save audio to Evernote (E)")
+            && !details.contains("[E] Save audio to Evernote")
+            && !details.contains("<u>E</u>Save audio to Evernote"),
+        "the Evernote button must not render its hotkey"
+    );
+
+    let popups = source_named("components/popups.tsx");
+    for required in [
+        "['E', 'save selected remote audio to Evernote']",
+        "Youta currently saves audio only",
+        "EvernoteField label='Title (optional)'",
+        "EvernoteField label='Description / body'",
+        "EvernoteField label='Tags (optional)'",
+        "Add YouTube captions",
+        "InsertEvernoteCaptions",
+        "Ctrl+Z undoes changes to the note body.",
+        "Thanks for preserving the history",
+        "OpenEvernoteNoteResult",
+        "EvernoteCredentialsPopup",
+        "OpenEvernoteDeveloperTokenGuide",
+        "SubmitEvernoteCredentials",
+        "~/.config/youta/secrets/credentials.toml",
+    ] {
+        assert!(
+            popups.contains(required),
+            "Evernote window flow no longer contains {required}"
+        );
+    }
+}
+
 #[test]
 fn the_window_keeps_radio_homepages_visible_and_openable() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1114,11 +1176,13 @@ fn the_contract_never_names_a_credential_bearing_editor() {
         "RssSubscriptionPopupView",
         "PrivateNotePopupView",
         "CommonsCredentialsPopupView",
+        "EvernoteCredentialsPopupView",
         "youtube_setup_popup",
         "yandex_music_setup_popup",
         "rss_subscription_popup",
         "private_note_popup",
         "commons_credentials_popup",
+        "evernote_credentials_popup",
     ] {
         assert!(
             !declared_interfaces(&source)

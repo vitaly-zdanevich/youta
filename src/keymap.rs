@@ -141,6 +141,8 @@ mod wire_tests {
     use crate::playback::PlaybackStatus;
     #[cfg(feature = "commons-upload")]
     use crate::view::{CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView};
+    #[cfg(feature = "evernote")]
+    use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
     use crate::view::{UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel};
 
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
@@ -353,6 +355,74 @@ mod wire_tests {
         assert_eq!(
             key_action(KeyPress::new(Key::Enter), &view, None, None),
             Some(UiAction::OpenCommonsUploadResult)
+        );
+    }
+
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn uppercase_e_opens_only_an_available_evernote_export() {
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('E')), &view, None, None),
+            None
+        );
+        view.evernote_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('E')), &view, None, None),
+            Some(UiAction::OpenEvernoteNote)
+        );
+    }
+
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn evernote_body_owns_newline_undo_captions_and_submit_keys() {
+        let popup = EvernoteNotePopupView {
+            selected_field: EvernoteNoteField::Body,
+            captions_available: true,
+            undo_available: true,
+            ..EvernoteNotePopupView::default()
+        };
+        let mut view = ViewModel {
+            evernote_popup: Some(popup),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::InsertEvernoteNoteNewline)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('z'))
+                },
+                &view,
+                None,
+                None,
+            ),
+            Some(UiAction::UndoEvernoteNoteBody)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(2)), &view, None, None),
+            Some(UiAction::InsertEvernoteCaptions)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('s'))
+                },
+                &view,
+                None,
+                None,
+            ),
+            Some(UiAction::SubmitEvernoteNote)
+        );
+
+        view.evernote_popup.as_mut().expect("Evernote popup").phase = EvernoteNotePhase::Complete;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::OpenEvernoteNoteResult)
         );
     }
 
@@ -778,6 +848,65 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    #[cfg(feature = "evernote")]
+    if let Some(popup) = view.evernote_popup.as_ref() {
+        if popup.phase == EvernoteNotePhase::Complete {
+            return match key.key {
+                Key::Enter => Some(UiAction::OpenEvernoteNoteResult),
+                Key::Esc => Some(UiAction::DismissEvernoteNote),
+                _ => None,
+            };
+        }
+        if popup.phase != EvernoteNotePhase::Review {
+            return match key.key {
+                Key::Esc => Some(UiAction::DismissEvernoteNote),
+                _ => None,
+            };
+        }
+        let fields = [
+            EvernoteNoteField::Title,
+            EvernoteNoteField::Body,
+            EvernoteNoteField::Tags,
+        ];
+        let selected = fields
+            .iter()
+            .position(|field| *field == popup.selected_field)
+            .unwrap_or_default();
+        let next = fields[(selected + 1) % fields.len()];
+        let previous = fields[(selected + fields.len() - 1) % fields.len()];
+        if key.key == Key::Tab {
+            return Some(UiAction::SelectEvernoteNoteField(if reverse_tab(key) {
+                previous
+            } else {
+                next
+            }));
+        }
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissEvernoteNote),
+            Key::Char('s' | 'S') if key.ctrl => Some(UiAction::SubmitEvernoteNote),
+            Key::Char('z' | 'Z')
+                if key.ctrl
+                    && popup.selected_field == EvernoteNoteField::Body
+                    && popup.undo_available =>
+            {
+                Some(UiAction::UndoEvernoteNoteBody)
+            }
+            Key::F(2) if popup.captions_available => Some(UiAction::InsertEvernoteCaptions),
+            Key::BackTab | Key::Up => Some(UiAction::SelectEvernoteNoteField(previous)),
+            Key::Enter if popup.selected_field == EvernoteNoteField::Body => {
+                Some(UiAction::InsertEvernoteNoteNewline)
+            }
+            Key::Down | Key::Enter => Some(UiAction::SelectEvernoteNoteField(next)),
+            Key::Backspace => Some(UiAction::DeleteEvernoteNoteCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteEvernoteNoteWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendEvernoteNoteCharacter(character))
+            }
+            _ => None,
+        };
+    }
     #[cfg(feature = "commons-upload")]
     if view.commons_credentials_popup.is_some() {
         return match key.key {
@@ -795,6 +924,22 @@ fn unfiltered_key_action(
             }
             Key::Char(character) if !character.is_control() && !key.chorded() => {
                 Some(UiAction::AppendCommonsCredentialCharacter(character))
+            }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "evernote")]
+    if view.evernote_credentials_popup.is_some() {
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissEvernoteCredentials),
+            Key::Enter => Some(UiAction::SubmitEvernoteCredentials),
+            Key::F(1) => Some(UiAction::OpenEvernoteDeveloperTokenGuide),
+            Key::Backspace => Some(UiAction::DeleteEvernoteTokenCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteEvernoteTokenWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendEvernoteTokenCharacter(character))
             }
             _ => None,
         };
@@ -1137,6 +1282,10 @@ fn unfiltered_key_action(
         #[cfg(feature = "commons-upload")]
         Key::Char('U') if !key.chorded() && view.commons_upload_available => {
             Some(UiAction::OpenCommonsUpload)
+        }
+        #[cfg(feature = "evernote")]
+        Key::Char('E') if !key.chorded() && view.evernote_available => {
+            Some(UiAction::OpenEvernoteNote)
         }
         Key::Char('l') if view.playlist_item.is_some() && !key.modified() => {
             Some(UiAction::ToggleTodoPlaylist)

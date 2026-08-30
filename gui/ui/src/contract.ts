@@ -14,7 +14,7 @@
 // YouTube API key, Yandex OAuth token, Commons credentials, private note body,
 // or feed URL that may itself be a credential — are skipped by the reducer, so
 // they never enter this process and must not be declared as if they might. The
-// Commons editor below carries only lengths and control state.
+// Commons and Evernote editors below carry only lengths and control state.
 
 /** A serde `Duration`, which crosses as seconds plus nanoseconds. */
 export interface RustDuration {
@@ -600,6 +600,44 @@ export interface CommonsCredentialsEditorView {
   validation_failed: boolean;
 }
 
+/** Editable metadata for one Evernote audio note. */
+export interface EvernoteNoteDraft {
+	title: string;
+	body: string;
+	tags: string;
+	source_url: string;
+}
+
+/** Evernote note field currently receiving input from the shared keymap. */
+export type EvernoteNoteField = 'Title' | 'Body' | 'Tags';
+
+/** Lifecycle of caption insertion, Opus preparation, and Evernote creation. */
+export type EvernoteNotePhase =
+	| 'Review'
+	| 'LoadingCaptions'
+	| 'PreparingAudio'
+	| 'Saving'
+	| 'Complete';
+
+/** Public review, progress, and completion state for one Evernote audio note. */
+export interface EvernoteNotePopupView {
+	draft: EvernoteNoteDraft;
+	selected_field: EvernoteNoteField;
+	phase: EvernoteNotePhase;
+	animation_frame: number;
+	total_bytes: number | null;
+	validation_error: string | null;
+	result_url: string | null;
+	captions_available: boolean;
+	undo_available: boolean;
+}
+
+/** Non-secret control state for entering an Evernote token in this window. */
+export interface EvernoteCredentialsEditorView {
+	token_length: number;
+	validation_failed: boolean;
+}
+
 /** The published snapshot. */
 export interface ViewModel {
   screen: string;
@@ -650,14 +688,18 @@ export interface ViewModel {
   playlist_popup: PlaylistPopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
-  // Most credential-bearing editors cross as one bit. Commons has a redacted
-  // projection so the window can draw controls without receiving either field.
+  // Most credential-bearing editors cross as one bit. Commons and Evernote
+  // have redacted projections so the window can draw controls without secrets.
   youtube_setup_open: boolean;
   yandex_music_setup_open: boolean;
   commons_upload_supported: boolean;
   commons_upload_available: boolean;
   commons_upload_popup: CommonsUploadPopupView | null;
   commons_credentials_editor: CommonsCredentialsEditorView | null;
+	evernote_supported: boolean;
+	evernote_available: boolean;
+	evernote_popup: EvernoteNotePopupView | null;
+	evernote_credentials_editor: EvernoteCredentialsEditorView | null;
   rss_subscription_open: boolean;
   private_note_open: boolean;
   quitting: boolean;

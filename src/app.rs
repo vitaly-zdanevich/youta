@@ -10,7 +10,7 @@
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(feature = "commons-upload")]
+#[cfg(any(feature = "commons-upload", feature = "evernote"))]
 use std::fs;
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
@@ -76,6 +76,11 @@ use crate::domain::{
 };
 #[cfg(feature = "yandex-music")]
 use crate::domain::{PendingYandexMusicReaction, YandexMusicReaction};
+#[cfg(feature = "evernote")]
+use crate::evernote::{
+    EVERNOTE_DEVELOPER_TOKEN_URL, EvernoteClient, EvernoteNoteDraft, EvernoteNoteResult,
+    body_with_captions,
+};
 use crate::links::{
     LinkTarget, is_advertisement_chapter_title, normalize_description_chapter_lines,
     parse_description_chapters, parse_description_links, parse_description_video_links,
@@ -93,6 +98,8 @@ use crate::local_waveform::{
     FfmpegLocalWaveformExtractor, LocalWaveformError, LocalWaveformExtractor,
     LocalWaveformIdentity, LocalWaveformRequest, WaveformCancellation,
 };
+#[cfg(feature = "evernote")]
+use crate::opus_export::{OpusAudioSource, prepare_provider_opus};
 #[cfg(feature = "wikidata")]
 use crate::persistence::CachedWikidataLookup;
 #[cfg(feature = "apple-podcasts")]
@@ -204,9 +211,11 @@ use crate::text_file_open::{
 };
 #[cfg(feature = "summary")]
 use crate::video_summary::{
-    CodexVideoSummarizer, VideoSummarizer, VideoSummaryCancellation, VideoSummaryError,
-    VideoSummaryRequest, YouTubeCaptionError, YouTubeCaptionExtractor,
+    CodexVideoSummarizer, VideoSummarizer, VideoSummaryError, VideoSummaryRequest,
+    YouTubeCaptionError,
 };
+#[cfg(any(feature = "summary", feature = "evernote"))]
+use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
 use crate::view::DetailLinkInternalTarget;
@@ -247,6 +256,10 @@ use crate::view::{
 #[cfg(feature = "wikidata")]
 use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
+};
+#[cfg(feature = "evernote")]
+use crate::view::{
+    EvernoteCredentialsPopupView, EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::view::{
@@ -2976,6 +2989,31 @@ struct CommonsUploadSelection {
     source: CommonsAudioSource,
 }
 
+/// Provider identity and audio locator retained while an Evernote note is reviewed.
+#[cfg(feature = "evernote")]
+#[derive(Clone)]
+struct EvernoteSelection {
+    media: MediaItem,
+    source: OpusAudioSource,
+}
+
+/// Messages from the sole active Evernote captions or save worker.
+#[cfg(feature = "evernote")]
+enum EvernoteWorkerResponse {
+    Captions {
+        generation: u64,
+        result: Result<String, String>,
+    },
+    AudioPrepared {
+        generation: u64,
+        total_bytes: u64,
+    },
+    Finished {
+        generation: u64,
+        result: Result<EvernoteNoteResult, String>,
+    },
+}
+
 /// Messages from bounded category lookups and the sole active upload worker.
 #[cfg(feature = "commons-upload")]
 enum CommonsWorkerResponse {
@@ -4839,6 +4877,24 @@ pub struct AppController {
     /// Sole Opus preparation/upload worker, joined after completion or shutdown.
     #[cfg(feature = "commons-upload")]
     commons_upload_thread: Option<JoinHandle<()>>,
+    /// Selected provider media and audio locator behind the Evernote popup.
+    #[cfg(feature = "evernote")]
+    evernote_selection: Option<EvernoteSelection>,
+    /// Monotonic owner for Evernote worker responses.
+    #[cfg(feature = "evernote")]
+    evernote_generation: u64,
+    /// Previous body snapshots retained for bounded Ctrl+Z behavior.
+    #[cfg(feature = "evernote")]
+    evernote_body_undo: Vec<String>,
+    /// Background caption, preparation, and note-creation completions.
+    #[cfg(feature = "evernote")]
+    evernote_responses: Receiver<EvernoteWorkerResponse>,
+    /// Sender cloned into bounded Evernote worker tasks.
+    #[cfg(feature = "evernote")]
+    evernote_response_sender: Sender<EvernoteWorkerResponse>,
+    /// Sole caption or note worker, joined after completion or shutdown.
+    #[cfg(feature = "evernote")]
+    evernote_thread: Option<JoinHandle<()>>,
     report_actions: Box<dyn DiagnosticActionHandler>,
     /// Completions from the sole explicitly confirmed GitHub submission.
     github_issue_submission_results: Receiver<GitHubIssueSubmissionCompletion>,
@@ -4997,6 +5053,8 @@ impl AppController {
         let (github_issue_submission_result_sender, github_issue_submission_results) = unbounded();
         #[cfg(feature = "commons-upload")]
         let (commons_upload_response_sender, commons_upload_responses) = unbounded();
+        #[cfg(feature = "evernote")]
+        let (evernote_response_sender, evernote_responses) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
@@ -5970,6 +6028,18 @@ impl AppController {
             commons_upload_response_sender,
             #[cfg(feature = "commons-upload")]
             commons_upload_thread: None,
+            #[cfg(feature = "evernote")]
+            evernote_selection: None,
+            #[cfg(feature = "evernote")]
+            evernote_generation: 0,
+            #[cfg(feature = "evernote")]
+            evernote_body_undo: Vec::new(),
+            #[cfg(feature = "evernote")]
+            evernote_responses,
+            #[cfg(feature = "evernote")]
+            evernote_response_sender,
+            #[cfg(feature = "evernote")]
+            evernote_thread: None,
             report_actions: Box::new(SystemReportActions::new()),
             github_issue_submission_results,
             github_issue_submission_result_sender,
@@ -15655,6 +15725,15 @@ impl AppController {
                 )
             });
         }
+        #[cfg(feature = "evernote")]
+        {
+            self.view.evernote_available = self.selected_queue_item().is_ok_and(|item| {
+                !matches!(
+                    item.media.id.source,
+                    SourceKind::Local | SourceKind::ModArchive | SourceKind::RemoteFiles
+                ) && matches!(item.media.webpage_url.scheme(), "http" | "https")
+            });
+        }
         self.view.playlist_item = None;
         self.view.playlist_edit_available = self.view.screen == Screen::Playlists
             && matches!(self.playlists_route, PlaylistsRoute::Index)
@@ -15717,7 +15796,6 @@ impl AppController {
                 });
             }
         }
-
         match self.view.screen {
             Screen::Subscriptions => {
                 let item_is_active = match self.view.subscriptions.layout {
@@ -16914,6 +16992,459 @@ impl AppController {
             ..CommonsUploadPopupView::default()
         });
         "Review Wikimedia Commons audio metadata".clone_into(&mut self.view.status_line);
+    }
+
+    #[cfg(feature = "evernote")]
+    fn open_evernote_note(&mut self) {
+        if self.evernote_thread.is_some() {
+            "An Evernote operation is already running".clone_into(&mut self.view.status_line);
+            return;
+        }
+        let item = match self.selected_queue_item() {
+            Ok(item) => item,
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+        };
+        if matches!(
+            item.media.id.source,
+            SourceKind::Local | SourceKind::ModArchive | SourceKind::RemoteFiles
+        ) {
+            "Evernote audio export requires a remote video or audio source"
+                .clone_into(&mut self.view.status_line);
+            return;
+        }
+        let mut media = item.media;
+        if let Some(details) = self
+            .view
+            .details
+            .as_ref()
+            .filter(|details| details.media_id.as_ref() == Some(&media.id))
+            && !details.description.is_empty()
+        {
+            media.description = Some(details.description.clone());
+        }
+        let source = if media.id.source == SourceKind::YandexMusic {
+            let Some(token) = self.config.providers.yandex_music_token.clone() else {
+                "Configure Yandex Music before exporting its audio"
+                    .clone_into(&mut self.view.status_line);
+                return;
+            };
+            OpusAudioSource::YandexMusic {
+                track_id: media.id.external_id.clone(),
+                token,
+            }
+        } else {
+            let audio_url = url::Url::parse(&item.playback_location)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .unwrap_or_else(|| media.webpage_url.clone());
+            OpusAudioSource::PublicPage(audio_url)
+        };
+        let draft = EvernoteNoteDraft {
+            title: media.title.clone(),
+            body: media.description.clone().unwrap_or_default(),
+            tags: String::new(),
+            source_url: media.webpage_url.to_string(),
+        };
+        if let Err(error) = draft.validate() {
+            self.view.status_line = error;
+            return;
+        }
+        self.evernote_selection = Some(EvernoteSelection { media, source });
+        self.evernote_body_undo.clear();
+        if self.config.providers.evernote_auth_token.is_some() {
+            self.open_evernote_review(draft);
+        } else {
+            self.view.evernote_credentials_popup = Some(EvernoteCredentialsPopupView {
+                token: String::new(),
+                credentials_path: self.config.credentials_file().display().to_string(),
+                validation_error: None,
+            });
+            "Enter an Evernote authentication token".clone_into(&mut self.view.status_line);
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn open_evernote_review(&mut self, draft: EvernoteNoteDraft) {
+        let captions_available = self
+            .evernote_selection
+            .as_ref()
+            .is_some_and(|selection| selection.media.id.source == SourceKind::YouTube);
+        self.view.evernote_credentials_popup = None;
+        self.view.evernote_popup = Some(EvernoteNotePopupView {
+            draft,
+            captions_available,
+            ..EvernoteNotePopupView::default()
+        });
+        "Review the Evernote audio note".clone_into(&mut self.view.status_line);
+    }
+
+    #[cfg(feature = "evernote")]
+    fn record_evernote_body_undo(&mut self) {
+        const MAXIMUM_UNDO_STATES: usize = 32;
+        let Some(body) = self
+            .view
+            .evernote_popup
+            .as_ref()
+            .map(|popup| popup.draft.body.clone())
+        else {
+            return;
+        };
+        if self.evernote_body_undo.last() == Some(&body) {
+            return;
+        }
+        if self.evernote_body_undo.len() == MAXIMUM_UNDO_STATES {
+            self.evernote_body_undo.remove(0);
+        }
+        self.evernote_body_undo.push(body);
+        if let Some(popup) = self.view.evernote_popup.as_mut() {
+            popup.undo_available = true;
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn append_evernote_note_character(&mut self, character: char) {
+        if character.is_control()
+            || self
+                .view
+                .evernote_popup
+                .as_ref()
+                .is_none_or(|popup| popup.phase != EvernoteNotePhase::Review)
+        {
+            return;
+        }
+        let body_selected = self
+            .view
+            .evernote_popup
+            .as_ref()
+            .is_some_and(|popup| popup.selected_field == EvernoteNoteField::Body);
+        if body_selected {
+            self.record_evernote_body_undo();
+        }
+        let Some(popup) = self.view.evernote_popup.as_mut() else {
+            return;
+        };
+        let (field, limit) = match popup.selected_field {
+            EvernoteNoteField::Title => (&mut popup.draft.title, 255),
+            EvernoteNoteField::Body => (&mut popup.draft.body, 512 * 1_024),
+            EvernoteNoteField::Tags => (&mut popup.draft.tags, 10 * 1_024),
+        };
+        if field.len().saturating_add(character.len_utf8()) <= limit {
+            field.push(character);
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "evernote")]
+    fn insert_evernote_note_newline(&mut self) {
+        let editable = self.view.evernote_popup.as_ref().is_some_and(|popup| {
+            popup.phase == EvernoteNotePhase::Review
+                && popup.selected_field == EvernoteNoteField::Body
+                && popup.draft.body.len() < 512 * 1_024
+        });
+        if !editable {
+            return;
+        }
+        self.record_evernote_body_undo();
+        if let Some(popup) = self.view.evernote_popup.as_mut() {
+            popup.draft.body.push('\n');
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn mutate_evernote_note_field(&mut self, delete_word: bool) {
+        let Some(selected_field) = self
+            .view
+            .evernote_popup
+            .as_ref()
+            .filter(|popup| popup.phase == EvernoteNotePhase::Review)
+            .map(|popup| popup.selected_field)
+        else {
+            return;
+        };
+        if selected_field == EvernoteNoteField::Body {
+            self.record_evernote_body_undo();
+        }
+        let Some(popup) = self.view.evernote_popup.as_mut() else {
+            return;
+        };
+        let field = match selected_field {
+            EvernoteNoteField::Title => &mut popup.draft.title,
+            EvernoteNoteField::Body => &mut popup.draft.body,
+            EvernoteNoteField::Tags => &mut popup.draft.tags,
+        };
+        if delete_word {
+            let mut cursor = field.len();
+            delete_previous_editor_word(field, &mut cursor);
+        } else {
+            field.pop();
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "evernote")]
+    fn undo_evernote_note_body(&mut self) {
+        let Some(body) = self.evernote_body_undo.pop() else {
+            return;
+        };
+        if let Some(popup) = self.view.evernote_popup.as_mut() {
+            popup.draft.body = body;
+            popup.undo_available = !self.evernote_body_undo.is_empty();
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn insert_evernote_captions(&mut self) {
+        if self.evernote_thread.is_some() {
+            return;
+        }
+        let Some(video_id) = self
+            .evernote_selection
+            .as_ref()
+            .filter(|selection| selection.media.id.source == SourceKind::YouTube)
+            .map(|selection| selection.media.id.external_id.clone())
+        else {
+            return;
+        };
+        self.evernote_generation = self.evernote_generation.wrapping_add(1);
+        let generation = self.evernote_generation;
+        let executable = self.config.providers.yt_dlp_executable.clone();
+        let sender = self.evernote_response_sender.clone();
+        let thread = thread::Builder::new()
+            .name("youta-evernote-captions".to_owned())
+            .spawn(move || {
+                let result = YouTubeCaptionExtractor::new(executable)
+                    .extract(&video_id, &VideoSummaryCancellation::default())
+                    .map(|captions| captions.transcript().to_owned())
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(EvernoteWorkerResponse::Captions { generation, result });
+            });
+        match thread {
+            Ok(thread) => {
+                self.evernote_thread = Some(thread);
+                if let Some(popup) = self.view.evernote_popup.as_mut() {
+                    popup.phase = EvernoteNotePhase::LoadingCaptions;
+                    popup.animation_frame = 0;
+                    popup.validation_error = None;
+                }
+                "Loading YouTube captions for Evernote".clone_into(&mut self.view.status_line);
+            }
+            Err(error) => self.show_error("Could not start the Evernote caption worker", &error),
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn append_evernote_token_character(&mut self, character: char) {
+        let Some(popup) = self.view.evernote_credentials_popup.as_mut() else {
+            return;
+        };
+        if !character.is_control()
+            && popup.token.len().saturating_add(character.len_utf8()) <= 4_096
+        {
+            popup.token.push(character);
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "evernote")]
+    fn delete_evernote_token(&mut self, word: bool) {
+        let Some(popup) = self.view.evernote_credentials_popup.as_mut() else {
+            return;
+        };
+        if word {
+            let mut cursor = popup.token.len();
+            delete_previous_editor_word(&mut popup.token, &mut cursor);
+        } else {
+            popup.token.pop();
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "evernote")]
+    fn submit_evernote_credentials(&mut self) {
+        let Some(token) = self
+            .view
+            .evernote_credentials_popup
+            .as_ref()
+            .map(|popup| popup.token.trim().to_owned())
+        else {
+            return;
+        };
+        if let Err(error) = self.config.save_evernote_auth_token(token) {
+            if let Some(popup) = self.view.evernote_credentials_popup.as_mut() {
+                popup.validation_error = Some(error.to_string());
+            }
+            return;
+        }
+        let Some(selection) = self.evernote_selection.as_ref() else {
+            self.view.evernote_credentials_popup = None;
+            return;
+        };
+        let draft = EvernoteNoteDraft {
+            title: selection.media.title.clone(),
+            body: selection.media.description.clone().unwrap_or_default(),
+            tags: String::new(),
+            source_url: selection.media.webpage_url.to_string(),
+        };
+        self.open_evernote_review(draft);
+    }
+
+    #[cfg(feature = "evernote")]
+    fn submit_evernote_note(&mut self) {
+        if self.evernote_thread.is_some() {
+            return;
+        }
+        let Some(draft) = self
+            .view
+            .evernote_popup
+            .as_ref()
+            .filter(|popup| popup.phase == EvernoteNotePhase::Review)
+            .map(|popup| popup.draft.clone())
+        else {
+            return;
+        };
+        if let Err(error) = draft.validate() {
+            if let Some(popup) = self.view.evernote_popup.as_mut() {
+                popup.validation_error = Some(error);
+            }
+            return;
+        }
+        let Some(selection) = self.evernote_selection.clone() else {
+            return;
+        };
+        let Some(token) = self.config.providers.evernote_auth_token.clone() else {
+            "Evernote authentication is unavailable".clone_into(&mut self.view.status_line);
+            return;
+        };
+        if let Err(error) = self.config.ensure_directories() {
+            self.show_error("Could not prepare Evernote runtime storage", &error);
+            return;
+        }
+        self.evernote_generation = self.evernote_generation.wrapping_add(1);
+        let generation = self.evernote_generation;
+        let staging_directory = self
+            .config
+            .runtime_dir()
+            .join("evernote")
+            .join(generation.to_string());
+        let yt_dlp_executable = self.config.providers.yt_dlp_executable.clone();
+        let ffmpeg_executable = self.config.providers.ffmpeg_executable.clone();
+        let sender = self.evernote_response_sender.clone();
+        let file_name = if draft.title.trim().is_empty() {
+            selection.media.title.clone()
+        } else {
+            draft.title.clone()
+        };
+        let thread = thread::Builder::new()
+            .name("youta-evernote-save".to_owned())
+            .spawn(move || {
+                let result = (|| {
+                    let path = prepare_provider_opus(
+                        &selection.source,
+                        &staging_directory,
+                        &yt_dlp_executable,
+                        &ffmpeg_executable,
+                        |_, _| {},
+                    )?;
+                    let total_bytes = fs::metadata(&path)
+                        .map_err(|error| format!("Cannot inspect prepared Opus audio: {error}"))?
+                        .len();
+                    let _ = sender.send(EvernoteWorkerResponse::AudioPrepared {
+                        generation,
+                        total_bytes,
+                    });
+                    EvernoteClient::new(token).create_opus_note(&path, &file_name, &draft)
+                })();
+                let _ = fs::remove_dir_all(&staging_directory);
+                let _ = sender.send(EvernoteWorkerResponse::Finished { generation, result });
+            });
+        match thread {
+            Ok(thread) => {
+                self.evernote_thread = Some(thread);
+                if let Some(popup) = self.view.evernote_popup.as_mut() {
+                    popup.phase = EvernoteNotePhase::PreparingAudio;
+                    popup.animation_frame = 0;
+                    popup.total_bytes = None;
+                    popup.validation_error = None;
+                }
+                "Preparing Opus audio for Evernote".clone_into(&mut self.view.status_line);
+            }
+            Err(error) => self.show_error("Could not start the Evernote save worker", &error),
+        }
+    }
+
+    #[cfg(feature = "evernote")]
+    fn drain_evernote_responses(&mut self) {
+        while let Ok(response) = self.evernote_responses.try_recv() {
+            match response {
+                EvernoteWorkerResponse::Captions { generation, result }
+                    if generation == self.evernote_generation =>
+                {
+                    if let Some(thread) = self.evernote_thread.take() {
+                        let _ = thread.join();
+                    }
+                    match result {
+                        Ok(captions) => {
+                            self.record_evernote_body_undo();
+                            if let Some(popup) = self.view.evernote_popup.as_mut() {
+                                popup.draft.body = body_with_captions(&popup.draft.body, &captions);
+                                popup.phase = EvernoteNotePhase::Review;
+                                popup.validation_error = None;
+                            }
+                            "Added YouTube captions to the Evernote note"
+                                .clone_into(&mut self.view.status_line);
+                        }
+                        Err(error) => {
+                            if let Some(popup) = self.view.evernote_popup.as_mut() {
+                                popup.phase = EvernoteNotePhase::Review;
+                                popup.validation_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                EvernoteWorkerResponse::AudioPrepared {
+                    generation,
+                    total_bytes,
+                } if generation == self.evernote_generation => {
+                    if let Some(popup) = self.view.evernote_popup.as_mut() {
+                        popup.phase = EvernoteNotePhase::Saving;
+                        popup.total_bytes = Some(total_bytes);
+                    }
+                    "Saving the Opus attachment to Evernote".clone_into(&mut self.view.status_line);
+                }
+                EvernoteWorkerResponse::Finished { generation, result }
+                    if generation == self.evernote_generation =>
+                {
+                    if let Some(thread) = self.evernote_thread.take() {
+                        let _ = thread.join();
+                    }
+                    match result {
+                        Ok(result) => {
+                            if let Some(popup) = self.view.evernote_popup.as_mut() {
+                                popup.phase = EvernoteNotePhase::Complete;
+                                popup.result_url = Some(result.url);
+                                popup.validation_error = None;
+                            }
+                            "Thanks for preserving the history"
+                                .clone_into(&mut self.view.status_line);
+                        }
+                        Err(error) => {
+                            if let Some(popup) = self.view.evernote_popup.as_mut() {
+                                popup.phase = EvernoteNotePhase::Review;
+                                popup.validation_error = Some(error);
+                            }
+                            "Could not save the Evernote note"
+                                .clone_into(&mut self.view.status_line);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     #[cfg(feature = "commons-upload")]
@@ -30452,6 +30983,10 @@ impl AppController {
         if let Some(thread) = self.commons_upload_thread.take() {
             let _ = thread.join();
         }
+        #[cfg(feature = "evernote")]
+        if let Some(thread) = self.evernote_thread.take() {
+            let _ = thread.join();
+        }
         #[cfg(feature = "yandex-music")]
         self.shutdown_yandex_music_media_workers();
         #[cfg(feature = "yandex-music")]
@@ -31183,6 +31718,59 @@ impl UiController for AppController {
                     self.open_external_url(&url);
                 }
             }
+            #[cfg(feature = "evernote")]
+            UiAction::OpenEvernoteNote => self.open_evernote_note(),
+            #[cfg(feature = "evernote")]
+            UiAction::SelectEvernoteNoteField(field) => {
+                if let Some(popup) = self
+                    .view
+                    .evernote_popup
+                    .as_mut()
+                    .filter(|popup| popup.phase == EvernoteNotePhase::Review)
+                {
+                    popup.selected_field = field;
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::AppendEvernoteNoteCharacter(character) => {
+                self.append_evernote_note_character(character);
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::InsertEvernoteNoteNewline => self.insert_evernote_note_newline(),
+            #[cfg(feature = "evernote")]
+            UiAction::DeleteEvernoteNoteCharacter => self.mutate_evernote_note_field(false),
+            #[cfg(feature = "evernote")]
+            UiAction::DeleteEvernoteNoteWord => self.mutate_evernote_note_field(true),
+            #[cfg(feature = "evernote")]
+            UiAction::UndoEvernoteNoteBody => self.undo_evernote_note_body(),
+            #[cfg(feature = "evernote")]
+            UiAction::InsertEvernoteCaptions => self.insert_evernote_captions(),
+            #[cfg(feature = "evernote")]
+            UiAction::SubmitEvernoteNote => self.submit_evernote_note(),
+            #[cfg(feature = "evernote")]
+            UiAction::DismissEvernoteNote => {
+                if self.evernote_thread.is_some() {
+                    "Wait for the Evernote operation to finish"
+                        .clone_into(&mut self.view.status_line);
+                } else {
+                    self.view.evernote_popup = None;
+                    self.evernote_selection = None;
+                    self.evernote_body_undo.clear();
+                }
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::OpenEvernoteNoteResult => {
+                let url = self
+                    .view
+                    .evernote_popup
+                    .as_ref()
+                    .and_then(|popup| popup.result_url.as_ref())
+                    .map(ToString::to_string);
+                if let Some(url) = url {
+                    self.open_external_url(&url);
+                }
+            }
             UiAction::EditPrivateNote => self.open_private_note_popup(),
             UiAction::AppendPrivateNoteCharacter(character) => {
                 self.append_private_note_character(character);
@@ -31381,6 +31969,26 @@ impl UiController for AppController {
             #[cfg(feature = "commons-upload")]
             UiAction::OpenCommonsAccountRegistration => {
                 self.open_external_url(COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL);
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::AppendEvernoteTokenCharacter(character) => {
+                self.append_evernote_token_character(character);
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::DeleteEvernoteTokenCharacter => self.delete_evernote_token(false),
+            #[cfg(feature = "evernote")]
+            UiAction::DeleteEvernoteTokenWord => self.delete_evernote_token(true),
+            #[cfg(feature = "evernote")]
+            UiAction::SubmitEvernoteCredentials => self.submit_evernote_credentials(),
+            #[cfg(feature = "evernote")]
+            UiAction::DismissEvernoteCredentials => {
+                self.view.evernote_credentials_popup = None;
+                self.evernote_selection = None;
+                "Evernote export cancelled".clone_into(&mut self.view.status_line);
+            }
+            #[cfg(feature = "evernote")]
+            UiAction::OpenEvernoteDeveloperTokenGuide => {
+                self.open_external_url(EVERNOTE_DEVELOPER_TOKEN_URL);
             }
             UiAction::OpenRssSubscriptionPopup => self.open_rss_subscription_popup(),
             UiAction::AppendRssSubscriptionCharacter(character) => {
@@ -31621,6 +32229,20 @@ impl UiController for AppController {
                 && matches!(
                     popup.phase,
                     CommonsUploadPhase::PreparingAudio | CommonsUploadPhase::Uploading
+                )
+            {
+                popup.animation_frame = popup.animation_frame.wrapping_add(1);
+            }
+        }
+        #[cfg(feature = "evernote")]
+        {
+            self.drain_evernote_responses();
+            if let Some(popup) = self.view.evernote_popup.as_mut()
+                && matches!(
+                    popup.phase,
+                    EvernoteNotePhase::LoadingCaptions
+                        | EvernoteNotePhase::PreparingAudio
+                        | EvernoteNotePhase::Saving
                 )
             {
                 popup.animation_frame = popup.animation_frame.wrapping_add(1);
