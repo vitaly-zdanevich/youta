@@ -35,6 +35,8 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(feature = "ascii-visualizer")]
+use crate::ascii_visualizer::render_ascii_frame;
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
@@ -1427,6 +1429,12 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     } else {
         settings.playing_tick
     };
+    #[cfg(feature = "ascii-visualizer")]
+    let playback_wait = if view.ascii_visualizer.is_some() {
+        playback_wait.min(Duration::from_millis(100))
+    } else {
+        playback_wait
+    };
     let wait = if view.local_browse_pending
         || view.local_artwork_pending
         || matches!(view.waveform, WaveformView::Loading { .. })
@@ -1442,6 +1450,53 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
         playback_wait
     };
     wait.max(Duration::from_millis(1))
+}
+
+/// Renders one audio-reactive visualization over the complete terminal.
+#[cfg(feature = "ascii-visualizer")]
+fn render_ascii_visualizer(frame: &mut Frame<'_>, visualizer: &AsciiVisualizerView, theme: &Theme) {
+    let area = frame.area();
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let heading = format!(
+        "Audio visualization - {} - {}",
+        visualizer.mode.label(),
+        visualizer.title
+    );
+    frame.render_widget(
+        Paragraph::new(truncate_terminal_text(
+            &heading,
+            usize::from(sections[0].width),
+        ))
+        .alignment(Alignment::Center)
+        .style(theme.accent.add_modifier(Modifier::BOLD)),
+        sections[0],
+    );
+    let lines = render_ascii_frame(
+        visualizer.mode,
+        sections[1].width,
+        sections[1].height,
+        visualizer.sample.unwrap_or_default(),
+        visualizer.frame,
+    );
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .alignment(Alignment::Left)
+            .style(theme.base),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Left/Right switch - Esc close")
+            .alignment(Alignment::Center)
+            .style(theme.muted),
+        sections[2],
+    );
 }
 
 struct TerminalSession {
@@ -1984,6 +2039,17 @@ fn render_frame(
     let theme = Theme::for_terminal(settings.funny_mode, view.physical_linux_console);
     hit_map.thumbnail_overlay_area = None;
     frame.render_widget(Block::default().style(theme.base), frame.area());
+    #[cfg(feature = "ascii-visualizer")]
+    if view.error_popup.is_none()
+        && let Some(visualizer) = view.ascii_visualizer.as_ref()
+    {
+        if let Some(renderer) = thumbnail_renderer.as_mut() {
+            renderer.obscure();
+        }
+        *hit_map = HitMap::default();
+        render_ascii_visualizer(frame, visualizer, &theme);
+        return;
+    }
 
     let chapter_label_rows = if view.waveform_visible {
         0
@@ -6315,6 +6381,11 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         "  F2 offline     Backspace back"
     };
+    #[cfg(feature = "ascii-visualizer")]
+    let project_history_help =
+        "  F9 recent commits and installation details     F10 ASCII visualizer";
+    #[cfg(not(feature = "ascii-visualizer"))]
+    let project_history_help = "  F9 recent commits and installation details";
     let mut video_actions_help = "  o video page".to_owned();
     #[cfg(feature = "youtube-captions")]
     if view.youtube_captions_supported {
@@ -6340,7 +6411,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         history_navigation_help,
         "  F4 playlists     F5 stats     p preferences",
-        "  F9 recent commits and installation details",
+        project_history_help,
         search_kind_help(view),
         "  j/k select     Enter open/play",
         "  ↪ internal video: click the marker after a YouTube URL",
@@ -12395,6 +12466,49 @@ mod tests {
         assert!(rendered_text(&terminal).contains("CC  Preserve this spoken history"));
     }
 
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn ascii_visualizer_replaces_the_complete_screen_and_clears_stale_hits() {
+        let mut terminal = Terminal::new(TestBackend::new(72, 20)).expect("visualizer terminal");
+        let mut hit_map = HitMap {
+            buttons: vec![(UiAction::ToggleHelp, Rect::new(1, 1, 2, 1))],
+            ..HitMap::default()
+        };
+        let view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ascii_visualizer: Some(AsciiVisualizerView {
+                title: "Fixture song".to_owned(),
+                sample: Some(crate::ascii_visualizer::AudioVisualizationSample {
+                    rms_db: -9.0,
+                    peak_db: -1.0,
+                    zero_crossing_rate: 0.2,
+                    centroid_hz: 2_400.0,
+                    spread_hz: 1_800.0,
+                    flux: 0.5,
+                    rolloff_hz: 7_600.0,
+                }),
+                ..AsciiVisualizerView::default()
+            }),
+            ..ViewModel::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None);
+            })
+            .expect("draw fullscreen visualizer");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Audio visualization"));
+        assert!(rendered.contains("Bars"));
+        assert!(rendered.contains("Fixture song"));
+        assert!(rendered.contains("Left/Right switch"));
+        assert!(!rendered.contains("YT Music"));
+        assert!(hit_map.buttons.is_empty());
+    }
+
     /// Builds the structured yt-dlp failure used by keyboard and renderer tests.
     fn yt_dlp_forbidden_error(gentoo: bool) -> ErrorPopupView {
         ErrorPopupView {
@@ -12500,6 +12614,12 @@ mod tests {
         view.playback_starting = false;
         view.playback.paused = false;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
+        #[cfg(feature = "ascii-visualizer")]
+        {
+            view.playback.paused = true;
+            view.ascii_visualizer = Some(AsciiVisualizerView::default());
+            assert_eq!(event_wait(&view, &settings), Duration::from_millis(100));
+        }
 
         let zero_settings = UiSettings {
             idle_tick: Duration::ZERO,
@@ -14238,6 +14358,8 @@ mod tests {
         );
         #[cfg(feature = "youtube-captions")]
         assert!(rendered.contains("Y captions/search/seek"));
+        #[cfg(feature = "ascii-visualizer")]
+        assert!(rendered.contains("F10 ASCII visualizer"));
         assert!(rendered.contains("physical mouse input requires a running GPM daemon"));
         let unsupported = ViewModel {
             audio_quality_supported: false,

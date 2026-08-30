@@ -9,6 +9,7 @@ import { SearchBar } from "./components/SearchBar";
 import { Subscriptions } from "./components/Subscriptions";
 import { Tabs } from "./components/Tabs";
 import { Waveform } from "./components/Waveform";
+import { AsciiVisualizer } from './components/AsciiVisualizer';
 import {
   AudioQualityPopup,
   CommonsCredentialsPopup,
@@ -186,12 +187,16 @@ export function App() {
       {view.help_open ? (
         <HelpPopup
           audioQualitySupported={view.audio_quality_supported}
+          asciiVisualizerSupported={view.ascii_visualizer_supported ?? false}
           commonsUploadSupported={view.commons_upload_supported}
 			evernoteSupported={view.evernote_supported}
           playbackHistoryEnabled={view.playback_history_enabled}
           videoSummarySupported={view.video_summary_supported}
           youtubeCaptionsSupported={view.youtube_captions_supported ?? false}
         />
+      ) : null}
+      {view.ascii_visualizer && !view.error_popup ? (
+        <AsciiVisualizer visualizer={view.ascii_visualizer} />
       ) : null}
       {view.project_history_popup ? (
         <ProjectHistoryPopup popup={view.project_history_popup} />

@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "ascii-visualizer")]
+use crate::ascii_visualizer::{AsciiVisualizationMode, AudioVisualizationSample};
 #[cfg(feature = "commons-upload")]
 use crate::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 #[cfg(feature = "commons-upload")]
@@ -2000,6 +2002,22 @@ pub struct RadioRecordingView {
     pub station_name: String,
 }
 
+/// Fullscreen, audio-reactive ASCII visualization shared by every frontend.
+#[cfg(feature = "ascii-visualizer")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct AsciiVisualizerView {
+    /// Current style in the stable left-to-right switching order.
+    pub mode: AsciiVisualizationMode,
+    /// Latest finite sample received from the active playback backend.
+    pub sample: Option<AudioVisualizationSample>,
+    /// Monotonic animation frame, wrapping for indefinitely long playback.
+    pub frame: u64,
+    /// Stable user-facing title of the playing media.
+    pub title: String,
+    /// Bounded frontend-neutral frame for renderers without Rust layout access.
+    pub lines: Vec<String>,
+}
+
 /// Complete immutable view rendered for one frame.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ViewModel {
@@ -2082,6 +2100,12 @@ pub struct ViewModel {
     pub waveform_playback_matches: bool,
     /// Current player state.
     pub playback: PlaybackStatus,
+    /// Whether this build contains fullscreen ASCII audio visualization.
+    #[cfg(feature = "ascii-visualizer")]
+    pub ascii_visualizer_supported: bool,
+    /// Fullscreen ASCII audio visualization, while explicitly opened.
+    #[cfg(feature = "ascii-visualizer")]
+    pub ascii_visualizer: Option<AsciiVisualizerView>,
     /// Best-effort current programme or track for the playing radio station.
     ///
     /// Fresh provider metadata is preferred; the player may supply ICY
@@ -2339,6 +2363,10 @@ impl Default for ViewModel {
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
+            #[cfg(feature = "ascii-visualizer")]
+            ascii_visualizer_supported: true,
+            #[cfg(feature = "ascii-visualizer")]
+            ascii_visualizer: None,
             audio_quality_supported: cfg!(feature = "audio-quality"),
             audio_quality_popup: None,
             video_summary_supported: cfg!(feature = "summary"),
@@ -2437,6 +2465,18 @@ pub enum UiAction {
     },
     /// Open or close the help overlay.
     ToggleHelp,
+    /// Open the fullscreen ASCII audio visualization, or close it when active.
+    #[cfg(feature = "ascii-visualizer")]
+    ToggleAsciiVisualizer,
+    /// Switch to the preceding fullscreen visualization style.
+    #[cfg(feature = "ascii-visualizer")]
+    PreviousAsciiVisualization,
+    /// Switch to the next fullscreen visualization style.
+    #[cfg(feature = "ascii-visualizer")]
+    NextAsciiVisualization,
+    /// Close the fullscreen visualization and remove backend analysis.
+    #[cfg(feature = "ascii-visualizer")]
+    DismissAsciiVisualizer,
     /// Open the offline-first recent project-history popup.
     OpenProjectHistory,
     /// Set the exact renderer-clamped project-history line offset.
@@ -3520,5 +3560,35 @@ mod tests {
             12_500
         );
         assert_eq!(json["youtube_captions_popup"]["state"], "Ready");
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn ascii_visualizer_serializes_mode_sample_and_bounded_frame() {
+        let view = ViewModel {
+            ascii_visualizer: Some(AsciiVisualizerView {
+                mode: AsciiVisualizationMode::Tunnel,
+                sample: Some(AudioVisualizationSample {
+                    rms_db: -12.0,
+                    peak_db: -2.0,
+                    zero_crossing_rate: 0.2,
+                    centroid_hz: 2_300.0,
+                    spread_hz: 1_500.0,
+                    flux: 0.4,
+                    rolloff_hz: 7_200.0,
+                }),
+                frame: 17,
+                title: "Fixture song".to_owned(),
+                lines: vec![" .# ".to_owned(), "#  #".to_owned()],
+            }),
+            ..ViewModel::default()
+        };
+
+        let json = serde_json::to_value(view).expect("serialize ASCII visualizer");
+        assert_eq!(json["ascii_visualizer"]["mode"], "Tunnel");
+        assert_eq!(json["ascii_visualizer"]["sample"]["rms_db"], -12.0);
+        assert_eq!(json["ascii_visualizer"]["frame"], 17);
+        assert_eq!(json["ascii_visualizer"]["title"], "Fixture song");
+        assert_eq!(json["ascii_visualizer"]["lines"][1], "#  #");
     }
 }

@@ -562,7 +562,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app,ascii-visualizer,audio-quality,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -573,7 +573,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app-core,ascii-visualizer,audio-quality,images,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -585,15 +585,19 @@ features are additive: `app-core` is the complete profile without
 `sponsorblock` is the independently removable SponsorBlock client and playback
 skip integration,
 `nyan-cat` is the independently removable rainbow seek-bar renderer,
+`ascii-visualizer` is the independently removable fullscreen renderer,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, SponsorBlock, the
-Nyan Cat renderer, YouTube captions, video summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
+five ASCII visualizers, Nyan Cat renderer, YouTube captions, video summaries,
+ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
 custom command above to retain archive folders; leaving it out removes the
 archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
 cache, and playback code. The shared ZIP decoder also disappears only when no
 other selected feature, such as tracker archive support, enables `archive-zip`.
 Leave `nyan-cat` out to remove the terminal and desktop rainbow renderer.
+Leave `ascii-visualizer` out to remove audio analysis and both fullscreen
+renderers.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -1333,6 +1337,21 @@ playhead. The desktop window uses the same shared preference. Set
 behavior without the popup. Builds made with `--no-default-features` can omit
 `nyan-cat` to remove both renderers and their preference control.
 
+The default-on `ascii-visualizer` feature adds five fullscreen, audio-reactive
+ASCII styles: Bars, Pulse, Rain, Tunnel, and Stars. While audio is playing,
+press `F10` to open the visualizer, use Left/Right to switch styles, and press
+Esc or `F10` to close it. The shortcut is listed in Help instead of occupying
+the ordinary playback screen. Both the terminal and desktop window use the
+same bounded renderer state.
+
+Opening the view temporarily adds a labeled FFmpeg analysis filter to the
+existing mpv process and reads its finite metadata; closing the view or ending
+playback removes that filter. Media is not fetched or decoded a second time.
+See [mpv audio-filter metadata](https://mpv.io/manual/master/#command-interface-af-metadata) and
+the [FFmpeg audio-statistics filters](https://ffmpeg.org/ffmpeg-filters.html#astats-1).
+Builds made with `--no-default-features` can omit `ascii-visualizer` to remove
+the analysis contract, five renderers, actions, and Help entry.
+
 When the `dearrow` build feature is enabled, Youta shows a crowdsourced title
 as `DeArrow title: …` immediately before the original video description. The
 provider title remains the primary title and is never replaced.
@@ -1449,7 +1468,7 @@ known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
 dependencies while retaining the other defaults, build with
-`--no-default-features --features app,audio-quality,qr,summary`. For a
+`--no-default-features --features app,ascii-visualizer,audio-quality,qr,summary`. For a
 smaller custom build, omit `images`; include it explicitly to restore rendering.
 The rendering integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
@@ -2036,9 +2055,11 @@ it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
 arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
-The source package maps the default-enabled `audio-quality`, `commons-upload`,
-`evernote`, `local-archives`, `nyan-cat`, `sponsorblock`, `summary`, and
-`youtube-captions` flags to their Cargo features.
+The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
+`commons-upload`, `evernote`, `local-archives`, `nyan-cat`, `sponsorblock`,
+`summary`, and `youtube-captions` flags to their Cargo features.
+`USE="-ascii-visualizer"` removes audio analysis, fullscreen rendering, and its
+Help entry.
 `USE="-audio-quality"` removes the analyzer and RustFFT dependency.
 `USE="-commons-upload"` removes the Commons client and review UI.
 `USE="-evernote"` removes the Evernote EDAM client and note UI.

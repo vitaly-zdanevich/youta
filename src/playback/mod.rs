@@ -252,6 +252,9 @@ pub enum PlayerCommand {
     /// A [`Some`] path starts or redirects recording. [`None`] stops the
     /// active recording and lets the backend finalize the output file.
     SetStreamRecording(Option<PathBuf>),
+    /// Enable or remove the live mpv/FFmpeg audio-analysis filter.
+    #[cfg(feature = "ascii-visualizer")]
+    SetAudioVisualization(bool),
     /// Stop the current item while keeping the backend available.
     Stop,
 }
@@ -305,6 +308,9 @@ pub struct PlaybackStatus {
     /// Youta owns the stable station title, while ICY or equivalent metadata
     /// may change for every song.
     pub stream_title: Option<String>,
+    /// Latest finite audio statistics while fullscreen visualization is active.
+    #[cfg(feature = "ascii-visualizer")]
+    pub audio_visualization: Option<crate::ascii_visualizer::AudioVisualizationSample>,
 }
 
 impl PlaybackStatus {
@@ -345,6 +351,8 @@ impl Default for PlaybackStatus {
             buffered_ranges: Vec::new(),
             title: None,
             stream_title: None,
+            #[cfg(feature = "ascii-visualizer")]
+            audio_visualization: None,
         }
     }
 }

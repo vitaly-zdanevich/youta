@@ -30,6 +30,10 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, u
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(all(feature = "ascii-visualizer", test))]
+use crate::ascii_visualizer::AsciiVisualizationMode;
+#[cfg(feature = "ascii-visualizer")]
+use crate::ascii_visualizer::render_ascii_frame;
 #[cfg(feature = "acoustid")]
 use crate::audio_identification::{
     AudioIdentificationCancellation, AudioIdentificationError, AudioIdentifier, FpcalcConfig,
@@ -228,6 +232,8 @@ use crate::video_summary::{
     feature = "youtube-captions"
 ))]
 use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
+#[cfg(feature = "ascii-visualizer")]
+use crate::view::AsciiVisualizerView;
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
 use crate::view::DetailLinkInternalTarget;
@@ -23733,6 +23739,98 @@ impl AppController {
         }
     }
 
+    /// Opens or closes backend analysis and its fullscreen ASCII presentation.
+    #[cfg(feature = "ascii-visualizer")]
+    fn toggle_ascii_visualizer(&mut self) {
+        if self.view.ascii_visualizer.is_some() {
+            self.dismiss_ascii_visualizer();
+            return;
+        }
+        if self.playback_phase == PlaybackPhase::Idle
+            || self.current_media.is_none()
+            || self.view.playback.idle
+        {
+            self.view.status_line = "Nothing is playing".to_owned();
+            return;
+        }
+        let Some(player) = self.player.as_mut() else {
+            self.view.status_line = "Nothing is playing".to_owned();
+            return;
+        };
+        match player.command(PlayerCommand::SetAudioVisualization(true)) {
+            Ok(()) => {
+                let mut visualizer = AsciiVisualizerView {
+                    title: self.current_playback_title(),
+                    ..AsciiVisualizerView::default()
+                };
+                visualizer.lines = render_ascii_frame(
+                    visualizer.mode,
+                    96,
+                    32,
+                    visualizer.sample.unwrap_or_default(),
+                    visualizer.frame,
+                );
+                self.view.ascii_visualizer = Some(visualizer);
+            }
+            Err(error) if matches!(error, PlaybackError::DirectProfileRestriction(_)) => {
+                self.view.status_line = error.to_string();
+            }
+            Err(error) => self.show_error("Could not start audio visualization", &error),
+        }
+    }
+
+    /// Removes backend analysis and returns to the ordinary application view.
+    #[cfg(feature = "ascii-visualizer")]
+    fn dismiss_ascii_visualizer(&mut self) {
+        if self.view.ascii_visualizer.take().is_none() {
+            return;
+        }
+        let result = self
+            .player
+            .as_mut()
+            .map(|player| player.command(PlayerCommand::SetAudioVisualization(false)));
+        if let Some(Err(error)) = result {
+            self.show_error("Could not stop audio visualization", &error);
+        }
+    }
+
+    /// Changes the stable visualizer mode and redraws the frontend-neutral frame.
+    #[cfg(feature = "ascii-visualizer")]
+    fn change_ascii_visualizer_mode(&mut self, direction: i8) {
+        let Some(visualizer) = self.view.ascii_visualizer.as_mut() else {
+            return;
+        };
+        visualizer.mode = if direction < 0 {
+            visualizer.mode.previous()
+        } else {
+            visualizer.mode.next()
+        };
+        visualizer.lines = render_ascii_frame(
+            visualizer.mode,
+            96,
+            32,
+            visualizer.sample.unwrap_or_default(),
+            visualizer.frame,
+        );
+    }
+
+    /// Advances animation and snapshots the latest finite backend measurements.
+    #[cfg(feature = "ascii-visualizer")]
+    fn refresh_ascii_visualizer(&mut self) {
+        let Some(visualizer) = self.view.ascii_visualizer.as_mut() else {
+            return;
+        };
+        visualizer.frame = visualizer.frame.wrapping_add(1);
+        visualizer.sample = self.view.playback.audio_visualization;
+        visualizer.lines = render_ascii_frame(
+            visualizer.mode,
+            96,
+            32,
+            visualizer.sample.unwrap_or_default(),
+            visualizer.frame,
+        );
+    }
+
     /// Sends one timeline command only while a media item owns the reusable backend.
     ///
     /// mpv stays alive after `end-file`, so the existence of a backend does not
@@ -24304,6 +24402,12 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        #[cfg(feature = "ascii-visualizer")]
+        if self.view.ascii_visualizer.take().is_some()
+            && let Some(player) = self.player.as_mut()
+        {
+            let _ = player.command(PlayerCommand::SetAudioVisualization(false));
+        }
         self.playback_phase = PlaybackPhase::Idle;
         self.playback_load_kind = PlaybackLoadKind::Regular;
         self.clear_playback_start_activity();
@@ -32177,6 +32281,14 @@ impl UiController for AppController {
                 self.transient_footer_notice_deadline = Some(Instant::now() + GPM_NOTICE_DURATION);
             }
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
+            #[cfg(feature = "ascii-visualizer")]
+            UiAction::ToggleAsciiVisualizer => self.toggle_ascii_visualizer(),
+            #[cfg(feature = "ascii-visualizer")]
+            UiAction::PreviousAsciiVisualization => self.change_ascii_visualizer_mode(-1),
+            #[cfg(feature = "ascii-visualizer")]
+            UiAction::NextAsciiVisualization => self.change_ascii_visualizer_mode(1),
+            #[cfg(feature = "ascii-visualizer")]
+            UiAction::DismissAsciiVisualizer => self.dismiss_ascii_visualizer(),
             UiAction::OpenProjectHistory => self.open_project_history(),
             UiAction::SetProjectHistoryScroll(offset) => {
                 if let Some(popup) = self.view.project_history_popup.as_mut() {
@@ -33451,6 +33563,8 @@ impl UiController for AppController {
         #[cfg(feature = "yt-dlp")]
         self.poll_download_at(Instant::now());
         self.update_player();
+        #[cfg(feature = "ascii-visualizer")]
+        self.refresh_ascii_visualizer();
         #[cfg(feature = "youtube-captions")]
         self.refresh_youtube_caption_line();
         #[cfg(feature = "yt-dlp")]
@@ -66353,6 +66467,70 @@ mod tests {
             status_queue,
             event_queue,
         )
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn fullscreen_ascii_visualizer_owns_one_backend_filter_and_five_modes() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.play_queue_item(fixture_direct_item("visualized fixture"), false);
+
+        controller.dispatch(UiAction::ToggleAsciiVisualizer);
+        let visualizer = controller
+            .view
+            .ascii_visualizer
+            .as_ref()
+            .expect("fullscreen visualizer");
+        assert_eq!(visualizer.mode, AsciiVisualizationMode::Bars);
+        assert_eq!(visualizer.title, "visualized fixture");
+        assert_eq!(visualizer.lines.len(), 32);
+        assert!(
+            state
+                .lock()
+                .expect("mock state")
+                .commands
+                .contains(&PlayerCommand::SetAudioVisualization(true))
+        );
+
+        controller.view.playback.audio_visualization =
+            Some(crate::ascii_visualizer::AudioVisualizationSample {
+                rms_db: -10.0,
+                peak_db: -1.0,
+                zero_crossing_rate: 0.2,
+                centroid_hz: 2_500.0,
+                spread_hz: 1_700.0,
+                flux: 0.5,
+                rolloff_hz: 8_000.0,
+            });
+        controller.refresh_ascii_visualizer();
+        for expected in [
+            AsciiVisualizationMode::Pulse,
+            AsciiVisualizationMode::Rain,
+            AsciiVisualizationMode::Tunnel,
+            AsciiVisualizationMode::Stars,
+            AsciiVisualizationMode::Bars,
+        ] {
+            controller.dispatch(UiAction::NextAsciiVisualization);
+            assert_eq!(
+                controller
+                    .view
+                    .ascii_visualizer
+                    .as_ref()
+                    .expect("visualizer remains open")
+                    .mode,
+                expected
+            );
+        }
+
+        controller.dispatch(UiAction::DismissAsciiVisualizer);
+        assert!(controller.view.ascii_visualizer.is_none());
+        assert!(
+            state
+                .lock()
+                .expect("mock state")
+                .commands
+                .contains(&PlayerCommand::SetAudioVisualization(false))
+        );
     }
 
     #[cfg(feature = "youtube-captions")]

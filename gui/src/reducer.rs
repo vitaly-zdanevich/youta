@@ -66,6 +66,8 @@ struct PlaybackTick {
     playback_start_animation_frame: usize,
     search_animation_frame: usize,
     local_fingerprint_animation_frame: usize,
+    #[cfg(feature = "ascii-visualizer")]
+    ascii_visualizer: Option<youta::view::AsciiVisualizerView>,
     #[cfg(feature = "youtube-captions")]
     youtube_caption_line: Option<String>,
 }
@@ -80,6 +82,8 @@ impl PlaybackTick {
             playback_start_animation_frame: view.playback_start_animation_frame,
             search_animation_frame: view.search_animation_frame,
             local_fingerprint_animation_frame: view.local_fingerprint_animation_frame,
+            #[cfg(feature = "ascii-visualizer")]
+            ascii_visualizer: view.ascii_visualizer.clone(),
             #[cfg(feature = "youtube-captions")]
             youtube_caption_line: view.youtube_caption_line.clone(),
         }
@@ -93,6 +97,10 @@ impl PlaybackTick {
         view.playback_start_animation_frame = self.playback_start_animation_frame;
         view.search_animation_frame = self.search_animation_frame;
         view.local_fingerprint_animation_frame = self.local_fingerprint_animation_frame;
+        #[cfg(feature = "ascii-visualizer")]
+        {
+            view.ascii_visualizer.clone_from(&self.ascii_visualizer);
+        }
         #[cfg(feature = "youtube-captions")]
         {
             view.youtube_caption_line
@@ -911,6 +919,23 @@ mod tests {
         let mut probe = before;
         PlaybackTick::of(&also_selected).apply_to(&mut probe);
         assert_ne!(probe, also_selected, "a list change must force a snapshot");
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn the_playback_tick_carries_each_animated_ascii_frame() {
+        let mut current = ViewModel::default();
+        current.ascii_visualizer = Some(youta::view::AsciiVisualizerView {
+            frame: 42,
+            lines: vec![" .# ".to_owned()],
+            ..youta::view::AsciiVisualizerView::default()
+        });
+        let tick = PlaybackTick::of(&current);
+        let mut published = ViewModel::default();
+
+        tick.apply_to(&mut published);
+
+        assert_eq!(published, current);
     }
 
     /// Playback-only publication must retain both snapshots' large row buffers.

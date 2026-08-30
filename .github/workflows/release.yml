@@ -91,6 +91,8 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features tui
           cargo test --locked --lib --no-default-features --features audio-quality
           cargo test --locked --all-targets --no-default-features --features tui,audio-quality
+          cargo test --locked --lib --no-default-features --features ascii-visualizer
+          cargo test --locked --all-targets --no-default-features --features tui,ascii-visualizer
           cargo test --locked --lib --no-default-features --features summary
           cargo test --locked --lib --no-default-features --features youtube-captions
           cargo test --locked --all-targets --no-default-features --features tui,summary
@@ -133,6 +135,8 @@ jobs:
           cargo test --locked --doc --no-default-features --features tui
           cargo test --locked --doc --no-default-features --features audio-quality
           cargo test --locked --doc --no-default-features --features tui,audio-quality
+          cargo test --locked --doc --no-default-features --features ascii-visualizer
+          cargo test --locked --doc --no-default-features --features tui,ascii-visualizer
           cargo test --locked --doc --no-default-features --features summary
           cargo test --locked --doc --no-default-features --features youtube-captions
           cargo test --locked --doc --no-default-features --features tui,summary

@@ -475,6 +475,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "archive-org",
         "archive-rar",
         "archive-zip",
+        "ascii-visualizer",
         "audio-quality",
         "backend-mpv",
         "backend-native",

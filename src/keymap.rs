@@ -286,6 +286,45 @@ mod wire_tests {
         }
     }
 
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn f10_opens_active_audio_visualization_and_modal_arrows_switch_it() {
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(10)), &view, None, None),
+            None,
+            "an idle backend has no audio to visualize"
+        );
+        view.playback.idle = false;
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(10)), &view, None, None),
+            Some(UiAction::ToggleAsciiVisualizer)
+        );
+
+        view.ascii_visualizer = Some(crate::view::AsciiVisualizerView::default());
+        assert_eq!(
+            key_action(KeyPress::new(Key::Left), &view, None, None),
+            Some(UiAction::PreviousAsciiVisualization)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Right), &view, None, None),
+            Some(UiAction::NextAsciiVisualization)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissAsciiVisualizer)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(10)), &view, None, None),
+            Some(UiAction::DismissAsciiVisualizer)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('q')), &view, None, None),
+            None,
+            "fullscreen visualization owns ordinary application shortcuts"
+        );
+    }
+
     #[test]
     fn uppercase_g_opens_only_an_available_video_summary() {
         let mut view = ViewModel::default();
@@ -543,6 +582,15 @@ pub fn key_action(
     page_rows: Option<usize>,
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
+    #[cfg(feature = "ascii-visualizer")]
+    if view.error_popup.is_none() && view.ascii_visualizer.is_some() {
+        return match key.key {
+            Key::Left => Some(UiAction::PreviousAsciiVisualization),
+            Key::Right => Some(UiAction::NextAsciiVisualization),
+            Key::Esc | Key::F(10) => Some(UiAction::DismissAsciiVisualizer),
+            _ => None,
+        };
+    }
     #[cfg(feature = "youtube-captions")]
     if view.error_popup.is_none()
         && let Some(popup) = view.youtube_captions_popup.as_ref()
@@ -1358,6 +1406,8 @@ fn unfiltered_key_action(
         }
         Key::Char('?') => Some(UiAction::ToggleHelp),
         Key::F(9) => Some(UiAction::OpenProjectHistory),
+        #[cfg(feature = "ascii-visualizer")]
+        Key::F(10) if !view.playback.idle => Some(UiAction::ToggleAsciiVisualizer),
         Key::Char('/') => Some(UiAction::BeginSearch),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
         Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(

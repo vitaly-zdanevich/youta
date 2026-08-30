@@ -94,6 +94,8 @@ jobs:
             feature_arguments: --no-default-features --features tui,sponsorblock
           - feature_set: TUI with Nyan Cat seek bar
             feature_arguments: --no-default-features --features tui,nyan-cat
+          - feature_set: TUI with fullscreen ASCII visualizer
+            feature_arguments: --no-default-features --features tui,ascii-visualizer
           - feature_set: TUI with YouTube captions
             feature_arguments: --no-default-features --features tui,youtube-captions
           - feature_set: standalone QR TUI
@@ -178,6 +180,7 @@ jobs:
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib
           cargo check --locked --no-default-features --features audio-quality --lib
+          cargo check --locked --no-default-features --features ascii-visualizer --lib
           cargo check --locked --no-default-features --features summary --lib
           cargo check --locked --no-default-features --features youtube-captions --lib
           cargo check --locked --no-default-features --features sponsorblock --lib
@@ -185,6 +188,7 @@ jobs:
           cargo check --locked --no-default-features --features acoustid --lib
           cargo check --locked --no-default-features --features tui,waveform
           cargo check --locked --no-default-features --features tui,audio-quality
+          cargo check --locked --no-default-features --features tui,ascii-visualizer
           cargo check --locked --no-default-features --features tui,summary
           cargo check --locked --no-default-features --features tui,youtube-captions
           cargo check --locked --no-default-features --features tui,sponsorblock
@@ -240,14 +244,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
 
       - name: Validate and start the i686 executable
         run: |

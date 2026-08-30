@@ -266,6 +266,55 @@ fn nyan_cat_seekbar_is_default_but_removable_from_both_front_ends() {
 }
 
 #[test]
+fn ascii_visualizer_is_default_but_removable_from_both_front_ends() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+
+    assert!(default.contains("ascii-visualizer"));
+    assert!(
+        !application.contains("ascii-visualizer"),
+        "`app` must not make fullscreen ASCII visualization impossible to compile out"
+    );
+    assert!(feature_entries(&manifest, "ascii-visualizer").is_empty());
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("ascii-visualizer"))
+    );
+    assert_eq!(
+        gui["features"]["ascii-visualizer"]
+            .as_array()
+            .expect("GUI ASCII visualizer forwarding")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        ["youta/ascii-visualizer"]
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(
+        readme.contains("`ascii-visualizer` is the independently removable fullscreen renderer")
+    );
+    assert!(readme.contains("`USE=\"-ascii-visualizer\"` removes audio analysis"));
+    assert!(readme.contains("[mpv audio-filter metadata]"));
+    assert!(readme.contains("[FFmpeg audio-statistics filters]"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("cargo check --locked --no-default-features --features ascii-visualizer --lib")
+    );
+    assert!(
+        ci.contains("cargo check --locked --no-default-features --features tui,ascii-visualizer")
+    );
+}
+
+#[test]
 fn audio_quality_is_default_but_remains_a_removable_local_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -483,8 +532,10 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app,audio-quality,nyan-cat,qr"));
-    assert!(readme.contains("--features app-core,audio-quality,images,nyan-cat,qr"));
+    assert!(readme.contains("--features app,ascii-visualizer,audio-quality,nyan-cat,qr"));
+    assert!(
+        readme.contains("--features app-core,ascii-visualizer,audio-quality,images,nyan-cat,qr")
+    );
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -556,14 +607,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
     ] {
         assert!(
             script
@@ -762,14 +813,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {
         assert!(
             ci.contains(&format!(
@@ -1177,9 +1228,12 @@ fn desktop_and_core_versions_remain_in_sync() {
             "the GUI core profile omitted `{required}`"
         );
     }
-    assert_eq!(
-        gui_manifest["features"]["default"][0].as_str(),
-        Some("audio-quality"),
+    assert!(
+        gui_manifest["features"]["default"]
+            .as_array()
+            .expect("GUI default features")
+            .iter()
+            .any(|feature| feature.as_str() == Some("audio-quality")),
         "ordinary desktop builds must enable audio quality analysis"
     );
     assert_eq!(

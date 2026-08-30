@@ -22,12 +22,16 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+#[cfg(feature = "ascii-visualizer")]
+use youta::ascii_visualizer::{AsciiVisualizationMode, AudioVisualizationSample};
 #[cfg(feature = "commons-upload")]
 use youta::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 use youta::domain::{MediaId, SourceKind};
 #[cfg(feature = "evernote")]
 use youta::evernote::EvernoteNoteDraft;
 use youta::keymap::{PopupGeometry, ScrollGeometry};
+#[cfg(feature = "ascii-visualizer")]
+use youta::view::AsciiVisualizerView;
 #[cfg(feature = "commons-upload")]
 use youta::view::CommonsUploadPopupView;
 #[cfg(feature = "evernote")]
@@ -195,6 +199,20 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     emitted.insert("PopupGeometry", emitted_keys(&PopupGeometry::default()));
     emitted.insert("ScrollGeometry", emitted_keys(&ScrollGeometry::default()));
     emitted.insert("PlaybackStatus", emitted_keys(&view.playback));
+    #[cfg(feature = "ascii-visualizer")]
+    {
+        emitted.insert(
+            "AudioVisualizationSample",
+            emitted_keys(&AudioVisualizationSample::default()),
+        );
+        emitted.insert(
+            "AsciiVisualizerView",
+            emitted_keys(&AsciiVisualizerView {
+                mode: AsciiVisualizationMode::Bars,
+                ..AsciiVisualizerView::default()
+            }),
+        );
+    }
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
     emitted.insert("RowView", emitted_keys(&RowView::default()));
     emitted.insert("DetailLinkView", emitted_keys(&DetailLinkView::default()));
@@ -360,6 +378,8 @@ fn every_checked_interface_is_actually_declared() {
         "PopupGeometry",
         "ScrollGeometry",
         "PlaybackStatus",
+        "AudioVisualizationSample",
+        "AsciiVisualizerView",
         "DetailView",
         "RowView",
         "DetailLinkView",
@@ -555,7 +575,7 @@ fn the_window_error_component_hides_issue_actions_for_setup_guidance() {
 
 /// Collects every action the window names inline at a `dispatch` call.
 ///
-/// The grammar accepted is the one the window is written in: `dispatch("Name")`
+/// The grammar accepted is the one the window is written in: `dispatch('Name')`
 /// for an action without a payload and `dispatch({ Name: … })` for one with one,
 /// the argument possibly starting on the next line. A call whose argument is a
 /// variable is skipped, because the name is then not in this file to check.
@@ -567,6 +587,8 @@ fn dispatched_actions(source: &str) -> BTreeSet<String> {
         let argument = rest.trim_start();
         let name = if let Some(quoted) = argument.strip_prefix('"') {
             quoted.split('"').next()
+        } else if let Some(quoted) = argument.strip_prefix('\'') {
+            quoted.split('\'').next()
         } else if let Some(object) = argument.strip_prefix('{') {
             object.split(':').next()
         } else {
@@ -659,6 +681,31 @@ fn the_window_dispatches_only_actions_the_reducer_declares() {
         checked >= 20,
         "only {checked} dispatch sites were found; the scanner has stopped matching"
     );
+}
+
+#[cfg(feature = "ascii-visualizer")]
+#[test]
+fn the_window_renders_and_controls_the_reducer_owned_ascii_frame() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("AsciiVisualizer.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "visualizer.lines.join('\\n')",
+        "dispatch('PreviousAsciiVisualization')",
+        "dispatch('NextAsciiVisualization')",
+        "dispatch('DismissAsciiVisualizer')",
+        "Audio visualization",
+    ] {
+        assert!(
+            source.contains(required),
+            "ASCII visualizer component no longer contains {required}"
+        );
+    }
 }
 
 #[test]

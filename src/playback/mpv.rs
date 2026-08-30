@@ -14,6 +14,8 @@ mod backend {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "ascii-visualizer")]
+    use crate::ascii_visualizer::AudioVisualizationSample;
     use serde_json::{Value, json};
 
     use super::super::mpv_ipc::{self, IpcLink};
@@ -33,6 +35,12 @@ mod backend {
     const MAX_RESOLVED_HTTP_HEADER_BYTES: usize = 16 * 1024;
     const ICY_TITLE_OBSERVER_ID: u64 = 1;
     const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
+    #[cfg(feature = "ascii-visualizer")]
+    const AUDIO_VISUALIZER_FILTER_LABEL: &str = "youta-visualizer";
+    #[cfg(feature = "ascii-visualizer")]
+    const AUDIO_VISUALIZER_FILTER_REFERENCE: &str = "@youta-visualizer";
+    #[cfg(feature = "ascii-visualizer")]
+    const AUDIO_VISUALIZER_FILTER: &str = "@youta-visualizer:lavfi=[astats=metadata=1:reset=1:measure_perchannel=Zero_crossings_rate:measure_overall=Peak_level+RMS_level,aspectralstats=measure=centroid+spread+flux+rolloff]";
 
     /// Audio-only selector used by every ordinary extractor-backed load.
     #[cfg(feature = "yt-dlp")]
@@ -59,6 +67,9 @@ mod backend {
         socket_path: PathBuf,
         profile: PlaybackProfile,
         process_exit_reported: bool,
+        /// Whether status polling should read the labeled analysis metadata.
+        #[cfg(feature = "ascii-visualizer")]
+        audio_visualization_enabled: bool,
     }
 
     impl MpvBackend {
@@ -92,6 +103,8 @@ mod backend {
                 socket_path,
                 profile: config.profile,
                 process_exit_reported: false,
+                #[cfg(feature = "ascii-visualizer")]
+                audio_visualization_enabled: false,
             };
             configure_ipc(&mut backend.ipc)?;
             Ok(backend)
@@ -351,6 +364,7 @@ mod backend {
                         | "quit"
                         | "request_log_messages"
                         | "observe_property"
+                        | "af"
                 )
             })
             .unwrap_or("unknown");
@@ -416,6 +430,45 @@ mod backend {
             .collect::<String>();
         bounded.push('…');
         bounded
+    }
+
+    /// Normalizes one mpv audio-filter metadata map into finite render inputs.
+    #[cfg(feature = "ascii-visualizer")]
+    fn parse_audio_visualization_sample(value: &Value) -> Option<AudioVisualizationSample> {
+        let rms_db = finite_metadata_number(value, "lavfi.astats.Overall.RMS_level")?;
+        let peak_db = finite_metadata_number(value, "lavfi.astats.Overall.Peak_level")
+            .unwrap_or(rms_db)
+            .clamp(-160.0, 24.0);
+        Some(AudioVisualizationSample {
+            rms_db: rms_db.clamp(-160.0, 24.0),
+            peak_db,
+            zero_crossing_rate: finite_metadata_number(value, "lavfi.astats.1.Zero_crossings_rate")
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            centroid_hz: finite_metadata_number(value, "lavfi.aspectralstats.1.centroid")
+                .unwrap_or_default()
+                .clamp(0.0, 192_000.0),
+            spread_hz: finite_metadata_number(value, "lavfi.aspectralstats.1.spread")
+                .unwrap_or_default()
+                .clamp(0.0, 192_000.0),
+            flux: finite_metadata_number(value, "lavfi.aspectralstats.1.flux")
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            rolloff_hz: finite_metadata_number(value, "lavfi.aspectralstats.1.rolloff")
+                .unwrap_or_default()
+                .clamp(0.0, 192_000.0),
+        })
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    fn finite_metadata_number(value: &Value, key: &str) -> Option<f32> {
+        let raw = value.as_object()?.get(key)?;
+        let number = match raw {
+            Value::Number(number) => number.as_f64()? as f32,
+            Value::String(number) => number.parse::<f32>().ok()?,
+            _ => return None,
+        };
+        number.is_finite().then_some(number)
     }
 
     /// Normalizes untrusted ICY text for one terminal line.
@@ -792,6 +845,26 @@ mod backend {
                 PlayerCommand::SetStreamRecording(path) => {
                     self.set_property("stream-record", stream_recording_property_value(path)?)?;
                 }
+                #[cfg(feature = "ascii-visualizer")]
+                PlayerCommand::SetAudioVisualization(enabled) => {
+                    if enabled {
+                        if !self.audio_visualization_enabled {
+                            self.ensure_processing_allowed("audio visualization")?;
+                            self.send(&[
+                                json!("af"),
+                                json!("add"),
+                                json!(AUDIO_VISUALIZER_FILTER),
+                            ])?;
+                        }
+                    } else if self.audio_visualization_enabled {
+                        self.send(&[
+                            json!("af"),
+                            json!("remove"),
+                            json!(AUDIO_VISUALIZER_FILTER_REFERENCE),
+                        ])?;
+                    }
+                    self.audio_visualization_enabled = enabled;
+                }
                 PlayerCommand::Stop => {
                     self.send(&[json!("stop")])?;
                 }
@@ -848,6 +921,14 @@ mod backend {
                 .property("media-title")?
                 .and_then(|value| value.as_str().map(ToOwned::to_owned));
             let stream_title = self.ipc.stream_title.clone();
+            #[cfg(feature = "ascii-visualizer")]
+            let audio_visualization = if self.audio_visualization_enabled {
+                self.property(&format!("af-metadata/{AUDIO_VISUALIZER_FILTER_LABEL}"))?
+                    .as_ref()
+                    .and_then(parse_audio_visualization_sample)
+            } else {
+                None
+            };
 
             Ok(PlaybackStatus {
                 idle,
@@ -863,6 +944,8 @@ mod backend {
                 buffered_ranges,
                 title,
                 stream_title,
+                #[cfg(feature = "ascii-visualizer")]
+                audio_visualization,
             })
         }
 
@@ -1167,6 +1250,8 @@ mod backend {
                     socket_path: PathBuf::from("/tmp/youta-unused-buffer-status.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
+                    #[cfg(feature = "ascii-visualizer")]
+                    audio_visualization_enabled: false,
                 },
                 server_thread,
             )
@@ -1235,6 +1320,8 @@ mod backend {
                     socket_path: PathBuf::from("/tmp/youta-unused-command-recorder.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
+                    #[cfg(feature = "ascii-visualizer")]
+                    audio_visualization_enabled: false,
                 },
                 command_receiver,
                 server_thread,
@@ -1254,6 +1341,72 @@ mod backend {
                     json!(-1),
                     json!({"pause": "no"}),
                 ]
+            );
+        }
+
+        #[cfg(feature = "ascii-visualizer")]
+        #[test]
+        fn audio_visualizer_uses_one_labeled_runtime_filter_without_a_second_decoder() {
+            let (mut backend, command_receiver, server_thread) = backend_with_command_recorder();
+
+            backend
+                .command(PlayerCommand::SetAudioVisualization(true))
+                .expect("enable analysis filter");
+            backend
+                .command(PlayerCommand::SetAudioVisualization(true))
+                .expect("repeat enable without duplicating the filter");
+            backend
+                .command(PlayerCommand::SetAudioVisualization(false))
+                .expect("remove analysis filter");
+            backend.shutdown().expect("stop mock backend");
+            server_thread.join().expect("mock command server");
+
+            assert_eq!(
+                command_receiver.into_iter().collect::<Vec<_>>(),
+                vec![
+                    vec![json!("af"), json!("add"), json!(AUDIO_VISUALIZER_FILTER)],
+                    vec![
+                        json!("af"),
+                        json!("remove"),
+                        json!(AUDIO_VISUALIZER_FILTER_REFERENCE),
+                    ],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[cfg(feature = "ascii-visualizer")]
+        #[test]
+        fn audio_visualizer_metadata_is_finite_bounded_and_requires_a_signal_level() {
+            let parsed = parse_audio_visualization_sample(&json!({
+                "lavfi.astats.Overall.RMS_level": "-12.5",
+                "lavfi.astats.Overall.Peak_level": "-1.25",
+                "lavfi.astats.1.Zero_crossings_rate": "0.17",
+                "lavfi.aspectralstats.1.centroid": "2420",
+                "lavfi.aspectralstats.1.spread": "1800",
+                "lavfi.aspectralstats.1.flux": "0.37",
+                "lavfi.aspectralstats.1.rolloff": "8100",
+            }))
+            .expect("complete mpv filter metadata");
+            assert_eq!(parsed.rms_db, -12.5);
+            assert_eq!(parsed.peak_db, -1.25);
+            assert_eq!(parsed.zero_crossing_rate, 0.17);
+            assert_eq!(parsed.centroid_hz, 2420.0);
+            assert_eq!(parsed.spread_hz, 1800.0);
+            assert_eq!(parsed.flux, 0.37);
+            assert_eq!(parsed.rolloff_hz, 8100.0);
+
+            assert!(
+                parse_audio_visualization_sample(&json!({
+                    "lavfi.astats.Overall.Peak_level": "-1"
+                }))
+                .is_none()
+            );
+            assert!(
+                parse_audio_visualization_sample(&json!({
+                    "lavfi.astats.Overall.RMS_level": "NaN"
+                }))
+                .is_none()
             );
         }
 
@@ -1535,6 +1688,8 @@ mod backend {
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
+                #[cfg(feature = "ascii-visualizer")]
+                audio_visualization_enabled: false,
             };
             let mut input = PlaybackInput::new("/tmp/fixture.opus");
             input.start_at = Duration::from_secs(30);
@@ -2150,6 +2305,8 @@ mod backend {
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
+                #[cfg(feature = "ascii-visualizer")]
+                audio_visualization_enabled: false,
             };
 
             let deadline = Instant::now() + Duration::from_secs(2);

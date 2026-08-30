@@ -54,6 +54,30 @@ export interface PlaybackStatus {
   buffered_ranges: BufferedRange[];
   title: string | null;
   stream_title: string | null;
+  audio_visualization?: AudioVisualizationSample | null;
+}
+
+/** One finite metadata sample from mpv's temporary analysis filter. */
+export interface AudioVisualizationSample {
+  rms_db: number;
+  peak_db: number;
+  zero_crossing_rate: number;
+  centroid_hz: number;
+  spread_hz: number;
+  flux: number;
+  rolloff_hz: number;
+}
+
+/** Five stable fullscreen visualization styles, in switching order. */
+export type AsciiVisualizationMode = 'Bars' | 'Pulse' | 'Rain' | 'Tunnel' | 'Stars';
+
+/** Reducer-owned fullscreen ASCII frame and its audio measurements. */
+export interface AsciiVisualizerView {
+  mode: AsciiVisualizationMode;
+  sample: AudioVisualizationSample | null;
+  frame: number;
+  title: string;
+  lines: string[];
 }
 
 /** One row of the main list. */
@@ -687,6 +711,8 @@ export interface ViewModel {
   waveform_visible: boolean;
   waveform_playback_matches: boolean;
   playback: PlaybackStatus;
+  ascii_visualizer_supported?: boolean;
+  ascii_visualizer?: AsciiVisualizerView | null;
   playback_starting: boolean;
   playback_chapters: Chapter[];
   show_chapter_timestamps: boolean;
@@ -744,6 +770,7 @@ export interface ViewModel {
 /** The high-frequency group carried on its own channel. */
 export interface PlaybackTick {
   playback: PlaybackStatus;
+  ascii_visualizer?: AsciiVisualizerView | null;
   radio_now_playing: string | null;
   playback_starting: boolean;
   playback_start_animation_frame: number;

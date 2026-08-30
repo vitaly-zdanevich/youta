@@ -89,6 +89,8 @@ pub mod thumbnails;
 
 #[cfg(feature = "controller")]
 pub mod app;
+#[cfg(feature = "ascii-visualizer")]
+pub mod ascii_visualizer;
 
 #[cfg(feature = "tui")]
 pub mod tui;

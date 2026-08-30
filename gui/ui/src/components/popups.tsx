@@ -71,6 +71,7 @@ function Body({ children }: { children: React.ReactNode }) {
  */
 export function HelpPopup({
   audioQualitySupported,
+  asciiVisualizerSupported,
   commonsUploadSupported,
 	evernoteSupported,
   playbackHistoryEnabled,
@@ -78,6 +79,7 @@ export function HelpPopup({
   youtubeCaptionsSupported,
 }: {
   audioQualitySupported: boolean;
+  asciiVisualizerSupported: boolean;
   commonsUploadSupported: boolean;
 	evernoteSupported: boolean;
   playbackHistoryEnabled: boolean;
@@ -117,6 +119,9 @@ export function HelpPopup({
         ["T", "chapter timestamps"],
         ["r · A", "repeat · autoplay"],
         ["w", "waveform"],
+        ...(asciiVisualizerSupported
+          ? ([['F10', 'fullscreen ASCII audio visualizer']] satisfies Array<[string, string]>)
+          : []),
       ],
     ],
     [
