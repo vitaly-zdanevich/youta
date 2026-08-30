@@ -7898,6 +7898,7 @@ impl AppController {
                         media_id: Some(MediaId::new(SourceKind::YandexMusic, &track.id)),
                         title: track.title.clone(),
                         source: "Yandex Music".to_owned(),
+                        webpage_url: Some(track.webpage_url.clone()),
                         channel_name: yandex_music_artist_names(&track.artists),
                         length: track
                             .duration_ms
@@ -7938,6 +7939,7 @@ impl AppController {
                 DetailView {
                     title: album.title.clone(),
                     source: "Yandex Music album".to_owned(),
+                    webpage_url: Some(album.webpage_url.clone()),
                     channel_name: yandex_music_artist_names(&album.artists),
                     description: format!(
                         "{}\nPress Enter or b to open this album.",
@@ -13286,6 +13288,7 @@ impl AppController {
             media_id: Some(release.id.clone()),
             title: release.title.clone(),
             source: "Bandcamp".to_owned(),
+            webpage_url: Some(release.webpage_url.clone()),
             description: description.join("\n"),
             thumbnail_url: release.artwork_url.clone(),
             links: vec![DetailLinkView {
@@ -13366,6 +13369,7 @@ impl AppController {
             media_id: Some(show.id.clone()),
             title: show.title.clone(),
             source: "Apple Podcasts".to_owned(),
+            webpage_url: show.webpage_url.clone(),
             description: description.join("\n"),
             thumbnail_url: show.artwork_url.clone(),
             links,
@@ -13411,6 +13415,7 @@ impl AppController {
             media_id: Some(media_id),
             title: url.clone(),
             source: "Apple Podcasts".to_owned(),
+            webpage_url: Some(direct.url.clone()),
             description: "Resolving public podcast metadata and its RSS enclosure.".to_owned(),
             links: vec![DetailLinkView {
                 label: "Apple Podcasts".to_owned(),
@@ -13507,6 +13512,8 @@ impl AppController {
             });
         }
         let description = episode.description.clone().unwrap_or_default();
+        let webpage_url =
+            canonical_apple_episode_url(episode, self.active_apple_podcast_show.as_ref());
         self.view.details = Some(DetailView {
             media_id: Some(MediaId::new(
                 SourceKind::ApplePodcasts,
@@ -13514,6 +13521,7 @@ impl AppController {
             )),
             title: episode.title.clone(),
             source: "Apple Podcasts".to_owned(),
+            webpage_url,
             channel_name: episode.podcast_title.clone(),
             length: episode
                 .duration_seconds
@@ -25378,6 +25386,7 @@ impl AppController {
             media_id: Some(MediaId::new(SourceKind::Radio, station.id)),
             title: station.name.to_owned(),
             source: "Radio".to_owned(),
+            webpage_url: station.homepage_url().ok(),
             channel_webpage_url: station.homepage_url().ok(),
             description,
             radio_favorite: self.radio_favorite_station_ids.contains(station.id),
@@ -27840,6 +27849,19 @@ impl AppController {
                 .tracker_results
                 .get(self.view.selected)
                 .map(|item| item.webpage_url.to_string());
+        }
+        if self.view.screen == Screen::YandexMusic {
+            #[cfg(feature = "yandex-music")]
+            {
+                return self
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.webpage_url.as_ref())
+                    .map(ToString::to_string);
+            }
+            #[cfg(not(feature = "yandex-music"))]
+            return None;
         }
         if self.view.screen == Screen::Subscriptions {
             if let Some(item) = self.selected_subscription_item()
@@ -36900,6 +36922,7 @@ fn librivox_book_detail(
         media_id: Some(librivox_book_media_id(book.book_id)),
         title: book.title.clone(),
         source: "LibriVox".to_owned(),
+        webpage_url: Some(book.webpage_url.clone()),
         channel_name: book
             .authors
             .iter()
@@ -36938,6 +36961,7 @@ fn librivox_section_detail(book: &LibrivoxBook, section: &LibrivoxSection) -> De
         media_id: Some(librivox_section_media_id(book.book_id, section.section_id)),
         title: section.title.clone(),
         source: "LibriVox".to_owned(),
+        webpage_url: Some(book.webpage_url.clone()),
         channel_name: if readers.is_empty() {
             book.authors
                 .iter()
@@ -37053,6 +37077,7 @@ fn apply_resolved_direct_view(
         media_id: Some(media_id),
         title: media.title.clone(),
         source: source.to_owned(),
+        webpage_url: media.webpage_url.clone(),
         length: media
             .duration_seconds
             .map_or_else(|| "unknown".to_owned(), format_seconds),
@@ -38634,6 +38659,7 @@ fn preliminary_detail_with_thumbnail_size(
                 media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
                 title: video.title.clone(),
                 source: "YouTube".to_owned(),
+                webpage_url: youtube_video_webpage_url(&video.video_id, video.webpage_url.clone()),
                 channel_name: video.channel_name.clone(),
                 channel_id: video.channel_id.clone(),
                 channel_webpage_url: youtube_channel_webpage_url(
@@ -38723,6 +38749,10 @@ fn detail_from_podcast_episode(episode: &PodcastEpisodeSummary) -> DetailView {
         media_id: Some(media_id),
         title: episode.title.clone(),
         source: "RSS podcast".to_owned(),
+        webpage_url: episode
+            .webpage_url
+            .clone()
+            .or_else(|| episode.feed_webpage_url.clone()),
         channel_name: episode.feed_title.clone(),
         length: episode
             .duration_seconds
@@ -39300,6 +39330,7 @@ fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTre
     DetailView {
         title: channel.name.clone(),
         source: "YouTube channel".to_owned(),
+        webpage_url: youtube_channel_webpage_url(&channel.channel_id, channel.webpage_url.clone()),
         channel_name: channel.name.clone(),
         channel_id: channel.channel_id.clone(),
         channel_webpage_url: youtube_channel_webpage_url(
@@ -39331,6 +39362,7 @@ fn detail_from_video_with_thumbnail_size(
         media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
         title: video.title.clone(),
         source: "YouTube".to_owned(),
+        webpage_url: youtube_video_webpage_url(&video.video_id, video.webpage_url.clone()),
         channel_name: video.channel_name.clone(),
         channel_id: video.channel_id.clone(),
         channel_webpage_url: youtube_channel_webpage_url(
@@ -39395,6 +39427,8 @@ fn detail_from_media_item(
         media_id: Some(media.id.clone()),
         title: media.title.clone(),
         source: media.id.source.to_string(),
+        webpage_url: matches!(media.webpage_url.scheme(), "http" | "https")
+            .then(|| media.webpage_url.clone()),
         channel_name: media.creator.clone().unwrap_or_default(),
         length: media
             .duration_seconds
@@ -39567,6 +39601,11 @@ fn youtube_channel_webpage_url(channel_id: &str, preferred: Option<url::Url>) ->
     preferred
         .filter(|url| is_safe_youtube_channel_webpage(url, channel_id))
         .or_else(|| canonical_youtube_channel_url(channel_id))
+}
+
+/// Chooses a provider-advertised YouTube video page or its canonical fallback.
+fn youtube_video_webpage_url(video_id: &str, preferred: Option<url::Url>) -> Option<url::Url> {
+    preferred.or_else(|| url::Url::parse(&youtube_video_url(video_id)).ok())
 }
 
 /// Shortens a validated channel page to a stable, readable display URL.
@@ -49665,6 +49704,10 @@ mod tests {
         assert_eq!(preliminary.views, "887,263");
         assert_eq!(preliminary.published, "2024 October 15");
         assert_eq!(
+            preliminary.webpage_url.as_ref().map(url::Url::as_str),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        assert_eq!(
             preliminary
                 .channel_webpage_url
                 .as_ref()
@@ -49702,6 +49745,10 @@ mod tests {
         assert_eq!(rendered.license, "Creative Commons Attribution");
         assert_eq!(rendered.channel_name, "Channel");
         assert_eq!(rendered.channel_id, "UCfixture");
+        assert_eq!(
+            rendered.webpage_url.as_ref().map(url::Url::as_str),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
         assert_eq!(
             rendered.channel_webpage_url.as_ref().map(url::Url::as_str),
             Some("https://www.youtube.com/channel/UCfixture")

@@ -675,6 +675,8 @@ pub struct DetailView {
     pub channel_name: String,
     /// Stable provider channel identifier used by local subscriptions.
     pub channel_id: String,
+    /// Exact public page opened by the selected item's browser action.
+    pub webpage_url: Option<url::Url>,
     /// Exact public channel page opened by the channel browser action.
     pub channel_webpage_url: Option<url::Url>,
     /// Whether the channel is present in Youta's local OPML subscriptions.

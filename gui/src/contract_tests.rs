@@ -986,6 +986,8 @@ fn the_window_keeps_radio_homepages_visible_and_openable() {
         "link.presentation.startsWith(\"LabelAndUrl\")",
         "{link.url}",
         "kind === \"Radio\" ? \"Open homepage\" : \"Open page\"",
+        "{details.webpage_url}",
+        "{details.channel_webpage_url}",
         "dispatch({ ActivateDetailLink: index })",
         "dispatch(\"OpenInBrowser\")",
     ] {

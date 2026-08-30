@@ -337,14 +337,24 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
           <Action onClick={() => void dispatch("OpenVideoQr")}>QR</Action>
         ) : null}
         {openable ? (
-          <Action onClick={() => void dispatch("OpenInBrowser")}>
-            {kind === "Radio" ? "Open homepage" : "Open page"}
-          </Action>
+          <span className="flex min-w-0 items-center gap-[6px]">
+            <Action onClick={() => void dispatch("OpenInBrowser")}>
+              {kind === "Radio" ? "Open homepage" : "Open page"}
+            </Action>
+            {details.webpage_url !== null ? (
+              <span className="break-all text-[11px] text-ink-faint">{details.webpage_url}</span>
+            ) : null}
+          </span>
         ) : null}
         {view.external_opener_available &&
         (kind === "Video" || kind === "Channel") &&
         details.channel_webpage_url !== null ? (
-          <Action onClick={() => void dispatch("OpenChannelInBrowser")}>Open channel</Action>
+          <span className="flex min-w-0 items-center gap-[6px]">
+            <Action onClick={() => void dispatch("OpenChannelInBrowser")}>Open channel</Action>
+            <span className="break-all text-[11px] text-ink-faint">
+              {details.channel_webpage_url}
+            </span>
+          </span>
         ) : null}
         {details.media_id !== null ? (
           <Action onClick={() => void dispatch("CopyLink")}>Copy link</Action>

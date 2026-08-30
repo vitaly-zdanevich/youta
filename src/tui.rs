@@ -41,7 +41,7 @@ use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
     VideoSummaryBackend,
 };
-use crate::domain::{Chapter, MediaId, SourceKind, decode_url_path_segment_once};
+use crate::domain::{Chapter, MediaId, SourceKind};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
 use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
@@ -3464,54 +3464,6 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
     }
 }
 
-/// Returns a real YouTube `@handle` carried by a safe channel URL.
-///
-/// Display names are handled separately so UI text can never be converted
-/// into a guessed channel address.
-fn youtube_channel_handle(url: Option<&url::Url>) -> Option<String> {
-    let url = url?;
-    if url.scheme() != "https"
-        || !url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("youtube.com")
-                || host.eq_ignore_ascii_case("www.youtube.com")
-                || host.eq_ignore_ascii_case("m.youtube.com")
-        })
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let mut segments = url
-        .path_segments()?
-        .map(decode_url_path_segment_once)
-        .collect::<Option<Vec<_>>>()?;
-    if segments.last().is_some_and(String::is_empty) {
-        segments.pop();
-    }
-    let [handle] = segments.as_slice() else {
-        return None;
-    };
-    handle
-        .strip_prefix('@')
-        .is_some_and(valid_youtube_channel_display_alias)
-        .then(|| handle.clone())
-}
-
-/// Checks a decoded handle before presenting it as an actionable channel URL.
-fn valid_youtube_channel_display_alias(alias: &str) -> bool {
-    !alias.is_empty()
-        && alias.len() <= 128
-        && !matches!(alias, "." | "..")
-        && !alias.chars().any(|character| {
-            character.is_control()
-                || character.is_whitespace()
-                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
-        })
-}
-
 /// Thumbnail sizing inputs retained until the responsive image width is known.
 #[derive(Clone, Copy)]
 struct ThumbnailSizing {
@@ -3954,16 +3906,14 @@ fn render_information_panel(
         )
         && details.channel_webpage_url.is_some()
     {
-        let channel_label = youtube_channel_handle(details.channel_webpage_url.as_ref())
-            .or_else(|| {
-                (!details.channel_name.trim().is_empty())
-                    .then(|| details.channel_name.trim().to_owned())
-            })
-            .or_else(|| (!details.title.trim().is_empty()).then(|| details.title.trim().to_owned()))
-            .unwrap_or_else(|| "channel".to_owned());
+        let channel_url = details
+            .channel_webpage_url
+            .as_ref()
+            .map(url::Url::as_str)
+            .unwrap_or_default();
         let label = button(
             "O",
-            &format!("{} channel · {channel_label}", system_url_opener_name()),
+            &format!("{} channel · {channel_url}", system_url_opener_name()),
             show_hotkeys,
         );
         push_right_detail_button(
@@ -3987,7 +3937,7 @@ fn render_information_panel(
         )
     {
         let opener_name = system_url_opener_name();
-        let action_text = match kind {
+        let mut action_text = match kind {
             InformationPanelKind::Podcast => format!("{opener_name} podcast"),
             InformationPanelKind::Audiobook => format!("{opener_name} audiobook"),
             InformationPanelKind::Radio => format!("{opener_name} homepage"),
@@ -3997,6 +3947,10 @@ fn render_information_panel(
             InformationPanelKind::YandexMusic => format!("{opener_name} item"),
             _ => format!("{opener_name} video"),
         };
+        if let Some(webpage_url) = details.webpage_url.as_ref() {
+            action_text.push_str(" · ");
+            action_text.push_str(webpage_url.as_str());
+        }
         let label = button(
             if kind == InformationPanelKind::Radio {
                 "O"
@@ -18976,16 +18930,20 @@ mod tests {
 
     #[test]
     fn details_render_clickable_local_subscription_without_duplicate_channel_name() {
-        let backend = TestBackend::new(120, 32);
+        let backend = TestBackend::new(240, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
             details: Some(DetailView {
                 title: "Mock video".to_owned(),
                 source: "YouTube".to_owned(),
+                webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/watch?v=fixture-video")
+                        .expect("fixture video URL"),
+                ),
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
                 channel_webpage_url: Some(
-                    url::Url::parse("https://www.youtube.com/@ქართული")
+                    url::Url::parse("https://www.youtube.com/@fixture")
                         .expect("fixture channel URL"),
                 ),
                 ..DetailView::default()
@@ -19018,9 +18976,12 @@ mod tests {
             "the selected source is already visible in the left panel"
         );
         assert!(rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
         assert!(rendered.contains(&format!(
-            "[O] {} channel · @ქართული",
+            "[o] {} video · https://www.youtube.com/watch?v=fixture-video",
+            system_url_opener_name()
+        )));
+        assert!(rendered.contains(&format!(
+            "[O] {} channel · https://www.youtube.com/@fixture",
             system_url_opener_name()
         )));
         let (_, subscribe_area) = hit_map
@@ -19424,7 +19385,10 @@ mod tests {
             "[l] Add to todo".to_owned(),
             "[F6] Twenty comments".to_owned(),
             "[P] Playlist…".to_owned(),
-            format!("[O] {} channel · @fixture", system_url_opener_name()),
+            format!(
+                "[O] {} channel · https://www.youtube.com/@fixture",
+                system_url_opener_name()
+            ),
             "[n] Add private note".to_owned(),
             format!("[o] {} video", system_url_opener_name()),
             "[s] Subscribe (locally)".to_owned(),
@@ -19672,28 +19636,6 @@ mod tests {
             assert!(
                 area.bottom() <= requested_thumbnail.y,
                 "{expected:?} must remain above full-width artwork"
-            );
-        }
-    }
-
-    #[test]
-    fn channel_handle_display_accepts_one_trailing_slash_but_rejects_extra_path() {
-        let handle =
-            url::Url::parse("https://www.youtube.com/@myChanName/").expect("fixture handle");
-        assert_eq!(
-            youtube_channel_handle(Some(&handle)).as_deref(),
-            Some("@myChanName")
-        );
-
-        for unsafe_url in [
-            "https://www.youtube.com/@myChanName//",
-            "https://www.youtube.com/@myChanName/videos",
-        ] {
-            let url = url::Url::parse(unsafe_url).expect("unsafe fixture URL");
-            assert_eq!(
-                youtube_channel_handle(Some(&url)),
-                None,
-                "{unsafe_url:?} must not be displayed as an exact channel handle"
             );
         }
     }
@@ -26591,7 +26533,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains(&format!(
-            "[O] {} channel · Mock channel",
+            "[O] {} channel · https://www.youtube.com/channel/UCfixture",
             system_url_opener_name()
         )));
         assert!(!rendered.contains("Load channel info"));

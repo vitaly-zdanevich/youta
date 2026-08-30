@@ -169,6 +169,7 @@ export interface DetailView {
   source: string;
   channel_name: string;
   channel_id: string;
+  webpage_url: string | null;
   channel_webpage_url: string | null;
   channel_subscribed: boolean;
   channel_subscriber_count: number | null;
