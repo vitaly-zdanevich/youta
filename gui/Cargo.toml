@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.38.0"
+version = "0.38.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
