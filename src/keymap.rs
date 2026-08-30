@@ -1093,6 +1093,9 @@ fn unfiltered_key_action(
             Key::Esc | Key::Char('p') => Some(UiAction::DismissPreferences),
             Key::Enter => Some(UiAction::SubmitPreferences),
             Key::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
+            Key::Char('S') if preferences.sponsorblock_supported => {
+                Some(UiAction::ToggleSponsorBlock)
+            }
             Key::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             Key::Char('t') if cfg!(feature = "images") => Some(UiAction::CycleYouTubeThumbnailSize),
             Key::Char('f') => Some(UiAction::ToggleLocalFolderSizes),

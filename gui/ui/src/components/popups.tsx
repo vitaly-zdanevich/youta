@@ -1148,6 +1148,21 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
               Video summaries are not included in this build.
             </p>
           )}
+          {popup.sponsorblock_supported ? (
+            <label className="flex items-center justify-between gap-4">
+              <span className="text-ink-dim">Skip SponsorBlock sponsored segments</span>
+              <PopupButton
+                emphasis={popup.sponsorblock_enabled}
+                onClick={() => void dispatch('ToggleSponsorBlock')}
+              >
+                {popup.sponsorblock_enabled ? 'on' : 'off'}
+              </PopupButton>
+            </label>
+          ) : (
+            <p className="m-0 text-[11px] text-ink-faint">
+              SponsorBlock is not included in this build.
+            </p>
+          )}
           {toggles.map(([label, value, action]) => (
             <label key={label} className="flex items-center justify-between gap-4">
               <span className="text-ink-dim">{label}</span>

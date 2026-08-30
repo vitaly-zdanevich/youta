@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.43.0"
+version = "0.44.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
@@ -12,7 +12,7 @@ publish = false
 unsafe_code = "forbid"
 
 [features]
-default = ["audio-quality", "commons-upload", "evernote", "local-archives", "summary"]
+default = ["audio-quality", "commons-upload", "evernote", "local-archives", "sponsorblock", "summary"]
 # Forward the source package's independently removable capabilities. Release
 # and ordinary GUI builds retain them through this crate's defaults;
 # distributors can disable both layers with `--no-default-features`.
@@ -20,6 +20,7 @@ audio-quality = ["youta/audio-quality"]
 commons-upload = ["youta/commons-upload"]
 evernote = ["youta/evernote"]
 local-archives = ["youta/local-archives"]
+sponsorblock = ["youta/sponsorblock"]
 summary = ["youta/summary"]
 
 [dependencies]

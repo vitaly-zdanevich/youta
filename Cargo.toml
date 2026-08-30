@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.43.0"
+version = "0.44.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -40,6 +40,7 @@ default = [
     "images",
     "local-archives",
     "qr",
+    "sponsorblock",
     "summary",
 ]
 
@@ -48,10 +49,10 @@ default = [
 # Yandex Music is included here so normal builds expose the complete top-level
 # source set. `app-core` remains the equivalent profile for distributors and
 # users who intentionally omit the private, experimental Yandex Music API.
-# Audio-quality analysis, GPM input, image rendering, QR encoding, video
-# summaries, and SQLite remain independent features. Keeping them outside this
-# profile lets system packages map positive options directly to Cargo features
-# without subtracting a transitive default.
+# Audio-quality analysis, GPM input, image rendering, QR encoding, SponsorBlock,
+# video summaries, and SQLite remain independent features. Keeping them outside
+# this profile lets system packages map positive options directly to Cargo
+# features without subtracting a transitive default.
 app = [
     "app-core",
     "yandex-music",
@@ -87,7 +88,6 @@ sources = [
     "librivox",
     "litres",
     "lastfm",
-    "sponsorblock",
     "dearrow",
     "wikidata",
     "generic-ytdlp",

@@ -190,6 +190,10 @@ chapter instead of skipping it.
 markers. This label preference is restored with the previous session. By
 default, Youta hides and skips only chapters whose normalized title is exactly
 `Реклама`; set `playback.skip_advertisement_chapters` to `false` to retain them.
+The default-on SponsorBlock preference independently skips crowdsourced
+`sponsor` segments during YouTube playback. Lookup failures leave playback
+unchanged, and the preference can be disabled without disabling exact
+`Реклама` chapter handling.
 
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player
@@ -233,7 +237,7 @@ implement the same playback interface without changing screens or history.
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
   commands;
 - `doctor` and configuration inspection commands;
-- parsing foundations for optional SponsorBlock and DeArrow data.
+- bounded, fail-open SponsorBlock segment skipping and labelled DeArrow titles.
 
 Run `youta --help` for the binary's authoritative command list.
 
@@ -558,7 +562,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,audio-quality,qr,summary
+	--features app,audio-quality,qr,sponsorblock,summary
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -569,7 +573,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,audio-quality,images,qr,summary
+	--features app-core,audio-quality,images,qr,sponsorblock,summary
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -577,13 +581,16 @@ Omit `images` from that command for the Yandex-free text-only variant. Omit
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
 `summary` is the independently removable Codex summary integration,
+`sponsorblock` is the independently removable SponsorBlock client and playback
+skip integration,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
-default feature set still enables audio-quality analysis, video summaries,
-ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either custom
-command above to retain archive folders; leaving it out removes the archive
-folder code. The shared ZIP decoder also disappears only when no other selected
-feature, such as tracker archive support, enables `archive-zip`.
+default feature set still enables audio-quality analysis, SponsorBlock, video
+summaries, ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
+custom command above to retain archive folders; leaving it out removes the
+archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
+cache, and playback code. The shared ZIP decoder also disappears only when no
+other selected feature, such as tracker archive support, enables `archive-zip`.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
@@ -1278,9 +1285,22 @@ rather than manually maintained tokens. Follow its current
 [PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) when the
 checked-format retry also fails.
 
-SponsorBlock is for crowdsourced in-video segments such as sponsor messages;
-it is not a blocker for YouTube's platform-inserted advertisements. Its
-integration cannot be combined with a policy-compliant official YouTube player.
+The default-on `sponsorblock` build feature requests the `sponsor` category
+from the read-only [SponsorBlock API](https://wiki.sponsor.ajay.app/w/API_Docs)
+for an exact YouTube video ID. Youta caches the bounded result in RAM and seeks
+past `skip` segments while they play. It rejects duration-stale responses,
+deduplicates each seek, and treats every network or parsing failure as an empty
+skip decision. SponsorBlock covers crowdsourced in-video messages; it is not a
+blocker for YouTube's platform-inserted advertisements. Its integration cannot
+be combined with a policy-compliant official YouTube player.
+
+Disable the runtime behavior in Preferences or with
+`playback.sponsorblock_enabled = false`. Custom Cargo builds can omit the code
+by leaving `sponsorblock` out of a `--no-default-features` feature list. The
+lookup discloses the selected YouTube video ID to the public
+SponsorBlock service; Youta does not submit segments or votes. SponsorBlock data
+is supplied by its community; see its
+[database/API licence and attribution terms](https://github.com/ajayyy/SponsorBlock/wiki/Database-and-API-License).
 When the `dearrow` build feature is enabled, Youta shows a crowdsourced title
 as `DeArrow title: …` immediately before the original video description. The
 provider title remains the primary title and is never replaced.
@@ -1580,17 +1600,18 @@ existing rows intact.
 
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
 Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
-skipped, choose whether selected YouTube audio is prepared, choose whether
-Local folder sizes are measured, choose the exact YouTube video-thumbnail
-size, choose whether new playback History entries are saved, choose the
-explicit summary backend, and press `Enter` to save. These preferences
-can be configured directly:
+skipped, choose whether SponsorBlock segments are skipped, choose whether
+selected YouTube audio is prepared, choose whether Local folder sizes are
+measured, choose the exact YouTube video-thumbnail size, choose whether new
+playback History entries are saved, choose the explicit summary backend, and
+press `Enter` to save. These preferences can be configured directly:
 
 ```toml
 [playback]
 autoplay = false
 youtube_prewarm = true
 skip_advertisement_chapters = true
+sponsorblock_enabled = true
 
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
@@ -1610,8 +1631,9 @@ codex_executable = 'codex'
 `YOUTA_UI__SHOW_YOUTUBE_SHORTS=false` and
 `YOUTA_PLAYBACK__AUTOPLAY=true` and
 `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false` and
-`YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` override the corresponding
-TOML values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
+`YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` and
+`YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false` override the corresponding TOML
+values. `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
 video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
@@ -1694,9 +1716,10 @@ The roadmap is intentionally tiered:
    public track/album discovery and playback, LibriVox public-domain audiobook
    discovery and chapter playback, tracker modules, generic
    `yt-dlp`, `mpv`, and search/history/queue/download state.
-2. **Open-data integrations:** SponsorBlock, DeArrow, broader Wikidata
+2. **Open-data integrations:** broader DeArrow thumbnail support and Wikidata
    discovery, Wikimedia Commons, Internet Archive, Podcast Index, and
-   gpodder.net.
+   gpodder.net. Read-only SponsorBlock skipping and labelled DeArrow titles are
+   already implemented.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
    bidirectional local/YouTube subscription sync, Last.fm scrobbling, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
@@ -1980,14 +2003,17 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `audio-quality`, `commons-upload`,
-`evernote`, `local-archives`, and `summary` flags to their Cargo features.
+`evernote`, `local-archives`, `sponsorblock`, and `summary` flags to their Cargo
+features.
 `USE="-audio-quality"` removes the analyzer and RustFFT dependency.
 `USE="-commons-upload"` removes the Commons client and review UI.
 `USE="-evernote"` removes the Evernote EDAM client and note UI.
 `USE="-local-archives"` removes ZIP/RAR Local-folder browsing and the RAR helper
 dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
 unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
-extraction. `USE="-summary"` removes the Codex summary UI and backend. Prebuilt
+extraction. `USE="-sponsorblock"` removes its API client, preference, cache, and
+playback skip logic. `USE="-summary"` removes the Codex summary UI and backend.
+Prebuilt
 executables contain the fixed upstream feature set and keep these capabilities
 enabled; offering binary USE switches would require another copy of every
 Linux release variant rather than changing installed code.

@@ -179,6 +179,52 @@ fn local_archive_folders_are_default_but_removable_from_both_front_ends() {
 }
 
 #[test]
+fn sponsorblock_is_default_but_removable_from_both_front_ends() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+
+    assert!(default.contains("sponsorblock"));
+    assert!(
+        !application.contains("sponsorblock"),
+        "`app` must not make SponsorBlock impossible to compile out"
+    );
+    assert_eq!(feature_entries(&manifest, "sponsorblock"), ["network"]);
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("sponsorblock"))
+    );
+    assert_eq!(
+        gui["features"]["sponsorblock"]
+            .as_array()
+            .expect("GUI SponsorBlock forwarding")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        ["youta/sponsorblock"]
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains(
+        "`sponsorblock` is the independently removable SponsorBlock client and playback"
+    ));
+    assert!(readme.contains("`YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false`"));
+    assert!(readme.contains("`USE=\"-sponsorblock\"` removes its API client"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("cargo check --locked --no-default-features --features sponsorblock --lib")
+    );
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,sponsorblock"));
+}
+
+#[test]
 fn audio_quality_is_default_but_remains_a_removable_local_capability() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -427,14 +473,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,qr,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,summary",
-        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,images,local-archives,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,gpm,local-archives,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,qr,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,images,local-archives,sponsorblock,summary",
+        "cargo_features=app,audio-quality,commons-upload,evernote,local-archives,sponsorblock,summary",
     ] {
         assert!(
             script
@@ -633,14 +679,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,summary",
-        "app,audio-quality,commons-upload,evernote,gpm,local-archives,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,qr,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,qr,summary",
-        "app,audio-quality,commons-upload,evernote,images,local-archives,summary",
-        "app,audio-quality,commons-upload,evernote,local-archives,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,images,local-archives,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,gpm,local-archives,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,qr,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,images,local-archives,sponsorblock,summary",
+        "app,audio-quality,commons-upload,evernote,local-archives,sponsorblock,summary",
     ] {
         assert!(
             ci.contains(&format!(

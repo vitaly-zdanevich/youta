@@ -41,6 +41,9 @@ pub const SHOW_YOUTUBE_SHORTS_ENV: &str = "YOUTA_UI__SHOW_YOUTUBE_SHORTS";
 /// Environment variable that overrides automatic advertisement-chapter skipping.
 pub const SKIP_ADVERTISEMENT_CHAPTERS_ENV: &str = "YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS";
 
+/// Environment variable that overrides automatic `SponsorBlock` segment skipping.
+pub const SPONSORBLOCK_ENABLED_ENV: &str = "YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED";
+
 /// Environment variable that overrides automatic same-source queue continuation.
 pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
 
@@ -71,6 +74,7 @@ pub const VIDEO_SUMMARY_BACKEND_ENV: &str = "YOUTA_VIDEO_SUMMARY__BACKEND";
 pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) -> bool {
     (cfg!(feature = "images") || variable != TTY_IMAGES_ENV)
         && (cfg!(feature = "summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
+        && (cfg!(feature = "sponsorblock") || variable != SPONSORBLOCK_ENABLED_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -700,14 +704,16 @@ impl Config {
 
     /// Persists the preferences currently exposed by the in-app editor.
     ///
-    /// The Subscriptions layout, advertisement-chapter behavior, selected
-    /// YouTube-video prewarming, lazy Local-folder size preference, physical-TTY
-    /// image preference, exact `YouTube` thumbnail size, playback-History
-    /// saving preference, and (when compiled) video-summary backend are written
-    /// together so confirming the popup cannot save only part of the draft.
+    /// The Subscriptions layout, advertisement-chapter behavior, `SponsorBlock`
+    /// behavior (when compiled), selected YouTube-video prewarming, lazy Local
+    /// folder size preference, physical-TTY image preference, exact `YouTube`
+    /// thumbnail size, playback-History saving preference, and (when compiled)
+    /// video-summary backend are written together so confirming the popup
+    /// cannot save only part of the draft.
     /// Existing unrelated keys, comments, and credentials are preserved.
     /// [`SUBSCRIPTIONS_LAYOUT_ENV`] and
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
+    /// [`SPONSORBLOCK_ENABLED_ENV`] and
     /// [`YOUTUBE_PREWARM_ENV`] and
     /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
@@ -732,6 +738,7 @@ impl Config {
         &mut self,
         layout: SubscriptionsLayout,
         skip_advertisement_chapters: bool,
+        sponsorblock_enabled: bool,
         youtube_prewarm: bool,
         show_local_folder_sizes: bool,
         show_images_in_tty: bool,
@@ -742,6 +749,7 @@ impl Config {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            SPONSORBLOCK_ENABLED_ENV,
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
             TTY_IMAGES_ENV,
@@ -793,6 +801,10 @@ impl Config {
                     )
                 })?;
             playback["skip_advertisement_chapters"] = value(skip_advertisement_chapters);
+            #[cfg(feature = "sponsorblock")]
+            {
+                playback["sponsorblock_enabled"] = value(sponsorblock_enabled);
+            }
             playback["youtube_prewarm"] = value(youtube_prewarm);
         }
         {
@@ -837,6 +849,12 @@ impl Config {
         let _ = show_images_in_tty;
         self.ui.youtube_thumbnail_size = youtube_thumbnail_size;
         self.playback.skip_advertisement_chapters = skip_advertisement_chapters;
+        #[cfg(feature = "sponsorblock")]
+        {
+            self.playback.sponsorblock_enabled = sponsorblock_enabled;
+        }
+        #[cfg(not(feature = "sponsorblock"))]
+        let _ = sponsorblock_enabled;
         self.playback.youtube_prewarm = youtube_prewarm;
         self.persistence.save_playback_history = save_playback_history;
         #[cfg(feature = "summary")]
@@ -987,6 +1005,8 @@ pub struct PlaybackConfig {
     pub youtube_prewarm: bool,
     /// Hide and skip chapters whose normalized title is exactly `Реклама`.
     pub skip_advertisement_chapters: bool,
+    /// Fetch and skip crowdsourced `SponsorBlock` sponsorship segments.
+    pub sponsorblock_enabled: bool,
     /// Settings that favor stable direct-device playback.
     pub audiophile: AudiophileConfig,
 }
@@ -1003,6 +1023,7 @@ impl Default for PlaybackConfig {
             autoplay: false,
             youtube_prewarm: true,
             skip_advertisement_chapters: true,
+            sponsorblock_enabled: true,
             audiophile: AudiophileConfig::default(),
         }
     }
@@ -2113,6 +2134,10 @@ mod tests {
             tui_preference_environment_variable_is_relevant(VIDEO_SUMMARY_BACKEND_ENV),
             cfg!(feature = "summary")
         );
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(SPONSORBLOCK_ENABLED_ENV),
+            cfg!(feature = "sponsorblock")
+        );
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
         ));
@@ -2128,6 +2153,7 @@ mod tests {
         assert!(!config.playback.autoplay);
         assert!(config.playback.youtube_prewarm);
         assert!(config.playback.skip_advertisement_chapters);
+        assert!(config.playback.sponsorblock_enabled);
         assert_eq!(config.persistence.backend, PersistenceBackend::Files);
         assert_eq!(config.persistence.position_save_interval_seconds, 30);
         assert!(config.persistence.save_playback_history);
@@ -2178,6 +2204,7 @@ speed_percent = 120
 autoplay = true
 youtube_prewarm = false
 skip_advertisement_chapters = false
+sponsorblock_enabled = false
 
 [subscriptions]
 auto_download = false
@@ -2212,6 +2239,7 @@ codex_executable = "/opt/openai/bin/codex"
         assert!(config.playback.autoplay);
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
+        assert!(!config.playback.sponsorblock_enabled);
         assert!(!config.subscriptions.auto_download);
         assert!(!config.persistence.save_playback_history);
         assert_eq!(config.ui.theme, ThemeMode::Light);
@@ -2485,6 +2513,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 false,
                 false,
+                false,
                 YouTubeThumbnailSize::Maxres,
                 false,
                 VideoSummaryBackend::Codex,
@@ -2499,6 +2528,10 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("youtube_api_key = \"keep-this-existing-secret\""));
         assert!(contents.contains("subscriptions_layout = \"split\""));
         assert!(contents.contains("skip_advertisement_chapters = false"));
+        #[cfg(feature = "sponsorblock")]
+        assert!(contents.contains("sponsorblock_enabled = false"));
+        #[cfg(not(feature = "sponsorblock"))]
+        assert!(!contents.contains("sponsorblock_enabled"));
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
@@ -2526,6 +2559,10 @@ youtube_api_key = "keep-this-existing-secret"
         );
         assert!(!config.playback.youtube_prewarm);
         assert!(!config.playback.skip_advertisement_chapters);
+        assert_eq!(
+            config.playback.sponsorblock_enabled,
+            !cfg!(feature = "sponsorblock")
+        );
         assert!(!config.persistence.save_playback_history);
         assert_eq!(
             config.video_summary.backend,
@@ -2550,6 +2587,10 @@ youtube_api_key = "keep-this-existing-secret"
         );
         assert!(!reloaded.playback.youtube_prewarm);
         assert!(!reloaded.playback.skip_advertisement_chapters);
+        assert_eq!(
+            reloaded.playback.sponsorblock_enabled,
+            !cfg!(feature = "sponsorblock")
+        );
         assert!(!reloaded.persistence.save_playback_history);
         assert_eq!(
             reloaded.video_summary.backend,
@@ -2577,6 +2618,7 @@ youtube_api_key = "keep-this-existing-secret"
         config
             .save_tui_preferences(
                 SubscriptionsLayout::Split,
+                false,
                 false,
                 false,
                 false,
@@ -2791,6 +2833,7 @@ youtube_api_key = "keep-this-existing-secret"
                 .save_tui_preferences(
                     SubscriptionsLayout::Split,
                     false,
+                    false,
                     true,
                     true,
                     true,
@@ -2811,6 +2854,7 @@ youtube_api_key = "keep-this-existing-secret"
         let overrides = [
             (SUBSCRIPTIONS_LAYOUT_ENV, "split"),
             (SKIP_ADVERTISEMENT_CHAPTERS_ENV, "false"),
+            (SPONSORBLOCK_ENABLED_ENV, "false"),
             (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),

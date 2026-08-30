@@ -9636,6 +9636,48 @@ fn render_preferences_popup(
         ),
     ));
 
+    let sponsorblock_label = if preferences.sponsorblock_supported {
+        format!(
+            "[S] SponsorBlock sponsored segments: {}",
+            if preferences.sponsorblock_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        )
+    } else {
+        "SponsorBlock: unavailable in this build".to_owned()
+    };
+    let sponsorblock_area = Rect::new(
+        sections[3].x,
+        sections[3].y.saturating_add(1),
+        sections[3].width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(sponsorblock_label.clone())
+            .style(if !preferences.sponsorblock_supported {
+                theme.muted
+            } else if preferences.sponsorblock_enabled {
+                theme.selected
+            } else {
+                theme.base
+            })
+            .alignment(Alignment::Center),
+        sponsorblock_area,
+    );
+    if preferences.sponsorblock_supported {
+        hit_map.preferences_buttons.push((
+            UiAction::ToggleSponsorBlock,
+            Rect::new(
+                centered_line_x(sponsorblock_area, terminal_text_width(&sponsorblock_label)),
+                sponsorblock_area.y,
+                terminal_text_width(&sponsorblock_label).min(sponsorblock_area.width),
+                1,
+            ),
+        ));
+    }
+
     let youtube_prewarm_label = format!(
         "[y] Prepare selected YouTube audio: {}",
         if preferences.youtube_prewarm {
@@ -17643,6 +17685,8 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: true,
                 skip_advertisement_chapters: true,
+                sponsorblock_enabled: true,
+                sponsorblock_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
@@ -17666,6 +17710,7 @@ mod tests {
         assert!(rendered.contains("[s] Split"));
         assert!(rendered.contains("Save playback history: on"));
         assert!(!rendered.contains("[h] Save playback history"));
+        assert!(rendered.contains("[S] SponsorBlock sponsored segments: on"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[t] YouTube thumbnails: 640×480 (standard)"));
@@ -17692,6 +17737,10 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleYouTubePrewarm)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleSponsorBlock)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &view),
@@ -17781,6 +17830,24 @@ mod tests {
                 &view,
             ),
             Some(UiAction::TogglePlaybackHistorySaving)
+        );
+        let (_, sponsorblock_target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleSponsorBlock)
+            .expect("SponsorBlock target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: sponsorblock_target.x,
+                    row: sponsorblock_target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleSponsorBlock)
         );
         let (_, youtube_prewarm_target) = hit_map
             .preferences_buttons
@@ -17952,6 +18019,8 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: false,
                 skip_advertisement_chapters: true,
+                sponsorblock_enabled: true,
+                sponsorblock_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
@@ -17992,6 +18061,8 @@ mod tests {
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: true,
                 skip_advertisement_chapters: true,
+                sponsorblock_enabled: true,
+                sponsorblock_supported: true,
                 youtube_prewarm: true,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,

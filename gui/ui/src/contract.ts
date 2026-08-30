@@ -364,6 +364,8 @@ export interface PreferencesPopupView {
   video_summary_backend: "off" | "codex";
   video_summary_supported: boolean;
   skip_advertisement_chapters: boolean;
+  sponsorblock_enabled: boolean;
+  sponsorblock_supported: boolean;
   youtube_prewarm: boolean;
   youtube_thumbnail_size: string;
   show_local_folder_sizes: boolean;

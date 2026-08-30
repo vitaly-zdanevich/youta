@@ -135,6 +135,8 @@ fn preferences() -> PreferencesPopupView {
         video_summary_backend: youta::config::VideoSummaryBackend::default(),
         video_summary_supported: true,
         skip_advertisement_chapters: false,
+        sponsorblock_enabled: true,
+        sponsorblock_supported: true,
         youtube_prewarm: false,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
         show_local_folder_sizes: false,

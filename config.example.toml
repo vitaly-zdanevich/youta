@@ -41,6 +41,12 @@ youtube_prewarm = true
 # YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS has higher precedence.
 skip_advertisement_chapters = true
 
+# Skip community-identified sponsor messages during YouTube playback. Lookup
+# failures never interrupt playback. This is distinct from exact `Реклама`
+# chapter skipping above.
+# YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED has higher precedence.
+sponsorblock_enabled = true
+
 [playback.audiophile]
 # These settings affect Youta/player arguments only. Youta never changes the
 # CPU governor, real-time scheduler, kernel parameters, or device permissions.

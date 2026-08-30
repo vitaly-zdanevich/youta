@@ -1,9 +1,9 @@
 //! Application controller connecting providers, persistence, playback, and TUI.
 //!
 //! General provider requests run on one blocking worker. `Apple Podcasts`,
-//! `Bandcamp` search, `YouTube Music` search, `Bandcamp` media resolution, Local
-//! directory listings, selected-video `YouTube` prewarming, and explicit video
-//! summaries use dedicated workers; action queues are bounded or
+//! `Bandcamp` search, `YouTube Music` search, `Bandcamp` media resolution,
+//! `SponsorBlock` lookup, Local directory listings, selected-video `YouTube`
+//! prewarming, and explicit video summaries use dedicated workers; queues are
 //! generation-owned. Slow catalogue, model, or speculative media requests
 //! therefore cannot delay `YouTube` search or foreground navigation. The
 //! terminal event loop never waits for these responses, while the process
@@ -54,9 +54,10 @@ use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV,
-    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV,
-    VideoSummaryBackend, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend,
-    YouTubeProviderSetting, YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
+    SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV,
+    VIDEO_SUMMARY_BACKEND_ENV, VideoSummaryBackend, YOUTUBE_PREWARM_ENV,
+    YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
+    tui_preference_environment_variable_is_relevant,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -174,6 +175,11 @@ use crate::providers::radio_wikidata::wikidata_item_ids_for_station;
 #[cfg(feature = "rss")]
 use crate::providers::rss::{
     PodcastEpisode, PodcastFeed, RssPodcastProvider, podcast_episode_external_id,
+};
+#[cfg(feature = "sponsorblock")]
+use crate::providers::sponsorblock::{
+    DEFAULT_SPONSORBLOCK_URL, SegmentAction, SponsorBlockClient, SponsorCategory, SponsorSegment,
+    skip_decision_at,
 };
 #[cfg(feature = "yandex-music")]
 use crate::providers::yandex_music::{
@@ -2482,6 +2488,25 @@ enum ProviderRequest {
     Shutdown,
 }
 
+/// Latest-only work accepted by the dedicated `SponsorBlock` network lane.
+#[cfg(feature = "sponsorblock")]
+enum SponsorBlockWorkerRequest {
+    /// Fetch sponsorships for one exact YouTube identity.
+    Segments {
+        video_id: String,
+        duration_seconds: Option<u64>,
+    },
+    /// Stop after any active bounded request returns.
+    Shutdown,
+}
+
+/// One fail-open `SponsorBlock` completion delivered outside the general lane.
+#[cfg(feature = "sponsorblock")]
+struct SponsorBlockWorkerResponse {
+    video_id: String,
+    result: Result<Vec<SponsorSegment>, String>,
+}
+
 /// Apple operations isolated from YouTube and other provider traffic.
 #[cfg(feature = "apple-podcasts")]
 enum AppleProviderRequest {
@@ -3719,6 +3744,15 @@ const MAX_CACHED_YOUTUBE_VIDEO_DETAILS: usize = 64;
 /// Maximum positive or empty DeArrow title results retained by the process.
 #[cfg(feature = "dearrow")]
 const MAX_CACHED_DEARROW_TITLES: usize = 64;
+/// Maximum positive or empty `SponsorBlock` result sets retained by the process.
+#[cfg(feature = "sponsorblock")]
+const MAX_CACHED_SPONSORBLOCK_VIDEOS: usize = 64;
+/// Conservative heap budget shared by process-local `SponsorBlock` results.
+#[cfg(feature = "sponsorblock")]
+const MAX_CACHED_SPONSORBLOCK_BYTES: usize = 4 * 1024 * 1024;
+/// Defensive limit for one video's selected sponsorship submissions.
+#[cfg(feature = "sponsorblock")]
+const MAX_SPONSORBLOCK_SEGMENTS_PER_VIDEO: usize = 2_048;
 /// Maximum selected-video comment result sets retained for one process.
 const MAX_CACHED_YOUTUBE_VIDEO_COMMENTS: usize = 64;
 /// Conservative owned-heap budget for process-local YouTube comment results.
@@ -4774,6 +4808,18 @@ pub struct AppController {
     provider_requests: Option<Sender<ProviderRequest>>,
     provider_responses: Receiver<ProviderResponse>,
     provider_thread: Option<JoinHandle<()>>,
+    /// Single queued latest-only lookup isolated from general provider work.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_requests: Option<Sender<SponsorBlockWorkerRequest>>,
+    /// Controller clone used to replace a queued obsolete playback lookup.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_request_drain: Receiver<SponsorBlockWorkerRequest>,
+    /// Fail-open sponsorship results drained before polling playback.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_responses: Receiver<SponsorBlockWorkerResponse>,
+    /// Sole blocking `SponsorBlock` network worker.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_thread: Option<JoinHandle<()>>,
     /// Foreground Local listings isolated from recursive and remote work.
     local_browse_requests: Option<Sender<LocalBrowseRequest>>,
     /// Completed foreground Local listings from the isolated worker.
@@ -4809,6 +4855,18 @@ pub struct AppController {
     /// Least-recently-used order bounding DeArrow title results.
     #[cfg(feature = "dearrow")]
     dearrow_title_cache_order: VecDeque<String>,
+    /// Process-local positive and empty `SponsorBlock` results keyed by video ID.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_segment_cache: HashMap<String, Vec<SponsorSegment>>,
+    /// Least-recently-used order bounding `SponsorBlock` result sets.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_segment_cache_order: VecDeque<String>,
+    /// Conservative owned-heap estimate for cached `SponsorBlock` result sets.
+    #[cfg(feature = "sponsorblock")]
+    sponsorblock_segment_cache_bytes: usize,
+    /// Video IDs with a `SponsorBlock` request owned by its network worker.
+    #[cfg(feature = "sponsorblock")]
+    pending_sponsorblock_video_ids: HashSet<String>,
     /// Whether the active YouTube provider can load public top-level comments.
     youtube_video_comments_supported: bool,
     /// Process-local positive and empty comment results keyed by video ID.
@@ -5003,6 +5061,9 @@ pub struct AppController {
     ignore_replaced_stop: bool,
     /// Advertisement chapter most recently skipped while backend status catches up.
     skipped_advertisement_chapter: Option<(MediaId, u64)>,
+    /// `SponsorBlock` target most recently skipped while backend status catches up.
+    #[cfg(feature = "sponsorblock")]
+    skipped_sponsorblock_segment: Option<(MediaId, u64)>,
     current_media: Option<MediaId>,
     /// Playback progress loaded once per item and updated without rescanning
     /// the complete human-readable progress document every checkpoint.
@@ -5072,6 +5133,12 @@ impl AppController {
         };
         let (response_sender, provider_responses) = unbounded();
         let (request_sender, request_receiver) = unbounded();
+        #[cfg(feature = "sponsorblock")]
+        let (sponsorblock_request_sender, sponsorblock_request_receiver) = bounded(1);
+        #[cfg(feature = "sponsorblock")]
+        let sponsorblock_request_drain = sponsorblock_request_receiver.clone();
+        #[cfg(feature = "sponsorblock")]
+        let (sponsorblock_response_sender, sponsorblock_responses) = unbounded();
         #[cfg(feature = "yandex-music")]
         let (yandex_music_request_sender, yandex_music_request_receiver) = bounded(1);
         #[cfg(feature = "yandex-music")]
@@ -5219,6 +5286,17 @@ impl AppController {
             Err(error) => (None, Some(error)),
         };
         let provider_requests = provider_thread.as_ref().map(|_| request_sender);
+        #[cfg(feature = "sponsorblock")]
+        let sponsorblock_thread = thread::Builder::new()
+            .name("youta-sponsorblock".to_owned())
+            .spawn(move || {
+                sponsorblock_worker(sponsorblock_request_receiver, sponsorblock_response_sender);
+            })
+            .ok();
+        #[cfg(feature = "sponsorblock")]
+        let sponsorblock_requests = sponsorblock_thread
+            .as_ref()
+            .map(|_| sponsorblock_request_sender);
         let local_browse_thread_result = thread::Builder::new()
             .name("youta-local-browser".to_owned())
             .spawn(move || {
@@ -5989,6 +6067,14 @@ impl AppController {
             provider_requests,
             provider_responses,
             provider_thread,
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_requests,
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_request_drain,
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_responses,
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_thread,
             local_browse_requests,
             local_browse_responses,
             local_browse_thread,
@@ -6010,6 +6096,14 @@ impl AppController {
             dearrow_title_cache: HashMap::new(),
             #[cfg(feature = "dearrow")]
             dearrow_title_cache_order: VecDeque::new(),
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_segment_cache: HashMap::new(),
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_segment_cache_order: VecDeque::new(),
+            #[cfg(feature = "sponsorblock")]
+            sponsorblock_segment_cache_bytes: 0,
+            #[cfg(feature = "sponsorblock")]
+            pending_sponsorblock_video_ids: HashSet::new(),
             youtube_video_comments_supported,
             youtube_video_comments_cache: HashMap::new(),
             youtube_video_comments_cache_order: VecDeque::new(),
@@ -6138,6 +6232,8 @@ impl AppController {
             pending_history: None,
             ignore_replaced_stop: false,
             skipped_advertisement_chapter: None,
+            #[cfg(feature = "sponsorblock")]
+            skipped_sponsorblock_segment: None,
             current_media: saved.selected_media,
             current_playback_progress: None,
             current_autoplay_origin: None,
@@ -9979,6 +10075,108 @@ impl AppController {
                 video_id: video_id.to_owned(),
                 original_title: original_title.to_owned(),
             });
+        }
+    }
+
+    /// Requests sponsorship segments once per uncached `YouTube` video.
+    #[cfg(feature = "sponsorblock")]
+    fn request_sponsorblock_segments(&mut self, media_id: &MediaId, duration_seconds: Option<u64>) {
+        if !self.config.playback.sponsorblock_enabled || media_id.source != SourceKind::YouTube {
+            self.skipped_sponsorblock_segment = None;
+            return;
+        }
+        let video_id = media_id.external_id.as_str();
+        if self.sponsorblock_segment_cache.contains_key(video_id) {
+            self.sponsorblock_segment_cache_order
+                .retain(|cached| cached != video_id);
+            self.sponsorblock_segment_cache_order
+                .push_back(video_id.to_owned());
+            return;
+        }
+        if !self
+            .pending_sponsorblock_video_ids
+            .insert(video_id.to_owned())
+        {
+            return;
+        }
+        while let Ok(stale) = self.sponsorblock_request_drain.try_recv() {
+            if let SponsorBlockWorkerRequest::Segments { video_id, .. } = stale {
+                self.pending_sponsorblock_video_ids.remove(&video_id);
+            }
+        }
+        let sent = self.sponsorblock_requests.as_ref().is_some_and(|requests| {
+            requests
+                .try_send(SponsorBlockWorkerRequest::Segments {
+                    video_id: video_id.to_owned(),
+                    duration_seconds,
+                })
+                .is_ok()
+        });
+        if !sent {
+            self.pending_sponsorblock_video_ids.remove(video_id);
+        }
+    }
+
+    /// Retains one successful bounded `SponsorBlock` result in a process LRU.
+    #[cfg(feature = "sponsorblock")]
+    fn cache_sponsorblock_segments(&mut self, video_id: String, segments: Vec<SponsorSegment>) {
+        let bytes = sponsorblock_segments_estimated_heap_bytes(&video_id, &segments);
+        if bytes > MAX_CACHED_SPONSORBLOCK_BYTES {
+            return;
+        }
+        if let Some((replaced_id, replaced_segments)) =
+            self.sponsorblock_segment_cache.remove_entry(&video_id)
+        {
+            self.sponsorblock_segment_cache_bytes =
+                self.sponsorblock_segment_cache_bytes.saturating_sub(
+                    sponsorblock_segments_estimated_heap_bytes(&replaced_id, &replaced_segments),
+                );
+            self.sponsorblock_segment_cache_order
+                .retain(|cached| cached != &video_id);
+        }
+        while self.sponsorblock_segment_cache.len() >= MAX_CACHED_SPONSORBLOCK_VIDEOS
+            || self.sponsorblock_segment_cache_bytes.saturating_add(bytes)
+                > MAX_CACHED_SPONSORBLOCK_BYTES
+        {
+            let Some(oldest) = self.sponsorblock_segment_cache_order.pop_front() else {
+                break;
+            };
+            if let Some((evicted_id, evicted_segments)) =
+                self.sponsorblock_segment_cache.remove_entry(&oldest)
+            {
+                self.sponsorblock_segment_cache_bytes =
+                    self.sponsorblock_segment_cache_bytes.saturating_sub(
+                        sponsorblock_segments_estimated_heap_bytes(&evicted_id, &evicted_segments),
+                    );
+            }
+        }
+        if self.sponsorblock_segment_cache_bytes.saturating_add(bytes)
+            > MAX_CACHED_SPONSORBLOCK_BYTES
+        {
+            return;
+        }
+        self.sponsorblock_segment_cache
+            .insert(video_id.clone(), segments);
+        self.sponsorblock_segment_cache_order.push_back(video_id);
+        self.sponsorblock_segment_cache_bytes =
+            self.sponsorblock_segment_cache_bytes.saturating_add(bytes);
+    }
+
+    /// Applies one isolated lookup without surfacing a fail-open network error.
+    #[cfg(feature = "sponsorblock")]
+    fn handle_sponsorblock_response(&mut self, response: SponsorBlockWorkerResponse) {
+        self.pending_sponsorblock_video_ids
+            .remove(&response.video_id);
+        if let Ok(segments) = response.result {
+            self.cache_sponsorblock_segments(response.video_id, segments);
+        }
+    }
+
+    /// Drains every `SponsorBlock` result published before this UI tick.
+    #[cfg(feature = "sponsorblock")]
+    fn drain_sponsorblock_responses(&mut self) {
+        while let Ok(response) = self.sponsorblock_responses.try_recv() {
+            self.handle_sponsorblock_response(response);
         }
     }
 
@@ -23275,6 +23473,10 @@ impl AppController {
         let media_changed = self.current_media.as_ref() != Some(&media_id);
         if media_changed {
             self.skipped_advertisement_chapter = None;
+            #[cfg(feature = "sponsorblock")]
+            {
+                self.skipped_sponsorblock_segment = None;
+            }
             if self.playback_phase == PlaybackPhase::Playing {
                 self.persist_position();
                 self.last_position_save = Instant::now();
@@ -23373,6 +23575,8 @@ impl AppController {
                         .begin_now(item.clone(), had_active_media);
                 }
                 self.current_media = Some(media_id.clone());
+                #[cfg(feature = "sponsorblock")]
+                self.request_sponsorblock_segments(&media_id, item.media.duration_seconds);
                 if live_stream {
                     self.view.repeating = false;
                     self.playback_queue.repeat_one = false;
@@ -23579,6 +23783,13 @@ impl AppController {
                 if self.playback_phase == PlaybackPhase::Playing {
                     self.update_live_local_progress_view();
                     let playback_owner = self.current_media.clone();
+                    #[cfg(feature = "sponsorblock")]
+                    let advertisement_active = self.skip_current_advertisement_chapter();
+                    #[cfg(feature = "sponsorblock")]
+                    if !advertisement_active {
+                        self.skip_current_sponsorblock_segment();
+                    }
+                    #[cfg(not(feature = "sponsorblock"))]
                     self.skip_current_advertisement_chapter();
                     if self.playback_phase != PlaybackPhase::Playing
                         || self.current_media != playback_owner
@@ -23610,13 +23821,13 @@ impl AppController {
 
     /// Skips one exact `Реклама` chapter and suppresses duplicate commands
     /// while the backend still reports its stale pre-seek position.
-    fn skip_current_advertisement_chapter(&mut self) {
+    fn skip_current_advertisement_chapter(&mut self) -> bool {
         if !self.config.playback.skip_advertisement_chapters {
             self.skipped_advertisement_chapter = None;
-            return;
+            return false;
         }
         let Some(media_id) = self.current_media.clone() else {
-            return;
+            return false;
         };
         let position = self.view.playback.position.as_secs();
         let matching = self.view.playback_chapters.iter().find(|chapter| {
@@ -23629,19 +23840,61 @@ impl AppController {
         });
         let Some(chapter) = matching else {
             self.skipped_advertisement_chapter = None;
-            return;
+            return false;
         };
         let key = (media_id, chapter.start_seconds);
         if self.skipped_advertisement_chapter.as_ref() == Some(&key) {
-            return;
+            return true;
         }
         let Some(end) = chapter.end_seconds else {
-            return;
+            return false;
         };
         self.skipped_advertisement_chapter = Some(key);
         if self.seek_player_command(PlayerCommand::SeekAbsolute(Duration::from_secs(end))) {
             self.view.status_line =
                 format!("Skipped advertisement section to {}", format_seconds(end));
+        }
+        true
+    }
+
+    /// Skips one trusted `SponsorBlock` segment without repeating a stale seek.
+    #[cfg(feature = "sponsorblock")]
+    fn skip_current_sponsorblock_segment(&mut self) {
+        if !self.config.playback.sponsorblock_enabled {
+            self.skipped_sponsorblock_segment = None;
+            return;
+        }
+        let Some(media_id) = self.current_media.clone() else {
+            return;
+        };
+        if media_id.source != SourceKind::YouTube {
+            self.skipped_sponsorblock_segment = None;
+            return;
+        }
+        let decision = self
+            .sponsorblock_segment_cache
+            .get(&media_id.external_id)
+            .and_then(|segments| {
+                skip_decision_at(segments, self.view.playback.position.as_secs_f64())
+            });
+        let Some(decision) = decision else {
+            self.skipped_sponsorblock_segment = None;
+            return;
+        };
+        let Ok(target) = Duration::try_from_secs_f64(decision.to_seconds) else {
+            self.skipped_sponsorblock_segment = None;
+            return;
+        };
+        let key = (media_id, decision.to_seconds.to_bits());
+        if self.skipped_sponsorblock_segment.as_ref() == Some(&key) {
+            return;
+        }
+        self.skipped_sponsorblock_segment = Some(key);
+        if self.seek_player_command(PlayerCommand::SeekAbsolute(target)) {
+            self.view.status_line = format!(
+                "Skipped SponsorBlock segment to {}",
+                format_seconds(target.as_secs())
+            );
         }
     }
 
@@ -28411,6 +28664,8 @@ impl AppController {
         if let Some(sender) = self.local_browse_requests.take() {
             let _ = sender.send(LocalBrowseRequest::Shutdown);
         }
+        #[cfg(feature = "sponsorblock")]
+        self.shutdown_sponsorblock_worker();
         if let Some(sender) = self.provider_requests.take() {
             let _ = sender.send(ProviderRequest::Shutdown);
         }
@@ -29947,6 +30202,7 @@ impl AppController {
         let environment_override = [
             SUBSCRIPTIONS_LAYOUT_ENV,
             SKIP_ADVERTISEMENT_CHAPTERS_ENV,
+            SPONSORBLOCK_ENABLED_ENV,
             YOUTUBE_PREWARM_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             LOCAL_FOLDER_SIZES_ENV,
@@ -29963,6 +30219,8 @@ impl AppController {
         self.view.preferences_popup = Some(PreferencesPopupView {
             subscriptions_layout: self.config.ui.subscriptions_layout,
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
+            sponsorblock_enabled: self.config.playback.sponsorblock_enabled,
+            sponsorblock_supported: cfg!(feature = "sponsorblock"),
             youtube_prewarm: self.config.playback.youtube_prewarm,
             youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
@@ -30104,6 +30362,24 @@ impl AppController {
             return;
         }
         preferences.skip_advertisement_chapters = !preferences.skip_advertisement_chapters;
+        preferences.validation_error = None;
+    }
+
+    fn toggle_draft_sponsorblock(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if !preferences.sponsorblock_supported {
+            preferences.validation_error =
+                Some("this build omits the `sponsorblock` feature".to_owned());
+            return;
+        }
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.sponsorblock_enabled = !preferences.sponsorblock_enabled;
         preferences.validation_error = None;
     }
 
@@ -30755,6 +31031,7 @@ impl AppController {
         }
         let layout = preferences.subscriptions_layout;
         let skip_advertisement_chapters = preferences.skip_advertisement_chapters;
+        let sponsorblock_enabled = preferences.sponsorblock_enabled;
         let youtube_prewarm = preferences.youtube_prewarm;
         let youtube_thumbnail_size = preferences.youtube_thumbnail_size;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
@@ -30767,6 +31044,9 @@ impl AppController {
         let video_summary_backend = preferences.video_summary_backend;
         let video_summary_backend_changed =
             self.config.video_summary.backend != video_summary_backend;
+        #[cfg(feature = "sponsorblock")]
+        let sponsorblock_preference_changed =
+            self.config.playback.sponsorblock_enabled != sponsorblock_enabled;
         #[cfg(feature = "yt-dlp")]
         let youtube_prewarm_preference_changed =
             self.config.playback.youtube_prewarm != youtube_prewarm;
@@ -30777,6 +31057,7 @@ impl AppController {
         if let Err(error) = self.config.save_tui_preferences(
             layout,
             skip_advertisement_chapters,
+            sponsorblock_enabled,
             youtube_prewarm,
             show_local_folder_sizes,
             show_images_in_tty,
@@ -30807,6 +31088,18 @@ impl AppController {
         }
         self.view.subscriptions.layout = layout;
         self.view.skip_advertisement_chapters = skip_advertisement_chapters;
+        #[cfg(feature = "sponsorblock")]
+        if sponsorblock_preference_changed {
+            self.skipped_sponsorblock_segment = None;
+            if sponsorblock_enabled && let Some(media_id) = self.current_media.clone() {
+                let duration_seconds = self
+                    .view
+                    .playback
+                    .duration
+                    .map(|duration| duration.as_secs());
+                self.request_sponsorblock_segments(&media_id, duration_seconds);
+            }
+        }
         #[cfg(feature = "yt-dlp")]
         if youtube_prewarm_preference_changed {
             self.youtube_prewarm_failure = None;
@@ -30844,12 +31137,17 @@ impl AppController {
             self.populate_subscriptions();
         }
         self.view.status_line = format!(
-            "Preferences saved: subscriptions {}; advertisement skipping {}; YouTube preparation {}; playback History {}; video summaries {}; TTY images {}; Bandcamp audio {}",
+            "Preferences saved: subscriptions {}; advertisement skipping {}; SponsorBlock {}; YouTube preparation {}; playback History {}; video summaries {}; TTY images {}; Bandcamp audio {}",
             layout.as_config_value(),
             if skip_advertisement_chapters {
                 "on"
             } else {
                 "off"
+            },
+            if cfg!(feature = "sponsorblock") {
+                if sponsorblock_enabled { "on" } else { "off" }
+            } else {
+                "unavailable in this build"
             },
             if youtube_prewarm { "on" } else { "off" },
             if save_playback_history { "on" } else { "off" },
@@ -31068,6 +31366,20 @@ impl AppController {
             let _ = handle.join();
         }
         while self.local_waveform_responses.try_recv().is_ok() {}
+    }
+
+    /// Stops the isolated `SponsorBlock` lane after discarding obsolete queued work.
+    #[cfg(feature = "sponsorblock")]
+    fn shutdown_sponsorblock_worker(&mut self) {
+        while self.sponsorblock_request_drain.try_recv().is_ok() {}
+        if let Some(sender) = self.sponsorblock_requests.take() {
+            let _ = sender.send(SponsorBlockWorkerRequest::Shutdown);
+        }
+        if let Some(handle) = self.sponsorblock_thread.take() {
+            let _ = handle.join();
+        }
+        while self.sponsorblock_responses.try_recv().is_ok() {}
+        self.pending_sponsorblock_video_ids.clear();
     }
 
     /// Cancels and joins authenticated media workers before state publication.
@@ -31370,6 +31682,8 @@ impl AppController {
             let _ = player.shutdown();
         }
         self.invalidate_local_folder_sizes();
+        #[cfg(feature = "sponsorblock")]
+        self.shutdown_sponsorblock_worker();
         if let Some(sender) = self.provider_requests.take() {
             let _ = sender.send(ProviderRequest::Shutdown);
         }
@@ -32365,6 +32679,9 @@ impl UiController for AppController {
             UiAction::ToggleSkipAdvertisementChapters => {
                 self.toggle_draft_skip_advertisement_chapters();
             }
+            UiAction::ToggleSponsorBlock => {
+                self.toggle_draft_sponsorblock();
+            }
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
             UiAction::TogglePlaybackHistorySaving => {
                 self.toggle_draft_playback_history_saving();
@@ -32610,6 +32927,8 @@ impl UiController for AppController {
         self.drain_local_fingerprint_responses();
         #[cfg(feature = "waveform")]
         self.drain_local_waveform_responses();
+        #[cfg(feature = "sponsorblock")]
+        self.drain_sponsorblock_responses();
         self.drain_local_browse_responses(true);
         loop {
             match self.provider_responses.try_recv() {
@@ -34679,6 +34998,39 @@ fn youtube_pagination_worker(
                 request: work.request,
                 result,
             })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Resolves latest-only `SponsorBlock` requests outside the general provider lane.
+#[cfg(feature = "sponsorblock")]
+fn sponsorblock_worker(
+    requests: Receiver<SponsorBlockWorkerRequest>,
+    responses: Sender<SponsorBlockWorkerResponse>,
+) {
+    let client = url::Url::parse(DEFAULT_SPONSORBLOCK_URL)
+        .map_err(|error| error.to_string())
+        .and_then(|base_url| SponsorBlockClient::new(base_url).map_err(|error| error.to_string()));
+    while let Ok(request) = requests.recv() {
+        let SponsorBlockWorkerRequest::Segments {
+            video_id,
+            duration_seconds,
+        } = request
+        else {
+            break;
+        };
+        let result = match &client {
+            Ok(client) => client
+                .segments(&video_id, &[])
+                .map_err(|error| error.to_string())
+                .and_then(|segments| compatible_sponsorblock_segments(segments, duration_seconds)),
+            Err(error) => Err(error.clone()),
+        };
+        if responses
+            .send(SponsorBlockWorkerResponse { video_id, result })
             .is_err()
         {
             break;
@@ -38854,6 +39206,62 @@ fn youtube_video_comments_estimated_heap_bytes(
                 )
         },
     )
+}
+
+/// Rejects stale or out-of-range `SponsorBlock` data before it reaches playback.
+#[cfg(feature = "sponsorblock")]
+fn compatible_sponsorblock_segments(
+    mut segments: Vec<SponsorSegment>,
+    duration_seconds: Option<u64>,
+) -> Result<Vec<SponsorSegment>, String> {
+    if segments.len() > MAX_SPONSORBLOCK_SEGMENTS_PER_VIDEO {
+        return Err(format!(
+            "SponsorBlock returned more than {MAX_SPONSORBLOCK_SEGMENTS_PER_VIDEO} segments"
+        ));
+    }
+    let known_duration = duration_seconds.map(|duration| duration as f64);
+    segments.retain_mut(|segment| {
+        if segment.category != SponsorCategory::Sponsor || segment.action != SegmentAction::Skip {
+            return false;
+        }
+        let Some(duration) = known_duration else {
+            return true;
+        };
+        if segment
+            .submitted_video_duration
+            .is_some_and(|submitted| (submitted - duration).abs() > 1.0)
+            || segment.start_seconds >= duration
+            || segment.end_seconds > duration + 1.0
+        {
+            return false;
+        }
+        segment.end_seconds = segment.end_seconds.min(duration);
+        segment.end_seconds > segment.start_seconds
+    });
+    Ok(segments)
+}
+
+/// Conservatively estimates heap retained by one `SponsorBlock` cache entry.
+#[cfg(feature = "sponsorblock")]
+fn sponsorblock_segments_estimated_heap_bytes(
+    video_id: &str,
+    segments: &[SponsorSegment],
+) -> usize {
+    let identifiers = std::mem::size_of::<String>()
+        .saturating_add(video_id.len())
+        .saturating_mul(2);
+    let storage = std::mem::size_of::<Vec<SponsorSegment>>().saturating_add(
+        segments
+            .len()
+            .saturating_mul(std::mem::size_of::<SponsorSegment>()),
+    );
+    segments
+        .iter()
+        .fold(identifiers.saturating_add(storage), |bytes, segment| {
+            bytes
+                .saturating_add(segment.uuid.capacity())
+                .saturating_add(segment.description.as_ref().map_or(0, String::capacity))
+        })
 }
 
 fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTree) -> DetailView {
@@ -55563,6 +55971,8 @@ mod tests {
             config.config_file().display().to_string()
         );
         controller.dispatch(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split));
+        #[cfg(feature = "sponsorblock")]
+        controller.dispatch(UiAction::ToggleSponsorBlock);
         controller.dispatch(UiAction::ToggleYouTubePrewarm);
         #[cfg(feature = "images")]
         controller.dispatch(UiAction::CycleYouTubeThumbnailSize);
@@ -55609,6 +56019,10 @@ mod tests {
         #[cfg(not(feature = "images"))]
         assert!(!contents.contains("show_images_in_tty"));
         assert!(contents.contains("[playback]"));
+        #[cfg(feature = "sponsorblock")]
+        assert!(contents.contains("sponsorblock_enabled = false"));
+        #[cfg(not(feature = "sponsorblock"))]
+        assert!(!contents.contains("sponsorblock_enabled"));
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("[persistence]"));
         assert!(contents.contains("save_playback_history = false"));
@@ -55628,6 +56042,10 @@ mod tests {
         #[cfg(not(feature = "images"))]
         assert!(reloaded.ui.show_images_in_tty);
         assert!(!reloaded.playback.youtube_prewarm);
+        assert_eq!(
+            reloaded.playback.sponsorblock_enabled,
+            !cfg!(feature = "sponsorblock")
+        );
         assert!(!reloaded.persistence.save_playback_history);
         #[cfg(feature = "bandcamp")]
         assert_eq!(
@@ -65829,6 +66247,157 @@ mod tests {
         controller.view.playback.position = Duration::from_secs(35);
         controller.skip_current_advertisement_chapter();
         assert_eq!(state.lock().expect("mock state").commands.len(), 2);
+    }
+
+    #[cfg(feature = "sponsorblock")]
+    #[test]
+    fn youtube_playback_requests_and_skips_one_cached_sponsorblock_segment() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.shutdown_sponsorblock_worker();
+        let (sender, requests) = bounded(1);
+        controller.sponsorblock_request_drain = requests.clone();
+        controller.sponsorblock_requests = Some(sender);
+        let mut video = subscription_video_summary();
+        video.duration_seconds = Some(120);
+
+        controller.play_queue_item(queue_item_from_video(&video, None), false);
+
+        assert!(matches!(
+            requests.try_recv().expect("SponsorBlock request"),
+            SponsorBlockWorkerRequest::Segments {
+                video_id,
+                duration_seconds: Some(120),
+            } if video_id == video.video_id
+        ));
+        controller.handle_sponsorblock_response(SponsorBlockWorkerResponse {
+            video_id: video.video_id.clone(),
+            result: Ok(vec![SponsorSegment {
+                start_seconds: 10.0,
+                end_seconds: 30.5,
+                category: SponsorCategory::Sponsor,
+                action: SegmentAction::Skip,
+                uuid: "sponsor-fixture".to_owned(),
+                votes: 4,
+                locked: false,
+                description: None,
+                submitted_video_duration: Some(120.0),
+            }]),
+        });
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback.position = Duration::from_secs(15);
+        state.lock().expect("mock state").commands.clear();
+
+        controller.skip_current_sponsorblock_segment();
+        controller.skip_current_sponsorblock_segment();
+
+        assert_eq!(
+            state.lock().expect("mock state").commands,
+            [PlayerCommand::SeekAbsolute(Duration::from_millis(30_500))],
+            "a stale pre-seek status must not repeat one SponsorBlock command"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "Skipped SponsorBlock segment to 0:30"
+        );
+    }
+
+    #[cfg(feature = "sponsorblock")]
+    #[test]
+    fn disabled_sponsorblock_neither_requests_nor_skips() {
+        let (mut controller, state) = controller_with_mock_statuses([]);
+        controller.shutdown_sponsorblock_worker();
+        let (sender, requests) = bounded(1);
+        controller.sponsorblock_request_drain = requests.clone();
+        controller.sponsorblock_requests = Some(sender);
+        controller.config.playback.sponsorblock_enabled = false;
+        let video = subscription_video_summary();
+
+        controller.play_queue_item(queue_item_from_video(&video, None), false);
+        controller.sponsorblock_segment_cache.insert(
+            video.video_id,
+            vec![SponsorSegment {
+                start_seconds: 0.0,
+                end_seconds: 30.0,
+                category: SponsorCategory::Sponsor,
+                action: SegmentAction::Skip,
+                uuid: "disabled-fixture".to_owned(),
+                votes: 1,
+                locked: false,
+                description: None,
+                submitted_video_duration: None,
+            }],
+        );
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback.position = Duration::from_secs(10);
+        state.lock().expect("mock state").commands.clear();
+
+        controller.skip_current_sponsorblock_segment();
+
+        assert!(requests.try_recv().is_err());
+        assert!(state.lock().expect("mock state").commands.is_empty());
+    }
+
+    #[cfg(feature = "sponsorblock")]
+    #[test]
+    fn sponsorblock_lane_replaces_a_queued_obsolete_playback_lookup() {
+        let (mut controller, _state) = controller_with_mock_statuses([]);
+        controller.shutdown_sponsorblock_worker();
+        let (sender, requests) = bounded(1);
+        controller.sponsorblock_request_drain = requests.clone();
+        controller.sponsorblock_requests = Some(sender);
+        let first = MediaId::new(SourceKind::YouTube, "aaaaaaaaaaa");
+        let latest = MediaId::new(SourceKind::YouTube, "bbbbbbbbbbb");
+
+        controller.request_sponsorblock_segments(&first, Some(60));
+        controller.request_sponsorblock_segments(&latest, Some(90));
+
+        assert!(matches!(
+            requests.try_recv().expect("latest SponsorBlock lookup"),
+            SponsorBlockWorkerRequest::Segments {
+                video_id,
+                duration_seconds: Some(90),
+            } if video_id == latest.external_id
+        ));
+        assert!(
+            !controller
+                .pending_sponsorblock_video_ids
+                .contains(&first.external_id)
+        );
+        assert!(
+            controller
+                .pending_sponsorblock_video_ids
+                .contains(&latest.external_id)
+        );
+    }
+
+    #[cfg(feature = "sponsorblock")]
+    #[test]
+    fn sponsorblock_rejects_stale_durations_and_clamps_rounding_at_the_end() {
+        let segment = |uuid: &str, start: f64, end: f64, submitted: Option<f64>| SponsorSegment {
+            start_seconds: start,
+            end_seconds: end,
+            category: SponsorCategory::Sponsor,
+            action: SegmentAction::Skip,
+            uuid: uuid.to_owned(),
+            votes: 1,
+            locked: false,
+            description: None,
+            submitted_video_duration: submitted,
+        };
+
+        let compatible = compatible_sponsorblock_segments(
+            vec![
+                segment("stale", 10.0, 20.0, Some(240.0)),
+                segment("past-end", 119.0, 121.5, Some(120.0)),
+                segment("rounded-end", 119.0, 120.5, Some(120.0)),
+            ],
+            Some(120),
+        )
+        .expect("bounded segments");
+
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0].uuid, "rounded-end");
+        assert_eq!(compatible[0].end_seconds, 120.0);
     }
 
     #[test]

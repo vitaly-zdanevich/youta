@@ -90,15 +90,16 @@ necessary transfer check, not sufficient copyright proof.
 ## SponsorBlock and DeArrow
 
 SponsorBlock's read API returns crowdsourced timestamp ranges with categories,
-actions, votes, and duration context. Youta can cache those ranges and perform
-a normal playback seek when an enabled category begins. It skips in-video
-segments such as sponsor messages. It does **not** block YouTube's
-platform-inserted/native advertisements, and using it alongside an official
-YouTube API player would conflict with YouTube policy.
+actions, votes, and duration context. The default-on Youta integration requests
+the `sponsor` category for the exact selected YouTube ID, validates the reported
+duration, caches a bounded result in RAM, and performs a normal playback seek
+when a `skip` segment begins. All lookup failures fail open. It does **not**
+block YouTube's platform-inserted/native advertisements, and using it alongside
+an official YouTube API player would conflict with YouTube policy.
 
-Privacy-aware hash-prefix queries should be preferred where practical.
-Submission/voting is a later authenticated feature with upstream rate and
-automation rules; read-only support comes first.
+The request reveals the selected video ID to the SponsorBlock service. Youta
+does not submit segments or votes. Submission/voting remains a possible later
+authenticated feature subject to upstream rate and automation rules.
 
 DeArrow can supply a crowdsourced title and thumbnail timestamp. Youta displays
 the alternate title as a labelled line before the original description; it
@@ -109,6 +110,7 @@ thumbnail is fetched on an unsupported TTY.
 References:
 
 - [SponsorBlock API](https://wiki.sponsor.ajay.app/w/API_Docs)
+- [SponsorBlock database/API licence](https://github.com/ajayyy/SponsorBlock/wiki/Database-and-API-License)
 - [DeArrow API](https://wiki.sponsor.ajay.app/w/API_Docs/DeArrow)
 - [DeArrow project](https://dearrow.ajay.app/)
 
@@ -430,8 +432,9 @@ robust offline behavior, and LibriVox book/author/chapter navigation.
 
 ### Phase 2 — open ecosystem
 
-SponsorBlock, DeArrow, broader Wikidata, Commons/Internet Archive discovery,
-gpodder.net, Podcast Index, radio catalogs, and Last.fm/ListenBrainz.
+Broader DeArrow thumbnail support, Wikidata, Commons/Internet Archive
+discovery, gpodder.net, Podcast Index, radio catalogs, and Last.fm/ListenBrainz.
+Read-only SponsorBlock skipping and labelled DeArrow titles have shipped.
 
 ### Phase 3 — reviewed remote writes
 

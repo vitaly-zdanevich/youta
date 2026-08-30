@@ -912,6 +912,10 @@ pub struct PreferencesPopupView {
     pub video_summary_supported: bool,
     /// Draft advertisement-chapter behavior saved only on confirmation.
     pub skip_advertisement_chapters: bool,
+    /// Draft automatic `SponsorBlock` behavior saved only on confirmation.
+    pub sponsorblock_enabled: bool,
+    /// Whether this binary contains the removable `SponsorBlock` capability.
+    pub sponsorblock_supported: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
     pub youtube_prewarm: bool,
     /// Draft exact `YouTube` thumbnail size saved only on confirmation.
@@ -2829,6 +2833,8 @@ pub enum UiAction {
     TogglePlaybackHistorySaving,
     /// Toggle hiding and skipping exact `Реклама` chapters in the draft.
     ToggleSkipAdvertisementChapters,
+    /// Toggle automatic `SponsorBlock` sponsorship skipping in the draft.
+    ToggleSponsorBlock,
     /// Toggle selected-video YouTube prewarming in the draft.
     ToggleYouTubePrewarm,
     /// Cycle the exact YouTube thumbnail size in the draft.

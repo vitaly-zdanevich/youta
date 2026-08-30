@@ -495,10 +495,16 @@ detail fields independently:
 2. provider details such as duration, description, statistics, and license;
 3. optional thumbnail, only when the terminal can render it;
 4. lazy Wikidata lookup;
-5. optional DeArrow title and SponsorBlock segments.
+5. optional DeArrow title.
 
 Each request carries the selected media ID and generation number. A late result
 for an old selection is cached but not painted over the new selection.
+
+SponsorBlock is playback-coupled instead of a detail field. Starting an exact
+YouTube identity requests its sponsorship ranges once unless a positive or
+empty bounded process-cache entry already exists. Playback reads only that
+cache, rejects duration-stale data in the worker, and fails open while the
+network result is absent or invalid.
 
 Apple Podcasts, Bandcamp, and LibriVox keep independent query, result, and
 selection state. Apple show search returns one bounded, storefront-specific
