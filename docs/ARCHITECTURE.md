@@ -1026,28 +1026,30 @@ Uploads, comments, remote subscriptions, scrobbles, and sync are explicit
 effects. The reducer first creates a reviewable request; the adapter performs it
 only after confirmation where the action is difficult to undo.
 
-### Wikimedia Commons transfer (**roadmap**)
+### Wikimedia Commons audio transfer
 
-The transfer pipeline is:
+The default `commons-upload` feature implements this bounded pipeline for
+YouTube, Yandex Music, and Apple Podcasts selections:
 
-1. retrieve and display source license and author;
-2. refuse Standard YouTube License and unknown-license media;
-3. warn that a Creative Commons marker does not prove ownership of embedded
-   works;
-4. search Commons by source URL/external identifier and normalized title;
-5. resolve the stream into a staging file and calculate a hash;
-6. use an existing open codec without generation loss where possible, otherwise
-   transcode to Ogg Opus or WebM VP9/AV1 plus Opus;
-7. show filename, title, multilingual caption, description, attribution,
-   source URL, structured-data statements, and categories for review;
-8. append `Uploaded by Youta` after a blank line in the category editor;
-9. honor all duplicate, filename, deleted-file, and policy warnings from the
-   MediaWiki upload API instead of forcing `ignorewarnings`;
-10. add structured source statements and display the canonical file URL.
+1. discover credentials in Youta's private configuration or bounded Pywikibot
+   password/cookie files without executing Python;
+2. prefill a reviewable Opus filename, caption, description, canonical source,
+   linked author, compatible detected license, and editable categories;
+3. require only a nonempty `.opus` filename, while leaving the license and
+   every other metadata field optional;
+4. map YouTube's current Creative Commons Attribution marker to CC BY 4.0 and
+   leave unknown, NC, and ND metadata unselected;
+5. complete categories through one debounced, latest-only public API request;
+6. prepare provider audio in a private runtime directory and transcode to Opus
+   where needed;
+7. upload through MediaWiki's chunked stash protocol and publish progress only
+   for server-accepted offsets;
+8. refuse API warnings rather than forcing `ignorewarnings`, append
+   `Uploaded by youta` after a blank line, and display the canonical file URL.
 
-LLM category and Wikidata-item suggestions are optional and never submitted
-without review. Suggestions state which local or remote model received which
-text. No token or private note is included.
+The feature intentionally does not claim duplicate/hash discovery, video
+transfer, or structured-data statements yet. Those remain follow-up work and
+must preserve the same explicit review boundary.
 
 Internet Archive follows a similar plan with service-specific duplicate keys
 and metadata. A transfer to one service does not imply permission to transfer
@@ -1063,6 +1065,15 @@ key remains plaintext at rest. `YOUTA_PROVIDERS__YOUTUBE_API_KEY` and other
 environment overrides have the highest precedence and avoid the persistent
 copy. System-keyring and explicit secret-reference backends remain roadmap
 work.
+
+Commons follows the same process-local secret boundary. Both front-ends accept
+a selected `BotPassword` or account password and atomically store it in the
+private credentials file. The terminal masks the password. The desktop webview
+forwards typed key actions to the reducer and receives only field lengths,
+focus, login method, and validation state; it never receives usernames,
+passwords, or authenticated cookies. Existing Pywikibot password and LWP
+cookie files are read only when they are bounded regular files, and Python
+source is never run.
 
 Keeping those files to their owner is a per-platform mechanism behind one
 interface. Unix sets `0o600` on each file and `0o700` on each directory, at the
@@ -1189,10 +1200,11 @@ channel needs a key pair and an endpoint a repository cannot manufacture for
 itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
-default-on `audio-quality`, `images`, `qr`, and `summary` USE flags and
-maps them to their corresponding Cargo features; each source-build capability
-can be disabled independently. Prebuilt artifacts always contain the analyzer
-and summary integration because a binary USE flag cannot change compiled code.
+default-on `audio-quality`, `commons-upload`, `images`, `qr`, and `summary` USE
+flags and maps them to their corresponding Cargo features; each source-build
+capability can be disabled independently. Prebuilt artifacts always contain
+the analyzer, Commons upload client, and summary integration because a binary
+USE flag cannot change compiled code.
 The ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as

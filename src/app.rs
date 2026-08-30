@@ -10,6 +10,8 @@
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(feature = "commons-upload")]
+use std::fs;
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
 use std::io::Read as _;
@@ -42,6 +44,13 @@ use crate::audio_quality::{
     collect_audio_quality_targets,
 };
 use crate::build_info::{self, RuntimeProvenance};
+#[cfg(feature = "commons-upload")]
+use crate::commons_upload::{
+    CommonsAudioSource, CommonsAuthentication, CommonsCategorySuggestion, CommonsClient,
+    CommonsUploadDraft, CommonsUploadResult, discover_commons_authentication, prepare_commons_opus,
+};
+#[cfg(feature = "commons-upload")]
+use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV,
@@ -54,6 +63,8 @@ use crate::diagnostics::ExternalHelperProbeStatus;
 use crate::diagnostics::{DiagnosticReport, ExternalHelper, ExternalHelperKind};
 #[cfg(feature = "radio")]
 use crate::domain::RADIO_FAVORITES_PLAYLIST_ID;
+#[cfg(feature = "librivox")]
+use crate::domain::librivox_section_external_id;
 #[cfg(feature = "bandcamp")]
 use crate::domain::{BandcampReleaseKind, BandcampSearchSummary};
 use crate::domain::{
@@ -61,8 +72,7 @@ use crate::domain::{
     MediaStatistics, PanelFocus, PlaybackProgress, PlaybackQueue, Playlist, PlaylistEntry,
     PlaylistMediaSnapshot, PlaylistSummary, PodcastShowSummary, QueueItem, Screen as StoredScreen,
     SessionState, SourceKind, TODO_PLAYLIST_ID, decode_url_path_segment_once,
-    is_canonical_librivox_audio_url, librivox_section_external_id,
-    parse_librivox_section_external_id,
+    is_canonical_librivox_audio_url, parse_librivox_section_external_id,
 };
 #[cfg(feature = "yandex-music")]
 use crate::domain::{PendingYandexMusicReaction, YandexMusicReaction};
@@ -98,6 +108,8 @@ use crate::persistence::{
 use crate::persistence::{MAX_SAVED_BANDCAMP_SEARCH_RESULTS, SavedBandcampSearch};
 #[cfg(feature = "bandcamp")]
 use crate::playback::PlaybackHttpHeaders;
+#[cfg(any(feature = "bandcamp", test))]
+use crate::playback::Result as PlaybackResult;
 #[cfg(feature = "yt-dlp")]
 use crate::playback::youtube_prewarm::{
     PrewarmedYouTubeAudio, YouTubePrewarmCancellation, YouTubePrewarmConfig, YouTubePrewarmError,
@@ -109,7 +121,7 @@ use crate::playback::ytdlp::{
 };
 use crate::playback::{
     BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent,
-    PlaybackInput, PlaybackStatus, PlayerCommand, Result as PlaybackResult,
+    PlaybackInput, PlaybackStatus, PlayerCommand,
 };
 #[cfg(test)]
 use crate::providers::MAX_VIDEO_COMMENT_TEXT_BYTES;
@@ -213,6 +225,11 @@ use crate::view::RadioSort;
 use crate::view::VideoQrPopupView;
 #[cfg(any(feature = "summary", test))]
 use crate::view::VideoSummaryPopupView;
+#[cfg(feature = "commons-upload")]
+use crate::view::{
+    COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL, COMMONS_BOT_PASSWORD_GUIDE_URL,
+    CommonsCredentialsPopupView, CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView,
+};
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
@@ -2951,6 +2968,41 @@ enum LocalBrowseResponse {
     },
 }
 
+/// Provider identity and audio locator retained while Commons metadata is reviewed.
+#[cfg(feature = "commons-upload")]
+#[derive(Clone)]
+struct CommonsUploadSelection {
+    media: MediaItem,
+    source: CommonsAudioSource,
+}
+
+/// Messages from bounded category lookups and the sole active upload worker.
+#[cfg(feature = "commons-upload")]
+enum CommonsWorkerResponse {
+    Categories {
+        generation: u64,
+        query: String,
+        result: Result<Vec<CommonsCategorySuggestion>, String>,
+    },
+    UploadStarted {
+        generation: u64,
+        total_bytes: u64,
+    },
+    UploadProgress {
+        generation: u64,
+        uploaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Finished {
+        generation: u64,
+        result: Result<CommonsUploadResult, String>,
+    },
+}
+
+/// Quiet period before one latest-only Commons category lookup starts.
+#[cfg(feature = "commons-upload")]
+const COMMONS_CATEGORY_LOOKUP_DEBOUNCE: Duration = Duration::from_millis(250);
+
 #[cfg(feature = "yt-dlp")]
 const DOWNLOAD_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 #[cfg(feature = "yt-dlp")]
@@ -4763,6 +4815,30 @@ pub struct AppController {
     /// Deadline for removing only a successful completed-path notice.
     #[cfg(feature = "yt-dlp")]
     download_completion_notice_deadline: Option<Instant>,
+    /// Selected provider media and private authentication behind the Commons popup.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_selection: Option<CommonsUploadSelection>,
+    /// Authentication selected from Youta or Pywikibot for the current review.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_authentication: Option<CommonsAuthentication>,
+    /// Monotonic owner for category and upload worker responses.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_generation: u64,
+    /// Latest category edit waiting for a short quiet period.
+    #[cfg(feature = "commons-upload")]
+    commons_category_lookup_deadline: Option<Instant>,
+    /// Whether the sole detached category request is currently in flight.
+    #[cfg(feature = "commons-upload")]
+    commons_category_lookup_pending: bool,
+    /// Background category, preparation, and upload completions.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_responses: Receiver<CommonsWorkerResponse>,
+    /// Sender cloned into bounded Commons worker tasks.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_response_sender: Sender<CommonsWorkerResponse>,
+    /// Sole Opus preparation/upload worker, joined after completion or shutdown.
+    #[cfg(feature = "commons-upload")]
+    commons_upload_thread: Option<JoinHandle<()>>,
     report_actions: Box<dyn DiagnosticActionHandler>,
     /// Completions from the sole explicitly confirmed GitHub submission.
     github_issue_submission_results: Receiver<GitHubIssueSubmissionCompletion>,
@@ -4919,6 +4995,8 @@ impl AppController {
         let (local_waveform_response_sender, local_waveform_responses) = unbounded();
         let (url_open_result_sender, url_open_results) = unbounded();
         let (github_issue_submission_result_sender, github_issue_submission_results) = unbounded();
+        #[cfg(feature = "commons-upload")]
+        let (commons_upload_response_sender, commons_upload_responses) = unbounded();
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
@@ -5876,6 +5954,22 @@ impl AppController {
             active_download: None,
             #[cfg(feature = "yt-dlp")]
             download_completion_notice_deadline: None,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_selection: None,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_authentication: None,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_generation: 0,
+            #[cfg(feature = "commons-upload")]
+            commons_category_lookup_deadline: None,
+            #[cfg(feature = "commons-upload")]
+            commons_category_lookup_pending: false,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_responses,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_response_sender,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_thread: None,
             report_actions: Box::new(SystemReportActions::new()),
             github_issue_submission_results,
             github_issue_submission_result_sender,
@@ -15552,6 +15646,15 @@ impl AppController {
     /// Rehydrates quick-action state and the right-panel playlist membership.
     fn refresh_selected_playlist_state(&mut self) {
         self.refresh_selected_private_note_state();
+        #[cfg(feature = "commons-upload")]
+        {
+            self.view.commons_upload_available = self.selected_queue_item().is_ok_and(|item| {
+                matches!(
+                    item.media.id.source,
+                    SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
+                )
+            });
+        }
         self.view.playlist_item = None;
         self.view.playlist_edit_available = self.view.screen == Screen::Playlists
             && matches!(self.playlists_route, PlaylistsRoute::Index)
@@ -16719,6 +16822,515 @@ impl AppController {
                 format!("Copying a video summary ({count} characters)…")
             }
         };
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn open_commons_upload(&mut self) {
+        if self.commons_upload_thread.is_some() {
+            "A Wikimedia Commons upload is already running".clone_into(&mut self.view.status_line);
+            return;
+        }
+        let item = match self.selected_queue_item() {
+            Ok(item) => item,
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+        };
+        let mut media = item.media;
+        if !matches!(
+            media.id.source,
+            SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
+        ) {
+            "Commons audio upload supports YouTube, Yandex Music, and Apple Podcasts"
+                .clone_into(&mut self.view.status_line);
+            return;
+        }
+        let channel_url = self
+            .view
+            .details
+            .as_ref()
+            .filter(|details| details.media_id.as_ref() == Some(&media.id))
+            .and_then(|details| {
+                if !details.description.is_empty() {
+                    media.description = Some(details.description.clone());
+                }
+                if !details.channel_name.is_empty() {
+                    media.creator = Some(details.channel_name.clone());
+                }
+                if !details.license.is_empty() {
+                    media.license = MediaLicense::CreativeCommons(details.license.clone());
+                }
+                details.channel_webpage_url.clone()
+            });
+        let source = match media.id.source {
+            SourceKind::YouTube => CommonsAudioSource::PublicPage(media.webpage_url.clone()),
+            SourceKind::ApplePodcasts => {
+                let Ok(url) = url::Url::parse(&item.playback_location) else {
+                    "The selected Apple episode has no public audio enclosure"
+                        .clone_into(&mut self.view.status_line);
+                    return;
+                };
+                CommonsAudioSource::PublicPage(url)
+            }
+            SourceKind::YandexMusic => {
+                let Some(token) = self.config.providers.yandex_music_token.clone() else {
+                    "Configure Yandex Music before uploading its audio"
+                        .clone_into(&mut self.view.status_line);
+                    return;
+                };
+                CommonsAudioSource::YandexMusic {
+                    track_id: media.id.external_id.clone(),
+                    token,
+                }
+            }
+            _ => unreachable!("supported Commons sources were checked above"),
+        };
+        let draft = CommonsUploadDraft::from_media(&media, channel_url.as_ref());
+        let selection = CommonsUploadSelection { media, source };
+        self.commons_upload_selection = Some(selection);
+        if let Some(discovered) = discover_commons_authentication(&self.config) {
+            self.commons_upload_authentication = Some(discovered.authentication);
+            self.open_commons_review(draft);
+        } else {
+            self.commons_upload_authentication = None;
+            self.view.commons_credentials_popup = Some(CommonsCredentialsPopupView {
+                username: String::new(),
+                password: String::new(),
+                auth_method: WikimediaCommonsAuthMethod::BotPassword,
+                password_selected: false,
+                credentials_path: self.config.credentials_file().display().to_string(),
+                validation_error: None,
+            });
+            "Enter Wikimedia Commons credentials".clone_into(&mut self.view.status_line);
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn open_commons_review(&mut self, draft: CommonsUploadDraft) {
+        self.view.commons_credentials_popup = None;
+        self.view.commons_upload_popup = Some(CommonsUploadPopupView {
+            draft,
+            ..CommonsUploadPopupView::default()
+        });
+        "Review Wikimedia Commons audio metadata".clone_into(&mut self.view.status_line);
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn append_commons_upload_character(&mut self, character: char) {
+        let Some(popup) = self.view.commons_upload_popup.as_mut() else {
+            return;
+        };
+        if popup.phase != CommonsUploadPhase::Review || character.is_control() {
+            return;
+        }
+        let (field, limit) = match popup.selected_field {
+            CommonsUploadField::Title => (&mut popup.draft.title, 240),
+            CommonsUploadField::Caption => (&mut popup.draft.caption, 1_024),
+            CommonsUploadField::Description => (&mut popup.draft.description, 16 * 1_024),
+            CommonsUploadField::Source => (&mut popup.draft.source, 4_096),
+            CommonsUploadField::Author => (&mut popup.draft.author, 4_096),
+            CommonsUploadField::Category => (&mut popup.category_query, 255),
+        };
+        if field.len().saturating_add(character.len_utf8()) <= limit {
+            field.push(character);
+        }
+        popup.validation_error = None;
+        if popup.selected_field == CommonsUploadField::Category {
+            self.request_commons_category_suggestions();
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn insert_commons_upload_newline(&mut self) {
+        let Some(popup) = self.view.commons_upload_popup.as_mut() else {
+            return;
+        };
+        if popup.phase == CommonsUploadPhase::Review
+            && popup.selected_field == CommonsUploadField::Description
+            && popup.draft.description.len() < 16 * 1_024
+        {
+            popup.draft.description.push('\n');
+            popup.validation_error = None;
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn mutate_commons_upload_field(&mut self, delete_word: bool) {
+        let Some(popup) = self.view.commons_upload_popup.as_mut() else {
+            return;
+        };
+        if popup.phase != CommonsUploadPhase::Review {
+            return;
+        }
+        let field = match popup.selected_field {
+            CommonsUploadField::Title => &mut popup.draft.title,
+            CommonsUploadField::Caption => &mut popup.draft.caption,
+            CommonsUploadField::Description => &mut popup.draft.description,
+            CommonsUploadField::Source => &mut popup.draft.source,
+            CommonsUploadField::Author => &mut popup.draft.author,
+            CommonsUploadField::Category => &mut popup.category_query,
+        };
+        if delete_word {
+            let mut cursor = field.len();
+            delete_previous_editor_word(field, &mut cursor);
+        } else {
+            field.pop();
+        }
+        popup.validation_error = None;
+        if popup.selected_field == CommonsUploadField::Category {
+            self.request_commons_category_suggestions();
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn request_commons_category_suggestions(&mut self) {
+        let Some(query) = self
+            .view
+            .commons_upload_popup
+            .as_ref()
+            .filter(|popup| popup.phase == CommonsUploadPhase::Review)
+            .map(|popup| popup.category_query.clone())
+        else {
+            return;
+        };
+        self.commons_upload_generation = self.commons_upload_generation.wrapping_add(1);
+        if query.trim().is_empty() {
+            self.commons_category_lookup_deadline = None;
+            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                popup.category_suggestions.clear();
+                popup.selected_category_suggestion = 0;
+            }
+            return;
+        }
+        self.commons_category_lookup_deadline = Some(
+            Instant::now()
+                .checked_add(COMMONS_CATEGORY_LOOKUP_DEBOUNCE)
+                .unwrap_or_else(Instant::now),
+        );
+    }
+
+    /// Starts at most one latest-only category request after typing settles.
+    #[cfg(feature = "commons-upload")]
+    fn maybe_start_commons_category_lookup(&mut self) {
+        if self.commons_category_lookup_pending
+            || self
+                .commons_category_lookup_deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+        let Some(query) = self
+            .view
+            .commons_upload_popup
+            .as_ref()
+            .filter(|popup| popup.phase == CommonsUploadPhase::Review)
+            .map(|popup| popup.category_query.clone())
+            .filter(|query| !query.trim().is_empty())
+        else {
+            self.commons_category_lookup_deadline = None;
+            return;
+        };
+        let generation = self.commons_upload_generation;
+        self.commons_category_lookup_deadline = None;
+        self.commons_category_lookup_pending = true;
+        let sender = self.commons_upload_response_sender.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("youta-commons-categories".to_owned())
+            .spawn(move || {
+                let result = CommonsClient::new().category_suggestions(&query);
+                let _ = sender.send(CommonsWorkerResponse::Categories {
+                    generation,
+                    query,
+                    result,
+                });
+            })
+        {
+            self.commons_category_lookup_pending = false;
+            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                popup.validation_error = Some(format!(
+                    "Could not start Commons category completion: {error}"
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn add_selected_commons_category(&mut self) {
+        let Some(popup) = self.view.commons_upload_popup.as_mut() else {
+            return;
+        };
+        let Some(suggestion) = popup
+            .category_suggestions
+            .get(popup.selected_category_suggestion)
+        else {
+            return;
+        };
+        if !popup
+            .draft
+            .categories
+            .iter()
+            .any(|category| category.eq_ignore_ascii_case(&suggestion.name))
+        {
+            popup.draft.categories.push(suggestion.name.clone());
+        }
+        popup.category_query.clear();
+        popup.category_suggestions.clear();
+        popup.selected_category_suggestion = 0;
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn open_selected_commons_category(&mut self) {
+        let url = self
+            .view
+            .commons_upload_popup
+            .as_ref()
+            .and_then(|popup| {
+                popup
+                    .category_suggestions
+                    .get(popup.selected_category_suggestion)
+            })
+            .map(|suggestion| suggestion.url.to_string());
+        if let Some(url) = url {
+            self.open_external_url(&url);
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn append_commons_credential_character(&mut self, character: char) {
+        let Some(popup) = self.view.commons_credentials_popup.as_mut() else {
+            return;
+        };
+        if character.is_control() {
+            return;
+        }
+        let field = if popup.password_selected {
+            &mut popup.password
+        } else {
+            &mut popup.username
+        };
+        if field.len().saturating_add(character.len_utf8()) <= 4_096 {
+            field.push(character);
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn delete_commons_credential(&mut self, word: bool) {
+        let Some(popup) = self.view.commons_credentials_popup.as_mut() else {
+            return;
+        };
+        let field = if popup.password_selected {
+            &mut popup.password
+        } else {
+            &mut popup.username
+        };
+        if word {
+            let mut cursor = field.len();
+            delete_previous_editor_word(field, &mut cursor);
+        } else {
+            field.pop();
+        }
+        popup.validation_error = None;
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn submit_commons_credentials(&mut self) {
+        let Some(popup) = self.view.commons_credentials_popup.as_ref() else {
+            return;
+        };
+        let username = popup.username.clone();
+        let password = popup.password.clone();
+        let method = popup.auth_method;
+        if let Err(error) = self.config.save_wikimedia_commons_credentials(
+            username.clone(),
+            password.clone(),
+            method,
+        ) {
+            if let Some(popup) = self.view.commons_credentials_popup.as_mut() {
+                popup.validation_error = Some(error.to_string());
+            }
+            return;
+        }
+        self.commons_upload_authentication = Some(CommonsAuthentication::Password {
+            username,
+            password,
+            method,
+        });
+        let Some(selection) = self.commons_upload_selection.as_ref() else {
+            self.view.commons_credentials_popup = None;
+            return;
+        };
+        let channel_url = self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.channel_webpage_url.as_ref());
+        let draft = CommonsUploadDraft::from_media(&selection.media, channel_url);
+        self.open_commons_review(draft);
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn submit_commons_upload(&mut self) {
+        if self.commons_upload_thread.is_some() {
+            return;
+        }
+        let Some(popup) = self.view.commons_upload_popup.as_ref() else {
+            return;
+        };
+        if let Err(error) = popup.draft.validate() {
+            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                popup.validation_error = Some(error);
+            }
+            return;
+        }
+        let Some(selection) = self.commons_upload_selection.clone() else {
+            return;
+        };
+        let Some(authentication) = self.commons_upload_authentication.clone() else {
+            "Wikimedia Commons credentials are unavailable".clone_into(&mut self.view.status_line);
+            return;
+        };
+        if let Err(error) = self.config.ensure_directories() {
+            self.show_error("Could not prepare Commons runtime storage", &error);
+            return;
+        }
+        self.commons_upload_generation = self.commons_upload_generation.wrapping_add(1);
+        let generation = self.commons_upload_generation;
+        let staging_directory = self
+            .config
+            .runtime_dir()
+            .join("commons-upload")
+            .join(generation.to_string());
+        let yt_dlp_executable = self.config.providers.yt_dlp_executable.clone();
+        let ffmpeg_executable = self.config.providers.ffmpeg_executable.clone();
+        let draft = popup.draft.clone();
+        let sender = self.commons_upload_response_sender.clone();
+        let thread = thread::Builder::new()
+            .name("youta-commons-upload".to_owned())
+            .spawn(move || {
+                let result = (|| {
+                    let session = CommonsClient::new().authenticate(&authentication)?;
+                    let path = prepare_commons_opus(
+                        &selection.source,
+                        &staging_directory,
+                        &yt_dlp_executable,
+                        &ffmpeg_executable,
+                        |_, _| {},
+                    )?;
+                    let total_bytes = fs::metadata(&path)
+                        .map_err(|error| format!("Cannot inspect prepared Opus audio: {error}"))?
+                        .len();
+                    let _ = sender.send(CommonsWorkerResponse::UploadStarted {
+                        generation,
+                        total_bytes,
+                    });
+                    session.upload_opus(&path, &draft, |uploaded_bytes, total_bytes| {
+                        let _ = sender.send(CommonsWorkerResponse::UploadProgress {
+                            generation,
+                            uploaded_bytes,
+                            total_bytes,
+                        });
+                    })
+                })();
+                let _ = fs::remove_dir_all(&staging_directory);
+                let _ = sender.send(CommonsWorkerResponse::Finished { generation, result });
+            });
+        match thread {
+            Ok(thread) => {
+                self.commons_upload_thread = Some(thread);
+                if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                    popup.phase = CommonsUploadPhase::PreparingAudio;
+                    popup.animation_frame = 0;
+                    popup.uploaded_bytes = 0;
+                    popup.total_bytes = None;
+                    popup.validation_error = None;
+                }
+                "Preparing audio for Wikimedia Commons; Youta currently uploads audio only"
+                    .clone_into(&mut self.view.status_line);
+            }
+            Err(error) => self.show_error("Could not start the Commons upload worker", &error),
+        }
+    }
+
+    #[cfg(feature = "commons-upload")]
+    fn drain_commons_upload_responses(&mut self) {
+        while let Ok(response) = self.commons_upload_responses.try_recv() {
+            match response {
+                CommonsWorkerResponse::Categories {
+                    generation,
+                    query,
+                    result,
+                } => {
+                    self.commons_category_lookup_pending = false;
+                    if generation == self.commons_upload_generation
+                        && let Some(popup) = self
+                            .view
+                            .commons_upload_popup
+                            .as_mut()
+                            .filter(|popup| popup.category_query == query)
+                    {
+                        match result {
+                            Ok(suggestions) => {
+                                popup.category_suggestions = suggestions;
+                                popup.selected_category_suggestion = 0;
+                            }
+                            Err(error) => popup.validation_error = Some(error),
+                        }
+                    }
+                }
+                CommonsWorkerResponse::UploadStarted {
+                    generation,
+                    total_bytes,
+                } if generation == self.commons_upload_generation => {
+                    if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                        popup.phase = CommonsUploadPhase::Uploading;
+                        popup.total_bytes = Some(total_bytes);
+                    }
+                    "Uploading audio to Wikimedia Commons in acknowledged chunks"
+                        .clone_into(&mut self.view.status_line);
+                }
+                CommonsWorkerResponse::UploadProgress {
+                    generation,
+                    uploaded_bytes,
+                    total_bytes,
+                } if generation == self.commons_upload_generation => {
+                    if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                        popup.uploaded_bytes = uploaded_bytes;
+                        popup.total_bytes = Some(total_bytes);
+                    }
+                }
+                CommonsWorkerResponse::Finished { generation, result }
+                    if generation == self.commons_upload_generation =>
+                {
+                    if let Some(thread) = self.commons_upload_thread.take() {
+                        let _ = thread.join();
+                    }
+                    match result {
+                        Ok(result) => {
+                            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                                popup.phase = CommonsUploadPhase::Complete;
+                                popup.uploaded_bytes = popup.total_bytes.unwrap_or_default();
+                                popup.result_url = Some(result.url);
+                                popup.validation_error = None;
+                            }
+                            "Thanks for preserving the history"
+                                .clone_into(&mut self.view.status_line);
+                        }
+                        Err(error) => {
+                            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                                popup.phase = CommonsUploadPhase::Review;
+                                popup.validation_error = Some(error);
+                            }
+                            "Wikimedia Commons upload failed"
+                                .clone_into(&mut self.view.status_line);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -29836,6 +30448,10 @@ impl AppController {
         if let Some(mut download) = self.active_download.take() {
             download.cancel_and_join();
         }
+        #[cfg(feature = "commons-upload")]
+        if let Some(thread) = self.commons_upload_thread.take() {
+            let _ = thread.join();
+        }
         #[cfg(feature = "yandex-music")]
         self.shutdown_yandex_music_media_workers();
         #[cfg(feature = "yandex-music")]
@@ -30456,6 +31072,117 @@ impl UiController for AppController {
             UiAction::UpdatePlaylist => self.update_selected_playlist(),
             UiAction::DismissPlaylistPopup => self.dismiss_playlist_popup(),
             UiAction::Download => self.start_selected_download(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsUpload => self.open_commons_upload(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::SelectCommonsUploadField(field) => {
+                if let Some(popup) = self
+                    .view
+                    .commons_upload_popup
+                    .as_mut()
+                    .filter(|popup| popup.phase == CommonsUploadPhase::Review)
+                {
+                    popup.selected_field = field;
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::AppendCommonsUploadCharacter(character) => {
+                self.append_commons_upload_character(character);
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::InsertCommonsUploadNewline => self.insert_commons_upload_newline(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::DeleteCommonsUploadCharacter => self.mutate_commons_upload_field(false),
+            #[cfg(feature = "commons-upload")]
+            UiAction::DeleteCommonsUploadWord => self.mutate_commons_upload_field(true),
+            #[cfg(feature = "commons-upload")]
+            UiAction::CycleCommonsUploadLicense => {
+                if let Some(popup) = self
+                    .view
+                    .commons_upload_popup
+                    .as_mut()
+                    .filter(|popup| popup.phase == CommonsUploadPhase::Review)
+                {
+                    popup.draft.license = popup.draft.license.next();
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::MoveCommonsCategorySuggestion(delta) => {
+                if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                    && let Some(selected) = moved_index(
+                        popup.selected_category_suggestion,
+                        popup.category_suggestions.len(),
+                        delta,
+                    )
+                {
+                    popup.selected_category_suggestion = selected;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::SelectCommonsCategorySuggestion(index) => {
+                if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                    && index < popup.category_suggestions.len()
+                {
+                    popup.selected_category_suggestion = index;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::AddCommonsCategorySuggestion => self.add_selected_commons_category(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::AddCommonsCategorySuggestionAt(index) => {
+                if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                    && index < popup.category_suggestions.len()
+                {
+                    popup.selected_category_suggestion = index;
+                    self.add_selected_commons_category();
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsCategorySuggestion => self.open_selected_commons_category(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsCategorySuggestionAt(index) => {
+                if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                    && index < popup.category_suggestions.len()
+                {
+                    popup.selected_category_suggestion = index;
+                }
+                self.open_selected_commons_category();
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::RemoveCommonsUploadCategory(index) => {
+                if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                    && index < popup.draft.categories.len()
+                {
+                    popup.draft.categories.remove(index);
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::SubmitCommonsUpload => self.submit_commons_upload(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::DismissCommonsUpload => {
+                if self.commons_upload_thread.is_some() {
+                    "Wait for the Wikimedia Commons upload to finish"
+                        .clone_into(&mut self.view.status_line);
+                } else {
+                    self.view.commons_upload_popup = None;
+                    self.commons_upload_selection = None;
+                    self.commons_upload_authentication = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsUploadResult => {
+                let url = self
+                    .view
+                    .commons_upload_popup
+                    .as_ref()
+                    .and_then(|popup| popup.result_url.as_ref())
+                    .map(ToString::to_string);
+                if let Some(url) = url {
+                    self.open_external_url(&url);
+                }
+            }
             UiAction::EditPrivateNote => self.open_private_note_popup(),
             UiAction::AppendPrivateNoteCharacter(character) => {
                 self.append_private_note_character(character);
@@ -30599,6 +31326,61 @@ impl UiController for AppController {
                 {
                     self.view.yandex_music_setup_popup = None;
                 }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::ToggleCommonsCredentialField => {
+                if let Some(popup) = self.view.commons_credentials_popup.as_mut() {
+                    popup.password_selected = !popup.password_selected;
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::SelectCommonsCredentialField(password_selected) => {
+                if let Some(popup) = self.view.commons_credentials_popup.as_mut() {
+                    popup.password_selected = password_selected;
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::AppendCommonsCredentialCharacter(character) => {
+                self.append_commons_credential_character(character);
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::DeleteCommonsCredentialCharacter => {
+                self.delete_commons_credential(false);
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::DeleteCommonsCredentialWord => self.delete_commons_credential(true),
+            #[cfg(feature = "commons-upload")]
+            UiAction::CycleCommonsAuthMethod => {
+                if let Some(popup) = self.view.commons_credentials_popup.as_mut() {
+                    popup.auth_method = match popup.auth_method {
+                        WikimediaCommonsAuthMethod::BotPassword => {
+                            WikimediaCommonsAuthMethod::AccountPassword
+                        }
+                        WikimediaCommonsAuthMethod::AccountPassword => {
+                            WikimediaCommonsAuthMethod::BotPassword
+                        }
+                    };
+                    popup.validation_error = None;
+                }
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::SubmitCommonsCredentials => self.submit_commons_credentials(),
+            #[cfg(feature = "commons-upload")]
+            UiAction::DismissCommonsCredentials => {
+                self.view.commons_credentials_popup = None;
+                self.commons_upload_selection = None;
+                self.commons_upload_authentication = None;
+                "Wikimedia Commons upload cancelled".clone_into(&mut self.view.status_line);
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsBotPasswordGuide => {
+                self.open_external_url(COMMONS_BOT_PASSWORD_GUIDE_URL);
+            }
+            #[cfg(feature = "commons-upload")]
+            UiAction::OpenCommonsAccountRegistration => {
+                self.open_external_url(COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL);
             }
             UiAction::OpenRssSubscriptionPopup => self.open_rss_subscription_popup(),
             UiAction::AppendRssSubscriptionCharacter(character) => {
@@ -30830,6 +31612,19 @@ impl UiController for AppController {
         self.drain_github_issue_submission_results();
         if self.diagnostic_only {
             return;
+        }
+        #[cfg(feature = "commons-upload")]
+        {
+            self.drain_commons_upload_responses();
+            self.maybe_start_commons_category_lookup();
+            if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                && matches!(
+                    popup.phase,
+                    CommonsUploadPhase::PreparingAudio | CommonsUploadPhase::Uploading
+                )
+            {
+                popup.animation_frame = popup.animation_frame.wrapping_add(1);
+            }
         }
         self.refresh_open_queue_popup();
         self.refresh_now_playing();

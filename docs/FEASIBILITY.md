@@ -152,21 +152,20 @@ no book entity is guessed from a title, genre, or author display name.
 
 ### Wikimedia Commons transfer
 
-Transfer is feasible with MediaWiki OAuth and the upload/Wikibase APIs. Before
-showing the final confirmation Youta must:
+Audio transfer is implemented with MediaWiki password/cookie authentication
+and the chunked upload API. The current review boundary:
 
-- accept only a Commons-compatible license and display attribution;
-- warn about third-party material despite the source license marker;
-- search by source URL, external ID, normalized filename/title, and later
-  content hash;
-- inspect duplicate/deleted-file warnings from the upload API;
-- prepare Ogg Opus audio or WebM with VP9/AV1 plus Opus where a direct
-  compatible stream is unavailable;
-- retain the YouTube URL in file-page source metadata;
-- add structured source/creator/depicts statements where supported;
-- keep model-suggested Wikidata items and categories editable;
-- append `Uploaded by Youta` after a blank line;
-- display the canonical uploaded-file URL.
+- requires only the Commons filename and displays any detected attribution;
+- leaves unknown, NC, and ND license metadata unselected;
+- warns about third-party material despite the source license marker;
+- prepares Ogg Opus audio, while video transfer remains future work;
+- retains the YouTube URL in file-page source metadata;
+- keeps bounded API category suggestions editable;
+- appends `Uploaded by youta` after a blank line;
+- refuses API warnings and displays the canonical uploaded-file URL.
+
+Duplicate discovery by source/title/hash and structured source, creator, or
+depicts statements remain follow-up work rather than implied behavior.
 
 Commons also accepts other formats, including FLAC, WAVE, Ogg Vorbis and, for
 eligible users, MP3. Youta chooses a narrow preferred open profile; it should

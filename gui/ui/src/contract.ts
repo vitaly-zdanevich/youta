@@ -10,10 +10,11 @@
 // fails that test — which is how the first Details panel's five invented names
 // were caught, after they had already shipped an empty panel.
 //
-// Anything absent here is absent deliberately. Four editors carry a YouTube API
-// key, a Yandex OAuth token, a private note body, and a feed URL that may itself
-// be a credential; the reducer skips them when serializing, so they never enter
-// this process and must never be declared as if they might.
+// Anything absent here is absent deliberately. Sensitive editor contents — a
+// YouTube API key, Yandex OAuth token, Commons credentials, private note body,
+// or feed URL that may itself be a credential — are skipped by the reducer, so
+// they never enter this process and must not be declared as if they might. The
+// Commons editor below carries only lengths and control state.
 
 /** A serde `Duration`, which crosses as seconds plus nanoseconds. */
 export interface RustDuration {
@@ -543,6 +544,62 @@ export interface DownloadView {
   completed_path: string | null;
 }
 
+/** Free license selected for a Wikimedia Commons upload. */
+export type CommonsLicense = "Unspecified" | "CcBy40" | "CcBySa40" | "Cc0";
+
+/** Editable metadata that becomes the Commons file-description page. */
+export interface CommonsUploadDraft {
+  title: string;
+  caption: string;
+  description: string;
+  source: string;
+  author: string;
+  license: CommonsLicense;
+  categories: string[];
+}
+
+/** Commons field currently receiving input from the shared keyboard map. */
+export type CommonsUploadField =
+  | "Title"
+  | "Caption"
+  | "Description"
+  | "Source"
+  | "Author"
+  | "Category";
+
+/** Public Commons category completion result. */
+export interface CommonsCategorySuggestion {
+  name: string;
+  url: string;
+}
+
+/** Lifecycle of audio preparation and a chunked Commons upload. */
+export type CommonsUploadPhase = "Review" | "PreparingAudio" | "Uploading" | "Complete";
+
+/** Public review, progress, and completion state for one Commons upload. */
+export interface CommonsUploadPopupView {
+  draft: CommonsUploadDraft;
+  selected_field: CommonsUploadField;
+  category_query: string;
+  category_suggestions: CommonsCategorySuggestion[];
+  selected_category_suggestion: number;
+  phase: CommonsUploadPhase;
+  animation_frame: number;
+  uploaded_bytes: number;
+  total_bytes: number | null;
+  validation_error: string | null;
+  result_url: string | null;
+}
+
+/** Non-secret control state for entering Commons credentials in this window. */
+export interface CommonsCredentialsEditorView {
+  username_length: number;
+  password_length: number;
+  password_selected: boolean;
+  auth_method: "bot-password" | "account-password";
+  validation_failed: boolean;
+}
+
 /** The published snapshot. */
 export interface ViewModel {
   screen: string;
@@ -593,11 +650,14 @@ export interface ViewModel {
   playlist_popup: PlaylistPopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
-  // The four credential-bearing editors cross as a single bit each: enough to
-  // know the reducer is modal and every key is going into an editor this window
-  // cannot draw, and nothing more. See the module header in `src/view.rs`.
+  // Most credential-bearing editors cross as one bit. Commons has a redacted
+  // projection so the window can draw controls without receiving either field.
   youtube_setup_open: boolean;
   yandex_music_setup_open: boolean;
+  commons_upload_supported: boolean;
+  commons_upload_available: boolean;
+  commons_upload_popup: CommonsUploadPopupView | null;
+  commons_credentials_editor: CommonsCredentialsEditorView | null;
   rss_subscription_open: boolean;
   private_note_open: boolean;
   quitting: boolean;

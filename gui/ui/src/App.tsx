@@ -11,6 +11,8 @@ import { Tabs } from "./components/Tabs";
 import { Waveform } from "./components/Waveform";
 import {
   AudioQualityPopup,
+  CommonsCredentialsPopup,
+  CommonsUploadPopup,
   CredentialEditorNotice,
   ErrorPopup,
   HelpPopup,
@@ -176,6 +178,7 @@ export function App() {
       {view.help_open ? (
         <HelpPopup
           audioQualitySupported={view.audio_quality_supported}
+          commonsUploadSupported={view.commons_upload_supported}
           playbackHistoryEnabled={view.playback_history_enabled}
           videoSummarySupported={view.video_summary_supported}
         />
@@ -186,6 +189,10 @@ export function App() {
       {view.youtube_setup_open ? <CredentialEditorNotice editor="youtube_setup" /> : null}
       {view.yandex_music_setup_open ? (
         <CredentialEditorNotice editor="yandex_music_setup" />
+      ) : null}
+      {view.commons_upload_popup ? <CommonsUploadPopup popup={view.commons_upload_popup} /> : null}
+      {view.commons_credentials_editor ? (
+        <CommonsCredentialsPopup editor={view.commons_credentials_editor} />
       ) : null}
       {view.rss_subscription_open ? <CredentialEditorNotice editor="rss_subscription" /> : null}
       {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} /> : null}

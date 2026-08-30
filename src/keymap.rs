@@ -139,6 +139,8 @@ pub struct PopupGeometry {
 mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
+    #[cfg(feature = "commons-upload")]
+    use crate::view::{CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView};
     use crate::view::{UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel};
 
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
@@ -293,6 +295,64 @@ mod wire_tests {
         assert_eq!(
             key_action(KeyPress::new(Key::Char('G')), &view, None, None),
             Some(UiAction::GenerateVideoSummary)
+        );
+    }
+
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn uppercase_u_opens_only_an_available_commons_upload() {
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('U')), &view, None, None),
+            None
+        );
+        view.commons_upload_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('U')), &view, None, None),
+            Some(UiAction::OpenCommonsUpload)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('u')), &view, None, None),
+            Some(UiAction::OpenQueuePopup),
+            "the existing lowercase queue shortcut must remain unchanged"
+        );
+    }
+
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn commons_review_owns_text_category_and_submit_keys() {
+        let popup = CommonsUploadPopupView {
+            selected_field: CommonsUploadField::Description,
+            ..CommonsUploadPopupView::default()
+        };
+        let mut view = ViewModel {
+            commons_upload_popup: Some(popup),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::InsertCommonsUploadNewline)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('s'))
+                },
+                &view,
+                None,
+                None,
+            ),
+            Some(UiAction::SubmitCommonsUpload)
+        );
+
+        view.commons_upload_popup
+            .as_mut()
+            .expect("Commons popup")
+            .phase = CommonsUploadPhase::Complete;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::OpenCommonsUploadResult)
         );
     }
 
@@ -639,6 +699,106 @@ fn unfiltered_key_action(
     if let Some(popup) = view.video_comments_popup.as_ref() {
         return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
+    #[cfg(feature = "commons-upload")]
+    if let Some(popup) = view.commons_upload_popup.as_ref() {
+        if popup.phase == CommonsUploadPhase::Complete {
+            return match key.key {
+                Key::Enter => Some(UiAction::OpenCommonsUploadResult),
+                Key::Esc => Some(UiAction::DismissCommonsUpload),
+                _ => None,
+            };
+        }
+        if popup.phase != CommonsUploadPhase::Review {
+            return match key.key {
+                Key::Esc => Some(UiAction::DismissCommonsUpload),
+                _ => None,
+            };
+        }
+        let fields = [
+            CommonsUploadField::Title,
+            CommonsUploadField::Caption,
+            CommonsUploadField::Description,
+            CommonsUploadField::Source,
+            CommonsUploadField::Author,
+            CommonsUploadField::Category,
+        ];
+        let selected = fields
+            .iter()
+            .position(|field| *field == popup.selected_field)
+            .unwrap_or_default();
+        let next = fields[(selected + 1) % fields.len()];
+        let previous = fields[(selected + fields.len() - 1) % fields.len()];
+        if key.key == Key::Tab {
+            return Some(UiAction::SelectCommonsUploadField(if reverse_tab(key) {
+                previous
+            } else {
+                next
+            }));
+        }
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissCommonsUpload),
+            Key::Char('s' | 'S') if key.ctrl => Some(UiAction::SubmitCommonsUpload),
+            Key::Up if popup.selected_field == CommonsUploadField::Category => {
+                Some(UiAction::MoveCommonsCategorySuggestion(-1))
+            }
+            Key::Down if popup.selected_field == CommonsUploadField::Category => {
+                Some(UiAction::MoveCommonsCategorySuggestion(1))
+            }
+            Key::BackTab | Key::Up => Some(UiAction::SelectCommonsUploadField(previous)),
+            Key::Enter
+                if popup.selected_field == CommonsUploadField::Category
+                    && !popup.category_suggestions.is_empty() =>
+            {
+                Some(UiAction::AddCommonsCategorySuggestion)
+            }
+            Key::Enter if popup.selected_field == CommonsUploadField::Description => {
+                Some(UiAction::InsertCommonsUploadNewline)
+            }
+            Key::Down | Key::Enter => Some(UiAction::SelectCommonsUploadField(next)),
+            Key::Char('l') if !key.chorded() => Some(UiAction::CycleCommonsUploadLicense),
+            Key::Char('o') if popup.selected_field == CommonsUploadField::Category => {
+                Some(UiAction::OpenCommonsCategorySuggestion)
+            }
+            Key::Char('x')
+                if popup.selected_field == CommonsUploadField::Category
+                    && popup.category_query.is_empty()
+                    && !popup.draft.categories.is_empty() =>
+            {
+                Some(UiAction::RemoveCommonsUploadCategory(
+                    popup.draft.categories.len() - 1,
+                ))
+            }
+            Key::Backspace => Some(UiAction::DeleteCommonsUploadCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteCommonsUploadWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendCommonsUploadCharacter(character))
+            }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "commons-upload")]
+    if view.commons_credentials_popup.is_some() {
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissCommonsCredentials),
+            Key::Enter => Some(UiAction::SubmitCommonsCredentials),
+            Key::Tab | Key::BackTab | Key::Up | Key::Down => {
+                Some(UiAction::ToggleCommonsCredentialField)
+            }
+            Key::F(1) => Some(UiAction::OpenCommonsBotPasswordGuide),
+            Key::F(2) => Some(UiAction::OpenCommonsAccountRegistration),
+            Key::F(3) => Some(UiAction::CycleCommonsAuthMethod),
+            Key::Backspace => Some(UiAction::DeleteCommonsCredentialCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteCommonsCredentialWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendCommonsCredentialCharacter(character))
+            }
+            _ => None,
+        };
+    }
     if let Some(popup) = view.private_note_popup.as_ref() {
         let control = key.ctrl;
         return match key.key {
@@ -974,6 +1134,10 @@ fn unfiltered_key_action(
             Some(UiAction::ToggleYouTubeCreativeCommons)
         }
         Key::Char('A') => Some(UiAction::ToggleAutoplay),
+        #[cfg(feature = "commons-upload")]
+        Key::Char('U') if !key.chorded() && view.commons_upload_available => {
+            Some(UiAction::OpenCommonsUpload)
+        }
         Key::Char('l') if view.playlist_item.is_some() && !key.modified() => {
             Some(UiAction::ToggleTodoPlaylist)
         }

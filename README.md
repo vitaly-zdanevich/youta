@@ -1713,25 +1713,44 @@ has no HTTPS endpoint.
 
 ## Wikimedia Commons transfer
 
-A future transfer action is shown only when source metadata reports a
-Commons-compatible license, and still requires user review. A YouTube Creative
-Commons marker is not proof that the uploader owned every element. Youta will:
+The default-on `commons-upload` feature adds a reviewed audio upload for exact
+YouTube, Yandex Music, and Apple Podcasts selections. The Details button is
+spelled `Upload to Commons`; its uppercase `U` shortcut is documented only in
+Help. Distributors and local builders can omit the client, multipart support,
+and its UI with `--no-default-features` or by leaving `commons-upload` out of a
+custom feature set.
 
-1. show the source license and attribution;
-2. check Commons by normalized source URL, proposed name, and content hash;
-3. prefer Ogg Opus for audio and WebM with VP9/AV1 plus Opus for video;
-4. collect title, optional caption, optional description, source URL,
-   attribution, structured-data statements, and categories;
-5. keep suggested categories editable and append `Uploaded by Youta` after a
-   blank line;
-6. upload only after an explicit confirmation, then display the resulting
-   Commons file URL.
+The review pre-fills an Opus filename (`video title [video ID].opus` for
+YouTube), caption, provider description, canonical source URL, and linked
+channel attribution. The filename is the only required field. YouTube's
+current Creative Commons option is Attribution, so Youta maps that marker to
+CC BY 4.0; it does not relicense the work as CC BY-SA. Unknown, noncommercial,
+and no-derivatives labels are never selected automatically. Leaving the
+optional license field empty does not establish permission: a source license
+marker is also not proof that the uploader owns every element, so the user
+must review the rights before publishing.
 
-Commons accepts more formats than only Opus, VP9, and AV1; those are Youta's
-preferred open output profiles. Consult [Commons file
-types](https://commons.wikimedia.org/wiki/Commons:File_types),
-[YouTube files on Commons](https://commons.wikimedia.org/wiki/Commons:YouTube_files),
-and the [MediaWiki upload API](https://www.mediawiki.org/wiki/API:Upload).
+Category completion uses Commons' bounded public API. Every suggestion carries
+a folder emoji; clicking it opens the exact category page, while adding it
+keeps the metadata editable. The generated file page always ends with a blank
+line followed by `[[Category:Uploaded by youta]]`. Youta currently uploads
+audio only: it prepares Opus privately, uses MediaWiki's chunked stash protocol,
+advances the progress bar only after Commons acknowledges each chunk, refuses
+upload warnings instead of forcing them, and presents a clickable file page
+with “Thanks for preserving the history” after success.
+
+Authentication is discovered first from Youta's private
+`~/.config/youta/secrets/credentials.toml`, then from bounded regular Pywikibot
+password/cookie files in `~/.pywikibot/` (or `PYWIKIBOT_DIR`). Python
+configuration is parsed as data and never executed. When neither source is
+usable, the credential popup accepts a scoped `BotPassword` or ordinary
+account password and links to the official registration pages; accounts
+requiring an interactive or two-factor login should use a `BotPassword`.
+Consult [Commons
+upload guidance](https://commons.wikimedia.org/wiki/Commons:Upload), [YouTube
+files on Commons](https://commons.wikimedia.org/wiki/Commons:YouTube_files),
+[BotPasswords](https://www.mediawiki.org/wiki/Manual:Bot_passwords), and the
+[MediaWiki upload API](https://www.mediawiki.org/wiki/API:Upload).
 
 Internet Archive transfer follows the same explicit-confirmation and duplicate
 check model and is also restricted to material the user may lawfully upload.
@@ -1913,10 +1932,11 @@ it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
 arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
-The source package maps the default-enabled `audio-quality` and `summary`
-flags to their Cargo features. `USE="-audio-quality"` removes the analyzer and
-RustFFT dependency. `USE="-summary"` removes the Codex summary UI and backend.
-Prebuilt executables contain the fixed upstream feature set and keep both
+The source package maps the default-enabled `audio-quality`, `commons-upload`,
+and `summary` flags to their Cargo features. `USE="-audio-quality"` removes the
+analyzer and RustFFT dependency. `USE="-commons-upload"` removes the Commons
+client and review UI. `USE="-summary"` removes the Codex summary UI and backend.
+Prebuilt executables contain the fixed upstream feature set and keep all three
 capabilities enabled; offering binary USE switches would require another copy
 of every Linux release variant rather than changing installed code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The

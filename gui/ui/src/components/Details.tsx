@@ -352,6 +352,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {kind !== "Local" && details.media_id !== null ? (
           <Action onClick={() => void dispatch("Download")}>Download</Action>
         ) : null}
+        {view.commons_upload_available ? (
+          <Action onClick={() => void dispatch("OpenCommonsUpload")}>Upload to Commons</Action>
+        ) : null}
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}

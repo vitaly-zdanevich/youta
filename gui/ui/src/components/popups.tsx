@@ -12,6 +12,9 @@
 
 import type {
   AudioQualityPopupView,
+  CommonsCredentialsEditorView,
+  CommonsUploadField,
+  CommonsUploadPopupView,
   ErrorPopupView,
   GitHubIssueSubmissionView,
   LocalFilePopupView,
@@ -34,15 +37,16 @@ export const LAYER = {
   help: 0,
   projectHistory: 1,
   credentialEditor: 2,
-  preferences: 3,
-  localFile: 4,
-  playlist: 5,
-  queue: 6,
-  videoComments: 7,
-  videoQr: 8,
-  videoSummary: 9,
-  audioQuality: 10,
-  error: 11,
+  commonsUpload: 3,
+  preferences: 4,
+  localFile: 5,
+  playlist: 6,
+  queue: 7,
+  videoComments: 8,
+  videoQr: 9,
+  videoSummary: 10,
+  audioQuality: 11,
+  error: 12,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -60,10 +64,12 @@ function Body({ children }: { children: React.ReactNode }) {
  */
 export function HelpPopup({
   audioQualitySupported,
+  commonsUploadSupported,
   playbackHistoryEnabled,
   videoSummarySupported,
 }: {
   audioQualitySupported: boolean;
+  commonsUploadSupported: boolean;
   playbackHistoryEnabled: boolean;
   videoSummarySupported: boolean;
 }) {
@@ -107,6 +113,11 @@ export function HelpPopup({
       [
         ["Ctrl+n · a · u", "play next · add to queue · show the queue"],
         ["d · o · y", "download · open page · copy link"],
+        ...(commonsUploadSupported
+          ? ([
+              ["U", "upload selected YouTube, Yandex Music, or Apple Podcasts audio to Commons"],
+            ] satisfies Array<[string, string]>)
+          : []),
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
         ["i", "expand artwork"],
@@ -161,6 +172,253 @@ export function HelpPopup({
               </dl>
             </section>
           ))}
+        </div>
+      </Body>
+    </Popup>
+  );
+}
+
+const COMMONS_LICENSE_LABELS = {
+  Unspecified: "Not specified",
+  CcBy40: "Creative Commons Attribution 4.0",
+  CcBySa40: "Creative Commons Attribution-ShareAlike 4.0",
+  Cc0: "CC0 1.0 public-domain dedication",
+} as const;
+
+/** One reducer-owned Commons text field; typing remains in the shared keymap. */
+function CommonsField({
+  label,
+  field,
+  selected,
+  value,
+  multiline = false,
+}: {
+  label: string;
+  field: CommonsUploadField;
+  selected: boolean;
+  value: string;
+  multiline?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() => void dispatch({ SelectCommonsUploadField: field })}
+      className={`grid min-h-[42px] w-full grid-cols-[105px_minmax(0,1fr)] gap-3 rounded-[5px] border px-[9px] py-[6px] text-left text-xs ${
+        selected ? "border-accent bg-raised" : "border-line-strong hover:border-ink-faint"
+      }`}
+    >
+      <span className="text-ink-faint">{label}</span>
+      <span className={multiline ? "max-h-[92px] overflow-y-auto whitespace-pre-wrap" : "truncate"}>
+        {value === "" ? <span className="text-ink-faint">Empty</span> : value}
+        {selected ? (
+          <span aria-hidden className="ml-px inline-block h-[13px] w-[2px] animate-pulse bg-accent" />
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+/** Commons metadata review, Opus preparation, upload progress, and result. */
+export function CommonsUploadPopup({ popup }: { popup: CommonsUploadPopupView }) {
+  const active = popup.phase === "PreparingAudio" || popup.phase === "Uploading";
+  const complete = popup.phase === "Complete";
+  const total = popup.total_bytes ?? 0;
+  const progress = total > 0 ? Math.min(100, Math.round((popup.uploaded_bytes / total) * 100)) : 0;
+  const activity = ".".repeat((Math.floor(popup.animation_frame / 4) % 3) + 1);
+
+  return (
+    <Popup
+      title="Upload audio to Wikimedia Commons"
+      subtitle="Youta currently uploads audio only"
+      layer={LAYER.commonsUpload}
+      width="820px"
+      onDismiss={() => void dispatch("DismissCommonsUpload")}
+      dismissDisabled={active}
+      footer={
+        complete ? (
+          <>
+            <PopupButton emphasis onClick={() => void dispatch("OpenCommonsUploadResult")}>Open file page</PopupButton>
+            <PopupButton onClick={() => void dispatch("DismissCommonsUpload")}>Close</PopupButton>
+          </>
+        ) : active ? (
+          <span>{popup.phase === "Uploading" ? `Uploading ${progress}%` : `Preparing Opus${activity}`}</span>
+        ) : (
+          <>
+            <PopupButton
+              emphasis
+              disabled={popup.draft.title.trim() === ""}
+              onClick={() => void dispatch("SubmitCommonsUpload")}
+            >
+              Upload audio
+            </PopupButton>
+            <PopupButton onClick={() => void dispatch("DismissCommonsUpload")}>Cancel</PopupButton>
+          </>
+        )
+      }
+    >
+      <Body>
+        {complete ? (
+          <div className="grid gap-3">
+            <p className="text-base text-ink">Thanks for preserving the history</p>
+            {popup.result_url ? (
+              <button
+                type="button"
+                onClick={() => void dispatch("OpenCommonsUploadResult")}
+                className="break-all text-left text-accent underline decoration-dotted underline-offset-2"
+              >
+                {popup.result_url}
+              </button>
+            ) : null}
+          </div>
+        ) : active ? (
+          <div className="grid gap-3">
+            <p className="text-ink-dim">
+              {popup.phase === "Uploading"
+                ? "Commons is accepting the staged Opus file in acknowledged chunks."
+                : `Downloading and transcoding the selected audio${activity}`}
+            </p>
+            {popup.phase === "Uploading" ? (
+              <div className="grid gap-1">
+                <progress className="h-[12px] w-full accent-accent" max={total || 1} value={popup.uploaded_bytes} />
+                <span className="text-[11px] text-ink-faint">{progress}% accepted by Commons</span>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="grid gap-[8px]">
+            <CommonsField label="Title *" field="Title" selected={popup.selected_field === "Title"} value={popup.draft.title} />
+            <CommonsField label="Caption" field="Caption" selected={popup.selected_field === "Caption"} value={popup.draft.caption} />
+            <CommonsField label="Description" field="Description" selected={popup.selected_field === "Description"} value={popup.draft.description} multiline />
+            <CommonsField label="Source" field="Source" selected={popup.selected_field === "Source"} value={popup.draft.source} />
+            <CommonsField label="Author" field="Author" selected={popup.selected_field === "Author"} value={popup.draft.author} />
+            <button
+              type="button"
+              onClick={() => void dispatch("CycleCommonsUploadLicense")}
+              className="grid min-h-[42px] grid-cols-[105px_minmax(0,1fr)] gap-3 rounded-[5px] border border-line-strong px-[9px] py-[6px] text-left text-xs hover:border-ink-faint"
+            >
+              <span className="text-ink-faint">License</span>
+              <span>{COMMONS_LICENSE_LABELS[popup.draft.license]}</span>
+            </button>
+            <CommonsField label="Categories" field="Category" selected={popup.selected_field === "Category"} value={popup.category_query} />
+            {popup.draft.categories.length > 0 ? (
+              <ul className="flex list-none flex-wrap gap-[5px] pl-0">
+                {popup.draft.categories.map((category, index) => (
+                  <li key={category}>
+                    <button
+                      type="button"
+                      title="Remove category"
+                      onClick={() => void dispatch({ RemoveCommonsUploadCategory: index })}
+                      className="rounded-[5px] border border-line-strong px-[7px] py-[3px] text-[11px] text-ink-dim hover:border-ink-faint"
+                    >
+                      {category} ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {popup.category_suggestions.length > 0 ? (
+              <ul className="m-0 max-h-[118px] list-none overflow-y-auto rounded-[5px] border border-line-strong p-0">
+                {popup.category_suggestions.map((suggestion, index) => (
+                  <li key={suggestion.url} className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      title={`Open ${suggestion.name}`}
+                      onClick={() => void dispatch({ OpenCommonsCategorySuggestionAt: index })}
+                      className={`min-w-0 grow truncate px-[9px] py-[4px] text-left text-xs ${
+                        index === popup.selected_category_suggestion ? "bg-raised text-ink" : "text-ink-dim"
+                      }`}
+                    >
+                      📁 {suggestion.name}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void dispatch({ AddCommonsCategorySuggestionAt: index })}
+                      className="mr-[6px] rounded-[4px] border border-line-strong px-[6px] py-[2px] text-[10px] text-ink-dim hover:border-ink-faint"
+                    >
+                      Add
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        )}
+        <PopupError message={popup.validation_error} />
+      </Body>
+    </Popup>
+  );
+}
+
+/** Redacted Commons credential editor; typed values remain in the Rust reducer. */
+export function CommonsCredentialsPopup({
+  editor,
+}: {
+  editor: CommonsCredentialsEditorView;
+}) {
+  const method = editor.auth_method === "bot-password" ? "BotPassword" : "Account password";
+  const fieldSummary = (length: number) =>
+    length === 0 ? "Empty" : `${length} character${length === 1 ? "" : "s"} entered`;
+
+  return (
+    <Popup
+      title="Wikimedia Commons credentials"
+      subtitle="Credentials stay in the Youta process"
+      layer={LAYER.credentialEditor}
+      width="600px"
+      onDismiss={() => void dispatch("DismissCommonsCredentials")}
+      footer={
+        <>
+          <PopupButton onClick={() => void dispatch("OpenCommonsBotPasswordGuide")}>Register BotPassword</PopupButton>
+          <PopupButton onClick={() => void dispatch("OpenCommonsAccountRegistration")}>Create account</PopupButton>
+          <PopupButton emphasis onClick={() => void dispatch("SubmitCommonsCredentials")}>Save credentials</PopupButton>
+          <PopupButton onClick={() => void dispatch("DismissCommonsCredentials")}>Cancel</PopupButton>
+        </>
+      }
+    >
+      <Body>
+        <div className="grid gap-3">
+          <p className="text-ink-dim">
+            Type into the selected field. Tab switches fields; Enter saves. Youta also discovers Pywikibot credentials and cookies in ~/.pywikibot/.
+          </p>
+          <button
+            type="button"
+            onClick={() => void dispatch({ SelectCommonsCredentialField: false })}
+            className={`grid min-h-[42px] grid-cols-[170px_minmax(0,1fr)] gap-3 rounded-[5px] border px-[9px] py-[6px] text-left text-xs ${
+              !editor.password_selected ? "border-accent bg-raised" : "border-line-strong hover:border-ink-faint"
+            }`}
+          >
+            <span className="text-ink-faint">Username</span>
+            <span>{fieldSummary(editor.username_length)}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void dispatch({ SelectCommonsCredentialField: true })}
+            className={`grid min-h-[42px] grid-cols-[170px_minmax(0,1fr)] gap-3 rounded-[5px] border px-[9px] py-[6px] text-left text-xs ${
+              editor.password_selected ? "border-accent bg-raised" : "border-line-strong hover:border-ink-faint"
+            }`}
+          >
+            <span className="text-ink-faint">Password</span>
+            <span>{fieldSummary(editor.password_length)}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void dispatch("CycleCommonsAuthMethod")}
+            className="grid min-h-[42px] grid-cols-[170px_minmax(0,1fr)] gap-3 rounded-[5px] border border-line-strong px-[9px] py-[6px] text-left text-xs hover:border-ink-faint"
+          >
+            <span className="text-ink-faint">Login method</span>
+            <span>{method} · click to change</span>
+          </button>
+          <p className="text-[11px] text-ink-faint">
+            Saved privately in ~/.config/youta/secrets/credentials.toml
+          </p>
+          <PopupError
+            message={
+              editor.validation_failed
+                ? "Could not save these credentials. Check both fields and try again."
+                : null
+            }
+          />
         </div>
       </Body>
     </Popup>
@@ -1099,7 +1357,7 @@ const CREDENTIAL_EDITORS: Record<CredentialEditor, { title: string; body: string
 /**
  * What the window shows while an editor it may not receive is open.
  *
- * This is a real gap rather than a placeholder for one. These four editors are
+ * This is a real gap rather than a placeholder for one. These editors are
  * modal, so while one is open the shared keyboard map routes every key into it
  * — and the YouTube one opens by itself the first time a search runs without
  * credentials. Without this the window would look like an ordinary screen that

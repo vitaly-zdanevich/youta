@@ -8,20 +8,21 @@
 //! # Serialization and secrets
 //!
 //! Most of this vocabulary derives [`Serialize`] so a frontend outside this
-//! process can consume it. Four popup views deliberately do not: they carry a
-//! `YouTube` API key, a Yandex OAuth token, a private note body, and a feed URL
-//! that may itself be a credential. Those values stay in this process. A
-//! frontend that must render those editors needs a redacting projection first —
-//! deriving [`Serialize`] on them would place secrets in another process's heap.
+//! process can consume it. Sensitive editor contents deliberately do not cross
+//! that boundary: API keys, OAuth tokens, Commons credentials, private notes,
+//! and potentially private feed URLs stay in this process. A frontend that must
+//! render those editors needs a redacting projection first — deriving
+//! [`Serialize`] on them would place secrets in another process's heap.
 //!
-//! Their [`ViewModel`] fields serialize as a bare `open` boolean rather than
-//! being skipped outright, through `serialize_editor_presence`. One bit is
-//! not a leak, and withholding it is worse than useless: these editors are
-//! modal, so while one is open the keyboard map routes every key into it. A
-//! frontend that cannot see that an editor exists renders an ordinary screen
-//! that silently ignores input — and the `YouTube` setup editor opens by itself
-//! the first time a search runs without credentials, so that is the state a new
-//! user would meet first.
+//! Most secret-bearing [`ViewModel`] fields serialize as a bare `open` boolean
+//! rather than being skipped outright, through `serialize_editor_presence`.
+//! The Commons editor uses a redacted projection containing only field lengths,
+//! focus, login method, and whether validation failed. Withholding even that
+//! state is worse than useless: these editors are modal, so while one is open
+//! the keyboard map routes every key into it. A frontend that cannot see that
+//! an editor exists renders an ordinary screen that silently ignores input —
+//! and the `YouTube` setup editor opens by itself the first time a search runs
+//! without credentials, so that is the state a new user would meet first.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "commons-upload")]
+use crate::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
+#[cfg(feature = "commons-upload")]
+use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
@@ -47,6 +52,16 @@ pub const YOUTUBE_API_KEY_GUIDE_URL: &str =
 
 /// Official overview of Yandex OAuth access tokens.
 pub const YANDEX_OAUTH_GUIDE_URL: &str = "https://yandex.com/dev/id/doc/en/concepts/ya-oauth-intro";
+
+/// Commons page for registering a narrowly scoped `BotPassword`.
+#[cfg(feature = "commons-upload")]
+pub const COMMONS_BOT_PASSWORD_GUIDE_URL: &str =
+    "https://commons.wikimedia.org/wiki/Special:BotPasswords";
+
+/// Commons page for registering a normal Wikimedia account.
+#[cfg(feature = "commons-upload")]
+pub const COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL: &str =
+    "https://commons.wikimedia.org/wiki/Special:CreateAccount";
 
 /// Google Cloud page where the user creates and restricts API credentials.
 pub const GOOGLE_CLOUD_CREDENTIALS_URL: &str = "https://console.cloud.google.com/apis/credentials";
@@ -568,6 +583,34 @@ fn serialize_editor_presence<T, S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_bool(editor.is_some())
+}
+
+/// Serializes only the non-secret shape needed to draw the Commons editor.
+#[cfg(feature = "commons-upload")]
+fn serialize_commons_credentials_editor<S: serde::Serializer>(
+    editor: &Option<CommonsCredentialsPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct RedactedCommonsCredentialsEditor {
+        username_length: usize,
+        password_length: usize,
+        password_selected: bool,
+        auth_method: WikimediaCommonsAuthMethod,
+        validation_failed: bool,
+    }
+
+    let Some(editor) = editor else {
+        return serializer.serialize_none();
+    };
+    RedactedCommonsCredentialsEditor {
+        username_length: editor.username.chars().count(),
+        password_length: editor.password.chars().count(),
+        password_selected: editor.password_selected,
+        auth_method: editor.auth_method,
+        validation_failed: editor.validation_error.is_some(),
+    }
+    .serialize(serializer)
 }
 
 /// Source-specific metadata layout used by a front-end's information panel.
@@ -1659,6 +1702,101 @@ impl std::fmt::Debug for YandexMusicSetupPopupView {
     }
 }
 
+/// Editable field focused in the Commons review popup.
+#[cfg(feature = "commons-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CommonsUploadField {
+    /// Required Commons filename.
+    #[default]
+    Title,
+    /// Short translatable caption.
+    Caption,
+    /// Provider description and contextual notes.
+    Description,
+    /// Canonical provider page.
+    Source,
+    /// Linked creator attribution.
+    Author,
+    /// Prefix used for Commons category completion.
+    Category,
+}
+
+/// Lifecycle shown in the Commons upload popup.
+#[cfg(feature = "commons-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CommonsUploadPhase {
+    /// Metadata is editable and no upload has started.
+    #[default]
+    Review,
+    /// Provider audio is downloading or transcoding to Opus.
+    PreparingAudio,
+    /// Commons is accepting server-acknowledged upload chunks.
+    Uploading,
+    /// Commons published the new file-description page.
+    Complete,
+}
+
+/// Public, serializable Commons review and progress state.
+#[cfg(feature = "commons-upload")]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommonsUploadPopupView {
+    /// Editable metadata used to create the file-description page.
+    pub draft: CommonsUploadDraft,
+    /// Field currently receiving keyboard input.
+    pub selected_field: CommonsUploadField,
+    /// Prefix used for category autocompletion.
+    pub category_query: String,
+    /// Current bounded category suggestions.
+    pub category_suggestions: Vec<CommonsCategorySuggestion>,
+    /// Highlighted category suggestion.
+    pub selected_category_suggestion: usize,
+    /// Current review, preparation, upload, or completion phase.
+    pub phase: CommonsUploadPhase,
+    /// Monotonic frame counter for the deliberately slow activity animation.
+    pub animation_frame: usize,
+    /// Bytes acknowledged by Commons during the chunked upload.
+    pub uploaded_bytes: u64,
+    /// Total staged Opus bytes when upload has begun.
+    pub total_bytes: Option<u64>,
+    /// Inline validation or worker error.
+    pub validation_error: Option<String>,
+    /// Public file page after a successful upload.
+    pub result_url: Option<url::Url>,
+}
+
+/// Secret-bearing Commons credential editor retained inside the process.
+#[cfg(feature = "commons-upload")]
+#[derive(Clone, Eq, PartialEq)]
+pub struct CommonsCredentialsPopupView {
+    /// Account or `BotPassword` username.
+    pub username: String,
+    /// Regular password or `BotPassword` secret.
+    pub password: String,
+    /// Selected `MediaWiki` authentication flow.
+    pub auth_method: WikimediaCommonsAuthMethod,
+    /// Whether keyboard input currently targets the password.
+    pub password_selected: bool,
+    /// Private Youta file that will receive the credentials.
+    pub credentials_path: String,
+    /// Inline validation or authentication error.
+    pub validation_error: Option<String>,
+}
+
+#[cfg(feature = "commons-upload")]
+impl std::fmt::Debug for CommonsCredentialsPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommonsCredentialsPopupView")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("auth_method", &self.auth_method)
+            .field("password_selected", &self.password_selected)
+            .field("credentials_path", &self.credentials_path)
+            .field("validation_error", &self.validation_error)
+            .finish()
+    }
+}
+
 /// Selectable credential field in the YouTube provider setup popup.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum YouTubeSetupField {
@@ -1869,6 +2007,22 @@ pub struct ViewModel {
         serialize_with = "serialize_editor_presence"
     )]
     pub yandex_music_setup_popup: Option<YandexMusicSetupPopupView>,
+    /// Whether this build contains the removable Commons upload capability.
+    #[cfg(feature = "commons-upload")]
+    pub commons_upload_supported: bool,
+    /// Whether the exact selection can enter the Commons audio review flow.
+    #[cfg(feature = "commons-upload")]
+    pub commons_upload_available: bool,
+    /// Public metadata review, progress, and completion state.
+    #[cfg(feature = "commons-upload")]
+    pub commons_upload_popup: Option<CommonsUploadPopupView>,
+    /// Secret Commons credential editor shown when discovery finds no account.
+    #[cfg(feature = "commons-upload")]
+    #[serde(
+        rename = "commons_credentials_editor",
+        serialize_with = "serialize_commons_credentials_editor"
+    )]
+    pub commons_credentials_popup: Option<CommonsCredentialsPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2004,6 +2158,14 @@ impl Default for ViewModel {
             video_qr_popup: None,
             youtube_setup_popup: None,
             yandex_music_setup_popup: None,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_supported: true,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_available: false,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_popup: None,
+            #[cfg(feature = "commons-upload")]
+            commons_credentials_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
@@ -2275,6 +2437,57 @@ pub enum UiAction {
     DismissPlaylistPopup,
     /// Download the selected item.
     Download,
+    /// Open the selected `YouTube`, Yandex Music, or Apple Podcasts Commons review.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsUpload,
+    /// Select one editable Commons metadata field.
+    #[cfg(feature = "commons-upload")]
+    SelectCommonsUploadField(CommonsUploadField),
+    /// Append one character to the focused Commons metadata field.
+    #[cfg(feature = "commons-upload")]
+    AppendCommonsUploadCharacter(char),
+    /// Insert a line break into a multiline Commons metadata field.
+    #[cfg(feature = "commons-upload")]
+    InsertCommonsUploadNewline,
+    /// Remove the final character from the focused Commons metadata field.
+    #[cfg(feature = "commons-upload")]
+    DeleteCommonsUploadCharacter,
+    /// Remove the final word from the focused Commons metadata field.
+    #[cfg(feature = "commons-upload")]
+    DeleteCommonsUploadWord,
+    /// Cycle the reviewed free-license choice.
+    #[cfg(feature = "commons-upload")]
+    CycleCommonsUploadLicense,
+    /// Move through bounded Commons category suggestions.
+    #[cfg(feature = "commons-upload")]
+    MoveCommonsCategorySuggestion(i32),
+    /// Select an exact Commons category suggestion.
+    #[cfg(feature = "commons-upload")]
+    SelectCommonsCategorySuggestion(usize),
+    /// Add the selected Commons category to the upload metadata.
+    #[cfg(feature = "commons-upload")]
+    AddCommonsCategorySuggestion,
+    /// Add one exact rendered Commons category suggestion.
+    #[cfg(feature = "commons-upload")]
+    AddCommonsCategorySuggestionAt(usize),
+    /// Open the selected Commons category page through the external opener.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsCategorySuggestion,
+    /// Open one exact rendered Commons category suggestion.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsCategorySuggestionAt(usize),
+    /// Remove one category already attached to the draft.
+    #[cfg(feature = "commons-upload")]
+    RemoveCommonsUploadCategory(usize),
+    /// Start Opus preparation and the reviewed Commons upload.
+    #[cfg(feature = "commons-upload")]
+    SubmitCommonsUpload,
+    /// Close the Commons review after editing or completion.
+    #[cfg(feature = "commons-upload")]
+    DismissCommonsUpload,
+    /// Open the successful Commons file page.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsUploadResult,
     /// Open the canonical item link in a browser.
     OpenInBrowser,
     /// Open the selected item's exact channel page in a browser.
@@ -2387,6 +2600,36 @@ pub enum UiAction {
     SubmitYandexMusicSetup,
     /// Close the Yandex Music setup popup without saving.
     DismissYandexMusicSetup,
+    /// Toggle the Commons credential editor between username and password.
+    #[cfg(feature = "commons-upload")]
+    ToggleCommonsCredentialField,
+    /// Select the username (`false`) or password (`true`) credential field.
+    #[cfg(feature = "commons-upload")]
+    SelectCommonsCredentialField(bool),
+    /// Append one character to the selected Commons credential field.
+    #[cfg(feature = "commons-upload")]
+    AppendCommonsCredentialCharacter(char),
+    /// Remove the final character from the selected Commons credential field.
+    #[cfg(feature = "commons-upload")]
+    DeleteCommonsCredentialCharacter,
+    /// Remove the final word from the selected Commons credential field.
+    #[cfg(feature = "commons-upload")]
+    DeleteCommonsCredentialWord,
+    /// Switch between recommended `BotPassword` and regular account login.
+    #[cfg(feature = "commons-upload")]
+    CycleCommonsAuthMethod,
+    /// Validate and save the entered Commons credentials.
+    #[cfg(feature = "commons-upload")]
+    SubmitCommonsCredentials,
+    /// Close the Commons credential editor without saving.
+    #[cfg(feature = "commons-upload")]
+    DismissCommonsCredentials,
+    /// Open `BotPassword` registration.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsBotPasswordGuide,
+    /// Open normal Wikimedia account registration.
+    #[cfg(feature = "commons-upload")]
+    OpenCommonsAccountRegistration,
     /// Open or focus the RSS/Atom podcast-feed editor.
     OpenRssSubscriptionPopup,
     /// Add one printable character to the draft RSS feed URL.
@@ -2486,7 +2729,7 @@ pub enum UiAction {
 impl UiAction {
     /// Returns whether this action exists only to launch an external URL.
     pub(crate) fn requires_external_opener(&self) -> bool {
-        matches!(
+        let standard = matches!(
             self,
             Self::ActivateDetailLink(_)
                 | Self::OpenWikidataValue(_)
@@ -2500,7 +2743,19 @@ impl UiAction {
                 | Self::OpenGoogleCloudCredentials
                 | Self::OpenInvidiousInstances
                 | Self::OpenYandexOAuthGuide
-        )
+        );
+        #[cfg(feature = "commons-upload")]
+        let commons = matches!(
+            self,
+            Self::OpenCommonsCategorySuggestion
+                | Self::OpenCommonsCategorySuggestionAt(_)
+                | Self::OpenCommonsUploadResult
+                | Self::OpenCommonsBotPasswordGuide
+                | Self::OpenCommonsAccountRegistration
+        );
+        #[cfg(not(feature = "commons-upload"))]
+        let commons = false;
+        standard || commons
     }
 }
 
@@ -2607,7 +2862,7 @@ mod tests {
         );
     }
 
-    /// Fills the four editors whose values must never leave this process.
+    /// Fills every editor whose values must never leave this process.
     fn view_holding_every_secret() -> ViewModel {
         ViewModel {
             youtube_setup_popup: Some(YouTubeSetupPopupView {
@@ -2622,6 +2877,15 @@ mod tests {
                 token: "y0_TOTALLY_SECRET_OAUTH_TOKEN_111111".to_owned(),
                 token_path: "/config/secrets/credentials.toml".to_owned(),
                 validating: false,
+                validation_error: None,
+            }),
+            #[cfg(feature = "commons-upload")]
+            commons_credentials_popup: Some(CommonsCredentialsPopupView {
+                username: "CommonsSecretUsername".to_owned(),
+                password: "TOTALLY_SECRET_COMMONS_PASSWORD_222222".to_owned(),
+                auth_method: WikimediaCommonsAuthMethod::BotPassword,
+                password_selected: true,
+                credentials_path: "/config/secrets/credentials.toml".to_owned(),
                 validation_error: None,
             }),
             rss_subscription_popup: Some(RssSubscriptionPopupView {
@@ -2698,6 +2962,10 @@ mod tests {
         for secret in [
             "AIzaSyTOTALLY_SECRET_API_KEY_000000000",
             "y0_TOTALLY_SECRET_OAUTH_TOKEN_111111",
+            #[cfg(feature = "commons-upload")]
+            "CommonsSecretUsername",
+            #[cfg(feature = "commons-upload")]
+            "TOTALLY_SECRET_COMMONS_PASSWORD_222222",
             "SECRET_FEED_GUID",
             "TOTALLY_SECRET_PRIVATE_NOTE_BODY",
             // Paths are not credentials, but they name the file that holds one,
@@ -2745,6 +3013,31 @@ mod tests {
                 "{marker} must report a closed editor as a bare boolean"
             );
         }
+    }
+
+    /// The Commons window receives editing shape but never credential content.
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn commons_credentials_cross_only_as_a_redacted_editor_projection() {
+        let encoded = serde_json::to_value(view_holding_every_secret())
+            .expect("the view model must serialize");
+        let closed =
+            serde_json::to_value(ViewModel::default()).expect("the view model must serialize");
+
+        assert_eq!(
+            encoded.get("commons_credentials_editor"),
+            Some(&serde_json::json!({
+                "username_length": 21,
+                "password_length": 38,
+                "password_selected": true,
+                "auth_method": "bot-password",
+                "validation_failed": false,
+            }))
+        );
+        assert_eq!(
+            closed.get("commons_credentials_editor"),
+            Some(&serde_json::Value::Null)
+        );
     }
 
     #[test]

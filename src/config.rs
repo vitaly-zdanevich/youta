@@ -85,6 +85,16 @@ pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
 /// Environment variable that overrides the Yandex Music OAuth access token.
 pub const YANDEX_MUSIC_TOKEN_ENV: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
 
+/// Environment variable that overrides the Wikimedia Commons username.
+pub const WIKIMEDIA_COMMONS_USERNAME_ENV: &str = "YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_USERNAME";
+
+/// Environment variable that overrides the Wikimedia Commons password.
+pub const WIKIMEDIA_COMMONS_PASSWORD_ENV: &str = "YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_PASSWORD";
+
+/// Environment variable that overrides the Wikimedia Commons login method.
+pub const WIKIMEDIA_COMMONS_AUTH_METHOD_ENV: &str =
+    "YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_AUTH_METHOD";
+
 /// Environment variable that overrides the configured Invidious base URL.
 pub const INVIDIOUS_BASE_URL_ENV: &str = "YOUTA_PROVIDERS__INVIDIOUS_BASE_URL";
 
@@ -127,6 +137,9 @@ struct CredentialsFile {
 struct ProviderCredentials {
     youtube_api_key: Option<String>,
     yandex_music_token: Option<String>,
+    wikimedia_commons_username: Option<String>,
+    wikimedia_commons_password: Option<String>,
+    wikimedia_commons_auth_method: WikimediaCommonsAuthMethod,
     mod_archive_api_key: Option<String>,
     jamendo_client_id: Option<String>,
     acoustid_client_key: Option<String>,
@@ -295,6 +308,10 @@ impl Config {
         if let Some(token) = self.providers.yandex_music_token.as_deref() {
             validate_generic_credential("providers.yandex_music_token", token)?;
         }
+        validate_wikimedia_commons_credentials(
+            self.providers.wikimedia_commons_username.as_deref(),
+            self.providers.wikimedia_commons_password.as_deref(),
+        )?;
         for (field, credential) in [
             (
                 "providers.mod_archive_api_key",
@@ -519,6 +536,71 @@ impl Config {
         )?;
         write_private_config(&config_path, config_document.to_string().as_bytes())?;
         self.providers.yandex_music_token = Some(token);
+        Ok(())
+    }
+
+    /// Persists Wikimedia Commons credentials in Youta's private credentials file.
+    ///
+    /// Existing unrelated settings, comments, and provider credentials are
+    /// preserved. A matching environment override prevents the update because
+    /// it would shadow the newly saved values on restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either credential is invalid, an override is
+    /// active, or the private TOML file cannot be updated atomically.
+    #[cfg(all(feature = "controller", feature = "commons-upload"))]
+    pub fn save_wikimedia_commons_credentials(
+        &mut self,
+        username: String,
+        password: String,
+        auth_method: WikimediaCommonsAuthMethod,
+    ) -> Result<(), ConfigError> {
+        for variable in [
+            WIKIMEDIA_COMMONS_USERNAME_ENV,
+            WIKIMEDIA_COMMONS_PASSWORD_ENV,
+            WIKIMEDIA_COMMONS_AUTH_METHOD_ENV,
+        ] {
+            if std::env::var_os(variable).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{variable} overrides the saved Wikimedia Commons credentials; change or remove it before saving"
+                )));
+            }
+        }
+        validate_wikimedia_commons_credentials(Some(&username), Some(&password))?;
+
+        self.ensure_directories()?;
+        let config_path = self.config_file();
+        let credentials_path = self.credentials_file();
+        let mut config_document = read_editable_config(&config_path)?;
+        let mut credentials_document = read_editable_credentials(&credentials_path)?;
+        migrate_legacy_provider_credentials(&mut config_document, &mut credentials_document)?;
+
+        if let Some(providers) = config_document
+            .get_mut("providers")
+            .and_then(Item::as_table_mut)
+        {
+            for field in [
+                "wikimedia_commons_username",
+                "wikimedia_commons_password",
+                "wikimedia_commons_auth_method",
+            ] {
+                providers.remove(field);
+            }
+        }
+        let providers = editable_table(&mut credentials_document, "providers")?;
+        providers["wikimedia_commons_username"] = value(username.clone());
+        providers["wikimedia_commons_password"] = value(password.clone());
+        providers["wikimedia_commons_auth_method"] = value(auth_method.as_config_value());
+
+        write_private_config(
+            &credentials_path,
+            credentials_document.to_string().as_bytes(),
+        )?;
+        write_private_config(&config_path, config_document.to_string().as_bytes())?;
+        self.providers.wikimedia_commons_username = Some(username);
+        self.providers.wikimedia_commons_password = Some(password);
+        self.providers.wikimedia_commons_auth_method = auth_method;
         Ok(())
     }
 
@@ -1301,6 +1383,27 @@ impl fmt::Display for PersistenceBackend {
     }
 }
 
+/// Password flow used when Youta logs in to Wikimedia Commons.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WikimediaCommonsAuthMethod {
+    /// `MediaWiki` `BotPassword` login, recommended for narrowly scoped access.
+    #[default]
+    BotPassword,
+    /// A regular Wikimedia account password through `clientlogin`.
+    AccountPassword,
+}
+
+impl WikimediaCommonsAuthMethod {
+    #[cfg(all(feature = "controller", feature = "commons-upload"))]
+    const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::BotPassword => "bot-password",
+            Self::AccountPassword => "account-password",
+        }
+    }
+}
+
 /// Configurable provider instances and external helper paths.
 ///
 /// Optional API keys are plain strings at this layer. A keyring adapter can
@@ -1327,6 +1430,12 @@ pub struct ProviderConfig {
     pub youtube_api_key: Option<String>,
     /// Optional OAuth access token for the user's Yandex Music account.
     pub yandex_music_token: Option<String>,
+    /// Optional Wikimedia Commons account or `BotPassword` username.
+    pub wikimedia_commons_username: Option<String>,
+    /// Optional Wikimedia Commons account or `BotPassword` password.
+    pub wikimedia_commons_password: Option<String>,
+    /// Login flow paired with the configured Commons password.
+    pub wikimedia_commons_auth_method: WikimediaCommonsAuthMethod,
     /// Optional Mod Archive API credential or externally resolved reference.
     pub mod_archive_api_key: Option<String>,
     /// Optional client ID issued for the user's Jamendo application.
@@ -1376,6 +1485,21 @@ impl fmt::Debug for ProviderConfig {
                 &self.yandex_music_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
+                "wikimedia_commons_username",
+                &self.wikimedia_commons_username,
+            )
+            .field(
+                "wikimedia_commons_password",
+                &self
+                    .wikimedia_commons_password
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .field(
+                "wikimedia_commons_auth_method",
+                &self.wikimedia_commons_auth_method,
+            )
+            .field(
                 "mod_archive_api_key",
                 &self.mod_archive_api_key.as_ref().map(|_| "[REDACTED]"),
             )
@@ -1407,6 +1531,9 @@ impl Default for ProviderConfig {
             funkwhale_instance_url: None,
             youtube_api_key: None,
             yandex_music_token: None,
+            wikimedia_commons_username: None,
+            wikimedia_commons_password: None,
+            wikimedia_commons_auth_method: WikimediaCommonsAuthMethod::default(),
             mod_archive_api_key: None,
             jamendo_client_id: None,
             acoustid_client_key: None,
@@ -1629,6 +1756,11 @@ fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
         validate_generic_credential("providers.yandex_music_token", token)
             .map_err(|error| credential_file_error(path, error))?;
     }
+    validate_wikimedia_commons_credentials(
+        credentials.providers.wikimedia_commons_username.as_deref(),
+        credentials.providers.wikimedia_commons_password.as_deref(),
+    )
+    .map_err(|error| credential_file_error(path, error))?;
     for (field, credential) in [
         (
             "providers.mod_archive_api_key",
@@ -1689,6 +1821,23 @@ fn validate_generic_credential(field: &str, credential: &str) -> Result<(), Conf
         )));
     }
     Ok(())
+}
+
+fn validate_wikimedia_commons_credentials(
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), ConfigError> {
+    match (username, password) {
+		(None, None) => Ok(()),
+		(Some(username), Some(password)) => {
+			validate_generic_credential("providers.wikimedia_commons_username", username)?;
+			validate_generic_credential("providers.wikimedia_commons_password", password)
+		}
+		_ => Err(ConfigError::Invalid(
+			"providers.wikimedia_commons_username and providers.wikimedia_commons_password must be configured together"
+				.to_owned(),
+		)),
+	}
 }
 
 fn validate_acoustid_client_key(field: &str, client_key: &str) -> Result<(), ConfigError> {
@@ -1831,6 +1980,9 @@ fn migrate_legacy_provider_credentials(
         for field in [
             "youtube_api_key",
             "yandex_music_token",
+            "wikimedia_commons_username",
+            "wikimedia_commons_password",
+            "wikimedia_commons_auth_method",
             "mod_archive_api_key",
             "jamendo_client_id",
         ] {
@@ -2742,6 +2894,8 @@ youtube_api_key = "keep-this-existing-secret"
             mod_archive_api_key: Some("mod-secret-canary".to_owned()),
             jamendo_client_id: Some("jamendo-client-canary".to_owned()),
             acoustid_client_key: Some("acoustid-secret-canary".to_owned()),
+            wikimedia_commons_username: Some("CommonsExample".to_owned()),
+            wikimedia_commons_password: Some("commons-password-canary".to_owned()),
             ..ProviderConfig::default()
         };
         let rendered = format!("{providers:?}");
@@ -2751,6 +2905,7 @@ youtube_api_key = "keep-this-existing-secret"
             "mod-secret-canary",
             "jamendo-client-canary",
             "acoustid-secret-canary",
+            "commons-password-canary",
         ] {
             assert!(!rendered.contains(secret));
         }
@@ -2759,6 +2914,53 @@ youtube_api_key = "keep-this-existing-secret"
 
         providers.youtube_api_key = None;
         assert!(!format!("{providers:?}").contains("youtube-secret-canary"));
+    }
+
+    #[cfg(all(feature = "controller", feature = "commons-upload"))]
+    #[test]
+    fn wikimedia_commons_credentials_save_privately_and_reload() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("youta");
+        fs::create_dir(&root).expect("config directory");
+        fs::write(
+            root.join("config.toml"),
+            "# keep this comment\n[providers]\nbandcamp_audio_format = \"flac\"\n",
+        )
+        .expect("public configuration");
+        let mut config = Config::load_from_dir_with_environment(root.clone(), false)
+            .expect("load initial config");
+
+        config
+            .save_wikimedia_commons_credentials(
+                "CommonsExample".to_owned(),
+                "bot-password-secret".to_owned(),
+                WikimediaCommonsAuthMethod::BotPassword,
+            )
+            .expect("save Commons credentials");
+
+        let public = fs::read_to_string(config.config_file()).expect("public config");
+        assert!(public.contains("# keep this comment"));
+        assert!(!public.contains("CommonsExample"));
+        assert!(!public.contains("bot-password-secret"));
+        let private = fs::read_to_string(config.credentials_file()).expect("credentials");
+        assert!(private.contains("wikimedia_commons_username = \"CommonsExample\""));
+        assert!(private.contains("wikimedia_commons_password = \"bot-password-secret\""));
+        assert!(private.contains("wikimedia_commons_auth_method = \"bot-password\""));
+
+        let reloaded =
+            Config::load_from_dir_with_environment(root, false).expect("reload credentials");
+        assert_eq!(
+            reloaded.providers.wikimedia_commons_username.as_deref(),
+            Some("CommonsExample")
+        );
+        assert_eq!(
+            reloaded.providers.wikimedia_commons_password.as_deref(),
+            Some("bot-password-secret")
+        );
+        assert_eq!(
+            reloaded.providers.wikimedia_commons_auth_method,
+            WikimediaCommonsAuthMethod::BotPassword
+        );
     }
 
     #[test]

@@ -206,6 +206,11 @@ bandcamp_audio_format = 'best-available'
 #   # OAuth access token issued for your Yandex Music account. This is not an
 #   # API key; Youta never asks for or stores the account password.
 #   yandex_music_token = '...'
+#   # Scoped BotPassword is recommended. Use `account-password` only when the
+#   # account can complete MediaWiki clientlogin without an interactive step.
+#   wikimedia_commons_username = 'Example@youta'
+#   wikimedia_commons_password = '...'
+#   wikimedia_commons_auth_method = 'bot-password'
 #
 # Environment overrides have the highest precedence, for example:
 #
@@ -214,6 +219,9 @@ bandcamp_audio_format = 'best-available'
 #   YOUTA_PROVIDERS__JAMENDO_CLIENT_ID='...'
 #   YOUTA_PROVIDERS__ACOUSTID_CLIENT_KEY='...'
 #   YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN='...'
+#   YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_USERNAME='Example@youta'
+#   YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_PASSWORD='...'
+#   YOUTA_PROVIDERS__WIKIMEDIA_COMMONS_AUTH_METHOD='bot-password'
 #
 # If YouTube search has no provider, its TUI setup popup accepts either the API
 # key or the Invidious URL above. It shows both exact destinations:

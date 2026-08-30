@@ -22,8 +22,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+#[cfg(feature = "commons-upload")]
+use youta::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 use youta::domain::{MediaId, SourceKind};
 use youta::keymap::{PopupGeometry, ScrollGeometry};
+#[cfg(feature = "commons-upload")]
+use youta::view::CommonsUploadPopupView;
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
@@ -248,6 +252,25 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         }),
     );
     emitted.insert("DownloadView", emitted_keys(&DownloadView::default()));
+    #[cfg(feature = "commons-upload")]
+    {
+        emitted.insert(
+            "CommonsUploadPopupView",
+            emitted_keys(&CommonsUploadPopupView::default()),
+        );
+        emitted.insert(
+            "CommonsUploadDraft",
+            emitted_keys(&CommonsUploadDraft::default()),
+        );
+        emitted.insert(
+            "CommonsCategorySuggestion",
+            emitted_keys(&CommonsCategorySuggestion {
+                name: String::new(),
+                url: url::Url::parse("https://commons.wikimedia.org/wiki/Category:Audio")
+                    .expect("Commons category fixture URL"),
+            }),
+        );
+    }
     emitted.insert(
         "SubscriptionsView",
         emitted_keys(&SubscriptionsView::default()),
@@ -338,6 +361,9 @@ fn every_checked_interface_is_actually_declared() {
         "PlaylistChoiceView",
         "LocalMoveDestinationView",
         "DownloadView",
+        "CommonsUploadPopupView",
+        "CommonsUploadDraft",
+        "CommonsCategorySuggestion",
         "SubscriptionsView",
         "QueuePopupView",
         "QueueRowView",
@@ -816,6 +842,53 @@ fn the_window_exposes_local_audio_quality_analysis_and_its_result_section() {
     );
 }
 
+#[cfg(feature = "commons-upload")]
+#[test]
+fn the_window_exposes_commons_review_without_putting_the_hotkey_on_the_button() {
+    let details = source_named("components/Details.tsx");
+    for required in [
+        "view.commons_upload_available",
+        "dispatch(\"OpenCommonsUpload\")",
+        ">Upload to Commons</Action>",
+    ] {
+        assert!(
+            details.contains(required),
+            "Commons Details control no longer contains {required}"
+        );
+    }
+    assert!(
+        !details.contains("Upload to Commons (U)")
+            && !details.contains("[U] Upload to Commons")
+            && !details.contains("<u>U</u>pload to Commons"),
+        "the Commons button must not render its hotkey"
+    );
+
+    let popups = source_named("components/popups.tsx");
+    for required in [
+        "[\"U\", \"upload selected YouTube, Yandex Music, or Apple Podcasts audio to Commons\"]",
+        "Youta currently uploads audio only",
+        "CommonsField label=\"Title *\"",
+        "OpenCommonsCategorySuggestionAt",
+        "📁 {suggestion.name}",
+        "<progress",
+        "Thanks for preserving the history",
+        "OpenCommonsUploadResult",
+        "CommonsCredentialsPopup",
+        "SelectCommonsCredentialField",
+        "CycleCommonsAuthMethod",
+        "SubmitCommonsCredentials",
+        "OpenCommonsBotPasswordGuide",
+        "OpenCommonsAccountRegistration",
+        "~/.config/youta/secrets/credentials.toml",
+        "~/.pywikibot/",
+    ] {
+        assert!(
+            popups.contains(required),
+            "Commons window flow no longer contains {required}"
+        );
+    }
+}
+
 #[test]
 fn the_window_keeps_radio_homepages_visible_and_openable() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1027,7 +1100,7 @@ fn the_window_video_summary_popup_keeps_progress_copy_cancel_close_and_scroll_ac
     }
 }
 
-/// The four credential-bearing editors must stay out of the window's vocabulary.
+/// Credential-bearing editors must stay out of the window's vocabulary.
 ///
 /// `src/view.rs` skips them when serializing, so declaring them here could only
 /// ever produce a type that is always `undefined` — and would signal to the next
@@ -1040,10 +1113,12 @@ fn the_contract_never_names_a_credential_bearing_editor() {
         "YandexMusicSetupPopupView",
         "RssSubscriptionPopupView",
         "PrivateNotePopupView",
+        "CommonsCredentialsPopupView",
         "youtube_setup_popup",
         "yandex_music_setup_popup",
         "rss_subscription_popup",
         "private_note_popup",
+        "commons_credentials_popup",
     ] {
         assert!(
             !declared_interfaces(&source)

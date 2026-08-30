@@ -35,6 +35,8 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(feature = "commons-upload")]
+use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
     VideoSummaryBackend,
@@ -1678,6 +1680,16 @@ struct HitMap {
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
     yandex_music_setup_field: Option<Rect>,
     yandex_music_setup_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "commons-upload")]
+    commons_upload_fields: Vec<(CommonsUploadField, Rect)>,
+    #[cfg(feature = "commons-upload")]
+    commons_upload_suggestions: Vec<(usize, Rect)>,
+    #[cfg(feature = "commons-upload")]
+    commons_upload_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "commons-upload")]
+    commons_credentials_fields: Vec<(bool, Rect)>,
+    #[cfg(feature = "commons-upload")]
+    commons_credentials_buttons: Vec<(UiAction, Rect)>,
     rss_subscription_field: Option<Rect>,
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
@@ -2023,6 +2035,10 @@ fn render_frame(
         || view.local_file_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    #[cfg(feature = "commons-upload")]
+    let thumbnail_is_obscured = thumbnail_is_obscured
+        || view.commons_upload_popup.is_some()
+        || view.commons_credentials_popup.is_some();
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
@@ -2109,6 +2125,32 @@ fn render_frame(
             &theme,
             hit_map,
         );
+    }
+    #[cfg(feature = "commons-upload")]
+    {
+        hit_map.commons_upload_fields.clear();
+        hit_map.commons_upload_suggestions.clear();
+        hit_map.commons_upload_buttons.clear();
+        if let Some(popup) = view.commons_upload_popup.as_ref() {
+            render_commons_upload_popup(
+                frame,
+                popup,
+                view.external_opener_available,
+                &theme,
+                hit_map,
+            );
+        }
+        hit_map.commons_credentials_fields.clear();
+        hit_map.commons_credentials_buttons.clear();
+        if let Some(popup) = view.commons_credentials_popup.as_ref() {
+            render_commons_credentials_popup(
+                frame,
+                popup,
+                view.external_opener_available,
+                &theme,
+                hit_map,
+            );
+        }
     }
     hit_map.rss_subscription_field = None;
     hit_map.rss_subscription_buttons.clear();
@@ -3853,6 +3895,17 @@ fn render_information_panel(
             button("G", "Summarize", show_hotkeys),
             theme.accent,
             UiAction::GenerateVideoSummary,
+        );
+    }
+    #[cfg(feature = "commons-upload")]
+    if show_text_selection && view.commons_upload_available {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            "Upload to Commons".to_owned(),
+            theme.accent,
+            UiAction::OpenCommonsUpload,
         );
     }
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
@@ -6181,6 +6234,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         "  o video page"
     };
+    #[cfg(feature = "commons-upload")]
+    let playlist_actions_help = "  U Commons audio     l toggle todo     P choose playlist";
+    #[cfg(not(feature = "commons-upload"))]
+    let playlist_actions_help = "  l toggle todo     P choose playlist";
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -6208,7 +6265,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Actions",
         "  Ctrl+n play next     a add to queue     u show queue     d download",
         video_actions_help,
-        "  l toggle todo     P choose playlist",
+        playlist_actions_help,
         "  O channel page     i subscription description     p preferences",
         "  y copy link     c channel info     s local subscribe/unsubscribe",
         private_note_help,
@@ -7925,6 +7982,407 @@ fn render_yandex_music_setup_popup(
         UiAction::DismissYandexMusicSetup,
         Rect::new(button_x, sections[5].y, cancel_width, sections[5].height),
     ));
+}
+
+#[cfg(feature = "commons-upload")]
+#[allow(clippy::too_many_lines)]
+fn render_commons_upload_popup(
+    frame: &mut Frame<'_>,
+    popup: &CommonsUploadPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(104, 28, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        panel_block(" Upload audio to Wikimedia Commons ", theme),
+        area,
+    );
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+		Paragraph::new(
+			"Youta currently uploads audio only. Review source rights before publishing; only the title is a required text field.",
+		)
+		.style(theme.base)
+		.wrap(Wrap { trim: false }),
+		sections[0],
+	);
+    let fields = [
+        (
+            CommonsUploadField::Title,
+            "Title",
+            popup.draft.title.as_str(),
+        ),
+        (
+            CommonsUploadField::Caption,
+            "Caption",
+            popup.draft.caption.as_str(),
+        ),
+        (
+            CommonsUploadField::Description,
+            "Description",
+            popup.draft.description.as_str(),
+        ),
+        (
+            CommonsUploadField::Source,
+            "Source",
+            popup.draft.source.as_str(),
+        ),
+        (
+            CommonsUploadField::Author,
+            "Author",
+            popup.draft.author.as_str(),
+        ),
+    ];
+    for ((field, label, value), area) in fields.into_iter().zip(sections[1..=5].iter()) {
+        let selected = popup.selected_field == field && popup.phase == CommonsUploadPhase::Review;
+        let value = value.replace('\n', " ↵ ");
+        frame.render_widget(
+            Paragraph::new(truncate_setup_value(
+                &value,
+                usize::from(area.width.saturating_sub(2)),
+            ))
+            .style(if selected { theme.selected } else { theme.base })
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(if selected { theme.accent } else { theme.border })
+                    .title(format!("{} {label}", if selected { "▶" } else { " " })),
+            ),
+            *area,
+        );
+        if popup.phase == CommonsUploadPhase::Review {
+            hit_map.commons_upload_fields.push((field, *area));
+        }
+    }
+    let license_text = format!(
+        "License: {}{}",
+        popup.draft.license.label(),
+        if popup.phase == CommonsUploadPhase::Review {
+            " · click to change"
+        } else {
+            ""
+        }
+    );
+    frame.render_widget(
+        Paragraph::new(license_text).style(
+            if popup.draft.license == crate::commons_upload::CommonsLicense::Unspecified {
+                Style::default().fg(Color::Yellow)
+            } else {
+                theme.base
+            },
+        ),
+        sections[6],
+    );
+    if popup.phase == CommonsUploadPhase::Review {
+        hit_map
+            .commons_upload_buttons
+            .push((UiAction::CycleCommonsUploadLicense, sections[6]));
+    }
+    let categories = if popup.draft.categories.is_empty() {
+        "Categories: none".to_owned()
+    } else {
+        format!("Categories: {}", popup.draft.categories.join(" · "))
+    };
+    frame.render_widget(Paragraph::new(categories).style(theme.muted), sections[7]);
+    let category_selected = popup.selected_field == CommonsUploadField::Category
+        && popup.phase == CommonsUploadPhase::Review;
+    frame.render_widget(
+        Paragraph::new(if popup.category_query.is_empty() {
+            "type a Commons category prefix".to_owned()
+        } else {
+            popup.category_query.clone()
+        })
+        .style(if category_selected {
+            theme.selected
+        } else {
+            theme.muted
+        })
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(if category_selected {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .title(if category_selected {
+                    " ▶ Category autocomplete "
+                } else {
+                    " Category autocomplete "
+                }),
+        ),
+        sections[8],
+    );
+    if popup.phase == CommonsUploadPhase::Review {
+        hit_map
+            .commons_upload_fields
+            .push((CommonsUploadField::Category, sections[8]));
+    }
+    let suggestion_area = sections[9];
+    for (row, suggestion) in popup
+        .category_suggestions
+        .iter()
+        .take(usize::from(suggestion_area.height))
+        .enumerate()
+    {
+        let row = u16::try_from(row).unwrap_or(u16::MAX);
+        let area = Rect::new(
+            suggestion_area.x,
+            suggestion_area.y.saturating_add(row),
+            suggestion_area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(suggestion.label()).style(
+                if usize::from(row) == popup.selected_category_suggestion {
+                    theme.selected
+                } else {
+                    theme.accent
+                },
+            ),
+            area,
+        );
+        if external_opener_available {
+            hit_map
+                .commons_upload_suggestions
+                .push((usize::from(row), area));
+        }
+    }
+    let status = match popup.phase {
+        CommonsUploadPhase::Review => popup.validation_error.as_deref().map_or(
+            "Enter adds a suggestion; clicking 📁 opens its Commons page.",
+            |error| error,
+        ),
+        CommonsUploadPhase::PreparingAudio => {
+            let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
+            frames[(popup.animation_frame / 4) % frames.len()]
+        }
+        CommonsUploadPhase::Uploading => "Uploading Opus to Wikimedia Commons…",
+        CommonsUploadPhase::Complete => "Thanks for preserving the history",
+    };
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(if popup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[10],
+    );
+    if popup.phase == CommonsUploadPhase::Uploading {
+        let percent = popup.total_bytes.map_or(0, |total| {
+            if total == 0 {
+                0
+            } else {
+                popup
+                    .uploaded_bytes
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or_default()
+                    .min(100)
+            }
+        });
+        frame.render_widget(
+            Gauge::default()
+                .percent(u16::try_from(percent).unwrap_or(100))
+                .gauge_style(theme.accent),
+            sections[11],
+        );
+    } else {
+        let controls: Vec<(&str, UiAction)> = match popup.phase {
+            CommonsUploadPhase::Review => vec![
+                ("Upload audio", UiAction::SubmitCommonsUpload),
+                ("Add category", UiAction::AddCommonsCategorySuggestion),
+                ("Cancel", UiAction::DismissCommonsUpload),
+            ],
+            CommonsUploadPhase::Complete => vec![
+                ("Open file page", UiAction::OpenCommonsUploadResult),
+                ("Close", UiAction::DismissCommonsUpload),
+            ],
+            _ => Vec::new(),
+        };
+        render_inline_popup_buttons(
+            frame,
+            sections[11],
+            &controls,
+            theme,
+            &mut hit_map.commons_upload_buttons,
+        );
+    }
+}
+
+#[cfg(feature = "commons-upload")]
+#[allow(clippy::too_many_lines)]
+fn render_commons_credentials_popup(
+    frame: &mut Frame<'_>,
+    popup: &CommonsCredentialsPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(100, 19, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Configure Wikimedia Commons ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+		Paragraph::new(
+			"A scoped BotPassword is recommended. A normal account password may require interactive login that Youta cannot complete.",
+		)
+		.style(theme.base)
+		.wrap(Wrap { trim: false }),
+		sections[0],
+	);
+    let values = [
+        (false, "Username", popup.username.clone()),
+        (
+            true,
+            "Password (masked)",
+            masked_setup_value(
+                &popup.password,
+                usize::from(sections[2].width.saturating_sub(2)),
+            ),
+        ),
+    ];
+    for ((password_selected, label, value), area) in values.into_iter().zip(sections[1..=2].iter())
+    {
+        let selected = popup.password_selected == password_selected;
+        frame.render_widget(
+            Paragraph::new(value)
+                .style(if selected { theme.selected } else { theme.base })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if selected { theme.accent } else { theme.border })
+                        .title(format!("{} {label} ", if selected { "▶" } else { " " })),
+                ),
+            *area,
+        );
+        hit_map
+            .commons_credentials_fields
+            .push((password_selected, *area));
+    }
+    let method = match popup.auth_method {
+        WikimediaCommonsAuthMethod::BotPassword => "BotPassword (recommended)",
+        WikimediaCommonsAuthMethod::AccountPassword => "Regular account password",
+    };
+    frame.render_widget(
+        Paragraph::new(format!("Authentication: {method} · click to change")).style(theme.accent),
+        sections[3],
+    );
+    hit_map
+        .commons_credentials_buttons
+        .push((UiAction::CycleCommonsAuthMethod, sections[3]));
+    let guide = if external_opener_available {
+        "BotPassword registration · Account registration"
+    } else {
+        "Registration links are unavailable on this physical console"
+    };
+    frame.render_widget(Paragraph::new(guide).style(theme.muted), sections[4]);
+    if external_opener_available {
+        let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[4]);
+        hit_map
+            .commons_credentials_buttons
+            .push((UiAction::OpenCommonsBotPasswordGuide, halves[0]));
+        hit_map
+            .commons_credentials_buttons
+            .push((UiAction::OpenCommonsAccountRegistration, halves[1]));
+    }
+    let storage = format!(
+        "Saves as plaintext with mode 0600: {}{}",
+        popup.credentials_path,
+        popup
+            .validation_error
+            .as_ref()
+            .map_or_else(String::new, |error| format!("\nError: {error}"))
+    );
+    frame.render_widget(
+        Paragraph::new(storage)
+            .style(if popup.validation_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                theme.muted
+            })
+            .wrap(Wrap { trim: false }),
+        sections[5],
+    );
+    render_inline_popup_buttons(
+        frame,
+        sections[6],
+        &[
+            ("Save", UiAction::SubmitCommonsCredentials),
+            ("Cancel", UiAction::DismissCommonsCredentials),
+        ],
+        theme,
+        &mut hit_map.commons_credentials_buttons,
+    );
+}
+
+#[cfg(feature = "commons-upload")]
+fn render_inline_popup_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: &[(&str, UiAction)],
+    theme: &Theme,
+    targets: &mut Vec<(UiAction, Rect)>,
+) {
+    let controls = buttons
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let mut x = centered_line_x(area, terminal_text_width(&controls));
+    for (label, action) in buttons {
+        let width = terminal_text_width(label);
+        targets.push((action.clone(), Rect::new(x, area.y, width, 1)));
+        x = x.saturating_add(width).saturating_add(3);
+    }
 }
 
 fn render_rss_subscription_popup(
@@ -9906,6 +10364,56 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+    #[cfg(feature = "commons-upload")]
+    if view.commons_credentials_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((password_selected, _)) = hit_map
+                    .commons_credentials_fields
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::SelectCommonsCredentialField(*password_selected))
+                } else {
+                    hit_map
+                        .commons_credentials_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "commons-upload")]
+    if view.commons_upload_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((field, _)) = hit_map
+                    .commons_upload_fields
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::SelectCommonsUploadField(*field))
+                } else if let Some((index, _)) = hit_map
+                    .commons_upload_suggestions
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(UiAction::OpenCommonsCategorySuggestionAt(*index))
+                } else {
+                    hit_map
+                        .commons_upload_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }
+            }
+            MouseEventKind::ScrollDown => Some(UiAction::MoveCommonsCategorySuggestion(1)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveCommonsCategorySuggestion(-1)),
+            _ => None,
+        };
+    }
     if view.audio_quality_popup.is_some() {
         return match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => hit_map
@@ -10735,6 +11243,8 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    #[cfg(feature = "commons-upload")]
+    use crate::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
     use crate::config::{BandcampAudioFormat, YouTubeThumbnailSize};
     use crate::domain::{MediaKind, SourceKind};
     use crate::waveform::PeakPyramid;
@@ -13087,6 +13597,8 @@ mod tests {
         assert!(rendered.contains("↪ internal video"));
         assert!(rendered.contains("F8 pointer"));
         assert!(rendered.contains("F9 recent commits and installation details"));
+        #[cfg(feature = "commons-upload")]
+        assert!(rendered.contains("U Commons audio"));
         #[cfg(feature = "qr")]
         assert!(rendered.contains("Q selected YouTube video QR code"));
         #[cfg(not(feature = "qr"))]
@@ -19689,6 +20201,142 @@ mod tests {
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenInBrowser)
         );
+    }
+
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn details_commons_button_never_renders_its_help_only_hotkey() {
+        let backend = TestBackend::new(140, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Creative Commons fixture".to_owned(),
+                ..DetailView::default()
+            }),
+            commons_upload_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Commons action");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Upload to Commons"));
+        assert!(!rendered.contains("[U] Upload to Commons"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenCommonsUpload)
+        );
+    }
+
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn commons_category_suggestion_click_opens_its_exact_page() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let suggestion = CommonsCategorySuggestion {
+            name: "Audio files from Tbilisi".to_owned(),
+            url: url::Url::parse(
+                "https://commons.wikimedia.org/wiki/Category:Audio_files_from_Tbilisi",
+            )
+            .expect("category URL"),
+        };
+        let view = ViewModel {
+            external_opener_available: true,
+            commons_upload_popup: Some(CommonsUploadPopupView {
+                draft: CommonsUploadDraft {
+                    title: "Fixture.opus".to_owned(),
+                    ..CommonsUploadDraft::default()
+                },
+                selected_field: CommonsUploadField::Category,
+                category_query: "Audio".to_owned(),
+                category_suggestions: vec![suggestion],
+                ..CommonsUploadPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Commons category suggestion");
+        assert!(rendered_text(&terminal).contains("Audio files from Tbilisi"));
+        let (_, area) = hit_map
+            .commons_upload_suggestions
+            .first()
+            .copied()
+            .expect("category suggestion mouse target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenCommonsCategorySuggestionAt(0))
+        );
+    }
+
+    #[cfg(feature = "commons-upload")]
+    #[test]
+    fn commons_credentials_stay_masked_and_registration_links_are_clickable() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            external_opener_available: true,
+            commons_credentials_popup: Some(CommonsCredentialsPopupView {
+                username: "Fixture@youta".to_owned(),
+                password: "must-never-render".to_owned(),
+                auth_method: WikimediaCommonsAuthMethod::BotPassword,
+                password_selected: true,
+                credentials_path: "/private/credentials.toml".to_owned(),
+                validation_error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Commons credentials");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("BotPassword registration"));
+        assert!(rendered.contains("Account registration"));
+        assert!(rendered.contains("/private/credentials.toml"));
+        assert!(!rendered.contains("must-never-render"));
+        for expected in [
+            UiAction::OpenCommonsBotPasswordGuide,
+            UiAction::OpenCommonsAccountRegistration,
+            UiAction::SubmitCommonsCredentials,
+            UiAction::DismissCommonsCredentials,
+        ] {
+            let area = hit_map
+                .commons_credentials_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .map(|(_, area)| *area)
+                .expect("Commons credential action target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

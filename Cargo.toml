@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.38.1"
+version = "0.39.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -34,6 +34,7 @@ required-features = ["cli"]
 default = [
     "app",
     "audio-quality",
+    "commons-upload",
     "gpm",
     "images",
     "qr",
@@ -175,6 +176,16 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
+# Explicit, review-first audio transfers to Wikimedia Commons. Cookie and
+# multipart support are kept behind this feature so distributors can remove
+# the authentication and upload code from constrained builds.
+commons-upload = [
+    "controller",
+    "network",
+    "yt-dlp",
+    "ureq/cookies",
+    "ureq/multipart",
+]
 # On-demand local-file Chromaprint fingerprinting and AcoustID lookup.
 #
 # The official `fpcalc` helper performs media decoding and fingerprinting, so
@@ -222,7 +233,8 @@ yt-dlp = ["dep:rustix"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]
-wikimedia = ["network"]
+# Compatibility alias retained for older custom build scripts.
+wikimedia = ["commons-upload"]
 archive-org = ["network"]
 librivox = ["network"]
 apple-podcasts = ["rss"]

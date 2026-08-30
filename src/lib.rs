@@ -20,6 +20,8 @@ pub(crate) mod fs_path;
 
 pub mod build_info;
 pub mod child_process;
+#[cfg(feature = "commons-upload")]
+pub mod commons_upload;
 pub mod config;
 pub mod diagnostics;
 pub mod domain;
