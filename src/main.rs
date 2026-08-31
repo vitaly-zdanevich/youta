@@ -72,6 +72,7 @@ fn main() -> ExitCode {
                     probe_diagnostic_helpers(
                         PathBuf::from("mpv"),
                         PathBuf::from("yt-dlp"),
+                        PathBuf::from("cava"),
                         PathBuf::from("fpcalc"),
                         None,
                     ),
@@ -97,6 +98,7 @@ fn is_another_instance_error(error: &anyhow::Error) -> bool {
 fn probe_diagnostic_helpers(
     mpv_executable: PathBuf,
     yt_dlp_executable: PathBuf,
+    cava_executable: PathBuf,
     fpcalc_executable: PathBuf,
     codex_executable: Option<PathBuf>,
 ) -> Vec<ExternalHelper> {
@@ -106,6 +108,14 @@ fn probe_diagnostic_helpers(
         (ExternalHelperKind::Ffmpeg, Some(PathBuf::from("ffmpeg"))),
         (ExternalHelperKind::Ffprobe, Some(PathBuf::from("ffprobe"))),
     ];
+    #[cfg(feature = "ascii-visualizer")]
+    let helpers = {
+        let mut helpers = helpers;
+        helpers.push((ExternalHelperKind::Cava, Some(cava_executable)));
+        helpers
+    };
+    #[cfg(not(feature = "ascii-visualizer"))]
+    let _ = cava_executable;
     #[cfg(feature = "local-archives")]
     let helpers = {
         let mut helpers = helpers;
@@ -169,6 +179,7 @@ fn run_tui(config: Config) -> Result<()> {
 
     let diagnostic_mpv = config.providers.mpv_executable.clone();
     let diagnostic_yt_dlp = config.providers.yt_dlp_executable.clone();
+    let diagnostic_cava = config.providers.cava_executable.clone();
     let diagnostic_fpcalc = config.providers.fpcalc_executable.clone();
     let diagnostic_codex = selected_codex_program(&config);
     let (provider, provider_startup_error) = match configured_youtube_provider(&config.providers) {
@@ -198,6 +209,7 @@ fn run_tui(config: Config) -> Result<()> {
             probe_diagnostic_helpers(
                 diagnostic_mpv.clone(),
                 diagnostic_yt_dlp.clone(),
+                diagnostic_cava.clone(),
                 diagnostic_fpcalc.clone(),
                 diagnostic_codex.clone(),
             ),
@@ -244,6 +256,7 @@ fn run_tui(config: Config) -> Result<()> {
             let helpers = probe_diagnostic_helpers(
                 diagnostic_mpv.clone(),
                 diagnostic_yt_dlp.clone(),
+                diagnostic_cava.clone(),
                 diagnostic_fpcalc.clone(),
                 diagnostic_codex.clone(),
             );
@@ -268,6 +281,7 @@ fn run_tui(config: Config) -> Result<()> {
                 .with_external_helpers(probe_diagnostic_helpers(
                     diagnostic_mpv,
                     diagnostic_yt_dlp,
+                    diagnostic_cava,
                     diagnostic_fpcalc,
                     diagnostic_codex,
                 ))
@@ -409,16 +423,22 @@ fn selected_codex_program(config: &Config) -> Option<PathBuf> {
     }
 }
 
-/// Returns actionable package guidance for an unavailable optional helper.
-#[cfg(feature = "acoustid")]
+/// Returns actionable package guidance for an unavailable external helper.
+#[cfg(any(feature = "acoustid", feature = "ascii-visualizer"))]
 fn helper_install_guidance(name: &str) -> Option<&'static str> {
-    (name == "fpcalc").then_some(youta::audio_identification::FPCALC_INSTALL_GUIDANCE)
+    match name {
+        #[cfg(feature = "ascii-visualizer")]
+        "cava" => Some(youta::ascii_visualizer::CAVA_INSTALL_GUIDANCE),
+        #[cfg(feature = "acoustid")]
+        "fpcalc" => Some(youta::audio_identification::FPCALC_INSTALL_GUIDANCE),
+        _ => None,
+    }
 }
 
 fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck> {
     use youta::config::PlaybackBackend;
 
-    let mut checks = Vec::with_capacity(6);
+    let mut checks = Vec::with_capacity(7);
     if cfg!(feature = "backend-mpv") && config.playback.backend == PlaybackBackend::Mpv {
         checks.push(HelperCheck {
             name: "mpv",
@@ -432,6 +452,14 @@ fn doctor_helper_checks(config: &Config) -> Vec<HelperCheck> {
             name: "yt-dlp",
             executable: config.providers.yt_dlp_executable.clone(),
             arguments: &["--version"],
+            required: true,
+        });
+    }
+    if cfg!(feature = "ascii-visualizer") {
+        checks.push(HelperCheck {
+            name: "cava",
+            executable: config.providers.cava_executable.clone(),
+            arguments: &["-v"],
             required: true,
         });
     }
@@ -507,6 +535,9 @@ fn run_doctor(config: &Config) -> Result<()> {
     if !cfg!(feature = "yt-dlp") {
         println!("yt-dlp: skipped (feature omitted at build time)");
     }
+    if !cfg!(feature = "ascii-visualizer") {
+        println!("cava: skipped (ASCII visualizer feature omitted at build time)");
+    }
     if !cfg!(feature = "acoustid") {
         println!("fpcalc: skipped (AcoustID feature omitted at build time)");
     }
@@ -522,7 +553,7 @@ fn run_doctor(config: &Config) -> Result<()> {
             Ok(version) => println!("{}: {version}", check.name),
             Err(error) => {
                 println!("{}: unavailable ({error})", check.name);
-                #[cfg(feature = "acoustid")]
+                #[cfg(any(feature = "acoustid", feature = "ascii-visualizer"))]
                 if let Some(guidance) = helper_install_guidance(check.name) {
                     println!("{guidance}");
                 }
@@ -645,6 +676,10 @@ fn print_config(config: &Config) {
         config.providers.mpv_executable.display()
     );
     println!(
+        "cava_executable = {}",
+        config.providers.cava_executable.display()
+    );
+    println!(
         "fpcalc_executable = {}",
         config.providers.fpcalc_executable.display()
     );
@@ -700,7 +735,7 @@ mod tests {
     use youta::config::VideoSummaryBackend;
     use youta::config::{Config, PlaybackBackend};
 
-    #[cfg(feature = "acoustid")]
+    #[cfg(any(feature = "acoustid", feature = "ascii-visualizer"))]
     use super::helper_install_guidance;
     use super::{doctor_helper_checks, video_summary_config_lines};
 
@@ -719,6 +754,10 @@ mod tests {
             cfg!(feature = "yt-dlp")
         );
         assert_eq!(
+            checks.iter().any(|check| check.name == "cava"),
+            cfg!(feature = "ascii-visualizer")
+        );
+        assert_eq!(
             checks.iter().any(|check| check.name == "fpcalc"),
             cfg!(feature = "acoustid")
         );
@@ -726,7 +765,28 @@ mod tests {
             checks
                 .iter()
                 .filter(|check| check.required)
-                .all(|check| check.name == "mpv" || check.name == "yt-dlp")
+                .all(|check| matches!(check.name, "mpv" | "yt-dlp" | "cava"))
+        );
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    #[test]
+    fn doctor_requires_the_configured_cava_executable() {
+        let temporary = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(temporary.path());
+        config.providers.cava_executable = "custom-cava".into();
+
+        let check = doctor_helper_checks(&config)
+            .into_iter()
+            .find(|check| check.name == "cava")
+            .expect("ASCII visualizer build must probe CAVA");
+        assert!(check.required);
+        assert_eq!(check.executable, std::path::Path::new("custom-cava"));
+        assert_eq!(check.arguments, ["-v"]);
+        assert!(
+            helper_install_guidance("cava")
+                .expect("CAVA install guidance")
+                .contains("emerge media-sound/cava")
         );
     }
 

@@ -74,6 +74,8 @@ enum Job {
 
 /// A playback backend supervised on its own thread.
 pub struct ThreadedBackend {
+    /// Process identity captured before the backend moves to its worker.
+    process_id: Option<u32>,
     jobs: Sender<Job>,
     events: Receiver<PlaybackEvent>,
     shared: Arc<Mutex<Shared>>,
@@ -87,6 +89,7 @@ impl ThreadedBackend {
     where
         B: PlaybackBackend + Send + 'static,
     {
+        let process_id = backend.process_id();
         let (job_sender, job_receiver) = channel();
         let (event_sender, event_receiver) = channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -96,6 +99,7 @@ impl ThreadedBackend {
             .spawn(move || run(backend, &job_receiver, &event_sender, &worker_shared))
             .ok();
         Self {
+            process_id,
             jobs: job_sender,
             events: event_receiver,
             shared,
@@ -204,6 +208,10 @@ fn run<B>(
 }
 
 impl PlaybackBackend for ThreadedBackend {
+    fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
     fn play(&mut self, input: &PlaybackInput) -> Result<()> {
         let input = Box::new(input.clone());
         self.request(|reply| Job::Play { input, reply })
@@ -263,6 +271,10 @@ mod tests {
     }
 
     impl PlaybackBackend for FakeBackend {
+        fn process_id(&self) -> Option<u32> {
+            Some(4242)
+        }
+
         fn play(&mut self, _input: &PlaybackInput) -> Result<()> {
             Ok(())
         }
@@ -355,6 +367,13 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         false
+    }
+
+    #[test]
+    fn process_identity_survives_moving_the_backend_to_its_worker() {
+        let (mut handle, _) = threaded(false);
+        assert_eq!(handle.process_id(), Some(4242));
+        handle.shutdown().expect("stop worker");
     }
 
     #[test]

@@ -1543,6 +1543,8 @@ pub struct ProviderConfig {
     pub yt_dlp_executable: PathBuf,
     /// `mpv` executable name or path.
     pub mpv_executable: PathBuf,
+    /// CAVA executable name or path used for fullscreen FFT visualization.
+    pub cava_executable: PathBuf,
     /// Chromaprint `fpcalc` executable name or path.
     pub fpcalc_executable: PathBuf,
     /// `FFmpeg` executable name or path.
@@ -1611,6 +1613,7 @@ impl fmt::Debug for ProviderConfig {
             .field("bandcamp_audio_format", &self.bandcamp_audio_format)
             .field("yt_dlp_executable", &self.yt_dlp_executable)
             .field("mpv_executable", &self.mpv_executable)
+            .field("cava_executable", &self.cava_executable)
             .field("fpcalc_executable", &self.fpcalc_executable)
             .field("ffmpeg_executable", &self.ffmpeg_executable)
             .field("ffprobe_executable", &self.ffprobe_executable)
@@ -1638,6 +1641,7 @@ impl Default for ProviderConfig {
             bandcamp_audio_format: BandcampAudioFormat::default(),
             yt_dlp_executable: PathBuf::from("yt-dlp"),
             mpv_executable: PathBuf::from("mpv"),
+            cava_executable: PathBuf::from("cava"),
             fpcalc_executable: PathBuf::from("fpcalc"),
             ffmpeg_executable: PathBuf::from("ffmpeg"),
             ffprobe_executable: PathBuf::from("ffprobe"),
@@ -2202,6 +2206,7 @@ mod tests {
         assert!(config.providers.jamendo_client_id.is_none());
         assert!(config.providers.acoustid_client_key.is_none());
         assert_eq!(config.providers.fpcalc_executable, PathBuf::from("fpcalc"));
+        assert_eq!(config.providers.cava_executable, PathBuf::from("cava"));
         assert_eq!(
             config.providers.bandcamp_audio_format,
             BandcampAudioFormat::BestAvailable

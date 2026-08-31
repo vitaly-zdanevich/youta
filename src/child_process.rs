@@ -33,7 +33,11 @@
 //! bought is the common case, where the resolver is still alive and holding its
 //! own children.
 
-#[cfg(any(feature = "audio-quality", feature = "yt-dlp"))]
+#[cfg(any(
+    feature = "ascii-visualizer",
+    feature = "audio-quality",
+    feature = "yt-dlp"
+))]
 use std::process::Child;
 use std::process::Command;
 
@@ -60,9 +64,13 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 /// Starts a supervised helper: no console of its own, and its own process
 /// group, so [`terminate_tree`] can end everything it goes on to start.
 ///
-/// Only deadline-bound helpers are supervised this way. `mpv` is not: it is
-/// meant to receive the terminal's own interrupt.
-#[cfg(any(feature = "audio-quality", feature = "yt-dlp"))]
+/// Only bounded or explicitly on-demand helpers are supervised this way. `mpv`
+/// is not: it is meant to receive the terminal's own interrupt.
+#[cfg(any(
+    feature = "ascii-visualizer",
+    feature = "audio-quality",
+    feature = "yt-dlp"
+))]
 pub fn supervised(command: &mut Command) -> &mut Command {
     #[cfg(unix)]
     {
@@ -77,7 +85,11 @@ pub fn supervised(command: &mut Command) -> &mut Command {
 ///
 /// Used where the caller already has its own rules for killing and reporting
 /// the direct child and only needs the descendants dealt with.
-#[cfg(any(feature = "audio-quality", feature = "yt-dlp"))]
+#[cfg(any(
+    feature = "ascii-visualizer",
+    feature = "audio-quality",
+    feature = "yt-dlp"
+))]
 pub fn kill_descendants(pid: u32) {
     #[cfg(windows)]
     {
@@ -102,7 +114,11 @@ pub fn kill_descendants(pid: u32) {
 /// Ends a helper and, as far as the platform allows, everything it started.
 ///
 /// Always reaps the child, so no zombie is left behind on Unix.
-#[cfg(any(feature = "audio-quality", feature = "yt-dlp"))]
+#[cfg(any(
+    feature = "ascii-visualizer",
+    feature = "audio-quality",
+    feature = "yt-dlp"
+))]
 pub fn terminate_tree(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -135,7 +151,17 @@ pub fn terminate_tree(child: &mut Child) {
 /// Compiled on Windows, where it is used, and under `cfg(test)` everywhere,
 /// because the argument vector is the whole behaviour and should not be a thing
 /// only one platform's build ever reads.
-#[cfg(any(all(windows, any(feature = "audio-quality", feature = "yt-dlp")), test))]
+#[cfg(any(
+    all(
+        windows,
+        any(
+            feature = "ascii-visualizer",
+            feature = "audio-quality",
+            feature = "yt-dlp"
+        )
+    ),
+    test
+))]
 mod windows_kill {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -211,7 +237,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("helper"));
     }
 
-    #[cfg(any(feature = "audio-quality", feature = "yt-dlp"))]
+    #[cfg(any(
+        feature = "ascii-visualizer",
+        feature = "audio-quality",
+        feature = "yt-dlp"
+    ))]
     #[test]
     fn a_terminated_helper_is_reaped_rather_than_left_behind() {
         let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sleep" });

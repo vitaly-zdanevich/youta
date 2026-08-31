@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.48.0"
+version = "0.48.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -154,8 +154,8 @@ nyan-cat = []
 # Rust performs the bounded FFT analysis; disabling this feature removes both
 # the action and its DSP dependency.
 audio-quality = ["local-browser", "dep:rustfft", "dep:rustix"]
-# Fullscreen audio-reactive ASCII rendering backed by mpv/FFmpeg metadata.
-ascii-visualizer = []
+# Fullscreen CAVA-backed FFT capture and audio-reactive ASCII rendering.
+ascii-visualizer = ["dep:crossbeam-channel", "dep:rustix"]
 # On-demand YouTube transcript summaries through the user's authenticated
 # Codex CLI. Youta continues to own caption retrieval, so the feature selects
 # the existing yt-dlp process boundary without adding an SDK or credential

@@ -31,9 +31,11 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(all(feature = "ascii-visualizer", test))]
-use crate::ascii_visualizer::AsciiVisualizationMode;
+use crate::ascii_visualizer::{AudioSpectrum, CAVA_SPECTRUM_BANDS, CavaSpectrumError};
 #[cfg(feature = "ascii-visualizer")]
-use crate::ascii_visualizer::render_ascii_frame;
+use crate::ascii_visualizer::{
+    AudioSpectrumStream, AudioSpectrumStreamFactory, SystemCavaSpectrumStreamFactory,
+};
 #[cfg(feature = "acoustid")]
 use crate::audio_identification::{
     AudioIdentificationCancellation, AudioIdentificationError, AudioIdentifier, FpcalcConfig,
@@ -5023,6 +5025,12 @@ pub struct AppController {
     youtube_prewarm_failure: Option<(MediaId, Instant)>,
     playback_factory: Option<PlaybackFactory>,
     player: Option<Box<dyn PlaybackBackend>>,
+    /// Injectable constructor for the on-demand CAVA FFT-band stream.
+    #[cfg(feature = "ascii-visualizer")]
+    ascii_visualizer_stream_factory: Box<dyn AudioSpectrumStreamFactory>,
+    /// Sole CAVA helper owned only while fullscreen visualization is open.
+    #[cfg(feature = "ascii-visualizer")]
+    ascii_visualizer_stream: Option<Box<dyn AudioSpectrumStream>>,
     #[cfg(feature = "yt-dlp")]
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
@@ -6240,6 +6248,10 @@ impl AppController {
             youtube_prewarm_failure: None,
             playback_factory,
             player: None,
+            #[cfg(feature = "ascii-visualizer")]
+            ascii_visualizer_stream_factory: Box::new(SystemCavaSpectrumStreamFactory),
+            #[cfg(feature = "ascii-visualizer")]
+            ascii_visualizer_stream: None,
             #[cfg(feature = "yt-dlp")]
             download_launcher,
             #[cfg(feature = "yt-dlp")]
@@ -23739,7 +23751,7 @@ impl AppController {
         }
     }
 
-    /// Opens or closes backend analysis and its fullscreen ASCII presentation.
+    /// Opens or closes CAVA capture and its fullscreen ASCII presentation.
     #[cfg(feature = "ascii-visualizer")]
     fn toggle_ascii_visualizer(&mut self) {
         if self.view.ascii_visualizer.is_some() {
@@ -23753,82 +23765,53 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
         }
-        let Some(player) = self.player.as_mut() else {
-            self.view.status_line = "Nothing is playing".to_owned();
-            return;
-        };
-        match player.command(PlayerCommand::SetAudioVisualization(true)) {
-            Ok(()) => {
+        match self.ascii_visualizer_stream_factory.start(
+            &self.config.providers.cava_executable,
+            self.player.as_ref().and_then(|player| player.process_id()),
+        ) {
+            Ok(stream) => {
                 let mut visualizer = AsciiVisualizerView {
                     title: self.current_playback_title(),
                     ..AsciiVisualizerView::default()
                 };
-                visualizer.lines = render_ascii_frame(
-                    visualizer.mode,
-                    96,
-                    32,
-                    visualizer.sample.unwrap_or_default(),
-                    visualizer.frame,
-                );
+                visualizer.lines = visualizer.renderer.render(96, 32);
+                self.ascii_visualizer_stream = Some(stream);
                 self.view.ascii_visualizer = Some(visualizer);
-            }
-            Err(error) if matches!(error, PlaybackError::DirectProfileRestriction(_)) => {
-                self.view.status_line = error.to_string();
             }
             Err(error) => self.show_error("Could not start audio visualization", &error),
         }
     }
 
-    /// Removes backend analysis and returns to the ordinary application view.
+    /// Stops CAVA and returns to the ordinary application view.
     #[cfg(feature = "ascii-visualizer")]
     fn dismiss_ascii_visualizer(&mut self) {
-        if self.view.ascii_visualizer.take().is_none() {
-            return;
-        }
-        let result = self
-            .player
-            .as_mut()
-            .map(|player| player.command(PlayerCommand::SetAudioVisualization(false)));
-        if let Some(Err(error)) = result {
-            self.show_error("Could not stop audio visualization", &error);
+        self.view.ascii_visualizer = None;
+        if let Some(mut stream) = self.ascii_visualizer_stream.take() {
+            stream.shutdown();
         }
     }
 
-    /// Changes the stable visualizer mode and redraws the frontend-neutral frame.
-    #[cfg(feature = "ascii-visualizer")]
-    fn change_ascii_visualizer_mode(&mut self, direction: i8) {
-        let Some(visualizer) = self.view.ascii_visualizer.as_mut() else {
-            return;
-        };
-        visualizer.mode = if direction < 0 {
-            visualizer.mode.previous()
-        } else {
-            visualizer.mode.next()
-        };
-        visualizer.lines = render_ascii_frame(
-            visualizer.mode,
-            96,
-            32,
-            visualizer.sample.unwrap_or_default(),
-            visualizer.frame,
-        );
-    }
-
-    /// Advances animation and snapshots the latest finite backend measurements.
+    /// Drains obsolete CAVA frames and renders the latest FFT-band snapshot.
     #[cfg(feature = "ascii-visualizer")]
     fn refresh_ascii_visualizer(&mut self) {
+        let spectrum = match self.ascii_visualizer_stream.as_mut() {
+            Some(stream) => match stream.drain_latest() {
+                Ok(spectrum) => spectrum,
+                Err(error) => {
+                    self.dismiss_ascii_visualizer();
+                    self.show_error("Audio visualization stopped", &error);
+                    return;
+                }
+            },
+            None => return,
+        };
         let Some(visualizer) = self.view.ascii_visualizer.as_mut() else {
             return;
         };
-        visualizer.frame = visualizer.frame.wrapping_add(1);
-        visualizer.sample = self.view.playback.audio_visualization;
-        visualizer.lines = render_ascii_frame(
-            visualizer.mode,
-            96,
-            32,
-            visualizer.sample.unwrap_or_default(),
-            visualizer.frame,
-        );
+        if let Some(spectrum) = spectrum {
+            visualizer.renderer.push_spectrum(spectrum);
+        }
+        visualizer.lines = visualizer.renderer.render(96, 32);
     }
 
     /// Sends one timeline command only while a media item owns the reusable backend.
@@ -24403,11 +24386,7 @@ impl AppController {
 
     fn reset_playback_state(&mut self) {
         #[cfg(feature = "ascii-visualizer")]
-        if self.view.ascii_visualizer.take().is_some()
-            && let Some(player) = self.player.as_mut()
-        {
-            let _ = player.command(PlayerCommand::SetAudioVisualization(false));
-        }
+        self.dismiss_ascii_visualizer();
         self.playback_phase = PlaybackPhase::Idle;
         self.playback_load_kind = PlaybackLoadKind::Regular;
         self.clear_playback_start_activity();
@@ -28437,6 +28416,15 @@ impl AppController {
                     Some(self.config.providers.yt_dlp_executable.clone()),
                 ),
             ];
+            #[cfg(feature = "ascii-visualizer")]
+            let helpers = {
+                let mut helpers = helpers;
+                helpers.push((
+                    ExternalHelperKind::Cava,
+                    Some(self.config.providers.cava_executable.clone()),
+                ));
+                helpers
+            };
             #[cfg(feature = "local-archives")]
             let helpers = {
                 let mut helpers = helpers;
@@ -28487,6 +28475,15 @@ impl AppController {
                 Some(self.config.providers.yt_dlp_executable.clone()),
             ),
         ];
+        #[cfg(feature = "ascii-visualizer")]
+        let helpers = {
+            let mut helpers = helpers;
+            helpers.push(ExternalHelper::new(
+                "cava",
+                Some(self.config.providers.cava_executable.clone()),
+            ));
+            helpers
+        };
         #[cfg(feature = "local-archives")]
         let helpers = {
             let mut helpers = helpers;
@@ -28843,6 +28840,8 @@ impl AppController {
         title: impl Into<String>,
         report: impl Into<String>,
     ) {
+        #[cfg(feature = "ascii-visualizer")]
+        self.dismiss_ascii_visualizer();
         #[cfg(feature = "audio-quality")]
         self.shutdown_local_audio_quality_worker();
         #[cfg(feature = "yt-dlp")]
@@ -32150,6 +32149,8 @@ impl AppController {
         // Prevent Drop from repeating partial teardown if a destructor or
         // worker join panics while this method is already running.
         self.shutdown_persistence_succeeded = Some(false);
+        #[cfg(feature = "ascii-visualizer")]
+        self.dismiss_ascii_visualizer();
         self.clear_search_activity();
         self.clear_playback_start_activity();
         #[cfg(feature = "summary")]
@@ -32283,10 +32284,6 @@ impl UiController for AppController {
             UiAction::ToggleHelp => self.view.help_open = !self.view.help_open,
             #[cfg(feature = "ascii-visualizer")]
             UiAction::ToggleAsciiVisualizer => self.toggle_ascii_visualizer(),
-            #[cfg(feature = "ascii-visualizer")]
-            UiAction::PreviousAsciiVisualization => self.change_ascii_visualizer_mode(-1),
-            #[cfg(feature = "ascii-visualizer")]
-            UiAction::NextAsciiVisualization => self.change_ascii_visualizer_mode(1),
             #[cfg(feature = "ascii-visualizer")]
             UiAction::DismissAsciiVisualizer => self.dismiss_ascii_visualizer(),
             UiAction::OpenProjectHistory => self.open_project_history(),
@@ -43172,6 +43169,7 @@ mod tests {
     use std::io::Cursor;
     #[cfg(any(
         feature = "acoustid",
+        feature = "ascii-visualizer",
         feature = "audio-quality",
         feature = "yandex-music",
         feature = "yt-dlp"
@@ -65774,6 +65772,43 @@ mod tests {
         end_before_command_error: bool,
     }
 
+    #[cfg(feature = "ascii-visualizer")]
+    struct MockAudioSpectrumStream {
+        spectrum: Option<AudioSpectrum>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    impl AudioSpectrumStream for MockAudioSpectrumStream {
+        fn drain_latest(&mut self) -> Result<Option<AudioSpectrum>, CavaSpectrumError> {
+            Ok(self.spectrum.take())
+        }
+
+        fn shutdown(&mut self) {
+            self.stopped.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    struct MockAudioSpectrumStreamFactory {
+        spectrum: AudioSpectrum,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "ascii-visualizer")]
+    impl AudioSpectrumStreamFactory for MockAudioSpectrumStreamFactory {
+        fn start(
+            &mut self,
+            _executable: &Path,
+            _playback_process_id: Option<u32>,
+        ) -> Result<Box<dyn AudioSpectrumStream>, CavaSpectrumError> {
+            Ok(Box::new(MockAudioSpectrumStream {
+                spectrum: Some(self.spectrum.clone()),
+                stopped: Arc::clone(&self.stopped),
+            }))
+        }
+    }
+
     struct MockPlaybackBackend {
         state: Arc<Mutex<MockPlaybackState>>,
         statuses: Arc<Mutex<VecDeque<crate::playback::PlaybackStatus>>>,
@@ -66471,8 +66506,18 @@ mod tests {
 
     #[cfg(feature = "ascii-visualizer")]
     #[test]
-    fn fullscreen_ascii_visualizer_owns_one_backend_filter_and_five_modes() {
-        let (mut controller, state) = controller_with_mock_statuses([]);
+    fn fullscreen_ascii_visualizer_owns_one_cava_spectrum_stream() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let stopped = Arc::new(AtomicBool::new(false));
+        controller.ascii_visualizer_stream_factory = Box::new(MockAudioSpectrumStreamFactory {
+            spectrum: AudioSpectrum::from_normalized_bands(
+                (0..CAVA_SPECTRUM_BANDS)
+                    .map(|band| if band < 24 { 0.75 } else { 0.2 })
+                    .collect(),
+            )
+            .expect("mock FFT bands"),
+            stopped: Arc::clone(&stopped),
+        });
         controller.play_queue_item(fixture_direct_item("visualized fixture"), false);
 
         controller.dispatch(UiAction::ToggleAsciiVisualizer);
@@ -66481,56 +66526,23 @@ mod tests {
             .ascii_visualizer
             .as_ref()
             .expect("fullscreen visualizer");
-        assert_eq!(visualizer.mode, AsciiVisualizationMode::Bars);
         assert_eq!(visualizer.title, "visualized fixture");
         assert_eq!(visualizer.lines.len(), 32);
-        assert!(
-            state
-                .lock()
-                .expect("mock state")
-                .commands
-                .contains(&PlayerCommand::SetAudioVisualization(true))
-        );
 
-        controller.view.playback.audio_visualization =
-            Some(crate::ascii_visualizer::AudioVisualizationSample {
-                rms_db: -10.0,
-                peak_db: -1.0,
-                zero_crossing_rate: 0.2,
-                centroid_hz: 2_500.0,
-                spread_hz: 1_700.0,
-                flux: 0.5,
-                rolloff_hz: 8_000.0,
-            });
         controller.refresh_ascii_visualizer();
-        for expected in [
-            AsciiVisualizationMode::Pulse,
-            AsciiVisualizationMode::Rain,
-            AsciiVisualizationMode::Tunnel,
-            AsciiVisualizationMode::Stars,
-            AsciiVisualizationMode::Bars,
-        ] {
-            controller.dispatch(UiAction::NextAsciiVisualization);
-            assert_eq!(
-                controller
-                    .view
-                    .ascii_visualizer
-                    .as_ref()
-                    .expect("visualizer remains open")
-                    .mode,
-                expected
-            );
-        }
-
+        assert!(
+            controller
+                .view
+                .ascii_visualizer
+                .as_ref()
+                .expect("visualizer after FFT frame")
+                .lines
+                .iter()
+                .any(|line| line.bytes().any(|byte| byte != b' '))
+        );
         controller.dispatch(UiAction::DismissAsciiVisualizer);
         assert!(controller.view.ascii_visualizer.is_none());
-        assert!(
-            state
-                .lock()
-                .expect("mock state")
-                .commands
-                .contains(&PlayerCommand::SetAudioVisualization(false))
-        );
+        assert!(stopped.load(Ordering::Acquire));
     }
 
     #[cfg(feature = "youtube-captions")]

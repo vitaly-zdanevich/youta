@@ -276,7 +276,10 @@ fn ascii_visualizer_is_default_but_removable_from_both_front_ends() {
         !application.contains("ascii-visualizer"),
         "`app` must not make fullscreen ASCII visualization impossible to compile out"
     );
-    assert!(feature_entries(&manifest, "ascii-visualizer").is_empty());
+    assert_eq!(
+        feature_entries(&manifest, "ascii-visualizer"),
+        ["dep:crossbeam-channel", "dep:rustix"]
+    );
 
     let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
         .expect("GUI Cargo.toml must remain valid TOML");
@@ -299,11 +302,14 @@ fn ascii_visualizer_is_default_but_removable_from_both_front_ends() {
 
     let readme = read_repository_file("README.md");
     assert!(
-        readme.contains("`ascii-visualizer` is the independently removable fullscreen renderer")
+        readme.contains("`ascii-visualizer` is the independently removable CAVA-backed fullscreen")
     );
-    assert!(readme.contains("`USE=\"-ascii-visualizer\"` removes audio analysis"));
-    assert!(readme.contains("[mpv audio-filter metadata]"));
-    assert!(readme.contains("[FFmpeg audio-statistics filters]"));
+    assert!(
+        readme
+            .contains("`USE=\"-ascii-visualizer\"` removes CAVA integration, fullscreen rendering")
+    );
+    assert!(readme.contains("[CAVA](https://github.com/karlstav/cava)"));
+    assert!(readme.contains("directs CAVA to that sink's monitor"));
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(

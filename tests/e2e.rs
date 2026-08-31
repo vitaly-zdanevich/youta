@@ -256,6 +256,7 @@ fn config_command_reports_paths_and_redacts_credentials() {
         .stdout(predicate::str::contains(
             "youtube_api_key = configured (redacted)",
         ))
+        .stdout(predicate::str::contains("cava_executable = cava"))
         .stdout(predicate::str::contains("must-not-leak-credential").not());
 }
 
@@ -901,7 +902,8 @@ fn doctor_uses_configured_helpers_only_when_features_need_them() {
     fs::write(
         temporary.path().join("config.toml"),
         format!(
-            "[providers]\nmpv_executable = {:?}\nyt_dlp_executable = {:?}\n",
+            "[providers]\nmpv_executable = {:?}\nyt_dlp_executable = {:?}\ncava_executable = {:?}\n",
+            helper.display().to_string(),
             helper.display().to_string(),
             helper.display().to_string()
         ),
@@ -929,5 +931,10 @@ fn doctor_uses_configured_helpers_only_when_features_need_them() {
         assert!(stdout.contains("yt-dlp: mock-helper 1.0"));
     } else {
         assert!(stdout.contains("yt-dlp: skipped (feature omitted at build time)"));
+    }
+    if cfg!(feature = "ascii-visualizer") {
+        assert!(stdout.contains("cava: mock-helper 1.0"));
+    } else {
+        assert!(stdout.contains("cava: skipped (ASCII visualizer feature omitted at build time)"));
     }
 }

@@ -288,7 +288,7 @@ mod wire_tests {
 
     #[cfg(feature = "ascii-visualizer")]
     #[test]
-    fn f10_opens_active_audio_visualization_and_modal_arrows_switch_it() {
+    fn f10_opens_active_audio_visualization_without_mode_switching() {
         let mut view = ViewModel::default();
         assert_eq!(
             key_action(KeyPress::new(Key::F(10)), &view, None, None),
@@ -304,11 +304,11 @@ mod wire_tests {
         view.ascii_visualizer = Some(crate::view::AsciiVisualizerView::default());
         assert_eq!(
             key_action(KeyPress::new(Key::Left), &view, None, None),
-            Some(UiAction::PreviousAsciiVisualization)
+            None
         );
         assert_eq!(
             key_action(KeyPress::new(Key::Right), &view, None, None),
-            Some(UiAction::NextAsciiVisualization)
+            None
         );
         assert_eq!(
             key_action(KeyPress::new(Key::Esc), &view, None, None),
@@ -585,8 +585,6 @@ pub fn key_action(
     #[cfg(feature = "ascii-visualizer")]
     if view.error_popup.is_none() && view.ascii_visualizer.is_some() {
         return match key.key {
-            Key::Left => Some(UiAction::PreviousAsciiVisualization),
-            Key::Right => Some(UiAction::NextAsciiVisualization),
             Key::Esc | Key::F(10) => Some(UiAction::DismissAsciiVisualizer),
             _ => None,
         };

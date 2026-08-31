@@ -40,6 +40,9 @@ pub const DIAGNOSTIC_FORMAT_VERSION: u32 = 2;
 /// path, but cannot inject diagnostic command arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalHelperKind {
+    /// The CAVA FFT visualizer, queried with `-v`.
+    #[cfg(feature = "ascii-visualizer")]
+    Cava,
     /// The Chromaprint fingerprint calculator, queried with `-version`.
     #[cfg(feature = "acoustid")]
     Fpcalc,
@@ -62,6 +65,8 @@ pub enum ExternalHelperKind {
 impl ExternalHelperKind {
     const fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "ascii-visualizer")]
+            Self::Cava => "cava",
             #[cfg(feature = "acoustid")]
             Self::Fpcalc => "fpcalc",
             Self::Mpv => "mpv",
@@ -77,6 +82,8 @@ impl ExternalHelperKind {
 
     const fn version_arguments(self) -> &'static [&'static str] {
         match self {
+            #[cfg(feature = "ascii-visualizer")]
+            Self::Cava => &["-v"],
             Self::Mpv | Self::YtDlp => &["--version"],
             Self::Ffmpeg | Self::Ffprobe => &["-version"],
             #[cfg(feature = "acoustid")]

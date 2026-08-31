@@ -54,28 +54,10 @@ export interface PlaybackStatus {
   buffered_ranges: BufferedRange[];
   title: string | null;
   stream_title: string | null;
-  audio_visualization?: AudioVisualizationSample | null;
 }
 
-/** One finite metadata sample from mpv's temporary analysis filter. */
-export interface AudioVisualizationSample {
-  rms_db: number;
-  peak_db: number;
-  zero_crossing_rate: number;
-  centroid_hz: number;
-  spread_hz: number;
-  flux: number;
-  rolloff_hz: number;
-}
-
-/** Five stable fullscreen visualization styles, in switching order. */
-export type AsciiVisualizationMode = 'Bars' | 'Pulse' | 'Rain' | 'Tunnel' | 'Stars';
-
-/** Reducer-owned fullscreen ASCII frame and its audio measurements. */
+/** Reducer-owned fullscreen ASCII frame backed by CAVA FFT bands. */
 export interface AsciiVisualizerView {
-  mode: AsciiVisualizationMode;
-  sample: AudioVisualizationSample | null;
-  frame: number;
   title: string;
   lines: string[];
 }

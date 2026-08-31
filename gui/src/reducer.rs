@@ -926,7 +926,6 @@ mod tests {
     fn the_playback_tick_carries_each_animated_ascii_frame() {
         let mut current = ViewModel::default();
         current.ascii_visualizer = Some(youta::view::AsciiVisualizerView {
-            frame: 42,
             lines: vec![" .# ".to_owned()],
             ..youta::view::AsciiVisualizerView::default()
         });

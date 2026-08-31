@@ -251,6 +251,11 @@ bandcamp_audio_format = 'best-available'
 yt_dlp_executable = 'yt-dlp'
 mpv_executable = 'mpv'
 
+# CAVA supplies the smoothed logarithmic FFT bands used by the fullscreen ASCII
+# spectrum. Its default PipeWire or PulseAudio source follows the
+# current output device; ALSA-only systems need a configured loopback source.
+cava_executable = 'cava'
+
 # `fpcalc` is supplied by Chromaprint. A media file is passed to it only after
 # the user requests local-audio fingerprinting; diagnostics may separately run
 # `fpcalc -version`. AcoustID receives the fingerprint and duration, never the

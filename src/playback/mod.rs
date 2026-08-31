@@ -252,9 +252,6 @@ pub enum PlayerCommand {
     /// A [`Some`] path starts or redirects recording. [`None`] stops the
     /// active recording and lets the backend finalize the output file.
     SetStreamRecording(Option<PathBuf>),
-    /// Enable or remove the live mpv/FFmpeg audio-analysis filter.
-    #[cfg(feature = "ascii-visualizer")]
-    SetAudioVisualization(bool),
     /// Stop the current item while keeping the backend available.
     Stop,
 }
@@ -308,9 +305,6 @@ pub struct PlaybackStatus {
     /// Youta owns the stable station title, while ICY or equivalent metadata
     /// may change for every song.
     pub stream_title: Option<String>,
-    /// Latest finite audio statistics while fullscreen visualization is active.
-    #[cfg(feature = "ascii-visualizer")]
-    pub audio_visualization: Option<crate::ascii_visualizer::AudioVisualizationSample>,
 }
 
 impl PlaybackStatus {
@@ -351,8 +345,6 @@ impl Default for PlaybackStatus {
             buffered_ranges: Vec::new(),
             title: None,
             stream_title: None,
-            #[cfg(feature = "ascii-visualizer")]
-            audio_visualization: None,
         }
     }
 }
@@ -405,6 +397,15 @@ pub enum PlaybackEndReason {
 
 /// Common interface implemented by playback engines.
 pub trait PlaybackBackend {
+    /// Returns the operating-system process that owns backend playback.
+    ///
+    /// Frontends use this optional identity only to correlate an audio-server
+    /// stream with the private player they started. In-process backends and
+    /// adapters without a stable process retain the default `None` value.
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Loads and starts a media item.
     ///
     /// # Errors

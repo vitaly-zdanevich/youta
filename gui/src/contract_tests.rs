@@ -22,8 +22,6 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-#[cfg(feature = "ascii-visualizer")]
-use youta::ascii_visualizer::{AsciiVisualizationMode, AudioVisualizationSample};
 #[cfg(feature = "commons-upload")]
 use youta::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 use youta::domain::{MediaId, SourceKind};
@@ -202,15 +200,8 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     #[cfg(feature = "ascii-visualizer")]
     {
         emitted.insert(
-            "AudioVisualizationSample",
-            emitted_keys(&AudioVisualizationSample::default()),
-        );
-        emitted.insert(
             "AsciiVisualizerView",
-            emitted_keys(&AsciiVisualizerView {
-                mode: AsciiVisualizationMode::Bars,
-                ..AsciiVisualizerView::default()
-            }),
+            emitted_keys(&AsciiVisualizerView::default()),
         );
     }
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
@@ -378,7 +369,6 @@ fn every_checked_interface_is_actually_declared() {
         "PopupGeometry",
         "ScrollGeometry",
         "PlaybackStatus",
-        "AudioVisualizationSample",
         "AsciiVisualizerView",
         "DetailView",
         "RowView",
@@ -685,7 +675,7 @@ fn the_window_dispatches_only_actions_the_reducer_declares() {
 
 #[cfg(feature = "ascii-visualizer")]
 #[test]
-fn the_window_renders_and_controls_the_reducer_owned_ascii_frame() {
+fn the_window_renders_the_single_reducer_owned_ascii_frame() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ui")
         .join("src")
@@ -696,14 +686,22 @@ fn the_window_renders_and_controls_the_reducer_owned_ascii_frame() {
 
     for required in [
         "visualizer.lines.join('\\n')",
-        "dispatch('PreviousAsciiVisualization')",
-        "dispatch('NextAsciiVisualization')",
         "dispatch('DismissAsciiVisualizer')",
         "Audio visualization",
     ] {
         assert!(
             source.contains(required),
             "ASCII visualizer component no longer contains {required}"
+        );
+    }
+    for removed in [
+        "dispatch('PreviousAsciiVisualization')",
+        "dispatch('NextAsciiVisualization')",
+        "switch visualization",
+    ] {
+        assert!(
+            !source.contains(removed),
+            "single-mode ASCII visualizer still contains {removed}"
         );
     }
 }

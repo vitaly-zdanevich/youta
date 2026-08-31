@@ -35,8 +35,6 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(feature = "ascii-visualizer")]
-use crate::ascii_visualizer::render_ascii_frame;
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
@@ -1466,7 +1464,7 @@ fn render_ascii_visualizer(frame: &mut Frame<'_>, visualizer: &AsciiVisualizerVi
         .split(area);
     let heading = format!(
         "Audio visualization - {} - {}",
-        visualizer.mode.label(),
+        crate::ascii_visualizer::ASCII_VISUALIZATION_LABEL,
         visualizer.title
     );
     frame.render_widget(
@@ -1478,13 +1476,9 @@ fn render_ascii_visualizer(frame: &mut Frame<'_>, visualizer: &AsciiVisualizerVi
         .style(theme.accent.add_modifier(Modifier::BOLD)),
         sections[0],
     );
-    let lines = render_ascii_frame(
-        visualizer.mode,
-        sections[1].width,
-        sections[1].height,
-        visualizer.sample.unwrap_or_default(),
-        visualizer.frame,
-    );
+    let lines = visualizer
+        .renderer
+        .render(sections[1].width, sections[1].height);
     frame.render_widget(
         Paragraph::new(lines.join("\n"))
             .alignment(Alignment::Left)
@@ -1492,7 +1486,7 @@ fn render_ascii_visualizer(frame: &mut Frame<'_>, visualizer: &AsciiVisualizerVi
         sections[1],
     );
     frame.render_widget(
-        Paragraph::new("Left/Right switch - Esc close")
+        Paragraph::new("Esc close")
             .alignment(Alignment::Center)
             .style(theme.muted),
         sections[2],
@@ -12474,24 +12468,23 @@ mod tests {
             buttons: vec![(UiAction::ToggleHelp, Rect::new(1, 1, 2, 1))],
             ..HitMap::default()
         };
+        let mut visualizer = AsciiVisualizerView {
+            title: "Fixture song".to_owned(),
+            ..AsciiVisualizerView::default()
+        };
+        visualizer.renderer.push_spectrum(
+            crate::ascii_visualizer::AudioSpectrum::from_normalized_bands(vec![
+                0.72;
+                crate::ascii_visualizer::CAVA_SPECTRUM_BANDS
+            ])
+            .expect("TUI FFT fixture"),
+        );
         let view = ViewModel {
             playback: PlaybackStatus {
                 idle: false,
                 ..PlaybackStatus::default()
             },
-            ascii_visualizer: Some(AsciiVisualizerView {
-                title: "Fixture song".to_owned(),
-                sample: Some(crate::ascii_visualizer::AudioVisualizationSample {
-                    rms_db: -9.0,
-                    peak_db: -1.0,
-                    zero_crossing_rate: 0.2,
-                    centroid_hz: 2_400.0,
-                    spread_hz: 1_800.0,
-                    flux: 0.5,
-                    rolloff_hz: 7_600.0,
-                }),
-                ..AsciiVisualizerView::default()
-            }),
+            ascii_visualizer: Some(visualizer),
             ..ViewModel::default()
         };
 
@@ -12502,9 +12495,10 @@ mod tests {
             .expect("draw fullscreen visualizer");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Audio visualization"));
-        assert!(rendered.contains("Bars"));
+        assert!(rendered.contains("Spectrum"));
         assert!(rendered.contains("Fixture song"));
-        assert!(rendered.contains("Left/Right switch"));
+        assert!(rendered.contains("Esc close"));
+        assert!(!rendered.contains("Left/Right switch"));
         assert!(!rendered.contains("YT Music"));
         assert!(hit_map.buttons.is_empty());
     }
