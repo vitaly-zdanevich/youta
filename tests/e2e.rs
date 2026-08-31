@@ -7,27 +7,11 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 /// Maximum time a hosted runner may take to expose one expected TUI effect.
-#[cfg(all(
-    target_os = "linux",
-    feature = "tui",
-    any(
-        feature = "youtube-official",
-        feature = "invidious",
-        feature = "backend-mpv"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "tui"))]
 const TUI_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Poll interval for transcript and helper-output readiness checks.
-#[cfg(all(
-    target_os = "linux",
-    feature = "tui",
-    any(
-        feature = "youtube-official",
-        feature = "invidious",
-        feature = "backend-mpv"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "tui"))]
 const TUI_READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Waits for a flushed pseudo-terminal transcript to contain `expected`.
@@ -51,29 +35,13 @@ fn wait_for_transcript_text(path: &std::path::Path, expected: &str) {
 ///
 /// This readiness boundary proves that an external action ran before the test
 /// sends another hotkey. The wait is capped by [`TUI_READINESS_TIMEOUT`].
-#[cfg(all(
-    target_os = "linux",
-    feature = "tui",
-    any(
-        feature = "youtube-official",
-        feature = "invidious",
-        feature = "backend-mpv"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "tui"))]
 fn wait_for_helper_output(path: &std::path::Path, expected: &str) {
     wait_for_text_file(path, expected, "helper output");
 }
 
 /// Polls one UTF-8-ish text file until it contains a readiness marker.
-#[cfg(all(
-    target_os = "linux",
-    feature = "tui",
-    any(
-        feature = "youtube-official",
-        feature = "invidious",
-        feature = "backend-mpv"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "tui"))]
 fn wait_for_text_file(path: &std::path::Path, expected: &str, label: &str) {
     use std::io::ErrorKind;
     use std::time::Instant;
