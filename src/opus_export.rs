@@ -270,6 +270,8 @@ fn validate_staged_opus_path(directory: &Path, path: PathBuf) -> Result<PathBuf,
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -304,9 +306,45 @@ mod tests {
         let source = temporary.path().join("field-recording.flac");
         fs::write(&source, b"fixture source bytes").expect("local audio fixture");
         let ffmpeg = temporary.path().join("fixture-ffmpeg");
-        fs::write(&ffmpeg, b"#!/bin/sh\ncp \"$7\" \"${13}\"\n").expect("fixture FFmpeg");
-        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700))
+        let writing_ffmpeg = temporary.path().join("fixture-ffmpeg.writing");
+        {
+            let mut fixture = fs::File::create(&writing_ffmpeg).expect("fixture FFmpeg staging");
+            fixture
+                .write_all(
+                    b"#!/bin/sh\n\
+if [ \"${1-}\" = '__youta_mock_ffmpeg_ready__' ]; then exit 0; fi\n\
+cp \"$7\" \"${13}\"\n",
+                )
+                .expect("fixture FFmpeg contents");
+            fixture.sync_all().expect("sync fixture FFmpeg");
+        }
+        fs::set_permissions(&writing_ffmpeg, fs::Permissions::from_mode(0o700))
             .expect("executable fixture FFmpeg");
+        fs::rename(&writing_ffmpeg, &ffmpeg).expect("publish closed fixture FFmpeg atomically");
+
+        // Parallel instrumented tests and security tooling can briefly retain
+        // a write handle after publication. Prove the script is executable so
+        // an ETXTBSY fixture race cannot be mistaken for an export failure.
+        let mut readiness_error = None;
+        for _ in 0..50 {
+            match Command::new(&ffmpeg)
+                .arg("__youta_mock_ffmpeg_ready__")
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    readiness_error = None;
+                    break;
+                }
+                Ok(status) => panic!("fixture FFmpeg readiness exited with {status}"),
+                Err(error) => {
+                    readiness_error = Some(error);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        if let Some(error) = readiness_error {
+            panic!("fixture FFmpeg stayed busy after publication: {error}");
+        }
         let staging = temporary.path().join("staging");
         let mut progress = Vec::new();
 
