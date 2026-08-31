@@ -54,6 +54,16 @@ fn contract_source() -> String {
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
+/// Reads one hand-written window source file used by a structural contract.
+fn source_named(relative_path: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join(relative_path);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 /// Extracts the field names of every `export interface` block.
 ///
 /// The grammar accepted here is the one this file is written in: one field per

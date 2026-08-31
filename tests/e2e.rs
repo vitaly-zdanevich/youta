@@ -541,6 +541,13 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         "first TUI process failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    wait_for_helper_output(
+        &opened_links,
+        "start https://www.youtube.com/channel/UCfixture\n\
+         start https://www.youtube.com/channel/UCfixture\n\
+         done https://www.youtube.com/channel/UCfixture\n\
+         done https://www.youtube.com/channel/UCfixture\n",
+    );
     let first_output = fs::read_to_string(&first_transcript).expect("first transcript");
     // The pseudo-terminal transcript records ratatui's incremental updates,
     // so unchanged cells inside a title can be omitted from its byte stream.

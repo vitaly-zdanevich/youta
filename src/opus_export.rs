@@ -253,9 +253,9 @@ fn prepare_yandex_music_opus(
 }
 
 fn validate_staged_opus_path(directory: &Path, path: PathBuf) -> Result<PathBuf, String> {
-    let directory = fs::canonicalize(directory)
+    let directory = crate::fs_path::canonicalize(directory)
         .map_err(|error| format!("Cannot resolve the audio staging directory: {error}"))?;
-    let path = fs::canonicalize(path)
+    let path = crate::fs_path::canonicalize(path)
         .map_err(|error| format!("Cannot resolve the prepared Opus file: {error}"))?;
     if path.parent() != Some(directory.as_path())
         || path.extension().and_then(|extension| extension.to_str()) != Some("opus")

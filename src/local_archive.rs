@@ -263,6 +263,8 @@ fn materialize_local_archive_with_rar_program(
             path: marker.clone(),
             source: source_error,
         })?;
+    // Windows refuses to rename a directory while a file beneath it is open.
+    drop(marker_file);
     if let Err(source_error) = fs::rename(&temporary, &cache_entry) {
         let _ = fs::remove_dir_all(&temporary);
         return Err(LocalArchiveError::Io {
