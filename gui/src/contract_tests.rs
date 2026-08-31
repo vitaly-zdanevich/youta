@@ -1145,6 +1145,23 @@ fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button()
     }
 }
 
+#[cfg(all(feature = "commons-upload", feature = "evernote"))]
+#[test]
+fn the_window_places_evernote_after_commons() {
+    let details = source_named("components/Details.tsx");
+    let commons = details
+        .find(">Upload to Commons</Action>")
+        .expect("Commons action");
+    let evernote = details
+        .find(">Save audio to Evernote</Action>")
+        .expect("Evernote action");
+
+    assert!(
+        commons < evernote,
+        "the Evernote action must follow the Commons action"
+    );
+}
+
 #[test]
 fn the_window_keeps_radio_homepages_visible_and_openable() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

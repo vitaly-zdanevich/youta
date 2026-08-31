@@ -3792,7 +3792,8 @@ fn push_right_detail_button<'a>(
 /// Pairing the two columns keeps actions near the top without overlapping on
 /// narrow panes. The monotonic row cursor preserves action order; once no
 /// remaining right-control row has enough room, the action and its successors
-/// receive appended rows.
+/// receive appended rows. Preservation handoff rows stay unpaired so Commons
+/// and Evernote remain consecutive in normal reading order.
 fn push_left_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
     right_buttons: &[DetailButtonPlacement],
@@ -3804,7 +3805,9 @@ fn push_left_detail_button<'a>(
 ) -> DetailButtonPlacement {
     let label_width = terminal_text_width(&label).min(panel_width);
     let shared_row = right_buttons.iter().find(|button| {
-        button.line_index >= *next_left_row && button.column >= label_width.saturating_add(2)
+        button.line_index >= *next_left_row
+            && !right_detail_button_reserves_full_row(&button.action)
+            && button.column >= label_width.saturating_add(2)
     });
     let line_index = if let Some(button) = shared_row {
         let gap = button.column.saturating_sub(label_width);
@@ -3826,6 +3829,17 @@ fn push_left_detail_button<'a>(
         label,
         style,
         action,
+    }
+}
+
+/// Keeps related preservation actions visually adjacent in the Details pane.
+fn right_detail_button_reserves_full_row(action: &UiAction) -> bool {
+    match action {
+        #[cfg(feature = "commons-upload")]
+        UiAction::OpenCommonsUpload => true,
+        #[cfg(feature = "evernote")]
+        UiAction::OpenEvernoteNote => true,
+        _ => false,
     }
 }
 
@@ -21061,6 +21075,59 @@ mod tests {
             .draw(|frame| render(frame, &help_view, &UiSettings::default(), &mut hit_map))
             .expect("draw Evernote help");
         assert!(rendered_text(&terminal).contains("E Evernote audio"));
+    }
+
+    #[cfg(all(feature = "commons-upload", feature = "evernote"))]
+    #[test]
+    fn details_preservation_buttons_are_adjacent_without_subscription_between() {
+        let backend = TestBackend::new(140, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            details: Some(DetailView {
+                title: "Shared preservation fixture".to_owned(),
+                channel_id: "fixture-channel".to_owned(),
+                ..DetailView::default()
+            }),
+            commons_upload_available: true,
+            evernote_available: true,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw preservation actions");
+
+        let commons = hit_map
+            .detail_buttons
+            .iter()
+            .position(|(action, _)| action == &UiAction::OpenCommonsUpload)
+            .expect("Commons action");
+        let evernote = hit_map
+            .detail_buttons
+            .iter()
+            .position(|(action, _)| action == &UiAction::OpenEvernoteNote)
+            .expect("Evernote action");
+        let subscription = hit_map
+            .detail_buttons
+            .iter()
+            .position(|(action, _)| action == &UiAction::ToggleSubscription)
+            .expect("subscription action");
+        assert!(
+            commons < evernote,
+            "the Evernote action must follow the Commons action"
+        );
+        let commons_row = hit_map.detail_buttons[commons].1.y;
+        let evernote_row = hit_map.detail_buttons[evernote].1.y;
+        assert!(
+            commons_row.checked_add(1) == Some(evernote_row),
+            "the Evernote button must render immediately below the Commons button"
+        );
+        let subscription_row = hit_map.detail_buttons[subscription].1.y;
+        assert!(
+            subscription_row < commons_row || subscription_row > evernote_row,
+            "the subscription action must not share the Commons or Evernote rows"
+        );
     }
 
     #[cfg(feature = "evernote")]
