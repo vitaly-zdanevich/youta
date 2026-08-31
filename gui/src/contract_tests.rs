@@ -67,9 +67,10 @@ fn source_named(relative_path: &str) -> String {
 /// Extracts the field names of every `export interface` block.
 ///
 /// The grammar accepted here is the one this file is written in: one field per
-/// line, indented two spaces, `name: type;` or `name?: type;`. Anything more
-/// elaborate would mean the contract had grown past what a hand-written subset
-/// should be, which is itself worth failing on.
+/// line, indented with either the project's preferred tab or two legacy spaces,
+/// `name: type;` or `name?: type;`. Anything more elaborate would mean the
+/// contract had grown past what a hand-written subset should be, which is itself
+/// worth failing on.
 fn declared_interfaces(source: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut interfaces = BTreeMap::new();
     let mut lines = source.lines();
@@ -85,7 +86,8 @@ fn declared_interfaces(source: &str) -> BTreeMap<String, BTreeSet<String>> {
             if body == "}" {
                 break;
             }
-            let Some(declaration) = body.strip_prefix("  ") else {
+            let Some(declaration) = body.strip_prefix('\t').or_else(|| body.strip_prefix("  "))
+            else {
                 continue;
             };
             let Some((field, _)) = declaration.split_once(':') else {
@@ -103,6 +105,122 @@ fn declared_interfaces(source: &str) -> BTreeMap<String, BTreeSet<String>> {
         interfaces.insert(name.to_owned(), fields);
     }
     interfaces
+}
+
+#[test]
+fn interface_contract_scanning_accepts_both_project_indentation_styles() {
+    let declared = declared_interfaces(
+        "export interface MixedIndentation {\n  spaces: boolean;\n\ttab: boolean;\n}\n",
+    );
+
+    assert_eq!(
+        declared.get("MixedIndentation"),
+        Some(&BTreeSet::from(["spaces".to_owned(), "tab".to_owned()]))
+    );
+}
+
+/// Whether one frontend field belongs to a capability omitted from this build.
+///
+/// The production TypeScript bundle is a feature superset. Unsupported controls
+/// stay hidden because their support fields are absent/false, while distributors
+/// can remove the Rust capability. Full-feature builds do not receive an
+/// exemption, so the same contract test still catches drift in every member.
+fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
+    interface == "ViewModel"
+        && ((!cfg!(feature = "ascii-visualizer")
+            && matches!(field, "ascii_visualizer" | "ascii_visualizer_supported"))
+            || (!cfg!(feature = "commons-upload")
+                && matches!(
+                    field,
+                    "commons_credentials_editor"
+                        | "commons_upload_available"
+                        | "commons_upload_popup"
+                        | "commons_upload_supported"
+                ))
+            || (!cfg!(feature = "evernote")
+                && matches!(
+                    field,
+                    "evernote_available"
+                        | "evernote_credentials_editor"
+                        | "evernote_popup"
+                        | "evernote_supported"
+                ))
+            || (!cfg!(feature = "youtube-captions")
+                && matches!(
+                    field,
+                    "youtube_caption_line"
+                        | "youtube_captions_available"
+                        | "youtube_captions_popup"
+                        | "youtube_captions_supported"
+                )))
+}
+
+/// Whether one frontend action belongs to a capability omitted from this build.
+///
+/// Action names remain in the shared page so one frontend can serve every
+/// feature set. Runtime support flags prevent these dispatch sites from becoming
+/// reachable when the corresponding Rust enum variants are not compiled.
+fn action_belongs_to_disabled_feature(name: &str) -> bool {
+    (!cfg!(feature = "ascii-visualizer") && name == "DismissAsciiVisualizer")
+        || (!cfg!(feature = "commons-upload")
+            && matches!(
+                name,
+                "AddCommonsCategorySuggestionAt"
+                    | "CycleCommonsAuthMethod"
+                    | "CycleCommonsUploadLicense"
+                    | "DismissCommonsCredentials"
+                    | "DismissCommonsUpload"
+                    | "OpenCommonsAccountRegistration"
+                    | "OpenCommonsBotPasswordGuide"
+                    | "OpenCommonsCategorySuggestionAt"
+                    | "OpenCommonsUpload"
+                    | "OpenCommonsUploadResult"
+                    | "RemoveCommonsUploadCategory"
+                    | "SelectCommonsCredentialField"
+                    | "SelectCommonsUploadField"
+                    | "SubmitCommonsCredentials"
+                    | "SubmitCommonsUpload"
+            ))
+        || (!cfg!(feature = "evernote")
+            && matches!(
+                name,
+                "DismissEvernoteCredentials"
+                    | "DismissEvernoteNote"
+                    | "InsertEvernoteCaptions"
+                    | "OpenEvernoteDeveloperTokenGuide"
+                    | "OpenEvernoteNote"
+                    | "OpenEvernoteNoteResult"
+                    | "SelectEvernoteNoteField"
+                    | "SubmitEvernoteCredentials"
+                    | "SubmitEvernoteNote"
+            ))
+        || (!cfg!(feature = "youtube-captions")
+            && matches!(name, "ActivateYouTubeCaption" | "DismissYouTubeCaptions"))
+}
+
+#[test]
+fn optional_contract_exemptions_follow_the_compiled_feature_set() {
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "ascii_visualizer"),
+        !cfg!(feature = "ascii-visualizer")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "commons_upload_popup"),
+        !cfg!(feature = "commons-upload")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "evernote_popup"),
+        !cfg!(feature = "evernote")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "youtube_captions_popup"),
+        !cfg!(feature = "youtube-captions")
+    );
+    assert!(!field_belongs_to_disabled_feature(
+        "ViewModel",
+        "status_line"
+    ));
+    assert!(!action_belongs_to_disabled_feature("Quit"));
 }
 
 /// Serializes one value and returns its top-level key set.
@@ -354,7 +472,7 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             continue;
         };
         for field in fields {
-            if !keys.contains(field) {
+            if !keys.contains(field) && !field_belongs_to_disabled_feature(interface, field) {
                 problems.push(format!(
                     "{interface}.{field} is declared but never serialized; \
                      the reducer emits: {}",
@@ -668,7 +786,7 @@ fn the_window_dispatches_only_actions_the_reducer_declares() {
     for (path, source) in window_sources() {
         for name in dispatched_actions(&source) {
             checked += 1;
-            if !reducer_knows_action(&name) {
+            if !reducer_knows_action(&name) && !action_belongs_to_disabled_feature(&name) {
                 problems.push(format!("{}: dispatches {name}", path.display()));
             }
         }

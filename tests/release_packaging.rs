@@ -1358,7 +1358,8 @@ fn live_librivox_workflow_guards_api_html_and_audio_contracts() {
     assert!(job.contains("YOUTA_RUN_LIVE_LIBRIVOX_TEST: '1'"));
     assert!(job.contains("--features librivox"));
     assert!(job.contains("--exact librivox_catalogue_book_author_and_audio_are_usable"));
-    assert!(job.contains("for attempt in 1 2; do"));
+    assert!(job.contains("for attempt in 1 2 3; do"));
+    assert!(job.contains("if [ \"${attempt}\" -eq 3 ]; then"));
 }
 
 #[test]

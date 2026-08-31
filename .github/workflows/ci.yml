@@ -855,7 +855,7 @@ jobs:
         env:
           YOUTA_RUN_LIVE_LIBRIVOX_TEST: '1'
         run: |
-          for attempt in 1 2; do
+          for attempt in 1 2 3; do
             if cargo test \
               --locked \
               --test live_services \
@@ -868,7 +868,7 @@ jobs:
             then
               exit 0
             fi
-            if [ "${attempt}" -eq 2 ]; then
+            if [ "${attempt}" -eq 3 ]; then
               exit 1
             fi
             sleep 10
