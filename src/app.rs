@@ -43755,6 +43755,8 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    #[cfg(feature = "lan-sharing")]
+    use std::fs;
     #[cfg(feature = "yt-dlp")]
     use std::io::Cursor;
     #[cfg(any(
