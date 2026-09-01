@@ -168,6 +168,18 @@ trait ThumbnailRenderer {
         None
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
+    /// Synchronizes a preferred artwork URL with a lower-resolution fallback.
+    ///
+    /// Renderers without failure tracking retain the preferred URL. Terminal
+    /// image renderers may use `fallback` after the preferred request fails.
+    fn synchronize_with_fallback(
+        &mut self,
+        preferred: Option<&url::Url>,
+        _fallback: Option<&url::Url>,
+        area: Rect,
+    ) -> bool {
+        self.synchronize(preferred, area)
+    }
     /// Synchronizes a selected local video with its midpoint-frame target.
     fn synchronize_local_video(&mut self, _source: &LocalVideoThumbnailView, _area: Rect) -> bool {
         false
@@ -200,6 +212,8 @@ struct TerminalThumbnailRenderer {
     clear_before_ready: bool,
     followup_frame_pending: bool,
     visible_source: Option<url::Url>,
+    fallback_preferred_source: Option<url::Url>,
+    fallback_preferred_failed: bool,
     prefetched_visible_source: Option<url::Url>,
     prefetch_sources: Vec<url::Url>,
 }
@@ -243,9 +257,28 @@ impl TerminalThumbnailRenderer {
             clear_before_ready: false,
             followup_frame_pending: false,
             visible_source: None,
+            fallback_preferred_source: None,
+            fallback_preferred_failed: false,
             prefetched_visible_source: None,
             prefetch_sources: Vec::new(),
         }
+    }
+
+    /// Synchronizes one URL without changing enlarged-artwork fallback state.
+    fn synchronize_visible(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+        self.visible_source = source.cloned();
+        let changed = self.manager.synchronize(source, area);
+        if changed {
+            self.clear_before_ready = false;
+            self.followup_frame_pending = false;
+        }
+        changed
+    }
+
+    /// Clears failure memory when leaving or replacing an enlarged-artwork request.
+    fn reset_fallback(&mut self) {
+        self.fallback_preferred_source = None;
+        self.fallback_preferred_failed = false;
     }
 }
 
@@ -279,6 +312,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.clear_before_ready = false;
         self.followup_frame_pending = false;
         self.visible_source = None;
+        self.reset_fallback();
         self.prefetched_visible_source = None;
         self.prefetch_sources.clear();
         true
@@ -323,16 +357,37 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
-        self.visible_source = source.cloned();
-        let changed = self.manager.synchronize(source, area);
-        if changed {
-            self.clear_before_ready = false;
-            self.followup_frame_pending = false;
+        self.reset_fallback();
+        self.synchronize_visible(source, area)
+    }
+
+    fn synchronize_with_fallback(
+        &mut self,
+        preferred: Option<&url::Url>,
+        fallback: Option<&url::Url>,
+        area: Rect,
+    ) -> bool {
+        if self.fallback_preferred_source.as_ref() != preferred {
+            self.fallback_preferred_source = preferred.cloned();
+            self.fallback_preferred_failed = false;
         }
-        changed
+        if !self.fallback_preferred_failed
+            && self.visible_source.as_ref() == preferred
+            && matches!(self.manager.state(), ThumbnailState::Failed(_))
+        {
+            self.fallback_preferred_failed = true;
+        }
+        let fallback = fallback.filter(|fallback| Some(*fallback) != preferred);
+        let source = if self.fallback_preferred_failed {
+            fallback.or(preferred)
+        } else {
+            preferred
+        };
+        self.synchronize_visible(source, area)
     }
 
     fn synchronize_local_video(&mut self, source: &LocalVideoThumbnailView, area: Rect) -> bool {
+        self.reset_fallback();
         self.visible_source = None;
         let changed =
             self.manager
@@ -365,6 +420,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
 
     fn clear(&mut self) -> bool {
         self.visible_source = None;
+        self.reset_fallback();
         self.clear_before_ready = false;
         self.followup_frame_pending = false;
         self.manager.clear()
@@ -1984,13 +2040,17 @@ fn render_fullscreen_thumbnail_overlay(
         .as_ref()
         .or(details.thumbnail_url.as_ref())
         .or_else(|| expanded_wikidata_entity.and_then(|entity| entity.image_url.as_ref()));
+    let fallback_thumbnail_url = details
+        .thumbnail_url
+        .as_ref()
+        .filter(|thumbnail| Some(*thumbnail) != visible_thumbnail_url);
     let visible_local_video = details.local_video_thumbnail.as_ref();
     let area = frame.area();
 
     if let Some(local_video) = visible_local_video {
         renderer.synchronize_local_video(local_video, area);
     } else {
-        renderer.synchronize(visible_thumbnail_url, area);
+        renderer.synchronize_with_fallback(visible_thumbnail_url, fallback_thumbnail_url, area);
     }
     let prepared = renderer.prepared_artwork_area(area).unwrap_or(area);
     let artwork_area = centered_sized_rect(prepared.width, prepared.height, area);
@@ -23450,6 +23510,128 @@ mod tests {
         assert!(
             rendered.contains('\u{10EEEE}') || rendered.contains("\u{1b}_G"),
             "the immediate follow-up frame must contain the enlarged terminal image"
+        );
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn failed_enlarged_thumbnail_falls_back_to_the_selected_preview() {
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let thumbnail_url = url::Url::parse("https://images.example/fixture-640.png")
+            .expect("fixture thumbnail URL");
+        let expanded_thumbnail_url = url::Url::parse("https://images.example/missing-maxres.png")
+            .expect("expanded fixture thumbnail URL");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Expanded thumbnail fallback fixture".to_owned(),
+                source: "YouTube".to_owned(),
+                thumbnail_url: Some(thumbnail_url.clone()),
+                expanded_thumbnail_url: Some(expanded_thumbnail_url.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let mut thumbnails = TerminalThumbnailRenderer::new(manager);
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("start selected thumbnail request");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("selected thumbnail request"),
+            thumbnail_url
+        );
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .expect("release selected thumbnail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "selected thumbnail remained Loading"
+            );
+            std::thread::yield_now();
+        }
+
+        view.details
+            .as_mut()
+            .expect("fixture details")
+            .thumbnail_expanded = true;
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("start enlarged thumbnail request");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("enlarged thumbnail request"),
+            expanded_thumbnail_url
+        );
+        replies
+            .send(Err(ThumbnailFailure::DownloadFailed))
+            .expect("fail enlarged thumbnail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "enlarged thumbnail remained Loading"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            thumbnails.manager.state(),
+            &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
+        );
+
+        terminal
+            .draw(|frame| {
+                render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+            })
+            .expect("start fallback thumbnail request");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("selected thumbnail fallback request"),
+            thumbnail_url,
+            "a missing enlarged image must fall back to the selected preview"
+        );
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .expect("release fallback thumbnail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while thumbnails.manager.state() == &ThumbnailState::Loading {
+            thumbnails.poll();
+            assert!(
+                Instant::now() < deadline,
+                "fallback thumbnail remained Loading"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                })
+                .expect("draw enlarged fallback thumbnail");
+        }
+        assert!(
+            !rendered_text(&terminal).contains("Thumbnail unavailable"),
+            "the working preview must replace the failed enlarged image"
         );
     }
 
