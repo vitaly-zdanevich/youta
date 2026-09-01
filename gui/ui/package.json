@@ -1,7 +1,7 @@
 {
   "name": "youta-ui",
   "private": true,
-  "version": "0.48.7",
+  "version": "0.49.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
