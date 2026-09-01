@@ -3662,6 +3662,12 @@ fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hot
         UiAction::AnalyzeLocalAudioQuality => Some(button("V", "Cancel analysis", show_hotkeys)),
         UiAction::ToggleYandexMusicLike => Some(button("L", "Remove like", show_hotkeys)),
         UiAction::ToggleYandexMusicDislike => Some(button("X", "Remove dislike", show_hotkeys)),
+        // Compact wording must not move a full-width thumbnail into a side rail.
+        UiAction::OpenInBrowser if button_placement.label.contains("open video") => Some(button(
+            "o",
+            &format!("{} video", system_url_opener_name()),
+            show_hotkeys,
+        )),
         _ => None,
     };
     stable_label.as_deref().map_or_else(
@@ -3792,8 +3798,8 @@ fn push_right_detail_button<'a>(
 /// Pairing the two columns keeps actions near the top without overlapping on
 /// narrow panes. The monotonic row cursor preserves action order; once no
 /// remaining right-control row has enough room, the action and its successors
-/// receive appended rows. Preservation handoff rows stay unpaired so Commons
-/// and Evernote remain consecutive in normal reading order.
+/// receive appended rows. Related right-side action groups stay unpaired so
+/// Commons/Evernote and channel/video remain consecutive in reading order.
 fn push_left_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
     right_buttons: &[DetailButtonPlacement],
@@ -3806,7 +3812,7 @@ fn push_left_detail_button<'a>(
     let label_width = terminal_text_width(&label).min(panel_width);
     let shared_row = right_buttons.iter().find(|button| {
         button.line_index >= *next_left_row
-            && !right_detail_button_reserves_full_row(&button.action)
+            && !right_detail_button_reserves_full_row(&button.action, right_buttons)
             && button.column >= label_width.saturating_add(2)
     });
     let line_index = if let Some(button) = shared_row {
@@ -3832,9 +3838,19 @@ fn push_left_detail_button<'a>(
     }
 }
 
-/// Keeps related preservation actions visually adjacent in the Details pane.
-fn right_detail_button_reserves_full_row(action: &UiAction) -> bool {
+/// Keeps related preservation and external-navigation actions visually adjacent.
+fn right_detail_button_reserves_full_row(
+    action: &UiAction,
+    right_buttons: &[DetailButtonPlacement],
+) -> bool {
+    let has_navigation_pair = right_buttons
+        .iter()
+        .any(|button| button.action == UiAction::OpenChannelInBrowser)
+        && right_buttons
+            .iter()
+            .any(|button| button.action == UiAction::OpenInBrowser);
     match action {
+        UiAction::OpenChannelInBrowser | UiAction::OpenInBrowser => has_navigation_pair,
         #[cfg(feature = "commons-upload")]
         UiAction::OpenCommonsUpload => true,
         #[cfg(feature = "evernote")]
@@ -4006,11 +4022,7 @@ fn render_information_panel(
             .as_ref()
             .map(url::Url::as_str)
             .unwrap_or_default();
-        let label = button(
-            "O",
-            &format!("{} channel · {channel_url}", system_url_opener_name()),
-            show_hotkeys,
-        );
+        let label = button("O", &format!("open channel {channel_url}"), show_hotkeys);
         push_right_detail_button(
             &mut lines,
             &mut right_buttons,
@@ -4040,10 +4052,14 @@ fn render_information_panel(
                 format!("{opener_name} track")
             }
             InformationPanelKind::YandexMusic => format!("{opener_name} item"),
-            _ => format!("{opener_name} video"),
+            _ => "open video".to_owned(),
         };
         if let Some(webpage_url) = details.webpage_url.as_ref() {
-            action_text.push_str(" · ");
+            action_text.push_str(if kind == InformationPanelKind::Video {
+                " "
+            } else {
+                " · "
+            });
             action_text.push_str(webpage_url.as_str());
         }
         let label = button(
@@ -13002,7 +13018,7 @@ mod tests {
                 "Yandex Music details omitted {label:?}:\n{rendered}"
             );
         }
-        assert!(!rendered.contains("xdg-open video"));
+        assert!(!rendered.contains("open video"));
         assert!(
             !rendered.contains("Length: 3:03"),
             "Yandex Music duration is already visible in the selected row and player"
@@ -17475,7 +17491,7 @@ mod tests {
             1,
             "the channel title already visible in the source row must not repeat"
         );
-        assert!(rendered.contains(&format!("[O] {}", system_url_opener_name())));
+        assert!(rendered.contains("[O] open channel https://www.youtube.com/@fixture"));
         assert!(rendered.contains("[a] Add RSS feed"));
         assert!(!rendered.contains("Refresh videos"));
         assert!(hit_map.subscription_source_rows.width > 0);
@@ -17800,7 +17816,7 @@ mod tests {
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Authors: Fixture host"));
         assert!(!rendered.contains("Subscribers:"));
-        assert!(!rendered.contains("xdg-open channel"));
+        assert!(!rendered.contains("open channel"));
     }
 
     #[test]
@@ -19339,14 +19355,10 @@ mod tests {
             "the selected source is already visible in the left panel"
         );
         assert!(rendered.contains("[s] Subscribe (locally)"));
-        assert!(rendered.contains(&format!(
-            "[o] {} video · https://www.youtube.com/watch?v=fixture-video",
-            system_url_opener_name()
-        )));
-        assert!(rendered.contains(&format!(
-            "[O] {} channel · https://www.youtube.com/@fixture",
-            system_url_opener_name()
-        )));
+        assert!(rendered.contains("[o] open video https://www.youtube.com/watch?v=fixture-video"));
+        assert!(rendered.contains("[O] open channel https://www.youtube.com/@fixture"));
+        assert!(!rendered.contains("xdg-open channel"));
+        assert!(!rendered.contains("xdg-open video"));
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -19390,6 +19402,11 @@ mod tests {
             open_area.y,
             open_channel_area.y.saturating_add(1),
             "the video opener should follow the channel opener"
+        );
+        assert_eq!(
+            subscribe_area.y,
+            open_area.y.saturating_add(1),
+            "the subscription action should follow the grouped channel and video openers"
         );
         let expected_right = hit_map
             .details_panel
@@ -19454,7 +19471,7 @@ mod tests {
     }
 
     #[test]
-    fn left_detail_actions_fill_unused_rows_before_right_controls() {
+    fn left_detail_actions_preserve_grouped_navigation_rows() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
         let view = ViewModel {
             video_comments_available: true,
@@ -19493,22 +19510,31 @@ mod tests {
                 .find_map(|(candidate, area)| (candidate == action).then_some(*area))
                 .unwrap_or_else(|| panic!("missing detail action {action:?}"))
         };
-        for (left, right) in [
-            (UiAction::ToggleTodoPlaylist, UiAction::OpenVideoComments),
-            (UiAction::OpenPlaylistPopup, UiAction::OpenChannelInBrowser),
-            (UiAction::EditPrivateNote, UiAction::OpenInBrowser),
-        ] {
-            let left_area = area_for(&left);
-            let right_area = area_for(&right);
-            assert_eq!(
-                left_area.y, right_area.y,
-                "the left action should reuse the earliest compatible right-control row"
-            );
-            assert!(
-                left_area.right().saturating_add(2) <= right_area.x,
-                "paired controls must retain a two-cell gap"
-            );
-        }
+        let todo_area = area_for(&UiAction::ToggleTodoPlaylist);
+        let comments_area = area_for(&UiAction::OpenVideoComments);
+        assert_eq!(
+            todo_area.y, comments_area.y,
+            "unrelated right-control rows should remain available for compact pairing"
+        );
+        assert!(
+            todo_area.right().saturating_add(2) <= comments_area.x,
+            "paired controls must retain a two-cell gap"
+        );
+
+        let ordered_actions = [
+            UiAction::OpenChannelInBrowser,
+            UiAction::OpenInBrowser,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
+            UiAction::ToggleSubscription,
+        ];
+        let ordered_areas = ordered_actions.each_ref().map(area_for);
+        assert!(
+            ordered_areas
+                .windows(2)
+                .all(|pair| pair[1].y == pair[0].y.saturating_add(1)),
+            "channel and video must stay grouped while Subscribe remains last"
+        );
     }
 
     #[test]
@@ -19699,10 +19725,10 @@ mod tests {
         let expected_actions = [
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenVideoComments,
-            UiAction::OpenPlaylistPopup,
             UiAction::OpenChannelInBrowser,
-            UiAction::EditPrivateNote,
             UiAction::OpenInBrowser,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
             UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
@@ -19747,13 +19773,10 @@ mod tests {
         let expected_labels = [
             "[l] Add to todo".to_owned(),
             "[F6] Twenty comments".to_owned(),
+            "[O] open channel https://www.youtube.com/@fixture".to_owned(),
+            "[o] open video".to_owned(),
             "[P] Playlist…".to_owned(),
-            format!(
-                "[O] {} channel · https://www.youtube.com/@fixture",
-                system_url_opener_name()
-            ),
             "[n] Add private note".to_owned(),
-            format!("[o] {} video", system_url_opener_name()),
             "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
@@ -20103,7 +20126,8 @@ mod tests {
             .expect("draw physical-console details");
         let rendered = rendered_text(&terminal);
 
-        assert!(!rendered.contains(system_url_opener_name()));
+        assert!(!rendered.contains("open channel"));
+        assert!(!rendered.contains("open video"));
         assert!(
             hit_map
                 .detail_buttons
@@ -20266,8 +20290,8 @@ mod tests {
             .expect("draw PTY details");
         let rendered = rendered_text(&terminal);
 
-        assert!(rendered.contains(&format!("[o] {} video", system_url_opener_name())));
-        assert!(rendered.contains(&format!("[O] {} channel", system_url_opener_name())));
+        assert!(rendered.contains("[o] open video"));
+        assert!(rendered.contains("[O] open channel"));
         assert!(
             hit_map
                 .detail_buttons
@@ -20324,7 +20348,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("stopped at 0:42"));
-        assert!(!rendered.contains(&format!("{} video", system_url_opener_name())));
+        assert!(!rendered.contains("open video"));
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
@@ -20586,8 +20610,8 @@ mod tests {
 
         assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(rendered.contains("Length: 42:05"));
-        assert!(!rendered.contains(&format!("{} video", system_url_opener_name())));
-        assert!(!rendered.contains(&format!("{} channel", system_url_opener_name())));
+        assert!(!rendered.contains("open video"));
+        assert!(!rendered.contains("open channel"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(
@@ -20992,9 +21016,9 @@ mod tests {
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(!rendered.contains("Select mode"));
-        assert!(rendered.contains(&format!("{} video", system_url_opener_name())));
-        assert!(!rendered.contains(&format!("[o] {} video", system_url_opener_name())));
-        assert!(!rendered.contains(&format!("[O] {}", system_url_opener_name())));
+        assert!(rendered.contains("open video"));
+        assert!(!rendered.contains("[o] open video"));
+        assert!(!rendered.contains("[O] open channel"));
         assert_eq!(hit_map.detail_buttons.len(), 2);
         assert!(
             hit_map
@@ -26948,10 +26972,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
-        assert!(rendered.contains(&format!(
-            "[O] {} channel · https://www.youtube.com/channel/UCfixture",
-            system_url_opener_name()
-        )));
+        assert!(rendered.contains("[O] open channel https://www.youtube.com/channel/UCfixture"));
         assert!(!rendered.contains("Load channel info"));
         assert!(rendered.contains("Full channel description"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
