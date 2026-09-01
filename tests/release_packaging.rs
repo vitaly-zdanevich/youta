@@ -179,6 +179,45 @@ fn local_archive_folders_are_default_but_removable_from_both_front_ends() {
 }
 
 #[test]
+fn lan_sharing_is_default_but_removable_from_both_front_ends() {
+    let manifest = manifest();
+    let default = feature_closure(&manifest, "default");
+    let application = feature_closure(&manifest, "app");
+    let sharing = feature_closure(&manifest, "lan-sharing");
+
+    assert!(default.contains("lan-sharing"));
+    assert!(
+        !application.contains("lan-sharing"),
+        "`app` must not make LAN sharing impossible to compile out"
+    );
+    for requirement in ["local-artwork", "network", "qr", "yt-dlp"] {
+        assert!(sharing.contains(requirement));
+    }
+
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml"))
+        .expect("GUI Cargo.toml must remain valid TOML");
+    assert!(
+        gui["features"]["default"]
+            .as_array()
+            .expect("GUI defaults")
+            .iter()
+            .any(|feature| feature.as_str() == Some("lan-sharing"))
+    );
+    assert_eq!(
+        gui["features"]["lan-sharing"][0].as_str(),
+        Some("youta/lan-sharing")
+    );
+
+    let readme = read_repository_file("README.md");
+    assert!(readme.contains("The default-on `lan-sharing` feature"));
+    assert!(readme.contains("`USE=\"-lan-sharing\"` removes the session HTTP server"));
+
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("cargo check --locked --no-default-features --features lan-sharing --lib"));
+    assert!(ci.contains("cargo check --locked --no-default-features --features tui,lan-sharing"));
+}
+
+#[test]
 fn sponsorblock_is_default_but_removable_from_both_front_ends() {
     let manifest = manifest();
     let default = feature_closure(&manifest, "default");
@@ -538,10 +577,8 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app,ascii-visualizer,audio-quality,nyan-cat,qr"));
-    assert!(
-        readme.contains("--features app-core,ascii-visualizer,audio-quality,images,nyan-cat,qr")
-    );
+    assert!(readme.contains("--features app,ascii-visualizer,audio-quality,commons-upload"));
+    assert!(readme.contains("--features app-core,ascii-visualizer,audio-quality,commons-upload"));
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -582,7 +619,7 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
 fn renderer_free_capabilities_never_require_a_front_end() {
     let manifest = manifest();
 
-    for capability in ["remote-artwork", "local-artwork", "qr"] {
+    for capability in ["remote-artwork", "local-artwork", "qr", "lan-sharing"] {
         let closure = feature_closure(&manifest, capability);
         for renderer in ["tui", "dep:ratatui", "dep:crossterm", "dep:ratatui-image"] {
             assert!(
@@ -613,12 +650,12 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
         "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
         "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
         "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
         "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
     ] {
@@ -819,12 +856,12 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
         "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
         "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
         "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
         "app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {

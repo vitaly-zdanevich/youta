@@ -1245,11 +1245,13 @@ itself. The release also contains a `cargo vendor` archive and matching Cargo
 source configuration so Gentoo and other external/offline builders use the
 exact locked dependency graph. The Gentoo source ebuild exposes positive
 default-on `audio-quality`, `commons-upload`, `evernote`, `images`,
-`local-archives`, `qr`, and `summary` USE
+`lan-sharing`, `local-archives`, `qr`, and `summary` USE
 flags and maps them to their corresponding Cargo features; each source-build
 capability can be disabled independently. Prebuilt artifacts always contain
-the analyzer, Commons upload client, Evernote client, and summary integration because a binary
-USE flag cannot change compiled code.
+the analyzer, Commons upload client, Evernote client, and summary integration
+because a binary USE flag cannot change compiled code. QR-capable upstream
+executables include session LAN sharing; the `-no-qr` variants omit both
+capabilities.
 The ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the separate personal overlay. It still prefers system executables such as

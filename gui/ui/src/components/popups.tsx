@@ -14,6 +14,7 @@ import { useEffect, useRef } from 'react';
 
 import type {
   AudioQualityPopupView,
+  ChannelDownloadPopupView,
   CommonsCredentialsEditorView,
   CommonsUploadField,
   CommonsUploadPopupView,
@@ -23,6 +24,7 @@ import type {
   ErrorPopupView,
   GitHubIssueSubmissionView,
   LocalFilePopupView,
+	LanSharePopupView,
   PlaylistPopupView,
   PreferencesPopupView,
   ProjectHistoryPopupView,
@@ -35,6 +37,7 @@ import type {
   YtDlpVersionLookupView,
 } from "../contract";
 import { dispatch } from "../ipc";
+import { humanBytes } from '../format';
 import { Popup, PopupButton, PopupError } from "./Popup";
 import { ScrollingText } from "./ScrollingText";
 
@@ -46,14 +49,16 @@ export const LAYER = {
   commonsUpload: 3,
   preferences: 4,
   localFile: 5,
-  playlist: 6,
-  queue: 7,
-  videoComments: 8,
-  videoQr: 9,
-  videoSummary: 10,
-  youtubeCaptions: 11,
-  audioQuality: 12,
-  error: 13,
+  channelDownload: 6,
+  playlist: 7,
+  queue: 8,
+  videoComments: 9,
+  videoQr: 10,
+	lanShare: 11,
+  videoSummary: 12,
+  youtubeCaptions: 13,
+  audioQuality: 14,
+  error: 15,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -73,7 +78,9 @@ export function HelpPopup({
   audioQualitySupported,
   asciiVisualizerSupported,
   commonsUploadSupported,
+	channelDownloadSupported,
 	evernoteSupported,
+	lanShareSupported,
   playbackHistoryEnabled,
   videoSummarySupported,
   youtubeCaptionsSupported,
@@ -81,7 +88,9 @@ export function HelpPopup({
   audioQualitySupported: boolean;
   asciiVisualizerSupported: boolean;
   commonsUploadSupported: boolean;
+	channelDownloadSupported: boolean;
 	evernoteSupported: boolean;
+	lanShareSupported: boolean;
   playbackHistoryEnabled: boolean;
   videoSummarySupported: boolean;
   youtubeCaptionsSupported: boolean;
@@ -129,6 +138,11 @@ export function HelpPopup({
       [
         ["Ctrl+n · a · u", "play next · add to queue · show the queue"],
         ["d · o · y", "download · open page · copy link"],
+		...(channelDownloadSupported
+			? ([
+					['D · C', 'download full YouTube channel · cancel active download'],
+				] satisfies Array<[string, string]>)
+			: []),
         ...(commonsUploadSupported
           ? ([
               ["U", "upload selected YouTube, Yandex Music, or Apple Podcasts audio to Commons"],
@@ -151,6 +165,9 @@ export function HelpPopup({
           ? ([['Y', 'search YouTube captions and seek to a cue']] satisfies Array<[string, string]>)
           : []),
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
+		...(lanShareSupported
+			? ([['F11 · F12', 'share Local selection · publish Local/YouTube podcast feed']] satisfies Array<[string, string]>)
+			: []),
         ...(audioQualitySupported
           ? ([
               ["V", "analyze selected/marked files or folder"],
@@ -200,6 +217,48 @@ export function HelpPopup({
       </Body>
     </Popup>
   );
+}
+
+/** Review gate for a full-channel audio transfer. */
+export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupView }) {
+	const estimate = popup.estimated_video_count === null
+		? 'Unavailable; yt-dlp will enumerate the channel.'
+		: `${popup.estimate_is_lower_bound ? 'At least ' : 'About '}${popup.estimated_video_count.toLocaleString('en-US')} public uploads`;
+
+	return (
+		<Popup
+			title='Download full channel?'
+			subtitle={popup.channel_name}
+			layer={LAYER.channelDownload}
+			onDismiss={() => void dispatch("DismissChannelDownload")}
+			dismissLabel='Cancel'
+			footer={
+				<>
+					<PopupButton emphasis onClick={() => void dispatch("ConfirmChannelDownload")}>
+						Download
+					</PopupButton>
+					<PopupButton onClick={() => void dispatch("DismissChannelDownload")}>
+						Cancel
+					</PopupButton>
+				</>
+			}
+		>
+			<Body>
+				<dl className='grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2'>
+					<dt className='text-ink-faint'>Estimated videos</dt>
+					<dd>{estimate}</dd>
+					<dt className='text-ink-faint'>Free space remaining</dt>
+					<dd>{humanBytes(popup.available_space_bytes)}</dd>
+					<dt className='text-ink-faint'>Destination</dt>
+					<dd className='break-all font-mono'>{popup.destination}</dd>
+				</dl>
+				<p className='mt-4 text-ink-dim'>
+					Youta currently downloads audio only. Videos, Shorts, and live uploads are included;
+					existing archive entries are skipped.
+				</p>
+			</Body>
+		</Popup>
+	);
 }
 
 const COMMONS_LICENSE_LABELS = {
@@ -1155,6 +1214,42 @@ export function VideoQrPopup({ popup }: { popup: VideoQrPopupView }) {
       </div>
     </Popup>
   );
+}
+
+/** A session-scoped LAN URL and scanner-ready QR code. */
+export function LanSharePopup({ popup }: { popup: LanSharePopupView }) {
+	const { width, modules } = popup.matrix;
+	return (
+		<Popup
+			title={popup.title}
+			subtitle={popup.message}
+			layer={LAYER.lanShare}
+			width='auto'
+			onDismiss={() => void dispatch('DismissLanShare')}
+			footer={
+				<div className='flex items-center justify-between gap-4'>
+					<span className='font-mono break-all'>{popup.url}</span>
+					<PopupButton onClick={() => void dispatch('StopLanShare')}>Stop sharing</PopupButton>
+				</div>
+			}
+		>
+			<div className='grid place-items-center p-6'>
+				<div
+					role='img'
+					aria-label={`QR code for ${popup.url}`}
+					className='grid bg-white p-4'
+					style={{
+						gridTemplateColumns: `repeat(${width}, 5px)`,
+						gridAutoRows: '5px',
+					}}
+				>
+					{modules.map((dark, index) => (
+						<span key={index} style={{ background: dark ? '#000' : '#fff' }} />
+					))}
+				</div>
+			</div>
+		</Popup>
+	);
 }
 
 /** The runtime preferences editor. Every value is a draft until Save. */

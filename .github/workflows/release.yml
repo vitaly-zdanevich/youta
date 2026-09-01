@@ -102,6 +102,8 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features tui,nyan-cat
           cargo test --locked --lib --no-default-features --features evernote
           cargo test --locked --all-targets --no-default-features --features tui,evernote
+          cargo test --locked --lib --no-default-features --features lan-sharing
+          cargo test --locked --all-targets --no-default-features --features tui,lan-sharing
           cargo test --locked --all-targets --no-default-features --features qr
           cargo test --locked --all-targets --no-default-features --features tui,local
           cargo test --locked --all-targets --no-default-features --features tui,local-archives
@@ -146,6 +148,8 @@ jobs:
           cargo test --locked --doc --no-default-features --features tui,nyan-cat
           cargo test --locked --doc --no-default-features --features evernote
           cargo test --locked --doc --no-default-features --features tui,evernote
+          cargo test --locked --doc --no-default-features --features lan-sharing
+          cargo test --locked --doc --no-default-features --features tui,lan-sharing
           cargo test --locked --doc --no-default-features --features qr
           cargo test --locked --doc --no-default-features --features tui,local
           cargo test --locked --doc --no-default-features --features tui,local-archives

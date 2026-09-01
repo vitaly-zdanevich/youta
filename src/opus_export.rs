@@ -19,7 +19,8 @@ use std::time::Duration;
 use url::Url;
 
 use crate::playback::ytdlp::{
-    DownloadEvent, DownloadFormat, DownloadRequest, YtDlp, YtDlpConfig, parse_download_event,
+    DownloadEvent, DownloadFormat, DownloadRequest, DownloadScope, YtDlp, YtDlpConfig,
+    parse_download_event,
 };
 #[cfg(feature = "yandex-music")]
 use crate::providers::yandex_music::YandexMusicClient;
@@ -155,6 +156,7 @@ fn prepare_public_page_opus(
             source_url: source_url.clone(),
             destination: staging_directory.to_owned(),
             format: DownloadFormat::TranscodeToOpus,
+            scope: DownloadScope::SingleItem,
             write_thumbnail: false,
         })
         .map_err(|error| format!("Could not start yt-dlp audio preparation: {error}"))?;

@@ -81,6 +81,8 @@ pub struct CollectionEntry {
     pub webpage_url: Option<Url>,
     /// Duration in whole seconds when known.
     pub duration_seconds: Option<u64>,
+    /// Provider artwork retained without resolving the media stream.
+    pub thumbnail_url: Option<Url>,
 }
 
 /// Bounded flat collection used for generic yt-dlp URL subscriptions.
@@ -109,6 +111,16 @@ pub enum DownloadFormat {
     TranscodeToOpus,
 }
 
+/// Number of extractor entries one supervised download may consume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DownloadScope {
+    /// Download only the selected media item.
+    #[default]
+    SingleItem,
+    /// Download every public entry exposed by a channel or playlist URL.
+    Collection,
+}
+
 /// One machine-readable event emitted by a supervised `yt-dlp` download.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DownloadEvent {
@@ -122,6 +134,10 @@ pub enum DownloadEvent {
         bytes_per_second: Option<f64>,
         /// Estimated seconds until the current media file finishes.
         eta_seconds: Option<u64>,
+        /// One-based position of the current media inside a collection.
+        collection_index: Option<u64>,
+        /// Total collection entries reported by the extractor.
+        collection_count: Option<u64>,
     },
     /// Final path printed after every post-processing move.
     CompletedFile(PathBuf),
@@ -136,6 +152,8 @@ pub struct DownloadRequest {
     pub destination: PathBuf,
     /// Audio output behavior.
     pub format: DownloadFormat,
+    /// Whether yt-dlp may traverse a collection URL.
+    pub scope: DownloadScope,
     /// Download the provider thumbnail alongside the audio.
     pub write_thumbnail: bool,
 }
@@ -465,6 +483,15 @@ struct ExtractedCollectionEntryJson {
     url: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
+    thumbnails: Vec<ExtractedThumbnailJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtractedThumbnailJson {
+    url: String,
 }
 
 impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
@@ -485,11 +512,23 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
                         PlaybackError::Protocol(format!("invalid collection entry URL: {error}"))
                     })?;
                 let duration_seconds = entry.duration.and_then(rounded_nonnegative_seconds);
+                let thumbnail_url = entry
+                    .thumbnails
+                    .into_iter()
+                    .rev()
+                    .map(|thumbnail| thumbnail.url)
+                    .chain(entry.thumbnail)
+                    .find_map(|raw| {
+                        Url::parse(&raw)
+                            .ok()
+                            .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    });
                 Ok(CollectionEntry {
                     id: entry.id,
                     title: entry.title,
                     webpage_url,
                     duration_seconds,
+                    thumbnail_url,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -517,21 +556,37 @@ fn build_base_command(config: &YtDlpConfig) -> Command {
 fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Command {
     let mut command = build_base_command(config);
     command
-        .arg("--no-playlist")
-        .arg("--no-overwrites")
+		.arg("--no-overwrites")
         .arg("--no-simulate")
         .arg("--newline")
         .arg("--progress")
         .arg("--progress-template")
-        .arg(
-            "download:youta-progress|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
-        )
+		.arg(
+			"download:youta-progress|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(info.playlist_index)s|%(info.playlist_count)s",
+		)
         .arg("--print")
         .arg("after_move:youta-file|%(filepath)s")
         .arg("--paths")
         .arg(&request.destination)
         .arg("--output")
-        .arg("%(title).180B [%(id)s].%(ext)s");
+		.arg(match request.scope {
+			DownloadScope::SingleItem => "%(title).180B [%(id)s].%(ext)s",
+			DownloadScope::Collection => {
+				"%(channel).100B [%(channel_id)s]/%(title).180B [%(id)s].%(ext)s"
+			}
+		});
+
+    match request.scope {
+        DownloadScope::SingleItem => {
+            command.arg("--no-playlist");
+        }
+        DownloadScope::Collection => {
+            command
+                .arg("--yes-playlist")
+                .arg("--download-archive")
+                .arg(request.destination.join(".youta-download-archive"));
+        }
+    }
 
     match request.format {
         DownloadFormat::OpusWithoutTranscoding => {
@@ -591,18 +646,22 @@ pub fn parse_download_event(line: &str) -> Option<DownloadEvent> {
         .strip_prefix("youta-progress|")?
         .split('|')
         .collect::<Vec<_>>();
-    if fields.len() != 5 {
+    if !matches!(fields.len(), 5 | 7) {
         return None;
     }
     let downloaded_bytes = parse_optional_u64(fields[0])?;
     let total_bytes = parse_optional_u64(fields[1]).or_else(|| parse_optional_u64(fields[2]));
     let bytes_per_second = parse_optional_f64(fields[3]);
     let eta_seconds = parse_optional_u64(fields[4]);
+    let collection_index = fields.get(5).and_then(|value| parse_optional_u64(value));
+    let collection_count = fields.get(6).and_then(|value| parse_optional_u64(value));
     Some(DownloadEvent::Progress {
         downloaded_bytes,
         total_bytes,
         bytes_per_second,
         eta_seconds,
+        collection_index,
+        collection_count,
     })
 }
 
@@ -711,6 +770,7 @@ mod tests {
             source_url: Url::parse("https://example.test/watch/fixture").expect("source URL"),
             destination: PathBuf::from("/tmp/youta-fixture-downloads"),
             format: DownloadFormat::OpusWithoutTranscoding,
+            scope: DownloadScope::SingleItem,
             write_thumbnail: true,
         };
         let command = build_download_command(&config, &request);
@@ -763,6 +823,8 @@ mod tests {
                 total_bytes: Some(4096),
                 bytes_per_second: Some(128.5),
                 eta_seconds: Some(31),
+                collection_index: None,
+                collection_count: None,
             })
         );
         assert_eq!(
@@ -772,6 +834,19 @@ mod tests {
                 total_bytes: Some(5000),
                 bytes_per_second: None,
                 eta_seconds: None,
+                collection_index: None,
+                collection_count: None,
+            })
+        );
+        assert_eq!(
+            parse_download_event("youta-progress|512|1024|NA|64|8|3|41"),
+            Some(DownloadEvent::Progress {
+                downloaded_bytes: 512,
+                total_bytes: Some(1024),
+                bytes_per_second: Some(64.0),
+                eta_seconds: Some(8),
+                collection_index: Some(3),
+                collection_count: Some(41),
             })
         );
         assert_eq!(
@@ -782,6 +857,38 @@ mod tests {
         );
         assert_eq!(parse_download_event("[download] ordinary log"), None);
         assert_eq!(parse_download_event("youta-progress|bad|1|1|1|1"), None);
+    }
+
+    #[test]
+    fn collection_download_enables_playlist_traversal_and_a_restart_safe_archive() {
+        let config = YtDlpConfig::default();
+        let request = DownloadRequest {
+            source_url: Url::parse("https://www.youtube.com/channel/UCfixture")
+                .expect("channel URL"),
+            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+            format: DownloadFormat::OpusWithoutTranscoding,
+            scope: DownloadScope::Collection,
+            write_thumbnail: true,
+        };
+        let command = build_download_command(&config, &request);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--yes-playlist")
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--no-playlist"));
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "--download-archive"
+                && pair[1] == "/tmp/youta-fixture-downloads/.youta-download-archive"
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "--output" && pair[1].starts_with("%(channel).100B [%(channel_id)s]/")
+        }));
     }
 
     #[test]
@@ -838,7 +945,8 @@ mod tests {
 					"id": "entry-1",
 					"title": "First",
 					"webpage_url": "https://media.example/watch/entry-1",
-					"duration": 90
+					"duration": 90,
+					"thumbnails": [{"url": "https://images.example/one.jpg"}]
 				}
 			]
 		}"#;
@@ -848,5 +956,12 @@ mod tests {
         assert_eq!(collection.title, "Mock channel");
         assert_eq!(collection.entries.len(), 1);
         assert_eq!(collection.entries[0].duration_seconds, Some(90));
+        assert_eq!(
+            collection.entries[0]
+                .thumbnail_url
+                .as_ref()
+                .map(Url::as_str),
+            Some("https://images.example/one.jpg")
+        );
     }
 }

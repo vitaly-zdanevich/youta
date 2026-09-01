@@ -64,11 +64,11 @@ esac
 case "${variant}" in
 	images)
 		executable_suffix=
-		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 		;;
 	text)
 		executable_suffix=-text
-		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 		;;
 	images-no-qr)
 		executable_suffix=-no-qr
@@ -80,11 +80,11 @@ case "${variant}" in
 		;;
 	images-no-gpm)
 		executable_suffix=-no-gpm
-		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 		;;
 	text-no-gpm)
 		executable_suffix=-text-no-gpm
-		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+		cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 		;;
 	images-no-qr-no-gpm)
 		executable_suffix=-no-qr-no-gpm

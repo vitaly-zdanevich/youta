@@ -131,7 +131,8 @@ use crate::playback::youtube_prewarm::{
 };
 #[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
-    DownloadFormat, DownloadProcess, DownloadRequest, YtDlp, YtDlpConfig, parse_download_event,
+    DownloadFormat, DownloadProcess, DownloadRequest, DownloadScope, ExtractedCollection, YtDlp,
+    YtDlpConfig, parse_download_event,
 };
 use crate::playback::{
     BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent,
@@ -238,12 +239,16 @@ use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
 use crate::view::AsciiVisualizerView;
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
+#[cfg(feature = "yt-dlp")]
+use crate::view::ChannelDownloadPopupView;
 use crate::view::DetailLinkInternalTarget;
 #[cfg(any(feature = "librivox", feature = "yandex-music"))]
 use crate::view::DetailLinkPresentation;
 use crate::view::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
 use crate::view::DownloadView;
+#[cfg(feature = "lan-sharing")]
+use crate::view::LanSharePopupView;
 #[cfg(feature = "local-move")]
 use crate::view::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
@@ -3095,6 +3100,33 @@ struct EvernoteSelection {
     source: OpusAudioSource,
 }
 
+/// Exact reviewed channel download retained outside the serialized view.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone)]
+struct ChannelDownloadSelection {
+    channel_name: String,
+    source_url: url::Url,
+    destination: PathBuf,
+    format: DownloadFormat,
+    estimated_video_count: Option<u64>,
+}
+
+/// One exact YouTube channel whose flat catalogue is being prepared for RSS.
+#[cfg(feature = "lan-sharing")]
+struct PendingYouTubePodcastFeed {
+    generation: u64,
+    channel_id: String,
+    channel_name: String,
+}
+
+/// Bounded flat-channel completion returned by the isolated feed worker.
+#[cfg(feature = "lan-sharing")]
+struct YouTubePodcastFeedResponse {
+    generation: u64,
+    channel_id: String,
+    result: Result<ExtractedCollection, String>,
+}
+
 #[cfg(feature = "evernote")]
 impl EvernoteSelection {
     /// Builds fresh review metadata without exposing a local filesystem URL.
@@ -3237,12 +3269,15 @@ struct DownloadProgress {
     total_bytes: Option<u64>,
     bytes_per_second: Option<f64>,
     eta_seconds: Option<u64>,
+    collection_index: Option<u64>,
+    collection_count: Option<u64>,
 }
 
 #[cfg(feature = "yt-dlp")]
 #[derive(Debug, Default)]
 struct DownloadOutputBuffer {
     progress: DownloadProgress,
+    completed_files: u64,
     completed_paths: VecDeque<PathBuf>,
     diagnostic_lines: VecDeque<String>,
     diagnostic_bytes: usize,
@@ -3280,16 +3315,21 @@ impl DownloadOutputBuffer {
                     total_bytes,
                     bytes_per_second,
                     eta_seconds,
+                    collection_index,
+                    collection_count,
                 }) => {
                     self.progress = DownloadProgress {
                         downloaded_bytes,
                         total_bytes,
                         bytes_per_second,
                         eta_seconds,
+                        collection_index,
+                        collection_count,
                     };
                     return;
                 }
                 Some(crate::playback::ytdlp::DownloadEvent::CompletedFile(path)) => {
+                    self.completed_files = self.completed_files.saturating_add(1);
                     if self.completed_paths.len() == DOWNLOAD_COMPLETED_PATHS {
                         self.completed_paths.pop_front();
                     }
@@ -3315,6 +3355,8 @@ impl DownloadOutputBuffer {
 struct ActiveDownload {
     title: String,
     destination: PathBuf,
+    collection: bool,
+    estimated_total_files: Option<u64>,
     process: Box<dyn RunningDownload>,
     output: Arc<Mutex<DownloadOutputBuffer>>,
     reader_threads: Vec<JoinHandle<()>>,
@@ -3325,6 +3367,8 @@ impl ActiveDownload {
     fn start(
         title: String,
         destination: PathBuf,
+        collection: bool,
+        estimated_total_files: Option<u64>,
         mut process: Box<dyn RunningDownload>,
     ) -> Result<Self, String> {
         let progress_reader = process
@@ -3359,6 +3403,8 @@ impl ActiveDownload {
         Ok(Self {
             title,
             destination,
+            collection,
+            estimated_total_files,
             process,
             output,
             reader_threads: vec![progress_thread, error_thread],
@@ -4542,6 +4588,24 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// Sole session-scoped LAN server; replacing or dropping it closes the old listener.
+    #[cfg(feature = "lan-sharing")]
+    lan_share_server: Option<crate::lan_share::LanShareServer>,
+    /// Flat YouTube-channel enumeration completion owned by the active request.
+    #[cfg(feature = "lan-sharing")]
+    youtube_podcast_feed_responses: Receiver<YouTubePodcastFeedResponse>,
+    /// Sender cloned only into the current bounded feed-enumeration worker.
+    #[cfg(feature = "lan-sharing")]
+    youtube_podcast_feed_response_sender: Sender<YouTubePodcastFeedResponse>,
+    /// Sole flat channel-enumeration worker, joined after it finishes.
+    #[cfg(feature = "lan-sharing")]
+    youtube_podcast_feed_thread: Option<JoinHandle<()>>,
+    /// Monotonic owner for superseded feed preparations.
+    #[cfg(feature = "lan-sharing")]
+    youtube_podcast_feed_generation: u64,
+    /// Exact channel allowed to publish the next feed response.
+    #[cfg(feature = "lan-sharing")]
+    pending_youtube_podcast_feed: Option<PendingYouTubePodcastFeed>,
     /// Nested read-only archives containing the current Local directory.
     #[cfg(feature = "local-archives")]
     local_archive_stack: Vec<crate::local_archive::MaterializedLocalArchive>,
@@ -5035,6 +5099,9 @@ pub struct AppController {
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
     active_download: Option<ActiveDownload>,
+    /// Exact channel source retained while its destructive-size transfer awaits confirmation.
+    #[cfg(feature = "yt-dlp")]
+    channel_download_selection: Option<ChannelDownloadSelection>,
     /// Deadline for removing only a successful completed-path notice.
     #[cfg(feature = "yt-dlp")]
     download_completion_notice_deadline: Option<Instant>,
@@ -5781,6 +5848,8 @@ impl AppController {
         let bandcamp_resolver: Box<dyn BandcampResolveClient> = Box::new(BandcampResolver::new(
             config.providers.yt_dlp_executable.clone(),
         ));
+        #[cfg(feature = "lan-sharing")]
+        let (youtube_podcast_feed_response_sender, youtube_podcast_feed_responses) = unbounded();
         let mut controller = Self {
             config,
             store,
@@ -5937,6 +6006,18 @@ impl AppController {
             private_note_editor: None,
             pending_playlist_replay: None,
             local_listing: None,
+            #[cfg(feature = "lan-sharing")]
+            lan_share_server: None,
+            #[cfg(feature = "lan-sharing")]
+            youtube_podcast_feed_responses,
+            #[cfg(feature = "lan-sharing")]
+            youtube_podcast_feed_response_sender,
+            #[cfg(feature = "lan-sharing")]
+            youtube_podcast_feed_thread: None,
+            #[cfg(feature = "lan-sharing")]
+            youtube_podcast_feed_generation: 0,
+            #[cfg(feature = "lan-sharing")]
+            pending_youtube_podcast_feed: None,
             #[cfg(feature = "local-archives")]
             local_archive_stack: Vec::new(),
             #[cfg(feature = "local-browser")]
@@ -6256,6 +6337,8 @@ impl AppController {
             download_launcher,
             #[cfg(feature = "yt-dlp")]
             active_download: None,
+            #[cfg(feature = "yt-dlp")]
+            channel_download_selection: None,
             #[cfg(feature = "yt-dlp")]
             download_completion_notice_deadline: None,
             #[cfg(feature = "commons-upload")]
@@ -10390,6 +10473,249 @@ impl AppController {
         }
     }
 
+    /// Returns the exact Local target represented by the visible selection.
+    ///
+    /// The synthetic `..` row is navigation, not the parent itself. Sharing it
+    /// therefore exposes the directory currently on screen, matching the user's
+    /// expectation that `..` means “this folder” for share actions.
+    #[cfg(feature = "lan-sharing")]
+    fn selected_local_share_target(&self) -> Option<PathBuf> {
+        let listing = self.local_listing.as_ref()?;
+        if self.view.selected == 0 && listing.parent.is_some() {
+            return Some(listing.path.clone());
+        }
+        self.local_entry_index()
+            .and_then(|index| listing.entries.get(index))
+            .map(|entry| entry.path.clone())
+    }
+
+    /// Starts a new bounded LAN share and replaces the previous listener only
+    /// after preparation, binding, and QR encoding all succeed.
+    #[cfg(feature = "lan-sharing")]
+    fn share_selected_local_target(&mut self, podcast: bool) {
+        let Some(target) = self.selected_local_share_target() else {
+            self.view.status_line = "No local file or folder is selected".to_owned();
+            return;
+        };
+        let prepared = if podcast {
+            crate::lan_share::prepare_podcast_share(&target, &self.config.thumbnail_cache_dir())
+        } else {
+            crate::lan_share::prepare_file_share(&target)
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.view.status_line = format!("Cannot prepare LAN share: {error}");
+                return;
+            }
+        };
+        let target_name = target.file_name().map_or_else(
+            || target.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let title = if podcast {
+            format!("Podcast feed: {target_name}")
+        } else {
+            format!("LAN share: {target_name}")
+        };
+        let message = if podcast {
+            "Scan this feed in a podcast app on the same network. Embedded artwork is used when available. The feed stops when Youta exits."
+        } else {
+            "Scan this URL on a device connected to the same network. The share stops when Youta exits."
+        };
+        let status = if podcast {
+            "Local podcast feed is available while Youta is running"
+        } else {
+            "Local selection is available while Youta is running"
+        };
+        self.install_lan_share(prepared, title, message.to_owned(), status.to_owned());
+    }
+
+    /// Binds one prepared manifest and publishes its scanner-ready URL.
+    #[cfg(feature = "lan-sharing")]
+    fn install_lan_share(
+        &mut self,
+        prepared: crate::lan_share::PreparedLocalShare,
+        title: String,
+        message: String,
+        status: String,
+    ) {
+        let server = match crate::lan_share::LanShareServer::start(prepared) {
+            Ok(server) => server,
+            Err(error) => {
+                self.view.status_line = format!("Cannot start LAN server: {error}");
+                return;
+            }
+        };
+        let url = server.url().to_owned();
+        let matrix = match QrMatrix::encode(&url) {
+            Ok(matrix) => matrix,
+            Err(error) => {
+                self.view.status_line = format!("Cannot create LAN share QR code: {error}");
+                return;
+            }
+        };
+        self.lan_share_server = Some(server);
+        self.view.lan_share_popup = Some(LanSharePopupView {
+            title,
+            message,
+            url,
+            matrix,
+        });
+        self.view.status_line = status;
+    }
+
+    /// Returns the exact public YouTube channel represented by the Channel panel.
+    #[cfg(feature = "lan-sharing")]
+    fn selected_youtube_channel_for_podcast(&self) -> Option<(String, String)> {
+        let route_supported = self.view.screen == Screen::Search
+            || (self.view.screen == Screen::Subscriptions
+                && self.view.subscriptions.source_kind == SubscriptionKind::YouTube);
+        if !route_supported || self.view.right_panel_mode != RightPanelMode::Channel {
+            return None;
+        }
+        let details = self.view.details.as_ref()?;
+        canonical_youtube_channel_url(&details.channel_id)?;
+        Some((details.channel_id.clone(), details.title.clone()))
+    }
+
+    /// Enumerates one whole channel off the UI thread before publishing its feed.
+    #[cfg(feature = "lan-sharing")]
+    fn share_selected_youtube_channel_as_podcast(&mut self) {
+        let Some((channel_id, channel_name)) = self.selected_youtube_channel_for_podcast() else {
+            self.view.status_line = "No YouTube channel is selected".to_owned();
+            return;
+        };
+        if self
+            .youtube_podcast_feed_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            self.view.status_line =
+                "Wait for the current YouTube podcast feed to finish preparing".to_owned();
+            return;
+        }
+        if let Some(thread) = self.youtube_podcast_feed_thread.take() {
+            let _ = thread.join();
+        }
+        self.youtube_podcast_feed_generation = self.youtube_podcast_feed_generation.wrapping_add(1);
+        let generation = self.youtube_podcast_feed_generation;
+        let Some(source_url) = canonical_youtube_channel_url(&channel_id) else {
+            self.view.status_line = "The selected YouTube channel ID is invalid".to_owned();
+            return;
+        };
+        let executable = self.config.providers.yt_dlp_executable.clone();
+        let sender = self.youtube_podcast_feed_response_sender.clone();
+        let response_channel_id = channel_id.clone();
+        let thread = thread::Builder::new()
+            .name("youta-youtube-podcast-feed".to_owned())
+            .spawn(move || {
+                let client = YtDlp::new(YtDlpConfig {
+                    executable,
+                    ..YtDlpConfig::default()
+                });
+                let result = client
+                    .collection(&source_url, u16::MAX)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(YouTubePodcastFeedResponse {
+                    generation,
+                    channel_id: response_channel_id,
+                    result,
+                });
+            });
+        match thread {
+            Ok(thread) => {
+                self.youtube_podcast_feed_thread = Some(thread);
+                self.pending_youtube_podcast_feed = Some(PendingYouTubePodcastFeed {
+                    generation,
+                    channel_id,
+                    channel_name: channel_name.clone(),
+                });
+                self.view.status_line =
+                    format!("Preparing a podcast feed for {channel_name} with yt-dlp…");
+            }
+            Err(error) => {
+                self.view.status_line =
+                    format!("Cannot start YouTube podcast-feed worker: {error}");
+            }
+        }
+    }
+
+    /// Applies a completed flat catalogue only to the exact requesting channel.
+    #[cfg(feature = "lan-sharing")]
+    fn handle_youtube_podcast_feed_response(&mut self, response: YouTubePodcastFeedResponse) {
+        let Some(pending) = self.pending_youtube_podcast_feed.as_ref() else {
+            return;
+        };
+        if response.generation != pending.generation || response.channel_id != pending.channel_id {
+            return;
+        }
+        let pending = self
+            .pending_youtube_podcast_feed
+            .take()
+            .expect("matching pending feed was checked above");
+        match response.result {
+            Ok(collection) => {
+                let count = collection.entries.len();
+                let config = YouTubePrewarmConfig {
+                    executable: self.config.providers.yt_dlp_executable.clone(),
+                    timeout: Duration::from_secs(30),
+                    ..YouTubePrewarmConfig::default()
+                };
+                match crate::lan_share::prepare_youtube_podcast_share(collection, config) {
+					Ok(prepared) => self.install_lan_share(
+						prepared,
+						format!("YouTube podcast: {}", pending.channel_name),
+						"Youta resolves and proxies fresh audio when each episode is requested. The feed and its links stop when Youta exits; download the channel first for offline use."
+							.to_owned(),
+						format!(
+							"YouTube podcast feed with {count} episode(s) is available while Youta is running"
+						),
+					),
+					Err(error) => {
+						self.view.status_line =
+							format!("Cannot prepare YouTube podcast feed: {error}");
+					}
+				}
+            }
+            Err(error) => {
+                self.view.status_line = format!("Cannot enumerate YouTube channel: {error}");
+            }
+        }
+    }
+
+    /// Drains feed-enumeration completions without allowing a finished worker to leak.
+    #[cfg(feature = "lan-sharing")]
+    fn drain_youtube_podcast_feed_responses(&mut self) {
+        loop {
+            match self.youtube_podcast_feed_responses.try_recv() {
+                Ok(response) => self.handle_youtube_podcast_feed_response(response),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if self
+            .youtube_podcast_feed_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            let join_failed = self
+                .youtube_podcast_feed_thread
+                .take()
+                .is_some_and(|thread| thread.join().is_err());
+            while let Ok(response) = self.youtube_podcast_feed_responses.try_recv() {
+                self.handle_youtube_podcast_feed_response(response);
+            }
+            if self.pending_youtube_podcast_feed.take().is_some() {
+                self.view.status_line = if join_failed {
+                    "YouTube podcast-feed worker failed unexpectedly"
+                } else {
+                    "YouTube podcast-feed worker stopped without a result"
+                }
+                .to_owned();
+            }
+        }
+    }
+
     /// Opens cached comments or starts one worker-owned selected-video request.
     fn open_youtube_video_comments(&mut self) {
         if !self.youtube_video_comments_supported {
@@ -10591,6 +10917,7 @@ impl AppController {
             .contains_youtube_channel(&channel.channel_id);
         if is_visible_subscription_source {
             self.view.subscriptions.source_subscriber_count = channel.subscriber_count;
+            self.view.subscriptions.source_video_count = channel.video_count;
             self.view.subscriptions.source_created = channel
                 .created_at
                 .map(format_unix_utc_date)
@@ -18441,6 +18768,184 @@ impl AppController {
     }
 
     #[cfg(feature = "yt-dlp")]
+    fn open_channel_download(&mut self) {
+        if self.active_download.is_some() {
+            self.view.status_line =
+                "One download is already running; wait for it to finish or cancel it".to_owned();
+            return;
+        }
+        if self.view.screen != Screen::Subscriptions
+            || self.view.subscriptions.source_kind != SubscriptionKind::YouTube
+        {
+            self.view.status_line =
+                "Full-channel download is available for YouTube subscriptions".to_owned();
+            return;
+        }
+        let Some(details) = self.view.details.as_ref() else {
+            self.view.status_line = "No subscribed YouTube channel is selected".to_owned();
+            return;
+        };
+        let channel_id = details.channel_id.clone();
+        if channel_id.is_empty()
+            || channel_id.len() > 128
+            || !channel_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            self.view.status_line =
+                "The selected subscription has no valid YouTube channel ID".to_owned();
+            return;
+        }
+        let channel_name = if details.channel_name.trim().is_empty() {
+            details.title.clone()
+        } else {
+            details.channel_name.clone()
+        };
+        let source_url = url::Url::parse(&format!("https://www.youtube.com/channel/{channel_id}"))
+            .expect("a validated channel ID always forms a YouTube URL");
+        let destination = match prepare_download_destination(&self.config) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.show_error_message("Download destination is unavailable", error);
+                return;
+            }
+        };
+        let available_space_bytes = match fs2::available_space(&destination) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.show_error_message(
+                    "Download destination space is unavailable",
+                    format!(
+                        "cannot read available space for {}: {error}",
+                        destination.display()
+                    ),
+                );
+                return;
+            }
+        };
+        let format = match configured_download_format(&self.config.subscriptions.audio_format) {
+            Ok(format) => format,
+            Err(error) => {
+                self.show_error_message("Download format is invalid", error);
+                return;
+            }
+        };
+        let provider_count = details
+            .channel_video_count
+            .or(self.view.subscriptions.source_video_count)
+            .or_else(|| {
+                self.channel_details_cache
+                    .get(&channel_id)
+                    .and_then(Option::as_ref)
+                    .and_then(|channel| channel.video_count)
+            });
+        let loaded_count = self
+            .subscription_video_cache
+            .get(&channel_id)
+            .map(|cached| u64::try_from(cached.items.len()).unwrap_or(u64::MAX))
+            .filter(|count| *count > 0);
+        let estimated_video_count = provider_count.or(loaded_count);
+        let estimate_is_lower_bound = provider_count.is_none() && loaded_count.is_some();
+        self.channel_download_selection = Some(ChannelDownloadSelection {
+            channel_name: channel_name.clone(),
+            source_url,
+            destination: destination.clone(),
+            format,
+            estimated_video_count,
+        });
+        self.view.channel_download_popup = Some(ChannelDownloadPopupView {
+            channel_name,
+            estimated_video_count,
+            estimate_is_lower_bound,
+            available_space_bytes,
+            destination: destination.display().to_string(),
+        });
+        self.view.help_open = false;
+        self.view.status_line = "Review the full-channel audio download".to_owned();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    fn confirm_channel_download(&mut self) {
+        let Some(selection) = self.channel_download_selection.clone() else {
+            self.view.channel_download_popup = None;
+            return;
+        };
+        if self.active_download.is_some() {
+            self.view.status_line =
+                "One download is already running; wait for it to finish or cancel it".to_owned();
+            return;
+        }
+        clear_download_completion_notice(
+            &mut self.view,
+            &mut self.download_completion_notice_deadline,
+        );
+        let request = DownloadRequest {
+            source_url: selection.source_url,
+            destination: selection.destination.clone(),
+            format: selection.format,
+            scope: DownloadScope::Collection,
+            write_thumbnail: self.config.subscriptions.download_thumbnails,
+        };
+        let process = match self.download_launcher.start(&request) {
+            Ok(process) => process,
+            Err(error) => {
+                self.show_error_message("Channel download could not start", error);
+                return;
+            }
+        };
+        let active = match ActiveDownload::start(
+            selection.channel_name.clone(),
+            selection.destination,
+            true,
+            selection.estimated_video_count,
+            process,
+        ) {
+            Ok(active) => active,
+            Err(error) => {
+                self.show_error_message("Channel download supervision could not start", error);
+                return;
+            }
+        };
+        self.view.download = Some(DownloadView {
+            title: selection.channel_name.clone(),
+            total_files: selection.estimated_video_count,
+            collection: true,
+            active: true,
+            ..DownloadView::default()
+        });
+        self.view.channel_download_popup = None;
+        self.channel_download_selection = None;
+        self.view.status_line = format!(
+            "Downloading every public upload from {} as audio",
+            selection.channel_name
+        );
+        self.active_download = Some(active);
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    fn dismiss_channel_download(&mut self) {
+        self.view.channel_download_popup = None;
+        self.channel_download_selection = None;
+        self.view.status_line = "Full-channel download cancelled before starting".to_owned();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    fn cancel_active_download(&mut self) {
+        let Some(mut active) = self.active_download.take() else {
+            self.view.status_line = "No download is running".to_owned();
+            return;
+        };
+        let title = active.title.clone();
+        active.cancel_and_join();
+        mark_download_inactive(&mut self.view);
+        if let Some(download) = self.view.download.as_mut() {
+            download.eta_seconds = None;
+        }
+        self.download_completion_notice_deadline = None;
+        self.view.status_line = format!("Cancelled download: {title}");
+    }
+
+    #[cfg(feature = "yt-dlp")]
     fn start_selected_download(&mut self) {
         #[cfg(feature = "yandex-music")]
         if self.view.screen == Screen::YandexMusic {
@@ -18500,6 +19005,7 @@ impl AppController {
             source_url,
             destination: destination.clone(),
             format,
+            scope: DownloadScope::SingleItem,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
         };
         let process = match self.download_launcher.start(&request) {
@@ -18510,7 +19016,7 @@ impl AppController {
             }
         };
         let title = item.media.title;
-        let active = match ActiveDownload::start(title.clone(), destination, process) {
+        let active = match ActiveDownload::start(title.clone(), destination, false, None, process) {
             Ok(active) => active,
             Err(error) => {
                 self.show_error_message("Download supervision could not start", error);
@@ -18548,14 +19054,25 @@ impl AppController {
         let Some(active) = self.active_download.as_mut() else {
             return;
         };
-        let (progress, read_error) = {
+        let (progress, completed_files, read_error) = {
             let output = active
                 .output
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (output.progress, output.read_error.clone())
+            (
+                output.progress,
+                output.completed_files,
+                output.read_error.clone(),
+            )
         };
-        apply_download_progress(&mut self.view, &active.title, progress);
+        apply_download_progress(
+            &mut self.view,
+            &active.title,
+            progress,
+            completed_files,
+            active.collection,
+            active.estimated_total_files,
+        );
 
         if let Some(error) = read_error {
             let mut active = self
@@ -18598,19 +19115,27 @@ impl AppController {
             .take()
             .expect("the completed download is still active");
         active.join_readers();
-        let (progress, completed_path, read_error, diagnostics) = {
+        let (progress, completed_files, completed_path, read_error, diagnostics) = {
             let output = active
                 .output
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 output.progress,
+                output.completed_files,
                 output.completed_paths.back().cloned(),
                 output.read_error.clone(),
                 output.diagnostics(),
             )
         };
-        apply_download_progress(&mut self.view, &active.title, progress);
+        apply_download_progress(
+            &mut self.view,
+            &active.title,
+            progress,
+            completed_files,
+            active.collection,
+            active.estimated_total_files,
+        );
         if let Some(error) = read_error {
             mark_download_inactive(&mut self.view);
             self.show_error_message(
@@ -18630,32 +19155,38 @@ impl AppController {
             );
             return;
         }
-        let Some(completed_path) = completed_path else {
-            mark_download_inactive(&mut self.view);
-            self.show_error_message(
-                "Download result is incomplete",
-                append_download_diagnostics(
-                    "yt-dlp succeeded but did not report a completed media path".to_owned(),
-                    &diagnostics,
-                ),
-            );
-            return;
-        };
-        let completed_path =
-            match validate_completed_download_path(&active.destination, &completed_path) {
+        let completed_path = match completed_path {
+            Some(path) => match validate_completed_download_path(&active.destination, &path) {
                 Ok(path) => path,
                 Err(error) => {
                     mark_download_inactive(&mut self.view);
                     self.show_error_message("Download path failed validation", error);
                     return;
                 }
-            };
+            },
+            None if active.collection => active.destination.clone(),
+            None => {
+                mark_download_inactive(&mut self.view);
+                self.show_error_message(
+                    "Download result is incomplete",
+                    append_download_diagnostics(
+                        "yt-dlp succeeded but did not report a completed media path".to_owned(),
+                        &diagnostics,
+                    ),
+                );
+                return;
+            }
+        };
         self.view.download = Some(DownloadView {
-            title: active.title,
+            title: active.title.clone(),
             downloaded_bytes: progress.downloaded_bytes,
             total_bytes: progress.total_bytes,
             bytes_per_second: progress.bytes_per_second.map(rounded_download_rate),
             eta_seconds: Some(0),
+            completed_files,
+            current_file: progress.collection_index,
+            total_files: progress.collection_count.max(active.estimated_total_files),
+            collection: active.collection,
             active: false,
             completed_path: Some(completed_path.display().to_string()),
         });
@@ -18664,7 +19195,16 @@ impl AppController {
             self.populate_downloads();
             self.refresh_selected_playlist_state();
         }
-        self.view.status_line = format!("Downloaded {}", completed_path.display());
+        self.view.status_line = if active.collection && completed_files == 0 {
+            format!("Channel is already up to date: {}", active.title)
+        } else if active.collection {
+            format!(
+                "Downloaded {completed_files} channel audio file(s); latest: {}",
+                completed_path.display()
+            )
+        } else {
+            format!("Downloaded {}", completed_path.display())
+        };
     }
 
     fn activate_selection(&mut self) {
@@ -26469,6 +27009,7 @@ impl AppController {
                     self.view.subscriptions.source_generation.wrapping_add(1);
             }
             self.view.subscriptions.source_subscriber_count = None;
+            self.view.subscriptions.source_video_count = None;
             self.view.subscriptions.source_created.clear();
             return;
         };
@@ -26520,6 +27061,11 @@ impl AppController {
             .copied()
             .flatten();
         self.view.subscriptions.source_subscriber_count = cached_subscribers;
+        self.view.subscriptions.source_video_count = self
+            .channel_details_cache
+            .get(&channel_id)
+            .and_then(Option::as_ref)
+            .and_then(|channel| channel.video_count);
         self.view.subscriptions.source_created.clear();
         #[cfg(feature = "rss")]
         let description = if let Some(info) = rss_info.as_ref() {
@@ -32151,6 +32697,11 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
+        #[cfg(feature = "lan-sharing")]
+        {
+            self.lan_share_server = None;
+            self.view.lan_share_popup = None;
+        }
         self.clear_search_activity();
         self.clear_playback_start_activity();
         #[cfg(feature = "summary")]
@@ -32849,6 +33400,14 @@ impl UiController for AppController {
             UiAction::UpdatePlaylist => self.update_selected_playlist(),
             UiAction::DismissPlaylistPopup => self.dismiss_playlist_popup(),
             UiAction::Download => self.start_selected_download(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::OpenChannelDownload => self.open_channel_download(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::ConfirmChannelDownload => self.confirm_channel_download(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::DismissChannelDownload => self.dismiss_channel_download(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::CancelDownload => self.cancel_active_download(),
             #[cfg(feature = "commons-upload")]
             UiAction::OpenCommonsUpload => self.open_commons_upload(),
             #[cfg(feature = "commons-upload")]
@@ -33075,6 +33634,22 @@ impl UiController for AppController {
             UiAction::OpenVideoQr => self.open_youtube_video_qr(),
             #[cfg(feature = "qr")]
             UiAction::DismissVideoQr => self.view.video_qr_popup = None,
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ShareLocalFiles => self.share_selected_local_target(false),
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ShareLocalPodcast => self.share_selected_local_target(true),
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ShareYouTubeChannelPodcast => {
+                self.share_selected_youtube_channel_as_podcast();
+            }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::DismissLanShare => self.view.lan_share_popup = None,
+            #[cfg(feature = "lan-sharing")]
+            UiAction::StopLanShare => {
+                self.lan_share_server = None;
+                self.view.lan_share_popup = None;
+                self.view.status_line = "LAN sharing stopped".to_owned();
+            }
             UiAction::ScrollErrorPopup(movement) => self.scroll_error_popup(movement),
             UiAction::CopyErrorReport => self.copy_error_report(),
             UiAction::RequestGitHubIssueSubmission => self.request_github_issue_submission(),
@@ -33498,6 +34073,8 @@ impl UiController for AppController {
         self.refresh_now_playing();
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
+        #[cfg(feature = "lan-sharing")]
+        self.drain_youtube_podcast_feed_responses();
         #[cfg(feature = "summary")]
         self.drain_video_summary_responses();
         #[cfg(feature = "youtube-captions")]
@@ -40517,13 +41094,24 @@ fn expire_download_completion_notice(
 }
 
 #[cfg(feature = "yt-dlp")]
-fn apply_download_progress(view: &mut ViewModel, title: &str, progress: DownloadProgress) {
+fn apply_download_progress(
+    view: &mut ViewModel,
+    title: &str,
+    progress: DownloadProgress,
+    completed_files: u64,
+    collection: bool,
+    estimated_total_files: Option<u64>,
+) {
     view.download = Some(DownloadView {
         title: title.to_owned(),
         downloaded_bytes: progress.downloaded_bytes,
         total_bytes: progress.total_bytes,
         bytes_per_second: progress.bytes_per_second.map(rounded_download_rate),
         eta_seconds: progress.eta_seconds,
+        completed_files,
+        current_file: progress.collection_index,
+        total_files: progress.collection_count.max(estimated_total_files),
+        collection,
         active: true,
         completed_path: None,
     });
@@ -50492,6 +51080,98 @@ mod tests {
                 .and_then(|details| details.media_id.as_ref()),
             Some(&MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"))
         );
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn local_parent_row_shares_the_directory_currently_on_screen() {
+        let temporary = crate::test_support::canonical_tempdir("local-parent-share");
+        let current = temporary.path().join("album");
+        fs::create_dir(&current).expect("create current directory");
+        let audio = current.join("episode.opus");
+        fs::write(&audio, b"fixture audio").expect("write audio");
+        let config = Config::for_dir(temporary.path().join("config"));
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Local;
+        controller.view.selected = 0;
+        controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+            path: current.clone(),
+            parent: Some(temporary.path().to_path_buf()),
+            entries: vec![crate::local_browser::LocalEntry {
+                name: "episode.opus".into(),
+                path: audio.clone(),
+                kind: crate::local_browser::LocalEntryKind::Audio,
+                size_bytes: Some(13),
+                image_dimensions: None,
+                directory_identity: None,
+            }],
+            truncated: false,
+            inspected_entries: 1,
+        });
+
+        assert_eq!(controller.selected_local_share_target(), Some(current));
+        controller.view.selected = 1;
+        assert_eq!(controller.selected_local_share_target(), Some(audio));
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn completed_youtube_channel_feed_opens_a_session_scoped_qr() {
+        let temporary = crate::test_support::canonical_tempdir("youtube-podcast-share");
+        let config = Config::for_dir(temporary.path().join("config"));
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Search;
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.details = Some(DetailView {
+            title: "Fixture channel".to_owned(),
+            channel_id: "UCfixture".to_owned(),
+            ..DetailView::default()
+        });
+        assert_eq!(
+            controller.selected_youtube_channel_for_podcast(),
+            Some(("UCfixture".to_owned(), "Fixture channel".to_owned()))
+        );
+
+        controller.youtube_podcast_feed_generation = 7;
+        controller.pending_youtube_podcast_feed = Some(PendingYouTubePodcastFeed {
+            generation: 7,
+            channel_id: "UCfixture".to_owned(),
+            channel_name: "Fixture channel".to_owned(),
+        });
+        controller.handle_youtube_podcast_feed_response(YouTubePodcastFeedResponse {
+            generation: 7,
+            channel_id: "UCfixture".to_owned(),
+            result: Ok(ExtractedCollection {
+                id: "UCfixture".to_owned(),
+                title: "Fixture channel".to_owned(),
+                extractor: Some("YoutubeTab".to_owned()),
+                entries: vec![crate::playback::ytdlp::CollectionEntry {
+                    id: "dQw4w9WgXcQ".to_owned(),
+                    title: "Fixture episode".to_owned(),
+                    webpage_url: None,
+                    duration_seconds: Some(42),
+                    thumbnail_url: None,
+                }],
+            }),
+        });
+
+        let popup = controller
+            .view
+            .lan_share_popup
+            .as_ref()
+            .expect("YouTube podcast QR popup");
+        assert_eq!(popup.title, "YouTube podcast: Fixture channel");
+        assert!(popup.url.ends_with("/feed.xml"));
+        assert!(popup.message.contains("fresh audio"));
+        assert!(popup.message.contains("stop when Youta exits"));
+        assert!(controller.lan_share_server.is_some());
+
+        controller.dispatch(UiAction::StopLanShare);
+        assert!(controller.lan_share_server.is_none());
+        assert!(controller.view.lan_share_popup.is_none());
+        assert_eq!(controller.view.status_line, "LAN sharing stopped");
     }
 
     #[test]
@@ -69336,6 +70016,7 @@ mod tests {
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         );
         assert_eq!(request.format, DownloadFormat::OpusWithoutTranscoding);
+        assert_eq!(request.scope, DownloadScope::SingleItem);
         assert!(!request.write_thumbnail);
         assert_eq!(
             request.destination,
@@ -69380,6 +70061,98 @@ mod tests {
         controller.poll_download_at(deadline);
         assert!(controller.view.download.is_none());
         assert!(controller.download_completion_notice_deadline.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn full_channel_download_requires_review_then_runs_as_a_cancellable_collection() {
+        let temporary = crate::test_support::canonical_tempdir("channel downloads");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(
+                b"youta-progress|512|1024|NA|64|8|3|41\n".to_vec(),
+            )),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (mut controller, requests, _) = controller_with_mock_download(config, process);
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.view.subscriptions.source_video_count = Some(412);
+        controller.view.details = Some(DetailView {
+            title: "Fixture upload".to_owned(),
+            channel_name: "Fixture channel".to_owned(),
+            channel_id: "UCfixture".to_owned(),
+            channel_subscribed: true,
+            channel_video_count: Some(412),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::OpenChannelDownload);
+
+        let popup = controller
+            .view
+            .channel_download_popup
+            .as_ref()
+            .expect("review popup");
+        assert_eq!(popup.channel_name, "Fixture channel");
+        assert_eq!(popup.estimated_video_count, Some(412));
+        assert!(!popup.estimate_is_lower_bound);
+        assert!(popup.destination.ends_with("downloads"));
+        assert!(requests.lock().expect("download requests").is_empty());
+
+        controller.dispatch(UiAction::ConfirmChannelDownload);
+
+        let request = requests
+            .lock()
+            .expect("download requests")
+            .first()
+            .cloned()
+            .expect("one reviewed request");
+        assert_eq!(request.scope, DownloadScope::Collection);
+        assert_eq!(
+            request.source_url.as_str(),
+            "https://www.youtube.com/channel/UCfixture"
+        );
+        let download = controller.view.download.as_ref().expect("active download");
+        assert!(download.active);
+        assert!(download.collection);
+        assert_eq!(download.total_files, Some(412));
+        assert!(controller.view.channel_download_popup.is_none());
+
+        for _ in 0..100 {
+            controller.poll_download_at(Instant::now());
+            if controller
+                .view
+                .download
+                .as_ref()
+                .is_some_and(|download| download.current_file == Some(3))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let download = controller.view.download.as_ref().expect("live progress");
+        assert_eq!(download.current_file, Some(3));
+        assert_eq!(
+            download.total_files,
+            Some(412),
+            "a nested yt-dlp playlist count must not replace the larger channel estimate"
+        );
+
+        controller.dispatch(UiAction::CancelDownload);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(controller.active_download.is_none());
+        assert!(
+            controller
+                .view
+                .download
+                .as_ref()
+                .is_some_and(|download| !download.active)
+        );
+        assert!(controller.view.status_line.contains("Cancelled download"));
     }
 
     #[cfg(feature = "yt-dlp")]

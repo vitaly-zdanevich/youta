@@ -12,6 +12,7 @@ import { Waveform } from "./components/Waveform";
 import { AsciiVisualizer } from './components/AsciiVisualizer';
 import {
   AudioQualityPopup,
+  ChannelDownloadPopup,
   CommonsCredentialsPopup,
   CommonsUploadPopup,
   CredentialEditorNotice,
@@ -20,6 +21,7 @@ import {
   ErrorPopup,
   HelpPopup,
   LocalFilePopup,
+	LanSharePopup,
   PlaylistPopup,
   PreferencesPopup,
   ProjectHistoryPopup,
@@ -189,7 +191,9 @@ export function App() {
           audioQualitySupported={view.audio_quality_supported}
           asciiVisualizerSupported={view.ascii_visualizer_supported ?? false}
           commonsUploadSupported={view.commons_upload_supported}
+			channelDownloadSupported={view.channel_download_supported}
 			evernoteSupported={view.evernote_supported}
+			lanShareSupported={view.lan_share_supported}
           playbackHistoryEnabled={view.playback_history_enabled}
           videoSummarySupported={view.video_summary_supported}
           youtubeCaptionsSupported={view.youtube_captions_supported ?? false}
@@ -216,6 +220,9 @@ export function App() {
       {view.rss_subscription_open ? <CredentialEditorNotice editor="rss_subscription" /> : null}
       {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} /> : null}
       {view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} /> : null}
+		{view.channel_download_popup ? (
+			<ChannelDownloadPopup popup={view.channel_download_popup} />
+		) : null}
       {view.playlist_popup ? <PlaylistPopup popup={view.playlist_popup} /> : null}
       {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}
@@ -223,6 +230,7 @@ export function App() {
         <VideoCommentsPopup popup={view.video_comments_popup} />
       ) : null}
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
+		{view.lan_share_popup ? <LanSharePopup popup={view.lan_share_popup} /> : null}
       {view.video_summary_popup ? (
         <VideoSummaryPopup popup={view.video_summary_popup} />
       ) : null}

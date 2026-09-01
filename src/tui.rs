@@ -1362,6 +1362,11 @@ fn render_virtual_cursor_overlay(
         virtual_cursor.synchronize_bounds(frame.area());
         return;
     }
+    #[cfg(feature = "lan-sharing")]
+    if view.lan_share_popup.is_some() && view.error_popup.is_none() {
+        virtual_cursor.synchronize_bounds(frame.area());
+        return;
+    }
     #[cfg(not(feature = "qr"))]
     let _ = view;
     virtual_cursor.render(frame);
@@ -1750,6 +1755,9 @@ struct HitMap {
     /// Close control rendered inside the selected-video QR popup.
     #[cfg(feature = "qr")]
     video_qr_buttons: Vec<(UiAction, Rect)>,
+    /// Close and stop controls rendered inside the LAN-share QR popup.
+    #[cfg(feature = "lan-sharing")]
+    lan_share_buttons: Vec<(UiAction, Rect)>,
     /// Wrapped text viewport inside the public-comments popup.
     video_comments_text_area: Rect,
     /// Actual first wrapped comment line rendered in the viewport.
@@ -1815,6 +1823,8 @@ struct HitMap {
     /// Largest wrapped-line offset that can change the private-note viewport.
     private_note_scroll_maximum: usize,
     local_file_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "yt-dlp")]
+    channel_download_buttons: Vec<(UiAction, Rect)>,
     /// Visible destination rows inside the Local Move popup.
     local_move_rows: Rect,
     /// First destination model row represented by [`Self::local_move_rows`].
@@ -2162,6 +2172,8 @@ fn render_frame(
         || view.local_file_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    #[cfg(feature = "yt-dlp")]
+    let thumbnail_is_obscured = thumbnail_is_obscured || view.channel_download_popup.is_some();
     #[cfg(feature = "youtube-captions")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.youtube_captions_popup.is_some();
     #[cfg(feature = "commons-upload")]
@@ -2174,6 +2186,8 @@ fn render_frame(
         || view.evernote_credentials_popup.is_some();
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
+    #[cfg(feature = "lan-sharing")]
+    let thumbnail_is_obscured = thumbnail_is_obscured || view.lan_share_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
         && view.expanded_thumbnail_available()
         && thumbnail_renderer
@@ -2217,7 +2231,7 @@ fn render_frame(
         );
     }
     if let Some(download) = view.download.as_ref() {
-        render_download_bar(frame, sections[2], download, &theme);
+        render_download_bar(frame, sections[2], download, &theme, hit_map);
     }
     render_seek_bar(frame, sections[3], view, settings, &theme, hit_map);
     if let Some(notice) = footer_notice {
@@ -2319,6 +2333,13 @@ fn render_frame(
     if let Some(popup) = view.local_file_popup.as_ref() {
         render_local_file_popup(frame, popup, &theme, hit_map);
     }
+    #[cfg(feature = "yt-dlp")]
+    {
+        hit_map.channel_download_buttons.clear();
+        if let Some(popup) = view.channel_download_popup.as_ref() {
+            render_channel_download_popup(frame, popup, &theme, hit_map);
+        }
+    }
     hit_map.playlist_popup_rows = Rect::default();
     hit_map.playlist_popup_first_index = 0;
     hit_map.playlist_popup_fields.clear();
@@ -2372,6 +2393,13 @@ fn render_frame(
             render_video_qr_popup(frame, popup, &theme, hit_map);
         }
     }
+    #[cfg(feature = "lan-sharing")]
+    {
+        hit_map.lan_share_buttons.clear();
+        if let Some(popup) = view.lan_share_popup.as_ref() {
+            render_lan_share_popup(frame, popup, &theme, hit_map);
+        }
+    }
     if let Some(popup) = view.video_summary_popup.as_ref() {
         render_video_summary_popup(frame, popup, &theme, hit_map);
     }
@@ -2392,10 +2420,35 @@ fn render_frame(
     }
 }
 
-fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadView, theme: &Theme) {
+fn render_download_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    download: &DownloadView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    #[cfg(not(feature = "yt-dlp"))]
+    let _ = &hit_map;
     let completed = !download.active && download.completed_path.is_some();
     let ratio = if completed {
         1.0
+    } else if download.collection {
+        download
+            .total_files
+            .filter(|total| *total > 0)
+            .map_or(0.0, |total| {
+                let prior_files = download
+                    .current_file
+                    .map(|current| current.saturating_sub(1))
+                    .unwrap_or(download.completed_files)
+                    .max(download.completed_files);
+                collection_download_ratio(
+                    prior_files,
+                    total,
+                    download.downloaded_bytes,
+                    download.total_bytes,
+                )
+            })
     } else {
         download
             .total_bytes
@@ -2405,7 +2458,15 @@ fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadVie
             })
     };
     let label = if let Some(path) = download.completed_path.as_deref() {
-        format!("Downloaded: {path}")
+        if download.collection {
+            if download.completed_files == 0 {
+                format!("Channel already up to date: {path}")
+            } else {
+                format!("Downloaded {} file(s): {path}", download.completed_files)
+            }
+        } else {
+            format!("Downloaded: {path}")
+        }
     } else {
         let transferred = match download.total_bytes {
             Some(total) if total > 0 => format!(
@@ -2424,8 +2485,18 @@ fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadVie
             .eta_seconds
             .map(|value| format!(" · ETA {}", format_duration(Duration::from_secs(value))))
             .unwrap_or_default();
+        let collection = if download.collection {
+            match (download.current_file, download.total_files) {
+                (Some(current), Some(total)) => format!(" · item {current} / {total}"),
+                (Some(current), None) => format!(" · item {current}"),
+                (None, Some(total)) => format!(" · 0 / {total} items"),
+                (None, None) => " · enumerating items".to_owned(),
+            }
+        } else {
+            String::new()
+        };
         format!(
-            "{} {} · {transferred}{speed}{eta}",
+            "{} {}{collection} · {transferred}{speed}{eta}",
             if download.active {
                 "Downloading"
             } else {
@@ -2434,6 +2505,16 @@ fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadVie
             download.title
         )
     };
+    #[cfg(feature = "yt-dlp")]
+    let cancel_label = "[C] Cancel";
+    #[cfg(feature = "yt-dlp")]
+    let rendered_label = if download.active {
+        format!("{label}   {cancel_label}")
+    } else {
+        label
+    };
+    #[cfg(not(feature = "yt-dlp"))]
+    let rendered_label = label;
     frame.render_widget(
         Gauge::default()
             .block(
@@ -2447,9 +2528,27 @@ fn render_download_bar(frame: &mut Frame<'_>, area: Rect, download: &DownloadVie
                 theme.progress
             })
             .ratio(ratio)
-            .label(label),
+            .label(rendered_label.as_str()),
         area,
     );
+    #[cfg(feature = "yt-dlp")]
+    if download.active {
+        let content_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+        let label_width = terminal_text_width(&rendered_label);
+        let cancel_width = terminal_text_width(cancel_label);
+        if label_width <= content_area.width {
+            let start = centered_line_x(content_area, label_width);
+            hit_map.buttons.push((
+                UiAction::CancelDownload,
+                Rect::new(
+                    start.saturating_add(label_width.saturating_sub(cancel_width)),
+                    content_area.y,
+                    cancel_width,
+                    1,
+                ),
+            ));
+        }
+    }
 }
 
 fn render_tabs(
@@ -4440,6 +4539,78 @@ fn render_information_panel(
             UiAction::EditPrivateNote,
         )
     });
+    let rename_button = (cfg!(feature = "local-rename")
+        && kind == InformationPanelKind::Local
+        && details.local_renamable)
+        .then(|| {
+            let label = button("r", "Rename", show_hotkeys);
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                label,
+                theme.accent,
+                UiAction::BeginLocalRename,
+            )
+        });
+    #[cfg(feature = "lan-sharing")]
+    let local_share_button = (kind == InformationPanelKind::Local).then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("F11", "Share over LAN", show_hotkeys),
+            theme.accent,
+            UiAction::ShareLocalFiles,
+        )
+    });
+    #[cfg(feature = "lan-sharing")]
+    let local_podcast_button = (kind == InformationPanelKind::Local).then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("F12", "Podcast feed", show_hotkeys),
+            theme.accent,
+            UiAction::ShareLocalPodcast,
+        )
+    });
+    #[cfg(feature = "lan-sharing")]
+    let channel_podcast_button = (kind == InformationPanelKind::Channel
+        && !details.channel_id.is_empty()
+        && (view.screen == Screen::Search
+            || (view.screen == Screen::Subscriptions
+                && view.subscriptions.source_kind == SubscriptionKind::YouTube)))
+        .then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("F12", "Podcast feed", show_hotkeys),
+                theme.accent,
+                UiAction::ShareYouTubeChannelPodcast,
+            )
+        });
+    #[cfg(feature = "yt-dlp")]
+    let channel_download_button = (view.screen == Screen::Subscriptions
+        && view.subscriptions.source_kind == SubscriptionKind::YouTube
+        && details.channel_subscribed
+        && !details.channel_id.is_empty())
+    .then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("D", "Download full channel", show_hotkeys),
+            theme.accent,
+            UiAction::OpenChannelDownload,
+        )
+    });
     let subscription_button = (!details.channel_id.is_empty()).then(|| {
         let label = button(
             "s",
@@ -4460,21 +4631,6 @@ fn render_information_panel(
             UiAction::ToggleSubscription,
         )
     });
-    let rename_button = (cfg!(feature = "local-rename")
-        && kind == InformationPanelKind::Local
-        && details.local_renamable)
-        .then(|| {
-            let label = button("r", "Rename", show_hotkeys);
-            push_left_detail_button(
-                &mut lines,
-                &right_buttons,
-                &mut next_left_row,
-                inner.width,
-                label,
-                theme.accent,
-                UiAction::BeginLocalRename,
-            )
-        });
     match kind {
         InformationPanelKind::Video => {
             let mut spans = Vec::new();
@@ -4592,12 +4748,20 @@ fn render_information_panel(
         playlist_button,
         edit_playlist_button,
         private_note_button,
-        subscription_button,
-        rename_button,
+        #[cfg(feature = "lan-sharing")]
+        local_share_button,
+        #[cfg(feature = "lan-sharing")]
+        local_podcast_button,
+        #[cfg(feature = "lan-sharing")]
+        channel_podcast_button,
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    #[cfg(feature = "yt-dlp")]
+    detail_buttons.extend(channel_download_button);
+    detail_buttons.extend(subscription_button);
+    detail_buttons.extend(rename_button);
     // Preserve the compact layout's established left-actions-first hit-map
     // order. The side rail independently sorts by visual row and column.
     detail_buttons.extend(right_buttons);
@@ -6440,17 +6604,21 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         local_actions.push("m move");
     }
     if cfg!(any(feature = "local-move", feature = "audio-quality")) {
-        local_actions.push("Shift+J/K mark");
+        local_actions.push("Shift+J/K");
     }
     if cfg!(feature = "local-trash") {
-        local_actions.push("Delete trash");
+        local_actions.push("Delete");
     }
     if view.audio_quality_supported {
         local_actions.push("V audio quality");
     }
+    if view.lan_share_supported {
+        local_actions.push("F11 share");
+        local_actions.push("F12 feed");
+    }
     if !local_actions.is_empty() {
         local_help.push_str("\n    ");
-        local_help.push_str(&local_actions.join("  "));
+        local_help.push_str(&local_actions.join(" "));
     }
     if !cfg!(feature = "local-browser") {
         local_help.clear();
@@ -6470,6 +6638,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  F9 recent commits and installation details     F10 ASCII visualizer";
     #[cfg(not(feature = "ascii-visualizer"))]
     let project_history_help = "  F9 recent commits and installation details";
+    #[cfg(feature = "yt-dlp")]
+    let subscription_help = "  Subscriptions: PageUp/Down page R refresh h Shorts on/off i info D full channel C cancel";
+    #[cfg(not(feature = "yt-dlp"))]
+    let subscription_help = "  Subscriptions: PageUp/Down page     R refresh videos     h Shorts on/off     i description";
     let mut video_actions_help = "  o video page".to_owned();
     #[cfg(feature = "youtube-captions")]
     if view.youtube_captions_supported {
@@ -6501,7 +6673,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  ↪ internal video: click the marker after a YouTube URL",
         local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
-        "  Subscriptions: PageUp/Down page     R refresh videos     h Shorts on/off     i description",
+        subscription_help,
         "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
@@ -7848,6 +8020,169 @@ fn render_video_qr_close_control(
     hit_map
         .video_qr_buttons
         .push((UiAction::DismissVideoQr, Rect::new(x, area.y, width, 1)));
+}
+
+/// Renders a scanner-safe URL for the active session-scoped LAN server.
+#[cfg(feature = "lan-sharing")]
+fn render_lan_share_popup(
+    frame: &mut Frame<'_>,
+    popup: &LanSharePopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let symbol_modules = popup
+        .matrix
+        .width()
+        .saturating_add(QR_QUIET_ZONE_MODULES.saturating_mul(2));
+    let symbol_rows = symbol_modules.saturating_add(1) / 2;
+    let required_width = u16::try_from(symbol_modules)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .max(54);
+    let required_height = u16::try_from(symbol_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(8);
+    if frame.area().width < required_width || frame.area().height < required_height {
+        render_lan_share_size_fallback(
+            frame,
+            popup,
+            required_width,
+            required_height,
+            theme,
+            hit_map,
+        );
+        return;
+    }
+    let area = centered_sized_rect(required_width, required_height, frame.area());
+    frame.render_widget(Clear, area);
+    let panel_title = format!(" {} ", popup.title);
+    frame.render_widget(panel_block(&panel_title, theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let sections = Layout::vertical([
+        Constraint::Length(u16::try_from(symbol_rows).unwrap_or(u16::MAX)),
+        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let qr_style = Style::default().fg(Color::Black).bg(Color::White);
+    let lines = (0..symbol_rows)
+        .map(|terminal_row| {
+            let top = terminal_row.saturating_mul(2);
+            let bottom = top.saturating_add(1);
+            let symbols = (0..symbol_modules)
+                .map(|x| {
+                    match (
+                        qr_module_is_dark(&popup.matrix, x, top),
+                        qr_module_is_dark(&popup.matrix, x, bottom),
+                    ) {
+                        (true, true) => '█',
+                        (true, false) => '▀',
+                        (false, true) => '▄',
+                        (false, false) => ' ',
+                    }
+                })
+                .collect::<String>();
+            Line::styled(symbols, qr_style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).style(qr_style), sections[0]);
+    frame.render_widget(
+        Paragraph::new(popup.message.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.base)
+            .wrap(Wrap { trim: true }),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(popup.url.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.muted)
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+    render_lan_share_controls(frame, sections[3], theme, hit_map);
+}
+
+/// Keeps the share URL available when the terminal cannot fit a valid QR.
+#[cfg(feature = "lan-sharing")]
+fn render_lan_share_size_fallback(
+    frame: &mut Frame<'_>,
+    popup: &LanSharePopupView,
+    required_width: u16,
+    required_height: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.min(72);
+    let height = frame.area().height.min(10);
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" LAN sharing ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let sections = Layout::vertical([
+        Constraint::Min(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Resize to at least {required_width}×{required_height} cells for the QR code. {}",
+            popup.message
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: true }),
+        sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(popup.url.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.muted)
+            .wrap(Wrap { trim: false }),
+        sections[1],
+    );
+    render_lan_share_controls(frame, sections[2], theme, hit_map);
+}
+
+/// Renders explicit close and stop controls for an active LAN listener.
+#[cfg(feature = "lan-sharing")]
+fn render_lan_share_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let close = "[Esc] Close";
+    let stop = "[x] Stop sharing";
+    let controls = format!("{close}   {stop}");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        area,
+    );
+    let start = centered_line_x(area, terminal_text_width(&controls));
+    let close_width = terminal_text_width(close);
+    hit_map.lan_share_buttons.push((
+        UiAction::DismissLanShare,
+        Rect::new(start, area.y, close_width, 1),
+    ));
+    hit_map.lan_share_buttons.push((
+        UiAction::StopLanShare,
+        Rect::new(
+            start.saturating_add(close_width).saturating_add(3),
+            area.y,
+            terminal_text_width(stop),
+            1,
+        ),
+    ));
 }
 
 fn render_youtube_setup_popup(
@@ -10398,6 +10733,78 @@ fn render_local_file_popup(
     ));
 }
 
+/// Renders the review gate for a potentially large full-channel transfer.
+#[cfg(feature = "yt-dlp")]
+fn render_channel_download_popup(
+    frame: &mut Frame<'_>,
+    popup: &ChannelDownloadPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let estimate = match popup.estimated_video_count {
+        Some(count) if popup.estimate_is_lower_bound => {
+            format!("at least {} currently loaded", format_count(count))
+        }
+        Some(count) => format!("about {} public uploads", format_count(count)),
+        None => "unavailable; yt-dlp will enumerate the channel".to_owned(),
+    };
+    let message = format!(
+        "Download every public upload from “{}” as audio?\n\nEstimated videos: {estimate}\nFree space remaining: {}\nDestination: {}\n\nThis includes the channel's videos, Shorts, and live uploads. Existing archive entries will be skipped.",
+        popup.channel_name,
+        human_bytes(popup.available_space_bytes),
+        popup.destination,
+    );
+    let width = frame.area().width.saturating_sub(4).clamp(1, 100);
+    let message_width = width.saturating_sub(6).max(1);
+    let wrapped = wrap_text_lines(&message, message_width);
+    let message_height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+    let height = message_height
+        .saturating_add(5)
+        .clamp(1, frame.area().height.saturating_sub(2).max(1));
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Download full channel? ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(wrapped.join("\n"))
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    let confirm_label = "[Enter] Download";
+    let cancel_label = "[Esc] Cancel";
+    let controls = format!("{confirm_label}   {cancel_label}");
+    frame.render_widget(
+        Paragraph::new(controls.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[1],
+    );
+    let start = centered_line_x(sections[1], terminal_text_width(&controls));
+    hit_map.channel_download_buttons.push((
+        UiAction::ConfirmChannelDownload,
+        Rect::new(start, sections[1].y, terminal_text_width(confirm_label), 1),
+    ));
+    hit_map.channel_download_buttons.push((
+        UiAction::DismissChannelDownload,
+        Rect::new(
+            start
+                .saturating_add(terminal_text_width(confirm_label))
+                .saturating_add(3),
+            sections[1].y,
+            terminal_text_width(cancel_label),
+            1,
+        ),
+    ));
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the Move popup keeps controller-owned destination state explicit"
@@ -11217,6 +11624,17 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+    #[cfg(feature = "lan-sharing")]
+    if view.lan_share_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .lan_share_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            _ => None,
+        };
+    }
     #[cfg(feature = "qr")]
     {
         if view.video_qr_popup.is_some() {
@@ -11336,6 +11754,17 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollUp if popup.mode == PlaylistPopupMode::Choose => {
                 Some(UiAction::MovePlaylistPopupSelection(-1))
             }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "yt-dlp")]
+    if view.channel_download_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .channel_download_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
             _ => None,
         };
     }
@@ -11849,6 +12278,31 @@ fn download_ratio(downloaded_bytes: u64, total_bytes: u64) -> f64 {
         .saturating_mul(u128::from(RATIO_SCALE))
         / u128::from(total_bytes);
     f64::from(u32::try_from(scaled).unwrap_or(RATIO_SCALE)) / f64::from(RATIO_SCALE)
+}
+
+/// Combines completed collection entries and current-file bytes without lossy
+/// integer-to-float casts for large channel counts.
+fn collection_download_ratio(
+    completed_files: u64,
+    total_files: u64,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) -> f64 {
+    const RATIO_SCALE: u128 = 10_000;
+
+    if total_files == 0 {
+        return 0.0;
+    }
+    let within_file = total_bytes.filter(|total| *total > 0).map_or(0, |total| {
+        u128::from(downloaded_bytes.min(total)).saturating_mul(RATIO_SCALE) / u128::from(total)
+    });
+    let denominator = u128::from(total_files).saturating_mul(RATIO_SCALE);
+    let numerator = u128::from(completed_files.min(total_files))
+        .saturating_mul(RATIO_SCALE)
+        .saturating_add(within_file)
+        .min(denominator);
+    let scaled = numerator.saturating_mul(RATIO_SCALE) / denominator;
+    f64::from(u32::try_from(scaled).unwrap_or(10_000)) / 10_000.0
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -19530,6 +19984,112 @@ mod tests {
         assert!(rendered.contains("[s] Unsubscribe (locally)"));
     }
 
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn subscribed_youtube_details_put_full_channel_download_before_unsubscribe() {
+        let backend = TestBackend::new(180, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            screen: Screen::Subscriptions,
+            details: Some(DetailView {
+                title: "Fixture upload".to_owned(),
+                channel_name: "Fixture channel".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_subscribed: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw subscribed YouTube details");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[D] Download full channel"));
+        assert!(rendered.contains("[s] Unsubscribe (locally)"));
+        let download_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::OpenChannelDownload).then_some(area.y))
+            .expect("channel-download target");
+        let unsubscribe_row = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| (action == &UiAction::ToggleSubscription).then_some(area.y))
+            .expect("unsubscribe target");
+        assert!(
+            download_row < unsubscribe_row,
+            "the channel download must precede Unsubscribe"
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenChannelDownload)
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn channel_download_confirmation_exposes_count_space_and_both_actions() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let view = ViewModel {
+            channel_download_popup: Some(ChannelDownloadPopupView {
+                channel_name: "Fixture channel".to_owned(),
+                estimated_video_count: Some(412),
+                estimate_is_lower_bound: false,
+                available_space_bytes: 24 * 1024 * 1024 * 1024,
+                destination: "/home/listener/.config/youta/downloads".to_owned(),
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw full-channel confirmation");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Download full channel?"));
+        assert!(rendered.contains("Estimated videos: about 412 public uploads"));
+        assert!(rendered.contains("Free space remaining: 24.0 GiB"));
+        assert!(rendered.contains("videos, Shorts, and live uploads"));
+        assert!(rendered.contains("[Enter] Download"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ConfirmChannelDownload)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::DismissChannelDownload)
+        );
+        let confirm_area = hit_map
+            .channel_download_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::ConfirmChannelDownload).then_some(*area)
+            })
+            .expect("confirmation mouse target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: confirm_area.x,
+                    row: confirm_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ConfirmChannelDownload)
+        );
+    }
+
     #[test]
     fn left_detail_actions_preserve_grouped_navigation_rows() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
@@ -19681,16 +20241,19 @@ mod tests {
                 .find_map(|(candidate, area)| (candidate == action).then_some(*area))
                 .unwrap_or_else(|| panic!("missing channel action {action:?}"))
         };
+        let podcast_area = area_for(&UiAction::ShareYouTubeChannelPodcast);
         let subscribe_area = area_for(&UiAction::ToggleSubscription);
         let open_area = area_for(&UiAction::OpenChannelInBrowser);
         let thumbnail_area = hit_map
             .thumbnail_area
             .expect("ready channel artwork hitbox");
-        assert_eq!(subscribe_area.y, thumbnail_area.y);
-        assert_eq!(open_area.y, subscribe_area.y.saturating_add(2));
+        assert_eq!(podcast_area.y, thumbnail_area.y);
+        assert_eq!(open_area.y, podcast_area.y.saturating_add(2));
+        assert_eq!(subscribe_area.y, open_area.y.saturating_add(2));
         assert!(
-            thumbnail_area.right().saturating_add(2) <= subscribe_area.x
+            thumbnail_area.right().saturating_add(2) <= podcast_area.x
                 && thumbnail_area.right().saturating_add(2) <= open_area.x
+                && thumbnail_area.right().saturating_add(2) <= subscribe_area.x
         );
         assert_eq!(
             thumbnail_area.y,
@@ -19710,7 +20273,9 @@ mod tests {
             description_y,
             thumbnail_area
                 .bottom()
+                .max(podcast_area.bottom())
                 .max(open_area.bottom())
+                .max(subscribe_area.bottom())
                 .saturating_add(1),
             "one blank row must separate channel artwork and controls from its description"
         );
@@ -25464,6 +26029,7 @@ prose 07:25 remains clickable but is not a chapter";
                 eta_seconds: Some(4),
                 active: true,
                 completed_path: None,
+                ..DownloadView::default()
             }),
             ..ViewModel::default()
         };
@@ -25507,11 +26073,64 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("1.0 KiB · size unknown"));
     }
 
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn collection_download_bar_shows_aggregate_progress_and_cancel_control() {
+        let mut terminal = Terminal::new(TestBackend::new(180, 2)).expect("terminal");
+        let view = ViewModel {
+            download: Some(DownloadView {
+                title: "Fixture channel".to_owned(),
+                downloaded_bytes: 512,
+                total_bytes: Some(1024),
+                completed_files: 2,
+                current_file: Some(3),
+                total_files: Some(10),
+                collection: true,
+                active: true,
+                ..DownloadView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| {
+                render_download_bar(
+                    frame,
+                    frame.area(),
+                    view.download.as_ref().expect("download view"),
+                    &Theme::new(false),
+                    &mut hit_map,
+                );
+            })
+            .expect("draw collection progress");
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Downloading Fixture channel · item 3 / 10"));
+        assert!(rendered.contains("25.0%"));
+        assert!(rendered.contains("[C] Cancel"));
+        assert!(
+            hit_map
+                .buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::CancelDownload)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::CancelDownload)
+        );
+    }
+
     #[test]
     fn download_ratio_and_binary_units_are_bounded_without_float_casts() {
         assert!((download_ratio(2, 4) - 0.5).abs() < f64::EPSILON);
         assert!((download_ratio(5, 4) - 1.0).abs() < f64::EPSILON);
         assert!(download_ratio(1, 0).abs() < f64::EPSILON);
+        assert!((collection_download_ratio(2, 4, 1, Some(2)) - 0.625).abs() < f64::EPSILON);
+        assert!((collection_download_ratio(u64::MAX, 4, 1, Some(2)) - 1.0).abs() < f64::EPSILON);
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
@@ -25567,9 +26186,16 @@ prose 07:25 remains clickable but is not a chapter";
         };
         let mut active_terminal =
             Terminal::new(TestBackend::new(80, 2)).expect("active download terminal");
+        let mut active_hit_map = HitMap::default();
         active_terminal
             .draw(|frame| {
-                render_download_bar(frame, frame.area(), &active, &Theme::new(false));
+                render_download_bar(
+                    frame,
+                    frame.area(),
+                    &active,
+                    &Theme::new(false),
+                    &mut active_hit_map,
+                );
             })
             .expect("draw active download");
         assert!(
@@ -27098,6 +27724,7 @@ prose 07:25 remains clickable but is not a chapter";
             details: Some(DetailView {
                 title: "Mock channel".to_owned(),
                 source: "Bilibili channel".to_owned(),
+                channel_id: "UCfixture".to_owned(),
                 channel_subscriber_count: Some(13_045),
                 channel_video_count: Some(412),
                 channel_total_view_count: Some(987_654_321),
@@ -27155,6 +27782,13 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains("[O] open channel https://www.youtube.com/channel/UCfixture"));
+        assert!(rendered.contains("[F12] Podcast feed"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
+        );
         assert!(!rendered.contains("Load channel info"));
         assert!(rendered.contains("Full channel description"));
         assert!(rendered.contains("Douglas Adams (Q42)"));
@@ -27563,6 +28197,64 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .any(|(action, _)| action == &UiAction::DismissVideoQr)
         );
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn local_share_buttons_and_qr_popup_expose_both_lan_actions() {
+        let local = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                title: "Fixture album".to_owned(),
+                source: "Local folder".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("Local terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &local, &UiSettings::default(), &mut hit_map))
+            .expect("draw Local share buttons");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("[F11] Share over LAN"));
+        assert!(rendered.contains("[F12] Podcast feed"));
+        for expected in [UiAction::ShareLocalFiles, UiAction::ShareLocalPodcast] {
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| action == &expected)
+            );
+        }
+
+        let url = "http://192.0.2.10:8123/feed.xml";
+        let popup = ViewModel {
+            lan_share_popup: Some(LanSharePopupView {
+                title: "Podcast feed: Fixture album".to_owned(),
+                message: "The feed stops when Youta exits.".to_owned(),
+                url: url.to_owned(),
+                matrix: QrMatrix::encode(url).expect("LAN feed QR"),
+            }),
+            ..local
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("LAN QR terminal");
+        terminal
+            .draw(|frame| render(frame, &popup, &UiSettings::default(), &mut hit_map))
+            .expect("draw LAN QR popup");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Podcast feed: Fixture album"));
+        assert!(rendered.contains(url));
+        assert!(rendered.contains("[Esc] Close"));
+        assert!(rendered.contains("[x] Stop sharing"));
+        for expected in [UiAction::DismissLanShare, UiAction::StopLanShare] {
+            assert!(
+                hit_map
+                    .lan_share_buttons
+                    .iter()
+                    .any(|(action, _)| action == &expected)
+            );
+        }
     }
 
     #[cfg(not(feature = "qr"))]

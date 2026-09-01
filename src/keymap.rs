@@ -325,6 +325,65 @@ mod wire_tests {
         );
     }
 
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn local_lan_share_shortcuts_and_popup_are_scoped() {
+        let local = ViewModel {
+            screen: crate::view::Screen::Local,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(11)), &local, None, None),
+            Some(UiAction::ShareLocalFiles)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &local, None, None),
+            Some(UiAction::ShareLocalPodcast)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(11)), &ViewModel::default(), None, None),
+            None
+        );
+
+        let channel = ViewModel {
+            right_panel_mode: crate::view::RightPanelMode::Channel,
+            details: Some(crate::view::DetailView {
+                title: "Fixture channel".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                ..crate::view::DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &channel, None, None),
+            Some(UiAction::ShareYouTubeChannelPodcast)
+        );
+
+        let popup = ViewModel {
+            lan_share_popup: Some(crate::view::LanSharePopupView {
+                title: "Podcast feed".to_owned(),
+                message: "Session scoped".to_owned(),
+                url: "http://192.0.2.1:8080/feed.xml".to_owned(),
+                matrix: crate::qr_code::QrMatrix::encode("http://192.0.2.1:8080/feed.xml")
+                    .expect("fixture QR"),
+            }),
+            ..local
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &popup, None, None),
+            Some(UiAction::DismissLanShare)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('x')), &popup, None, None),
+            Some(UiAction::StopLanShare)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &popup, None, None),
+            None,
+            "the modal must own keys until it closes"
+        );
+    }
+
     #[test]
     fn uppercase_g_opens_only_an_available_video_summary() {
         let mut view = ViewModel::default();
@@ -910,6 +969,14 @@ fn unfiltered_key_action(
             };
         }
     }
+    #[cfg(feature = "lan-sharing")]
+    if view.lan_share_popup.is_some() {
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissLanShare),
+            Key::Char('x' | 'X') => Some(UiAction::StopLanShare),
+            _ => None,
+        };
+    }
     if let Some(popup) = view.project_history_popup.as_ref() {
         return project_history_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
@@ -1178,6 +1245,14 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    #[cfg(feature = "yt-dlp")]
+    if view.channel_download_popup.is_some() {
+        return match key.key {
+            Key::Enter => Some(UiAction::ConfirmChannelDownload),
+            Key::Esc => Some(UiAction::DismissChannelDownload),
+            _ => None,
+        };
+    }
     if let Some(popup) = view.local_file_popup.as_ref() {
         return match (popup, key.key) {
             (_, Key::Esc) => Some(UiAction::DismissLocalFilePopup),
@@ -1406,6 +1481,23 @@ fn unfiltered_key_action(
         Key::F(9) => Some(UiAction::OpenProjectHistory),
         #[cfg(feature = "ascii-visualizer")]
         Key::F(10) if !view.playback.idle => Some(UiAction::ToggleAsciiVisualizer),
+        #[cfg(feature = "lan-sharing")]
+        Key::F(11) if view.screen == Screen::Local => Some(UiAction::ShareLocalFiles),
+        #[cfg(feature = "lan-sharing")]
+        Key::F(12) if view.screen == Screen::Local => Some(UiAction::ShareLocalPodcast),
+        #[cfg(feature = "lan-sharing")]
+        Key::F(12)
+            if view.right_panel_mode == RightPanelMode::Channel
+                && view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| !details.channel_id.is_empty())
+                && (view.screen == Screen::Search
+                    || (view.screen == Screen::Subscriptions
+                        && view.subscriptions.source_kind == SubscriptionKind::YouTube)) =>
+        {
+            Some(UiAction::ShareYouTubeChannelPodcast)
+        }
         Key::Char('/') => Some(UiAction::BeginSearch),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
         Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(
@@ -1430,6 +1522,15 @@ fn unfiltered_key_action(
         Key::Char('v') => Some(UiAction::ToggleSearchKind),
         Key::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         Key::Char('n') if key.ctrl => Some(UiAction::PlayNext),
+        #[cfg(feature = "yt-dlp")]
+        Key::Char('C')
+            if view
+                .download
+                .as_ref()
+                .is_some_and(|download| download.active) =>
+        {
+            Some(UiAction::CancelDownload)
+        }
         Key::Char('C') if view.screen != Screen::YandexMusic => {
             Some(UiAction::ToggleYouTubeCreativeCommons)
         }
@@ -1481,6 +1582,17 @@ fn unfiltered_key_action(
             if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_open =>
         {
             Some(UiAction::DownloadYandexMusicAlbum)
+        }
+        #[cfg(feature = "yt-dlp")]
+        Key::Char('D')
+            if view.screen == Screen::Subscriptions
+                && view.subscriptions.source_kind
+                    == crate::subscriptions::SubscriptionKind::YouTube
+                && view.details.as_ref().is_some_and(|details| {
+                    details.channel_subscribed && !details.channel_id.is_empty()
+                }) =>
+        {
+            Some(UiAction::OpenChannelDownload)
         }
         Key::Char('R')
             if view.screen == Screen::YandexMusic

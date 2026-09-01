@@ -849,6 +849,8 @@ pub struct SubscriptionsView {
     pub source_kind: SubscriptionKind,
     /// Public subscriber count for the selected source, when exposed.
     pub source_subscriber_count: Option<u64>,
+    /// Public video count for the selected YouTube source, when exposed.
+    pub source_video_count: Option<u64>,
     /// Human-readable channel creation date, when exposed.
     pub source_created: String,
 }
@@ -872,6 +874,7 @@ impl Default for SubscriptionsView {
             source_generation: 0,
             source_kind: SubscriptionKind::YouTube,
             source_subscriber_count: None,
+            source_video_count: None,
             source_created: String::new(),
         }
     }
@@ -1677,6 +1680,20 @@ pub struct VideoQrPopupView {
     pub matrix: QrMatrix,
 }
 
+/// Scanner-ready URL for one session-scoped LAN share.
+#[cfg(feature = "lan-sharing")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LanSharePopupView {
+    /// Short description of the selected file, folder, or podcast feed.
+    pub title: String,
+    /// Explanation of the server lifetime and what the URL exposes.
+    pub message: String,
+    /// Full LAN URL encoded into [`Self::matrix`].
+    pub url: String,
+    /// Provider-independent QR modules generated once after binding the server.
+    pub matrix: QrMatrix,
+}
+
 /// One source-control commit rendered in the offline-first project-history popup.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ProjectCommitView {
@@ -1986,10 +2003,34 @@ pub struct DownloadView {
     pub bytes_per_second: Option<u64>,
     /// Estimated seconds remaining.
     pub eta_seconds: Option<u64>,
+    /// Completed media files in a collection download.
+    pub completed_files: u64,
+    /// One-based position of the currently transferring collection item.
+    pub current_file: Option<u64>,
+    /// Estimated or extractor-reported collection size.
+    pub total_files: Option<u64>,
+    /// Whether this progress belongs to a multi-item collection.
+    pub collection: bool,
     /// Whether the supervised child process is still running.
     pub active: bool,
     /// Confined final media path reported after post-processing.
     pub completed_path: Option<String>,
+}
+
+/// Explicit full-channel download confirmation shown before yt-dlp starts.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChannelDownloadPopupView {
+    /// Human-readable channel title.
+    pub channel_name: String,
+    /// Provider-reported or cache-derived public video estimate.
+    pub estimated_video_count: Option<u64>,
+    /// Whether the count is only the number of currently loaded public videos.
+    pub estimate_is_lower_bound: bool,
+    /// Bytes currently available to the non-privileged user at the destination.
+    pub available_space_bytes: u64,
+    /// Exact Youta-owned destination directory.
+    pub destination: String,
 }
 
 /// A live Radio stream capture that remains private until it is finalized.
@@ -2190,6 +2231,11 @@ pub struct ViewModel {
     /// Offline QR code for the exact selected YouTube video.
     #[cfg(feature = "qr")]
     pub video_qr_popup: Option<VideoQrPopupView>,
+    /// Whether this build can share local files and podcast feeds over the LAN.
+    pub lan_share_supported: bool,
+    /// QR code and lifetime notice for the active session-scoped LAN share.
+    #[cfg(feature = "lan-sharing")]
+    pub lan_share_popup: Option<LanSharePopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2266,6 +2312,11 @@ pub struct ViewModel {
     pub yandex_music_actions: YandexMusicActionsView,
     /// Explicit rename, move, or recoverable Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
+    /// Whether this build can supervise a full-channel `yt-dlp` download.
+    pub channel_download_supported: bool,
+    /// Review-first confirmation for downloading every public channel upload.
+    #[cfg(feature = "yt-dlp")]
+    pub channel_download_popup: Option<ChannelDownloadPopupView>,
     /// Active or most recently completed supervised download.
     pub download: Option<DownloadView>,
     /// Whether the controller has requested application shutdown.
@@ -2384,6 +2435,9 @@ impl Default for ViewModel {
             video_comments_popup: None,
             #[cfg(feature = "qr")]
             video_qr_popup: None,
+            lan_share_supported: cfg!(feature = "lan-sharing"),
+            #[cfg(feature = "lan-sharing")]
+            lan_share_popup: None,
             youtube_setup_popup: None,
             yandex_music_setup_popup: None,
             #[cfg(feature = "commons-upload")]
@@ -2410,6 +2464,9 @@ impl Default for ViewModel {
             private_note_available: false,
             yandex_music_actions: YandexMusicActionsView::default(),
             local_file_popup: None,
+            channel_download_supported: cfg!(feature = "yt-dlp"),
+            #[cfg(feature = "yt-dlp")]
+            channel_download_popup: None,
             download: None,
             quitting: false,
         }
@@ -2679,6 +2736,18 @@ pub enum UiAction {
     DismissPlaylistPopup,
     /// Download the selected item.
     Download,
+    /// Review a full-channel audio download before starting yt-dlp.
+    #[cfg(feature = "yt-dlp")]
+    OpenChannelDownload,
+    /// Start the reviewed full-channel audio download.
+    #[cfg(feature = "yt-dlp")]
+    ConfirmChannelDownload,
+    /// Close the full-channel confirmation without starting it.
+    #[cfg(feature = "yt-dlp")]
+    DismissChannelDownload,
+    /// Cancel the sole active supervised download.
+    #[cfg(feature = "yt-dlp")]
+    CancelDownload,
     /// Open the selected `YouTube`, Yandex Music, or Apple Podcasts Commons review.
     #[cfg(feature = "commons-upload")]
     OpenCommonsUpload,
@@ -2855,6 +2924,21 @@ pub enum UiAction {
     /// Close the selected-video QR popup without changing Details.
     #[cfg(feature = "qr")]
     DismissVideoQr,
+    /// Share the selected local file or folder through a session-scoped server.
+    #[cfg(feature = "lan-sharing")]
+    ShareLocalFiles,
+    /// Publish playable files below the local selection as a podcast feed.
+    #[cfg(feature = "lan-sharing")]
+    ShareLocalPodcast,
+    /// Publish every public video in the selected YouTube channel as audio RSS.
+    #[cfg(feature = "lan-sharing")]
+    ShareYouTubeChannelPodcast,
+    /// Close the LAN QR popup while leaving its server active.
+    #[cfg(feature = "lan-sharing")]
+    DismissLanShare,
+    /// Stop the active LAN server and close its QR popup.
+    #[cfg(feature = "lan-sharing")]
+    StopLanShare,
     /// Scroll the diagnostic report.
     ScrollErrorPopup(ErrorPopupScroll),
     /// Copy the complete diagnostic report.

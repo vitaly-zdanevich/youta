@@ -17,13 +17,13 @@
 
 ![Youta subscriptions screen](screenshot.webp)
 
-Youta is a low-resource terminal YouTube audio player and subscription manager
-written in Rust. It saves and shows listening progress. Subscriptions are
-currently stored and managed locally; YouTube-account synchronization is not
-implemented yet. Youta uses an invisible `mpv` process for playback,
-communicates with it over JSON IPC, and can use `yt-dlp` as an explicitly
-enabled media resolver and downloader. The terminal UI remains the only visible
-interface: its seek bar, queue, volume, pause state, and hotkeys control `mpv`.
+Youta is a low-resource audio player and subscription manager written in Rust,
+with terminal and desktop front-ends. It saves and shows listening progress.
+Subscriptions are currently stored and managed locally; YouTube-account
+synchronization is not implemented yet. Youta uses an invisible `mpv` process
+for playback, communicates with it over JSON IPC, and uses `yt-dlp` for
+supported media resolution and downloads. Both front-ends share the same seek
+bar, queue, volume, pause state, actions, and persistent controller state.
 
 ## Why this design
 
@@ -216,7 +216,8 @@ implement the same playback interface without changing screens or history.
 - local subscriptions with OPML import/export;
 - persistent local playlists with editable descriptions, cross-source replay,
   and a built-in `todo` list;
-- a two-panel terminal UI and restartable screen state;
+- a two-panel terminal UI, an optional desktop window, and restartable shared
+  screen state;
 - official YouTube Data API v3 or Invidious video/channel search and video
   details, with description-link extraction;
 - an independent YouTube Music tab that searches playable tracks through
@@ -236,6 +237,9 @@ implement the same playback interface without changing screens or history.
   author, and fingerprint-derived MusicBrainz external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
   commands;
+- reviewed full-channel audio downloads, session-scoped LAN file sharing, and
+  local or YouTube-channel podcast feeds with QR discovery;
+- reviewed audio preservation workflows for Wikimedia Commons and Evernote;
 - `doctor` and configuration inspection commands;
 - bounded, fail-open SponsorBlock segment skipping and labelled DeArrow titles.
 
@@ -565,7 +569,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,ascii-visualizer,audio-quality,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -576,13 +580,16 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,ascii-visualizer,audio-quality,images,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app-core,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
-`qr` to remove QR encoding and its shortcut from any custom build. Cargo
+both `qr` and `lan-sharing` to remove QR encoding, LAN sharing, and their
+shortcuts from a custom build. Cargo
 features are additive: `app-core` is the complete profile without
 `yandex-music`, `audio-quality` is the independently removable local analyzer,
+`commons-upload` and `evernote` are independently removable preservation
+clients,
 `summary` is the independently removable Codex summary integration,
 `youtube-captions` is the independently removable caption browser,
 `sponsorblock` is the independently removable SponsorBlock client and playback
@@ -590,11 +597,14 @@ skip integration,
 `nyan-cat` is the independently removable rainbow seek-bar renderer,
 `ascii-visualizer` is the independently removable CAVA-backed fullscreen
 renderer,
+`lan-sharing` is the independently removable session HTTP server and feed
+builder,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, SponsorBlock, the
 ASCII spectrum visualizer, Nyan Cat renderer, YouTube captions, video summaries,
-ZIP/RAR folders, Yandex Music, and GPM. Add `local-archives` to either
+Commons and Evernote transfer, LAN sharing, ZIP/RAR folders, Yandex Music, and
+GPM. Add `local-archives` to either
 custom command above to retain archive folders; leaving it out removes the
 archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
 cache, and playback code. The shared ZIP decoder also disappears only when no
@@ -1586,11 +1596,11 @@ YouTube subscriptions are currently local-only channel subscriptions. Choosing
 `Subscribe (locally)` while a video is selected adds its channel to Youta's
 OPML-backed source list; it does not subscribe the signed-in YouTube account.
 OAuth-based synchronization remains roadmap work. In Details, uppercase
-`[O]` opens the selected YouTube channel's webpage, while lowercase `[o]`
-opens the selected video's webpage. Their labels identify the platform helper:
-`xdg-open` on Linux and `open` on macOS. Youta waits for the system opener's
-exit status before reporting success; a missing browser association or
-headless-session failure is shown as a diagnostic instead.
+`[O] open channel` opens the selected YouTube channel's webpage, while lowercase
+`[o] open video` opens the selected video's webpage. Each control shows its full
+URL. Youta waits for the platform URL opener's exit status before reporting
+success; a missing browser association or headless-session failure is shown as
+a diagnostic instead.
 
 Selecting a YouTube channel lazily loads its description, subscriber count,
 joined date, public video count, aggregate public views, and country when those
@@ -1750,6 +1760,43 @@ this snapshot, so playback resolves a fresh stream from the canonical video
 page. The detailed disk bounds are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
 
+### Full-channel downloads and session LAN feeds
+
+On a subscribed YouTube channel, `[D] Download full channel` opens a review
+popup before starting anything. It shows the provider's estimated video count
+when available, marks a loaded-row count as a lower bound when necessary,
+shows the exact destination and currently available disk space, and uses the
+configured audio download format. Confirmation starts one supervised `yt-dlp`
+collection download with per-file and aggregate progress, speed, ETA, completed
+file count, and cancellation. It downloads public uploads as audio and can
+write each provider thumbnail beside its audio file.
+
+The default-on `lan-sharing` feature adds two Local actions. `[F11] Share over
+LAN` serves the selected regular file or a bounded, recursive folder index.
+`[F12] Podcast feed` serves playable audio under the selection as RSS. When the
+synthetic `..` row is selected, both actions share the directory currently on
+screen. A local podcast episode uses embedded artwork when available and then
+Youta's normal sidecar-artwork fallback. The popup shows a local-IP URL and QR
+code; `[x] Stop sharing` closes the server explicitly.
+
+`[F12] Podcast feed` is also available on a YouTube channel in Search and in
+YouTube Subscriptions. Feed creation uses flat channel metadata, downloads no
+media, and gives every episode a stable Youta URL and artwork route. When a
+podcast client requests an enclosure, Youta resolves a fresh audio-only M4A
+URL with `yt-dlp` and proxies the bytes without publishing YouTube's signed URL
+in the XML. This keeps feed creation fast, but it is deliberately session
+scoped: the HTTP server and every feed URL stop when Youta exits. Use the
+full-channel download first and share the resulting Local folder when the feed
+must remain usable without Youta or without Internet access.
+
+The server exposes only an immutable manifest prepared for that explicit
+action, ignores symbolic links during folder scans, supports `HEAD` and one
+HTTP byte range, and handles a bounded number of concurrent clients. It uses
+plain HTTP on the local network and does not change firewall rules, authenticate
+clients, or continue in the background. Share only on a trusted LAN. Custom
+builds can omit the server, QR UI, network proxy, and embedded-artwork path by
+leaving `lan-sharing` out of a `--no-default-features` feature list.
+
 Application-owned persistent state stays under `~/.config/youta/`; transient
 IPC sockets may use the operating system's runtime directory. The Local tab's
 explicit Rename, Move to Trash, and Move actions are the only operations that
@@ -1784,7 +1831,7 @@ The roadmap is intentionally tiered:
    discovery and chapter playback, tracker modules, generic
    `yt-dlp`, `mpv`, and search/history/queue/download state.
 2. **Open-data integrations:** broader DeArrow thumbnail support and Wikidata
-   discovery, Wikimedia Commons, Internet Archive, Podcast Index, and
+   discovery, Internet Archive, Podcast Index, and
    gpodder.net. Read-only SponsorBlock skipping and labelled DeArrow titles are
    already implemented.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
@@ -1889,9 +1936,6 @@ page](https://www.evernote.com/api/DeveloperToken.action). Distributors can
 remove the generated EDAM bindings, hashing, network client, and UI by leaving
 `evernote` out of a `--no-default-features` build.
 
-Internet Archive transfer follows the same explicit-confirmation and duplicate
-check model and is also restricted to material the user may lawfully upload.
-
 ## Diagnostics and issue review
 
 Recoverable operational errors open a scrollable report containing the Youta
@@ -1957,7 +2001,9 @@ and `qr` capabilities. These established executables retain GPM support. Linux
 additionally publishes the same four combinations with a trailing `-no-gpm`
 suffix for distributions where GPM is opt-in. The `-text` suffix omits images,
 while `-no-qr` omits QR support. These are raw GitHub artifacts rather than ZIP
-or tar wrappers. GitHub does not preserve their Unix executable bit, so a
+or tar wrappers. QR-capable executables include LAN sharing; `-no-qr` variants
+omit it because every share is presented through its QR workflow. GitHub does
+not preserve their Unix executable bit, so a
 downloaded Linux or macOS file needs `chmod +x ./youta-*` before it is run. The
 release also publishes one Cargo vendor archive for offline/external build systems. It
 contains the locked Rust dependency graph and the already-built GUI page, so a
@@ -2070,14 +2116,16 @@ arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
 enabled by default. Gentoo users can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
-`commons-upload`, `evernote`, `local-archives`, `nyan-cat`, `sponsorblock`,
-`summary`, and `youtube-captions` flags to their Cargo features.
+`commons-upload`, `evernote`, `lan-sharing`, `local-archives`, `nyan-cat`,
+`sponsorblock`, `summary`, and `youtube-captions` flags to their Cargo features.
 With `USE="ascii-visualizer"`, the source ebuild installs CAVA for FFT capture.
 `USE="-ascii-visualizer"` removes CAVA integration, fullscreen rendering, and
 its Help entry.
 `USE="-audio-quality"` removes the analyzer and RustFFT dependency.
 `USE="-commons-upload"` removes the Commons client and review UI.
 `USE="-evernote"` removes the Evernote EDAM client and note UI.
+`USE="-lan-sharing"` removes the session HTTP server, LAN-share/feed actions,
+and their QR workflow.
 `USE="-local-archives"` removes ZIP/RAR Local-folder browsing and the RAR helper
 dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
 unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
@@ -2086,10 +2134,10 @@ playback skip logic. `USE="-summary"` removes the Codex summary UI and backend.
 `USE="-youtube-captions"` removes caption loading, search, and seeking while
 leaving the independent `summary` and `evernote` integrations available.
 `USE="-nyan-cat"` removes the rainbow seek-bar renderers and preference.
-Prebuilt
-executables contain the fixed upstream feature set and keep these capabilities
-enabled; offering binary USE switches would require another copy of every
-Linux release variant rather than changing installed code.
+Prebuilt executables contain a fixed upstream feature set: QR-capable variants
+keep these capabilities enabled, while `-no-qr` variants also omit LAN sharing.
+Offering more binary USE switches would require another copy of every Linux
+release variant rather than changing installed code.
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.

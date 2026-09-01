@@ -29,6 +29,8 @@ pub mod durability;
 #[cfg(feature = "evernote")]
 pub mod evernote;
 pub mod file_identity;
+#[cfg(feature = "lan-sharing")]
+pub mod lan_share;
 pub mod links;
 #[cfg(feature = "local-archives")]
 pub mod local_archive;

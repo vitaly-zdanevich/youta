@@ -39,6 +39,7 @@ default = [
     "evernote",
     "gpm",
     "images",
+    "lan-sharing",
     "local-archives",
     "nyan-cat",
     "qr",
@@ -136,6 +137,17 @@ tui = [
 # which is what every documented build variant selects; a window links the same
 # encoder without Ratatui.
 qr = ["dep:qrcode"]
+# Session-scoped LAN file sharing plus local and YouTube-channel podcast feeds.
+# The implementation uses Rust's standard networking primitives and stops with
+# Youta; QR encoding, networking, and embedded-artwork extraction remain
+# removable together.
+lan-sharing = [
+	"local-artwork",
+	"network",
+	"qr",
+	"yt-dlp",
+	"dep:percent-encoding",
+]
 # Safe, opportunistic Linux virtual-console mouse input through `/dev/gpmctl`.
 # This links no system GPM library; F8 retries a missing daemon and retains its
 # keyboard pointer when physical input is unavailable.
@@ -253,7 +265,7 @@ vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
 youtube-music = ["yt-dlp"]
-yt-dlp = ["dep:rustix"]
+yt-dlp = ["dep:fs2", "dep:rustix"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]
@@ -345,6 +357,7 @@ crossterm = { version = "0.29.0", optional = true }
 delharc = { version = "0.7.0", optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
 feed-rs = { version = "2.4.0", optional = true }
+fs2 = { version = "0.4.3", optional = true }
 flate2 = { version = "1.1.9", optional = true }
 lofty = { version = "0.24.0", optional = true }
 mio = { version = "1.2.0", features = ["net", "os-ext", "os-poll"], optional = true }

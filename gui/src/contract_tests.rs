@@ -30,10 +30,13 @@ use youta::evernote::EvernoteNoteDraft;
 use youta::keymap::{PopupGeometry, ScrollGeometry};
 #[cfg(feature = "ascii-visualizer")]
 use youta::view::AsciiVisualizerView;
+use youta::view::ChannelDownloadPopupView;
 #[cfg(feature = "commons-upload")]
 use youta::view::CommonsUploadPopupView;
 #[cfg(feature = "evernote")]
 use youta::view::EvernoteNotePopupView;
+#[cfg(feature = "lan-sharing")]
+use youta::view::LanSharePopupView;
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
@@ -50,6 +53,16 @@ fn contract_source() -> String {
         .join("ui")
         .join("src")
         .join("contract.ts");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+/// Reads one window source relative to `gui/ui/src`.
+fn window_source(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join(relative);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
@@ -152,7 +165,8 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
                         | "youtube_captions_available"
                         | "youtube_captions_popup"
                         | "youtube_captions_supported"
-                )))
+                ))
+            || (!cfg!(feature = "lan-sharing") && field == "lan_share_popup"))
 }
 
 /// Whether one frontend action belongs to a capability omitted from this build.
@@ -196,6 +210,15 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
             ))
         || (!cfg!(feature = "youtube-captions")
             && matches!(name, "ActivateYouTubeCaption" | "DismissYouTubeCaptions"))
+        || (!cfg!(feature = "lan-sharing")
+            && matches!(
+                name,
+                "DismissLanShare"
+                    | "ShareLocalFiles"
+                    | "ShareLocalPodcast"
+                    | "ShareYouTubeChannelPodcast"
+                    | "StopLanShare"
+            ))
 }
 
 #[test]
@@ -215,6 +238,10 @@ fn optional_contract_exemptions_follow_the_compiled_feature_set() {
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "youtube_captions_popup"),
         !cfg!(feature = "youtube-captions")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "lan_share_popup"),
+        !cfg!(feature = "lan-sharing")
     );
     assert!(!field_belongs_to_disabled_feature(
         "ViewModel",
@@ -368,6 +395,16 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         "VideoSummaryPopupView",
         emitted_keys(&VideoSummaryPopupView::default()),
     );
+    #[cfg(feature = "lan-sharing")]
+    emitted.insert(
+        "LanSharePopupView",
+        emitted_keys(&LanSharePopupView {
+            title: String::new(),
+            message: String::new(),
+            url: String::new(),
+            matrix: youta::qr_code::QrMatrix::encode("http://127.0.0.1/").expect("fixture QR"),
+        }),
+    );
     emitted.insert(
         "VideoCommentView",
         emitted_keys(&VideoCommentView::default()),
@@ -397,6 +434,16 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         }),
     );
     emitted.insert("DownloadView", emitted_keys(&DownloadView::default()));
+    emitted.insert(
+        "ChannelDownloadPopupView",
+        emitted_keys(&ChannelDownloadPopupView {
+            channel_name: String::new(),
+            estimated_video_count: None,
+            estimate_is_lower_bound: false,
+            available_space_bytes: 0,
+            destination: String::new(),
+        }),
+    );
     #[cfg(feature = "commons-upload")]
     {
         emitted.insert(
@@ -510,6 +557,7 @@ fn every_checked_interface_is_actually_declared() {
         "YtDlpGentooVersionView",
         "VideoCommentsPopupView",
         "VideoSummaryPopupView",
+        "LanSharePopupView",
         "VideoCommentView",
         "ProjectHistoryPopupView",
         "ProjectCommitView",
@@ -518,6 +566,7 @@ fn every_checked_interface_is_actually_declared() {
         "PlaylistChoiceView",
         "LocalMoveDestinationView",
         "DownloadView",
+        "ChannelDownloadPopupView",
         "CommonsUploadPopupView",
         "CommonsUploadDraft",
         "CommonsCategorySuggestion",
@@ -535,6 +584,70 @@ fn every_checked_interface_is_actually_declared() {
             "contract.ts no longer declares {interface}"
         );
     }
+}
+
+#[test]
+fn the_window_can_share_local_files_and_podcast_feeds() {
+    let details = window_source("components/Details.tsx");
+    let popups = window_source("components/popups.tsx");
+    let app = window_source("App.tsx");
+
+    for required in [
+        "view.lan_share_supported",
+        "dispatch('ShareLocalFiles')",
+        "dispatch('ShareLocalPodcast')",
+        "dispatch('ShareYouTubeChannelPodcast')",
+        "Share over LAN",
+        "Podcast feed",
+    ] {
+        assert!(
+            details.contains(required),
+            "Details no longer contains {required}"
+        );
+    }
+    for required in [
+        "dispatch('DismissLanShare')",
+        "dispatch('StopLanShare')",
+        "QR code for ${popup.url}",
+    ] {
+        assert!(
+            popups.contains(required),
+            "LAN popup no longer contains {required}"
+        );
+    }
+    assert!(app.contains("<LanSharePopup"));
+}
+
+#[test]
+fn the_window_reviews_and_can_cancel_a_full_channel_download() {
+    let details = window_source("components/Details.tsx");
+    let popups = window_source("components/popups.tsx");
+    let download = window_source("components/DownloadBar.tsx");
+    let app = window_source("App.tsx");
+
+    for required in [
+        "view.channel_download_supported",
+        "dispatch(\"OpenChannelDownload\")",
+        "Download full channel",
+    ] {
+        assert!(
+            details.contains(required),
+            "Details no longer contains {required}"
+        );
+    }
+    for required in [
+        "Estimated videos",
+        "Free space remaining",
+        "dispatch(\"ConfirmChannelDownload\")",
+        "dispatch(\"DismissChannelDownload\")",
+    ] {
+        assert!(
+            popups.contains(required),
+            "channel confirmation no longer contains {required}"
+        );
+    }
+    assert!(download.contains("dispatch(\"CancelDownload\")"));
+    assert!(app.contains("<ChannelDownloadPopup"));
 }
 
 #[test]

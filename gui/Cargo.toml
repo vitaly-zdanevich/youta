@@ -12,7 +12,7 @@ publish = false
 unsafe_code = "forbid"
 
 [features]
-default = ["ascii-visualizer", "audio-quality", "commons-upload", "evernote", "local-archives", "nyan-cat", "sponsorblock", "summary", "youtube-captions"]
+default = ["ascii-visualizer", "audio-quality", "commons-upload", "evernote", "lan-sharing", "local-archives", "nyan-cat", "sponsorblock", "summary", "youtube-captions"]
 # Forward the source package's independently removable capabilities. Release
 # and ordinary GUI builds retain them through this crate's defaults;
 # distributors can disable both layers with `--no-default-features`.
@@ -20,6 +20,7 @@ ascii-visualizer = ["youta/ascii-visualizer"]
 audio-quality = ["youta/audio-quality"]
 commons-upload = ["youta/commons-upload"]
 evernote = ["youta/evernote"]
+lan-sharing = ["youta/lan-sharing"]
 local-archives = ["youta/local-archives"]
 nyan-cat = ["youta/nyan-cat"]
 sponsorblock = ["youta/sponsorblock"]

@@ -359,6 +359,14 @@ export interface VideoQrPopupView {
   matrix: QrMatrix;
 }
 
+/** One session-scoped local file or podcast share. */
+export interface LanSharePopupView {
+	title: string;
+	message: string;
+	url: string;
+	matrix: QrMatrix;
+}
+
 /** One source-control commit in the offline-first history popup. */
 export interface ProjectCommitView {
   hash: string;
@@ -564,6 +572,7 @@ export interface SubscriptionsView {
 	source_generation: number;
   source_kind: SubscriptionKind;
   source_subscriber_count: number | null;
+  source_video_count: number | null;
   source_created: string;
 }
 
@@ -574,8 +583,21 @@ export interface DownloadView {
   total_bytes: number | null;
   bytes_per_second: number | null;
   eta_seconds: number | null;
+  completed_files: number;
+  current_file: number | null;
+  total_files: number | null;
+  collection: boolean;
   active: boolean;
   completed_path: string | null;
+}
+
+/** Review data shown before starting a potentially large channel transfer. */
+export interface ChannelDownloadPopupView {
+	channel_name: string;
+	estimated_video_count: number | null;
+	estimate_is_lower_bound: boolean;
+	available_space_bytes: number;
+	destination: string;
 }
 
 /** Free license selected for a Wikimedia Commons upload. */
@@ -710,6 +732,8 @@ export interface ViewModel {
   playlist_item: PlaylistItemView | null;
   playlist_edit_available: boolean;
   yandex_music_actions: YandexMusicActionsView;
+  channel_download_supported: boolean;
+  channel_download_popup: ChannelDownloadPopupView | null;
   download: DownloadView | null;
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
@@ -725,6 +749,8 @@ export interface ViewModel {
   youtube_captions_popup: YouTubeCaptionsPopupView | null;
   video_comments_popup: VideoCommentsPopupView | null;
   video_qr_popup: VideoQrPopupView | null;
+	lan_share_supported: boolean;
+	lan_share_popup: LanSharePopupView | null;
   preferences_popup: PreferencesPopupView | null;
   playlist_popup: PlaylistPopupView | null;
   queue_popup: QueuePopupView | null;

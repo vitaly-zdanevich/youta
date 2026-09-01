@@ -295,6 +295,26 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
       ) : null}
 
       <div className="mt-3 flex flex-wrap gap-[6px]">
+		{view.lan_share_supported && kind === 'Local' ? (
+			<>
+				<Action onClick={() => void dispatch('ShareLocalFiles')}>Share over LAN</Action>
+				<Action onClick={() => void dispatch('ShareLocalPodcast')}>Podcast feed</Action>
+			</>
+		) : null}
+		{view.lan_share_supported &&
+		kind === 'Channel' &&
+		details.channel_id !== '' &&
+		(view.screen === 'Search' ||
+			(view.screen === 'Subscriptions' && view.subscriptions.source_kind === YOUTUBE)) ? (
+			<Action onClick={() => void dispatch('ShareYouTubeChannelPodcast')}>Podcast feed</Action>
+		) : null}
+		{view.channel_download_supported &&
+		view.screen === 'Subscriptions' &&
+		view.subscriptions.source_kind === YOUTUBE &&
+		details.channel_subscribed &&
+		details.channel_id !== '' ? (
+			<Action onClick={() => void dispatch("OpenChannelDownload")}>Download full channel</Action>
+		) : null}
         {details.channel_id !== "" ? (
           <Action
             active={details.channel_subscribed}
