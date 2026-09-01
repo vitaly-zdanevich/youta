@@ -20231,6 +20231,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lan-sharing")]
     #[test]
     fn left_detail_actions_preserve_grouped_navigation_rows() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
@@ -20426,6 +20427,7 @@ mod tests {
         assert!(rendered_text(&terminal).contains("Subscribers: 1,234"));
     }
 
+    #[cfg(feature = "lan-sharing")]
     #[test]
     fn wide_artwork_places_all_detail_actions_in_a_spaced_right_rail() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
