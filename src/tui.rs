@@ -1758,6 +1758,9 @@ struct HitMap {
     /// Close and stop controls rendered inside the LAN-share QR popup.
     #[cfg(feature = "lan-sharing")]
     lan_share_buttons: Vec<(UiAction, Rect)>,
+    /// Checkbox, confirm, and cancel controls in podcast-feed review.
+    #[cfg(feature = "lan-sharing")]
+    podcast_feed_options_buttons: Vec<(UiAction, Rect)>,
     /// Wrapped text viewport inside the public-comments popup.
     video_comments_text_area: Rect,
     /// Actual first wrapped comment line rendered in the viewport.
@@ -2187,7 +2190,9 @@ fn render_frame(
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     #[cfg(feature = "lan-sharing")]
-    let thumbnail_is_obscured = thumbnail_is_obscured || view.lan_share_popup.is_some();
+    let thumbnail_is_obscured = thumbnail_is_obscured
+        || view.lan_share_popup.is_some()
+        || view.podcast_feed_options_popup.is_some();
     let thumbnail_is_fullscreen = !thumbnail_is_obscured
         && view.expanded_thumbnail_available()
         && thumbnail_renderer
@@ -2395,6 +2400,10 @@ fn render_frame(
     }
     #[cfg(feature = "lan-sharing")]
     {
+        hit_map.podcast_feed_options_buttons.clear();
+        if let Some(popup) = view.podcast_feed_options_popup.as_ref() {
+            render_podcast_feed_options_popup(frame, popup, &theme, hit_map);
+        }
         hit_map.lan_share_buttons.clear();
         if let Some(popup) = view.lan_share_popup.as_ref() {
             render_lan_share_popup(frame, popup, &theme, hit_map);
@@ -4579,22 +4588,17 @@ fn render_information_panel(
         )
     });
     #[cfg(feature = "lan-sharing")]
-    let channel_podcast_button = (kind == InformationPanelKind::Channel
-        && !details.channel_id.is_empty()
-        && (view.screen == Screen::Search
-            || (view.screen == Screen::Subscriptions
-                && view.subscriptions.source_kind == SubscriptionKind::YouTube)))
-        .then(|| {
-            push_left_detail_button(
-                &mut lines,
-                &right_buttons,
-                &mut next_left_row,
-                inner.width,
-                button("F12", "Podcast feed", show_hotkeys),
-                theme.accent,
-                UiAction::ShareYouTubeChannelPodcast,
-            )
-        });
+    let youtube_podcast_button = view.youtube_podcast_feed_available().then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("F12", "Podcast feed", show_hotkeys),
+            theme.accent,
+            UiAction::ShareYouTubeChannelPodcast,
+        )
+    });
     #[cfg(feature = "yt-dlp")]
     let channel_download_button = (view.screen == Screen::Subscriptions
         && view.subscriptions.source_kind == SubscriptionKind::YouTube
@@ -4753,7 +4757,7 @@ fn render_information_panel(
         #[cfg(feature = "lan-sharing")]
         local_podcast_button,
         #[cfg(feature = "lan-sharing")]
-        channel_podcast_button,
+        youtube_podcast_button,
     ]
     .into_iter()
     .flatten()
@@ -8022,7 +8026,133 @@ fn render_video_qr_close_control(
         .push((UiAction::DismissVideoQr, Rect::new(x, area.y, width, 1)));
 }
 
-/// Renders a scanner-safe URL for the active session-scoped LAN server.
+/// Renders the inclusive selected-item boundary before feed preparation.
+#[cfg(feature = "lan-sharing")]
+fn render_podcast_feed_options_popup(
+    frame: &mut Frame<'_>,
+    popup: &PodcastFeedOptionsPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.saturating_sub(4).clamp(1, 88);
+    let message_width = width.saturating_sub(6).max(1);
+    let message = if popup.phase == PodcastFeedOptionsPhase::Failed {
+        format!(
+            "Source: {}\nSelected item: {}\n\n{}",
+            popup.source,
+            popup.selected_item,
+            popup
+                .error
+                .as_deref()
+                .unwrap_or("Podcast feed preparation failed")
+        )
+    } else {
+        format!(
+            "Source: {}\nSelected item: {}",
+            popup.source, popup.selected_item
+        )
+    };
+    let wrapped = wrap_text_lines(&message, message_width);
+    let height = u16::try_from(wrapped.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(6)
+        .clamp(1, frame.area().height.saturating_sub(2).max(1));
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    let title = match popup.phase {
+        PodcastFeedOptionsPhase::Review => " Create podcast feed? ",
+        PodcastFeedOptionsPhase::Preparing => " Preparing podcast feed… ",
+        PodcastFeedOptionsPhase::Failed => " Could not create podcast feed ",
+    };
+    frame.render_widget(panel_block(title, theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(wrapped.join("\n"))
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    let controls: Vec<(&str, UiAction)> = match popup.phase {
+        PodcastFeedOptionsPhase::Review => {
+            let checkbox = format!(
+                "[{}] Ignore items before this item",
+                if popup.ignore_items_before { 'x' } else { ' ' }
+            );
+            frame.render_widget(
+                Paragraph::new(checkbox.as_str()).style(theme.accent),
+                sections[1],
+            );
+            hit_map.podcast_feed_options_buttons.push((
+                UiAction::TogglePodcastFeedIgnoreBefore,
+                Rect::new(
+                    sections[1].x,
+                    sections[1].y,
+                    terminal_text_width(&checkbox).min(sections[1].width),
+                    1,
+                ),
+            ));
+            vec![
+                (
+                    "[Space] Check/uncheck",
+                    UiAction::TogglePodcastFeedIgnoreBefore,
+                ),
+                ("[Enter] Create feed", UiAction::ConfirmPodcastFeed),
+                ("[Esc] Cancel", UiAction::DismissPodcastFeed),
+            ]
+        }
+        PodcastFeedOptionsPhase::Preparing => {
+            let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
+            let animation = frames[(popup.animation_frame / 4) % frames.len()];
+            frame.render_widget(
+                Paragraph::new(format!("{animation} Enumerating channel with yt-dlp…"))
+                    .style(theme.muted),
+                sections[1],
+            );
+            vec![("[Esc] Hide", UiAction::DismissPodcastFeed)]
+        }
+        PodcastFeedOptionsPhase::Failed => {
+            frame.render_widget(
+                Paragraph::new("Podcast feed preparation failed")
+                    .style(Style::default().fg(Color::Red)),
+                sections[1],
+            );
+            vec![("[Esc] Close", UiAction::DismissPodcastFeed)]
+        }
+    };
+    let controls_text = controls
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(controls_text.as_str())
+            .alignment(Alignment::Center)
+            .style(theme.accent),
+        sections[2],
+    );
+    let mut x = centered_line_x(sections[2], terminal_text_width(&controls_text));
+    for (label, action) in controls {
+        let control_width = terminal_text_width(label);
+        hit_map
+            .podcast_feed_options_buttons
+            .push((action, Rect::new(x, sections[2].y, control_width, 1)));
+        x = x.saturating_add(control_width).saturating_add(3);
+    }
+}
+
+/// Renders the scanner-safe URL for the active session-scoped LAN server.
 #[cfg(feature = "lan-sharing")]
 fn render_lan_share_popup(
     frame: &mut Frame<'_>,
@@ -11621,6 +11751,17 @@ fn mouse_action_unfiltered(
                     hit_map.project_history_scroll_offset.saturating_sub(3),
                 ))
             }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "lan-sharing")]
+    if view.podcast_feed_options_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .podcast_feed_options_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
             _ => None,
         };
     }
@@ -20146,6 +20287,7 @@ mod tests {
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
         ];
         let ordered_areas = ordered_actions.each_ref().map(area_for);
@@ -20188,6 +20330,7 @@ mod tests {
     fn wide_subscription_channel_uses_the_shared_spaced_action_rail() {
         let mut view = ViewModel {
             screen: Screen::Subscriptions,
+            right_panel_mode: RightPanelMode::Channel,
             external_opener_available: true,
             details: Some(DetailView {
                 title: "Fixture channel".to_owned(),
@@ -20355,6 +20498,7 @@ mod tests {
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
@@ -20403,6 +20547,7 @@ mod tests {
             "[o] open video".to_owned(),
             "[P] Playlist…".to_owned(),
             "[n] Add private note".to_owned(),
+            "[F12] Podcast feed".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
@@ -27806,6 +27951,55 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn selected_youtube_subscription_video_renders_podcast_feed_action() {
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            right_panel_mode: RightPanelMode::Details,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                title: "Fixture video".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        view.subscriptions.route = SubscriptionRoute::Items;
+        view.subscriptions.focus = SubscriptionPane::Items;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let theme = Theme::new(false);
+
+        terminal
+            .draw(|frame| {
+                render_information_panel(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    &theme,
+                    &mut hit_map,
+                    " Details ",
+                    "No video is selected.",
+                    InformationPanelKind::Video,
+                    true,
+                    ThumbnailSizing::fixed(12),
+                    None,
+                );
+            })
+            .expect("draw selected subscription video");
+
+        assert!(rendered_text(&terminal).contains("[F12] Podcast feed"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
+        );
+    }
+
     #[test]
     fn channel_panel_clears_trailing_cells_when_external_links_shrink() {
         use ratatui::backend::Backend;
@@ -28229,6 +28423,71 @@ prose 07:25 remains clickable but is not a chapter";
                     .any(|(action, _)| action == &expected)
             );
         }
+
+        let mut options = ViewModel {
+            podcast_feed_options_popup: Some(PodcastFeedOptionsPopupView {
+                source: "Local folder: Fixture album".to_owned(),
+                selected_item: "02-selected.opus".to_owned(),
+                ignore_items_before: true,
+                phase: PodcastFeedOptionsPhase::Review,
+                animation_frame: 0,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut options_terminal =
+            Terminal::new(TestBackend::new(100, 20)).expect("feed-options terminal");
+        options_terminal
+            .draw(|frame| render(frame, &options, &UiSettings::default(), &mut hit_map))
+            .expect("draw feed boundary options");
+        let rendered = rendered_text(&options_terminal);
+        assert!(rendered.contains("Create podcast feed?"));
+        assert!(rendered.contains("Selected item: 02-selected.opus"));
+        assert!(rendered.contains("[x] Ignore items before this item"));
+        assert!(rendered.contains("[Space] Check/uncheck"));
+        assert!(rendered.contains("[Enter] Create feed"));
+        assert!(rendered.contains("[Esc] Cancel"));
+        for expected in [
+            UiAction::TogglePodcastFeedIgnoreBefore,
+            UiAction::ConfirmPodcastFeed,
+            UiAction::DismissPodcastFeed,
+        ] {
+            assert!(
+                hit_map
+                    .podcast_feed_options_buttons
+                    .iter()
+                    .any(|(action, _)| action == &expected)
+            );
+        }
+
+        let options_popup = options
+            .podcast_feed_options_popup
+            .as_mut()
+            .expect("feed-options popup");
+        options_popup.phase = PodcastFeedOptionsPhase::Preparing;
+        options_popup.animation_frame = 8;
+        options_terminal
+            .draw(|frame| render(frame, &options, &UiSettings::default(), &mut hit_map))
+            .expect("draw feed preparation");
+        let rendered = rendered_text(&options_terminal);
+        assert!(rendered.contains("Preparing podcast feed…"));
+        assert!(rendered.contains("Enumerating channel with yt-dlp…"));
+        assert!(rendered.contains("[Esc] Hide"));
+        assert!(!rendered.contains("[Enter] Create feed"));
+
+        let options_popup = options
+            .podcast_feed_options_popup
+            .as_mut()
+            .expect("feed-options popup");
+        options_popup.phase = PodcastFeedOptionsPhase::Failed;
+        options_popup.error = Some("fixture yt-dlp failure".to_owned());
+        options_terminal
+            .draw(|frame| render(frame, &options, &UiSettings::default(), &mut hit_map))
+            .expect("draw feed failure");
+        let rendered = rendered_text(&options_terminal);
+        assert!(rendered.contains("Could not create podcast feed"));
+        assert!(rendered.contains("fixture yt-dlp failure"));
+        assert!(rendered.contains("[Esc] Close"));
 
         let url = "http://192.0.2.10:8123/feed.xml";
         let popup = ViewModel {

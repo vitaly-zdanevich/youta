@@ -39,6 +39,8 @@ use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
+#[cfg(feature = "lan-sharing")]
+use crate::domain::SourceKind;
 use crate::domain::{Chapter, MediaId, MediaKind};
 #[cfg(feature = "evernote")]
 use crate::evernote::EvernoteNoteDraft;
@@ -1694,6 +1696,36 @@ pub struct LanSharePopupView {
     pub matrix: QrMatrix,
 }
 
+/// Lifecycle of podcast-feed review and asynchronous channel enumeration.
+#[cfg(feature = "lan-sharing")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum PodcastFeedOptionsPhase {
+    /// The selected boundary can still be changed or confirmed.
+    Review,
+    /// `yt-dlp` is enumerating the selected `YouTube` channel.
+    Preparing,
+    /// Channel enumeration or feed preparation failed.
+    Failed,
+}
+
+/// Review and preparation state for a podcast feed anchored to one visible item.
+#[cfg(feature = "lan-sharing")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PodcastFeedOptionsPopupView {
+    /// Local folder or YouTube channel that will own the feed.
+    pub source: String,
+    /// Exact visible file or video retained as the optional inclusive boundary.
+    pub selected_item: String,
+    /// Whether entries before [`Self::selected_item`] are omitted.
+    pub ignore_items_before: bool,
+    /// Current review, preparation, or failure phase.
+    pub phase: PodcastFeedOptionsPhase,
+    /// Slow indeterminate-animation frame advanced by the controller tick.
+    pub animation_frame: usize,
+    /// Visible preparation failure retained until the popup is closed.
+    pub error: Option<String>,
+}
+
 /// One source-control commit rendered in the offline-first project-history popup.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ProjectCommitView {
@@ -2236,6 +2268,9 @@ pub struct ViewModel {
     /// QR code and lifetime notice for the active session-scoped LAN share.
     #[cfg(feature = "lan-sharing")]
     pub lan_share_popup: Option<LanSharePopupView>,
+    /// Review-first boundary choice for a local or YouTube podcast feed.
+    #[cfg(feature = "lan-sharing")]
+    pub podcast_feed_options_popup: Option<PodcastFeedOptionsPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2324,6 +2359,28 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Reports whether the current details or channel panel can create a `YouTube` feed.
+    ///
+    /// A selected video already owns its channel ID, so users inside a channel
+    /// need not switch from Details to the separate Channel panel before using
+    /// the podcast-feed shortcut.
+    #[cfg(feature = "lan-sharing")]
+    #[must_use]
+    pub fn youtube_podcast_feed_available(&self) -> bool {
+        let supported_route = self.screen == Screen::Search
+            || (self.screen == Screen::Subscriptions
+                && self.subscriptions.source_kind == SubscriptionKind::YouTube);
+        supported_route
+            && self.details.as_ref().is_some_and(|details| {
+                !details.channel_id.is_empty()
+                    && (self.right_panel_mode == RightPanelMode::Channel
+                        || details
+                            .media_id
+                            .as_ref()
+                            .is_some_and(|media_id| media_id.source == SourceKind::YouTube))
+            })
+    }
+
     /// Reports whether expanded Details owns a renderable artwork source.
     ///
     /// Both front-ends need this to decide whether the expanded-artwork key is
@@ -2438,6 +2495,8 @@ impl Default for ViewModel {
             lan_share_supported: cfg!(feature = "lan-sharing"),
             #[cfg(feature = "lan-sharing")]
             lan_share_popup: None,
+            #[cfg(feature = "lan-sharing")]
+            podcast_feed_options_popup: None,
             youtube_setup_popup: None,
             yandex_music_setup_popup: None,
             #[cfg(feature = "commons-upload")]
@@ -2933,6 +2992,15 @@ pub enum UiAction {
     /// Publish every public video in the selected YouTube channel as audio RSS.
     #[cfg(feature = "lan-sharing")]
     ShareYouTubeChannelPodcast,
+    /// Toggle whether a reviewed feed omits items before its selected boundary.
+    #[cfg(feature = "lan-sharing")]
+    TogglePodcastFeedIgnoreBefore,
+    /// Create the reviewed local or YouTube podcast feed.
+    #[cfg(feature = "lan-sharing")]
+    ConfirmPodcastFeed,
+    /// Close the podcast-feed review without starting a server or worker.
+    #[cfg(feature = "lan-sharing")]
+    DismissPodcastFeed,
     /// Close the LAN QR popup while leaving its server active.
     #[cfg(feature = "lan-sharing")]
     DismissLanShare,

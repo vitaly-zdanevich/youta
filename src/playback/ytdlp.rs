@@ -3,7 +3,7 @@
 //! Arguments are passed directly to the executable. Youta never constructs a
 //! shell command from a media URL or title.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -466,8 +466,11 @@ struct ExtractedCollectionJson {
     id: String,
     #[serde(default)]
     title: String,
-    #[serde(default, alias = "extractor_key")]
+    #[serde(default)]
     extractor: Option<String>,
+    // yt-dlp emits both extractor fields for channel and playlist documents.
+    #[serde(default)]
+    extractor_key: Option<String>,
     #[serde(default)]
     entries: Vec<ExtractedCollectionEntryJson>,
 }
@@ -487,6 +490,9 @@ struct ExtractedCollectionEntryJson {
     thumbnail: Option<String>,
     #[serde(default)]
     thumbnails: Vec<ExtractedThumbnailJson>,
+    // Channel roots contain Videos, Live, and Shorts playlist wrappers.
+    #[serde(default)]
+    entries: Vec<ExtractedCollectionEntryJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,10 +504,15 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
     type Error = PlaybackError;
 
     fn try_from(value: ExtractedCollectionJson) -> Result<Self> {
-        let entries = value
-            .entries
-            .into_iter()
-            .map(|entry| {
+        let mut entries = Vec::new();
+        let mut pending = VecDeque::from(value.entries);
+        while let Some(entry) = pending.pop_front() {
+            if !entry.entries.is_empty() {
+                // Prepending in reverse retains yt-dlp's depth-first provider order.
+                for child in entry.entries.into_iter().rev() {
+                    pending.push_front(child);
+                }
+            } else {
                 let raw_url = entry.webpage_url.or(entry.url);
                 let webpage_url = raw_url
                     .as_deref()
@@ -523,20 +534,20 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
                             .ok()
                             .filter(|url| matches!(url.scheme(), "http" | "https"))
                     });
-                Ok(CollectionEntry {
+                entries.push(CollectionEntry {
                     id: entry.id,
                     title: entry.title,
                     webpage_url,
                     duration_seconds,
                     thumbnail_url,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                });
+            }
+        }
 
         Ok(Self {
             id: value.id,
             title: value.title,
-            extractor: value.extractor,
+            extractor: value.extractor_key.or(value.extractor),
             entries,
         })
     }
@@ -962,6 +973,63 @@ mod tests {
                 .as_ref()
                 .map(Url::as_str),
             Some("https://images.example/one.jpg")
+        );
+    }
+
+    #[test]
+    fn parses_collection_with_extractor_and_extractor_key() {
+        let fixture = r#"{
+			"id": "collection-1",
+			"title": "Mock channel",
+			"extractor": "youtube:tab",
+			"extractor_key": "YoutubeTab",
+			"entries": []
+		}"#;
+
+        let extracted: ExtractedCollectionJson =
+            serde_json::from_str(fixture).expect("yt-dlp collection metadata");
+        let collection = ExtractedCollection::try_from(extracted).expect("collection");
+
+        assert_eq!(collection.extractor.as_deref(), Some("YoutubeTab"));
+    }
+
+    #[test]
+    fn flattens_nested_youtube_channel_tabs() {
+        let fixture = r#"{
+			"id": "UCfixture",
+			"title": "Fixture channel",
+			"extractor": "youtube:tab",
+			"extractor_key": "YoutubeTab",
+			"entries": [
+				{
+					"id": "UCfixture",
+					"title": "Fixture channel - Videos",
+					"entries": [
+						{"id": "dQw4w9WgXcQ", "title": "First video"},
+						{"id": "M7lc1UVf-VE", "title": "Selected video"}
+					]
+				},
+				{
+					"id": "UCfixture",
+					"title": "Fixture channel - Shorts",
+					"entries": [
+						{"id": "aqz-KE-bpKQ", "title": "One short"}
+					]
+				}
+			]
+		}"#;
+
+        let extracted: ExtractedCollectionJson =
+            serde_json::from_str(fixture).expect("nested yt-dlp channel metadata");
+        let collection = ExtractedCollection::try_from(extracted).expect("collection");
+
+        assert_eq!(
+            collection
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["dQw4w9WgXcQ", "M7lc1UVf-VE", "aqz-KE-bpKQ"]
         );
     }
 }

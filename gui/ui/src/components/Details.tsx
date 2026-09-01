@@ -302,7 +302,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			</>
 		) : null}
 		{view.lan_share_supported &&
-		kind === 'Channel' &&
+		(kind === 'Channel' || (kind === 'Video' && details.media_id?.source === YOUTUBE)) &&
 		details.channel_id !== '' &&
 		(view.screen === 'Search' ||
 			(view.screen === 'Subscriptions' && view.subscriptions.source_kind === YOUTUBE)) ? (

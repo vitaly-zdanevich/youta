@@ -292,6 +292,8 @@ use crate::view::{
 use crate::view::{
     GENTOO_YT_DLP_PACKAGE_URL, YT_DLP_PROJECT_URL, YtDlpForbiddenView, YtDlpVersionLookupView,
 };
+#[cfg(feature = "lan-sharing")]
+use crate::view::{PodcastFeedOptionsPhase, PodcastFeedOptionsPopupView};
 #[cfg(feature = "yandex-music")]
 use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
@@ -3113,12 +3115,29 @@ struct ChannelDownloadSelection {
     estimated_video_count: Option<u64>,
 }
 
+/// Exact local or YouTube boundary retained outside the serialized popup.
+#[cfg(feature = "lan-sharing")]
+enum PodcastFeedSelection {
+    /// One playable file and the visible folder whose order contains it.
+    Local {
+        selected_file: PathBuf,
+        folder: PathBuf,
+    },
+    /// One public channel and the selected video inside its provider order.
+    YouTube {
+        channel_id: String,
+        channel_name: String,
+        selected_video_id: String,
+    },
+}
+
 /// One exact YouTube channel whose flat catalogue is being prepared for RSS.
 #[cfg(feature = "lan-sharing")]
 struct PendingYouTubePodcastFeed {
     generation: u64,
     channel_id: String,
     channel_name: String,
+    first_video_id: Option<String>,
 }
 
 /// Bounded flat-channel completion returned by the isolated feed worker.
@@ -4593,6 +4612,9 @@ pub struct AppController {
     /// Sole session-scoped LAN server; replacing or dropping it closes the old listener.
     #[cfg(feature = "lan-sharing")]
     lan_share_server: Option<crate::lan_share::LanShareServer>,
+    /// Exact unredacted source retained while the feed-boundary popup is open.
+    #[cfg(feature = "lan-sharing")]
+    podcast_feed_selection: Option<PodcastFeedSelection>,
     /// Flat YouTube-channel enumeration completion owned by the active request.
     #[cfg(feature = "lan-sharing")]
     youtube_podcast_feed_responses: Receiver<YouTubePodcastFeedResponse>,
@@ -6010,6 +6032,8 @@ impl AppController {
             local_listing: None,
             #[cfg(feature = "lan-sharing")]
             lan_share_server: None,
+            #[cfg(feature = "lan-sharing")]
+            podcast_feed_selection: None,
             #[cfg(feature = "lan-sharing")]
             youtube_podcast_feed_responses,
             #[cfg(feature = "lan-sharing")]
@@ -10499,10 +10523,67 @@ impl AppController {
             self.view.status_line = "No local file or folder is selected".to_owned();
             return;
         };
+        self.share_local_target(&target, podcast, None);
+    }
+
+    /// Opens feed-boundary review for a playable file, or directly shares a folder.
+    #[cfg(feature = "lan-sharing")]
+    fn open_selected_local_podcast_options(&mut self) {
+        let Some(target) = self.selected_local_share_target() else {
+            self.view.status_line = "No local file or folder is selected".to_owned();
+            return;
+        };
+        let Some(listing) = self.local_listing.as_ref() else {
+            self.view.status_line = "No local folder is open".to_owned();
+            return;
+        };
+        let selected_entry = self
+            .local_entry_index()
+            .and_then(|index| listing.entries.get(index));
+        let Some(selected_entry) = selected_entry.filter(|entry| {
+            entry.path == target && entry.kind.is_playable() && entry.path.is_file()
+        }) else {
+            self.share_local_target(&target, true, None);
+            return;
+        };
+        let selected_file = selected_entry.path.clone();
+        let selected_item = selected_entry.name.to_string_lossy().into_owned();
+        let folder = listing.path.clone();
+        let source_name = folder.file_name().map_or_else(
+            || folder.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.podcast_feed_selection = Some(PodcastFeedSelection::Local {
+            selected_file,
+            folder,
+        });
+        self.view.podcast_feed_options_popup = Some(PodcastFeedOptionsPopupView {
+            source: format!("Local folder: {source_name}"),
+            selected_item,
+            ignore_items_before: false,
+            phase: PodcastFeedOptionsPhase::Review,
+            animation_frame: 0,
+            error: None,
+        });
+    }
+
+    /// Prepares one exact local target, optionally starting at an inclusive file.
+    #[cfg(feature = "lan-sharing")]
+    fn share_local_target(&mut self, target: &Path, podcast: bool, first_file: Option<&Path>) {
         let prepared = if podcast {
-            crate::lan_share::prepare_podcast_share(&target, &self.config.thumbnail_cache_dir())
+            match first_file {
+                Some(first_file) => crate::lan_share::prepare_podcast_share_from(
+                    target,
+                    &self.config.thumbnail_cache_dir(),
+                    first_file,
+                ),
+                None => crate::lan_share::prepare_podcast_share(
+                    target,
+                    &self.config.thumbnail_cache_dir(),
+                ),
+            }
         } else {
-            crate::lan_share::prepare_file_share(&target)
+            crate::lan_share::prepare_file_share(target)
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -10530,7 +10611,86 @@ impl AppController {
         } else {
             "Local selection is available while Youta is running"
         };
-        self.install_lan_share(prepared, title, message.to_owned(), status.to_owned());
+        let _ = self.install_lan_share(prepared, title, message.to_owned(), status.to_owned());
+    }
+
+    /// Toggles the inclusive selected-item boundary in the review popup.
+    #[cfg(feature = "lan-sharing")]
+    fn toggle_podcast_feed_ignore_before(&mut self) {
+        if let Some(popup) = self
+            .view
+            .podcast_feed_options_popup
+            .as_mut()
+            .filter(|popup| popup.phase == PodcastFeedOptionsPhase::Review)
+        {
+            popup.ignore_items_before = !popup.ignore_items_before;
+        }
+    }
+
+    /// Closes feed review and discards its path or provider identity.
+    #[cfg(feature = "lan-sharing")]
+    fn dismiss_podcast_feed_options(&mut self) {
+        self.view.podcast_feed_options_popup = None;
+        self.podcast_feed_selection = None;
+    }
+
+    /// Applies the reviewed boundary to one captured local file or YouTube video.
+    #[cfg(feature = "lan-sharing")]
+    fn confirm_podcast_feed_options(&mut self) {
+        let Some(ignore_items_before) = self
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .filter(|popup| popup.phase == PodcastFeedOptionsPhase::Review)
+            .map(|popup| popup.ignore_items_before)
+        else {
+            return;
+        };
+        let Some(selection) = self.podcast_feed_selection.take() else {
+            self.show_youtube_podcast_feed_failure("The podcast-feed selection expired".to_owned());
+            return;
+        };
+        match selection {
+            PodcastFeedSelection::Local {
+                selected_file,
+                folder,
+            } => {
+                self.view.podcast_feed_options_popup = None;
+                if ignore_items_before {
+                    self.share_local_target(&folder, true, Some(&selected_file));
+                } else {
+                    self.share_local_target(&selected_file, true, None);
+                }
+            }
+            PodcastFeedSelection::YouTube {
+                channel_id,
+                channel_name,
+                selected_video_id,
+            } => {
+                if let Some(popup) = self.view.podcast_feed_options_popup.as_mut() {
+                    popup.phase = PodcastFeedOptionsPhase::Preparing;
+                    popup.animation_frame = 0;
+                    popup.error = None;
+                }
+                if let Err(error) = self.start_youtube_channel_podcast(
+                    channel_id,
+                    channel_name,
+                    ignore_items_before.then_some(selected_video_id),
+                ) {
+                    self.show_youtube_podcast_feed_failure(error);
+                }
+            }
+        }
+    }
+
+    /// Retains a visible worker or preparation error instead of failing in the footer.
+    #[cfg(feature = "lan-sharing")]
+    fn show_youtube_podcast_feed_failure(&mut self, message: String) {
+        if let Some(popup) = self.view.podcast_feed_options_popup.as_mut() {
+            popup.phase = PodcastFeedOptionsPhase::Failed;
+            popup.error = Some(message.clone());
+        }
+        self.view.status_line = message;
     }
 
     /// Binds one prepared manifest and publishes its scanner-ready URL.
@@ -10541,12 +10701,12 @@ impl AppController {
         title: String,
         message: String,
         status: String,
-    ) {
+    ) -> bool {
         let server = match crate::lan_share::LanShareServer::start(prepared) {
             Ok(server) => server,
             Err(error) => {
                 self.view.status_line = format!("Cannot start LAN server: {error}");
-                return;
+                return false;
             }
         };
         let url = server.url().to_owned();
@@ -10554,7 +10714,7 @@ impl AppController {
             Ok(matrix) => matrix,
             Err(error) => {
                 self.view.status_line = format!("Cannot create LAN share QR code: {error}");
-                return;
+                return false;
             }
         };
         self.lan_share_server = Some(server);
@@ -10565,15 +10725,33 @@ impl AppController {
             matrix,
         });
         self.view.status_line = status;
+        true
     }
 
-    /// Returns the exact public YouTube channel represented by the Channel panel.
+    /// Returns the exact public `YouTube` channel represented by the selection.
     #[cfg(feature = "lan-sharing")]
     fn selected_youtube_channel_for_podcast(&self) -> Option<(String, String)> {
         let route_supported = self.view.screen == Screen::Search
             || (self.view.screen == Screen::Subscriptions
                 && self.view.subscriptions.source_kind == SubscriptionKind::YouTube);
-        if !route_supported || self.view.right_panel_mode != RightPanelMode::Channel {
+        if !route_supported {
+            return None;
+        }
+        if let Some(selected) = self.selected_youtube_item() {
+            let (channel_id, channel_name) = match selected {
+                SearchItem::Video(video) => (&video.channel_id, &video.channel_name),
+                SearchItem::Channel(channel) => (&channel.channel_id, &channel.name),
+                SearchItem::PodcastEpisode(_) => return None,
+            };
+            canonical_youtube_channel_url(channel_id)?;
+            let channel_name = if channel_name.trim().is_empty() {
+                channel_id.clone()
+            } else {
+                channel_name.clone()
+            };
+            return Some((channel_id.clone(), channel_name));
+        }
+        if self.view.right_panel_mode != RightPanelMode::Channel {
             return None;
         }
         let details = self.view.details.as_ref()?;
@@ -10581,21 +10759,62 @@ impl AppController {
         Some((details.channel_id.clone(), details.title.clone()))
     }
 
-    /// Enumerates one whole channel off the UI thread before publishing its feed.
+    /// Opens feed-boundary review when a video in the selected channel is visible.
     #[cfg(feature = "lan-sharing")]
-    fn share_selected_youtube_channel_as_podcast(&mut self) {
+    fn open_selected_youtube_channel_podcast_options(&mut self) {
         let Some((channel_id, channel_name)) = self.selected_youtube_channel_for_podcast() else {
             self.view.status_line = "No YouTube channel is selected".to_owned();
             return;
         };
+        let selected_video = self.selected_youtube_item().and_then(|item| match item {
+            SearchItem::Video(video) if video.channel_id == channel_id => Some(video),
+            _ => None,
+        });
+        let Some(selected_video) = selected_video else {
+            self.view.podcast_feed_options_popup = Some(PodcastFeedOptionsPopupView {
+                source: format!("YouTube channel: {channel_name}"),
+                selected_item: "Entire channel".to_owned(),
+                ignore_items_before: false,
+                phase: PodcastFeedOptionsPhase::Preparing,
+                animation_frame: 0,
+                error: None,
+            });
+            if let Err(error) = self.start_youtube_channel_podcast(channel_id, channel_name, None) {
+                self.show_youtube_podcast_feed_failure(error);
+            }
+            return;
+        };
+        let selected_video_id = selected_video.video_id.clone();
+        let selected_item = selected_video.title.clone();
+        self.podcast_feed_selection = Some(PodcastFeedSelection::YouTube {
+            channel_id,
+            channel_name: channel_name.clone(),
+            selected_video_id,
+        });
+        self.view.podcast_feed_options_popup = Some(PodcastFeedOptionsPopupView {
+            source: format!("YouTube channel: {channel_name}"),
+            selected_item,
+            ignore_items_before: false,
+            phase: PodcastFeedOptionsPhase::Review,
+            animation_frame: 0,
+            error: None,
+        });
+    }
+
+    /// Enumerates one whole channel off the UI thread before publishing its feed.
+    #[cfg(feature = "lan-sharing")]
+    fn start_youtube_channel_podcast(
+        &mut self,
+        channel_id: String,
+        channel_name: String,
+        first_video_id: Option<String>,
+    ) -> Result<(), String> {
         if self
             .youtube_podcast_feed_thread
             .as_ref()
             .is_some_and(|thread| !thread.is_finished())
         {
-            self.view.status_line =
-                "Wait for the current YouTube podcast feed to finish preparing".to_owned();
-            return;
+            return Err("Wait for the current YouTube podcast feed to finish preparing".to_owned());
         }
         if let Some(thread) = self.youtube_podcast_feed_thread.take() {
             let _ = thread.join();
@@ -10603,8 +10822,7 @@ impl AppController {
         self.youtube_podcast_feed_generation = self.youtube_podcast_feed_generation.wrapping_add(1);
         let generation = self.youtube_podcast_feed_generation;
         let Some(source_url) = canonical_youtube_channel_url(&channel_id) else {
-            self.view.status_line = "The selected YouTube channel ID is invalid".to_owned();
-            return;
+            return Err("The selected YouTube channel ID is invalid".to_owned());
         };
         let executable = self.config.providers.yt_dlp_executable.clone();
         let sender = self.youtube_podcast_feed_response_sender.clone();
@@ -10632,14 +10850,13 @@ impl AppController {
                     generation,
                     channel_id,
                     channel_name: channel_name.clone(),
+                    first_video_id,
                 });
                 self.view.status_line =
                     format!("Preparing a podcast feed for {channel_name} with yt-dlp…");
+                Ok(())
             }
-            Err(error) => {
-                self.view.status_line =
-                    format!("Cannot start YouTube podcast-feed worker: {error}");
-            }
+            Err(error) => Err(format!("Cannot start YouTube podcast-feed worker: {error}")),
         }
     }
 
@@ -10658,30 +10875,49 @@ impl AppController {
             .expect("matching pending feed was checked above");
         match response.result {
             Ok(collection) => {
-                let count = collection.entries.len();
                 let config = YouTubePrewarmConfig {
                     executable: self.config.providers.yt_dlp_executable.clone(),
                     timeout: Duration::from_secs(30),
                     ..YouTubePrewarmConfig::default()
                 };
-                match crate::lan_share::prepare_youtube_podcast_share(collection, config) {
-					Ok(prepared) => self.install_lan_share(
-						prepared,
-						format!("YouTube podcast: {}", pending.channel_name),
-						"Youta resolves and proxies fresh audio when each episode is requested. The feed and its links stop when Youta exits; download the channel first for offline use."
-							.to_owned(),
-						format!(
-							"YouTube podcast feed with {count} episode(s) is available while Youta is running"
-						),
-					),
-					Err(error) => {
-						self.view.status_line =
-							format!("Cannot prepare YouTube podcast feed: {error}");
-					}
-				}
+                let prepared = if let Some(first_video_id) = pending.first_video_id.as_deref() {
+                    crate::lan_share::prepare_youtube_podcast_share_from(
+                        collection,
+                        config,
+                        first_video_id,
+                    )
+                } else {
+                    crate::lan_share::prepare_youtube_podcast_share(collection, config)
+                };
+                match prepared {
+                    Ok(prepared) => {
+                        let count = prepared.item_count();
+                        let installed = self.install_lan_share(
+                            prepared,
+                            format!("YouTube podcast: {}", pending.channel_name),
+                            "Youta resolves and proxies fresh audio when each episode is requested. The feed and its links stop when Youta exits; download the channel first for offline use."
+                                .to_owned(),
+                            format!(
+                                "YouTube podcast feed with {count} episode(s) is available while Youta is running"
+                            ),
+                        );
+                        if installed {
+                            self.view.podcast_feed_options_popup = None;
+                        } else {
+                            self.show_youtube_podcast_feed_failure(self.view.status_line.clone());
+                        }
+                    }
+                    Err(error) => {
+                        self.show_youtube_podcast_feed_failure(format!(
+                            "Cannot prepare YouTube podcast feed: {error}"
+                        ));
+                    }
+                }
             }
             Err(error) => {
-                self.view.status_line = format!("Cannot enumerate YouTube channel: {error}");
+                self.show_youtube_podcast_feed_failure(format!(
+                    "Cannot enumerate YouTube channel: {error}"
+                ));
             }
         }
     }
@@ -10708,12 +10944,13 @@ impl AppController {
                 self.handle_youtube_podcast_feed_response(response);
             }
             if self.pending_youtube_podcast_feed.take().is_some() {
-                self.view.status_line = if join_failed {
+                let message = if join_failed {
                     "YouTube podcast-feed worker failed unexpectedly"
                 } else {
                     "YouTube podcast-feed worker stopped without a result"
                 }
                 .to_owned();
+                self.show_youtube_podcast_feed_failure(message);
             }
         }
     }
@@ -32703,6 +32940,8 @@ impl AppController {
         {
             self.lan_share_server = None;
             self.view.lan_share_popup = None;
+            self.podcast_feed_selection = None;
+            self.view.podcast_feed_options_popup = None;
         }
         self.clear_search_activity();
         self.clear_playback_start_activity();
@@ -33639,11 +33878,19 @@ impl UiController for AppController {
             #[cfg(feature = "lan-sharing")]
             UiAction::ShareLocalFiles => self.share_selected_local_target(false),
             #[cfg(feature = "lan-sharing")]
-            UiAction::ShareLocalPodcast => self.share_selected_local_target(true),
+            UiAction::ShareLocalPodcast => self.open_selected_local_podcast_options(),
             #[cfg(feature = "lan-sharing")]
             UiAction::ShareYouTubeChannelPodcast => {
-                self.share_selected_youtube_channel_as_podcast();
+                self.open_selected_youtube_channel_podcast_options();
             }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::TogglePodcastFeedIgnoreBefore => {
+                self.toggle_podcast_feed_ignore_before();
+            }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ConfirmPodcastFeed => self.confirm_podcast_feed_options(),
+            #[cfg(feature = "lan-sharing")]
+            UiAction::DismissPodcastFeed => self.dismiss_podcast_feed_options(),
             #[cfg(feature = "lan-sharing")]
             UiAction::DismissLanShare => self.view.lan_share_popup = None,
             #[cfg(feature = "lan-sharing")]
@@ -34076,7 +34323,14 @@ impl UiController for AppController {
         self.drain_url_open_results();
         self.drain_local_media_metadata_responses();
         #[cfg(feature = "lan-sharing")]
-        self.drain_youtube_podcast_feed_responses();
+        {
+            self.drain_youtube_podcast_feed_responses();
+            if let Some(popup) = self.view.podcast_feed_options_popup.as_mut()
+                && popup.phase == PodcastFeedOptionsPhase::Preparing
+            {
+                popup.animation_frame = popup.animation_frame.wrapping_add(1);
+            }
+        }
         #[cfg(feature = "summary")]
         self.drain_video_summary_responses();
         #[cfg(feature = "youtube-captions")]
@@ -51121,6 +51375,157 @@ mod tests {
 
     #[cfg(feature = "lan-sharing")]
     #[test]
+    fn selected_local_file_opens_inclusive_podcast_boundary_review() {
+        let temporary = crate::test_support::canonical_tempdir("local-podcast-options");
+        let current = temporary.path().join("album");
+        fs::create_dir(&current).expect("create current directory");
+        let first = current.join("01-first.opus");
+        let selected = current.join("02-selected.opus");
+        fs::write(&first, b"first").expect("write first audio");
+        fs::write(&selected, b"selected").expect("write selected audio");
+        let entry = |name: &str, path: PathBuf, size_bytes| crate::local_browser::LocalEntry {
+            name: name.into(),
+            path,
+            kind: crate::local_browser::LocalEntryKind::Audio,
+            size_bytes: Some(size_bytes),
+            image_dimensions: None,
+            directory_identity: None,
+        };
+        let config = Config::for_dir(temporary.path().join("config"));
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Local;
+        controller.view.selected = 2;
+        controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+            path: current.clone(),
+            parent: Some(temporary.path().to_path_buf()),
+            entries: vec![
+                entry("01-first.opus", first, 5),
+                entry("02-selected.opus", selected.clone(), 8),
+            ],
+            truncated: false,
+            inspected_entries: 2,
+        });
+
+        controller.dispatch(UiAction::ShareLocalPodcast);
+
+        let popup = controller
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .expect("podcast boundary review");
+        assert_eq!(popup.source, "Local folder: album");
+        assert_eq!(popup.selected_item, "02-selected.opus");
+        assert!(!popup.ignore_items_before);
+        assert!(matches!(
+            controller.podcast_feed_selection.as_ref(),
+            Some(PodcastFeedSelection::Local {
+                selected_file,
+                folder,
+            }) if selected_file == &selected && folder == &current
+        ));
+
+        controller.dispatch(UiAction::TogglePodcastFeedIgnoreBefore);
+        assert!(
+            controller
+                .view
+                .podcast_feed_options_popup
+                .as_ref()
+                .is_some_and(|popup| popup.ignore_items_before)
+        );
+        controller.dispatch(UiAction::DismissPodcastFeed);
+        assert!(controller.view.podcast_feed_options_popup.is_none());
+        assert!(controller.podcast_feed_selection.is_none());
+        assert!(controller.lan_share_server.is_none());
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn selected_youtube_video_opens_inclusive_channel_feed_boundary_review() {
+        let temporary = crate::test_support::canonical_tempdir("youtube-podcast-options");
+        let mut config = Config::for_dir(temporary.path().join("config"));
+        config.providers.yt_dlp_executable = temporary.path().join("missing-yt-dlp");
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        let selected_video = subscription_video_summary();
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Items;
+        controller.view.subscriptions.focus = SubscriptionPane::Items;
+        controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        controller.view.subscriptions.source_title = "Fixture channel".to_owned();
+        controller.view.right_panel_mode = RightPanelMode::Details;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        controller.subscription_video_cache.insert(
+            "UCfixture".to_owned(),
+            CachedSubscriptionVideos {
+                items: vec![SearchItem::Video(selected_video.clone())],
+                ..CachedSubscriptionVideos::default()
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::YouTube, &selected_video.video_id)),
+            title: selected_video.title,
+            channel_name: selected_video.channel_name,
+            channel_id: "UCfixture".to_owned(),
+            ..DetailView::default()
+        });
+
+        controller.dispatch(UiAction::ShareYouTubeChannelPodcast);
+
+        let popup = controller
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .expect("YouTube podcast boundary review");
+        assert_eq!(popup.source, "YouTube channel: Fixture channel");
+        assert_eq!(popup.selected_item, "Fixture video");
+        assert!(!popup.ignore_items_before);
+        assert!(matches!(
+            controller.podcast_feed_selection.as_ref(),
+            Some(PodcastFeedSelection::YouTube {
+                channel_id,
+                channel_name,
+                selected_video_id,
+            }) if channel_id == "UCfixture"
+                && channel_name == "Fixture channel"
+                && selected_video_id == "dQw4w9WgXcQ"
+        ));
+
+        controller.dispatch(UiAction::ConfirmPodcastFeed);
+
+        assert!(
+            controller
+                .view
+                .podcast_feed_options_popup
+                .as_ref()
+                .is_some_and(|popup| popup.phase == PodcastFeedOptionsPhase::Preparing),
+            "confirmation must retain visible progress until channel enumeration finishes"
+        );
+        assert!(controller.pending_youtube_podcast_feed.is_some());
+
+        let generation = controller.youtube_podcast_feed_generation;
+        controller.handle_youtube_podcast_feed_response(YouTubePodcastFeedResponse {
+            generation,
+            channel_id: "UCfixture".to_owned(),
+            result: Err("fixture yt-dlp failure".to_owned()),
+        });
+        let failed = controller
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .expect("visible podcast-feed failure");
+        assert_eq!(failed.phase, PodcastFeedOptionsPhase::Failed);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("fixture yt-dlp failure"))
+        );
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
     fn completed_youtube_channel_feed_opens_a_session_scoped_qr() {
         let temporary = crate::test_support::canonical_tempdir("youtube-podcast-share");
         let config = Config::for_dir(temporary.path().join("config"));
@@ -51143,6 +51548,7 @@ mod tests {
             generation: 7,
             channel_id: "UCfixture".to_owned(),
             channel_name: "Fixture channel".to_owned(),
+            first_video_id: None,
         });
         controller.handle_youtube_podcast_feed_response(YouTubePodcastFeedResponse {
             generation: 7,

@@ -367,6 +367,16 @@ export interface LanSharePopupView {
 	matrix: QrMatrix;
 }
 
+/** Review options for a feed anchored to one selected file or video. */
+export interface PodcastFeedOptionsPopupView {
+	source: string;
+	selected_item: string;
+	ignore_items_before: boolean;
+	phase: 'Review' | 'Preparing' | 'Failed';
+	animation_frame: number;
+	error: string | null;
+}
+
 /** One source-control commit in the offline-first history popup. */
 export interface ProjectCommitView {
   hash: string;
@@ -751,6 +761,7 @@ export interface ViewModel {
   video_qr_popup: VideoQrPopupView | null;
 	lan_share_supported: boolean;
 	lan_share_popup: LanSharePopupView | null;
+	podcast_feed_options_popup: PodcastFeedOptionsPopupView | null;
   preferences_popup: PreferencesPopupView | null;
   playlist_popup: PlaylistPopupView | null;
   queue_popup: QueuePopupView | null;

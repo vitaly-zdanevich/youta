@@ -22,6 +22,7 @@ import {
   HelpPopup,
   LocalFilePopup,
 	LanSharePopup,
+	PodcastFeedOptionsPopup,
   PlaylistPopup,
   PreferencesPopup,
   ProjectHistoryPopup,
@@ -230,6 +231,9 @@ export function App() {
         <VideoCommentsPopup popup={view.video_comments_popup} />
       ) : null}
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
+		{view.podcast_feed_options_popup ? (
+			<PodcastFeedOptionsPopup popup={view.podcast_feed_options_popup} />
+		) : null}
 		{view.lan_share_popup ? <LanSharePopup popup={view.lan_share_popup} /> : null}
       {view.video_summary_popup ? (
         <VideoSummaryPopup popup={view.video_summary_popup} />

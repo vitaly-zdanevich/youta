@@ -45,6 +45,25 @@ const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CODEC_BYTES: usize = 128;
 const MAX_PROTOCOL_BYTES: usize = 128;
 
+/// Closed `YouTube` player-client policies permitted by the bounded resolver.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum YouTubePlayerClientPolicy {
+    /// Let yt-dlp choose its normal anonymous clients.
+    #[default]
+    Default,
+    /// Prefer the cookie-free embedded client, then try yt-dlp's defaults.
+    EmbeddedThenDefault,
+}
+
+impl YouTubePlayerClientPolicy {
+    const fn extractor_argument(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::EmbeddedThenDefault => Some("youtube:player_client=web_embedded,default"),
+        }
+    }
+}
+
 /// Process and memory limits for speculative `YouTube` audio resolution.
 #[derive(Clone, Eq, PartialEq)]
 pub struct YouTubePrewarmConfig {
@@ -65,6 +84,8 @@ pub struct YouTubePrewarmConfig {
     /// way. Enabling plugins is an execution-trust decision and should be an
     /// explicit user preference when this resolver is wired into the app.
     pub allow_plugins: bool,
+    /// Allowlisted player-client sequence used for anonymous extraction.
+    pub player_client_policy: YouTubePlayerClientPolicy,
     /// `yt-dlp` format expression used to select one audio-only stream.
     pub audio_format: String,
 }
@@ -77,6 +98,7 @@ impl Default for YouTubePrewarmConfig {
             max_json_bytes: 128 * 1024,
             max_stderr_bytes: 8 * 1024,
             allow_plugins: false,
+            player_client_policy: YouTubePlayerClientPolicy::Default,
             audio_format: DEFAULT_AUDIO_FORMAT.to_owned(),
         }
     }
@@ -91,6 +113,7 @@ impl fmt::Debug for YouTubePrewarmConfig {
             .field("max_json_bytes", &self.max_json_bytes)
             .field("max_stderr_bytes", &self.max_stderr_bytes)
             .field("allow_plugins", &self.allow_plugins)
+            .field("player_client_policy", &self.player_client_policy)
             .field("audio_format", &"<configured>")
             .finish()
     }
@@ -541,7 +564,11 @@ fn build_command(config: &YouTubePrewarmConfig, source_url: &Url) -> Command {
         .arg("--retries")
         .arg("1")
         .arg("--extractor-retries")
-        .arg("1")
+        .arg("1");
+    if let Some(argument) = config.player_client_policy.extractor_argument() {
+        command.arg("--extractor-args").arg(argument);
+    }
+    command
         .arg("--format")
         .arg(&config.audio_format)
         .arg("--print")
@@ -1097,6 +1124,7 @@ mod tests {
         );
         assert!(arguments.contains(&"--ignore-config".to_owned()));
         assert!(arguments.contains(&"--no-plugin-dirs".to_owned()));
+        assert!(!arguments.contains(&"--extractor-args".to_owned()));
         assert!(
             arguments
                 .windows(2)
@@ -1113,6 +1141,28 @@ mod tests {
                 .map(|pair| pair[1].as_str()),
             Some(PRINT_TEMPLATE)
         );
+    }
+
+    #[test]
+    fn embedded_client_policy_is_explicit_and_keeps_config_disabled() {
+        let config = YouTubePrewarmConfig {
+            player_client_policy: YouTubePlayerClientPolicy::EmbeddedThenDefault,
+            ..YouTubePrewarmConfig::default()
+        };
+        let command = build_command(&config, &watch_url());
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.contains(&"--ignore-config".to_owned()));
+        assert!(arguments.contains(&"--no-plugin-dirs".to_owned()));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "--extractor-args",
+                "youtube:player_client=web_embedded,default",
+            ]
+        }));
     }
 
     #[test]

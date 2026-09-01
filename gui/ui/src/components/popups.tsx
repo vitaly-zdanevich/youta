@@ -25,6 +25,7 @@ import type {
   GitHubIssueSubmissionView,
   LocalFilePopupView,
 	LanSharePopupView,
+	PodcastFeedOptionsPopupView,
   PlaylistPopupView,
   PreferencesPopupView,
   ProjectHistoryPopupView,
@@ -54,11 +55,12 @@ export const LAYER = {
   queue: 8,
   videoComments: 9,
   videoQr: 10,
-	lanShare: 11,
-  videoSummary: 12,
-  youtubeCaptions: 13,
-  audioQuality: 14,
-  error: 15,
+	podcastFeedOptions: 11,
+	lanShare: 12,
+  videoSummary: 13,
+  youtubeCaptions: 14,
+  audioQuality: 15,
+  error: 16,
 } as const;
 
 /** A short scrollable region for popups whose offset the reducer does not own. */
@@ -1214,6 +1216,66 @@ export function VideoQrPopup({ popup }: { popup: VideoQrPopupView }) {
       </div>
     </Popup>
   );
+}
+
+/** Review-first inclusive boundary for a local or YouTube podcast feed. */
+export function PodcastFeedOptionsPopup({
+	popup,
+}: {
+	popup: PodcastFeedOptionsPopupView;
+}) {
+	const activity = '.'.repeat((Math.floor(popup.animation_frame / 4) % 3) + 1);
+	const reviewing = popup.phase === 'Review';
+	const title = reviewing
+		? 'Create podcast feed?'
+		: popup.phase === 'Preparing'
+			? 'Preparing podcast feed…'
+			: 'Could not create podcast feed';
+	return (
+		<Popup
+			title={title}
+			subtitle={popup.source}
+			layer={LAYER.podcastFeedOptions}
+			onDismiss={() => void dispatch('DismissPodcastFeed')}
+			dismissLabel={reviewing ? 'Cancel' : popup.phase === 'Preparing' ? 'Hide' : 'Close'}
+			footer={
+				reviewing ? (
+					<>
+						<PopupButton emphasis onClick={() => void dispatch('ConfirmPodcastFeed')}>
+							Create feed
+						</PopupButton>
+						<PopupButton onClick={() => void dispatch('DismissPodcastFeed')}>
+							Cancel
+						</PopupButton>
+					</>
+				) : (
+					<PopupButton onClick={() => void dispatch('DismissPodcastFeed')}>
+						{popup.phase === 'Preparing' ? 'Hide' : 'Close'}
+					</PopupButton>
+				)
+			}
+		>
+			<Body>
+				<p className='m-0 text-ink-dim'>
+					Selected item: <span className='text-ink'>{popup.selected_item}</span>
+				</p>
+				{reviewing ? (
+					<label className='mt-4 flex cursor-pointer items-center gap-2 text-ink'>
+						<input
+							type='checkbox'
+							checked={popup.ignore_items_before}
+							onChange={() => void dispatch('TogglePodcastFeedIgnoreBefore')}
+						/>
+						Ignore items before this item
+					</label>
+				) : popup.phase === 'Preparing' ? (
+					<p className='mt-4 text-ink-dim'>Enumerating channel with yt-dlp{activity}</p>
+				) : (
+					<p className='mt-4 text-accent'>{popup.error ?? 'Podcast feed preparation failed'}</p>
+				)}
+			</Body>
+		</Popup>
+	);
 }
 
 /** A session-scoped LAN URL and scanner-ready QR code. */

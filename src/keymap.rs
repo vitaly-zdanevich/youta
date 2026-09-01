@@ -359,6 +359,32 @@ mod wire_tests {
             Some(UiAction::ShareYouTubeChannelPodcast)
         );
 
+        let subscription_video = ViewModel {
+            screen: crate::view::Screen::Subscriptions,
+            right_panel_mode: crate::view::RightPanelMode::Details,
+            details: Some(crate::view::DetailView {
+                media_id: Some(crate::domain::MediaId::new(
+                    crate::domain::SourceKind::YouTube,
+                    "dQw4w9WgXcQ",
+                )),
+                title: "Fixture video".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                ..crate::view::DetailView::default()
+            }),
+            subscriptions: crate::view::SubscriptionsView {
+                source_kind: crate::subscriptions::SubscriptionKind::YouTube,
+                route: crate::view::SubscriptionRoute::Items,
+                focus: crate::view::SubscriptionPane::Items,
+                ..crate::view::SubscriptionsView::default()
+            },
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &subscription_video, None, None),
+            Some(UiAction::ShareYouTubeChannelPodcast),
+            "a selected YouTube subscription video must expose its podcast boundary"
+        );
+
         let popup = ViewModel {
             lan_share_popup: Some(crate::view::LanSharePopupView {
                 title: "Podcast feed".to_owned(),
@@ -381,6 +407,50 @@ mod wire_tests {
             key_action(KeyPress::new(Key::F(12)), &popup, None, None),
             None,
             "the modal must own keys until it closes"
+        );
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_feed_options_popup_owns_review_and_preparation_keys() {
+        let options = ViewModel {
+            podcast_feed_options_popup: Some(crate::view::PodcastFeedOptionsPopupView {
+                source: "Local folder: album".to_owned(),
+                selected_item: "02-selected.opus".to_owned(),
+                ignore_items_before: false,
+                phase: crate::view::PodcastFeedOptionsPhase::Review,
+                animation_frame: 0,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char(' ')), &options, None, None),
+            Some(UiAction::TogglePodcastFeedIgnoreBefore)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &options, None, None),
+            Some(UiAction::ConfirmPodcastFeed)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &options, None, None),
+            Some(UiAction::DismissPodcastFeed)
+        );
+
+        let mut preparing = options;
+        preparing
+            .podcast_feed_options_popup
+            .as_mut()
+            .expect("podcast-feed popup")
+            .phase = crate::view::PodcastFeedOptionsPhase::Preparing;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &preparing, None, None),
+            None,
+            "preparation must not submit a second channel worker"
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &preparing, None, None),
+            Some(UiAction::DismissPodcastFeed)
         );
     }
 
@@ -970,6 +1040,20 @@ fn unfiltered_key_action(
         }
     }
     #[cfg(feature = "lan-sharing")]
+    if let Some(popup) = view.podcast_feed_options_popup.as_ref() {
+        return match popup.phase {
+            PodcastFeedOptionsPhase::Review => match key.key {
+                Key::Char(' ') => Some(UiAction::TogglePodcastFeedIgnoreBefore),
+                Key::Enter => Some(UiAction::ConfirmPodcastFeed),
+                Key::Esc => Some(UiAction::DismissPodcastFeed),
+                _ => None,
+            },
+            PodcastFeedOptionsPhase::Preparing | PodcastFeedOptionsPhase::Failed => {
+                (key.key == Key::Esc).then_some(UiAction::DismissPodcastFeed)
+            }
+        };
+    }
+    #[cfg(feature = "lan-sharing")]
     if view.lan_share_popup.is_some() {
         return match key.key {
             Key::Esc => Some(UiAction::DismissLanShare),
@@ -1486,16 +1570,7 @@ fn unfiltered_key_action(
         #[cfg(feature = "lan-sharing")]
         Key::F(12) if view.screen == Screen::Local => Some(UiAction::ShareLocalPodcast),
         #[cfg(feature = "lan-sharing")]
-        Key::F(12)
-            if view.right_panel_mode == RightPanelMode::Channel
-                && view
-                    .details
-                    .as_ref()
-                    .is_some_and(|details| !details.channel_id.is_empty())
-                && (view.screen == Screen::Search
-                    || (view.screen == Screen::Subscriptions
-                        && view.subscriptions.source_kind == SubscriptionKind::YouTube)) =>
-        {
+        Key::F(12) if view.youtube_podcast_feed_available() => {
             Some(UiAction::ShareYouTubeChannelPodcast)
         }
         Key::Char('/') => Some(UiAction::BeginSearch),

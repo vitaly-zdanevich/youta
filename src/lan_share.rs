@@ -22,8 +22,8 @@ use url::Url;
 
 use crate::local_browser::{LocalEntryKind, classify_local_file};
 use crate::playback::youtube_prewarm::{
-    PrewarmedYouTubeAudio, YouTubePrewarmCancellation, YouTubePrewarmConfig, YouTubePrewarmRequest,
-    YouTubePrewarmResolver,
+    PrewarmedYouTubeAudio, YouTubePlayerClientPolicy, YouTubePrewarmCancellation,
+    YouTubePrewarmConfig, YouTubePrewarmRequest, YouTubePrewarmResolver,
 };
 use crate::playback::ytdlp::ExtractedCollection;
 use crate::providers::validate_youtube_video_id;
@@ -36,7 +36,8 @@ const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const IO_POLL: Duration = Duration::from_millis(100);
 const REMOTE_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const REMOTE_RESOLUTION_CACHE_TTL: Duration = Duration::from_mins(30);
-const YOUTUBE_PODCAST_AUDIO_FORMAT: &str = "bestaudio[ext=m4a]";
+const YOUTUBE_PODCAST_AUDIO_FORMAT: &str = "bestaudio[ext=webm]";
+const YOUTUBE_PODCAST_MIME: &str = "audio/webm";
 
 /// What one immutable LAN server exposes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,14 @@ pub struct PreparedLocalShare {
     files: Vec<SharedFile>,
     artwork: Vec<SharedArtwork>,
     remote_config: Option<YouTubePrewarmConfig>,
+}
+
+impl PreparedLocalShare {
+    /// Returns the immutable number of files or podcast episodes to publish.
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.files.len()
+    }
 }
 
 /// One active server and the LAN URL suitable for a QR code.
@@ -139,7 +148,7 @@ impl Drop for LanShareServer {
 /// Returns an error for symlinks, unsupported target types, unreadable
 /// entries, or a directory that exceeds the traversal bounds.
 pub fn prepare_file_share(target: &Path) -> io::Result<PreparedLocalShare> {
-    prepare_local_share(target, None)
+    prepare_local_share(target, None, None)
 }
 
 /// Builds a bounded podcast feed from playable files under one target.
@@ -155,12 +164,33 @@ pub fn prepare_podcast_share(
     target: &Path,
     artwork_cache: &Path,
 ) -> io::Result<PreparedLocalShare> {
-    prepare_local_share(target, Some(artwork_cache))
+    prepare_local_share(target, Some(artwork_cache), None)
+}
+
+/// Builds a bounded podcast feed beginning with one selected file.
+///
+/// Files are ordered exactly as in a normal local podcast manifest: a
+/// case-insensitive relative-path sort after the bounded recursive scan. The
+/// selected file remains the first episode, while every earlier file is
+/// omitted. This lets a visible Local row act as an inclusive resume boundary.
+///
+/// # Errors
+///
+/// Returns the same errors as [`prepare_podcast_share`], and also rejects a
+/// symbolic-link boundary or a selected file absent from the playable
+/// manifest below `target`.
+pub fn prepare_podcast_share_from(
+    target: &Path,
+    artwork_cache: &Path,
+    first_file: &Path,
+) -> io::Result<PreparedLocalShare> {
+    prepare_local_share(target, Some(artwork_cache), Some(first_file))
 }
 
 fn prepare_local_share(
     target: &Path,
     artwork_cache: Option<&Path>,
+    first_file: Option<&Path>,
 ) -> io::Result<PreparedLocalShare> {
     let metadata = fs::symlink_metadata(target)?;
     if metadata.file_type().is_symlink() {
@@ -205,7 +235,10 @@ fn prepare_local_share(
             },
         ));
     }
-    paths.sort_by(|left, right| left.1.to_lowercase().cmp(&right.1.to_lowercase()));
+    paths.sort_by_key(|(_, label)| label.to_lowercase());
+    if let Some(first_file) = first_file {
+        retain_podcast_files_from(&mut paths, first_file)?;
+    }
     let mut artwork = Vec::new();
     let mut artwork_routes: HashMap<PathBuf, String> = HashMap::new();
     let mut files = Vec::with_capacity(paths.len());
@@ -264,7 +297,30 @@ fn prepare_local_share(
     })
 }
 
-/// Builds a feed whose stable local enclosure routes resolve fresh YouTube
+/// Drops local podcast entries before one validated, inclusive file boundary.
+fn retain_podcast_files_from(
+    paths: &mut Vec<(PathBuf, String)>,
+    first_file: &Path,
+) -> io::Result<()> {
+    let first_metadata = fs::symlink_metadata(first_file)?;
+    if first_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "symbolic-link podcast boundaries are disabled",
+        ));
+    }
+    let canonical_first = fs::canonicalize(first_file)?;
+    let Some(first_index) = paths.iter().position(|(path, _)| path == &canonical_first) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the selected file is absent from the playable podcast manifest",
+        ));
+    };
+    paths.drain(..first_index);
+    Ok(())
+}
+
+/// Builds a feed whose stable local enclosure routes resolve fresh `YouTube`
 /// audio only when a podcast client requests an episode.
 ///
 /// Flat extraction keeps feed creation fast: it downloads neither video nor
@@ -274,11 +330,56 @@ fn prepare_local_share(
 /// # Errors
 ///
 /// Returns an error when the collection is empty, exceeds the feed bound, or
-/// contains no valid YouTube video identifiers.
+/// contains no valid `YouTube` video identifiers.
 pub fn prepare_youtube_podcast_share(
     collection: ExtractedCollection,
-    mut config: YouTubePrewarmConfig,
+    config: YouTubePrewarmConfig,
 ) -> io::Result<PreparedLocalShare> {
+    prepare_youtube_podcast_share_with_boundary(collection, config, None)
+}
+
+/// Builds a `YouTube` podcast feed beginning with one selected channel video.
+///
+/// The flat collection's provider order is retained. The selected video is
+/// inclusive, and entries that appeared before it are omitted before Youta's
+/// podcast-size bound is applied.
+///
+/// # Errors
+///
+/// Returns the same errors as [`prepare_youtube_podcast_share`], and also
+/// rejects an invalid or absent selected video identifier.
+pub fn prepare_youtube_podcast_share_from(
+    collection: ExtractedCollection,
+    config: YouTubePrewarmConfig,
+    first_video_id: &str,
+) -> io::Result<PreparedLocalShare> {
+    if validate_youtube_video_id(first_video_id).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the selected YouTube video ID is invalid",
+        ));
+    }
+    prepare_youtube_podcast_share_with_boundary(collection, config, Some(first_video_id))
+}
+
+fn prepare_youtube_podcast_share_with_boundary(
+    mut collection: ExtractedCollection,
+    mut config: YouTubePrewarmConfig,
+    first_video_id: Option<&str>,
+) -> io::Result<PreparedLocalShare> {
+    if let Some(first_video_id) = first_video_id {
+        let Some(first_index) = collection
+            .entries
+            .iter()
+            .position(|entry| entry.id == first_video_id)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the selected video is absent from the enumerated YouTube channel",
+            ));
+        };
+        collection.entries.drain(..first_index);
+    }
     let title = if collection.title.trim().is_empty() {
         "YouTube channel".to_owned()
     } else {
@@ -305,7 +406,7 @@ pub fn prepare_youtube_podcast_share(
             entry.title
         };
         let route = format!(
-            "/media/{index}/{}.m4a",
+            "/media/{index}/{}.webm",
             utf8_percent_encode(&entry.id, NON_ALPHANUMERIC)
         );
         let artwork_route = format!("/artwork/{index}");
@@ -313,7 +414,7 @@ pub fn prepare_youtube_podcast_share(
             guid: format!("urn:youta:youtube:{}", entry.id),
             label,
             length: 0,
-            mime: "audio/mp4",
+            mime: YOUTUBE_PODCAST_MIME,
             source: SharedFileSource::YouTube {
                 source_url,
                 duration_seconds: entry.duration_seconds,
@@ -343,9 +444,10 @@ pub fn prepare_youtube_podcast_share(
         ));
     }
     // A podcast enclosure must advertise a stable media type before the
-    // signed stream exists, so request YouTube's podcast-compatible AAC/M4A
-    // representation instead of allowing yt-dlp to choose another container.
-    config.audio_format = YOUTUBE_PODCAST_AUDIO_FORMAT.to_owned();
+    // signed stream exists. Prefer cookie-free embedded extraction and an
+    // audio-only Opus/WebM representation rather than importing credentials.
+    YOUTUBE_PODCAST_AUDIO_FORMAT.clone_into(&mut config.audio_format);
+    config.player_client_policy = YouTubePlayerClientPolicy::EmbeddedThenDefault;
     Ok(PreparedLocalShare {
         kind: LanShareKind::Podcast,
         title,
@@ -768,7 +870,7 @@ fn proxy_youtube_audio(
                 stream,
                 502,
                 "Bad Gateway",
-                "Could not resolve fresh YouTube audio",
+                "Could not resolve cookie-free YouTube audio; embedded playback may be unavailable",
                 head,
             );
         }
@@ -782,7 +884,7 @@ fn proxy_youtube_audio(
         range,
         head,
         stop,
-        "audio/mp4",
+        YOUTUBE_PODCAST_MIME,
     )
 }
 
@@ -1194,6 +1296,33 @@ mod tests {
     }
 
     #[test]
+    fn local_podcast_boundary_starts_with_the_selected_file_in_feed_order() {
+        let directory = canonical_tempdir("lan-podcast-boundary");
+        let first = directory.path().join("01-introduction.opus");
+        let selected = directory.path().join("02-selected.opus");
+        let last = directory.path().join("03-finale.opus");
+        fs::write(&first, b"first").expect("write first audio");
+        fs::write(&selected, b"selected").expect("write selected audio");
+        fs::write(&last, b"last").expect("write last audio");
+
+        let prepared = prepare_podcast_share_from(
+            directory.path(),
+            &directory.path().join("cache"),
+            &selected,
+        )
+        .expect("prepare feed from selected file");
+
+        assert_eq!(
+            prepared
+                .files
+                .iter()
+                .map(|file| file.label.as_str())
+                .collect::<Vec<_>>(),
+            ["02-selected.opus", "03-finale.opus"]
+        );
+    }
+
+    #[test]
     fn youtube_feed_uses_stable_proxy_routes_and_artwork_for_every_episode() {
         let collection = ExtractedCollection {
             id: "UCfixture".to_owned(),
@@ -1236,7 +1365,14 @@ mod tests {
                 .remote_config
                 .as_ref()
                 .map(|config| config.audio_format.as_str()),
-            Some(YOUTUBE_PODCAST_AUDIO_FORMAT)
+            Some("bestaudio[ext=webm]")
+        );
+        assert_eq!(
+            prepared
+                .remote_config
+                .as_ref()
+                .map(|config| config.player_client_policy),
+            Some(YouTubePlayerClientPolicy::EmbeddedThenDefault)
         );
         let state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
 
@@ -1244,10 +1380,48 @@ mod tests {
         assert!(rss.contains("<title>First &amp; episode</title>"));
         assert_eq!(rss.matches("<itunes:image href=").count(), 2);
         assert!(rss.contains("<itunes:duration>42</itunes:duration>"));
-        assert!(rss.contains("length=\"0\" type=\"audio/mp4\""));
+        assert!(rss.contains("length=\"0\" type=\"audio/webm\""));
         assert!(rss.contains("http://192.0.2.10:8123/media/0/"));
         assert!(!rss.contains("googlevideo.com"));
         assert!(!rss.contains("i.ytimg.com"));
+    }
+
+    #[test]
+    fn youtube_podcast_boundary_starts_with_the_selected_video_in_provider_order() {
+        let entry = |id: &str, title: &str| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+        };
+        let collection = ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Fixture channel".to_owned(),
+            extractor: Some("YoutubeTab".to_owned()),
+            entries: vec![
+                entry("dQw4w9WgXcQ", "Before selection"),
+                entry("M7lc1UVf-VE", "Selected episode"),
+                entry("aqz-KE-bpKQ", "After selection"),
+            ],
+        };
+
+        let prepared = prepare_youtube_podcast_share_from(
+            collection,
+            YouTubePrewarmConfig::default(),
+            "M7lc1UVf-VE",
+        )
+        .expect("prepare YouTube feed from selected video");
+
+        assert_eq!(
+            prepared
+                .files
+                .iter()
+                .map(|file| file.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Selected episode", "After selection"]
+        );
+        assert_eq!(prepared.files[0].route, "/media/0/M7lc1UVf%2DVE.webm");
     }
 
     #[test]

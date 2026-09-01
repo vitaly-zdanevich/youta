@@ -35,8 +35,6 @@ use youta::view::ChannelDownloadPopupView;
 use youta::view::CommonsUploadPopupView;
 #[cfg(feature = "evernote")]
 use youta::view::EvernoteNotePopupView;
-#[cfg(feature = "lan-sharing")]
-use youta::view::LanSharePopupView;
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
@@ -45,6 +43,8 @@ use youta::view::{
     RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
     ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
+#[cfg(feature = "lan-sharing")]
+use youta::view::{LanSharePopupView, PodcastFeedOptionsPopupView};
 use youta::waveform::PeakPyramid;
 
 /// Reads the declarations the window compiles against.
@@ -166,7 +166,8 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
                         | "youtube_captions_popup"
                         | "youtube_captions_supported"
                 ))
-            || (!cfg!(feature = "lan-sharing") && field == "lan_share_popup"))
+            || (!cfg!(feature = "lan-sharing")
+                && matches!(field, "lan_share_popup" | "podcast_feed_options_popup")))
 }
 
 /// Whether one frontend action belongs to a capability omitted from this build.
@@ -213,11 +214,14 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
         || (!cfg!(feature = "lan-sharing")
             && matches!(
                 name,
-                "DismissLanShare"
+                "ConfirmPodcastFeed"
+                    | "DismissLanShare"
+                    | "DismissPodcastFeed"
                     | "ShareLocalFiles"
                     | "ShareLocalPodcast"
                     | "ShareYouTubeChannelPodcast"
                     | "StopLanShare"
+                    | "TogglePodcastFeedIgnoreBefore"
             ))
 }
 
@@ -241,6 +245,10 @@ fn optional_contract_exemptions_follow_the_compiled_feature_set() {
     );
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "lan_share_popup"),
+        !cfg!(feature = "lan-sharing")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "podcast_feed_options_popup"),
         !cfg!(feature = "lan-sharing")
     );
     assert!(!field_belongs_to_disabled_feature(
@@ -405,6 +413,18 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             matrix: youta::qr_code::QrMatrix::encode("http://127.0.0.1/").expect("fixture QR"),
         }),
     );
+    #[cfg(feature = "lan-sharing")]
+    emitted.insert(
+        "PodcastFeedOptionsPopupView",
+        emitted_keys(&PodcastFeedOptionsPopupView {
+            source: String::new(),
+            selected_item: String::new(),
+            ignore_items_before: false,
+            phase: youta::view::PodcastFeedOptionsPhase::Review,
+            animation_frame: 0,
+            error: None,
+        }),
+    );
     emitted.insert(
         "VideoCommentView",
         emitted_keys(&VideoCommentView::default()),
@@ -558,6 +578,7 @@ fn every_checked_interface_is_actually_declared() {
         "VideoCommentsPopupView",
         "VideoSummaryPopupView",
         "LanSharePopupView",
+        "PodcastFeedOptionsPopupView",
         "VideoCommentView",
         "ProjectHistoryPopupView",
         "ProjectCommitView",
@@ -606,8 +627,12 @@ fn the_window_can_share_local_files_and_podcast_feeds() {
         );
     }
     for required in [
+        "dispatch('ConfirmPodcastFeed')",
+        "dispatch('DismissPodcastFeed')",
         "dispatch('DismissLanShare')",
         "dispatch('StopLanShare')",
+        "dispatch('TogglePodcastFeedIgnoreBefore')",
+        "Ignore items before this item",
         "QR code for ${popup.url}",
     ] {
         assert!(
@@ -616,6 +641,7 @@ fn the_window_can_share_local_files_and_podcast_feeds() {
         );
     }
     assert!(app.contains("<LanSharePopup"));
+    assert!(app.contains("<PodcastFeedOptionsPopup"));
 }
 
 #[test]
