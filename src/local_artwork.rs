@@ -168,6 +168,7 @@ pub(crate) fn sidecar_covers_in(directory: &Path) -> HashMap<String, PathBuf> {
 
 /// Returns the sidecar covering one media file from an already-scanned
 /// directory.
+#[cfg(feature = "controller")]
 pub(crate) fn sidecar_cover_for(
     covers: &HashMap<String, PathBuf>,
     media_path: &Path,

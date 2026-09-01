@@ -129,10 +129,12 @@ use crate::playback::youtube_prewarm::{
     PrewarmedYouTubeAudio, YouTubePrewarmCancellation, YouTubePrewarmConfig, YouTubePrewarmError,
     YouTubePrewarmRequest, YouTubePrewarmResolver, YouTubePrewarmResult,
 };
+#[cfg(feature = "lan-sharing")]
+use crate::playback::ytdlp::ExtractedCollection;
 #[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
-    DownloadFormat, DownloadProcess, DownloadRequest, DownloadScope, ExtractedCollection, YtDlp,
-    YtDlpConfig, parse_download_event,
+    DownloadFormat, DownloadProcess, DownloadRequest, DownloadScope, YtDlp, YtDlpConfig,
+    parse_download_event,
 };
 use crate::playback::{
     BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason, PlaybackError, PlaybackEvent,

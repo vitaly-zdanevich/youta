@@ -20183,6 +20183,7 @@ mod tests {
         assert_eq!(exact_fit.height, 15);
     }
 
+    #[cfg(feature = "lan-sharing")]
     #[test]
     fn wide_subscription_channel_uses_the_shared_spaced_action_rail() {
         let mut view = ViewModel {
@@ -27715,6 +27716,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    #[cfg(feature = "lan-sharing")]
     #[test]
     fn channel_panel_renders_description_wikidata_and_external_links() {
         let backend = TestBackend::new(120, 32);
