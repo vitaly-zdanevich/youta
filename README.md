@@ -2205,3 +2205,5 @@ Youta is licensed under the [MIT License](LICENSE).
 - [ytfzf](https://github.com/pystardust/ytfzf) is a POSIX and `fzf`-based
   search, watch, and download frontend with thumbnails, subscriptions, and
   history; its upstream repository says it is no longer actively maintained.
+
+My lecture/meetup about youta, in Batumi, August 2026, in Russian language https://www.youtube.com/watch?v=swzZX4Y30Ak
